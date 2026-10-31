@@ -1255,10 +1255,38 @@ pub const StreamingRoundSummary = struct {
     sources_failed: usize = 0,
 };
 
+/// Resume point for the per-round (table, source) work loop. A round's five
+/// second quantum is shared across every source; without this, a source that
+/// repeatedly blocks until its own call times out leaves nothing for sources
+/// later in the list, because the next round always restarted from the
+/// first table. The caller owns one of these across rounds (a fresh
+/// coordinator, like a fresh round, starts at the default and resumes at
+/// the top, same as before this existed).
+pub const SourceRoundCursor = struct {
+    valid: bool = false,
+    table_id: u64 = 0,
+    source_ordinal: u32 = 0,
+
+    /// Index of `table_id` within `tables` in the order the caller supplied
+    /// them, or 0 when the cursor is unset or that table is gone (dropped,
+    /// or renamed out from under a stale cursor) — natural order resumes.
+    fn startTableIndex(self: SourceRoundCursor, tables: []const metadata_table_manager.TableRecord) usize {
+        if (!self.valid) return 0;
+        for (tables, 0..) |table, index| if (table.table_id == self.table_id) return index;
+        return 0;
+    }
+
+    fn startOrdinal(self: SourceRoundCursor, table: metadata_table_manager.TableRecord, source_count: usize) usize {
+        if (!self.valid or table.table_id != self.table_id or source_count == 0) return 0;
+        return @as(usize, self.source_ordinal) % source_count;
+    }
+};
+
 pub const SnapshotBackfillCoordinator = struct {
     alloc: Allocator,
     runner: SnapshotBackfillRunner,
     runtime_quantum_ns: u64 = default_runtime_quantum_ns,
+    cursor: SourceRoundCursor = .{},
 
     pub fn runRound(self: *SnapshotBackfillCoordinator, service: anytype) !BackfillRoundSummary {
         const Service = switch (@typeInfo(@TypeOf(service))) {
@@ -1285,9 +1313,18 @@ pub const SnapshotBackfillCoordinator = struct {
         };
 
         var summary: BackfillRoundSummary = .{};
-        for (tables) |table| {
-            if (platform_time.monotonicNs() >= quantum_deadline_ns)
+        // Resume after whatever this coordinator's cursor last pointed at,
+        // rather than always restarting at tables[0]: a source stuck until
+        // its own timeout must not starve every source that would otherwise
+        // come after it this round.
+        const start_table_index = self.cursor.startTableIndex(tables);
+        var visited_tables: usize = 0;
+        while (visited_tables < tables.len) : (visited_tables += 1) {
+            const table = tables[(start_table_index + visited_tables) % tables.len];
+            if (platform_time.monotonicNs() >= quantum_deadline_ns) {
+                self.cursor = .{ .valid = true, .table_id = table.table_id, .source_ordinal = if (visited_tables == 0) self.cursor.source_ordinal else 0 };
                 return summary;
+            }
             try self.runner.checkpointWork();
             const source_count = try countReplicationSourcesJson(self.alloc, table.replication_sources_json);
             if (source_count == 0) continue;
@@ -1299,9 +1336,14 @@ pub const SnapshotBackfillCoordinator = struct {
             }
             summary.tables_considered += 1;
 
-            for (0..source_count) |ordinal| {
-                if (platform_time.monotonicNs() >= quantum_deadline_ns)
+            const start_ordinal: usize = self.cursor.startOrdinal(table, source_count);
+            var visited_sources: usize = 0;
+            while (visited_sources < source_count) : (visited_sources += 1) {
+                const ordinal = (start_ordinal + visited_sources) % source_count;
+                if (platform_time.monotonicNs() >= quantum_deadline_ns) {
+                    self.cursor = .{ .valid = true, .table_id = table.table_id, .source_ordinal = @intCast(ordinal) };
                     return summary;
+                }
                 try self.runner.checkpointWork();
                 summary.sources_considered += 1;
                 const existing = findReplicationSourceStatus(statuses, table.table_id, @intCast(ordinal));
@@ -1784,6 +1826,7 @@ pub const StreamingReplicationCoordinator = struct {
     alloc: Allocator,
     runner: StreamingReplicationRunner,
     runtime_quantum_ns: u64 = default_runtime_quantum_ns,
+    cursor: SourceRoundCursor = .{},
 
     pub fn runRound(self: *StreamingReplicationCoordinator, service: anytype) !StreamingRoundSummary {
         const Service = switch (@typeInfo(@TypeOf(service))) {
@@ -1808,9 +1851,18 @@ pub const StreamingReplicationCoordinator = struct {
         };
 
         var summary: StreamingRoundSummary = .{};
-        for (tables) |table| {
-            if (platform_time.monotonicNs() >= quantum_deadline_ns)
+        // See SnapshotBackfillCoordinator.runRound: resume after the last
+        // source this coordinator reached, rather than always restarting at
+        // tables[0], so one source stuck until its own timeout can't starve
+        // sources later in the list every round.
+        const start_table_index = self.cursor.startTableIndex(tables);
+        var visited_tables: usize = 0;
+        while (visited_tables < tables.len) : (visited_tables += 1) {
+            const table = tables[(start_table_index + visited_tables) % tables.len];
+            if (platform_time.monotonicNs() >= quantum_deadline_ns) {
+                self.cursor = .{ .valid = true, .table_id = table.table_id, .source_ordinal = if (visited_tables == 0) self.cursor.source_ordinal else 0 };
                 return summary;
+            }
             try self.runner.checkpointWork();
             const source_count = try countReplicationSourcesJson(self.alloc, table.replication_sources_json);
             if (source_count == 0) continue;
@@ -1822,9 +1874,14 @@ pub const StreamingReplicationCoordinator = struct {
             }
             summary.tables_considered += 1;
 
-            for (0..source_count) |ordinal| {
-                if (platform_time.monotonicNs() >= quantum_deadline_ns)
+            const start_ordinal: usize = self.cursor.startOrdinal(table, source_count);
+            var visited_sources: usize = 0;
+            while (visited_sources < source_count) : (visited_sources += 1) {
+                const ordinal = (start_ordinal + visited_sources) % source_count;
+                if (platform_time.monotonicNs() >= quantum_deadline_ns) {
+                    self.cursor = .{ .valid = true, .table_id = table.table_id, .source_ordinal = @intCast(ordinal) };
                     return summary;
+                }
                 try self.runner.checkpointWork();
                 summary.sources_considered += 1;
                 const existing = findReplicationSourceStatus(statuses, table.table_id, @intCast(ordinal)) orelse {
@@ -5057,6 +5114,237 @@ test "metadata replication backfill coordinator continues past one source's retr
         }
     }
     try std.testing.expect(saw_failure and saw_completion);
+}
+
+test "metadata replication backfill coordinator rotates past a source stuck until its own timeout" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-metadata-replication-backfill-fairness";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+
+    const FakeExecutor = struct {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64, _: ?CancellationToken) !foreign_mod.QueryResult {
+            var owned = prepared;
+            defer owned.deinit(inner_alloc);
+            // Models a source whose own call blocks until it times out: the
+            // scenario that starved every later source indefinitely before
+            // the round loop kept a rotating cursor across rounds.
+            if (std.mem.indexOf(u8, owned.sql_text, "slow_source") != null) {
+                platform_time.sleepNs(2000 * std.time.ns_per_ms);
+                return error.ForeignConnectionFailed;
+            }
+            const rows = try inner_alloc.alloc(std.json.Value, 1);
+            rows[0] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"doc:1\",\"name\":\"ok\"}", .{});
+            return .{ .rows = rows, .total = 1 };
+        }
+
+        fn statistics(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !foreign_mod.TableStatistics {
+            return .{ .row_count = 1, .size_bytes = 32 };
+        }
+
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_mod.Column {
+            const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
+            columns[0] = .{
+                .name = try inner_alloc.dupe(u8, "id"),
+                .data_type = try inner_alloc.dupe(u8, "text"),
+                .nullable = false,
+            };
+            return columns;
+        }
+    };
+
+    var registry = foreign_mod.Registry{};
+    defer registry.deinit(alloc);
+    try foreign_mod.registerPostgresExecutor(alloc, &registry, .{
+        .ptr = undefined,
+        .vtable = &.{
+            .query = FakeExecutor.query,
+            .statistics = FakeExecutor.statistics,
+            .discover_columns = FakeExecutor.discoverColumns,
+        },
+    });
+
+    var write_source = table_writes_api.BoundTableWriteSource.init("docs", &db);
+
+    const FakeService = struct {
+        alloc: Allocator,
+        table: metadata_table_manager.TableRecord,
+        statuses: std.ArrayListUnmanaged(metadata_table_manager.ReplicationSourceStatusRecord) = .empty,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.statuses.items) |record| metadata_table_manager.freeReplicationSourceStatus(self.alloc, record);
+            self.statuses.deinit(self.alloc);
+        }
+
+        pub fn metadataStatus(_: *@This()) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        pub fn listProjectedTables(self: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.TableRecord {
+            const out = try inner_alloc.alloc(metadata_table_manager.TableRecord, 1);
+            out[0] = .{
+                .table_id = self.table.table_id,
+                .name = try inner_alloc.dupe(u8, self.table.name),
+                .replication_sources_json = try inner_alloc.dupe(u8, self.table.replication_sources_json),
+            };
+            return out;
+        }
+
+        pub fn freeProjectedTables(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.TableRecord) void {
+            for (records) |record| {
+                inner_alloc.free(record.name);
+                inner_alloc.free(record.replication_sources_json);
+            }
+            inner_alloc.free(records);
+        }
+
+        // No ranges declared: tableReadyForReplication treats a rangeless
+        // table as ready without needing placement/health fixtures.
+        pub fn listProjectedRanges(_: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.RangeRecord {
+            return try inner_alloc.alloc(metadata_table_manager.RangeRecord, 0);
+        }
+
+        pub fn freeProjectedRanges(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.RangeRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedStores(_: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.StoreRecord {
+            return try inner_alloc.alloc(metadata_table_manager.StoreRecord, 0);
+        }
+
+        pub fn freeProjectedStores(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.StoreRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedPlacementIntents(_: *@This(), inner_alloc: Allocator) ![]raft_reconciler.PlacementIntent {
+            return try inner_alloc.alloc(raft_reconciler.PlacementIntent, 0);
+        }
+
+        pub fn freeProjectedPlacementIntents(_: *@This(), inner_alloc: Allocator, records: []raft_reconciler.PlacementIntent) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedSplitTransitions(_: *@This(), inner_alloc: Allocator) ![]metadata_transition_state.SplitTransitionRecord {
+            return try inner_alloc.alloc(metadata_transition_state.SplitTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedSplitTransitions(_: *@This(), inner_alloc: Allocator, records: []metadata_transition_state.SplitTransitionRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedMergeTransitions(_: *@This(), inner_alloc: Allocator) ![]metadata_transition_state.MergeTransitionRecord {
+            return try inner_alloc.alloc(metadata_transition_state.MergeTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedMergeTransitions(_: *@This(), inner_alloc: Allocator, records: []metadata_transition_state.MergeTransitionRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedReplicationSourceStatuses(self: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.ReplicationSourceStatusRecord {
+            const out = try inner_alloc.alloc(metadata_table_manager.ReplicationSourceStatusRecord, self.statuses.items.len);
+            for (self.statuses.items, 0..) |record, i| out[i] = try metadata_table_manager.cloneReplicationSourceStatus(inner_alloc, record);
+            return out;
+        }
+
+        pub fn freeProjectedReplicationSourceStatuses(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.ReplicationSourceStatusRecord) void {
+            for (records) |record| metadata_table_manager.freeReplicationSourceStatus(inner_alloc, record);
+            if (records.len > 0) inner_alloc.free(records);
+        }
+
+        pub fn upsertReplicationSourceStatus(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+            for (self.statuses.items) |*existing| {
+                if (existing.table_id == record.table_id and existing.source_ordinal == record.source_ordinal) {
+                    metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing.*);
+                    existing.* = try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record);
+                    return;
+                }
+            }
+            try self.statuses.append(self.alloc, try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record));
+        }
+    };
+
+    var service: FakeService = .{
+        .alloc = alloc,
+        .table = .{
+            .table_id = 22,
+            .name = "docs",
+            .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"slow_source\",\"key_template\":\"id\"}," ++
+                "{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"fast_b\",\"key_template\":\"id\"}," ++
+                "{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"fast_c\",\"key_template\":\"id\"}]",
+        },
+    };
+    defer service.deinit();
+
+    // A fresh source with no status tries beginPreparedReplicationSnapshot
+    // and then source.prepareReplication first, neither of which this fake
+    // executor implements. Seed an in-progress "snapshot" status (like the
+    // retryable-failure test above) so each source resumes straight through
+    // query() instead.
+    for ([_]u32{ 0, 1, 2 }) |ordinal| {
+        try service.upsertReplicationSourceStatus(.{
+            .table_id = 22,
+            .source_ordinal = ordinal,
+            .source_kind = "postgres",
+            .external_table = "docs",
+            .phase = "snapshot",
+            .cutover_mode = "exported_snapshot",
+            .prepared_checkpoint = "lsn:resume",
+            .last_error = "",
+            .lag_records = 0,
+            .updated_at_ms = 1,
+        });
+    }
+
+    var coordinator = SnapshotBackfillCoordinator{
+        .alloc = alloc,
+        .runner = .{
+            .alloc = alloc,
+            .registry = &registry,
+            .write_source = write_source.source(),
+        },
+        // Tiny relative to the slow source's call (2s, always overruns it)
+        // so without a rotating cursor every round restarts at ordinal 0
+        // and the other two sources never run.
+        .runtime_quantum_ns = 500 * std.time.ns_per_ms,
+    };
+    const round1 = try coordinator.runRound(&service);
+    try std.testing.expectEqual(@as(usize, 1), round1.sources_considered);
+    try std.testing.expectEqual(@as(usize, 1), round1.sources_failed);
+    try std.testing.expect(coordinator.cursor.valid);
+    try std.testing.expectEqual(@as(u64, 22), coordinator.cursor.table_id);
+    try std.testing.expectEqual(@as(u32, 1), coordinator.cursor.source_ordinal);
+
+    // A fresh coordinator (a new round, same as every real round) carrying
+    // only the cursor forward resumes at source 1, not source 0 again.
+    var coordinator2 = SnapshotBackfillCoordinator{
+        .alloc = alloc,
+        .runner = .{
+            .alloc = alloc,
+            .registry = &registry,
+            .write_source = write_source.source(),
+        },
+        .runtime_quantum_ns = 500 * std.time.ns_per_ms,
+        .cursor = coordinator.cursor,
+    };
+    const round2 = try coordinator2.runRound(&service);
+    try std.testing.expect(round2.sources_considered >= 2);
+    try std.testing.expectEqual(@as(usize, 2), round2.sources_completed);
+
+    var saw_b = false;
+    var saw_c = false;
+    for (service.statuses.items) |record| {
+        if (record.source_ordinal == 1) saw_b = true;
+        if (record.source_ordinal == 2) saw_c = true;
+    }
+    try std.testing.expect(saw_b and saw_c);
 }
 
 test "metadata replication backfill marks existing-slot fallback as slot_resumed" {
