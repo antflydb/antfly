@@ -84,12 +84,14 @@ export class R2CoordinatorStore {
     if(!this.durableBootstrap)return Promise.reject(Error("DurableBootstrapStorageRequired"));
     return this.enqueue({kind:"durable_checkpoint",priority:"maintenance",deadlineMs,run:()=>{}});
   }
-  async servingCodec(action,extra={}){
-    return this.snapshotKernel.withHost(host=>{
+  async servingCodec(action,extra={},{tryOnly=false}={}){
+    const run=host=>{
       if(host.servingCapsuleABI!==1)throw Error("ServingCapsuleModuleRequired");
       if(action==="probe")return;
       return host.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{root_backend:"bounded_journal",action,owner:this.owner,serving_scope:this.exclusiveOwnerId,...extra}},{transport:()=>{throw Error("ServingCapsuleIoForbidden");},deadlineMs:this.deadline??this.clock()+5000});
-    },{deadlineMs:this.deadline??this.clock()+5000,fairKey:this.namespace,priority:action==="serving_import"?"interactive":"commit"});
+    };
+    const options={deadlineMs:this.deadline??this.clock()+5000,fairKey:this.namespace,priority:action==="serving_export"?"maintenance":action==="serving_import"?"interactive":"commit"};
+    return tryOnly?this.snapshotKernel.tryWithHost(run,options):this.snapshotKernel.withHost(run,options);
   }
   async restoreDurableRead(){
     if(!this.durableBootstrap)return;
@@ -443,7 +445,11 @@ export class R2CoordinatorStore {
         const item=this.pending.shift();completed.push(item);
         if(this.freezeRequested||!this.acquired||this.recovering||this.ioDrain||!this.state){item.result={done:false,revision:this.state?.revision??0};return completed;}
         if(this.durableBootstrap.entry?.dirty===false){item.result={done:true,revision:this.durableBootstrap.generation??0,native_revision:this.state.revision};return completed;}
-        await this.durableBootstrap.finish(this.state,(action,extra)=>this.servingCodec(action,extra));checkDurableDeadline();
+        // Optional acceleration must not hold the metadata queue while waiting
+        // for native capacity needed by foreground preparation/finalization.
+        const exported=await this.servingCodec("serving_export",{state:this.state,owner:this.state.owner},{tryOnly:true});checkDurableDeadline();
+        if(!exported.admitted){item.result={done:false,busy:true,revision:this.durableBootstrap.generation??0};return completed;}
+        await this.durableBootstrap.finish(this.state,()=>exported.value);checkDurableDeadline();
         item.result={done:true,revision:this.durableBootstrap.generation??0,native_revision:this.state.revision};return completed;
       }
       // Commit-only native plans expose no read result before append. A warm

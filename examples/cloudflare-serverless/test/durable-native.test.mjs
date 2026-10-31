@@ -69,3 +69,16 @@ test('retirement suppresses new recovery hints before physical I/O',async()=>{
  assert.deepEqual(await store.checkpointHint(),{busy:true});assert.equal(f.calls(),before);
  await assert.rejects(store.flushDurableCheckpoint(),/CoordinatorMigrationRequired/);
 });
+
+test('optional checkpoints defer without holding the metadata queue behind occupied native capacity',{timeout:5000},async()=>{
+ const f=await fixture(),store=await f.reopen();await store.transaction(tx=>tx.put('value',1));
+ let atHost,release;const ready=new Promise(r=>atHost=r),gate=new Promise(r=>release=r);
+ const held=store.snapshotKernel.withHost(async()=>{atHost();await gate;});
+ try{
+  await ready;const before=f.calls(),checkpoint=await store.flushDurableCheckpoint();
+  assert.equal(checkpoint.done,false);assert.equal(checkpoint.busy,true);assert.equal(f.calls(),before);assert.equal(store.running,false);assert.equal(store.pending.length,0);
+  await store.transaction(tx=>tx.put('value',2));assert.equal(f.local.value.dirty,true);
+ }finally{release();await held;}
+ assert.equal((await store.flushDurableCheckpoint()).done,true);
+ const recovered=await f.reopen(),before=f.calls();assert.equal(await recovered.ownerRead(tx=>tx.get('value')),2);assert.equal(f.calls(),before);
+});

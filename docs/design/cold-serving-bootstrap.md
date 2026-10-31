@@ -68,8 +68,11 @@ The record states are:
 3. **Acknowledgment:** the application write returns after native R2 commit.
    A confirmed dirty interval coalesces subsequent intents without another local
    write. No optional clean checkpoint is on this acknowledgment path.
-4. **Clean capsule:** after one quiet second, native exports confirmed state on
-   the coordinator's existing serialized maintenance queue. The provider record
+4. **Clean capsule:** after one quiet second, native attempts to export confirmed
+   state on the coordinator's existing serialized maintenance queue. Export uses
+   try-only admission to the 8 MiB observation lane at maintenance priority. Busy
+   capacity defers immediately; it cannot retain the metadata queue while waiting
+   for a slot needed by foreground preparation/finalization. The provider record
    is persisted and synchronized before a clean checkpoint is confirmed.
 5. **Frozen:** new admission stops, queued work and outstanding I/O drain, then a
    durable blocked record is installed before namespace retirement/migration.
@@ -79,7 +82,10 @@ native R2 recovery. A checkpoint failure cannot revoke an already accepted R2
 write; it remains visible in diagnostics and invalidates qualification. The
 scheduler does not retry checkpoint exceptions automatically, and busy admission
 is bounded to four checks within ten seconds. A future write can schedule another
-attempt. The owner never installs a clean checkpoint concurrently with a write. Scheduling
+attempt. This is a best-effort accelerator: exhausted busy checks can leave a
+dirty record until another write or explicit maintenance attempt. A crash in
+that interval takes the ordinary R2 recovery path. The owner never installs a
+clean checkpoint concurrently with a write. Scheduling
 tracks a host-local dirty generation, so ownership/checkpoint work that leaves
 the native metadata revision unchanged can still become clean after quiescence.
 
@@ -115,7 +121,10 @@ its durable storage capability.
 V1/v2 adapters and incompatible flag combinations reject v3. Disabling the flag
 is not rollback. Retirement must first call the owner's private freeze operation
 and drain active work before changing the R2 descriptor. Out-of-band edits to an
-active v3 descriptor are outside the protocol. No in-place migration or unfreeze
+active v3 descriptor are outside the protocol. The DATABASE binding and its
+logical storage identity are also immutable: rebinding an R2 bucket requires
+retirement and a new namespace/storage ID. The adapter cannot independently
+identify a different physical bucket behind the same logical binding. No in-place migration or unfreeze
 tool is provided; rollout uses a fresh compatible namespace. Native capsule
 primitives can support other providers only when their adapters supply an
 explicit equivalent exclusive-owner/durability contract.
@@ -151,3 +160,8 @@ are a coalesced recovery accelerator. Dense offered-load runs, both execution
 orders, recovered-error histories and actual-workerd restart tests are required
 to evaluate this correction. Earlier synchronous measurements remain historical
 and must not be combined with corrected measurements as a single passing run.
+
+The provider storage contract requires ordered writes and a durability barrier
+under the exclusive owner. Cloudflare documents [storage output gates](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/)
+and the [storage API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/).
+Native capsules do not manufacture those guarantees for another provider.
