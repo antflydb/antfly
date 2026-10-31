@@ -2798,7 +2798,7 @@ it does not raise the statement or host memory limit.
 Large, singly bound source fields can stream nonexpanding token-local analysis
 into postings while capturing original spans in compact replay storage. Each
 16-byte record stores an interned term ID, byte bounds and position. The compact
-prefix uses at most an eighth of recognized initial headroom, capped at 4 MiB
+prefix stages up to an eighth of recognized initial headroom in record bytes, capped at 4 MiB
 (256 KiB for an unknown owner), before moving once to an admitted private run.
 Backing capacity, distinct-term interning, occurrence links and run read buffers
 remain charged to the build owner. This removes the owning per-occurrence Token
@@ -2819,3 +2819,16 @@ platform dependencies. `zig build lake-native-bench-build -Doptimize=fast` build
 all three probes without referring to disposable cache-generated files. See the
 [benchmark instructions](bench/lake/README.md#quota-governed-residency-and-streamed-capture)
 for controls, exact timer boundaries and measured tradeoffs.
+
+
+The [governed-residency and capture observation](bench/lake/governed-residency-and-streamed-capture-v1-observation.json)
+qualifies this runtime with 592 native checks and 50 real Parquet/Iceberg E2E
+cases. Three alternating optimized native pairs at 65,536 rows show 16.3–18.0%
+lower full-sort CPU and 88.5–89.0% fewer physical read bytes against the same
+binary's fixed-cap policy control. Tracked peaks rise from about 17 MB to 127 MB
+under the unchanged 256-MiB quota. The tight 32-MiB-quota cohort keeps identical
+I/O/memory and shows no CPU improvement. Repeated four-term capture fixtures use
+91–94% less tracked peak memory; English capture takes 5.7–7.4% more CPU and the
+smaller simple-analyzer fixture takes 14.2% more CPU. These kernel observations
+are separate from earlier complete-publication measurements; no current HTTP,
+archive, cloud or RSS gain is claimed.

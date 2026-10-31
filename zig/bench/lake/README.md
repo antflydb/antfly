@@ -2999,7 +2999,7 @@ ANTFLY_CAPTURE_REPEATS=65536 zig-out/bin/lake-source-capture-bench
 
 Set `ANTFLY_CAPTURE_ENGLISH=1` for English stemming; otherwise the capture probe
 uses the simple analyzer. Both variants must match every token's term, position
-and original byte-span digest, and the complete encoded offset SHA-256. Capture
+and original byte-span digest, and the complete encoded offset SHA-256. The analyzer fingerprint is precomputed. Capture
 timing includes analysis, callback validation, encoding and temporary teardown;
 input creation, process startup, encoded-output verification and final Capture
 teardown are excluded. Tracked peak includes the complete capture operation,
@@ -3012,3 +3012,51 @@ SQL NULL and tagged string under identical quotas for none/Snappy compression.
 add, finish, drain and sort teardown. Manager construction and process startup
 are excluded. Payload-read counts and physical read bytes are distinct counters.
 These kernel comparisons make no HTTP, cloud, empty-cache or archive-scale claim.
+
+
+[governed-residency-and-streamed-capture-v1-observation.json](governed-residency-and-streamed-capture-v1-observation.json)
+records runtime `04e87128ffef7efe9fb1ea0fee64ae29e4651ae7`, the test-only
+follow-up `f73f851f05112e7f016132cd1402ee41d80ec342`, frozen server/probe identities,
+exact commands, warmups and three alternating measured pairs per cohort.
+Both commits include main `f91c9c0e4682a3ff20e39fce9a44d67b658a7b55`.
+
+At 65,536 rows, a 4-MiB workspace and the same 256-MiB hard quota:
+
+| Compression | Fixed-cap median full-sort CPU | Governed median full-sort CPU | CPU change | Read-byte change |
+| --- | ---: | ---: | ---: | ---: |
+| None | 1,026.953 ms | 859.220 ms | 16.3% lower | 89.0% lower |
+| Snappy | 1,120.466 ms | 918.248 ms | 18.0% lower | 88.5% lower |
+
+Every productive 32,768/65,536-row pair is faster. At 32,768 rows, full-sort CPU
+falls 15.1% uncompressed and 25.6% with Snappy. At 65,536 rows, payload decodes
+fall from 39,204/39,486 to 4,097. Tracked peaks increase from about 17 MB to
+127 MB, within the unchanged 268,435,456-byte quota. Writes and merge counts
+match within each cohort. This is an intentional use of spare admitted memory,
+not a reduction in memory use. The 8,192-row, 32-MiB-quota control has identical
+I/O and tracked peaks, with median CPU 0.6–1.8% higher; no tight-quota speedup is
+claimed. Required-allocation pressure tests prove optional residency is refunded.
+
+Capture uses repeated four-term text, with every output token and complete
+encoded-byte digest matched across variants:
+
+| Analyzer / input bytes | Materialized tracked peak | Streamed tracked peak | Peak change | CPU change |
+| --- | ---: | ---: | ---: | ---: |
+| Simple / 229,376 | 18,532,191 | 1,092,230 | 94.1% lower | 14.2% higher |
+| English / 229,376 | 12,622,187 | 1,092,227 | 91.3% lower | 5.7% higher |
+| Simple / 1,835,008 | 94,546,401 | 8,295,110 | 91.2% lower | 0.5% lower |
+| English / 1,835,008 | 141,772,729 | 8,295,107 | 94.1% lower | 7.4% higher |
+
+The streamed path is retained for materially lower build memory, with its CPU
+tradeoff explicit. These repeated-term kernels do not establish the same memory
+ratio for diverse vocabularies or a full ingestion speedup. Runtime ABI 82 fences
+cache state; reader protocol 97 and persisted encodings are unchanged.
+
+Final qualification passes **409 shared + 183 API native checks (592 total)**,
+with zero failures, skips or leaks, plus **50 real Parquet/Iceberg E2E cases in
+387.32 seconds** against the frozen Debug server. The initial shared run exposed
+two new test-oracle issues: allocator resize nondeterminism and term-grouped
+occurrence order. A test-only correction precedes the complete passing rerun.
+Apache boundary, license, formatting and whole-branch whitespace checks pass.
+No task-owned builds, tests or cleanup overlap final measurements. Host activity
+and OS caches remain uncontrolled. These optimized native kernel observations
+do not qualify optimized-server throughput, peak RSS, cloud or archive scale.
