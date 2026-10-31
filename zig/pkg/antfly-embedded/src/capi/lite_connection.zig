@@ -1695,6 +1695,7 @@ pub const Owner = struct {
         if (self.owned_ttl_owner_id) |id| alloc.free(id);
         if (self.owned_models_dir) |directory| alloc.free(directory);
         self.path_lock_io.deinit();
+        @import("io_lifetime.zig").release();
         alloc.destroy(self);
     }
 };
@@ -2016,8 +2017,12 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     const owner = existing orelse try alloc.create(Owner);
     errdefer if (existing == null) alloc.destroy(owner);
     if (existing == null) {
+        // Runtime snapshots may close out of order or before this owner. Keep
+        // the process signal owner alive until this executor has joined too.
+        @import("io_lifetime.zig").acquire();
         owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir, .path_lock_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) }) };
     }
+    errdefer if (existing == null) @import("io_lifetime.zig").release();
     errdefer if (existing == null) owner.path_lock_io.deinit();
     if (existing == null) {
         owner.reader_coordinator = try native.ReaderCoordinator.create(alloc, io);
