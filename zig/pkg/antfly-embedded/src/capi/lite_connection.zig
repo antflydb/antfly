@@ -855,6 +855,31 @@ pub const Owner = struct {
         if (try backend.existingRootIncarnation("root") == null) return false;
         var read = try store.beginRead();
         defer read.abort();
+        // API entry runs SQL recovery after opening the root. That recovery
+        // can open every named namespace and publish immutable-reader leases,
+        // even when the root's own index catalog is empty. Keep the exception
+        // limited to root-only databases, without opening any child indexes.
+        const directory = @import("../storage/lite/embedded_catalog.zig");
+        const directory_bytes = read.getOwned(alloc, directory.key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (directory_bytes) |bytes| {
+            defer alloc.free(bytes);
+            const parsed = std.json.parseFromSlice(directory.Catalog, alloc, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return false,
+            };
+            defer parsed.deinit();
+            if (parsed.value.tables.len != 0) return false;
+        }
+        // A root-only read can also mutate while reconciling a pending SQL
+        // decision or DDL/FK job. Its durable markers require the same turn.
+        inline for (.{
+            "\x00antfly/embedded/sql-commit/v1",
+            "\x00antfly/embedded/sql-ddl",
+            "\x00antfly/embedded/sql-fk-publication",
+        }) |key| if (try read.valueIdentity(key) != null) return false;
         const indexes = @import("../storage/db/catalog/index_manager.zig");
         inline for (.{
             .{ "\x00\x00__metadata__:indexes", indexes.deserializeCatalog, true },
@@ -3872,7 +3897,14 @@ test "issue1015 issue1431 unverified peer opens yield to a detached proof turn" 
 
 test "issue1431 unindexed diagnostics do not wait for a peer allocator proof" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
-    for ([_]bool{ false, true }) |unindexed| {
+    const Scenario = enum { indexed, unindexed, named_indexed, pending_commit, pending_ddl, pending_fk };
+    for (std.meta.tags(Scenario)) |scenario| {
+        const recovery_key: ?[]const u8 = switch (scenario) {
+            .pending_commit => "\x00antfly/embedded/sql-commit/v1",
+            .pending_ddl => "\x00antfly/embedded/sql-ddl",
+            .pending_fk => "\x00antfly/embedded/sql-fk-publication",
+            else => null,
+        };
         var fixture = try AdmissionFollowupFixture.init("unindexed-proof-diagnostic", 1000, .batch);
         defer fixture.deinit();
         try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
@@ -3885,7 +3917,25 @@ test "issue1431 unindexed diagnostics do not wait for a peer allocator proof" {
                 owner.gate.mutex.unlock(io);
             }
             try owner.current.?.db.addIndex(.{ .name = "proof-index", .kind = .full_text, .config_json = "{}" });
-            if (unindexed) try std.testing.expect(try owner.current.?.db.deleteIndex("proof-index"));
+            if (scenario != .indexed) try std.testing.expect(try owner.current.?.db.deleteIndex("proof-index"));
+            if (scenario == .named_indexed) {
+                try @import("tables.zig").create(owner.current.?, "named", "{}", false);
+                const named = try @import("tables.zig").get(owner.current.?, "named");
+                try named.addIndex(.{ .name = "named-index", .kind = .full_text, .config_json = "{}" });
+                _ = try named.indexTextKernelDocuments("named-index", &.{.{
+                    .id = "named-doc",
+                    .stored_data = "{}",
+                    .text_fields = &.{.{ .field_name = "body", .text = "named diagnostic reader" }},
+                    .doc_ordinal = 1,
+                }});
+            }
+            if (recovery_key) |key| {
+                var write = try owner.current.?.db.core.store.beginWriteTxn();
+                errdefer write.abort();
+                // The guard must refuse before recovery parses this marker.
+                try write.put(key, "{}");
+                try write.commit();
+            }
         }
         var expected: native.Header = undefined;
         {
@@ -3922,7 +3972,7 @@ test "issue1431 unindexed diagnostics do not wait for a peer allocator proof" {
         peer_owner.verification_cancel.requested.store(false, .release);
         var out: h.capi.Buffer = .{};
         defer api.antfly_buffer_free_zero(&out);
-        try std.testing.expectEqual(if (unindexed) h.capi.ErrorCode.ok else h.capi.ErrorCode.busy, api.antfly_db_pending_work_stats_json(peer_id, &out));
+        try std.testing.expectEqual(if (scenario == .unindexed) h.capi.ErrorCode.ok else h.capi.ErrorCode.busy, api.antfly_db_pending_work_stats_json(peer_id, &out));
         try std.testing.expectEqual(@as(u64, 0), peer_owner.publication_stats.allocator_proof_walks);
         {
             var probe = try native.NativeFile.openWithIo(alloc, io, fixture.path, .{ .read_only = true, .internal_reader = true });
@@ -3936,6 +3986,13 @@ test "issue1431 unindexed diagnostics do not wait for a peer allocator proof" {
         owner.releaseMaintenanceTurnAssumeLocked();
         owner.gate.mutex.unlock(io);
         held = false;
+        if (recovery_key) |key| {
+            var lease = try native.lockWriterPathWithIo(alloc, io, fixture.path);
+            defer lease.close();
+            var foreign = try native.NativeFile.openWithIo(alloc, io, fixture.path, .{ .externally_locked = true, .no_sync = true });
+            defer foreign.close();
+            try foreign.deleteDocument(key);
+        }
         try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(peer_id, &writes, writes.len, null, 0, 0, 0));
     }
 }

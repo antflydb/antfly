@@ -1210,9 +1210,11 @@ capped at five seconds per acquisition. Like other coordination inodes, the side
 must remain in place while any process may have the database open. Refused turns
 back off for 100 ms, including during an otherwise immediate namespace round.
 An initialized root with an explicitly empty index catalog, no configured
-enrichments or resolvers, and no graph-build recovery work can reopen without
-that turn: it publishes no index readers. This lets diagnostics observe its
-current tip during a peer's proof. Mutations still require allocator admission.
+enrichments or resolvers, no named tables, and no pending SQL or graph-build
+recovery work can reopen without that turn: it publishes no index readers.
+Named tables remain guarded because API-entry recovery can open their indexes.
+This lets diagnostics observe a root-only database's current tip during a peer's
+proof. Mutations still require allocator admission.
 
 Full-text catch-up treats `CapacityUnavailable` and `CapacityObservationStale` as
 recoverable admission failures, with bounded backoff and persisted progress after
