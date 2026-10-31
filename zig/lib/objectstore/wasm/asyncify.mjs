@@ -254,5 +254,5 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
       try { requestMetrics(metrics); } catch {}
     }
   }
-  return { request, immutablePreparationABI:Number(wasm.antfly_host_immutable_preparation_abi?.()??0),residentReadABI:Number(wasm.antfly_host_resident_read_abi?.()??0),readDependencyABI: wasm.antfly_host_read_dependency_abi?.()??0, usable: () => !poisoned && !invalidClock, memoryBytes: () => wasm.memory.buffer.byteLength, draining: () => draining };
+  return { request, immutablePreparationABI:Number(wasm.antfly_host_immutable_preparation_abi?.()??0),residentStateABI:Number(wasm.antfly_host_resident_state_abi?.()??0),residentReadABI:Number(wasm.antfly_host_resident_read_abi?.()??0),readDependencyABI: wasm.antfly_host_read_dependency_abi?.()??0, usable: () => !poisoned && !invalidClock, memoryBytes: () => wasm.memory.buffer.byteLength, draining: () => draining };
 }

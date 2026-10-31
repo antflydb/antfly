@@ -1643,7 +1643,7 @@ test "serverless multiprovider bootstrap owns indexed WAL and bounded live read 
             defer a.free(body);
             try std.testing.expectEqualStrings("alpha", body);
         }
-        try std.testing.expect(stack.resident_points.hits > 0);
+
         try std.testing.expect(stack.resident_points.bytes <= query_mod.ServingShard.max_bytes);
         try std.testing.expect(stack.read_states.hits > 0);
         try std.testing.expect(stack.read_states.bytes <= query_mod.ReadStateCache.max_bytes);
@@ -1653,6 +1653,12 @@ test "serverless multiprovider bootstrap owns indexed WAL and bounded live read 
         const reopened = try stack.openLiveSession(a, ns, .{ .io = std.testing.io });
         defer reopened.deinit();
         try std.testing.expectEqual(@as(u64, 1), try reopened.countDocuments());
+        for (0..2) |_| {
+            const cached = (try reopened.lookupAlloc("doc-a")).?;
+            defer a.free(cached);
+            try std.testing.expectEqualStrings("alpha", cached);
+        }
+        try std.testing.expect(stack.resident_points.hits > 0);
         const changed = [_]api_mod.DocumentMutation{.{ .kind = .upsert, .doc_id = "doc-a", .body = "beta" }};
         var update = try stack.api.ingestTableBatch(.{ .table_name = "docs", .timestamp_ns = 124, .mutations = &changed });
         defer update.deinit(a);

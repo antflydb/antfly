@@ -67,7 +67,8 @@ export class R2CoordinatorStore {
     if(!["r2","r2-conditional","r2-bounded","sqlite"].includes(descriptor?.mode))throw Error("CoordinatorAuthorityMismatch");const backend=descriptor.mode==="r2-conditional"?"conditional":descriptor.mode==="r2-bounded"?"bounded_journal":"journal";
     if(this.rootBackend!==backend){if(this.state||this.observedState||this.acquired||this.running||this.pending.length)throw Error("CoordinatorMigrationRequired");this.rootBackend=backend;this.rootCursor=null;this.journalProof=null;this.rootProofScope=Array.from(crypto.getRandomValues(new Uint8Array(16)));this.rootProofKey=Array.from(crypto.getRandomValues(new Uint8Array(32)));if(backend==="conditional")this.idleCheckpoint=null;}
     if(descriptor.format===2){
-      if(descriptor.mode!=="r2-bounded"||descriptor.serving?.protocol!=="serialized-owner-v1"||typeof descriptor.serving.owner_id!=="string"||this.exclusiveOwnerId!=null&&descriptor.serving.owner_id!==this.exclusiveOwnerId)throw Error("ResidentServingOwnerMismatch");
+      this.ownerMvcc=descriptor.serving?.protocol==="serialized-owner-v2";
+      if(descriptor.mode!=="r2-bounded"||!["serialized-owner-v1","serialized-owner-v2"].includes(descriptor.serving?.protocol)||typeof descriptor.serving.owner_id!=="string"||this.exclusiveOwnerId!=null&&descriptor.serving.owner_id!==this.exclusiveOwnerId)throw Error("ResidentServingOwnerMismatch");
       this.requiresExclusiveOwner=true;this.ownerServing=this.exclusiveOwnerId===descriptor.serving.owner_id;
     }
     this.readLeasePolicy=descriptor.read_lease_policy;
@@ -164,24 +165,24 @@ export class R2CoordinatorStore {
   offerRootHint(hint){
     if(!hint||typeof hint.namespace!=="string"||hint.namespace!==this.namespace||!Array.isArray(hint.epoch)||hint.epoch.length!==16||!Array.from(hint.epoch).every(n=>Number.isInteger(n)&&n>=0&&n<=255)||!Number.isSafeInteger(hint.next)||hint.next<1||hint.next>64||!Number.isSafeInteger(hint.revision)||hint.revision<1||this.rootHint&&hint.revision<=this.rootHint.revision)return false;
     const value={namespace:hint.namespace,epoch:[...hint.epoch],next:hint.next,revision:hint.revision},charge=utf8.encode(JSON.stringify(value)).length*2+256;
-    if(charge>4096||charge+this.hintBytes>this.rowBudgetBytes)return false;
+    if(charge>4096||charge+this.hintBytes+(this.servingTailBytes??0)>this.rowBudgetBytes)return false;
     this.boundRows?.(this);this.rootHint=value;this.cursorHintBytes=charge;
-    while(this.rows.size&&this.rowBytes+this.hintBytes+charge>this.rowBudgetBytes){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
+    while(this.rows.size&&this.rowBytes+this.hintBytes+(this.servingTailBytes??0)+charge>this.rowBudgetBytes){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
     return true;
   }
   setReadHints(namespace,generation,hints){
     const accepted=normalizeReadHints(namespace,generation,hints);
-    if(!accepted||accepted.charge+this.cursorHintBytes>this.rowBudgetBytes||this.readHints&&BigInt(accepted.version)<BigInt(this.readHints.version))return false;
+    if(!accepted||accepted.charge+this.cursorHintBytes+(this.servingTailBytes??0)>this.rowBudgetBytes||this.readHints&&BigInt(accepted.version)<BigInt(this.readHints.version))return false;
     this.boundRows?.(this);this.readHints=structuredClone(accepted);this.hintBytes=accepted.charge;
-    while(this.rows.size&&this.rowBytes+this.hintBytes+this.cursorHintBytes>this.rowBudgetBytes){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
+    while(this.rows.size&&this.rowBytes+this.hintBytes+this.cursorHintBytes+(this.servingTailBytes??0)>this.rowBudgetBytes){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
     return true;
   }
   remember(key,value){
     this.boundRows?.(this);
     const previous=this.rows.get(key);if(previous)this.rowBytes-=previous.bytes;this.rows.delete(key);
     const bytes=utf8.encode(key).length+(value===undefined?0:utf8.encode(encode(value)).length)+128;
-    if(bytes>this.rowBudgetBytes-this.hintBytes-this.cursorHintBytes)return;
-    while(this.rows.size>=256||this.rowBytes+this.hintBytes+this.cursorHintBytes+bytes>this.rowBudgetBytes){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
+    if(bytes>this.rowBudgetBytes-this.hintBytes-this.cursorHintBytes-(this.servingTailBytes??0))return;
+    while(this.rows.size>=256||this.rowBytes+this.hintBytes+this.cursorHintBytes+(this.servingTailBytes??0)+bytes>this.rowBudgetBytes){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
     this.rows.set(key,{value:structuredClone(value),bytes});this.rowBytes+=bytes;
   }
   // A preparation hint only. It carries no freshness claim; callers must
@@ -195,8 +196,12 @@ export class R2CoordinatorStore {
     if(names.some(name=>!map.has(name)))return null;
     return new Map([...map].map(([key,value])=>[key,value==null?undefined:JSON.parse(value,(_,v)=>v&&Object.keys(v).length===1&&typeof v.__antfly_utf8==="string"?utf8.encode(v.__antfly_utf8):v&&Object.keys(v).length===1&&Array.isArray(v.__antfly_bytes)?Uint8Array.from(v.__antfly_bytes):v)]));
   }
-  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background,deadlineMs:outerDeadlineMs=Infinity,readKeys,readPrefix}={}){
+  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background,deadlineMs:outerDeadlineMs=Infinity,readKeys,readPrefix,ownerCurrent=false}={}){
     if(this.ownerReady)await this.ownerReady;
+    if(ownerCurrent&&(!this.ownerMvcc||!this.acquired||this.recovering||this.ioDrain||!this.state))throw Error("ReadSnapshotNeedsAdmission");
+    if(ownerCurrent&&(readKeys||readPrefix))throw Error("InvalidOwnerSnapshotProjection");
+    // Seal admission membership before capturing the immutable committed root.
+    if(ownerCurrent)onAdmission?.();
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
     const capturedHint=this.rootHint?{epoch:[...this.rootHint.epoch],next:this.rootHint.next,revision:this.rootHint.revision}:null;
     const owned=this.acquired,captured=structuredClone(owned?this.state:(this.rootBackend==="bounded_journal"||this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=Math.min(this.clock()+5000,outerDeadlineMs),started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false,capsuleMetrics={};
@@ -234,7 +239,7 @@ export class R2CoordinatorStore {
       }finally{
         proofPermit?.();this.snapshotReaders--;
         if(outcome==="ok"&&(this.clock()>=deadlineMs||proofPermit&&performance.now()>=monotonicDeadline))outcome="error";
-        try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,proof_prefetch:!!proofPermit,proof_prefetch_reserved_bytes:proofPermit?proofPrefetchBytes:0,...capsuleMetrics,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}
+        try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,owner_current:ownerCurrent,proof_prefetch:!!proofPermit,proof_prefetch_reserved_bytes:proofPermit?proofPrefetchBytes:0,...capsuleMetrics,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}
       }
       })();
     };
@@ -271,8 +276,8 @@ export class R2CoordinatorStore {
         if(!result||result.observation_fallback){proofPermit();proofPermit=null;return null;}
         return result;
       };
-      let observed,state=captured;
-      for(let attempt=0;attempt<4;attempt++){
+      let observed=ownerCurrent?{state:captured,base:this.base,page_prefix:this.pagePrefix,has_more:false}:null,state=captured;
+      for(let attempt=0;!ownerCurrent&&attempt<4;attempt++){
         const coordinate=readKeys?{action:"observe_read",observe_owned:owned,commands:readKeys.map(key=>({kind:"get",key})),read_prefix:readPrefix??null} :{action:owned?"observe":"observe_committed"};
         observed=readKeys?await plannedObservation(state,coordinate):null;
         observed??=await native(state,coordinate);state=observed.state;
@@ -289,7 +294,7 @@ export class R2CoordinatorStore {
         if(observed.selected){if(!readPrefix||!observed.selected.key.startsWith(readPrefix))throw Error("InvalidCoordinatorReadProjection");rows.set(observed.selected.key,decode(observed.selected.value));}
       }
       Object.assign(capsuleMetrics,rootMetrics(observed.state));
-      if(!this.observedState||observed.state.revision>=this.observedState.revision){this.observedState=structuredClone(observed.state);this.observedProof=structuredClone(snapshotProof);}
+      if(!ownerCurrent&&(!this.observedState||observed.state.revision>=this.observedState.revision)){this.observedState=structuredClone(observed.state);this.observedProof=structuredClone(snapshotProof);}
       this.base??=observed.base;this.pagePrefix??=observed.page_prefix;
       const tx={getMany:async names=>{
         // A decoded row is reusable only after a fresh matching observation.
@@ -297,13 +302,18 @@ export class R2CoordinatorStore {
           for(const name of names)if(!rows.has(name)&&this.rows.has(name))rows.set(name,structuredClone(this.rows.get(name).value));
         }
         const missing=[...new Set(names.filter(name=>!rows.has(name)))];
-        if(missing.length){const result=await native(observed.state,{action:"read",commands:missing.map(key=>({kind:"get",key}))});missing.forEach((key,i)=>rows.set(key,result.results[i][0]?decode(result.results[i][0].value):undefined));}
+        if(missing.length){const result=await native(observed.state,{action:"read",commands:missing.map(key=>({kind:"get",key}))});missing.forEach((key,i)=>rows.set(key,result.results[i][0]?decode(result.results[i][0].value):undefined));
+          // Publish decoded rows only while the captured committed root is still
+          // current. A read that outlives a commit must never seed its cache.
+          if(ownerCurrent&&this.acquired&&this.rowRevision===observed.state.revision&&this.state?.revision===observed.state.revision&&hex(this.state.epoch)===hex(observed.state.epoch)&&hex(this.state.owner)===hex(observed.state.owner)){
+            for(const key of missing)this.remember(key,rows.get(key));
+          }}
         return names.map(key=>structuredClone(rows.get(key)));
-      },get:async key=>(await tx.getMany([key]))[0],put:()=>{throw Error("ReadSnapshotNeedsPin");}};
+      },get:async key=>(await tx.getMany([key]))[0],snapshot:()=>structuredClone(observed.state),put:()=>{throw Error("ReadSnapshotNeedsPin");}};
       const result=await run(tx);outcome="ok";return result;
     }catch(error){
       failure=error;
-      if(admissionBudgetExceeded||["ConditionalRootMissing","ObjectIoBudgetExceeded","HostedWorkingSetBudgetExceeded","ReadAheadCapacityExceeded"].includes(error?.message)){outcome="needs_admission";failure=Error("ReadSnapshotNeedsAdmission");if(error.ioSettled)Object.defineProperty(failure,"ioSettled",{value:error.ioSettled});throw failure;}
+      if(!ownerCurrent&&(admissionBudgetExceeded||["ConditionalRootMissing","ObjectIoBudgetExceeded","HostedWorkingSetBudgetExceeded","ReadAheadCapacityExceeded"].includes(error?.message))){outcome="needs_admission";failure=Error("ReadSnapshotNeedsAdmission");if(error.ioSettled)Object.defineProperty(failure,"ioSettled",{value:error.ioSettled});throw failure;}
       throw error;
     }finally{
       const settlement=finish();
@@ -323,6 +333,7 @@ export class R2CoordinatorStore {
   }
   async ownerRead(run,{deadlineMs=this.clock()+30000,traceId}={}){
     if(!this.ownerServing)throw Error("ResidentServingOwnerRequired");
+    if(this.ownerMvcc)try{return await this.readOnly(run,{ownerCurrent:true,traceId,deadlineMs});}catch(error){if(!/^ReadSnapshotNeeds(?:Admission|Pin)$/.test(error.message))throw error;}
     const reservedOperations=1024-254,reservedBytes=24*1024*1024,ioBudget={operations:reservedOperations,bytes:reservedBytes};
     for(let attempt=0;attempt<4;attempt++)try{
       return await this.enqueue({kind:"owner_read",priority:"interactive",deadlineMs,traceId,ioBudget,run:tx=>run({get:tx.get,getMany:tx.getMany,snapshot:tx.snapshot,put:()=>{throw Error("OwnerReadWriteForbidden");},delete:()=>{throw Error("OwnerReadWriteForbidden");}})});
@@ -475,7 +486,7 @@ export class R2CoordinatorStore {
         this.rowRevision=this.state.revision;
       }
     } catch(error) {
-      {this.acquired=false;this.rows.clear();this.rowBytes=0;this.rowRevision=null;}
+      {this.acquired=false;this.clearServingTail?.();this.rows.clear();this.rowBytes=0;this.rowRevision=null;}
       for(const item of completed)item.batchError=error;
       // Recovery advances a bounded cursor before returning backpressure.
       // Reject queued callers rather than retaining an unbounded request set.

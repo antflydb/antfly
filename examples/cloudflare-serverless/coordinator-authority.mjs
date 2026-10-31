@@ -24,7 +24,8 @@ export async function openAuthority(env, mode, {allowRetired = false, allowExist
   const namespace = env.ANTFLY_INCARNATION;
   const resident=env.RESIDENT_SERVING==="true";
   if(resident&&(mode!=="r2-bounded"||env.COORDINATOR_BACKEND!=="r2"||env.INLINE_METADATA_ROOTS!=="true"||!env.COMMITS?.idFromName))throw Error("InvalidResidentServingProfile");
-  const serving=resident?{protocol:"serialized-owner-v1",owner_id:env.COMMITS.idFromName(namespace).toString()}:null;
+  if(env.RESIDENT_MVCC==="true"&&!resident)throw Error("InvalidResidentConfiguration");
+  const serving=resident?{protocol:env.RESIDENT_MVCC==="true"?"serialized-owner-v2":"serialized-owner-v1",owner_id:env.COMMITS.idFromName(namespace).toString()}:null;
   if(serving&&!/^[a-f0-9]{64}$/i.test(serving.owner_id))throw Error("InvalidResidentServingOwner");
   if (!namespace || !env.DATABASE) throw new Error("CoordinatorNamespaceRequired");
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(namespace)));

@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import{takeRpcData}from"./rpc-data.mjs";
 import{FencedReadLeases}from"../../zig/lib/objectstore/wasm/read-view-lease.mjs";
 import {edgeCacheForEnv} from "./edge-immutable-cache.mjs";
 import {AuthorityAdmission} from "./authority-admission.mjs";
@@ -40,6 +41,10 @@ export class NativeReadViews {
  confirm(view,token){return this.leases?.confirm(view,token)??false;}
  metrics(){return{read_view_lease_bytes:this.leases?.bytes??0,read_view_lease_hits:this.leases?.hits??0,read_view_lease_joins:this.leases?.joins??0};}
  freshOpen(options={}){const observedAt=this.clock();
+  if(this.env.RESIDENT_MVCC==="true")return this.authorityAdmission.get().then(authority=>{
+   this.store.configureAuthority(authority.descriptor);options.onAdmitted?.();
+   return takeRpcData(this.env.COMMITS.getByName(this.env.ANTFLY_INCARNATION).openReadView({version:options.version,durable_pin:options.durable_pin,immutable:options.immutable,trace_id:options.trace_id,deadlineMs:options.deadlineMs}));
+  });
   return this.cohorts.run(JSON.stringify([options.version??"latest",options.durable_pin===true]),async(traceIds,close,publish)=>{
    const mode=coordinatorAuthorityMode(this.env),loading=this.authorityAdmission.get(),parallel=mode==="r2-bounded"&&!this.authorityAdmission.value;
    // This speculative observation is GET-only. Verify the persisted authority

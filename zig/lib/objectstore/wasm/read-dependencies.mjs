@@ -20,7 +20,7 @@ import {proofPrefetchBytes,ReadAheadBudget} from './read-ahead.mjs';
 const pointBudgets=new WeakMap();
 export function pointDependencyBudgetFor(kernel){
  let budget=pointBudgets.get(kernel);
- if(!budget){budget=new ReadAheadBudget(Math.max(1,Math.min(4,kernel.slots.length)),{reserveQueued:typeof kernel.reserveQueuedAdmission==='function'?()=>kernel.reserveQueuedAdmission():undefined});pointBudgets.set(kernel,budget);}
+ if(!budget){budget=new ReadAheadBudget(Math.max(1,Math.min(4,kernel.pointDependencySlots??kernel.slots.length)),{reserveQueued:typeof kernel.reserveQueuedAdmission==='function'?()=>kernel.reserveQueuedAdmission():undefined});pointBudgets.set(kernel,budget);}
  return budget;
 }
 export function pointDependencyMetrics(kernel){

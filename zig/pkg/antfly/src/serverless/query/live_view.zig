@@ -23,6 +23,15 @@ const records = @import("../wal/types.zig");
 const visibility = @import("../visibility.zig");
 const Overlay = @import("live_overlay.zig").Overlay;
 
+/// A complete native-normalized interval installed by an exclusive commit owner.
+/// This is caller-admitted data, never a proof or an untrusted client option.
+pub const AdmittedTail = struct {
+    scope: [32]u8,
+    start_lsn: []const u8,
+    end_lsn: []const u8,
+    mutations: []const @import("../api/types.zig").DocumentMutation,
+};
+
 pub const View = struct {
     overlay: Overlay,
     token: visibility.Token,
@@ -31,6 +40,7 @@ pub const View = struct {
 
     pub const Options = struct {
         required: ?visibility.Token = null,
+        admitted_tail: ?AdmittedTail = null,
         /// A resumed page retains its original cutoff, even if HEAD advances.
         cutoff: ?u64 = null,
         max_records: usize = 4096,
@@ -43,6 +53,33 @@ pub const View = struct {
     };
     pub fn open(alloc: A, wal: *WalStore, incarnation: []const u8, published_lsn: u64, options: Options) !View {
         if (options.cancellation) |token| try token.check();
+        if (options.admitted_tail) |tail| {
+            const first = try std.fmt.parseInt(u64, tail.start_lsn, 10);
+            const end = try std.fmt.parseInt(u64, tail.end_lsn, 10);
+            if (first == 0 or end < first or end - first + 1 != tail.mutations.len or tail.mutations.len > 128 or !std.mem.eql(u8, &tail.scope, &visibility.Token.init(incarnation, 0).scope)) return error.InvalidAdmittedTail;
+            const latest = try wal.latestLsn(incarnation);
+            const cutoff = options.cutoff orelse latest;
+            if (cutoff > latest) return error.WalVisibilityUnavailable;
+            _ = try visibility.Cut.capture(incarnation, published_lsn, cutoff, options.required);
+            if (end >= cutoff and first <= published_lsn +| 1 and published_lsn <= cutoff) {
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                const skip: usize = if (published_lsn < first) 0 else @intCast(@min(published_lsn - first, tail.mutations.len - 1) + 1);
+                const count: usize = @intCast(cutoff - published_lsn);
+                const selected = tail.mutations[@min(skip, tail.mutations.len)..][0..count];
+                if (selected.len > options.max_records) return error.WalReadBudgetExceeded;
+                const owned = try arena.allocator().alloc(records.Record, selected.len);
+                var bytes: usize = 0;
+                for (selected, owned, 0..) |mutation, *record, i| {
+                    if ((mutation.kind != .upsert and mutation.kind != .delete) or (mutation.kind == .upsert and mutation.body == null) or (mutation.kind == .delete and mutation.body != null)) return error.InvalidAdmittedTail;
+                    const payload = try @import("../api/codec.zig").encodeMutationAlloc(arena.allocator(), mutation);
+                    bytes = try std.math.add(usize, bytes, payload.len);
+                    if (bytes > options.max_bytes) return error.WalReadBudgetExceeded;
+                    record.* = .{ .lsn = published_lsn + i + 1, .timestamp_ns = 0, .payload = payload };
+                }
+                return .{ .overlay = try Overlay.initWithResolver(alloc, owned, published_lsn, cutoff, options.max_bytes, options.body_resolver), .token = visibility.Token.init(incarnation, cutoff), .published_lsn = published_lsn };
+            }
+        }
         const snapshot = if (options.state_cache != null) try wal.readSnapshot(incarnation) else null;
         const latest = if (snapshot) |value| value.latest_lsn else try wal.latestLsn(incarnation);
         const cutoff = options.cutoff orelse latest;
@@ -167,4 +204,44 @@ test "serverless live view fences cross-instance reads before publication and pr
     try std.testing.expectError(error.VisibilityIncarnationMismatch, View.open(a, &wal, "other-incarnation", 0, .{ .required = token }));
     try std.testing.expectError(error.WalVisibilityUnavailable, View.open(a, &wal, "incarnation", 0, .{ .required = visibility.Token.init("incarnation", 3) }));
     try std.testing.expectError(error.WalReadBudgetExceeded, View.open(a, &wal, "incarnation", 0, .{ .max_records = 1 }));
+}
+
+test "resident serving shard admitted tail preserves updates tombstones gaps and current fences" {
+    const a = std.testing.allocator;
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var indexed = try @import("../wal/indexed_object_store.zig").IndexedObjectStore.init(a, client, "db", "admitted");
+    defer indexed.deinit();
+    var wal = indexed.walStore();
+    const Mutation = @import("../api/types.zig").DocumentMutation;
+    const mutations = [_]Mutation{ .{ .kind = .upsert, .doc_id = "one", .body = "first" }, .{ .kind = .delete, .doc_id = "one" } };
+    for (mutations, 0..) |mutation, i| {
+        const payload = try @import("../api/codec.zig").encodeMutationAlloc(a, mutation);
+        defer a.free(payload);
+        _ = try indexed.appendIdempotent("ns", i + 1, payload, if (i == 0) "one" else "two");
+    }
+    const Base = struct {
+        fn lookupAlloc(_: @This(), alloc: A, _: []const u8) !?[]u8 {
+            return try alloc.dupe(u8, "base");
+        }
+    };
+    const tail = AdmittedTail{ .scope = visibility.Token.init("ns", 0).scope, .start_lsn = "1", .end_lsn = "2", .mutations = &mutations };
+    var view = try View.open(a, &wal, "ns", 0, .{ .admitted_tail = tail, .required = visibility.Token.init("ns", 2) });
+    defer view.deinit();
+    try std.testing.expect((try view.lookupAlloc("one", Base{})) == null);
+    const unchanged = (try view.lookupAlloc("other", Base{})).?;
+    defer a.free(unchanged);
+    try std.testing.expectEqualStrings("base", unchanged);
+    try std.testing.expectError(error.WalVisibilityUnavailable, View.open(a, &wal, "ns", 0, .{ .admitted_tail = tail, .required = visibility.Token.init("ns", 3) }));
+    var wrong = tail;
+    wrong.scope = @splat(0);
+    try std.testing.expectError(error.InvalidAdmittedTail, View.open(a, &wal, "ns", 0, .{ .admitted_tail = wrong }));
+    var gap = tail;
+    gap.start_lsn = "2";
+    gap.mutations = mutations[1..];
+    var fallback = try View.open(a, &wal, "ns", 0, .{ .admitted_tail = gap });
+    defer fallback.deinit();
+    try std.testing.expect((try fallback.lookupAlloc("one", Base{})) == null);
 }

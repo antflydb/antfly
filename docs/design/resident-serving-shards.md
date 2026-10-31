@@ -356,3 +356,105 @@ Initial prototype/intermediate precheck sources or raw modules overwritten befor
 archiving are not promoted to exact final evidence. Credentials and post-write
 summaries were excluded before reading/hashing. Production, measurement and
 rollout/qualification limitations above remain unchanged.
+
+## Burst and reconstruction serving state (v3 implementation)
+
+This increment keeps the existing object-store authority and publication formats.
+It introduces opt-in `RESIDENT_READ_STATE`, `RESIDENT_MVCC`,
+`RESIDENT_SHARED_KERNELS`, `RESIDENT_BOOTSTRAP`, `RESIDENT_READ_COHORTS` and
+`RESIDENT_FETCH_COALESCE`. These are experimental until the same correctness,
+resource and paired hosted gates pass. None changes a gate threshold.
+
+### Committed native state and visibility
+
+Native `live_session` now caches published bodies by namespace, generation and
+facts checksum. A later WAL append does not invalidate unchanged published
+bodies. Every lookup still applies its captured WAL overlay first, including
+updates and tombstones. This cache benefits native S3/GCS sessions without
+changing their admission protocol.
+
+An exclusive owner can additionally retain a contiguous interval of canonical
+mutations emitted by the native append result. Installation happens only after
+the durable metadata finalizer succeeds, before acknowledging the write. Raw
+application bodies are never installed: native normalization must happen first.
+The owner retains at most 128 records / 64 KiB charged bytes, deducted from its
+existing 512 KiB decoded-row budget. The physical native owner term binds the
+interval; ordinary metadata epoch rotation does not discard valid history.
+Reconstruction, uncertainty, eviction and gaps safely lose the optimization.
+
+The private `resident_tail` input is trusted owner-admitted data, not a portable
+proof. The native view independently validates namespace scope, interval shape,
+its current captured WAL latest, published boundary and each caller's required
+visibility. It clips an admitted newer interval to the captured cutoff. A gap
+falls back to the ordinary bounded WAL path; it never proves absence. Public
+requests cannot supply these private runtime fields.
+
+### MVCC admission and bounded execution
+
+Fresh namespaces can select authority protocol `serialized-owner-v2`. Reads
+capture the last confirmed immutable metadata root without waiting for a
+concurrent write's storage acknowledgement. Unacknowledged durable prefixes are
+not visible through an independent latest-read observer: reader admission goes
+through the owner. Native fencing and recovery remain mandatory on reconstruction.
+A v1 adapter rejects the v2 descriptor. No in-place migration is implemented.
+
+Decoded metadata is reusable only at the exact captured revision, epoch and
+owner. A snapshot read can populate the existing bounded decoded-row cache only
+if that root remains current after its native read completes. A read paused
+across a commit cannot seed the newer root with stale data.
+
+Shared execution retains the existing 64 MiB writer-isolate total: writes keep
+48 MiB; point reads and metadata observation share the existing 16 MiB observation
+pool. Small points reserve 8 MiB; explicit capacity promotion reserves 16 MiB.
+The same pool is counted once in aggregate metrics. Transcript permits stay at
+two. Sharing can still cause head-of-line delay and is not evidence of 10x gains.
+
+Cohorts have at most 16 pending members / 64 KiB inputs and two active groups.
+One native session serves up to 16 points, with independent visibility errors.
+Bodies larger than 16 KiB per member use the existing individual bounded path;
+resource, integrity and transport failures do not trigger arbitrary replay.
+Cohort metrics describe a physical native group once, with its member count.
+They must not be multiplied into fictitious per-member physical I/O.
+
+### Reconstruction headers and immutable misses
+
+Publication atomically stores a bounded serving bootstrap beside HEAD in native
+metadata. It contains owned copies of the exact immutable manifest and eligible
+native facts-root header (two records, at most 8 KiB each / 17 KiB encoded).
+Generation mismatch ignores it. Native checksum/domain validation, captured
+leases, ranges, conditions and response budgets still apply. Existing covering
+point leaves supply small document bodies; there is no second mutable database
+or parallel document format. A published point can avoid manifest/root round
+trips after owner admission, while truly cold ownership still requires recovery.
+
+Immutable miss coalescing matches exact namespace/bucket/key/range/condition/
+version/response-budget identities. Its registry holds at most four flights and
+16 followers per flight, charged to the existing input reservation budget.
+Only the selected submitting request performs physical I/O. Followers re-enter
+their own completed-cache transport after settlement; response handles and
+physical I/O promises never cross request contexts. Failures remain failures.
+Each follower retains its own deadline and request-owned timer.
+
+An actual-workerd negative test reproduced cancellation when even CPU-only
+shared wake promises were used between independent requests. The implementation
+therefore uses bounded plain-data tickets inspected by timers belonging to each
+submitting request, for both flights and cohort handoff. The corrected test
+checks concurrent R2 reads, owned response bytes and propagated resource errors.
+
+### Qualification boundaries
+
+Earlier evidence closures remain unchanged. New exploratory reports and all
+failed attempts are under `dist/burst-v3` and
+`dist/qualification/burst-v3-*`; they are not hosted qualification. Initial
+50 ms injected-delay warm burst probes improved read p95 from about 413 ms to
+144 ms with a shared writer pool, but retained write contention. Sharing the
+observation pool measured about 409 to 199 ms. These are distinct experimental
+configurations, not repeatable 10x proof. Later concurrent-suite probes are
+confounded by other local builds and must not replace isolated paired trials.
+
+The remaining targets include larger-corpus, burst, offered-load, worker-cold
+and physically cold trials in both orders; live provider measurements; and the
+unchanged hosted availability/memory gate, including historical SQLITE_NOMEM.
+At a fixed 100 ms mandatory object GET latency, an 86 ms truly cold target is
+impossible. Reducing serial dependencies helps; claims must separate warm cache,
+worker reconstruction, ownership recovery and physically cold object reads.

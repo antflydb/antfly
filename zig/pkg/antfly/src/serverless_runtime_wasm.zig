@@ -50,6 +50,10 @@ export fn antfly_host_immutable_preparation_abi() u32 {
     return 1;
 }
 
+export fn antfly_host_resident_state_abi() u32 {
+    return 1;
+}
+
 export fn antfly_host_resident_read_abi() u32 {
     return 1;
 }
@@ -206,6 +210,9 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         native_read_prepare: ?[16]u8 = null,
         native_read_reuse: bool = false,
         resident_cut: ?[32]u8 = null,
+        resident_read_state: bool = false,
+        resident_tail: ?@import("serverless/query/live_view.zig").AdmittedTail = null,
+        resident_docs: []const struct { doc_id: []const u8, required_visibility: ?[]const u8 = null } = &.{},
         native_immutable_manifest_version: ?[]const u8 = null,
         native_read_yield: bool = false,
         native_read_resume: ?[16]u8 = null,
@@ -272,6 +279,8 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     defer parsed.deinit();
     const req = parsed.value;
     if (req.native_immutable_manifest_version != null and (req.op != .lookup or !req.native_read_plan_mode or req.doc_id.len != 0 or req.resident_cut != null or req.native_read_plan != null or req.native_read_prepare != null or req.native_read_resume != null or req.native_read_spent_bytes != 0)) return error.InvalidNativeReadPlan;
+    if (req.resident_docs.len > 16 or req.resident_docs.len != 0 and (!req.resident_read_state or req.resident_cut == null)) return error.InvalidResidentRead;
+    if (req.resident_tail != null and (req.resident_cut == null or !req.resident_read_state)) return error.InvalidResidentRead;
     if (req.resident_cut != null and (req.op != .lookup or req.cursor != null or req.native_read_plan_mode)) return error.InvalidResidentRead;
     if (req.limit > 100 or (req.limit == 0 and (req.op == .list or req.op == .search))) return error.QueryCandidateBudgetExceeded;
     const filter = @import("serverless/query/live_filter.zig").Filter{ .alloc = a, .clauses = req.filters };
@@ -414,9 +423,26 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         }
         const results = try indexed_wal.appendGroupsIdempotent(req.namespace, native_groups);
         defer a.free(results);
-        const Result = struct { visibility: @TypeOf(@import("serverless/visibility.zig").Token.init("", 0).encode()), committed: bool = true };
+        const Result = struct {
+            visibility: @TypeOf(@import("serverless/visibility.zig").Token.init("", 0).encode()),
+            committed: bool = true,
+            tail: ?@import("serverless/query/live_view.zig").AdmittedTail = null,
+            pub fn jsonStringify(self: @This(), writer: anytype) !void {
+                if (self.tail) |tail| return writer.write(.{ .visibility = self.visibility, .committed = self.committed, .__resident_tail = tail });
+                return writer.write(.{ .visibility = self.visibility, .committed = self.committed });
+            }
+        };
         const output = try arena.allocator().alloc(Result, results.len);
         for (results, output) |result, *item| item.* = .{ .visibility = @import("serverless/visibility.zig").Token.init(req.namespace, result.end_lsn).encode() };
+        if (req.resident_read_state) for (results, native_groups, output) |result, group, *item| {
+            var bytes: usize = 0;
+            for (group.payloads) |payload| bytes = std.math.add(usize, bytes, payload.len) catch 32769;
+            if (bytes <= 32768 and group.payloads.len <= 128 and result.end_lsn >= result.start_lsn and result.end_lsn - result.start_lsn + 1 == group.payloads.len) {
+                const mutations = try arena.allocator().alloc(@import("serverless/api/types.zig").DocumentMutation, group.payloads.len);
+                for (group.payloads, mutations) |payload, *mutation| mutation.* = try @import("serverless/api/codec.zig").decodeMutationAlloc(arena.allocator(), payload);
+                item.tail = .{ .scope = @import("serverless/visibility.zig").Token.init(req.namespace, 0).scope, .start_lsn = try std.fmt.allocPrint(arena.allocator(), "{d}", .{result.start_lsn}), .end_lsn = try std.fmt.allocPrint(arena.allocator(), "{d}", .{result.end_lsn}), .mutations = mutations };
+            }
+        };
         if (write_plan) |*plan| {
             var maximum: u64 = 0;
             for (results) |result| maximum = @max(maximum, result.end_lsn);
@@ -526,7 +552,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     var runtime = @import("serverless/query/runtime.zig").QueryRuntime.init(a, &artifacts, &manifests, &progress);
     defer runtime.deinit();
     prepareServingScope(req.bucket, req.prefix);
-    if (req.resident_cut) |cut| {
+    if (!req.resident_read_state) if (req.resident_cut) |cut| {
         if (req.op != .lookup or req.cursor != null or req.native_read_plan_mode) return error.InvalidResidentRead;
         const required = if (req.required_visibility) |text| try @import("serverless/visibility.zig").Token.decode(text) else null;
         if (try resident_shard.get(a, req.namespace, cut, req.doc_id, required)) |value| {
@@ -534,7 +560,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
             try cancellation.check();
             return std.json.Stringify.valueAlloc(a, .{ .body = value.body, .visibility = @import("serverless/visibility.zig").Token.init(req.namespace, value.lsn).encode() }, .{});
         }
-    }
+    };
     runtime.shared_read_leases = &shared_read_leases;
     runtime.bounded_manifest_reads = req.bounded_manifest_reads;
     runtime.decoded_manifests = &decoded_manifests;
@@ -634,7 +660,9 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
             .version = if (cursor) |value| value.cursor.generation else null,
             .max_read_bytes = read_allowance,
             .lazy_facts = req.op == .lookup,
-            .view = .{ .required = required, .cutoff = if (cursor) |value| value.cursor.cutoff else null, .cancellation = transport_cancellation, .state_cache = if (req.native_read_state) &read_states else null, .cache_allocator = wasm_allocator, .point_id = if (req.op == .lookup and req.wal_document_index) req.doc_id else null },
+            .resident_shard = if (req.resident_read_state) &resident_shard else null,
+            .resident_allocator = if (req.resident_read_state) wasm_allocator else null,
+            .view = .{ .admitted_tail = req.resident_tail, .required = required, .cutoff = if (cursor) |value| value.cursor.cutoff else null, .cancellation = transport_cancellation, .state_cache = if (req.native_read_state) &read_states else null, .cache_allocator = wasm_allocator, .point_id = if (req.op == .lookup and req.wal_document_index and req.resident_docs.len == 0) req.doc_id else null },
         });
         defer live.deinit();
         if (req.op == .search) {
@@ -651,11 +679,49 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
             return std.json.Stringify.valueAlloc(a, .{ .count = count, .visibility = live.view.token.encode() }, .{});
         }
         if (req.op == .lookup) {
+            if (req.resident_docs.len != 0) {
+                const Item = struct {
+                    body: ?[]u8 = null,
+                    visibility: @TypeOf(live.view.token.encode()),
+                    error_code: ?[]const u8 = null,
+                    individual: bool = false,
+                    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+                        if (self.error_code) |code| return writer.write(.{ .@"error" = code });
+                        if (self.individual) return writer.write(.{ .__individual = true });
+                        return writer.write(.{ .body = self.body, .visibility = self.visibility });
+                    }
+                };
+                const items = try a.alloc(Item, req.resident_docs.len);
+                defer {
+                    for (items) |item| if (item.body) |body| a.free(body);
+                    a.free(items);
+                }
+                for (items) |*item| item.* = .{ .visibility = live.view.token.encode() };
+                for (req.resident_docs, items) |doc, *item| {
+                    try cancellation.check();
+                    if (doc.required_visibility) |encoded| {
+                        const required_doc = @import("serverless/visibility.zig").Token.decode(encoded) catch |err| {
+                            item.error_code = @errorName(err);
+                            continue;
+                        };
+                        required_doc.require(req.namespace, live.view.token.lsn) catch |err| {
+                            item.error_code = @errorName(err);
+                            continue;
+                        };
+                    }
+                    const body = try live.lookupAlloc(doc.doc_id);
+                    if (body != null and body.?.len > 16 * 1024) {
+                        a.free(body.?);
+                        item.individual = true;
+                    } else item.body = body;
+                }
+                return std.json.Stringify.valueAlloc(a, .{ .results = items }, .{});
+            }
             const body = if (prepared_read) |prepared| try prepared.lookupAlloc(live, req.doc_id) else try live.lookupAlloc(req.doc_id);
             defer if (body) |value| a.free(value);
-            if (req.resident_cut) |cut| {
+            if (!req.resident_read_state) if (req.resident_cut) |cut| {
                 _ = try resident_shard.put(wasm_allocator, req.namespace, cut, req.doc_id, body, live.view.token.lsn);
-            }
+            };
             if (req.native_read_plan_mode) return std.json.Stringify.valueAlloc(a, .{ .body = body, .visibility = live.view.token.encode(), .__read_plan = read_plan.Plan.fromSession(live) }, .{});
             return std.json.Stringify.valueAlloc(a, .{ .body = body, .visibility = live.view.token.encode() }, .{});
         }

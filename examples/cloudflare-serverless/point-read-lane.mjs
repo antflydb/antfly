@@ -43,7 +43,7 @@ export async function withPointReadLane(kernel,run,options={}){
     transferred+=bytes;return result;
    }});}};
    return run(limited);
-  },{...options,kernelVariant:"observe",memoryReservationBytes:8*MiB});
+  },{...options,kernelVariant:options.smallKernelVariant??"observe",memoryReservationBytes:options.smallKernelVariant==="compact"?16*MiB:8*MiB});
   return options.tryOnly?(admitted.admitted?admitted.value:undefined):admitted;
  }catch(error){
   // A normal capacity promotion is safe only for the immutable point-read

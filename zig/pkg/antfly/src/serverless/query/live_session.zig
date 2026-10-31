@@ -115,34 +115,38 @@ pub const Session = struct {
     pub fn lookupAlloc(self: *Session, id: []const u8) !?[]u8 {
         if (transportCancelled(self)) return error.Canceled;
         if (self.published) |*published| try published.checkCancellation();
+        return self.lookupUncachedAlloc(id);
+    }
+    fn publishedLookupAlloc(self: *Session, id: []const u8) !?[]u8 {
+        const published = self.published orelse return null;
         if (self.resident_shard) |shard| {
-            // The session already admitted this exact published/WAL cut. This
-            // portable cache skips body traversal, never fresh admission.
+            // Cache only the immutable base. The freshly admitted WAL overlay
+            // always resolves updates/deletes before consulting this reader.
             var hash = std.crypto.hash.sha2.Sha256.init(.{});
-            hash.update("antfly.fresh.session.point.v1");
+            hash.update("antfly.published.point.v1");
             hash.update(&self.view.token.scope);
-            var counters: [16]u8 = undefined;
-            std.mem.writeInt(u64, counters[0..8], self.generation(), .little);
-            std.mem.writeInt(u64, counters[8..16], self.view.token.lsn, .little);
-            hash.update(&counters);
-            if (self.published) |published| for (published.manifest.artifacts) |ref| {
-                if (ref.kind == .document_facts) hash.update(ref.checksum);
+            var generation_bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &generation_bytes, self.generation(), .little);
+            hash.update(&generation_bytes);
+            for (published.manifest.artifacts) |ref| if (ref.kind == .document_facts) {
+                hash.update(ref.checksum);
             };
             const cut = hash.finalResult();
             if (try shard.get(self.alloc, self.resident_namespace.?, cut, id, null)) |value| return value.body;
-            const body = try self.lookupUncachedAlloc(id);
+            const reader = (try self.ensureReader()) orelse return null;
+            const body = try reader.lookupBodyAlloc(id);
             errdefer if (body) |value| self.alloc.free(value);
-            _ = try shard.put(self.resident_allocator.?, self.resident_namespace.?, cut, id, body, self.view.token.lsn);
+            _ = try shard.put(self.resident_allocator.?, self.resident_namespace.?, cut, id, body, published.manifest.wal_end_lsn);
             return body;
         }
-        return self.lookupUncachedAlloc(id);
+        const reader = (try self.ensureReader()) orelse return null;
+        return reader.lookupBodyAlloc(id);
     }
     fn lookupUncachedAlloc(self: *Session, id: []const u8) !?[]u8 {
         const Base = struct {
             session: *Session,
             pub fn lookupAlloc(base: @This(), _: A, key: []const u8) !?[]u8 {
-                const reader = (try base.session.ensureReader()) orelse return null;
-                return try reader.lookupBodyAlloc(key);
+                return base.session.publishedLookupAlloc(key);
             }
         };
         return self.view.lookupAlloc(id, Base{ .session = self });

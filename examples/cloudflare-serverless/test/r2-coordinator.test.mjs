@@ -396,3 +396,25 @@ test('live resident read authority does not renew an expired append certificate'
  assert.equal(store.needsWriteRefresh(),true);assert.equal(await store.ownerRead(tx=>tx.get('value')),7);assert.equal(calls,0);assert.deepEqual(store.journalProof,proof);assert.equal(store.needsWriteRefresh(),true);
  await retry(store,tx=>tx.put('value',8));assert.ok(calls>0);assert.ok(store.journalProof.anchor.wall_ms>proof.anchor.wall_ms);assert.equal(await store.ownerRead(tx=>tx.get('value')),8);
 });
+test('owner v2 snapshots admit confirmed state while a durable PUT awaits acknowledgement',async()=>{
+ const bucket=new Bucket(),actor='f'.repeat(64),env={DATABASE:bucket,ANTFLY_INCARNATION:'owner-mvcc',COORDINATOR_BACKEND:'r2',RESIDENT_SERVING:'true',RESIDENT_MVCC:'true',METADATA_ROOT_BACKEND:'bounded-journal',INLINE_METADATA_ROOTS:'true',COMMITS:{idFromName:()=>({toString:()=>actor})}};
+ const authority=await openAuthority(env,'r2-bounded');await assert.rejects(openAuthority({...env,RESIDENT_MVCC:'false'},'r2-bounded'),/MigrationRequired/);
+ const raw=createR2Transport({database:bucket});let armed=false,atPut,release;const ready=new Promise(r=>atPut=r),gate=new Promise(r=>release=r);
+ const store=storeFor(bucket,{exclusiveOwnerId:actor,transport:async(request,body)=>{const result=await raw(request,body);if(armed&&request.op==='put'&&/\/epochs\/[^/]+\/[0-9]+\.json$/.test(request.key)){armed=false;atPut();await gate;}return result;}});store.configureAuthority(authority.descriptor);
+ await retry(store,tx=>tx.put('value',1));armed=true;const pending=store.transaction(tx=>tx.put('value',2));await ready;
+ assert.equal(await store.ownerRead(tx=>tx.get('value')),1);release();await pending;assert.equal(await store.ownerRead(tx=>tx.get('value')),2);
+});
+test('owner snapshot decoded rows reuse the captured root and cannot poison a later commit',async()=>{
+ const bucket=new Bucket(),actor='a'.repeat(64),env={DATABASE:bucket,ANTFLY_INCARNATION:'owner-row-cache',COORDINATOR_BACKEND:'r2',RESIDENT_SERVING:'true',RESIDENT_MVCC:'true',METADATA_ROOT_BACKEND:'bounded-journal',INLINE_METADATA_ROOTS:'true',COMMITS:{idFromName:()=>({toString:()=>actor})}};
+ const authority=await openAuthority(env,'r2-bounded'),store=storeFor(bucket,{exclusiveOwnerId:actor});store.configureAuthority(authority.descriptor);
+ await retry(store,tx=>tx.put('value',1));store.rows.clear();store.rowBytes=0;
+ const native=store.snapshotKernel.request.bind(store.snapshotKernel);let reads=0,hold=false,atRead,release;
+ const ready=new Promise(r=>atRead=r),gate=new Promise(r=>release=r);
+ store.snapshotKernel.request=async(...args)=>{const result=await native(...args);if(args[0].coordinate?.action==='read'){reads++;if(hold){hold=false;atRead();await gate;}}return result;};
+ assert.equal(await store.ownerRead(tx=>tx.get('value')),1);const first=reads;
+ assert.ok(first>0);assert.equal(await store.ownerRead(tx=>tx.get('value')),1);assert.equal(reads,first);
+ store.rows.clear();store.rowBytes=0;hold=true;
+ const old=store.ownerRead(tx=>tx.get('value'));await ready;
+ try{await retry(store,tx=>tx.put('value',2));}finally{release();}
+ assert.equal(await old,1);assert.equal(await store.ownerRead(tx=>tx.get('value')),2);assert.equal(store.rows.get('value').value,2);
+});

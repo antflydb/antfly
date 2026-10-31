@@ -36,6 +36,11 @@ import {MaintenanceTickets} from "./maintenance-tickets.mjs";
 import {compactionIdentity,readCompactionReceipt,beginCompactionReceipt,finishCompactionReceipt} from "./compaction-receipt.mjs";
 import {PreparedWal} from "./prepared-wal.mjs";
 import {withPointReadDependencies} from '../../zig/lib/objectstore/wasm/point-read.mjs';
+import{CommittedHeaders}from"../../zig/lib/objectstore/wasm/committed-headers.mjs";
+import{reserveInput}from"./request-pool.mjs";
+import{ReadCohorts}from"./read-cohorts.mjs";
+import{ImmutableFlights}from"../../zig/lib/objectstore/wasm/immutable-flights.mjs";
+import {ResidentTail} from "./resident-tail.mjs";
 import {OptimisticWal} from "./optimistic-wal.mjs";
 import {metadataKeys} from "./read-view.mjs";
 import {MutationGroups} from "./mutation-groups.mjs";
@@ -63,12 +68,15 @@ export class R2CommitCoordinator extends DurableObject {
     if (!env.ANTFLY_INCARNATION) throw new Error("CoordinatorNamespaceRequired");
     if(env.ANTFLY_TENANTS){const binding=env.COMMITS;env=tenantEnvs(env).find(candidate=>binding.idFromName(candidate.ANTFLY_INCARNATION).equals(ctx.id));if(!env)throw new Error("UnknownTenant");}
     this.env = env;
-    if(env.RESIDENT_SERVING==="true")enableOwnerReads();
+    if(env.RESIDENT_READ_COHORTS==="true"&&env.RESIDENT_READ_STATE!=="true")throw Error("InvalidResidentConfiguration");
+    if(env.RESIDENT_SERVING==="true")enableOwnerReads({shared:env.RESIDENT_SHARED_KERNELS==="true"});
     // A stable provider ID routes requests, but a new native term must fence
     // late external PUTs from a terminated instance before resident reads start.
     const instanceId=crypto.randomUUID(),owner=env.RESIDENT_SERVING==="true"?undefined:actorOwner(ctx.id.toString(),env.WORKER_VERSION?.id,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION);
     this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{readBatch:env.NATIVE_METADATA_READ_BATCH!=="false",owner,exclusiveOwnerId:ctx.id.toString(),inlineReadSet:env.INLINE_METADATA_ROOTS==="true"?inlineReadSet(env.ANTFLY_INCARNATION):undefined,remoteCache:edgeCacheForEnv(env,{background:promise=>ctx.waitUntil(promise)}),kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics(),actor_instance_id:instanceId}));}});
     if(env.REPLAY_COST_CHECKPOINTS==="true"&&this.store.idleCheckpoint)this.store.idleCheckpoint.replayCost=()=>({bytes:this.store.replayBytes??0,waves:Math.ceil(Math.min(64,Math.max(0,(this.store.state?.revision??0)-this.store.idleCheckpoint.last))/4)});
+    this.servingTail=new ResidentTail({onCharge:bytes=>{this.store.servingTailBytes=bytes;if(bytes)this.store.boundRows?.(this.store);while(this.store.rows.size&&this.store.rowBytes+this.store.hintBytes+this.store.cursorHintBytes+bytes>this.store.rowBudgetBytes){const key=this.store.rows.keys().next().value;this.store.rowBytes-=this.store.rows.get(key).bytes;this.store.rows.delete(key);}}});
+    this.store.clearServingTail=()=>this.servingTail.clear();
     this.serviceStore = Object.create(this.store);
     this.serviceStore.transaction = run => this.transaction(run);
     this.maintenanceStore=Object.create(this.store);this.maintenanceStore.transaction=run=>this.transaction(run,{priority:"maintenance"});
@@ -79,10 +87,18 @@ export class R2CommitCoordinator extends DurableObject {
     if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.actor_started",role:"writer",actor_id:ctx.id.toString(),actor_instance_id:instanceId,version:env.WORKER_VERSION?.id,owner_identity:env.RESIDENT_SERVING==="true"?"instance-term":owner?"actor-version":"ephemeral",...kernelMetrics()}));
   }
   async ensureAuthority(){if(!this.authority){const authority=await this.authorityAdmission.get();this.store.configureAuthority(authority.descriptor);this.authority??=authority;}return this.authority;}
-  async lookupResident(input,{trace_id}={}) {
+  async lookupResident(input,{trace_id,cohort,requestWall:submittedWall,requestMono:submittedMono}={}) {
+    if(this.env.RESIDENT_READ_COHORTS==="true"&&!cohort&&input.op==="lookup"&&input.cursor==null&&!input.filters?.length&&typeof input.doc_id==="string"&&input.doc_id.isWellFormed()&&(input.required_visibility==null||typeof input.required_visibility==="string")&&new TextEncoder().encode(JSON.stringify(input)).length<=4096){
+      this.readCohorts??=new ReadCohorts(async members=>{
+        const result=await this.lookupResident(members[0].input,{trace_id:members[0].traceId,cohort:members,requestWall:Math.min(...members.map(m=>m.wall)),requestMono:Math.min(...members.map(m=>m.mono))});return result.results;
+      });
+      const result=await this.readCohorts.submit(input,trace_id);
+      if(result.__individual){return this.lookupResident(input,{trace_id,cohort:[]});}
+      return result;
+    }
     if(this.env.RESIDENT_SERVING!=="true"||input.op!=="lookup"||typeof input.doc_id!=="string"||input.cursor!=null)throw Error("InvalidResidentRead");
     if(input.filters?.length)throw Error("FilterCapabilityUnsupported");
-    const requestWall=Date.now(),requestMono=performance.now(),deadlineMs=requestWall+30000,trace=new CriticalPath({id:trace_id,scope:"resident:lookup"});
+    const requestWall=submittedWall??Date.now(),requestMono=submittedMono??performance.now(),deadlineMs=requestWall+30000,trace=new CriticalPath({id:trace_id,scope:"resident:lookup"});
     const physical={};let metrics,succeeded=false,promotions=0;
     try{
     await this.ensureAuthority();
@@ -91,7 +107,7 @@ export class R2CommitCoordinator extends DurableObject {
       const migration=await tx.get(MIGRATION);
       if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration)throw Error("CoordinatorMigrationRequired");
       const view=await captureReadView(tx,keys,{allow_ephemeral_pin:true,read_lease_policy:this.authority.descriptor.read_lease_policy,lease_observed_at_ms:Date.now()});
-      return{view,epoch:tx.snapshot().epoch};
+      const epoch=tx.snapshot().epoch;const boot=this.env.RESIDENT_BOOTSTRAP==="true"?await tx.get("__antfly_serving_boot/"+this.env.ANTFLY_INCARNATION):null;return{view,epoch,boot,tail:this.servingTail.snapshot(tx.snapshot().owner)};
     },{deadlineMs,traceId:trace.id}));
     // Hash only owned captured bytes outside the sequencing queue.
     const raw=new TextEncoder().encode(JSON.stringify(["antfly.resident.cut.v1",this.env.ANTFLY_INCARNATION,this.authority.descriptor.serving.owner_id,this.store.namespace,captured.epoch,captured.view.version,captured.view.entries.filter(([key])=>key===keys.head||key===keys.wal||key===keys.floor)]));
@@ -99,16 +115,21 @@ export class R2CommitCoordinator extends DurableObject {
     if(captured.view.lease&&!bindReadLease(captured.view,{started:requestMono}))throw Error("ManifestReadLeaseExpired");
     let lastWall=requestWall,lastMono=requestMono;
     const check=()=>{const wall=Date.now(),mono=performance.now();if(wall<lastWall||mono<lastMono||wall>=deadlineMs||mono-requestMono>=30000||captured.view.lease&&readLeaseRemaining(captured.view)<=0)throw Error("ManifestReadLeaseExpired");lastWall=wall;lastMono=mono;return Math.min(deadlineMs-wall,requestMono+30000-mono,captured.view.lease?readLeaseRemaining(captured.view):Infinity);};
-    const rawTransport=instrumentTransport(createR2Transport({database:this.env.DATABASE}),physical),wrapTransport=up=>withReadView(this.store.dataCache.wrap(up,this.env.ANTFLY_INCARNATION,{protect:true}),{openReadView:()=>{throw Error("ResidentReadViewMissing");}},this.env.ANTFLY_INCARNATION,{initial:captured.view});
+    const rawTransport=instrumentTransport(createR2Transport({database:this.env.DATABASE}),physical),wrapTransport=up=>withReadView(this.store.dataCache.wrap(CommittedHeaders.wrap(up,captured.boot,this.env.ANTFLY_INCARNATION,captured.view.version),this.env.ANTFLY_INCARNATION,{protect:true}),{openReadView:()=>{throw Error("ResidentReadViewMissing");}},this.env.ANTFLY_INCARNATION,{initial:captured.view});
+      let loadTransport=wrapTransport(rawTransport);
+      if(this.env.RESIDENT_FETCH_COALESCE==="true"){
+        this.immutableFlights??=new ImmutableFlights({reserve:reserveInput,onCharge:bytes=>{this.store.servingFlightBytes=bytes;}});
+        loadTransport=this.immutableFlights.wrap(loadTransport,this.store.namespace,{deadlineMs});
+      }
       check();
       const acquire=run=>withPointReadLane(residentKernel,run,{fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs,kernelVariant:"compact",memoryReservationBytes:16*1024*1024,affinityKey:"resident/"+this.env.ANTFLY_INCARNATION,beforePromote:check,onPromote:()=>{promotions++;},onStage:s=>trace.stage(s)});
-      const execute=async(host,phase={transport:wrapTransport(rawTransport)})=>{
-        if(host.residentReadABI!==1)throw Error("ResidentReadModuleRequired");
-        check();return host.request({op:"lookup",doc_id:input.doc_id,...(input.required_visibility!=null?{required_visibility:input.required_visibility}:{}),resident_cut:captured.cut,...(phase.nativeReadYield?{native_read_yield:true}:{}),native_read_state:true,wal_document_index:this.env.WAL_DOCUMENT_INDEX==="true",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",bounded_manifest_reads:true,working_set_bytes:Math.min(8*1024*1024,Number(this.env.READER_WORKING_SET_BYTES??8*1024*1024)),bucket:"database",prefix:"antfly",namespace:this.env.ANTFLY_INCARNATION},{...phase,background:p=>this.ctx.waitUntil(p),deadlineMs,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",onMetrics:sample=>{phase.onMetrics?.(sample);const prior=metrics;metrics=prior?{...sample,operations:prior.operations+sample.operations,transferred_bytes:prior.transferred_bytes+sample.transferred_bytes,elapsed_ms:prior.elapsed_ms+sample.elapsed_ms,io_wait_ms:prior.io_wait_ms+sample.io_wait_ms,resident_read_cache_hits:prior.resident_read_cache_hits+sample.resident_read_cache_hits,working_set_peak_bytes:Math.max(prior.working_set_peak_bytes??0,sample.working_set_peak_bytes??0)}:sample;},onIoSettled:sample=>{if(this.env.LOG_METRICS==="true")console.log(JSON.stringify(sample));}});
+      const execute=async(host,phase={transport:wrapTransport(loadTransport)})=>{
+        if(host.residentReadABI!==1||this.env.RESIDENT_READ_STATE==="true"&&host.residentStateABI!==1)throw Error("ResidentReadModuleRequired");
+        check();return host.request({op:"lookup",doc_id:input.doc_id,...(!cohort?.length&&input.required_visibility!=null?{required_visibility:input.required_visibility}:{}),resident_cut:captured.cut,...(cohort?.length?{resident_docs:cohort.map(m=>({doc_id:m.input.doc_id,required_visibility:m.input.required_visibility??null}))}:{}),...(this.env.RESIDENT_READ_STATE==="true"?{resident_read_state:true,resident_tail:captured.tail}:{}),...(phase.nativeReadYield?{native_read_yield:true}:{}),native_read_state:true,wal_document_index:this.env.WAL_DOCUMENT_INDEX==="true",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",bounded_manifest_reads:true,working_set_bytes:Math.min(8*1024*1024,Number(this.env.READER_WORKING_SET_BYTES??8*1024*1024)),bucket:"database",prefix:"antfly",namespace:this.env.ANTFLY_INCARNATION},{...phase,background:p=>this.ctx.waitUntil(p),deadlineMs,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",onMetrics:sample=>{phase.onMetrics?.(sample);const prior=metrics;metrics=prior?{...sample,operations:prior.operations+sample.operations,transferred_bytes:prior.transferred_bytes+sample.transferred_bytes,elapsed_ms:prior.elapsed_ms+sample.elapsed_ms,io_wait_ms:prior.io_wait_ms+sample.io_wait_ms,resident_read_cache_hits:prior.resident_read_cache_hits+sample.resident_read_cache_hits,working_set_peak_bytes:Math.max(prior.working_set_peak_bytes??0,sample.working_set_peak_bytes??0)}:sample;},onIoSettled:sample=>{if(this.env.LOG_METRICS==="true")console.log(JSON.stringify(sample));}});
       };
-      const result=this.env.NATIVE_POINT_CONTINUATIONS==="true"?await withPointReadDependencies({kernel:residentKernel,acquire,execute,transport:wrapTransport(rawTransport),wrapTransport,fairKey:this.env.ANTFLY_INCARNATION,deadlineMs,remainingMs:check,onStage:s=>trace.stage(s),background:p=>this.ctx.waitUntil(p),onUsage:usage=>{if(metrics)metrics={...metrics,...usage};},onMetrics:sample=>{if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.point_dependency",trace_id:trace.id,...sample}));}}):await acquire(host=>execute(host));
+      const result=this.env.NATIVE_POINT_CONTINUATIONS==="true"?await withPointReadDependencies({kernel:residentKernel,acquire,execute,transport:loadTransport,wrapTransport,fairKey:this.env.ANTFLY_INCARNATION,deadlineMs,remainingMs:check,onStage:s=>trace.stage(s),background:p=>this.ctx.waitUntil(p),onUsage:usage=>{if(metrics)metrics={...metrics,...usage};},onMetrics:sample=>{if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.point_dependency",trace_id:trace.id,...sample}));}}):await acquire(host=>execute(host));
       check();succeeded=true;return result;
-    }catch(error){trace.error("resident",error);throw error;}finally{if(metrics&&this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.operation",resident_owner:true,resident_capacity_promotions:promotions,op:"lookup",role:"interactive",trace_id:trace.id,...metrics,...kernelMetrics(),physical,operation_outcome:succeeded?"ok":"error"}));trace.emit(this.env.LOG_METRICS==="true");}
+    }catch(error){trace.error("resident",error);throw error;}finally{if(metrics&&this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.operation",resident_owner:true,resident_cohort_size:cohort?.length??1,resident_cohort_trace_ids:cohort?.map(m=>m.traceId)??null,resident_capacity_promotions:promotions,op:"lookup",role:"interactive",trace_id:trace.id,...metrics,...kernelMetrics(),physical,operation_outcome:succeeded?"ok":"error"}));trace.emit(this.env.LOG_METRICS==="true");}
   }
   requestMaintenance(kind,jobId){return this.maintenance.request(kind,jobId);}
   validMaintenance(kind,ticket,jobId){return this.maintenance.valid(kind,ticket,jobId);}
@@ -131,7 +152,7 @@ export class R2CommitCoordinator extends DurableObject {
         return captureReadView(tx,keys,{...options,lease_observed_at_ms:observedAt,allow_ephemeral_pin:this.store.rootBackend!=="journal",read_lease_policy:this.env.FENCED_READ_LEASES!=="false"||this.store.rootBackend!=="journal"?this.authority.descriptor.read_lease_policy:undefined});
       };
       if(this.env.READ_ONLY_SNAPSHOTS==="false")close();
-      return(this.env.READ_ONLY_SNAPSHOTS==="false"?Promise.reject(Error("ReadSnapshotNeedsAdmission")):this.store.readOnly(capture,{traceId:options.trace_id,traceIds,onAdmission:close,deadlineMs:options.deadlineMs,priority:options.immutable===false?"commit":"interactive"})).catch(error=>{
+      return(this.store.ownerMvcc?this.store.readOnly(capture,{ownerCurrent:true,traceId:options.trace_id,traceIds,onAdmission:close,deadlineMs:options.deadlineMs}):this.env.READ_ONLY_SNAPSHOTS==="false"?Promise.reject(Error("ReadSnapshotNeedsAdmission")):this.store.readOnly(capture,{traceId:options.trace_id,traceIds,onAdmission:close,deadlineMs:options.deadlineMs,priority:options.immutable===false?"commit":"interactive"})).catch(error=>{
         close();if(!/ReadSnapshotNeeds(?:Admission|Pin)/.test(String(error)))throw error;
         return this.transaction(capture,{traceId:options.trace_id,deadlineMs:options.deadlineMs});
       }).then(view=>options.immutable!==false&&!view.immutable&&this.store.readHints?.version===view.version?{...view,immutable:structuredClone(this.store.readHints.records)}:view);
@@ -187,6 +208,7 @@ export class R2CommitCoordinator extends DurableObject {
       if(version!==receipt.version)throw Error("InvalidCompactionResult");
       const written=batch.writes.find(([key])=>key===keys[0]);
       if(receipt.published!==Boolean(written))throw Error("InvalidCompactionResult");
+      if(written&&this.env.RESIDENT_BOOTSTRAP==="true"){if(prepared.boot)tx.put("__antfly_serving_boot/"+this.env.ANTFLY_INCARNATION,prepared.boot);else tx.delete("__antfly_serving_boot/"+this.env.ANTFLY_INCARNATION);}
       if(written)writeReadHints(tx,this.env.ANTFLY_INCARNATION,version,readHints);
       if(!(await this.nativePublication(tx,"publication_release",batch.lease)).released)throw Error("WorkLeaseLost");
     }),{priority:"maintenance",...prepared});
@@ -198,6 +220,7 @@ export class R2CommitCoordinator extends DurableObject {
     if(!head)return limits;
     const version=new TextDecoder().decode(head[1].body).trim();
     if(!/^[1-9][0-9]{0,19}$/.test(version)||BigInt(version)>18446744073709551615n)throw Error("InvalidPublicationVersion");
+    const boot=new CommittedHeaders(this.env.ANTFLY_INCARNATION,version);
     const ioBudget=limits.ioBudget??{operations:0,bytes:0},deadlineMs=limits.deadlineMs??Date.now()+30000,physical={};let metrics,capacity=false,supported=false;
     // Opportunistic immutable preparation leaves a lane for actual reads and
     // runs outside the metadata sequencing queue. No current view is invented.
@@ -205,7 +228,7 @@ export class R2CommitCoordinator extends DurableObject {
     const cache=this.store.dataCache.wrap(instrumentTransport(createR2Transport({database:this.env.DATABASE}),physical),this.env.ANTFLY_INCARNATION,{preserveProtected:true});
     const immutable=withNativeReadPreparation(cache,{manifestKey:`antfly/manifests/${this.env.ANTFLY_INCARNATION}/manifests/${version}.bin`});
     const transport=async(request,body)=>{
-      try{return await immutable({...request,...(['get','head'].includes(request.op)?{max_response_bytes:Math.min(128*1024,request.max_response_bytes??128*1024)}:{})},body);}
+      try{const bounded={...request,...(['get','head'].includes(request.op)?{max_response_bytes:Math.min(128*1024,request.max_response_bytes??128*1024)}:{})};const result=await immutable(bounded,body);if(this.env.RESIDENT_BOOTSTRAP==="true")boot.offer(bounded,result);return result;}
       catch(error){if(error instanceof ObjectStoreError&&error.status===4&&/^(?:object|cached) response exceeds budget$/.test(error.message))capacity=true;throw error;}
     };
     let result;
@@ -217,7 +240,7 @@ export class R2CommitCoordinator extends DurableObject {
       },{tryOnly:true,preparationOnly:true,fairKey:this.env.ANTFLY_INCARNATION,priority:"maintenance",deadlineMs,kernelVariant:"compact",memoryReservationBytes:16*1024*1024});
     }catch(error){if(!(capacity&&error?.message==="ObjectIoBudgetExceeded"))throw error;}
     finally{if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.resident_publication_prewarm",supported,prepared:result?.__read_headers_prepared===true,capacity_skip:capacity,...metrics,physical,...kernelMetrics()}));}
-    return{ioBudget,deadlineMs};
+    return{ioBudget,deadlineMs,boot:boot.encode()};
   }
   async finalizePublication(batch,observation,readHints){
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION,batch?.format===3),prepared=await this.prepareResidentPublication(batch);
@@ -226,6 +249,7 @@ export class R2CommitCoordinator extends DurableObject {
       const entries=await publicationSnapshot(tx,keys);
       await applyPublication(tx,entries.map(([key])=>key),batch);
       const head=batch.writes.find(([key])=>key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`);
+      if(head){if(this.env.RESIDENT_BOOTSTRAP==="true"){if(prepared.boot)tx.put("__antfly_serving_boot/"+this.env.ANTFLY_INCARNATION,prepared.boot);else tx.delete("__antfly_serving_boot/"+this.env.ANTFLY_INCARNATION);}}
       if(head)writeReadHints(tx,this.env.ANTFLY_INCARNATION,new TextDecoder().decode(head[1].body).trim(),readHints);
       if(!(await this.nativePublication(tx,"publication_release",batch.lease)).released)throw Error("WorkLeaseLost");
       if(this.env.PUBLICATION_ADAPTIVE_SLICES==="true"&&Number.isSafeInteger(observation?.posting_quantum)&&observation.posting_quantum>=1&&observation.posting_quantum<=4096)tx.put("__antfly_publication_quantum_limit",observation.posting_quantum);
@@ -356,7 +380,7 @@ export class R2CommitCoordinator extends DurableObject {
       const dependencies=retained?this.optimisticWal.dependencies(view,keys.wal,encode):[];
       const transport=this.store.dataCache.wrap(withCommitCoordinator(edgeCacheForEnv(this.env,{background:promise=>this.ctx.waitUntil(promise),budgetKey:()=>physical,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical)),prepared),this.env.ANTFLY_INCARNATION,{preserveProtected:this.env.FOREGROUND_CACHE_POLICY==="true"});
 
-      let result;try{result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",...(this.env.WAL_DEFERRED_INDEXES==="true"?{wal_deferred_indexes:true}:{}),...(this.env.WAL_PACKED_PAGES==="true"?{wal_packed_pages:true}:{}),...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:walWorkingBytes,mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));}catch(error){if(retained&&/^(FileNotFound|ObjectNotFound)$/.test(error?.message)){this.optimisticWal.clear();continue;}throw error;}
+      let result;try{result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",...(this.env.WAL_DEFERRED_INDEXES==="true"?{wal_deferred_indexes:true}:{}),...(this.env.WAL_PACKED_PAGES==="true"?{wal_packed_pages:true}:{}),...(this.env.RESIDENT_READ_STATE==="true"?{resident_read_state:true}:{}),...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:walWorkingBytes,mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));}catch(error){if(retained&&/^(FileNotFound|ObjectNotFound)$/.test(error?.message)){this.optimisticWal.clear();continue;}throw error;}
       // Replays still take fresh authority admission; a cached receipt never
       // substitutes for current namespace/fencing validation.
       if(retained&&!prepared.head){this.optimisticWal.clear();continue;}
@@ -378,7 +402,7 @@ export class R2CommitCoordinator extends DurableObject {
         trace.publicationId=committed.id;
         if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,prepare_attempts:attempt+1,physical_r2:physical}));
         trace.emit(this.env.LOG_METRICS==="true");
-        return result.results.map((item,i)=>({...item,...(this.env.METADATA_COMMIT_HINTS==="true"?{__metadata_hint:this.store.exportRootHint()}:{}),__publication:i===0?committed:{...committed,enqueue:false}}));
+        return result.results.map((rawItem,i)=>{const {__resident_tail,...item}=rawItem;if(this.env.RESIDENT_READ_STATE==="true")this.servingTail.install(__resident_tail,this.store.state.owner);return({...item,...(this.env.METADATA_COMMIT_HINTS==="true"?{__metadata_hint:this.store.exportRootHint()}:{}),__publication:i===0?committed:{...committed,enqueue:false}});});
       }
       this.optimisticWal.clear();
     }
@@ -406,7 +430,7 @@ export class R2CommitCoordinator extends DurableObject {
       let wave,permit;
       if(!prepared)try{
         prepareAttempts++;
-        const request={op:"mutate",...(this.env.WAL_DEFERRED_INDEXES==="true"?{wal_deferred_indexes:true}:{}),...(this.env.WAL_PACKED_PAGES==="true"?{wal_packed_pages:true}:{}),...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",working_set_bytes:walWorkingBytes,native_write_plan:{...(this.store.rootBackend!=="journal"?{metadata_backend:this.store.rootBackend}:{}),state:structuredClone(attempt===0&&preparationState?preparationState:this.store.state),metadata_namespace:this.store.namespace,reservation_id:crypto.randomUUID()},mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))};
+        const request={op:"mutate",...(this.env.WAL_DEFERRED_INDEXES==="true"?{wal_deferred_indexes:true}:{}),...(this.env.WAL_PACKED_PAGES==="true"?{wal_packed_pages:true}:{}),...(this.env.RESIDENT_READ_STATE==="true"?{resident_read_state:true}:{}),...(this.env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(this.env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}),namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",working_set_bytes:walWorkingBytes,native_write_plan:{...(this.store.rootBackend!=="journal"?{metadata_backend:this.store.rootBackend}:{}),state:structuredClone(attempt===0&&preparationState?preparationState:this.store.state),metadata_namespace:this.store.namespace,reservation_id:crypto.randomUUID()},mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))};
         const options=()=>({transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-ioBudget.operations,maxTransferBytes:32*1024*1024-ioBudget.bytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{ioBudget.operations+=sample.operations;ioBudget.bytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,native_write_plan:true,...sample,physical}));}});
         if(this.env.NATIVE_WRITE_READ_AHEAD==="true")permit=readAheadBudgetFor(buildKernel,Math.min(4,buildKernel.slots.length)).tryAcquire(this.env.ANTFLY_INCARNATION);
         if(permit){
@@ -429,7 +453,7 @@ export class R2CommitCoordinator extends DurableObject {
       if(!committed.applied){prepared=null;await refresh();continue;}
       trace.publicationId=committed.publication.id;
       if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_id:trace.id,trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,native_write_plan:true,prepare_attempts:prepareAttempts,finalize_attempts:finalizeAttempts,operations:ioBudget.operations,transferred_bytes:ioBudget.bytes,physical_r2:physical}));
-      return prepared.results.map((item,i)=>({...item,...(this.env.METADATA_COMMIT_HINTS==="true"?{__metadata_hint:this.store.exportRootHint()}:{}),__publication:i===0?committed.publication:{...committed.publication,enqueue:false}}));
+      return prepared.results.map((rawItem,i)=>{const {__resident_tail,...item}=rawItem;if(this.env.RESIDENT_READ_STATE==="true")this.servingTail.install(__resident_tail,this.store.state.owner);return({...item,...(this.env.METADATA_COMMIT_HINTS==="true"?{__metadata_hint:this.store.exportRootHint()}:{}),__publication:i===0?committed.publication:{...committed.publication,enqueue:false}});});
     }
     throw Error("WalCommitContended");
     }finally{if(refreshing)await Promise.allSettled([refreshing]);trace.emit(this.env.LOG_METRICS==="true");}
