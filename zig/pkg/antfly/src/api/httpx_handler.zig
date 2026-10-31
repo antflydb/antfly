@@ -8066,6 +8066,7 @@ pub const AntflyApiHandler = struct {
             },
             error.EmbeddingProbeUnavailable => {
                 _ = ctx.status(503);
+                try ctx.setHeader("Retry-After", "1");
                 return ctx.text("table index validation probe unavailable");
             },
             else => return err,
@@ -8095,6 +8096,7 @@ pub const AntflyApiHandler = struct {
             },
             error.EmbeddingProbeUnavailable => {
                 _ = ctx.status(503);
+                try ctx.setHeader("Retry-After", "1");
                 return ctx.text("table index validation probe unavailable");
             },
             error.InvalidCreateTableRequest, error.ChatGPTInteractiveOnly => {
