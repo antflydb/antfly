@@ -2733,3 +2733,29 @@ test root produces nine passing focused checks. That correction changes no
 production code. All 50 real Parquet/Iceberg E2E cases pass against the frozen
 implementation binary. Memory, spill-byte and file-count admission remain in
 force, including cumulative writes exceeding a bounded live disk quota.
+
+
+### Ordered identity maps and typed spill merges
+
+Fresh complete row-map builds consume the already ID-sorted pending stream
+through the existing leased record interface. With no retained membership,
+queued mutations or prior result root, the by-ID tree can be built directly.
+Single-cohort input evidence has a constant recipe prefix and can use the same
+ordered tree writer. Queued removals, retained rows, multiple interleaved cohorts
+and repeated finishes retain the mutation reducer where its ordering proof is
+needed. Duplicate IDs are checked before insertion; copy-on-write publication,
+input evidence, authentication and root validation keep their existing rules.
+
+Native spill merges expose selected primitive wire lanes as physical columns.
+Fixed and dictionary integers, doubles, booleans and strings are gathered in
+native vectors; string payload bytes remain borrowed from pinned input blocks.
+SQL NULL flags stay distinct from JSON null. Decimal, heterogeneous JSON and
+shared/unsupported encodings decline before gathering and retain the existing
+scalar or frozen codec. Floating-point bits, including signed zero, are preserved.
+
+A merge gathers and encodes one column at a time using the existing bounded
+column scratch arena. Row sizing retains the prior block boundaries, so wide
+rows do not retain a full matrix of gathered columns. Input blocks remain pinned
+through the synchronous encode, and all added scratch uses the existing manager
+allocator and quotas. The ordinary borrowed-batch write path remains available.
+Runtime ABI 81, reader protocol 97 and persisted formats are unchanged.

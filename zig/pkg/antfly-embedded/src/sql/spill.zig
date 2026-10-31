@@ -1419,7 +1419,7 @@ fn appendColumnarBatchVersionMode(output_alloc: Allocator, scratch: Allocator, b
     const pa = physical_arena.allocator();
     const physical = try pa.alloc(?@import("execution_batch.zig").PhysicalColumn, values.width());
     for (physical, 0..) |*view, column| view.* = try values.physicalColumn(pa, column);
-    try Sequential.encodeBatchColumns(&encoder, values, physical, 0, values.len());
+    try Sequential.encodeBatchColumns(&encoder, values, physical, 0, values.len(), false);
 }
 /// Payload bytes and decoded metadata borrow the caller's page arena. Fetch
 /// authenticated artifact bytes into that same arena before decoding, so no
@@ -2341,6 +2341,14 @@ pub const Sequential = struct {
     /// Encode borrowed columns synchronously. Neither payloads nor row arrays
     /// enter the per-run staging arena; physical dictionary values stay borrowed.
     pub fn appendBatch(self: *Sequential, values: @import("execution_batch.zig").Batch, keys: @import("execution_batch.zig").Batch, ordinals: []const u64) !void {
+        return self.appendBatchMode(values, keys, ordinals, false);
+    }
+    // Merge scatters gather only the column currently being encoded. Holding
+    // every gathered column at once would make scratch grow with row width.
+    fn appendMergeBatch(self: *Sequential, values: @import("execution_batch.zig").Batch, keys: @import("execution_batch.zig").Batch, ordinals: []const u64) !void {
+        return self.appendBatchMode(values, keys, ordinals, true);
+    }
+    fn appendBatchMode(self: *Sequential, values: @import("execution_batch.zig").Batch, keys: @import("execution_batch.zig").Batch, ordinals: []const u64, comptime gather_columns: bool) !void {
         if (values.len() != keys.len() or values.len() != ordinals.len) return error.InvalidSqlSpill;
         try self.flush();
         var physical_arena = std.heap.ArenaAllocator.init(self.file.manager.allocator());
@@ -2350,11 +2358,11 @@ pub const Sequential = struct {
         const physical_values = try pa.alloc(?Physical, values.width());
         const physical_keys = try pa.alloc(?Physical, keys.width());
         for (physical_values, 0..) |*view, column| {
-            view.* = try values.physicalColumn(pa, column);
+            view.* = if (gather_columns) null else try values.physicalColumn(pa, column);
             if (view.*) |native| try native.validate();
         }
         for (physical_keys, 0..) |*view, column| {
-            view.* = try keys.physicalColumn(pa, column);
+            view.* = if (gather_columns) null else try keys.physicalColumn(pa, column);
             if (view.*) |native| try native.validate();
         }
         var begin: usize = 0;
@@ -2382,14 +2390,14 @@ pub const Sequential = struct {
             try encoder.word(values.width());
             try encoder.word(keys.width());
             for (ordinals[begin..end]) |ordinal| try encoder.word(ordinal);
-            try encodeBatchColumns(&encoder, values, physical_values, begin, end);
-            try encodeBatchColumns(&encoder, keys, physical_keys, begin, end);
+            try encodeBatchColumns(&encoder, values, physical_values, begin, end, gather_columns);
+            try encodeBatchColumns(&encoder, keys, physical_keys, begin, end, gather_columns);
             try self.writeEncoded(bytes.items);
             self.size += end - begin;
             begin = end;
         }
     }
-    fn encodeBatchColumns(encoder: *Encoder, batch: @import("execution_batch.zig").Batch, physical_columns: []const ?@import("execution_batch.zig").PhysicalColumn, begin: usize, end: usize) !void {
+    fn encodeBatchColumns(encoder: *Encoder, batch: @import("execution_batch.zig").Batch, physical_columns: []const ?@import("execution_batch.zig").PhysicalColumn, begin: usize, end: usize, comptime gather_columns: bool) !void {
         var scratch = std.heap.ArenaAllocator.init(encoder.scratch orelse encoder.a);
         defer scratch.deinit();
         const temporary = scratch.allocator();
@@ -2410,6 +2418,11 @@ pub const Sequential = struct {
             }
             if (!column_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
             const column_alloc = column_scratch.allocator();
+            if (gather_columns) if (try selected.physicalColumn(column_alloc, column)) |native| {
+                try native.validate();
+                try encodeNativeColumn(encoder, native);
+                continue;
+            };
             var frozen: [256]?@import("execution_batch.zig").FrozenJson = undefined;
             var encoded: [256]?[]const u8 = undefined;
             var has_encoded = false;
@@ -3042,6 +3055,75 @@ pub const Sequential = struct {
             dictionary: Dictionary,
         },
         const SharedColumn = struct { base: EncodedColumn, bodies: []?*OwnedBlock };
+        fn nativeTag(self: EncodedColumn) ?u8 {
+            const wire_kind = switch (self.values) {
+                .fixed => |v| v.kind,
+                .dictionary => |v| v.kind,
+                .texts => |v| if (v.decimal) return null else @as(u8, 5),
+                else => return null,
+            };
+            return switch (wire_kind) {
+                1, 2, 3, 5 => wire_kind,
+                else => null,
+            };
+        }
+        fn nativeValue(self: EncodedColumn, comptime T: type, row: usize) T {
+            return switch (self.values) {
+                .fixed => |v| if (T == bool) v.bytes[v.positions[row]] == 1 else if (T == i64 or T == f64) @bitCast(std.mem.readInt(u64, v.bytes[@as(usize, v.positions[row]) * 8 ..][0..8], .little)) else unreachable,
+                .dictionary => |v| if (T == []const u8) v.texts[v.indices[row]] else if (T == bool) v.bytes[v.indices[row]] == 1 else @bitCast(std.mem.readInt(u64, v.bytes[@as(usize, v.indices[row]) * 8 ..][0..8], .little)),
+                .texts => |v| if (T == []const u8) v.values[row] else unreachable,
+                else => unreachable,
+            };
+        }
+        /// Gather primitive wire lanes without Datum reconstruction or payload
+        /// copies. Heterogeneous JSON, decimal and shared columns decline before
+        /// allocating; the existing scalar/frozen codec remains authoritative.
+        fn gatherPhysical(a: Allocator, columns: []const *const EncodedColumn, rows: []const usize) !?@import("execution_batch.zig").PhysicalColumn {
+            if (columns.len != rows.len or rows.len > 256) return error.InvalidSqlSpill;
+            if (rows.len == 0) return null;
+            const wire_kind = columns[0].nativeTag() orelse return null;
+            for (columns, rows) |column, row| {
+                if (column.nativeTag() != wire_kind) return null;
+                const count = switch (column.values) {
+                    .fixed => |v| v.positions.len,
+                    .dictionary => |v| v.indices.len,
+                    .texts => |v| v.values.len,
+                    else => unreachable,
+                };
+                if (row >= count) return error.InvalidSqlSpill;
+                if (((column.flags[row / 4] >> @as(u3, @intCast(row % 4 * 2))) & 3) > 1) return null;
+            }
+            const nulls = try a.alloc(u8, rows.len);
+            errdefer a.free(nulls);
+            for (columns, rows, nulls) |column, row, *flag| flag.* = @intFromBool(column.isSqlNull(row));
+            switch (wire_kind) {
+                inline 1, 2, 3, 5 => |kind| {
+                    const T = switch (kind) {
+                        1 => bool,
+                        2 => i64,
+                        3 => f64,
+                        5 => []const u8,
+                        else => unreachable,
+                    };
+                    const values = try a.alloc(T, rows.len);
+                    for (columns, rows, nulls, values) |column, row, flag, *value| value.* = if (flag != 0) (if (T == bool) false else if (T == []const u8) "" else 0) else column.nativeValue(T, row);
+                    return .{ .vector = .{ .name = "", .values = switch (kind) {
+                        1 => .{ .bool = values },
+                        2 => .{ .i64 = values },
+                        3 => .{ .f64 = values },
+                        5 => .{ .bytes = values },
+                        else => unreachable,
+                    }, .nulls = .{ .bytes = nulls } }, .range = .{ .count = rows.len }, .kind = switch (kind) {
+                        1 => .boolean,
+                        2 => .integer,
+                        3 => .number,
+                        5 => .string,
+                        else => unreachable,
+                    }, .element = if (kind == 3) .float64 else null };
+                },
+                else => unreachable,
+            }
+        }
         fn isSqlNull(self: EncodedColumn, index: usize) bool {
             if (self.values == .dynamic) {
                 const dynamic = self.values.dynamic;
@@ -3299,12 +3381,7 @@ pub const Sequential = struct {
                     const columns = if (view.keys) encoded.keys else encoded.values;
                     if (column >= columns.len) return error.InvalidSqlSpill;
                     const stored = columns[column];
-                    const wire_tag = switch (stored.values) {
-                        .fixed => |v| v.kind,
-                        .dictionary => |v| v.kind,
-                        .texts => |v| if (v.decimal) return null else @as(u8, 5),
-                        else => return null,
-                    };
+                    const wire_tag = stored.nativeTag() orelse return null;
                     for (0..encoded.count()) |row_index| {
                         const flag = (stored.flags[row_index / 4] >> @as(u3, @intCast(row_index % 4 * 2))) & 3;
                         if (flag > 1) return null;
@@ -5416,15 +5493,29 @@ pub const Sort = struct {
             const location = self.locations[row];
             return if (location.block.encoded) |block| block.encodedJson(location.row, column, self.keys) else null;
         }
+        fn physical(raw: *anyopaque, a: Allocator, column: usize) anyerror!?@import("execution_batch.zig").PhysicalColumn {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.locations.len > 64) return error.InvalidSqlSpill;
+            var columns: [64]*const Sequential.EncodedColumn = undefined;
+            var rows: [64]usize = undefined;
+            for (self.locations, columns[0..self.locations.len], rows[0..self.locations.len]) |location, *source, *row| {
+                const encoded = location.block.encoded orelse return null;
+                const fields = if (self.keys) encoded.keys else encoded.values;
+                if (column >= fields.len) return error.InvalidSqlSpill;
+                source.* = &fields[column];
+                row.* = location.row;
+            }
+            return Sequential.EncodedColumn.gatherPhysical(a, columns[0..self.locations.len], rows[0..self.locations.len]);
+        }
         fn batch(self: *@This()) @import("execution_batch.zig").Batch {
             const block = self.locations[0].block;
-            return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .width = if (self.keys) block.keyWidth() else block.width(), .count = self.locations.len } };
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_physical = physical, .read_frozen = frozen, .read_json = json, .width = if (self.keys) block.keyWidth() else block.width(), .count = self.locations.len } };
         }
         fn write(locations: []const Location, ordinals: []const u64, output: *Sequential) !void {
             if (locations.len == 0) return;
             var values: MergeRows = .{ .locations = locations, .keys = false };
             var keys: MergeRows = .{ .locations = locations, .keys = true };
-            try output.appendBatch(values.batch(), keys.batch(), ordinals);
+            try output.appendMergeBatch(values.batch(), keys.batch(), ordinals);
         }
     };
     fn mergeMany(self: *Sort, inputs: []const *Sequential) !Sequential {
@@ -10288,4 +10379,51 @@ test "SQL adaptive payload cache keeps region allocators outside shared reclamat
     try std.testing.expect(!cache.registered);
     try std.testing.expect(manager.payload_caches == null);
     try std.testing.expectEqual(@as(usize, 64 << 10), cache.target());
+}
+
+test "SQL typed spill merge gathers primitive dictionaries preserves SQL null and declines JSON null and decimals" {
+    const C = Sequential.EncodedColumn;
+    const a = std.testing.allocator;
+    var integer_bytes: [16]u8 = undefined;
+    std.mem.writeInt(u64, integer_bytes[0..8], @bitCast(@as(i64, 9007199254740993)), .little);
+    std.mem.writeInt(u64, integer_bytes[8..16], @bitCast(@as(i64, -17)), .little);
+    const flags = [_]u8{0b00010000};
+    const indices = [_]u16{ 0, 1, 0 };
+    const integer: C = .{ .flags = &flags, .values = .{ .dictionary = .{ .kind = 2, .size = 2, .bytes = &integer_bytes, .indices = &indices } } };
+    const text: C = .{ .flags = &flags, .values = .{ .dictionary = .{ .kind = 5, .size = 2, .texts = &.{ "first", "second" }, .indices = &indices } } };
+    const floating: C = .{ .flags = &.{0}, .values = .{ .fixed = .{ .kind = 3, .positions = &.{0}, .bytes = &.{ 0, 0, 0, 0, 0, 0, 0, 0x80 } } } };
+    const boolean: C = .{ .flags = &flags, .values = .{ .dictionary = .{ .kind = 1, .size = 2, .bytes = &.{ 1, 0 }, .indices = &indices } } };
+    const Probe = struct {
+        fn run(alloc: Allocator, col: *const C) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const view = (try C.gatherPhysical(arena.allocator(), &.{ col, col, col, col }, &.{ 1, 2, 0, 1 })).?;
+            try view.validate();
+            for ([_]usize{ 1, 2, 0, 1 }, 0..) |row, i| {
+                const expected = try col.cell(row);
+                const actual = try view.cell(i);
+                try std.testing.expectEqual(expected.sql_null, actual.sql_null);
+                if (!expected.sql_null) switch (expected.value) {
+                    .integer => |v| try std.testing.expectEqual(v, actual.value.integer),
+                    .string => |v| try std.testing.expectEqualStrings(v, actual.value.string),
+                    .bool => |v| try std.testing.expectEqual(v, actual.value.bool),
+                    else => return error.UnexpectedDatum,
+                };
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Probe.run, .{&integer});
+    try Probe.run(a, &text);
+    try Probe.run(a, &boolean);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const float_view = (try C.gatherPhysical(arena.allocator(), &.{&floating}, &.{0})).?;
+    try std.testing.expectEqual(@as(u64, 0x8000000000000000), @as(u64, @bitCast((try float_view.cell(0)).value.float)));
+    const json_null: C = .{ .flags = &.{2}, .values = .{ .texts = .{ .values = &.{""}, .decimal = false } } };
+    const decimal: C = .{ .flags = &.{0}, .values = .{ .texts = .{ .values = &.{"9007199254740993.1250"}, .decimal = true } } };
+    var no_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expect(try C.gatherPhysical(no_allocations.allocator(), &.{&json_null}, &.{0}) == null);
+    try std.testing.expect(try C.gatherPhysical(no_allocations.allocator(), &.{&decimal}, &.{0}) == null);
+    try std.testing.expect(try C.gatherPhysical(no_allocations.allocator(), &.{ &text, &integer }, &.{ 0, 0 }) == null);
+    try std.testing.expectError(error.InvalidSqlSpill, C.gatherPhysical(a, &.{&integer}, &.{3}));
 }
