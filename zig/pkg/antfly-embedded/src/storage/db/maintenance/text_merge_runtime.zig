@@ -767,7 +767,26 @@ const PlatformTextMergeRuntime = struct {
             }
             self.mutex.unlock(io);
             if (self.config.manual_producer_assistance) {
-                if (!try self.runOnce()) {
+                const merged = self.runOnce() catch |err| failed: {
+                    if (isShutdown(self)) return error.TextMergeRuntimeShutdown;
+                    switch (err) {
+                        error.OutOfMemory,
+                        error.OutcomeUnknown,
+                        error.DurabilityOutcomeUnknown,
+                        error.WriteOutcomeUnknown,
+                        error.SqlTransactionOutcomeUnknown,
+                        error.SqlMutationOutcomeUnknown,
+                        error.CommitDecisionUnknown,
+                        => return err,
+                        else => {},
+                    }
+                    // The global scheduler can select another index. Task
+                    // failures already quarantine its source; recheck this
+                    // producer's constrained dimensions before refusing it.
+                    // Transient source cancellation also needs a fresh turn.
+                    break :failed false;
+                };
+                if (!merged) {
                     // Failed execution can signal admission without freeing
                     // capacity. Waiting on the pre-attempt epoch would return
                     // immediately and busy-spin on the same resource refusal.

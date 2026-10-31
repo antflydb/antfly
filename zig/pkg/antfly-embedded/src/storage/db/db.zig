@@ -120171,10 +120171,38 @@ test "db text merge producer admission isolates quarantined dimensions" {
     };
     db.core.unlockApply();
 
-    var failed_task = (try resources.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
-    defer failed_task.deinit(alloc);
-    try std.testing.expectEqualStrings("quarantined", failed_task.index_name);
-    resources.index_manager.noteTextMergeFailure(&failed_task, error.InvalidChunk);
+    {
+        var assistant = try text_merge_runtime_mod.TextMergeRuntime.init(
+            alloc,
+            resources.index_manager,
+            resources.apply_mutex,
+            db.backend_runtime,
+            .{
+                .enabled = true,
+                .manual_producer_assistance = true,
+                .max_pending_segments = 3,
+                .max_pending_bytes = 0,
+                .backpressure_max_wait_ms = 100,
+            },
+        );
+        defer assistant.deinit();
+        // The healthy producer is blocked only by an in-flight reservation.
+        // Its assistance selects the other index's pending merge. Failure of
+        // that source must not escape as a corruption error on this producer.
+        var held = try assistant.acquireProducerPermit("healthy", 3, 0);
+        defer held.release();
+        text_merge_runtime_mod.test_task_failure_error = error.InvalidChunk;
+        defer text_merge_runtime_mod.test_task_failure_error = error.PersistentDescriptorAdmissionExhausted;
+        text_merge_runtime_mod.test_execute_admission_failures_remaining.store(1, .release);
+        defer text_merge_runtime_mod.test_execute_admission_failures_remaining.store(0, .release);
+        try std.testing.expectError(error.TextMergeBackpressureTimeout, assistant.acquireProducerPermit("healthy", 1, 0));
+        try std.testing.expectEqual(@as(u32, 0), text_merge_runtime_mod.test_execute_admission_failures_remaining.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 1), resources.index_manager.textMergeStatsSnapshot().failed_merges);
+        held.release();
+        var healthy = try assistant.acquireProducerPermit("healthy", 3, 0);
+        defer healthy.release();
+        try std.testing.expectError(error.TextMergeBackpressureUnavailable, assistant.acquireProducerPermit("quarantined", 2, 0));
+    }
 
     const quarantined_stats = resources.index_manager.textMergeStatsSnapshotForIndex("quarantined");
     try std.testing.expectEqual(@as(u64, 2), quarantined_stats.pending_segments);
