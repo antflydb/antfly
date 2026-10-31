@@ -17,7 +17,7 @@
 // Antfly's own documentation. It walks the docs with docsaf, splits markdown
 // into sections, and writes them to embedded Antfly Lite (the default) or to a
 // running Antfly server (-url or ANTFLY_URL). Antfly chunks and embeds each
-// section with Qwen3 for semantic search and extracts entities and relations
+// section with EmbeddingGemma 2 for semantic search and extracts entities and relations
 // with GLiNER2.5 into a knowledge graph. Commands query the result with hybrid
 // search and graph traversal, export a portable backup, and run a model-free
 // smoke check of the embedded API.
@@ -44,7 +44,7 @@ const (
 	// defaultInferenceURL is antfly inference run's default listen address
 	// (--host 127.0.0.1 --port 8090; see zig/pkg/inference/src/main.zig).
 	defaultInferenceURL = "" // empty: in-process inference via libantfly
-	defaultEmbedModel   = "Qwen/Qwen3-Embedding-0.6B-GGUF"
+	defaultEmbedModel   = "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
 	// GLiNER2.5 base is qualified for production extraction, including
 	// windowed long documents (zig/pkg/inference/models/gliner2/GLINER25.md).
 	defaultExtractModel  = "fastino/gliner2.5-base-v1"
