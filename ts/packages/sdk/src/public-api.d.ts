@@ -43,7 +43,7 @@ export interface paths {
         put?: never;
         /**
          * ingestLakeChanges
-         * @description Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table admin permission and iceberg_writer policy.
+         * @description Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table write permission without a row filter and iceberg_writer policy. Catalog initialization, file commits and maintenance require table admin permission.
          */
         post: operations["ingestLakeChanges"];
         delete?: never;
@@ -8765,6 +8765,29 @@ export interface components {
              */
             limit: number;
             result: components["schemas"]["TableRepairRunResult"];
+            /** @description Documents that still fail after this pass, grouped by error code with the next step. Omitted for control passes. */
+            remaining_failures?: components["schemas"]["RepairRemainingFailure"][];
+            /** @description Whether more repair issues exist than the summary scanned. */
+            remaining_failures_truncated?: boolean;
+        };
+        /** @description A group of documents whose repair still fails with the same error. */
+        RepairRemainingFailure: {
+            /** @description Error recorded for the documents, for example `ModelNotFound`. */
+            error_code: string;
+            /**
+             * Format: uint64
+             * @description Number of documents in this group.
+             */
+            count: number;
+            /**
+             * Format: uint64
+             * @description Highest repair attempt count among the group's documents.
+             */
+            attempts: number;
+            /** @description Whether the error is temporary (admission refusal, rate limit). Repair retries these within a job; running repair again usually succeeds. */
+            transient: boolean;
+            /** @description What to do next. */
+            hint: string;
         };
         /** @description Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair. */
         TableRepairJobStartRequest: {
@@ -8831,10 +8854,14 @@ export interface components {
             /** @description Table being repaired. */
             table_name: string;
             /**
-             * @description Lifecycle phase of the repair job.
+             * @description Lifecycle phase of the repair job. `completed_with_failures` means every
+             *     pass ran but some documents still fail; `remaining_failures` says why
+             *     and what to do, and running repair again retries them. `failed` means
+             *     the job itself could not run, for example an invalid request or a
+             *     stale control fence.
              * @enum {string}
              */
-            phase: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+            phase: "queued" | "running" | "succeeded" | "completed_with_failures" | "failed" | "cancelled";
             /**
              * @description User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
              * @enum {string}
@@ -8885,6 +8912,10 @@ export interface components {
              * @description Unix epoch milliseconds when the job is eligible for cleanup.
              */
             expires_at_millis: number;
+            /** @description Documents that still fail, grouped by error code with the next step. Present on finished repair jobs that are not controls, read from the current repair issues. */
+            remaining_failures?: components["schemas"]["RepairRemainingFailure"][];
+            /** @description Whether more repair issues exist than the summary scanned. */
+            remaining_failures_truncated?: boolean;
         };
         DocumentArtifactReprocessResponse: {
             /**
@@ -16856,13 +16887,392 @@ export interface components {
         MediaOutputConfig: {
             output_name: string;
         };
+        /** @description Names of row fields that carry source metadata. Each overrides the matching static field. */
+        DocumentExtractionSourceConfig: {
+            /** @description Row field holding the source filename. */
+            filename_field?: string;
+            /** @description Row field holding the source content type. */
+            content_type_field?: string;
+            /** @description Row field holding the source ETag. */
+            etag_field?: string;
+            /** @description Row field holding the source checksum. */
+            checksum_field?: string;
+            /** @description Row field holding the source version. */
+            version_field?: string;
+            /** @description Row field holding the source last-modified timestamp. */
+            last_modified_field?: string;
+        };
+        /** @description Reader provider for OCR. Every provider except `apple` requires `model`; Apple uses Vision text recognition and accepts no model, credentials, or prompt. */
+        DocumentExtractionReaderConfig: {
+            /** @enum {string} */
+            provider: "antfly" | "openai" | "cloudflare" | "vertex" | "apple";
+            /** @description Reader model, such as `lightonai/LightOnOCR-3-0.8B`. */
+            model?: string;
+            /** @description Provider-level prompt. Hosted readers send their own read instruction when it is omitted. */
+            prompt?: string;
+            /**
+             * Format: int64
+             * @description Maximum output tokens per page.
+             */
+            max_tokens?: number;
+            /** @description Reader endpoint URL. */
+            api_url?: string;
+            /** @description Reader endpoint URL; takes precedence over `api_url`. */
+            url?: string;
+            /** @description Provider API base URL. */
+            base_url?: string;
+            /** @description API key, normally a `${secret:...}` reference. */
+            api_key?: string;
+            /** @description Bearer token, normally a `${secret:...}` reference. */
+            bearer_token?: string;
+            /** @description Capability token for an Antfly inference endpoint. */
+            capability_token?: string;
+            /** @description Revision of the capability token. */
+            capability_revision?: string;
+            /** @description Cloudflare account ID. Required for `cloudflare`. */
+            account_id?: string;
+            /** @description Cloudflare AI Gateway ID. */
+            gateway_id?: string;
+            /** @description Google Cloud project for `vertex`. */
+            project_id?: string;
+            /** @description Google Cloud location for `vertex`. */
+            location?: string;
+            /** @description Path to Google Cloud credentials for `vertex`. */
+            credentials_path?: string;
+            /** @description Apple Vision recognition languages. Defaults to `en-US`. */
+            recognition_languages?: string[];
+            /**
+             * @description Apple Vision recognition level.
+             * @default accurate
+             * @enum {string}
+             */
+            recognition_level?: "accurate" | "fast";
+            /**
+             * @description Apple Vision language correction.
+             * @default false
+             */
+            uses_language_correction?: boolean;
+        };
+        /** @description How PDF pages are rasterized for OCR. */
+        DocumentExtractionRenderConfig: {
+            /**
+             * @description Render resolution in dots per inch.
+             * @default 150
+             */
+            dpi?: number;
+            /**
+             * @description `requested_dpi` renders at `dpi` within the caps. `model_input` renders near the model's preferred input size.
+             * @default requested_dpi
+             * @enum {string}
+             */
+            resolution?: "requested_dpi" | "model_input";
+            /**
+             * Format: int64
+             * @description Maximum pixels per rendered page.
+             * @default 40000000
+             */
+            max_pixels?: number;
+            /**
+             * @description Maximum width or height of a rendered page.
+             * @default 4096
+             */
+            max_dimension?: number;
+        };
+        /** @description Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode. */
+        DocumentExtractionOcrQualityConfig: {
+            /**
+             * @description Pages with fewer meaningful characters are read with OCR.
+             * @default 50
+             */
+            min_content_chars?: number;
+            /**
+             * @description Minimum words before the garbled-text check applies.
+             * @default 20
+             */
+            garbled_min_words?: number;
+            /**
+             * @description Words sampled by the garbled-text check.
+             * @default 50
+             */
+            garbled_sample_words?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of single-character words before text counts as garbled.
+             * @default 0.4
+             */
+            max_single_char_word_ratio?: number;
+            /**
+             * @description Minimum characters for a line to count in the corrupted-line check.
+             * @default 15
+             */
+            substantial_line_min_chars?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of corrupted lines.
+             * @default 0.2
+             */
+            max_corrupted_line_ratio?: number;
+            /**
+             * Format: double
+             * @description Font corruption score at which text is replaced by OCR.
+             * @default 0.5
+             */
+            font_corruption_score_threshold?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of Unicode replacement characters.
+             * @default 0.05
+             */
+            max_replacement_char_ratio?: number;
+        };
+        /** @description Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction. */
+        DocumentExtractionOcrConfig: {
+            reader?: components["schemas"]["DocumentExtractionReaderConfig"];
+            generator?: components["schemas"]["GeneratorConfig"];
+            /**
+             * @description `auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page.
+             * @default auto
+             * @enum {string}
+             */
+            mode?: "auto" | "always";
+            /** @description Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts. */
+            prompt?: string;
+            render?: components["schemas"]["DocumentExtractionRenderConfig"];
+            quality?: components["schemas"]["DocumentExtractionOcrQualityConfig"];
+        };
+        /** @description Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN. */
+        CloudflareSTTConfig: {
+            /** @enum {string} */
+            provider: "cloudflare";
+            account_id: string;
+            gateway_id?: string;
+            /** @default @cf/openai/whisper-large-v3-turbo */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned full native endpoint override. */
+            base_url?: string;
+            language_code?: string;
+            voice?: string;
+        };
+        /**
+         * @description Configuration for OpenAI STT (Whisper) provider.
+         *
+         *     API key via `api_key` field or `OPENAI_API_KEY` environment variable.
+         *
+         *     **Model:** whisper-1
+         *
+         *     **Supported Formats:** mp3, wav, webm, ogg, flac (max 25MB)
+         *
+         *     **Docs:** https://platform.openai.com/docs/guides/speech-to-text
+         * @example {
+         *       "model": "whisper-1"
+         *     }
+         */
+        OpenAISTTConfig: {
+            /**
+             * @description Whisper model to use.
+             * @default whisper-1
+             */
+            model?: string;
+            /** @description OpenAI API key. Falls back to OPENAI_API_KEY environment variable. */
+            api_key?: string;
+            /**
+             * Format: uri
+             * @description API base URL. Falls back to OPENAI_BASE_URL environment variable.
+             */
+            base_url?: string;
+        };
+        /**
+         * @description Configuration for Google Cloud Speech-to-Text provider (Vertex AI).
+         *
+         *     Uses Application Default Credentials (ADC) for authentication.
+         *
+         *     **Features:** Streaming, speaker diarization, automatic punctuation
+         *
+         *     **Docs:** https://cloud.google.com/speech-to-text/docs
+         * @example {
+         *       "project_id": "my-gcp-project",
+         *       "language_code": "en-US",
+         *       "enable_automatic_punctuation": true
+         *     }
+         */
+        VertexSTTConfig: {
+            /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable. */
+            project_id?: string;
+            /**
+             * @description Google Cloud location.
+             * @default us-central1
+             */
+            location?: string;
+            /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain. */
+            credentials_path?: string;
+            /**
+             * @description Default language code (e.g., 'en-US', 'es-ES').
+             * @default en-US
+             */
+            language_code?: string;
+            /**
+             * @description Enable automatic punctuation.
+             * @default true
+             */
+            enable_automatic_punctuation?: boolean;
+            /**
+             * @description Use enhanced models for better accuracy (costs more).
+             * @default false
+             */
+            use_enhanced?: boolean;
+            /** @description Recognition model (e.g., 'latest_long', 'telephony', 'medical_dictation'). */
+            model?: string;
+        };
+        /**
+         * @description Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider.
+         *
+         *     Uses the Antfly inference service for speech-to-text inference.
+         *
+         *     **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base
+         *
+         *     **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC
+         *
+         *     **Docs:** See inference documentation
+         * @example {
+         *       "api_url": "http://localhost:8080",
+         *       "model": "openai/whisper-base"
+         *     }
+         */
+        AntflySTTConfig: {
+            /**
+             * Format: uri
+             * @description Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
+             */
+            api_url?: string;
+            /** @description Explicit Antfly transcriber model name (e.g., 'openai/whisper-tiny'). */
+            model: string;
+        };
+        /** @description On-device SpeechAnalyzer file transcription. Requires a macOS Apple provider build and supported Speech assets. Diarization is unsupported. */
+        AppleSTTConfig: {
+            /**
+             * @description Supported Speech locale; Apple transcription does not infer a language.
+             * @default en-US
+             */
+            language_code?: string;
+            /** @default true */
+            timestamps?: boolean;
+            /**
+             * @description Explicitly permit preparing and installing the selected Speech assets.
+             * @default false
+             */
+            download_assets?: boolean;
+        };
+        /**
+         * @description The STT provider to use.
+         * @enum {string}
+         */
+        STTProvider: "cloudflare" | "openai" | "vertex" | "antfly" | "apple";
+        /**
+         * @description Unified configuration for an STT provider.
+         *
+         *     Select the provider type and configure provider-specific settings.
+         *
+         *     **Supported Providers:**
+         *     - `openai` - OpenAI Whisper (whisper-1)
+         *     - `vertex` - Google Cloud Speech-to-Text (Vertex AI)
+         *     - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT)
+         *
+         *     **Example:**
+         *     ```yaml
+         *     provider: antfly
+         *     api_url: "http://localhost:8080"
+         *     model: openai/whisper-base
+         *     ```
+         * @example {
+         *       "provider": "antfly",
+         *       "api_url": "http://localhost:8080",
+         *       "model": "openai/whisper-base"
+         *     }
+         */
+        STTConfig: (components["schemas"]["CloudflareSTTConfig"] | components["schemas"]["OpenAISTTConfig"] | components["schemas"]["VertexSTTConfig"] | components["schemas"]["AntflySTTConfig"] | components["schemas"]["AppleSTTConfig"]) & {
+            provider: components["schemas"]["STTProvider"];
+        };
+        /** @description Transcribes audio units. */
+        DocumentExtractionTranscriptionConfig: {
+            transcriber: components["schemas"]["STTConfig"];
+        };
+        /** @description Conditions a source must meet. Every condition given must match. */
+        DocumentExtractionRouteMatch: {
+            /** @description Exact content type. */
+            content_type?: string;
+            /** @description Content type prefix, such as `image/`. */
+            content_type_prefix?: string;
+            /** @description Filename extension or list of extensions. */
+            extension?: string | string[];
+            /** @description Leading bytes or list of leading-byte prefixes. */
+            magic_prefix?: string | string[];
+        };
+        DocumentExtractionRoute: {
+            match?: components["schemas"]["DocumentExtractionRouteMatch"];
+            extractor: {
+                /**
+                 * @description Extractor for matching sources. `image` is an alias of `ocr` and `transcript` of `audio`. An `ocr` route requires an `ocr` block and an `audio` route requires a `transcription` block; otherwise the configuration is rejected with `DocumentExtractionModelRequired`.
+                 * @enum {string}
+                 */
+                type: "pdf" | "html" | "text" | "email" | "docx" | "pptx" | "xlsx" | "archive" | "ocr" | "image" | "audio" | "transcript" | "unsupported";
+                /** @description Unit type recorded for the extracted units, such as `page` or `transcript_segment`. */
+                unit?: string;
+            };
+        };
+        /**
+         * @description Configuration for the `document_extraction` producer. It downloads the source URL and persists derived units such as PDF pages, sections, images, and audio.
+         *
+         *     Native text (PDF text layers, Office documents, HTML, email, plain text) is extracted with no model. Scanned pages and images are read only when `ocr` names a reader or generator, and audio is transcribed only when `transcription` names a transcriber. Units that need a producer that is not configured report `extraction_status` `ocr_not_configured` or `transcription_not_configured`.
+         *
+         *     **Example:**
+         *     ```json
+         *     {
+         *       "source": {"filename_field": "filename", "content_type_field": "mime_type"},
+         *       "ocr": {"reader": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}},
+         *       "transcription": {"transcriber": {"provider": "antfly", "model": "openai/whisper-small"}}
+         *     }
+         *     ```
+         */
+        DocumentExtractionConfig: {
+            source?: components["schemas"]["DocumentExtractionSourceConfig"];
+            /** @description Static filename used for content detection when the row has none. */
+            filename?: string;
+            /** @description Static content type. Overrides the downloaded response's content type. */
+            content_type?: string;
+            /** @description Static ETag recorded as source version metadata. */
+            etag?: string;
+            /** @description Static checksum recorded as source version metadata. */
+            checksum?: string;
+            /** @description Static source version. Together with the other metadata it lets extraction skip unchanged sources. */
+            version?: string;
+            /** @description Static last-modified timestamp recorded as source version metadata. */
+            last_modified?: string;
+            /** @description Credential reference used to download the source URL. */
+            credentials?: string;
+            /**
+             * @description Strip HTML markup from HTML sources before storing their text.
+             * @default true
+             */
+            html_strip_tags?: boolean;
+            ocr?: components["schemas"]["DocumentExtractionOcrConfig"];
+            transcription?: components["schemas"]["DocumentExtractionTranscriptionConfig"];
+            /**
+             * @description How sources that match no explicit route are handled. `mixed_files` (alias `default`) detects PDFs, HTML, email, Office documents, ZIP archives, images, audio, and text. `explicit_only` (alias `none`) records unmatched sources as unsupported. Detection never requests a producer: detected images and audio without a configured producer report `ocr_not_configured` or `transcription_not_configured`.
+             * @default mixed_files
+             * @enum {string}
+             */
+            route_preset?: "mixed_files" | "explicit_only";
+            /** @description Routes evaluated in order before the preset. The first route whose match applies selects the extractor. */
+            routes?: components["schemas"]["DocumentExtractionRoute"][];
+        };
         EnrichmentProducerConfig: {
             /** @enum {string} */
             type: "copy" | "generator" | "extractor" | "decision" | "reader" | "transcriber" | "document_extraction" | "vector_labels" | "media_output";
             /** @description Producer-specific configuration. Generator schemas and generated extractors share constrained output admission, batching, validation retry, and immutable artifact replay. */
             config?: components["schemas"]["ConstrainedGeneratorProducerConfig"] | components["schemas"]["GeneratedExtractorConfig"] | {
                 [key: string]: unknown;
-            } | components["schemas"]["VectorLabelsConfig"] | components["schemas"]["MediaOutputConfig"];
+            } | components["schemas"]["VectorLabelsConfig"] | components["schemas"]["MediaOutputConfig"] | components["schemas"]["DocumentExtractionConfig"];
         };
         /** @description Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer. */
         EnrichmentNeighborContextConfig: {
@@ -16898,11 +17308,6 @@ export interface components {
              */
             max_document_pages?: number;
         };
-        /**
-         * @description The STT provider to use.
-         * @enum {string}
-         */
-        STTProvider: "cloudflare" | "openai" | "vertex" | "antfly" | "apple";
         /**
          * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
          *
@@ -23714,6 +24119,25 @@ export interface components {
             qualified_limits?: {
                 [key: string]: unknown;
             };
+            /**
+             * @description Whether this artifact can run in the current build. `incompatible`
+             *     artifacts are rejected before load; a model whose directory cannot
+             *     be read is listed as `incompatible` with `error` set.
+             * @enum {string}
+             */
+            compatibility?: "compatible" | "unknown" | "incompatible";
+            /**
+             * @description False when this deployment rejects public execution
+             *     (`public_inference_enabled: false`); the model is installed and
+             *     listed, but public calls return 403. Omitted when it can be invoked.
+             */
+            invocable?: boolean;
+            /** @description Why the model is unusable, set when its directory could not be read. Other models still list. */
+            error?: {
+                /** @description Error identifier, for example `MissingGlinerSpanEncoderConfig`. */
+                code: string;
+                message: string;
+            };
             /** @description List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring. */
             capabilities?: string[];
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
@@ -23729,7 +24153,7 @@ export interface components {
             usage: components["schemas"]["DecisionUsage"];
         };
         InferenceModelsResponse: {
-            /** @description Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
+            /** @description Whether public inference execution is enabled on this deployment. When false, locally installed models are still listed with `invocable: false` and remote upstreams are not probed. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
             public_inference_enabled?: boolean;
             /**
              * @description OpenAI-compatible response object type.

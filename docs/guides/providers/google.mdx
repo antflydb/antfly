@@ -1,6 +1,7 @@
 ---
 title: Google Gemini and Vertex AI
 description: Gemini API and Vertex AI embeddings, generation, reranking, reading, transcription, speech, and web search
+order: 10
 ---
 
 Google models are reachable two ways. The `gemini` provider calls the Gemini
@@ -55,7 +56,48 @@ and count toward the agent's context limit.
 }
 ```
 
+## Extraction
+
+Use `gemini` as an extraction provider: name the model and the schema, and
+Antfly runs a generated extractor on that model. As an `extractor` producer on an
+enrichment:
+
+```json
+{
+  "type": "extractor",
+  "config": {
+    "provider": "gemini",
+    "model": "gemini-2.5-flash",
+    "api_key": "${secret:gemini.api_key}",
+    "schema": {
+      "entities": ["person", "company"],
+      "relations": [{"type": "works_for"}]
+    }
+  }
+}
+```
+
+The schema takes `entities` and `relations`. Admitted model families: Gemini 2.0, 2.5, and 3 in `flash`, `flash-lite`, and `pro`, including `-preview` and numbered releases. With `vertex`, add `project_id` and optionally `location` and `credentials_path`.
+Other models, and task variants such as audio, image, search, or embedding
+models, are rejected when the config is saved. Scores are verdict-only.
+
+To set instructions, output mode, probabilities, or batching, use the
+generated form instead, which takes the same generator config under
+`generator`:
+
+```json
+{
+  "method": "generated",
+  "generator": {"provider": "gemini", "model": "gemini-2.5-flash", "api_key": "${secret:gemini.api_key}"},
+  "probabilities": "verdict_only",
+  "instructions": "Only extract people named in the signature block.",
+  "schema": {"entities": ["person"]}
+}
+```
+
+The generated form, with `inputs` added, is also what `/ai/v1/extract` accepts.
+
 ## Related
 
-- [Provider rate limits](/docs/guides/provider-rate-limits)
+- [Provider rate limits](/docs/guides/providers/rate-limits)
 - [Inference Components and Providers](/docs/guides/inference-providers)

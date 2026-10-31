@@ -640,6 +640,22 @@ pub const EntityCompanyPropertiesHeadquarters = struct {
     /// Full country name.
     country: OpenApiOptionalNullable([]const u8) = .absent,
 
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "address", "address", false },
+        .{ "city", "city", false },
+        .{ "postalCode", "postal_code", false },
+        .{ "country", "country", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         switch (self.address) {
@@ -694,6 +710,19 @@ pub const EntityCompanyPropertiesHeadquarters = struct {
 pub const EntityCompanyPropertiesWebTraffic = struct {
     /// Estimated monthly website visits.
     visits_monthly: OpenApiOptionalNullable(i64) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "visitsMonthly", "visits_monthly", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();

@@ -939,6 +939,15 @@ pub const Detail = enum(c_int) {
     invalid_cloudflare_response,
     document_token_limit_exceeded,
     hierarchy_cursor_stale,
+    read_transient_failure,
+    read_request_failed,
+    invalid_gcs_url,
+    gcs_connection_not_found_or_out_of_scope,
+    ambiguous_gcs_connection,
+    invalid_connection_credentials,
+    pioneer_credential_missing,
+    unsupported_pioneer_schema,
+    unsupported_pioneer_input,
 };
 
 pub const Status = extern struct {
@@ -956,6 +965,12 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.ReadTransientFailure => status(.retryable, .read_transient_failure),
+        error.ReadRequestFailed => status(.invalid_argument, .read_request_failed),
+        error.InvalidGcsUrl => status(.invalid_argument, .invalid_gcs_url),
+        error.GcsConnectionNotFoundOrOutOfScope => status(.forbidden, .gcs_connection_not_found_or_out_of_scope),
+        error.AmbiguousGcsConnection => status(.invalid_argument, .ambiguous_gcs_connection),
+        error.InvalidConnectionCredentials => status(.invalid_argument, .invalid_connection_credentials),
         error.InvalidDocumentSource => status(.invalid_argument, .invalid_document_source),
         error.UnsupportedDocumentFormat => status(.invalid_argument, .unsupported_document_format),
         error.DocumentSourceLimitExceeded => status(.invalid_argument, .document_source_limit_exceeded),
@@ -973,6 +988,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidCloudflareConfig => status(.invalid_argument, .invalid_cloudflare_config),
         error.UnsupportedCloudflareModel => status(.invalid_argument, .unsupported_cloudflare_model),
         error.UnsupportedCloudflareSchema => status(.invalid_argument, .unsupported_cloudflare_schema),
+        error.PioneerCredentialMissing => status(.invalid_argument, .pioneer_credential_missing),
+        error.UnsupportedPioneerSchema => status(.invalid_argument, .unsupported_pioneer_schema),
+        error.UnsupportedPioneerInput => status(.invalid_argument, .unsupported_pioneer_input),
         error.CloudflareAuthenticationFailed => status(.unauthorized, .cloudflare_authentication_failed),
         error.InvalidExtractorResponse => status(.invalid_argument, .invalid_extractor_response),
         error.UnsupportedExtractionSchemaVersion => status(.invalid_argument, .unsupported_extraction_schema_version),
@@ -1859,6 +1877,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_cloudflare_config => "InvalidCloudflareConfig",
         .unsupported_cloudflare_model => "UnsupportedCloudflareModel",
         .unsupported_cloudflare_schema => "UnsupportedCloudflareSchema",
+        .pioneer_credential_missing => "PioneerCredentialMissing",
+        .unsupported_pioneer_schema => "UnsupportedPioneerSchema",
+        .unsupported_pioneer_input => "UnsupportedPioneerInput",
         .cloudflare_authentication_failed => "CloudflareAuthenticationFailed",
         .invalid_extractor_response => "InvalidExtractorResponse",
         .unsupported_extraction_schema_version => "UnsupportedExtractionSchemaVersion",
@@ -1992,6 +2013,13 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
         .hierarchy_cursor_stale => "HierarchyCursorStale",
+        .read_transient_failure => "ReadTransientFailure",
+        .read_request_failed => "ReadRequestFailed",
+        .invalid_gcs_url => "InvalidGcsUrl",
+        .gcs_connection_not_found_or_out_of_scope => "GcsConnectionNotFoundOrOutOfScope",
+        .ambiguous_gcs_connection => "AmbiguousGcsConnection",
+        .invalid_connection_credentials => "InvalidConnectionCredentials",
+
         .crc_mismatch => "CrcMismatch",
         .invalid_data => "InvalidData",
         .mapped_artifact_unsupported => "MappedArtifactUnsupported",
@@ -3161,6 +3189,9 @@ test "durable document policy errors retain identity across native runtime bound
         error.InvalidCloudflareConfig,
         error.UnsupportedCloudflareModel,
         error.UnsupportedCloudflareSchema,
+        error.PioneerCredentialMissing,
+        error.UnsupportedPioneerSchema,
+        error.UnsupportedPioneerInput,
         error.CloudflareAuthenticationFailed,
         error.InvalidExtractorResponse,
         error.UnsupportedExtractionSchemaVersion,
@@ -3183,5 +3214,14 @@ test "durable document policy errors retain identity across native runtime bound
         error.OutOfMemory,
     }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
+test "reader failures preserve retry semantics and GCS failures preserve scope semantics" {
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.ReadTransientFailure).code);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.ReadRequestFailed).code);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.GcsConnectionNotFoundOrOutOfScope).code);
+    inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
+        try std.testing.expectEqual(expected, errorFromStatus(statusFromError(expected)));
     }
 }

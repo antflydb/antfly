@@ -1,25 +1,25 @@
 ---
 title: Multimodal Embeddings
-description: Index and search images, audio, and documents with executable Antfly workflows
+description: Index and search images, audio, and video with native multimodal embeddings, precomputed descriptions, or your own vectors
 prerequisites:
   - Antfly installed and running
   - Antfly Inference with the ClipClap model for native image or audio embeddings
 difficulty: intermediate
 estimatedTime: "20 min"
-tags: [multimodal, images, pdf, embeddings]
-sidebar: concepts
-order: 6
+tags: [multimodal, images, audio, embeddings]
+sidebar: ingest
+order: 2
 ---
 
 <Questions>
 - How do I index images in Antfly?
 - How do I search by image or audio?
 - When should I preprocess media into text?
-- How do I index PDFs durably?
+- How do I index PDFs and scanned documents?
 - Which embedding providers can maintain an index?
 </Questions>
 
-Antfly indexes images, audio, and documents in one of three shapes, and the choice decides what runs at write time, what is stored durably, and which providers can maintain the index. ClipClap, the native model, puts text, images, and audio in one vector space, so a plain-language query can return a picture and a picture can return its neighbors.
+Antfly indexes images, audio, and video in one of three shapes, and the choice decides what runs at write time, what is stored durably, and which providers can maintain the index. ClipClap, the native model, puts text, images, and audio in one vector space, so a plain-language query can return a picture and a picture can return its neighbors.
 
 ## Choose the Ingestion Shape
 
@@ -253,54 +253,13 @@ model revisions in one index.
 Managed index creation accepts `antfly`, `ollama`, `openai`, `openrouter`,
 `cohere`, `gemini`, `vertex`, and `bedrock`.
 
-## Durable PDF Ingestion
+## Documents and Scans
 
-Template helpers are request-time transformations; they do not persist PDF
-pages or make OCR output independently reprocessable. Use a
-`document_extraction` asset producer for durable document ingestion:
-
-```json
-{
-  "name": "document_units_v1",
-  "kind": "asset",
-  "field": "url",
-  "content_type": "application/json",
-  "producer_json": "{\"type\":\"document_extraction\",\"config\":{}}"
-}
-```
-
-The built-in parser targets unencrypted, born-digital PDFs. Pages with no native
-text, such as scans and photos, are read with OCR. Use
-[LightOnOCR-3](/docs/guides/lightonocr3), which transcribes pages into Markdown
-with tables and formulas:
-
-```bash
-antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671bd8e479c517a004f7566bd9
-```
-
-```json
-{
-  "name": "document_units_v1",
-  "kind": "asset",
-  "field": "url",
-  "content_type": "application/json",
-  "producer_json": "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"prompt_policy\":\"plain\",\"config\":{\"provider\":\"antfly\",\"model\":\"lightonai/LightOnOCR-3-0.8B\"}}}}"
-}
-```
-
-LightOnOCR-3 takes no instruction prompt, so set `prompt_policy` to `plain`.
-Without an `ocr` model, extraction uses the smaller `antflydb/Florence-2-base`
-reader. Any reader provider works here, including
-[Apple Vision](/docs/guides/providers/apple) on macOS.
-
-If the model is absent, the page records a failed OCR outcome instead of
-silently disappearing. Install the model and explicitly reprocess the artifact
-to retry. Set `ocr_fallback` to `false` or `ocr.enabled` to `false` to disable
-OCR. For formats outside the built-in parser, use the
-[docsaf CLI](https://github.com/antflydb/antfly/tree/main/go/pkg/docsaf).
-
-`remotePDF` remains a compatibility helper for template-time extraction, but it
-is deprecated. Prefer durable extraction for production workflows.
+To index PDFs, Office documents, scanned pages, and photos of documents as
+text, use a `document_extraction` enrichment, which extracts native text and
+reads the rest with OCR. [Index PDFs and Scanned Documents](/docs/guides/index-documents)
+walks through it. `remotePDF` remains a deprecated template helper; prefer
+durable extraction.
 
 ## Operational Guidance
 
@@ -330,5 +289,5 @@ Then prompt it with the outcome, for example "Add a ClipClap image index over th
 ## Next Steps
 
 - [Quickstart](/docs/guides/quickstart#image-search): the same image index built over the Wikipedia thumbnails
-- [Artifact-Backed Indexes](/docs/guides/artifact-indexes): searching extracted PDF pages and chunks alongside whole documents
+- [Index PDFs and Scanned Documents](/docs/guides/index-documents): extracting and OCRing documents into searchable text
 - [Antfly Inference](/docs/guides/inference): pulling ClipClap and the other local models

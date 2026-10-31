@@ -46,6 +46,7 @@ from .antfly_generator_config import AntflyGeneratorConfig
 from .antfly_generator_config_provider import AntflyGeneratorConfigProvider
 from .antfly_reranker_config import AntflyRerankerConfig
 from .antfly_reranker_config_provider import AntflyRerankerConfigProvider
+from .antfly_stt_config import AntflySTTConfig
 from .antfly_type import AntflyType
 from .anthropic_generator_config import AnthropicGeneratorConfig
 from .anthropic_generator_config_provider import AnthropicGeneratorConfigProvider
@@ -54,6 +55,7 @@ from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
 from .apple_generator_config import AppleGeneratorConfig
 from .apple_generator_config_provider import AppleGeneratorConfigProvider
+from .apple_stt_config import AppleSTTConfig
 from .artifact_index_source import ArtifactIndexSource
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
@@ -168,6 +170,8 @@ from .cloudflare_generator_config import CloudflareGeneratorConfig
 from .cloudflare_generator_config_provider import CloudflareGeneratorConfigProvider
 from .cloudflare_reranker_config import CloudflareRerankerConfig
 from .cloudflare_reranker_config_provider import CloudflareRerankerConfigProvider
+from .cloudflare_stt_config import CloudflareSTTConfig
+from .cloudflare_stt_config_provider import CloudflareSTTConfigProvider
 from .cluster_backup_request import ClusterBackupRequest
 from .cluster_backup_request_format import ClusterBackupRequestFormat
 from .cluster_backup_response import ClusterBackupResponse
@@ -344,6 +348,22 @@ from .document_artifact_table_reprocess_response_reprocess import DocumentArtifa
 from .document_artifact_table_reprocess_response_reprocess_status import (
     DocumentArtifactTableReprocessResponseReprocessStatus,
 )
+from .document_extraction_config import DocumentExtractionConfig
+from .document_extraction_config_route_preset import DocumentExtractionConfigRoutePreset
+from .document_extraction_ocr_config import DocumentExtractionOcrConfig
+from .document_extraction_ocr_config_mode import DocumentExtractionOcrConfigMode
+from .document_extraction_ocr_quality_config import DocumentExtractionOcrQualityConfig
+from .document_extraction_reader_config import DocumentExtractionReaderConfig
+from .document_extraction_reader_config_provider import DocumentExtractionReaderConfigProvider
+from .document_extraction_reader_config_recognition_level import DocumentExtractionReaderConfigRecognitionLevel
+from .document_extraction_render_config import DocumentExtractionRenderConfig
+from .document_extraction_render_config_resolution import DocumentExtractionRenderConfigResolution
+from .document_extraction_route import DocumentExtractionRoute
+from .document_extraction_route_extractor import DocumentExtractionRouteExtractor
+from .document_extraction_route_extractor_type import DocumentExtractionRouteExtractorType
+from .document_extraction_route_match import DocumentExtractionRouteMatch
+from .document_extraction_source_config import DocumentExtractionSourceConfig
+from .document_extraction_transcription_config import DocumentExtractionTranscriptionConfig
 from .document_field_mapping import DocumentFieldMapping
 from .document_field_mapping_fields import DocumentFieldMappingFields
 from .document_field_mapping_missing_null_policy import DocumentFieldMappingMissingNullPolicy
@@ -1059,7 +1079,9 @@ from .inference_memory_config import InferenceMemoryConfig
 from .inference_model_backend import InferenceModelBackend
 from .inference_model_info import InferenceModelInfo
 from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
+from .inference_model_info_compatibility import InferenceModelInfoCompatibility
 from .inference_model_info_dense_output import InferenceModelInfoDenseOutput
+from .inference_model_info_error import InferenceModelInfoError
 from .inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_instance import InferenceModelInstance
@@ -1919,6 +1941,7 @@ from .open_ai_embedder_config_provider import OpenAIEmbedderConfigProvider
 from .open_ai_generator_config import OpenAIGeneratorConfig
 from .open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
 from .open_ai_reasoning_effort import OpenAIReasoningEffort
+from .open_aistt_config import OpenAISTTConfig
 from .open_router_embedder_config import OpenRouterEmbedderConfig
 from .open_router_embedder_config_provider import OpenRouterEmbedderConfigProvider
 from .open_router_generator_config import OpenRouterGeneratorConfig
@@ -2118,6 +2141,7 @@ from .relational_unique_constraint import RelationalUniqueConstraint
 from .relational_unique_constraint_origin import RelationalUniqueConstraintOrigin
 from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
+from .repair_remaining_failure import RepairRemainingFailure
 from .repair_run_request import RepairRunRequest
 from .repair_run_request_control import RepairRunRequestControl
 from .repair_target import RepairTarget
@@ -2335,6 +2359,7 @@ from .storage_status import StorageStatus
 from .store_root_enrollment_identity import StoreRootEnrollmentIdentity
 from .store_root_enrollment_request import StoreRootEnrollmentRequest
 from .stream_transcription_audio_format import StreamTranscriptionAudioFormat
+from .stt_config import STTConfig
 from .stt_provider import STTProvider
 from .style import Style
 from .success_message import SuccessMessage
@@ -2494,6 +2519,7 @@ from .vertex_reranker_config_provider import VertexRerankerConfigProvider
 from .vertex_search_config import VertexSearchConfig
 from .vertex_search_config_provider import VertexSearchConfigProvider
 from .vertex_search_config_service import VertexSearchConfigService
+from .vertex_stt_config import VertexSTTConfig
 from .video_sampling_policy import VideoSamplingPolicy
 from .video_sampling_policy_overflow import VideoSamplingPolicyOverflow
 from .video_sampling_policy_policy import VideoSamplingPolicyPolicy
@@ -2552,6 +2578,7 @@ __all__ = (
     "AntflyGeneratorConfigProvider",
     "AntflyRerankerConfig",
     "AntflyRerankerConfigProvider",
+    "AntflySTTConfig",
     "AntflyType",
     "AnthropicGeneratorConfig",
     "AnthropicGeneratorConfigProvider",
@@ -2560,6 +2587,7 @@ __all__ = (
     "ApiKeyWithSecret",
     "AppleGeneratorConfig",
     "AppleGeneratorConfigProvider",
+    "AppleSTTConfig",
     "ArtifactIndexSource",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
@@ -2674,6 +2702,8 @@ __all__ = (
     "CloudflareGeneratorConfigProvider",
     "CloudflareRerankerConfig",
     "CloudflareRerankerConfigProvider",
+    "CloudflareSTTConfig",
+    "CloudflareSTTConfigProvider",
     "ClusterBackupRequest",
     "ClusterBackupRequestFormat",
     "ClusterBackupResponse",
@@ -2848,6 +2878,22 @@ __all__ = (
     "DocumentArtifactTableReprocessResponse",
     "DocumentArtifactTableReprocessResponseReprocess",
     "DocumentArtifactTableReprocessResponseReprocessStatus",
+    "DocumentExtractionConfig",
+    "DocumentExtractionConfigRoutePreset",
+    "DocumentExtractionOcrConfig",
+    "DocumentExtractionOcrConfigMode",
+    "DocumentExtractionOcrQualityConfig",
+    "DocumentExtractionReaderConfig",
+    "DocumentExtractionReaderConfigProvider",
+    "DocumentExtractionReaderConfigRecognitionLevel",
+    "DocumentExtractionRenderConfig",
+    "DocumentExtractionRenderConfigResolution",
+    "DocumentExtractionRoute",
+    "DocumentExtractionRouteExtractor",
+    "DocumentExtractionRouteExtractorType",
+    "DocumentExtractionRouteMatch",
+    "DocumentExtractionSourceConfig",
+    "DocumentExtractionTranscriptionConfig",
     "DocumentFieldMapping",
     "DocumentFieldMappingFields",
     "DocumentFieldMappingMissingNullPolicy",
@@ -3557,7 +3603,9 @@ __all__ = (
     "InferenceModelBackend",
     "InferenceModelInfo",
     "InferenceModelInfoChunkingLimits",
+    "InferenceModelInfoCompatibility",
     "InferenceModelInfoDenseOutput",
+    "InferenceModelInfoError",
     "InferenceModelInfoInferenceCapabilities",
     "InferenceModelInfoQualifiedLimits",
     "InferenceModelInstance",
@@ -4203,6 +4251,7 @@ __all__ = (
     "OpenAIGeneratorConfig",
     "OpenAIGeneratorConfigProvider",
     "OpenAIReasoningEffort",
+    "OpenAISTTConfig",
     "OpenRouterEmbedderConfig",
     "OpenRouterEmbedderConfigProvider",
     "OpenRouterGeneratorConfig",
@@ -4400,6 +4449,7 @@ __all__ = (
     "RelationalUniqueConstraintOrigin",
     "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
+    "RepairRemainingFailure",
     "RepairRunRequest",
     "RepairRunRequestControl",
     "RepairTarget",
@@ -4617,6 +4667,7 @@ __all__ = (
     "StoreRootEnrollmentIdentity",
     "StoreRootEnrollmentRequest",
     "StreamTranscriptionAudioFormat",
+    "STTConfig",
     "STTProvider",
     "Style",
     "SuccessMessage",
@@ -4776,6 +4827,7 @@ __all__ = (
     "VertexSearchConfig",
     "VertexSearchConfigProvider",
     "VertexSearchConfigService",
+    "VertexSTTConfig",
     "VideoSamplingPolicy",
     "VideoSamplingPolicyOverflow",
     "VideoSamplingPolicyPolicy",

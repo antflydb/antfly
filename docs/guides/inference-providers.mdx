@@ -1,9 +1,9 @@
 ---
 title: Inference Components and Providers
-sidebar: concepts
-order: 3
 description: The kinds of inference Antfly runs, where each plugs in, and which providers serve each kind
 tags: [inference, providers, embedding, reranking, generation, ocr, transcription]
+sidebar: inference
+order: 2
 ---
 
 <Questions>
@@ -41,17 +41,17 @@ environment variables; see [Secrets management](/docs/secrets).
 | Provider | [Embedder](#embedder) | [Reranker](#reranker) | [Chunker](#chunker) | [Reader](#reader) | [Transcriber](#transcriber) | [Speech](#speech-synthesizer) | [Generator](#generator) | [Extractor](#extractor) | [Decider](#decider) | [Web search](#web-search) |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | [Antfly](/docs/guides/providers/antfly) (`antfly`) | ✓ | ✓ | ✓ | ✓ | ✓ |  | ✓ | ✓ | ✓ |  |
-| [Anthropic](/docs/guides/providers/anthropic) (`anthropic`) |  |  |  |  |  |  | ✓ |  |  |  |
+| [Anthropic](/docs/guides/providers/anthropic) (`anthropic`) |  |  |  |  |  |  | ✓ | ✓ |  |  |
 | [Apple](/docs/guides/providers/apple) (`apple`) |  |  |  | ✓ | ✓ |  | ✓ |  |  |  |
-| [AWS Bedrock](/docs/guides/providers/bedrock) (`bedrock`) | ✓ |  |  |  |  |  | ✓ |  |  |  |
+| [AWS Bedrock](/docs/guides/providers/bedrock) (`bedrock`) | ✓ |  |  |  |  |  | ✓ | ✓ |  |  |
 | [Brave](/docs/guides/providers/web-search) (`brave`) |  |  |  |  |  |  |  |  |  | ✓ |
 | [ChatGPT plan](/docs/guides/providers/chatgpt) (`chatgpt`) |  |  |  |  |  |  | ✓ |  |  |  |
 | [Cloudflare Workers AI](/docs/guides/providers/cloudflare) (`cloudflare`) | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |  |
 | [Cohere](/docs/guides/providers/cohere) (`cohere`) | ✓ | ✓ |  |  |  |  |  |  |  |  |
 | [ElevenLabs](/docs/guides/providers/elevenlabs) (`elevenlabs`) |  |  |  |  |  | ✓ |  |  |  |  |
 | [Exa](/docs/guides/providers/web-search) (`exa`) |  |  |  |  |  |  |  |  |  | ✓ |
-| [Gemini API](/docs/guides/providers/google) (`gemini`) | ✓ |  |  |  |  |  | ✓ |  |  |  |
-| [Google Vertex AI](/docs/guides/providers/google) (`vertex`) | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ |  |  | ✓ |
+| [Gemini API](/docs/guides/providers/google) (`gemini`) | ✓ |  |  |  |  |  | ✓ | ✓ |  |  |
+| [Google Vertex AI](/docs/guides/providers/google) (`vertex`) | ✓ | ✓ |  | ✓ | ✓ | ✓ | ✓ | ✓ |  | ✓ |
 | [Jev (TypeSafe)](/docs/guides/providers/jev) (`jev`) |  |  |  |  |  |  |  |  | ✓ |  |
 | [Linkup](/docs/guides/providers/web-search) (`linkup`) |  |  |  |  |  |  |  |  |  | ✓ |
 | [Ollama](/docs/guides/providers/ollama) (`ollama`) | ✓ |  |  |  |  |  | ✓ |  |  |  |
@@ -96,7 +96,7 @@ Chunking runs in Antfly; any embedder can embed the chunks. Direct endpoint:
 Reads text from page images and documents: OCR and document parsing. Configured
 under `readers`, used by the `reader` enrichment producer and by
 `document_extraction` for scanned pages. Direct endpoint: `/ai/v1/read`.
-[LightOnOCR-3](/docs/guides/lightonocr3) is the recommended local reader.
+[LightOnOCR-3](/docs/guides/models/lightonocr3) is the recommended local reader.
 
 ### Transcriber
 
@@ -118,7 +118,7 @@ the `generator` enrichment producer, retrieval agents, and generated deciders an
 extractors. Generators can be chained so a request falls back to the next
 provider. Direct endpoints: `/ai/v1/generate` and `/ai/v1/chat/completions`. See
 the [Named inference gateway](https://github.com/antflydb/antfly/blob/main/docs/reference/inference-gateway.md)
-for chains, sessions, and tools, and [Provider rate limits](/docs/guides/provider-rate-limits)
+for chains, sessions, and tools, and [Provider rate limits](/docs/guides/providers/rate-limits)
 for quotas.
 
 Server-side agents can call function tools through the Antfly, OpenAI,
@@ -131,7 +131,11 @@ to use tools, because text-only callbacks cannot carry tool calls and results.
 
 Pulls entities, relations, and structured records out of text. Configured under
 `extractors` and used by the `extractor` enrichment producer and graph indexes.
-A generator can also act as an extractor through a constrained output schema.
+OpenAI, Gemini, Vertex AI, Anthropic, and Bedrock Claude models extract
+directly: set the extractor's `provider` and `model`, and Antfly runs the model
+with a constrained output schema. The generated form (`"method": "generated"`)
+adds instructions, output mode, probabilities, and batching, and works with any
+qualified generator.
 Direct endpoint: `/ai/v1/extract`.
 
 ### Decider
@@ -162,4 +166,4 @@ them.
 
 - [Antfly](/docs/guides/providers/antfly): the built-in runtime and its recommended models
 - [Local Model Compatibility](/docs/guides/supported-models): which local artifacts load
-- [Provider rate limits](/docs/guides/provider-rate-limits): request, token, and concurrency budgets
+- [Provider rate limits](/docs/guides/providers/rate-limits): request, token, and concurrency budgets

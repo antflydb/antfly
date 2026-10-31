@@ -161,24 +161,47 @@ separate; it needs read access to the originals bucket.
 ./grepstein publish --state ./grepstein-corpus --bucket antfly-showcases-originals
 # Set ANTFLY_API_KEY securely to a write key for this instance/table.
 ./grepstein load --state ./grepstein-corpus --url "$ANTFLY_URL" \
-  --create-table --num-shards 4 --reader-config lightonocr-reader.example.json \
+  --create-table --num-shards 4 --source-connection "$GCS_SOURCE_CONNECTION" \
+  --reader-config lightonocr-reader.example.json \
   --inference-url "$ANTFLY_INFERENCE_URL" \
   --inference-secret antfly.antfly_inference.api_key
 ./grepstein wait --url "$ANTFLY_URL"
+./grepstein qualify --state ./grepstein-corpus --url "$ANTFLY_URL" \
+  --output ./grepstein-corpus/extraction-qualification.json
 ./grepstein stats --state ./grepstein-corpus --url "$ANTFLY_URL"
 ```
+
+`wait` checks index serving milestones. `qualify` separately checks every PDF in
+the sealed publication against its native generation-pinned GCS artifact, exact
+page count and explicit OCR counters from the raw extraction manifest. With API
+authentication enabled, `qualify` needs a table-admin key to read that raw evidence.
+Failed or unfinished extraction, missing counters, stale source bindings or any
+OCR failure block qualification, even when full-text search is ready. Run it
+before semantic/graph enrichment; a successful receipt measures extraction
+coverage, not OCR transcription accuracy, source authorization or public readiness.
 
 The showcase OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
 inference. The deployed Antfly v0.3.0-rc.6 shared L4 reader pool passed synthetic
 OCR and model-switching qualification for both 4B and 0.8B. Those checks establish
 runtime compatibility; corpus coverage and text quality still require a representative
 PDF pilot before backfill. Its native `/read` contract uses
-an image-only prompt, so the extraction producer keeps `prompt_policy: plain`.
-The profile requests at most 512 output tokens per page; truncated OCR returns
-an error instead of publishing incomplete text. Dense pages can need a separate
-larger-budget workflow and a separately qualified serving policy. Do not count
-failed or truncated pages as searchable. Use `zig/tools/qualify_reader_generator_pools.py`
-for native execution checks when changing the runtime or serving policy.
+an image-only prompt; the extraction producer sends no prompt to readers.
+The profile requests at most 2048 output tokens per page. A cached dense DOJ
+page exceeded the earlier 512-token allowance; both reader checkpoints completed
+it at 2048 and retained the checked page-tail text. This is a bounded sample,
+not a completeness guarantee for every page. The serving policy must permit
+`resources.inference.request_limits.max_output_tokens_per_item: 2048` and at
+least 12 `resources.inference.admission.max_work_units` for one image-only
+request. Keep request concurrency at one while qualifying the intended GPU and
+memory limits. The deployed 512-token/eight-unit policy needs a separately
+reviewed update before this profile can be used there.
+Truncated OCR returns an error instead of publishing incomplete text. Do not
+count failed or truncated pages as searchable. Complete the
+[release qualification](../../docs/design/inference/grepstein-release-qualification.md)
+before backfill or enrichment. `zig/tools/qualify_reader_generator_pools.py`
+uses a 512-token reader policy by default; pass
+`--reader-max-output-tokens 2048` to check the larger serving ceiling and its
+exact rejection boundary. Its synthetic pass does not establish corpus coverage.
 The LightOnOCR models return
 Markdown, including table structure, through the same native reader API.
 Set `ANTFLY_INFERENCE_URL` to a server-reachable inference root or `/ai/v1` URL;
@@ -222,16 +245,22 @@ truncated/blocked model completions and preserve all final Vertex text parts. In
 publication can be rerun. Keep the state and immutable source snapshots for
 recovery. No local source server is required after publication.
 
-V1 uses Antfly's **existing S3-compatible remote-content reader against GCS's
-XML endpoint**: source rows use `s3://BUCKET/objects/sha256/...`. They are GCS
-objects, not AWS objects. Configure a bucket-scoped GCS HMAC read credential in
-Colony's existing S3 provider connection, endpoint `storage.googleapis.com`, SSL
-enabled, with `buckets: ["antfly-showcases-originals"]`. Colony already publishes
-these credentials to Antfly's secret store and hot-reloaded remote-content
-configuration. Keep HMAC material out of manifests, index configs, and Pulumi
-state. Self-hosted deployments configure that same bucket-scoped `remote_content.s3`
-entry with secret references. Direct `gs://` remote artifact fetching is not added
-by this example; the existing GCS source connector uses the JSON API separately.
+Native artifact reads use `gs://BUCKET/objects/sha256/...?generation=GENERATION`
+through an existing `connections` entry with protocol `gcs`, capability
+`content.fetch`, an exact bucket allowlist and prefix `objects/sha256`.
+Set `GCS_SOURCE_CONNECTION` to that runtime connection name. In Cloud, configure
+the existing instance GCS provider connection with Google Workload Identity,
+read-only access, the bucket and prefix; Colony seals this selector and publishes
+the scoped runtime connection. Grant only the instance's Kubernetes Workload
+Identity principal `roles/storage.objectViewer` on the originals bucket.
+Self-hosting uses the same canonical connection with ADC or a keystore-backed
+Google credential source. A bare `gs://` URL never enables ambient access.
+No HMAC keys or organization-policy exceptions are required.
+
+This native artifact transport is new in this PR and requires the next published
+Antfly release containing it; rc.6 has GCS external-I/O support but does not route
+artifact downloads through it. Keep the corpus private and staged until the
+released runtime passes generation, scope and real-PDF OCR qualification.
 
 `load` defaults to full text only and resumes durable batches against the exact
 manifest, endpoint, table identity, and extraction configuration. Reuse the same

@@ -16,29 +16,32 @@
 """Render staged managed HN requests without creating infrastructure or credentials."""
 
 import argparse
-from copy import deepcopy
 import json
-from pathlib import Path
 import re
+from copy import deepcopy
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from uuid import UUID
 
 from configure_catalog import table_definition
+
+RUNTIME = json.loads(Path(__file__).with_name("runtime.json").read_text())
 
 
 def connection(auth_id):
     return "cloud-gcs-cred_" + UUID(auth_id).hex
 
 
-def management_plan(project, image):
+def management_plan(project, image=None):
+    image = image or RUNTIME["image"]
     if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project):
         raise ValueError("Invalid showcase project")
     match = re.fullmatch(
-        r"[a-zA-Z0-9./_-]+(?::0\.3\.0-rc\.5)?@(sha256:[a-f0-9]{64})", image
+        r"[a-zA-Z0-9./_-]+(?::v?0\.3\.0-rc\.6)?@(sha256:[a-f0-9]{64})", image
     )
-    if not match:
+    if not match or match[1] != RUNTIME["image"].rsplit("@", 1)[1]:
         raise ValueError(
-            "Supply the published, verified RC.5 multi-platform image digest"
+            "Supply the published, verified RC.7 multi-platform image digest recorded in runtime.json"
         )
 
     def binding(name, bucket, prefix, mode):
@@ -55,12 +58,12 @@ def management_plan(project, image):
             "name": "Hacker News",
             "slug": "hackernews",
             "region": "us-central1",
-            "tier": "starter",
+            "tier": "standard",
             "mode": "single",
             "version_policy": "pinned",
             "node_config": {"cpu": "1000m", "memory": "4Gi", "data_storage": "20Gi"},
             "initial_runtime": {
-                "version": "v0.3.0-rc.5",
+                "version": RUNTIME["version"],
                 "image": image,
                 "image_digest": match[1],
             },
@@ -97,7 +100,16 @@ def management_plan(project, image):
     }
 
 
-def native_plan(project, archive_auth, current_auth):
+def native_plan(project, archive_auth, current_auth, archive_prefix="archive"):
+    path = PurePosixPath(archive_prefix)
+    if (
+        str(path) != archive_prefix
+        or path.is_absolute()
+        or ".." in path.parts
+        or path.parts[:1] != ("archive",)
+        or not re.fullmatch(r"[A-Za-z0-9_./-]+", archive_prefix)
+    ):
+        raise ValueError("Archive prefix must be a canonical path within archive/")
     current = table_definition(
         SimpleNamespace(
             mode="managed",
@@ -112,9 +124,14 @@ def native_plan(project, archive_auth, current_auth):
         "kind": "external",
         "format": "parquet",
         "table_id": "hn-archive",
-        "uri": f"gs://{project}-hn-archive/archive",
+        "uri": f"gs://{project}-hn-archive/{archive_prefix}",
         "credentials": {"ref": connection(archive_auth)},
     }
+    # Relational indexes share the SQL relation namespace, including across
+    # object tables. The copied schemas must not reserve the same index names.
+    for table, definition in (("hn_archive", archive), ("hn_current", current)):
+        for index in definition["schema"]["relational_indexes"]:
+            index["name"] = table + "_" + index["name"]
     return {
         "archive-table.json": archive,
         "current-table.json": current,
@@ -136,8 +153,15 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     commands = parser.add_subparsers(dest="stage", required=True)
     management = commands.add_parser("management")
-    management.add_argument("--image", required=True)
+    management.add_argument(
+        "--image", help="Optional mirror of the digest in runtime.json"
+    )
     native = commands.add_parser("native")
+    native.add_argument(
+        "--archive-prefix",
+        default="archive",
+        help="Frozen archive snapshot or private qualification prefix",
+    )
     native.add_argument("--archive-auth", required=True)
     native.add_argument("--current-auth", required=True)
     args = parser.parse_args()
@@ -145,7 +169,9 @@ def main():
         files = (
             management_plan(args.project, args.image)
             if args.stage == "management"
-            else native_plan(args.project, args.archive_auth, args.current_auth)
+            else native_plan(
+                args.project, args.archive_auth, args.current_auth, args.archive_prefix
+            )
         )
         # A plan is review evidence; do not silently overwrite earlier inputs.
         args.output.mkdir(parents=True, exist_ok=False)

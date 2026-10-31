@@ -1,7 +1,7 @@
 # EmbeddingGemma 2 embeddings and similarity decisions
 
 > Historical record: the full EmbeddingGemma 2 guide as of 2026-10-22, kept for its
-> qualification evidence. The current guide is [EmbeddingGemma 2](../../../../guides/embeddinggemma2.md).
+> qualification evidence. The current guide is [EmbeddingGemma 2](../../../../guides/models/embeddinggemma2.mdx).
 
 Antfly runs the open Hugging Face `google/embeddinggemma-2` safetensors checkpoint
 on native CPU, Metal and CUDA. Text, images, audio, video and ordered combinations

@@ -1002,6 +1002,7 @@ fn artifactRepairRunRequestForShard(
         .repair_attempt_id = req.repair_attempt_id,
         .repair_job_created_at_ms = req.repair_job_created_at_ms,
         .repair_cancel_base_uri = req.repair_cancel_base_uri,
+        .operator_initiated = req.operator_initiated,
     };
 }
 
@@ -24883,7 +24884,11 @@ pub const ProvisionedTableWriteSource = struct {
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const group_result = try db.repairArtifactIssuesWithRequestOptions(alloc, req, effective_options);
-            if (group_result.scanned > 0) self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            // Deferred repair submits durable replay for the maintenance owner.
+            // Draining a transient writer here would execute providers while
+            // this request still owns the exclusive group-operation guard.
+            if (group_result.scanned > 0 and !effective_options.defer_durable_index_repair_execution)
+                self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             break :blk group_result;
         };
         errdefer result.deinit(alloc);
@@ -34042,15 +34047,12 @@ fn consumerTests() type {
         test "provisioning detects document extraction OCR as model backed" {
             const alloc = std.testing.allocator;
             try std.testing.expect(try indexesJsonNeedsAssetProducer(alloc,
-                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}"}]}]
+                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}"}]}]
             ));
-            // PDF OCR fallback is enabled by default, so an otherwise-empty document
-            // extraction config still needs the model-backed asset producer.
-            try std.testing.expect(try indexesJsonNeedsAssetProducer(alloc,
-                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]}]
-            ));
+            // Without an ocr or transcription block, extraction is native text
+            // only and needs no model-backed producer.
             try std.testing.expect(!(try indexesJsonNeedsAssetProducer(alloc,
-                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr_fallback\":false}}"}]}]
+                \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]}]
             )));
         }
 

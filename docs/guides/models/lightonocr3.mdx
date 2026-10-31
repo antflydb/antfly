@@ -52,30 +52,28 @@ are not converted into pixel-coordinate `regions`.
 On Metal, and on CUDA with the LightOn batch profile, `/read` batches pages from
 the same request and from concurrent requests on the GPU.
 
-`/read` accepts at most 1024 output tokens
-per page and rejects truncated output. Use `/generate` with a larger budget
-for dense pages; its content should contain the image and either no text or
-the exact `grounding` keyword, with thinking disabled.
+`/read` accepts up to 8192 output tokens per page and rejects truncated output.
+Use this endpoint for repeated page extraction so the reader can reuse its
+prepared execution state. The default output budget remains 256 tokens;
+request a larger budget explicitly for dense pages.
 
 ## Read documents during ingestion
 
-To OCR scanned PDF pages as they are indexed, name the model in a
-`document_extraction` enrichment. `prompt_policy` must be `plain`, because the
-model takes no instruction prompt:
+To OCR scanned PDF pages and images as they are indexed, name the model as the
+`ocr.reader` of a `document_extraction` enrichment:
 
 ```json
 {
   "type": "document_extraction",
   "config": {
     "ocr": {
-      "prompt_policy": "plain",
-      "config": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}
+      "reader": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}
     }
   }
 }
 ```
 
-[Multimodal Embeddings](/docs/guides/multimodal) shows the full enrichment.
+[Index PDFs and Scanned Documents](/docs/guides/index-documents) walks through the full table setup.
 
 ## Image size
 
@@ -84,5 +82,5 @@ The runtime takes its pixel limits from the installed image processor, capped at
 optimizing latency; LightOn's own speed evaluation uses a 1540-pixel long side.
 
 Execution details, GPU tuning switches, and measured throughput are in the
-[LightOnOCR-3 runtime notes](../design/inference/lightonocr3-runtime.md). Published
+[LightOnOCR-3 runtime notes](../../design/inference/lightonocr3-runtime.md). Published
 quality numbers are in [LightOn's evaluation](https://huggingface.co/blog/lightonai/lightonocr-3).

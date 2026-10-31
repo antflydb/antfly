@@ -3842,6 +3842,8 @@ export interface InferenceGatewayModel {
   availability?: string;
   freshness?: string;
   gateway_capabilities?: Record<string, "supported" | "unsupported" | "unknown">;
+  /** False when public inference is disabled: the model is installed, but calls return 403. */
+  invocable?: boolean;
 }
 export interface InferenceGatewayCatalog {
   /** Deployment policy; omitted by servers predating public inference controls. */

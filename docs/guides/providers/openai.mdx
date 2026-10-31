@@ -1,6 +1,7 @@
 ---
 title: OpenAI
 description: OpenAI embeddings, generation, vision reading, transcription, speech, and decisions in Antfly
+order: 10
 ---
 
 The `openai` provider calls the OpenAI API. Its generator adapter also serves
@@ -15,12 +16,10 @@ OpenAI-compatible endpoints; set `url` to point it elsewhere.
 | Transcriber | Audio | `whisper-1`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` |
 | Speech synthesizer | Text | `tts-1` and its voices |
 | Generator | Text, images | Chat Completions, with streaming and function tools |
-| Extractor | Text | Posts to an extraction service at `url` (`{url}/extract`); `url` is required |
 | Decider | Text, images | OpenAI Decisions at `https://api.openai.com/v1/decisions`; a model is required |
 
 The generator sends images as `image_url` parts. Other media, such as audio or
-PDFs, is rejected before the request is sent. To extract structured records with
-an OpenAI model, use a generated extractor backed by an OpenAI generator.
+PDFs, is rejected before the request is sent.
 
 ## Credentials
 
@@ -61,7 +60,48 @@ for parameter support.
 Function tools work with any model that supports function calling; the adapter
 does not make a model tool-capable.
 
+## Extraction
+
+Use `openai` as an extraction provider: name the model and the schema, and
+Antfly runs a generated extractor on that model. As an `extractor` producer on an
+enrichment:
+
+```json
+{
+  "type": "extractor",
+  "config": {
+    "provider": "openai",
+    "model": "gpt-4.1-mini",
+    "api_key": "${secret:openai.api_key}",
+    "schema": {
+      "entities": ["person", "company"],
+      "relations": [{"type": "works_for"}]
+    }
+  }
+}
+```
+
+The schema takes `entities` and `relations`. Admitted model families: `gpt-4o`, `gpt-4.1`, and `gpt-5` (including point releases such as `gpt-5.1`), each with optional `mini` or `nano` tiers and dated snapshots, plus `o3` and `o4-mini`.
+Other models, and task variants such as audio, image, search, or embedding
+models, are rejected when the config is saved. Models in the `gpt-4o` and `gpt-4.1` families score extractions with token log-probabilities; other models use verdict-only scores.
+
+To set instructions, output mode, probabilities, or batching, use the
+generated form instead, which takes the same generator config under
+`generator`:
+
+```json
+{
+  "method": "generated",
+  "generator": {"provider": "openai", "model": "gpt-4.1-mini", "api_key": "${secret:openai.api_key}"},
+  "probabilities": "verdict_only",
+  "instructions": "Only extract people named in the signature block.",
+  "schema": {"entities": ["person"]}
+}
+```
+
+The generated form, with `inputs` added, is also what `/ai/v1/extract` accepts.
+
 ## Related
 
-- [Provider rate limits](/docs/guides/provider-rate-limits)
+- [Provider rate limits](/docs/guides/providers/rate-limits)
 - [Inference Components and Providers](/docs/guides/inference-providers)

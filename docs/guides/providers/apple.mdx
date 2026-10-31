@@ -1,6 +1,7 @@
 ---
 title: Apple
 description: macOS Vision OCR, SpeechAnalyzer transcription, and Foundation Models generation on device
+order: 10
 ---
 
 The `apple` provider uses Apple's on-device frameworks on macOS: Vision for OCR,
@@ -76,7 +77,7 @@ Plain-text output contains the recognized lines. With `content_type:
 text, confidence, and bounding boxes in image pixels from the top left.
 
 Vision recognizes text; it does not rebuild tables or multi-column layouts, and
-it does not describe scenes. Use [LightOnOCR-3](/docs/guides/lightonocr3) for
+it does not describe scenes. Use [LightOnOCR-3](/docs/guides/models/lightonocr3) for
 documents with tables and formulas, or a vision-capable generator to describe
 images.
 
@@ -109,12 +110,9 @@ grounding. This table indexes OCR chunks:
             "type": "document_extraction",
             "config": {
               "ocr": {
-                "enabled": true,
-                "executor": "reader",
                 "mode": "always",
-                "render_dpi": 150,
-                "prompt_policy": "plain",
-                "config": {
+                "render": {"dpi": 150},
+                "reader": {
                   "provider": "apple",
                   "recognition_languages": ["en-US"]
                 }
@@ -139,7 +137,7 @@ grounding. This table indexes OCR chunks:
 Send that body to `POST /db/v1/tables/documents`, then write documents whose
 `document_url` points to a PDF, either a URL or an inline
 `data:application/pdf;base64,...` value. `mode: "always"` OCRs every page; `auto`
-OCRs only pages without native text.
+OCRs only pages whose native text is missing or fails the quality checks.
 
 ## Transcribe Recordings
 
@@ -198,5 +196,5 @@ refusals return errors rather than truncated output.
 ## Related
 
 - [Inference providers](/docs/guides/inference-providers): every provider and component
-- [Multimodal Embeddings](/docs/guides/multimodal): document extraction and OCR options
+- [Index PDFs and Scanned Documents](/docs/guides/index-documents): document extraction and OCR options
 - [Apple native provider design](https://github.com/antflydb/antfly/blob/main/docs/design/apple-intelligence-provider.md): bridge loading, validation, and test commands

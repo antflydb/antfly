@@ -1802,7 +1802,10 @@ pub const AntflyApiHandler = struct {
         const raw_body = (try ctx.body()) orelse "{}";
         const Create = struct { space: []const u8, config: module.memory.types.Config = .{} };
         const creating = std.mem.eql(u8, ctx.request.uri.path, "/memory/v1/spaces");
-        const create = if (creating) std.json.parseFromSliceLeaky(Create, a, raw_body, .{}) catch |err| return memoryFailure(ctx, err) else null;
+        const create = if (creating) switch (try parseJsonBody(Create, a, raw_body, .{})) {
+            .value => |value| value,
+            .invalid => |problem| return memoryInvalidJson(ctx, problem),
+        } else null;
         const selected = if (create) |input| module.Route{ .space = input.space, .action = .create } else module.route(@tagName(ctx.request.method), ctx.request.uri.path) catch |err| return memoryFailure(ctx, err);
         const name = (try decodePathParamOrBadRequest(ctx, selected.space)) orelse return ctx.text("invalid memory space");
         defer ctx.allocator.free(name);
@@ -1822,6 +1825,10 @@ pub const AntflyApiHandler = struct {
             };
         }
         const body = if (create) |input| try std.json.Stringify.valueAlloc(a, input.config, .{}) else if (ctx.request.method == .GET) try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = query_body }, .{}) else raw_body;
+        const body_value = switch (try parseJsonBody(std.json.Value, a, body, .{ .parse_numbers = false })) {
+            .value => |value| value,
+            .invalid => |problem| return memoryInvalidJson(ctx, problem),
+        };
         const identifier = (try decodePathParamOrBadRequest(ctx, selected.id)) orelse return ctx.text("invalid memory id");
         defer ctx.allocator.free(identifier);
         var response = try self.api_server.executeMemoryService(name, .{
@@ -1830,7 +1837,7 @@ pub const AntflyApiHandler = struct {
             .namespace = ctx.header("x-antfly-namespace") orelse "public",
             .action = selected.action,
             .id = identifier,
-            .body = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{ .parse_numbers = false }),
+            .body = body_value,
             .idempotency_key = ctx.header("idempotency-key") orelse "",
         }, identity, tableMutationContext(ctx, &identity));
         defer response.deinit(self.api_server.alloc);
@@ -1838,10 +1845,53 @@ pub const AntflyApiHandler = struct {
         return jsonResponse(ctx, response.status, response.body);
     }
 
+    const JsonBodyProblem = struct {
+        /// Stable identifier for clients: the JSON error name.
+        code: []const u8,
+        /// Human-readable description with the position in the body.
+        message: []const u8,
+    };
+
+    fn ParsedJsonBody(comptime T: type) type {
+        return union(enum) { value: T, invalid: JsonBodyProblem };
+    }
+
+    /// Parses a JSON request body. A body that is not valid JSON for `T`
+    /// is returned as a problem naming what is wrong and where; other errors
+    /// propagate unchanged. The message never echoes request content.
+    fn parseJsonBody(
+        comptime T: type,
+        a: std.mem.Allocator,
+        raw: []const u8,
+        options: std.json.ParseOptions,
+    ) !ParsedJsonBody(T) {
+        var diagnostics: std.json.Diagnostics = .{};
+        var scanner = std.json.Scanner.initCompleteInput(a, raw);
+        scanner.enableDiagnostics(&diagnostics);
+        const value = std.json.parseFromTokenSourceLeaky(T, a, &scanner, options) catch |err| {
+            const problem = jsonBodyProblem(err) orelse return err;
+            return .{ .invalid = .{
+                .code = @errorName(err),
+                .message = try std.fmt.allocPrint(a, "invalid JSON at line {d}, column {d}: {s}", .{
+                    diagnostics.getLine(), diagnostics.getColumn(), problem,
+                }),
+            } };
+        };
+        return .{ .value = value };
+    }
+
+    fn jsonBodyProblem(err: anyerror) ?[]const u8 {
+        return @import("memory.zig").jsonErrorDescription(err);
+    }
+
+    fn memoryInvalidJson(ctx: *httpx.Context, problem: JsonBodyProblem) !httpx.Response {
+        return ctx.status(400).json(.{ .code = problem.code, .retryable = false, .@"error" = problem.message });
+    }
+
     fn memoryFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         const code = @import("memory.zig").status(err);
         if (code == 503 or code == 429) try ctx.setHeader("Retry-After", "1");
-        return ctx.status(code).json(.{ .code = @errorName(err), .retryable = code == 503 or code == 429, .@"error" = @errorName(err) });
+        return ctx.status(code).json(.{ .code = @errorName(err), .retryable = code == 503 or code == 429, .@"error" = @import("memory.zig").errorMessage(err) });
     }
 
     fn extensionRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -4798,11 +4848,11 @@ pub const AntflyApiHandler = struct {
         }
     };
 
-    fn gatewayRequest(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_provider_registry.gateway.Task) !httpx.Response {
+    fn gatewayRequest(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_inference_gateway.Task) !httpx.Response {
         return self.gatewayRequestOperation(ctx, task, null);
     }
 
-    fn gatewayRequestOperation(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_provider_registry.gateway.Task, operation: ?[]const u8) !httpx.Response {
+    fn gatewayRequestOperation(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_inference_gateway.Task, operation: ?[]const u8) !httpx.Response {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*value| value.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
@@ -19058,6 +19108,57 @@ test "native memory HTTP validates route and space without loading a model" {
     }
 }
 
+test "native memory HTTP names malformed JSON bodies and their position" {
+    const a = std.testing.allocator;
+    var source = SchemaUpdateStatusSource{};
+    defer source.deinit(a);
+    var api = ApiHttpServer.init(a, .{}, source.iface(), null, null);
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(a, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const Case = struct { path: []const u8, body: []const u8, code: []const u8, message: []const u8 };
+    const cases = [_]Case{
+        .{ .path = "/memory/v1/spaces", .body = "{\"space\": \"team\", \"config\": {", .code = "UnexpectedEndOfInput", .message = "invalid JSON at line 1, column 30: request body ended unexpectedly" },
+        .{ .path = "/memory/v1/spaces", .body = "{\"config\": {}}", .code = "MissingField", .message = "a required field is missing" },
+        .{ .path = "/memory/v1/spaces", .body = "{\"space\": 7}", .code = "UnexpectedToken", .message = "a field has the wrong type" },
+        .{ .path = "/memory/v1/spaces/team/observations", .body = "{\n  \"evidence\": [}", .code = "SyntaxError", .message = "invalid JSON at line 2, column 16: syntax error" },
+    };
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    for (cases) |case| {
+        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base, case.path });
+        defer a.free(url);
+        var response = try requestWithRetry(&client, threaded.io(), .POST, url, case.body, &headers, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        var payload = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer payload.deinit();
+        try std.testing.expectEqualStrings(case.code, payload.value.object.get("code").?.string);
+        try std.testing.expect(!payload.value.object.get("retryable").?.bool);
+        const message = payload.value.object.get("error").?.string;
+        if (std.mem.indexOf(u8, message, case.message) == null) {
+            std.debug.print("unexpected message for {s}: {s}\n", .{ case.path, message });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "native memory error messages describe JSON shape failures and keep other names" {
+    const memory = @import("memory.zig");
+    try std.testing.expectEqualStrings("a field has the wrong type", memory.errorMessage(error.UnexpectedToken));
+    try std.testing.expectEqualStrings("a required field is missing", memory.errorMessage(error.MissingField));
+    try std.testing.expectEqualStrings("unknown field", memory.errorMessage(error.UnknownField));
+    // Non-JSON failures and ambiguous number errors keep their stable names.
+    try std.testing.expectEqualStrings("MemorySpaceNotFound", memory.errorMessage(error.MemorySpaceNotFound));
+    try std.testing.expectEqualStrings("Overflow", memory.errorMessage(error.Overflow));
+}
+
 test "native memory HTTP and MCP share persistent storage and private provenance" {
     const a = std.testing.allocator;
     const module = @import("memory.zig");
@@ -19771,7 +19872,7 @@ test "httpx inference gateway deployment disable fences public routes but preser
     defer internal.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), internal.status);
     try std.testing.expectEqual(@as(usize, 1), target.calls);
-    try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.forbidden, try server.authorizeInferenceRequest(.{}, .write));
+    try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.public_inference_disabled, try server.authorizeInferenceRequest(.{}, .write));
     try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.allowed, try server.authorizeInferenceRequest(.{}, .read));
     var request = try httpx.Request.init(a, .GET, "/ai/v1/models");
     defer request.deinit();
@@ -20469,7 +20570,7 @@ test "httpx inference gateway request errors remain client errors without reclas
     var server = ApiHttpServer.init(a, .{ .node_config = &config }, source.iface(), null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
-    const Task = @import("antfly_local_sources").common_provider_registry.gateway.Task;
+    const Task = @import("antfly_local_sources").common_inference_gateway.Task;
     const cases = .{
         .{ Task.embed, "/ai/v1/embeddings", "{\"model\":" },
         .{ Task.embed, "/ai/v1/embeddings", "" },

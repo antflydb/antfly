@@ -1,7 +1,7 @@
 # LightOnOCR-3 runtime
 
 Execution details, tuning switches, and measurements for the LightOnOCR-3
-readers. Usage is in the [LightOnOCR-3 guide](../../guides/lightonocr3.mdx).
+readers. Usage is in the [LightOnOCR-3 guide](../../guides/models/lightonocr3.mdx).
 
 ## Model geometry
 
@@ -39,7 +39,6 @@ memory.
 
 ## Resolution, vision, and decoder execution
 
-
 The shared Qwen vision path supplies learned image-position embeddings and
 two-axis vision rotary positions. Qwen3.5's full-attention layers use three-axis
 M-RoPE on the first 64 channels of each 256-channel head, preserving the tail;
@@ -59,6 +58,13 @@ Other shapes retain the existing dispatch. The CPU fallback uses vectorized
 recurrence and activations. Measure release-build latency on deployment
 hardware before setting an SLO; this does not qualify CUDA or vLLM throughput.
 
+The qualified Qwen Metal image-attention path supports up to 16,384 unmerged
+patches, matching the runtime cap of 4096 merged vision tokens. Qualified
+LightOn single-token split attention supports contexts of 192 through 16,384
+tokens, including image, prompt, and generated tokens. Longer contexts retain
+the generic fallback and need separate latency measurements. The numerical
+checks cover the 2048- and 4096-token boundaries, the 16,384-token limit,
+batched pages with different lengths, and independent CPU reference values.
 The Metal `/read` throughput profile requires
 `ANTFLY_LIGHTONOCR3_THROUGHPUT=1`,
 `ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE=1`, and
@@ -103,11 +109,37 @@ they are not Antfly runtime measurements.
 
 ## CUDA execution
 
-CUDA supports both original BF16 checkpoints with opt-in recurrent, attention
-and vision kernels. The experimental DGX Spark presets in
+CUDA supports both original BF16 checkpoints. On supported SM80+ devices,
+including A100, L4 and GB10, recurrent execution defaults to the portable CUDA
+core. This is a model geometry and device capability decision, independent of
+throughput benchmarks or the optional wide-batching preset. Recurrent histories
+are device-owned and reserved by the same per-page admission used for execution.
+Serial generation charges persistent state alongside its working set; cohorts
+retain that state per page while sharing only transient workspace.
+
+`TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE=0` explicitly selects host recurrent
+execution for a newly loaded model. Existing device histories never migrate or
+restart on the CPU after an execution failure. Startup logs report resolved
+placement, reason and compute capability. `/ml/v1/metrics` exposes
+`antfly_inference_recurrent_cuda_models` and
+`antfly_inference_recurrent_host_models` for loaded CUDA sessions. A CUDA model
+label alone does not imply every operation executes on the device.
+
+Batching remains separately bounded by the operator's request/admission limits.
+The benchmark driver's omitted `--cuda-recurrent-core` exercises the runtime
+default; `--no-cuda-recurrent-core` is the explicit host baseline.
+
+The experimental DGX Spark presets in
 `scripts/lightonocr3/cuda_ocr_profiles.json` require a CUDA build and cuDNN on the
 dynamic library search path. They preserve operator limits and retain F32
 decode projection outputs and recurrent state. Native attention KV is F16.
+The 0.8B preset keeps vision-block activations BF16 on SM12.1; patch embedding
+and the final merger retain F32. The 4B preset retains F32 vision. Set
+`ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE=f32` to select the original vision path.
+This is a partial precision profile, not a full BF16 decoder. The optional
+SM12.1 fused kernels and external recurrent-prefill library are architecture
+specific; A100 uses the portable CUDA implementation when those optimizations
+are unavailable. Do not copy the 128-slot GB10 benchmark budgets to a 40GB GPU.
 
 ```bash
 python3 zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py lighton08 --print-env
@@ -182,6 +214,10 @@ option remains opt-in while an older rare output mismatch is investigated.
 
 ## Measurements (as of 2026-10-27)
 
+For corpus deployment, also complete the [Grepstein release qualification](grepstein-release-qualification.md).
+It covers document completeness, embedding identity, extraction, cold starts,
+and memory pressure beyond these synthetic throughput measurements.
+
 The table combines archived Metal/Florence qualifications with the latest
 LightOn CUDA measurements. Each qualifies the named build and three synthetic
 fixtures, not broad document accuracy or an SLO.
@@ -191,14 +227,15 @@ fixtures, not broad document accuracy or an SLO.
 | M4 Max, LightOn 0.8B | 4.725–4.736 | vLLM 4.097–4.102 |
 | M4 Max, LightOn 4B | 1.210–1.211 | vLLM 1.1517–1.1518 |
 | M4 Max, Florence | 5.306–5.309 | MLX proxy 5.131–5.138 |
-| DGX Spark, LightOn 0.8B, optional prefill | 13.073–13.096 | vLLM 14.426–14.485 |
-| DGX Spark, LightOn 4B, optional prefill/attention | 4.036–4.083 | vLLM 4.630–4.634 |
+| DGX Spark, LightOn 0.8B, BF16 vision and optional prefill | 13.995–14.154 | vLLM 14.354–14.522 |
+| DGX Spark, LightOn 4B, optional prefill/attention | 4.308–4.330 | vLLM 4.620–4.626 |
 | DGX Spark, Florence FP16 | 25.347–25.758 | vLLM 25.340–25.348 |
 
 The Metal comparisons are paired. Latest LightOn CUDA runs use 256 warmup
 requests and two 256-request measurements, with four-token chains, GPU-resident
-vision features and asynchronous token readback for both models. The CUDA
-reference is a separate isolated run. LightOn CUDA parity remains outstanding.
+vision features, fused attention preparation and asynchronous token readback for
+both models. The CUDA reference is a fresh separate isolated run; raw output text
+matches on all three fixtures. LightOn CUDA parity remains outstanding.
 Metal Florence uses Q4_K weights and
 an F16 encoder versus an FP16 MLX proxy. Encoded-image, decoded-image and HTTP
 frontends have different overheads. These are not fully precision-matched runs.

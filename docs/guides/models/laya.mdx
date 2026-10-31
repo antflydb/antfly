@@ -1,8 +1,11 @@
-# Laya typed decisions
+---
+title: Laya typed decisions
+description: Run Laya checkpoints for typed classification decisions without text generation
+---
 
 Laya models answer classification questions without generating text. Antfly serves
 prepared Laya checkpoints through `/ai/v1/decisions` using the model-independent
-[typed decision contract](../reference/decisions.md). They appear under deciders in model
+[typed decision contract](../../reference/decisions.md). They appear under deciders in model
 discovery. Standalone typed decisions use `/decisions`; extraction keeps ordinary
 classification alongside entities, relations, attributes and structured records.
 
@@ -91,7 +94,7 @@ Laya checkpoints; OpenDecider-nano has no action head. Decisions do not execute
 a tool. Applications validate arguments and apply their action policy.
 
 Batches use `inputs` with optional IDs; results preserve input order and IDs in
-`data` with aggregate token usage. See the [decision guide](../reference/decisions.md) for
+`data` with aggregate token usage. See the [decision guide](../../reference/decisions.md) for
 HTTP, CLI, embedded inference and SQL examples. The unreleased extraction
 `decisions` output and Boolean decision modes have been removed.
 
@@ -229,4 +232,4 @@ start with small batches. CUDA/DDP and mixed-precision training are not
 implemented.
 
 Reference validation, resident-path measurements, and training parity results
-are in [Laya validation and measurements](../design/inference/history/laya/2026-10-12-validation-and-measurements.md).
+are in [Laya validation and measurements](../../design/inference/history/laya/2026-10-12-validation-and-measurements.md).

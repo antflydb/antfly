@@ -4964,6 +4964,13 @@ pub fn runFromIterator(
     try ensureDirPath(setup_io.io(), resolved.auth_store_root_dir);
 
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    const trusted_principal_secret = try resolveRuntimeSecretValue(alloc, &secret_store, "antfly.trusted_principal.secret");
+    defer if (trusted_principal_secret) |value| alloc.free(value);
+    const trusted_principal_issuer = try resolveRuntimeSecretValue(alloc, &secret_store, "antfly.trusted_principal.issuer");
+    defer if (trusted_principal_issuer) |value| alloc.free(value);
+    // A hosted verifier secures public requests without creating a local
+    // password authority. Local user-store bootstrap still follows auth_enabled.
+    const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
     // The storage kernel sizes its ResourceManager when its context is
     // created, so the operator's process envelope must be resolved first.
     const process_memory_resolution = process_memory_budget.resolveSystemWithConfig(
@@ -5284,6 +5291,7 @@ pub fn runFromIterator(
             return err;
         };
     }
+    try internal_service_auth.validateCredentialIsolation(internal_service_secret, trusted_principal_secret);
 
     var auth_backend: ?LegacyAuthBackend = null;
     defer if (comptime !control_only_storage_sources) if (auth_backend) |*backend| backend.close();
@@ -5344,7 +5352,7 @@ pub fn runFromIterator(
     }
 
     const public_listener = resolvePublicListener(cli);
-    antfly.common.listener_security.warnIfUnauthenticated("public", public_listener.bind_host, public_listener.bind_port, auth_enabled);
+    antfly.common.listener_security.warnIfUnauthenticated("public", public_listener.bind_host, public_listener.bind_port, effective_auth_enabled);
     const local_node_id = cli.local_node_id orelse 1;
     const public_api_url = try std.fmt.allocPrint(
         alloc,
@@ -5619,7 +5627,9 @@ pub fn runFromIterator(
             .hot_standby_failover_safe_mutations_only = hot_standby_mutation_guard_enabled,
             .hot_standby_remote_apply_mutations_enabled = hotStandbyRemoteApplyMutationsEnabled(hot_standby_sync_policy.policy),
             .hot_standby_catalog_create_enabled = hot_standby_role_requested and cli.hot_standby_table_id == 0 and cli.hot_standby_shard_id == 0,
-            .auth_enabled = auth_enabled,
+            .auth_enabled = effective_auth_enabled,
+            .trusted_principal_secret = trusted_principal_secret,
+            .trusted_principal_issuer = trusted_principal_issuer,
             .chatgpt = if (chatgpt) |*manager| manager else null,
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
@@ -6465,8 +6475,19 @@ fn inferenceAuth(route_context: *StandaloneHttpContext, ctx: *httpx.Context, nex
         .allowed => next.call(ctx),
         .unauthorized => inferenceUnauthorizedResponse(ctx),
         .forbidden => inferenceForbiddenResponse(ctx, permission),
+        .public_inference_disabled => publicInferenceDisabledResponse(ctx),
         .not_ready => inferenceNotReadyResponse(ctx),
     };
+}
+
+/// Matches the gateway's deployment-policy rejection so clients can tell it
+/// apart from a missing inference permission.
+fn publicInferenceDisabledResponse(ctx: *httpx.Context) !httpx.Response {
+    return ctx.status(403).json(.{ .@"error" = .{
+        .code = "PublicInferenceDisabled",
+        .type = "permission_error",
+        .message = "Public inference is disabled on this deployment; set public_inference.enabled in the server config",
+    } });
 }
 
 fn interactiveGenerateMiddleware() httpx.Middleware {
@@ -8289,6 +8310,13 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     if (cli.auth_enabled) |value| return value;
     if (cfg) |loaded| return loaded.auth_enabled;
     return false;
+}
+
+fn resolveRuntimeSecretValue(alloc: std.mem.Allocator, store: *antfly.common.secrets.FileStore, key: []const u8) !?[]u8 {
+    const value = (try store.getOwned(alloc, key)) orelse return null;
+    if (std.mem.trim(u8, value, " \t\r\n").len != 0) return value;
+    alloc.free(value);
+    return null;
 }
 
 fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {

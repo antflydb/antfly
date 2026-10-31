@@ -1,11 +1,14 @@
 # Docs authoring standard
 
-Every page under `docs/guides/` is one of two kinds. A **guide** takes a reader who has
+Every page under `docs/guides/` is one of four kinds. A **guide** takes a reader who has
 finished the [Quickstart](quickstart.mdx) to one named outcome. A **concept** page explains
-how one part of Antfly works so the reader can make good decisions with it. Both are
+how one part of Antfly works so the reader can make good decisions with it. A **provider**
+page (`providers/`) describes one inference provider, and a **model** page (`models/`)
+describes one model Antfly runs locally. Both are
 written for people steering an agent-assisted workflow: the agent gets its knowledge from
 the `antfly-skills` skill, so the page's job is judgment and context, not exhaustive
-reference. (This file is `.md`, not `.mdx`, so it never syncs to the docs site.)
+reference. Everything under `docs/guides/` publishes to the docs site, `.md` files as unlisted
+pages; the site's sync skips only this file by name.
 
 The bar for every sentence: it earns its place or it goes. Nothing stays because it was
 there before.
@@ -50,6 +53,20 @@ as prose with a verification command, whether or not it is also listed in
   Search". The `description` is what the reader ends with, one sentence.
 - Concept pages set `sidebar: concepts` and take a noun title: "Document Engine",
   "Antfly Lite". The `description` says what the page explains.
+
+`sidebar` picks the site section, and `order` sorts within it (unique per section; unset
+sorts last, by title):
+
+| `sidebar` | Section | Holds |
+|---|---|---|
+| `getting-started` | Getting Started | The Quickstart |
+| omitted | Build | Outcome guides, such as the use-case walkthroughs |
+| `concepts` | Concepts | How search, indexes, graphs, and Lite work |
+| `ingest` | Ingest and Enrich | Getting data in: documents and OCR, media, transcription, CDC |
+| `inference` | Inference | The model runtime, providers hub, and model compatibility |
+
+Pages under `providers/` and `models/` need no `sidebar`; they nest under Inference as
+Providers and Models. An unknown `sidebar` value lists the page under Build.
 
 ## Guide anatomy
 
@@ -126,6 +143,37 @@ sections vary by subject; the bookends do not.
    "Summary", "Key Takeaways") is deleted; the guidance belongs in the section that
    explains the mechanism.
 
+## Provider anatomy
+
+Target 30 to 130 lines, one page per provider in `providers/`. Keep the same h2
+headings in this order so provider pages compare side by side:
+
+1. The opener, no heading: what the provider is and which components it offers.
+2. **`## What It Provides`**: a table with one row per component (embedder, reranker,
+   reader, transcriber, speech, generator, extractor, decider, web search) and the
+   inputs that component accepts (text, image, audio, video, PDF). Inputs come from the
+   adapter code, not the provider's marketing; when they depend on the model, name an
+   example model.
+3. **`## Credentials`**: the `${secret:...}` or environment variable names the code
+   reads. Never a literal key.
+4. **`## Example`** (or one h2 per component when the provider has several distinct
+   setups): the smallest working configuration for the main component.
+5. **`## Limits`**, when there are any: request caps, rate limits, unsupported inputs.
+6. **`## Related`**: two or three links.
+
+The component and provider matrix lives in `inference-providers.mdx` and is generated
+by `scripts/generate_provider_matrix.py`; update the specs, not the table.
+
+## Model anatomy
+
+Target 60 to 250 lines, one page per model in `models/`, for a model with its own
+setup, prompts, or limits beyond a row in `supported-models.mdx`. Start with what
+the model does and why to pick it, then: how to pull it (the full owner-qualified
+reference, pinned to a revision when the registry does), a working request, how to
+use it in an enrichment, and the user-facing limits. Benchmarks, kernel switches, and
+qualification evidence belong in `docs/design/` or its `history/`, linked once at the
+end.
+
 ## Facts
 
 Every endpoint, flag, provider name, enum value, and default is verified against the
@@ -146,12 +194,14 @@ break silently. The recurring traps:
   and `model`, which the `antfly` provider can omit when one reranker is installed.
   The providers that execute are `antfly`, `cohere`, and `vertex`. Pruning runs
   after fusion and reranking and before `offset` and `limit`.
-- The models the Quickstart installs, and so the ones every guide should use: text
-  embedding `Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1`, reranking
-  `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0`, images and audio
-  `antflydb/clipclap`, generation `ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0`. The
-  `hf:` prefix on pull refs is optional (the registry strips it if present).
-  `dimension` is probed, not passed.
+- The preferred models, and so the ones every guide should use: embedding
+  `google/embeddinggemma-2:bf16-safetensors-bundle-v1` (text and images, 768
+  dimensions), reranking `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0`,
+  extraction `fastino/gliner2.5-base-v1` (pull the pinned
+  `:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d` revision), OCR
+  `lightonai/LightOnOCR-3-0.8B`, and generation `ggml-org/gemma-4-E4B-it-GGUF`
+  (pull `:gguf:Q4_0`). The `hf:` prefix on pull refs is optional (the registry
+  strips it if present). `dimension` is probed, not passed.
 - Retrieval-agent generation runs via `steps.generation` and accepts providers
   `gemini`, `vertex`, `openai`, `ollama`, `antfly` only; `stream` defaults to
   `true`, so responses are SSE unless `stream: false`.

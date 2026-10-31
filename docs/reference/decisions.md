@@ -102,7 +102,7 @@ it does not imply shared model computation or lower billed token usage.
 
 ## Embedding similarity and multi-choice
 
-[EmbeddingGemma 2](../guides/embeddinggemma2.md) advertises `embedding_similarity` and
+[EmbeddingGemma 2](../guides/models/embeddinggemma2.mdx) advertises `embedding_similarity` and
 supports `choice` and `multi_choice`. Answers include
 `decision_method: "embedding_similarity"`, `similarity_metric: "cosine"` and
 `similarities: [{value, similarity}]`. Raw cosine values range from -1 to 1;
@@ -199,5 +199,5 @@ predicates require trained deciders. A database handle alone does not configure
 SQL providers.
 
 Validate quality, thresholds and resource limits on your workload before
-deployment. Preparation and limits are in [Laya](../guides/laya.md) and
-[EmbeddingGemma 2](../guides/embeddinggemma2.md).
+deployment. Preparation and limits are in [Laya](../guides/models/laya.mdx) and
+[EmbeddingGemma 2](../guides/models/embeddinggemma2.mdx).

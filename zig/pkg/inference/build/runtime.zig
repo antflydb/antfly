@@ -210,6 +210,8 @@ pub fn create(config: Config) Graph {
     };
     const scraping_mod = shared.scraping orelse blk: {
         const mod = createSharedModule(config, "lib/scraping/src/mod.zig");
+        mod.addImport("antfly_data_uri", createSharedModule(config, "lib/scraping/src/data_uri.zig"));
+        mod.addImport("antfly_platform", platform_mod);
         mod.addImport("antfly_source_reference", createSharedModule(config, "lib/scraping/src/source_reference.zig"));
         mod.addImport("objectstore", objectstore_mod);
         mod.addImport("httpx", httpx_mod);
@@ -289,6 +291,7 @@ pub fn create(config: Config) Graph {
         });
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+        mod.addAnonymousImport("fastino_api", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/fastino_api/root.zig")) });
         break :blk mod;
     };
     const reader_config_mod = shared.reader_config orelse createSharedModule(config, "lib/readers/src/config.zig");
@@ -304,6 +307,7 @@ pub fn create(config: Config) Graph {
         const module = createSharedModule(config, "lib/generating/src/mod.zig");
         module.addImport("antfly-json", json_mod);
         module.addImport("antfly_generating_openapi", generating_openapi_mod);
+        module.addAnonymousImport("anthropic_api", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig")) });
         break :blk module;
     };
     structured_mod.addImport("antfly_generating", generating_mod);

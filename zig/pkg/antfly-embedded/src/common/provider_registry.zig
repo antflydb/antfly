@@ -21,12 +21,11 @@ const reranking = @import("antfly_reranking");
 const decisions = @import("../functions/decisions.zig");
 
 const Allocator = std.mem.Allocator;
-pub const tasks = @import("inference_tasks.zig");
-pub const gateway = @import("inference_gateway.zig");
+const capabilities = @import("inference_capabilities.zig");
 
 test {
-    _ = gateway;
-    _ = tasks;
+    _ = @import("inference_gateway.zig");
+    _ = @import("inference_tasks.zig");
     _ = @import("inference_telemetry.zig");
     _ = @import("inference_stream.zig");
 }
@@ -92,7 +91,7 @@ pub const Registry = struct {
     extractor_configs: std.StringArrayHashMapUnmanaged(RuntimeBinding) = .{},
     rewriter_configs: std.StringArrayHashMapUnmanaged(RuntimeBinding) = .{},
     predictor_configs: std.StringArrayHashMapUnmanaged(RuntimeBinding) = .{},
-    inference_capabilities: std.StringArrayHashMapUnmanaged(gateway.Capabilities) = .{},
+    inference_capabilities: std.StringArrayHashMapUnmanaged(capabilities.Capabilities) = .{},
 
     pub fn init(alloc: Allocator) Registry {
         return .{ .allocator = alloc };
@@ -198,7 +197,7 @@ pub const Registry = struct {
             if (configs != .object) return error.InvalidRegistryConfig;
             var it = configs.object.iterator();
             while (it.next()) |entry| {
-                const parsed = try std.json.parseFromValue(gateway.Capabilities, alloc, entry.value_ptr.*, .{});
+                const parsed = try std.json.parseFromValue(capabilities.Capabilities, alloc, entry.value_ptr.*, .{});
                 defer parsed.deinit();
                 const key = try alloc.dupe(u8, entry.key_ptr.*);
                 errdefer alloc.free(key);
@@ -691,7 +690,7 @@ test "provider registry gateway generated rewriting shares task execution and pr
     var client = @import("httpx").Client.initWithConfig(a, std.testing.io, .{});
     defer client.deinit();
     var state = Check{};
-    const executor = tasks.Executor{
+    const executor = @import("inference_tasks.zig").Executor{
         .view = .{ .providers = &registry },
         .http = &client,
         .context = .{ .io = std.testing.io, .deadline_ns = null },

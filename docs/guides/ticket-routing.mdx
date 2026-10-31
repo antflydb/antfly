@@ -1,7 +1,7 @@
 ---
 title: "Route Tickets with Retrieval"
 description: "New tickets stream out of PostgreSQL and get assigned a team by the resolved tickets that look most like them"
-order: 4
+order: 7
 ---
 
 <Questions>
@@ -37,9 +37,9 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
         "field": "body",
         "candidate_count": 50
       },
-      "pruner": {"min_score_ratio": 0.6}
+      "pruner": {"min_absolute_score": 0.1, "min_score_ratio": 0.6}
     }],
-    "generator": {"provider": "ollama", "model": "gemma3:4b"},
+    "generator": {"provider": "antfly", "model": "ggml-org/gemma-4-E4B-it-GGUF"},
     "stream": false,
     "steps": {
       "generation": {
@@ -75,11 +75,12 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
 
 ## Before You Start
 
-Antfly running with the embedding and reranking models pulled (the [Quickstart](/docs/guides/quickstart) leaves you there), a Postgres with `wal_level = logical`, and its connection string stored as a secret:
+Antfly running with the embedding, reranking, and generation models pulled (the [Quickstart](/docs/guides/quickstart) leaves you there), a Postgres with `wal_level = logical`, and its connection string stored as a secret:
 
 ```bash
-antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1 --tasks embed
+antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
 antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
 
 ```bash
@@ -114,7 +115,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/tickets \
         "template": "{{subject}} {{body}}",
         "embedder": {
           "provider": "antfly",
-          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
+          "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
         }
       }
     }
@@ -149,7 +150,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/query \
       "field": "body",
       "candidate_count": 50
     },
-    "pruner": {"min_score_ratio": 0.6}
+    "pruner": {"min_absolute_score": 0.1, "min_score_ratio": 0.6}
   }'
 ```
 
@@ -169,9 +170,9 @@ Because Postgres is the source and replication is always on, corrections feed ba
 
 The pruner's floor sets how much evidence a routing decision needs before it goes out without a person.
 
-A misrouted ticket is almost always a retrieval failure: the wrong history reached the classifier. The pruner is where you set how much evidence a decision needs. With `min_score_ratio: 0.6`, a ticket unlike anything resolved before comes back with few or no neighbors, and that is the signal to send it to a triage queue instead of guessing.
+A misrouted ticket is almost always a retrieval failure: the wrong history reached the classifier. The pruner is where you set how much evidence a decision needs. `min_absolute_score: 0.1` is the floor: a ticket unlike anything resolved before, such as "How do I export my invoices as a CSV file?" against payment, identity, and analytics history, reranks below 0.01 and comes back with no neighbors, which is the signal to send it to a triage queue instead of guessing. `min_score_ratio: 0.6` then drops neighbors that score far below the best one. The ratio alone never empties the result, because the best hit always passes its own ratio.
 
-An agent that routes only when it has strong evidence is one you can trust with the easy cases, which are most of them, so keep that floor in place. Tighten the ratio if you see confident misroutes; loosen it if too much lands in triage while good neighbors are being cut.
+An agent that routes only when it has strong evidence is one you can trust with the easy cases, which are most of them, so keep that floor in place. Raise the floor or tighten the ratio if you see confident misroutes; loosen it if too much lands in triage while good neighbors are being cut.
 
 ## Use Agent Skills
 

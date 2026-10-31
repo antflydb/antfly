@@ -61,6 +61,9 @@ pub const ModelEntry = struct {
     path: []const u8,
     variant: []const u8,
     gliner_architecture: @import("../models/gliner_boundary.zig").Architecture = .unknown,
+    /// Set when this candidate's manifest could not be read. The entry stays
+    /// listed so one malformed directory never hides the others.
+    load_error: ?anyerror = null,
 };
 
 const DiscoverKindMode = enum {
@@ -778,9 +781,18 @@ pub const ModelRegistry = struct {
         };
 
         var gliner_architecture: @import("../models/gliner_boundary.zig").Architecture = .unknown;
+        var load_error: ?anyerror = null;
         const kind = switch (kind_mode) {
             .manifest => blk: {
-                var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
+                var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch |err| {
+                    // Candidate-local failures describe this model only; keep
+                    // listing the rest. Resource failures still abort the scan.
+                    if (!manifest_mod.isListingCandidateRejection(err)) return err;
+                    load_error = err;
+                    if (kind_hint) |hint| break :blk hint;
+                    if (containsAsciiIgnoreCase(model_path, "gliner")) break :blk .extractor;
+                    break :blk inferModelKindFromPath(model_path);
+                };
                 defer manifest.deinit();
                 gliner_architecture = manifest.gliner_architecture;
                 break :blk modelKindFromManifestType(manifest.model_type);
@@ -801,6 +813,7 @@ pub const ModelRegistry = struct {
             .path = owned_path,
             .variant = "f32",
             .gliner_architecture = gliner_architecture,
+            .load_error = load_error,
         });
     }
 
@@ -2174,6 +2187,49 @@ test "discover skips empty owner subdirectories and keeps multistage readers" {
 
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqualStrings("monkt/paddleocr-onnx", models[0].name);
+}
+
+test "discovery keeps listing when one model directory is malformed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // ONNX-only span bundle: valid. Adding safetensors without encoder
+    // geometry makes the manifest unreadable.
+    try tmp.dir.createDirPath(io, "acme/good-gliner");
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/good-gliner/config.json", .data = "{\"model_type\":\"extractor\",\"max_width\":8}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/good-gliner/model.onnx", .data = "" });
+    try tmp.dir.createDirPath(io, "acme/bad-gliner");
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/bad-gliner/config.json", .data = "{\"model_type\":\"extractor\",\"max_width\":8}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/bad-gliner/model.onnx", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/bad-gliner/model.safetensors", .data = "" });
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+    var reg = ModelRegistry.init(allocator, models_dir);
+    const models = try reg.discover(io);
+    defer {
+        for (models) |model| {
+            allocator.free(model.name);
+            allocator.free(model.path);
+        }
+        allocator.free(models);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    var saw_good = false;
+    var saw_bad = false;
+    for (models) |model| {
+        if (std.mem.eql(u8, model.name, "acme/good-gliner")) {
+            saw_good = true;
+            try std.testing.expect(model.load_error == null);
+        } else if (std.mem.eql(u8, model.name, "acme/bad-gliner")) {
+            saw_bad = true;
+            try std.testing.expectEqual(@as(?anyerror, error.MissingGlinerSpanEncoderConfig), model.load_error);
+            try std.testing.expectEqual(ModelKind.extractor, model.kind);
+        }
+    }
+    try std.testing.expect(saw_good and saw_bad);
 }
 
 test "shallow discovery cleans up every allocation failure" {

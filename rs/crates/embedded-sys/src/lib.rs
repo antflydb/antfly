@@ -280,8 +280,10 @@ pub struct antfly_open_options {
     pub inference_combined_budget_mb: u32,
     pub inference_kv_budget_mb: u32,
     pub inference_scratch_budget_mb: u32,
-    /// Milliseconds to keep retrying while another writer holds the writer
-    /// lock (`ANTFLY_BUSY`), like `sqlite3_busy_timeout`. 0 fails immediately.
+    /// Milliseconds to retry Lite admission while another process holds the
+    /// writer lease or advances the allocator checkpoint (`ANTFLY_BUSY`), like
+    /// `sqlite3_busy_timeout`. 0 fails immediately. Mutation bodies are never
+    /// replayed by this admission retry.
     pub busy_timeout_ms: u64,
     pub reserved: [u64; 6],
     pub models_dir: antfly_slice,

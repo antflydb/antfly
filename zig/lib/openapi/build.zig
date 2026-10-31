@@ -71,6 +71,26 @@ pub fn build(b: *std.Build) void {
     const run_response_tests = b.addRunArtifact(response_tests);
     test_step.dependOn(&run_response_tests.step);
 
+    // Required camelCase/hyphenated properties must keep their JSON names even
+    // when no optional/null field would otherwise require custom JSON methods.
+    const wire_fixture = b.addRunArtifact(exe);
+    wire_fixture.addArgs(&.{ "--spec", "test/fixtures/required-wire-names.json", "--output" });
+    const wire_directory = wire_fixture.addOutputDirectoryArg2("wire-names", .{ .make_absolute = true });
+    wire_fixture.addArgs(&.{ "--package", "wire_names", "--generate", "types" });
+    const wire_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/required_wire_names_runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    wire_tests.root_module.addImport("wire_types", b.createModule(.{
+        .root_source_file = wire_directory.path(b, "types.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    test_step.dependOn(&b.addRunArtifact(wire_tests).step);
+
     // E2E test for modular code generation
     const e2e_modular = b.addSystemCommand(&.{"bash"});
     e2e_modular.addFileArg2(b.path("test/e2e_modular.sh"), .{ .make_absolute = true });
