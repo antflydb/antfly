@@ -26,7 +26,7 @@ export const readerKernel=new RequestPool(job=>instantiateHost(job.hostKey==="ob
 const standaloneMetadataKernel=new RequestPool(()=>instantiateHost(compact,null),1);
 export let metadataKernel=standaloneMetadataKernel;
 let snapshotKernel=new RequestPool(job=>instantiateHost(job.hostKey==="compact"?compact:observe,null),0,{maxReservedBytes:16*1024*1024,reservationBytes:8*1024*1024,defaultKernelVariant:"observe",recycleBytes:job=>(job.hostKey==="compact"?12:7)*1024*1024});
-export function readObservationKernel(){return ownerReadsEnabled&&residentKernel===writerKernel?{request:(input,options)=>writerKernel.request(input,{kernelVariant:"observe",memoryReservationBytes:8*1024*1024,...options})}:snapshotKernel.slots.length?snapshotKernel:metadataKernel;}
+export function readObservationKernel(){return ownerReadsEnabled&&residentKernel===writerKernel?{request:(input,options)=>writerKernel.request(input,{kernelVariant:"observe",memoryReservationBytes:8*1024*1024,...options}),withHost:(run,options)=>writerKernel.withHost(run,{kernelVariant:"observe",memoryReservationBytes:8*1024*1024,...options})}:snapshotKernel.slots.length?snapshotKernel:metadataKernel;}
 const standaloneBuildKernel=new RequestPool(job=>instantiateHost(job.options.kernelVariant==="compact"?compact:full,null),1,{recycleBytes:job=>(job.hostKey==="compact"?12:24)*1024*1024,maxReservedBytes:32*1024*1024,reservationBytes:32*1024*1024});
 export let buildKernel=standaloneBuildKernel;
 const writerKernel=new RequestPool(job=>instantiateHost(job.hostKey==="full"?full:job.hostKey==="observe"?observe:compact,null),0,{maxReservedBytes:48*1024*1024,reservationBytes:16*1024*1024,defaultKernelVariant:"compact",recycleBytes:job=>(job.hostKey==="full"?24:job.hostKey==="observe"?7:12)*1024*1024});

@@ -75,14 +75,18 @@ export class R2CoordinatorStore {
     this.readLeasePolicy=descriptor.read_lease_policy;
   }
   async servingCodec(action,extra={}){
-    return(this.kernel??this.snapshotKernel).request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{root_backend:"bounded_journal",action,owner:this.owner,serving_scope:this.exclusiveOwnerId,...extra}},{transport:()=>{throw Error("ServingCapsuleIoForbidden");},deadlineMs:this.deadline??this.clock()+5000,fairKey:this.namespace,priority:"commit"});
+    return this.snapshotKernel.withHost(host=>{
+      if(host.servingCapsuleABI!==1)throw Error("ServingCapsuleModuleRequired");
+      if(action==="probe")return;
+      return host.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{root_backend:"bounded_journal",action,owner:this.owner,serving_scope:this.exclusiveOwnerId,...extra}},{transport:()=>{throw Error("ServingCapsuleIoForbidden");},deadlineMs:this.deadline??this.clock()+5000});
+    },{deadlineMs:this.deadline??this.clock()+5000,fairKey:this.namespace,priority:action==="serving_import"?"interactive":"commit"});
   }
   async restoreDurableRead(){
     if(!this.durableBootstrap)return;
     if(!WebAssembly.Module.exports(this.module).some(entry=>entry.name==="antfly_host_serving_capsule_v1"))throw Error("ServingCapsuleModuleRequired");
     if(this.durableRestore){while(!this.durableRestore.done)await new Promise(r=>setTimeout(r,2));if(this.durableRestore.error)throw Error(this.durableRestore.error);return;}
     const ticket=this.durableRestore={done:false,error:null};
-    try{const restored=await this.durableBootstrap.restore((action,extra)=>this.servingCodec(action,extra));
+    try{if(this.durableBootstrap.entry?.dirty)await this.servingCodec("probe");const restored=await this.durableBootstrap.restore((action,extra)=>this.servingCodec(action,extra));
       if(restored){this.durableReadState=restored;this.durableWriteCursor=restored.state;this.observedState=restored.state;this.base=restored.base;this.pagePrefix=restored.page_prefix;}
     }catch(error){ticket.error=String(error.message??error);throw error;}finally{ticket.done=true;}
   }

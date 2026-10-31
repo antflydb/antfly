@@ -48,7 +48,7 @@ response bytes, queued jobs and retained input reservations.
 
 The v3 owner persists one provider-local opaque record using the Durable Object
 storage API. Antfly still owns metadata trees, WALs, indexes, receipts and capsule
-encoding. No application SQL schema is introduced. The provider's storage
+encoding. Capsule import/export run in the 8 MiB observation module, preserving write-module capacity. The actual module capability is checked before activation and on each codec call. No application SQL schema is introduced. The provider's storage
 implementation is an additional durable tier; this mode is not R2-only durability
 and does not establish that historical platform SQLITE_NOMEM is resolved.
 
