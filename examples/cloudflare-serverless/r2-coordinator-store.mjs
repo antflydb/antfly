@@ -42,8 +42,9 @@ function rootMetrics(state){try{const root=JSON.parse(state?.root??'null');retur
 export const encode = value => JSON.stringify(value, (_, v) => v instanceof Uint8Array || v instanceof ArrayBuffer ? {__antfly_bytes: Array.from(new Uint8Array(v.buffer ?? v, v.byteOffset ?? 0, v.byteLength))} : v);
 const decode = value => JSON.parse(value, (_, v) => v && Object.keys(v).length === 1 && Array.isArray(v.__antfly_bytes) ? Uint8Array.from(v.__antfly_bytes) : v);
 export class R2CoordinatorStore {
-  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, inlineReadSet,transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8,remoteCache=transport=>transport,proofBudget,rowBudgetBytes=512*1024,readBatch=true,readContinuations=false} = {}) {
+  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, inlineReadSet,transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8,remoteCache=transport=>transport,proofBudget,rowBudgetBytes=512*1024,exclusiveOwnerId,readBatch=true,readContinuations=false} = {}) {
     if(!Number.isSafeInteger(rowBudgetBytes)||rowBudgetBytes<32768||rowBudgetBytes>512*1024)throw Error("InvalidCoordinatorRowBudget");this.rowBudgetBytes=rowBudgetBytes;
+    this.exclusiveOwnerId=exclusiveOwnerId;this.ownerServing=false;
     this.rootBackend="journal";this.rootCursor=null;this.journalProof=null;this.readBatch=readBatch;this.readContinuations=readContinuations;this.observationPlanSupported=false;
     this.module = module; this.bucket = bucket; this.namespace = namespace; this.prefix = prefix; this.clock = clock; this.onMetrics = onMetrics; this.background = background;
     this.kernel=kernel;this.boundRows=boundRows;this.checkpointCommits=checkpointCommits;this.recoveryWindow=recoveryWindow;
@@ -65,6 +66,10 @@ export class R2CoordinatorStore {
   configureAuthority(descriptor){
     if(!["r2","r2-conditional","r2-bounded","sqlite"].includes(descriptor?.mode))throw Error("CoordinatorAuthorityMismatch");const backend=descriptor.mode==="r2-conditional"?"conditional":descriptor.mode==="r2-bounded"?"bounded_journal":"journal";
     if(this.rootBackend!==backend){if(this.state||this.observedState||this.acquired||this.running||this.pending.length)throw Error("CoordinatorMigrationRequired");this.rootBackend=backend;this.rootCursor=null;this.journalProof=null;this.rootProofScope=Array.from(crypto.getRandomValues(new Uint8Array(16)));this.rootProofKey=Array.from(crypto.getRandomValues(new Uint8Array(32)));if(backend==="conditional")this.idleCheckpoint=null;}
+    if(descriptor.format===2){
+      if(descriptor.mode!=="r2-bounded"||descriptor.serving?.protocol!=="serialized-owner-v1"||typeof descriptor.serving.owner_id!=="string"||this.exclusiveOwnerId!=null&&descriptor.serving.owner_id!==this.exclusiveOwnerId)throw Error("ResidentServingOwnerMismatch");
+      this.requiresExclusiveOwner=true;this.ownerServing=this.exclusiveOwnerId===descriptor.serving.owner_id;
+    }
     this.readLeasePolicy=descriptor.read_lease_policy;
   }
   // Scheduling hint only: native MAC, clocks, floor and slot checks remain
@@ -140,7 +145,7 @@ export class R2CoordinatorStore {
     }
     try {
       if ((this.usedOperations ?? 0) >= 1024 || (this.usedBytes ?? 0) >= 32*1024*1024) throw new Error("CoordinatorIoBudgetExceeded");
-      const result=await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {...this.rootOptions(),checkpoint_commits:this.checkpointCommits,owner: this.owner, state: cursor, inline_read_set:this.inlineReadSet, ...coordinate}}, {transport,drainTransport:()=>cleanup(),background:this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority:this.groupPriority==="maintenance"?"maintenance":"commit",onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
+      const result=await (this.readingOwner&&coordinate.action==="read"?this.snapshotKernel:this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {...this.rootOptions(),checkpoint_commits:this.checkpointCommits,owner: this.owner, state: cursor, inline_read_set:this.inlineReadSet, ...coordinate}}, {transport,drainTransport:()=>cleanup(),background:this.background,onIoSettled:sample=>this.onMetrics?.(sample),fairKey:this.namespace,priority:this.groupPriority==="maintenance"?"maintenance":"commit",onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
       if(result.checkpoint_hint_supported===true)this.checkpointHintSupported=true;
       if(this.rootBackend==="conditional"&&Object.hasOwn(result,"root_cursor"))this.rootCursor=result.root_cursor;
       if(this.rootBackend==="bounded_journal"&&Object.hasOwn(result,"journal_proof"))this.journalProof=result.journal_proof;
@@ -316,6 +321,10 @@ export class R2CoordinatorStore {
       if(!failure&&outcome!=="ok")throw Error("DeadlineExceeded");
     }
   }
+  ownerRead(run,{deadlineMs=this.clock()+30000,traceId}={}){
+    if(!this.ownerServing)return Promise.reject(Error("ResidentServingOwnerRequired"));
+    return this.enqueue({kind:"owner_read",priority:"interactive",deadlineMs,traceId,run:tx=>run({get:tx.get,getMany:tx.getMany,snapshot:tx.snapshot,put:()=>{throw Error("OwnerReadWriteForbidden");},delete:()=>{throw Error("OwnerReadWriteForbidden");}})});
+  }
   commitWal(commit,{deadlineMs=Infinity,traceId,nativePlan=false,ioBudget}={}){
     return this.enqueue({kind:"commit_wal",commit,deadlineMs,traceId,nativePlan,ioBudget,priority:"interactive"});
   }
@@ -323,6 +332,7 @@ export class R2CoordinatorStore {
     return this.enqueue({run,priority,traceId,deadlineMs,ioBudget});
   }
   enqueue(input) {
+    if(this.requiresExclusiveOwner&&!this.ownerServing)return Promise.reject(Error("ResidentServingOwnerRequired"));
     if(this.ioDrain)return Promise.reject(new Error("CoordinatorRecovering"));
     if(this.pending.length>=64)return Promise.reject(new Error("CoordinatorCommitBusy"));
     return new Promise((resolve,reject)=>{
@@ -356,7 +366,7 @@ export class R2CoordinatorStore {
     this.physical={};this.usedOperations=creditedOperations; this.usedBytes=creditedBytes;this.nativeCpuMs=0;this.prefetchReservedBytes=0;let beginMs=0,commitMs=0,maxQueueMs=0;
     // The selected owner remains first until consumed. Arrivals during begin
     // cannot defer its callback and strand a consumed batch permit.
-    this.groupPriority=this.pending[0]?.priority;
+    this.groupPriority=this.pending[0]?.priority;this.readingOwner=this.pending[0]?.kind==="owner_read";
     const completed=[];
     try {
       if(this.ioDrain)throw new Error("CoordinatorRecovering");
@@ -369,7 +379,8 @@ export class R2CoordinatorStore {
       // checks, then linearized by its immutable conditional journal slot.
       // Stale slots fail closed and force ordinary recovery before a retry.
       const warmCommit=this.pending[0]?.kind==="commit_wal"&&this.pending[0].nativePlan&&this.acquired&&!this.recovering&&this.state?.next<64&&(this.rootBackend!=="conditional"||this.rootCursor?.revision!=null);
-      const recovered = warmCommit?{state:this.state,base:this.base,page_prefix:this.pagePrefix,has_more:false}:await this.trace.span("recovery",()=>this.native({action: "begin"}));
+      const warmOwnerRead=this.pending[0]?.kind==="owner_read"&&this.ownerServing&&this.acquired&&!this.recovering&&this.state&&!this.needsWriteRefresh();
+      const recovered = warmCommit||warmOwnerRead?{state:this.state,base:this.base,page_prefix:this.pagePrefix,has_more:false}:await this.trace.span("recovery",()=>this.native({action: "begin"}));
       beginMs=performance.now()-started;
       if(this.acquired&&hex(recovered.state.owner)!==hex(this.owner))throw new Error("ImmutableLogFenced");
       this.state = recovered.state; this.base = recovered.base; this.pagePrefix = recovered.page_prefix;
@@ -453,15 +464,15 @@ export class R2CoordinatorStore {
         this.rowRevision=this.state.revision;
       }
     } catch(error) {
-      if(completed.some(item=>item.nativePlan)){this.acquired=false;this.rows.clear();this.rowBytes=0;this.rowRevision=null;}
+      {this.acquired=false;this.rows.clear();this.rowBytes=0;this.rowRevision=null;}
       for(const item of completed)item.batchError=error;
       // Recovery advances a bounded cursor before returning backpressure.
       // Reject queued callers rather than retaining an unbounded request set.
       if (!completed.length)for(const item of this.pending.splice(0,ioBudget?1:16))completed.push({...item,batchError:error});
     } finally {
       if(ioBudget){ioBudget.operations=this.usedOperations;ioBudget.bytes=this.usedBytes;}
-      try{this.onMetrics?.({event:"antfly.coordinator_group",operations:this.usedOperations-creditedOperations,transferred_bytes:this.usedBytes-creditedBytes,elapsed_ms:performance.now()-started,physical_r2:{...this.physical},trace:this.trace.report(),prefetch_reserved_bytes:this.prefetchReservedBytes,begin_ms:beginMs,commit_ms:commitMs,native_cpu_ms:this.nativeCpuMs,queue_wait_max_ms:maxQueueMs,row_cache_bytes:this.rowBytes,callbacks:completed.length,trace_ids:completed.map(item=>item.traceId).filter(Boolean)});}catch{}
-      this.deadline = null;
+      try{this.onMetrics?.({event:"antfly.coordinator_group",owner_read:this.readingOwner===true,operations:this.usedOperations-creditedOperations,transferred_bytes:this.usedBytes-creditedBytes,elapsed_ms:performance.now()-started,physical_r2:{...this.physical},trace:this.trace.report(),prefetch_reserved_bytes:this.prefetchReservedBytes,begin_ms:beginMs,commit_ms:commitMs,native_cpu_ms:this.nativeCpuMs,queue_wait_max_ms:maxQueueMs,row_cache_bytes:this.rowBytes,callbacks:completed.length,trace_ids:completed.map(item=>item.traceId).filter(Boolean)});}catch{}
+      this.deadline = null;this.readingOwner=false;
       this.idleCheckpoint?.schedule();
     }
     return completed;

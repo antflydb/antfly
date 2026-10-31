@@ -22,6 +22,10 @@ export const isObjectStoreAuthority=mode=>mode==="r2"||mode==="r2-conditional"||
 export async function openAuthority(env, mode, {allowRetired = false, allowExistingSqlite = false, allowCreate = true} = {}) {
   if(!["r2","r2-conditional","r2-bounded","sqlite"].includes(mode))throw Error("CoordinatorAuthorityInvalid");
   const namespace = env.ANTFLY_INCARNATION;
+  const resident=env.RESIDENT_SERVING==="true";
+  if(resident&&(mode!=="r2-bounded"||env.COORDINATOR_BACKEND!=="r2"||env.INLINE_METADATA_ROOTS!=="true"||!env.COMMITS?.idFromName))throw Error("InvalidResidentServingProfile");
+  const serving=resident?{protocol:"serialized-owner-v1",owner_id:env.COMMITS.idFromName(namespace).toString()}:null;
+  if(serving&&!/^[a-f0-9]{64}$/i.test(serving.owner_id))throw Error("InvalidResidentServingOwner");
   if (!namespace || !env.DATABASE) throw new Error("CoordinatorNamespaceRequired");
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(namespace)));
   const id = Array.from(digest, b => b.toString(16).padStart(2,"0")).join("");
@@ -36,7 +40,7 @@ export async function openAuthority(env, mode, {allowRetired = false, allowExist
       if (isObjectStoreAuthority(mode) || !allowExistingSqlite) prefixes.push(`antfly/wal-v1/${id}/`, `antfly/manifests/${namespace}/`);
       for (const prefix of prefixes) if ((await callR2Binding(()=>env.DATABASE.list({prefix,limit:1}))).objects.length) throw new Error("CoordinatorMigrationRequired");
     }
-    descriptor = {format:1,namespace,mode,storage_id: isObjectStoreAuthority(mode) ? env.COORDINATOR_STORAGE_ID ?? namespace : null,...((mode==="r2-conditional"||mode==="r2-bounded")?{read_lease_policy:conditionalReadLeasePolicy}:mode==="r2"&&env.FENCED_READ_LEASES!=="false"?{read_lease_policy:readLeasePolicy}:{})};
+    descriptor = {format:resident?2:1,...(serving?{serving}:{}),namespace,mode,storage_id: isObjectStoreAuthority(mode) ? env.COORDINATOR_STORAGE_ID ?? namespace : null,...((mode==="r2-conditional"||mode==="r2-bounded")?{read_lease_policy:conditionalReadLeasePolicy}:mode==="r2"&&env.FENCED_READ_LEASES!=="false"?{read_lease_policy:readLeasePolicy}:{})};
     const written = await callR2Binding(()=>env.DATABASE.put(key, JSON.stringify(descriptor), {onlyIf:{etagDoesNotMatch:"*"},httpMetadata:{contentType:"application/json"}}));
     if (written) return {key, descriptor, etag:written.etag};
     object = await callR2Binding(()=>env.DATABASE.get(key));
@@ -46,7 +50,9 @@ export async function openAuthority(env, mode, {allowRetired = false, allowExist
   descriptor = await callR2Binding(()=>object.json());
   if(descriptor.read_lease_policy!=null&&!validReadLeasePolicy(descriptor.read_lease_policy))throw Error("CoordinatorAuthorityInvalid");
   if((descriptor.mode==="r2-conditional"||descriptor.mode==="r2-bounded")&&descriptor.read_lease_policy?.format!==2)throw Error("CoordinatorAuthorityInvalid");
-  if (descriptor.format !== 1 || descriptor.namespace !== namespace) throw new Error("CoordinatorAuthorityInvalid");
+  if(resident){if(descriptor.format!==2||descriptor.serving?.protocol!==serving.protocol||descriptor.serving?.owner_id!==serving.owner_id)throw Error("ResidentServingMigrationRequired");}
+  else if(descriptor.format!==1)throw Error("CoordinatorAuthorityInvalid");
+  if (![1,2].includes(descriptor.format) || descriptor.namespace !== namespace) throw new Error("CoordinatorAuthorityInvalid");
   if (descriptor.mode !== mode) {
     if (!(mode === "r2" && descriptor.mode === "sqlite" && env.COORDINATOR_MIGRATION_REQUIRED === "true" && env.LEGACY_COMMITS) && !(mode === "sqlite" && descriptor.mode === "r2" && allowRetired)) throw new Error("CoordinatorAuthorityMismatch");
   } else if (isObjectStoreAuthority(mode) && descriptor.storage_id !== (env.COORDINATOR_STORAGE_ID ?? namespace)) throw new Error("CoordinatorAuthorityMismatch");

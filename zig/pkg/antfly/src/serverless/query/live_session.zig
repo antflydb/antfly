@@ -27,6 +27,9 @@ const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const Session = struct {
     alloc: A,
+    resident_shard: ?*@import("serving_shard.zig").Shard = null,
+    resident_allocator: ?A = null,
+    resident_namespace: ?[]u8 = null,
     published: ?runtime.QuerySession = null,
     reader: ?*facts.Reader = null,
     remaining_read_bytes: u64,
@@ -37,6 +40,8 @@ pub const Session = struct {
 
     pub const Options = struct {
         view: View.Options = .{},
+        resident_shard: ?*@import("serving_shard.zig").Shard = null,
+        resident_allocator: ?A = null,
         version: ?u64 = null,
         max_read_bytes: u64 = 16 * 1024 * 1024,
         /// Point reads may be satisfied entirely by the freshly admitted WAL.
@@ -47,9 +52,14 @@ pub const Session = struct {
     };
     pub fn open(alloc: A, query: *runtime.QueryRuntime, wal: *WalStore, namespace: []const u8, options: Options) !*Session {
         try options.cancellation.check();
+        if (options.resident_shard != null and options.resident_allocator == null) return error.InvalidResidentAllocator;
         const self = try alloc.create(Session);
         errdefer alloc.destroy(self);
         self.* = .{ .alloc = alloc, .remaining_read_bytes = options.max_read_bytes, .cancellation = options.cancellation, .wal_cancellation = options.view.cancellation, .io = options.io };
+        self.resident_shard = options.resident_shard;
+        self.resident_allocator = options.resident_allocator;
+        self.resident_namespace = if (options.resident_shard != null) try alloc.dupe(u8, namespace) else null;
+        errdefer if (self.resident_namespace) |value| alloc.free(value);
         errdefer if (self.published) |*published| published.deinit();
         self.published = if (options.version) |version|
             if (version == 0) null else try query.openVersionSessionWithCancellation(namespace, version, options.cancellation)
@@ -99,9 +109,35 @@ pub const Session = struct {
         self.view.deinit();
         if (self.reader) |reader| reader.destroy();
         if (self.published) |*published| published.deinit();
+        if (self.resident_namespace) |value| self.alloc.free(value);
         self.alloc.destroy(self);
     }
     pub fn lookupAlloc(self: *Session, id: []const u8) !?[]u8 {
+        if (transportCancelled(self)) return error.Canceled;
+        if (self.published) |*published| try published.checkCancellation();
+        if (self.resident_shard) |shard| {
+            // The session already admitted this exact published/WAL cut. This
+            // portable cache skips body traversal, never fresh admission.
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("antfly.fresh.session.point.v1");
+            hash.update(&self.view.token.scope);
+            var counters: [16]u8 = undefined;
+            std.mem.writeInt(u64, counters[0..8], self.generation(), .little);
+            std.mem.writeInt(u64, counters[8..16], self.view.token.lsn, .little);
+            hash.update(&counters);
+            if (self.published) |published| for (published.manifest.artifacts) |ref| {
+                if (ref.kind == .document_facts) hash.update(ref.checksum);
+            };
+            const cut = hash.finalResult();
+            if (try shard.get(self.alloc, self.resident_namespace.?, cut, id, null)) |value| return value.body;
+            const body = try self.lookupUncachedAlloc(id);
+            errdefer if (body) |value| self.alloc.free(value);
+            _ = try shard.put(self.resident_allocator.?, self.resident_namespace.?, cut, id, body, self.view.token.lsn);
+            return body;
+        }
+        return self.lookupUncachedAlloc(id);
+    }
+    fn lookupUncachedAlloc(self: *Session, id: []const u8) !?[]u8 {
         const Base = struct {
             session: *Session,
             pub fn lookupAlloc(base: @This(), _: A, key: []const u8) !?[]u8 {

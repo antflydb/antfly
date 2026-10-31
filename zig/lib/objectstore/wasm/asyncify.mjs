@@ -144,6 +144,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
     let ioLifecycleId, requestPtr = 0, protocolError = false, outcome = "error", failureCode = null, waitMs = 0, clockRefreshes = 0, clockRegressionMs = 0;
     const started = performance.now();
     const readStateHitsBefore=Number(wasm.antfly_host_read_state_cache_hits?.()??0),readStateExtensionsBefore=Number(wasm.antfly_host_read_state_cache_extensions?.()??0);
+    const residentHitsBefore=Number(wasm.antfly_host_resident_read_hits?.()??0);
     const preparedReadHitsBefore=Number(wasm.antfly_host_prepared_read_cache_hits?.()??0);
     const manifestCacheHitsBefore=Number(wasm.antfly_host_manifest_cache_hits?.()??0);
     try {
@@ -237,6 +238,8 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
       const metrics = Object.freeze({outcome, failure_code: failureCode, clock_valid: !invalidClock, clock_refreshes: clockRefreshes, clock_regression_ms: clockRegressionMs, operations, inference_calls: inferenceCalls,
         transferred_bytes: transferred, elapsed_ms: performance.now() - started, io_wait_ms: waitMs, io_draining: Boolean(draining), ...(ioLifecycleId ? {io_lifecycle_id:ioLifecycleId} : {}),
         wasm_linear_bytes: wasm.memory.buffer.byteLength,
+        resident_read_cache_hits:Number(wasm.antfly_host_resident_read_hits?.()??0)-residentHitsBefore,
+        resident_read_cache_bytes:wasm.antfly_host_resident_read_bytes?.()??0,
         decoded_manifest_cache_hits: Number(wasm.antfly_host_manifest_cache_hits?.() ?? 0)-manifestCacheHitsBefore,
         read_state_cache_bytes: wasm.antfly_host_read_state_cache_bytes?.() ?? 0,
         read_state_cache_hits: Number(wasm.antfly_host_read_state_cache_hits?.() ?? 0)-readStateHitsBefore,
@@ -251,5 +254,5 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
       try { requestMetrics(metrics); } catch {}
     }
   }
-  return { request, readDependencyABI: wasm.antfly_host_read_dependency_abi?.()??0, usable: () => !poisoned && !invalidClock, memoryBytes: () => wasm.memory.buffer.byteLength, draining: () => draining };
+  return { request, residentReadABI:Number(wasm.antfly_host_resident_read_abi?.()??0),readDependencyABI: wasm.antfly_host_read_dependency_abi?.()??0, usable: () => !poisoned && !invalidClock, memoryBytes: () => wasm.memory.buffer.byteLength, draining: () => draining };
 }

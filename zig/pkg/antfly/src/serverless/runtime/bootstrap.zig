@@ -55,6 +55,7 @@ pub const BootstrapConfig = struct {
     /// Explicit namespace format selection; legacy prefixes require migration.
     indexed_wal: bool = false,
     native_read_state: bool = false,
+    resident_points: bool = false,
     wal_document_index: bool = false,
     wal_packed_pages: bool = false,
     wal_deferred_indexes: bool = false,
@@ -419,6 +420,8 @@ pub const OwnedStack = struct {
     query_cache: ?query_mod.QueryCache = null,
     read_states: query_mod.ReadStateCache = .{},
     read_state_enabled: bool = false,
+    resident_points: query_mod.ServingShard = .{},
+    resident_points_enabled: bool = false,
     point_index_enabled: bool = false,
     embedding_provider_runtime: managed_embedder.ProviderRuntime,
     managed_query_embedder: ?managed_embedder.ManagedEmbedder = null,
@@ -440,6 +443,8 @@ pub const OwnedStack = struct {
         self.gcs_client_pool = GcsClientPool.init(alloc, self.s3_client_pool.io_impl.io());
         errdefer self.gcs_client_pool.deinit();
         self.read_states = .{};
+        self.resident_points = .{};
+        self.resident_points_enabled = cfg.resident_points;
         self.read_state_enabled = cfg.native_read_state;
         self.point_index_enabled = cfg.wal_document_index;
         self.wal_collector = null;
@@ -692,7 +697,7 @@ pub const OwnedStack = struct {
         self.runtime.setEnricher(enricher);
         enricher_owned = false;
         self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
-        if (cfg.indexed_wal) self.handler.live_read_options = .{ .view = .{
+        if (cfg.indexed_wal) self.handler.live_read_options = .{ .resident_shard = if (cfg.resident_points) &self.resident_points else null, .resident_allocator = if (cfg.resident_points) self.alloc else null, .view = .{
             .state_cache = if (self.read_state_enabled) &self.read_states else null,
             .cache_allocator = if (self.read_state_enabled) self.alloc else null,
         } };
@@ -735,6 +740,10 @@ pub const OwnedStack = struct {
     /// host. Only derived bounded overlays survive in the stack's cache.
     pub fn openLiveSession(self: *OwnedStack, alloc: Allocator, namespace: []const u8, options: query_mod.live_session.Session.Options) !*query_mod.live_session.Session {
         var configured = options;
+        if (self.resident_points_enabled) {
+            configured.resident_shard = &self.resident_points;
+            configured.resident_allocator = self.alloc;
+        }
         if (self.read_state_enabled) {
             configured.view.state_cache = &self.read_states;
             configured.view.cache_allocator = self.alloc;
@@ -744,6 +753,7 @@ pub const OwnedStack = struct {
     }
 
     pub fn deinit(self: *OwnedStack) void {
+        self.resident_points.deinit(self.alloc);
         self.read_states.deinit();
         self.runtime.deinit();
         if (self.wal_collector) |collector| self.alloc.destroy(collector);
@@ -781,7 +791,7 @@ fn workLeaseOwnerIdAlloc(alloc: Allocator, io: std.Io) ![]u8 {
 }
 
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
-    if ((cfg.native_read_state or cfg.wal_document_index or cfg.wal_gc or cfg.wal_packed_pages or cfg.wal_deferred_indexes) and !cfg.indexed_wal) return error.IndexedWalRequired;
+    if ((cfg.resident_points or cfg.native_read_state or cfg.wal_document_index or cfg.wal_gc or cfg.wal_packed_pages or cfg.wal_deferred_indexes) and !cfg.indexed_wal) return error.IndexedWalRequired;
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
         return error.InvalidGraphMetricBuildOptions;
@@ -1613,6 +1623,7 @@ test "serverless multiprovider bootstrap owns indexed WAL and bounded live read 
             .catalog_uri = "file:///unused",
             .indexed_wal = true,
             .native_read_state = true,
+            .resident_points = true,
             .wal_document_index = true,
             .wal_packed_pages = use_blocks,
             .wal_deferred_indexes = use_blocks,
@@ -1632,6 +1643,8 @@ test "serverless multiprovider bootstrap owns indexed WAL and bounded live read 
             defer a.free(body);
             try std.testing.expectEqualStrings("alpha", body);
         }
+        try std.testing.expect(stack.resident_points.hits > 0);
+        try std.testing.expect(stack.resident_points.bytes <= query_mod.ServingShard.max_bytes);
         try std.testing.expect(stack.read_states.hits > 0);
         try std.testing.expect(stack.read_states.bytes <= query_mod.ReadStateCache.max_bytes);
         var published = try stack.catalog.buildTable("docs");
@@ -1640,6 +1653,20 @@ test "serverless multiprovider bootstrap owns indexed WAL and bounded live read 
         const reopened = try stack.openLiveSession(a, ns, .{ .io = std.testing.io });
         defer reopened.deinit();
         try std.testing.expectEqual(@as(u64, 1), try reopened.countDocuments());
+        const changed = [_]api_mod.DocumentMutation{.{ .kind = .upsert, .doc_id = "doc-a", .body = "beta" }};
+        var update = try stack.api.ingestTableBatch(.{ .table_name = "docs", .timestamp_ns = 124, .mutations = &changed });
+        defer update.deinit(a);
+        const fresh = try stack.openLiveSession(a, ns, .{ .io = std.testing.io });
+        defer fresh.deinit();
+        const changed_body = (try fresh.lookupAlloc("doc-a")).?;
+        defer a.free(changed_body);
+        try std.testing.expectEqualStrings("beta", changed_body);
+        const removed = [_]api_mod.DocumentMutation{.{ .kind = .delete, .doc_id = "doc-a" }};
+        var deletion = try stack.api.ingestTableBatch(.{ .table_name = "docs", .timestamp_ns = 125, .mutations = &removed });
+        defer deletion.deinit(a);
+        const absent = try stack.openLiveSession(a, ns, .{ .io = std.testing.io });
+        defer absent.deinit();
+        try std.testing.expect((try absent.lookupAlloc("doc-a")) == null);
     }
 }
 
@@ -2062,4 +2089,15 @@ test "serverless multiprovider live managed collection preserves published bodie
             }
         }
     }
+}
+
+test "serverless multiprovider resident point working sets require indexed admission" {
+    try std.testing.expectError(error.IndexedWalRequired, validateConfig(std.testing.allocator, .{
+        .artifacts_uri = "file:///unused",
+        .manifests_uri = "file:///unused",
+        .wal_uri = "file:///unused",
+        .progress_uri = "file:///unused",
+        .catalog_uri = "file:///unused",
+        .resident_points = true,
+    }));
 }

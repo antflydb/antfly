@@ -20,8 +20,9 @@ export class AppReadViews {
  constructor(create,{maxStores=8}={}){if(typeof create!=="function"||!Number.isInteger(maxStores)||maxStores<1||maxStores>8)throw Error("InvalidAppReadViewLimit");this.create=create;this.maxStores=maxStores;this.entries=[];this.attempts=0;this.evictions=0;this.fallbacks=0;}
  get(env){
   if(env.LOCAL_METADATA_READS!=="true"||env.READ_ONLY_SNAPSHOTS==="false"||env.__ANTFLY_PHYSICAL_EPOCH>0)return;
-  const config=Object.fromEntries(["DATABASE","ANTFLY_INCARNATION","COORDINATOR_STORAGE_ID","COORDINATOR_MIGRATION_REQUIRED","LEGACY_COMMITS","EDGE_IMMUTABLE_CACHE","EDGE_IMMUTABLE_CACHE_SCOPE","LOG_METRICS","READ_VIEW_BATCH_MS","INLINE_METADATA_ROOTS","FUSED_READ_ADMISSION","DETACHED_METADATA_PROOFS","FENCED_READ_LEASES","METADATA_ROOT_BACKEND","NATIVE_METADATA_READ_BATCH","NATIVE_READ_AFFINITY","METADATA_COMMIT_HINTS","NATIVE_METADATA_CONTINUATIONS"].map(key=>[key,env[key]]));
-  const key=JSON.stringify(Object.fromEntries(Object.entries(config).filter(([key])=>!["DATABASE","LEGACY_COMMITS"].includes(key))));
+  const config=Object.fromEntries(["RESIDENT_SERVING","COORDINATOR_BACKEND","DATABASE","ANTFLY_INCARNATION","COORDINATOR_STORAGE_ID","COORDINATOR_MIGRATION_REQUIRED","LEGACY_COMMITS","EDGE_IMMUTABLE_CACHE","EDGE_IMMUTABLE_CACHE_SCOPE","LOG_METRICS","READ_VIEW_BATCH_MS","INLINE_METADATA_ROOTS","FUSED_READ_ADMISSION","DETACHED_METADATA_PROOFS","FENCED_READ_LEASES","METADATA_ROOT_BACKEND","NATIVE_METADATA_READ_BATCH","NATIVE_READ_AFFINITY","METADATA_COMMIT_HINTS","NATIVE_METADATA_CONTINUATIONS"].map(key=>[key,env[key]]));
+  if(env.RESIDENT_SERVING==="true"){config.COMMITS=env.COMMITS;config.RESIDENT_OWNER_ID=env.COMMITS.idFromName(env.ANTFLY_INCARNATION).toString();}
+  const key=JSON.stringify(Object.fromEntries(Object.entries(config).filter(([key])=>!["DATABASE","LEGACY_COMMITS","COMMITS"].includes(key))));
   let index=this.entries.findIndex(e=>e.key===key&&e.bucket===config.DATABASE&&e.legacy===config.LEGACY_COMMITS),entry;
   if(index>=0){[entry]=this.entries.splice(index,1);}else{
    if(this.entries.length>=this.maxStores){const idle=this.entries.findIndex(e=>e.users===0);if(idle<0){this.fallbacks++;return;}this.entries.splice(idle,1);this.evictions++;}

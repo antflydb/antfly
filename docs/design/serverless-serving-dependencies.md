@@ -188,3 +188,6 @@ regressions, source/module identities and evidence are in
 Validation: 537 Node, 54 workerd, 198 shared object-store (two live-provider skips)
 and 32 focused native tests pass. All five switches remain off by default.
 No new Cloudflare resources were deployed for these experiments.
+
+
+The next architectural step is [resident owner-coordinated serving](resident-serving-shards.md), which introduces an explicit exclusive-owner contract instead of treating cached journal proofs as fresh authority.

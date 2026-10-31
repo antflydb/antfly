@@ -18,6 +18,7 @@ test {
     _ = @import("serverless/build/publication_input.zig");
     _ = @import("serverless/build/publication_postings.zig");
     _ = @import("serverless/query/read_plan.zig");
+    _ = @import("serverless/query/serving_shard.zig");
     _ = @import("serverless/query/read_state_cache.zig");
     _ = @import("serverless/wal/write_plan.zig");
     _ = @import("serverless/wal/indexed_object_store.zig");

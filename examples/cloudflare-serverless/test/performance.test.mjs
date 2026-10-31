@@ -877,12 +877,12 @@ test('native speculative permits resume after aged work drains without another r
 });
 
 test('native point promotion shares its original I/O allowance and waits for fresh authority',async()=>{
- const{withPointReadLane}=await import('../point-read-lane.mjs');for(const prior of[0,100]){let attempts=0,fresh=false;
+ const{withPointReadLane}=await import('../point-read-lane.mjs');for(const resident of[false,true])for(const prior of[0,100]){let attempts=0,fresh=false;
  const kernel={withHost:async run=>run({request:async(input,options)=>{
   attempts++;if(attempts===1){options.onMetrics({operations:1000-prior,transferred_bytes:31*1024*1024});throw Error('HostedWorkingSetBudgetExceeded');}
   assert.equal(fresh,true);assert.equal(options.maxOperations,24);assert.equal(options.maxTransferBytes,1024*1024);return{body:'large'};
  }})};
- const result=await withPointReadLane(kernel,host=>host.request({op:'lookup',native_read_plan_mode:true,working_set_bytes:1024*1024},{maxOperations:1024-prior}),{beforePromote:async()=>{fresh=true;}});
+ const result=await withPointReadLane(kernel,host=>host.request({op:'lookup',...(resident?{resident_cut:Array(32).fill(1)}:{native_read_plan_mode:true}),working_set_bytes:1024*1024},{maxOperations:1024-prior}),{beforePromote:async()=>{fresh=true;}});
  assert.equal(result.body,'large');assert.equal(attempts,2);}
 });
 
@@ -980,4 +980,9 @@ test('advisory metadata locations retain only bounded namespace-scoped values an
  const reader=new R2CoordinatorStore(module,bucket,'performance',{rowBudgetBytes:32768});assert.equal(reader.offerRootHint(hint),true);assert.ok(reader.cursorHintBytes<=4096);assert.notEqual(reader.rootHint.epoch,hint.epoch);const saved=[...reader.rootHint.epoch];hint.epoch[0]^=255;assert.deepEqual(reader.rootHint.epoch,saved);
  for(const patch of[{namespace:'other'},{epoch:new Array(16)},{epoch:Array(16).fill(256)},{next:0},{next:65},{revision:2**53}])assert.equal(reader.offerRootHint({...hint,revision:hint.revision+1,...patch}),false);
  for(let i=0;i<100;i++)reader.remember('key/'+i,'x'.repeat(512));assert.ok(reader.rowBytes+reader.hintBytes+reader.cursorHintBytes<=reader.rowBudgetBytes);assert.equal(reader.offerRootHint({...hint,revision:hint.revision}),false);
+});
+test('app observers preserve resident authority policy and isolate provider owner bindings',async()=>{
+ const{AppReadViews}=await import('../app-read-views.mjs'),created=[],views=new AppReadViews(config=>{created.push(config);return{open:async()=>({})};}),commits={idFromName:()=>({toString:()=>'a'.repeat(64)})},env={DATABASE:{},ANTFLY_INCARNATION:'resident-observer',LOCAL_METADATA_READS:'true',RESIDENT_SERVING:'true',COORDINATOR_BACKEND:'r2',COMMITS:commits,API_TOKEN:'must-not-retain'};
+ const original=views.get(env);assert.equal(views.get(env),original);assert.equal(created[0].RESIDENT_SERVING,'true');assert.equal(created[0].COORDINATOR_BACKEND,'r2');assert.equal(created[0].COMMITS,commits);assert.equal(Object.hasOwn(created[0],'API_TOKEN'),false);
+ assert.equal(views.get({...env,COMMITS:{idFromName:commits.idFromName}}),original);assert.notEqual(views.get({...env,COMMITS:{idFromName:()=>({toString:()=>'b'.repeat(64)})}}),original);assert.notEqual(views.get({...env,RESIDENT_SERVING:'false'}),original);
 });

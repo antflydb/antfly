@@ -23,6 +23,7 @@ var decoded_manifests: @import("serverless/manifest/decoded_cache.zig").Cache = 
 var shared_read_leases: @import("serverless/manifest/read_lease.zig").Cache = .{};
 var prepared_reads: @import("serverless/query/read_plan.zig").PreparedCache = .{};
 var read_states: @import("serverless/query/read_state_cache.zig").Cache = .{};
+var resident_shard: @import("serverless/query/serving_shard.zig").Shard = .{};
 var serving_scope: ?[32]u8 = null;
 // A kernel is serialized by the host pool. These caches own no request pointers
 // and must never cross a bucket/prefix boundary when a kernel is reused.
@@ -38,10 +39,21 @@ fn prepareServingScope(bucket: []const u8, prefix: []const u8) void {
     if (serving_scope == null or !std.mem.eql(u8, &serving_scope.?, &digest)) {
         decoded_manifests.deinit(wasm_allocator);
         prepared_reads.deinit(wasm_allocator);
+        resident_shard.deinit(wasm_allocator);
         read_states.deinit();
         shared_read_leases = .{};
         serving_scope = digest;
     }
+}
+
+export fn antfly_host_resident_read_abi() u32 {
+    return 1;
+}
+export fn antfly_host_resident_read_hits() u64 {
+    return resident_shard.hits;
+}
+export fn antfly_host_resident_read_bytes() usize {
+    return resident_shard.bytes;
 }
 
 export fn antfly_host_read_dependency_abi() u32 {
@@ -189,6 +201,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         wal_document_index: bool = false,
         native_read_prepare: ?[16]u8 = null,
         native_read_reuse: bool = false,
+        resident_cut: ?[32]u8 = null,
         native_read_yield: bool = false,
         native_read_resume: ?[16]u8 = null,
         native_read_spent_bytes: u64 = 0,
@@ -253,6 +266,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     const parsed = try std.json.parseFromSlice(Request, a, raw, .{});
     defer parsed.deinit();
     const req = parsed.value;
+    if (req.resident_cut != null and (req.op != .lookup or req.cursor != null or req.native_read_plan_mode)) return error.InvalidResidentRead;
     if (req.limit > 100 or (req.limit == 0 and (req.op == .list or req.op == .search))) return error.QueryCandidateBudgetExceeded;
     const filter = @import("serverless/query/live_filter.zig").Filter{ .alloc = a, .clauses = req.filters };
     try filter.validate();
@@ -488,6 +502,15 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     var runtime = @import("serverless/query/runtime.zig").QueryRuntime.init(a, &artifacts, &manifests, &progress);
     defer runtime.deinit();
     prepareServingScope(req.bucket, req.prefix);
+    if (req.resident_cut) |cut| {
+        if (req.op != .lookup or req.cursor != null or req.native_read_plan_mode) return error.InvalidResidentRead;
+        const required = if (req.required_visibility) |text| try @import("serverless/visibility.zig").Token.decode(text) else null;
+        if (try resident_shard.get(a, req.namespace, cut, req.doc_id, required)) |value| {
+            defer value.deinit(a);
+            try cancellation.check();
+            return std.json.Stringify.valueAlloc(a, .{ .body = value.body, .visibility = @import("serverless/visibility.zig").Token.init(req.namespace, value.lsn).encode() }, .{});
+        }
+    }
     runtime.shared_read_leases = &shared_read_leases;
     runtime.bounded_manifest_reads = req.bounded_manifest_reads;
     runtime.decoded_manifests = &decoded_manifests;
@@ -606,6 +629,9 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         if (req.op == .lookup) {
             const body = if (prepared_read) |prepared| try prepared.lookupAlloc(live, req.doc_id) else try live.lookupAlloc(req.doc_id);
             defer if (body) |value| a.free(value);
+            if (req.resident_cut) |cut| {
+                _ = try resident_shard.put(wasm_allocator, req.namespace, cut, req.doc_id, body, live.view.token.lsn);
+            }
             if (req.native_read_plan_mode) return std.json.Stringify.valueAlloc(a, .{ .body = body, .visibility = live.view.token.encode(), .__read_plan = read_plan.Plan.fromSession(live) }, .{});
             return std.json.Stringify.valueAlloc(a, .{ .body = body, .visibility = live.view.token.encode() }, .{});
         }

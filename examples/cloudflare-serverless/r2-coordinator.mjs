@@ -13,6 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {bindReadLease,readLeaseRemaining} from "../../zig/lib/objectstore/wasm/read-view-lease.mjs";
+import {withReadView} from "./read-view.mjs";
+import {withPointReadLane} from "./point-read-lane.mjs";
 import {reserveIoBranch} from "./io-branch.mjs";
 import {immutableReadWave} from "../../zig/lib/objectstore/wasm/immutable-read-wave.mjs";
 import {readAheadBudgetFor} from "../../zig/lib/objectstore/wasm/read-ahead.mjs";
@@ -26,7 +29,7 @@ import {CriticalPath} from "./trace.mjs";
 import {nextPublicationBudget} from "./publication-budget.mjs";
 import {encode} from "./r2-coordinator-store.mjs";
 import {publicationKeys,publicationCall,publicationSnapshot} from "./publication-view.mjs";
-import {metadataKernel,readObservationKernel,buildKernel,sharedCache,boundRows,kernelMetrics} from "./kernels.mjs";
+import {metadataKernel,readObservationKernel,buildKernel,residentKernel,enableOwnerReads,sharedCache,boundRows,kernelMetrics} from "./kernels.mjs";
 import {MaintenanceTickets} from "./maintenance-tickets.mjs";
 import {compactionIdentity,readCompactionReceipt,beginCompactionReceipt,finishCompactionReceipt} from "./compaction-receipt.mjs";
 import {PreparedWal} from "./prepared-wal.mjs";
@@ -57,8 +60,9 @@ export class R2CommitCoordinator extends DurableObject {
     if (!env.ANTFLY_INCARNATION) throw new Error("CoordinatorNamespaceRequired");
     if(env.ANTFLY_TENANTS){const binding=env.COMMITS;env=tenantEnvs(env).find(candidate=>binding.idFromName(candidate.ANTFLY_INCARNATION).equals(ctx.id));if(!env)throw new Error("UnknownTenant");}
     this.env = env;
+    if(env.RESIDENT_SERVING==="true")enableOwnerReads();
     const instanceId=crypto.randomUUID(),owner=actorOwner(ctx.id.toString(),env.WORKER_VERSION?.id,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION);
-    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{readBatch:env.NATIVE_METADATA_READ_BATCH!=="false",owner,inlineReadSet:env.INLINE_METADATA_ROOTS==="true"?inlineReadSet(env.ANTFLY_INCARNATION):undefined,remoteCache:edgeCacheForEnv(env,{background:promise=>ctx.waitUntil(promise)}),kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics(),actor_instance_id:instanceId}));}});
+    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{readBatch:env.NATIVE_METADATA_READ_BATCH!=="false",owner,exclusiveOwnerId:ctx.id.toString(),inlineReadSet:env.INLINE_METADATA_ROOTS==="true"?inlineReadSet(env.ANTFLY_INCARNATION):undefined,remoteCache:edgeCacheForEnv(env,{background:promise=>ctx.waitUntil(promise)}),kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics(),actor_instance_id:instanceId}));}});
     if(env.REPLAY_COST_CHECKPOINTS==="true"&&this.store.idleCheckpoint)this.store.idleCheckpoint.replayCost=()=>({bytes:this.store.replayBytes??0,waves:Math.ceil(Math.min(64,Math.max(0,(this.store.state?.revision??0)-this.store.idleCheckpoint.last))/4)});
     this.serviceStore = Object.create(this.store);
     this.serviceStore.transaction = run => this.transaction(run);
@@ -70,6 +74,33 @@ export class R2CommitCoordinator extends DurableObject {
     if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.actor_started",role:"writer",actor_id:ctx.id.toString(),actor_instance_id:instanceId,version:env.WORKER_VERSION?.id,owner_identity:owner?"actor-version":"ephemeral",...kernelMetrics()}));
   }
   async ensureAuthority(){if(!this.authority){const authority=await this.authorityAdmission.get();this.store.configureAuthority(authority.descriptor);this.authority??=authority;}return this.authority;}
+  async lookupResident(input,{trace_id}={}) {
+    if(this.env.RESIDENT_SERVING!=="true"||input.op!=="lookup"||typeof input.doc_id!=="string"||input.cursor!=null)throw Error("InvalidResidentRead");
+    if(input.filters?.length)throw Error("FilterCapabilityUnsupported");
+    const requestWall=Date.now(),requestMono=performance.now(),deadlineMs=requestWall+30000,trace=new CriticalPath({id:trace_id,scope:"resident:lookup"});
+    const physical={};let metrics,succeeded=false,promotions=0;
+    try{
+    await this.ensureAuthority();
+    const captured=await trace.span("owner_admission",()=>this.store.ownerRead(async tx=>{
+      const keys=await metadataKeys(this.env.ANTFLY_INCARNATION),migration=await tx.get(MIGRATION);
+      if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration)throw Error("CoordinatorMigrationRequired");
+      const view=await captureReadView(tx,keys,{allow_ephemeral_pin:true,read_lease_policy:this.authority.descriptor.read_lease_policy,lease_observed_at_ms:Date.now()});
+      const raw=new TextEncoder().encode(JSON.stringify(["antfly.resident.cut.v1",this.env.ANTFLY_INCARNATION,this.authority.descriptor.serving.owner_id,this.store.namespace,tx.snapshot().epoch,view.version,view.entries.filter(([key])=>key===keys.head||key===keys.wal||key===keys.floor)]));
+      const cut=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",raw)));
+      return{view,cut,empty:view.version==="0"&&new Map(view.entries).get(keys.wal)==null};
+    },{deadlineMs,traceId:trace.id}));
+    if(!captured.empty&&!bindReadLease(captured.view,{started:requestMono}))throw Error("ManifestReadLeaseExpired");
+    let lastWall=requestWall,lastMono=requestMono;
+    const check=()=>{const wall=Date.now(),mono=performance.now();if(wall<lastWall||mono<lastMono||wall>=deadlineMs||mono-requestMono>=30000||!captured.empty&&readLeaseRemaining(captured.view)<=0)throw Error("ManifestReadLeaseExpired");lastWall=wall;lastMono=mono;};
+    const transport=withReadView(this.store.dataCache.wrap(instrumentTransport(createR2Transport({database:this.env.DATABASE}),physical),this.env.ANTFLY_INCARNATION,{protect:true}),{openReadView:()=>{throw Error("ResidentReadViewMissing");}},this.env.ANTFLY_INCARNATION,{initial:captured.view});
+      check();
+      const result=await withPointReadLane(residentKernel,async host=>{
+        if(host.residentReadABI!==1)throw Error("ResidentReadModuleRequired");
+        check();return host.request({op:"lookup",doc_id:input.doc_id,...(input.required_visibility!=null?{required_visibility:input.required_visibility}:{}),resident_cut:captured.cut,native_read_state:true,wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",bounded_manifest_reads:true,working_set_bytes:8*1024*1024,bucket:"database",prefix:"antfly",namespace:this.env.ANTFLY_INCARNATION},{transport,background:p=>this.ctx.waitUntil(p),deadlineMs,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",onMetrics:sample=>{const prior=metrics;metrics=prior?{...sample,operations:prior.operations+sample.operations,transferred_bytes:prior.transferred_bytes+sample.transferred_bytes,elapsed_ms:prior.elapsed_ms+sample.elapsed_ms,io_wait_ms:prior.io_wait_ms+sample.io_wait_ms,resident_read_cache_hits:prior.resident_read_cache_hits+sample.resident_read_cache_hits,working_set_peak_bytes:Math.max(prior.working_set_peak_bytes??0,sample.working_set_peak_bytes??0)}:sample;},onIoSettled:sample=>{if(this.env.LOG_METRICS==="true")console.log(JSON.stringify(sample));}});
+      },{fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs,kernelVariant:"compact",memoryReservationBytes:16*1024*1024,affinityKey:"resident/"+this.env.ANTFLY_INCARNATION,beforePromote:check,onPromote:()=>{promotions++;},onStage:s=>trace.stage(s)});
+      check();succeeded=true;return result;
+    }catch(error){trace.error("resident",error);throw error;}finally{if(metrics&&this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.operation",resident_owner:true,resident_capacity_promotions:promotions,op:"lookup",role:"interactive",trace_id:trace.id,...metrics,...kernelMetrics(),physical,operation_outcome:succeeded?"ok":"error"}));trace.emit(this.env.LOG_METRICS==="true");}
+  }
   requestMaintenance(kind,jobId){return this.maintenance.request(kind,jobId);}
   validMaintenance(kind,ticket,jobId){return this.maintenance.valid(kind,ticket,jobId);}
   advanceMaintenance(kind,ticket,jobId){return this.maintenance.advance(kind,ticket,jobId);}

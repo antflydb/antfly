@@ -338,3 +338,33 @@ test('bounded journal makes progress under a frozen per-key overwrite limit',asy
  // slot keys and remain recoverable through the original seal protocol.
  const reopened=storeFor(bucket);reopened.configureAuthority(authority.descriptor);assert.equal(await retry(reopened,tx=>tx.get('latest')),79);
 });
+
+test('resident authority permanently binds one provider-serialized actor and rejects legacy adapters',async()=>{
+ const bucket=new Bucket(),actor='a'.repeat(64),env={DATABASE:bucket,ANTFLY_INCARNATION:'resident-authority',COORDINATOR_BACKEND:'r2',METADATA_ROOT_BACKEND:'bounded-journal',INLINE_METADATA_ROOTS:'true',RESIDENT_SERVING:'true',COMMITS:{idFromName:()=>({toString:()=>actor})}};
+ const {descriptor}=await openAuthority(env,'r2-bounded');assert.equal(descriptor.format,2);assert.equal(descriptor.serving.owner_id,actor);
+ await assert.rejects(openAuthority({...env,RESIDENT_SERVING:'false'},'r2-bounded'),/CoordinatorAuthorityInvalid/);
+ await assert.rejects(openAuthority({...env,COMMITS:{idFromName:()=>({toString:()=>'b'.repeat(64)})}},'r2-bounded'),/ResidentServingMigrationRequired/);
+ let calls=0;const raw=createR2Transport({database:bucket});const store=storeFor(bucket,{exclusiveOwnerId:actor,transport:async(...args)=>{calls++;return raw(...args);}});store.configureAuthority(descriptor);
+ assert.throws(()=>storeFor(bucket,{exclusiveOwnerId:'b'.repeat(64)}).configureAuthority(descriptor),/ResidentServingOwnerMismatch/);
+ await retry(store,tx=>tx.put('value',1));
+ calls=0;
+ assert.equal(await store.ownerRead(tx=>tx.get('value')),1);assert.equal(calls,0);
+ await assert.rejects(store.ownerRead(tx=>tx.put('value',2)),/OwnerReadWriteForbidden/);
+ await retry(store,tx=>tx.put('value',3));assert.equal(await store.ownerRead(tx=>tx.get('value')),3);
+ const observer=storeFor(bucket);observer.configureAuthority(descriptor);await assert.rejects(observer.transaction(()=>1),/ResidentServingOwnerRequired/);
+ const reopened=storeFor(bucket,{exclusiveOwnerId:actor});reopened.configureAuthority(descriptor);assert.equal(await reopened.ownerRead(tx=>tx.get('value')),3);
+});
+test('resident serving cannot silently activate on an existing namespace',async()=>{
+ const bucket=new Bucket(),env={DATABASE:bucket,ANTFLY_INCARNATION:'existing-resident',METADATA_ROOT_BACKEND:'bounded-journal'};
+ await openAuthority(env,'r2-bounded');
+ await assert.rejects(openAuthority({...env,COORDINATOR_BACKEND:'r2',INLINE_METADATA_ROOTS:'true',RESIDENT_SERVING:'true',COMMITS:{idFromName:()=>({toString:()=>'a'.repeat(64)})}},'r2-bounded'),/ResidentServingMigrationRequired/);
+ await assert.rejects(storeFor(bucket).ownerRead(()=>1),/ResidentServingOwnerRequired/);
+});
+test('resident owner recovers a generic metadata commit whose durable acknowledgement was lost',async()=>{
+ const bucket=new Bucket(),actor='c'.repeat(64),env={DATABASE:bucket,ANTFLY_INCARNATION:'resident-ambiguous',COORDINATOR_BACKEND:'r2',METADATA_ROOT_BACKEND:'bounded-journal',INLINE_METADATA_ROOTS:'true',RESIDENT_SERVING:'true',COMMITS:{idFromName:()=>({toString:()=>actor})}};
+ const authority=await openAuthority(env,'r2-bounded'),raw=createR2Transport({database:bucket});let lose=false;
+ const store=storeFor(bucket,{exclusiveOwnerId:actor,transport:async(request,body)=>{const result=await raw(request,body);if(lose&&request.op==='put'&&/\/epochs\/[^/]+\/[0-9]+\.json$/.test(request.key)){lose=false;throw Error('lost durable acknowledgement');}return result;}});store.configureAuthority(authority.descriptor);
+ await retry(store,tx=>tx.put('value',1));lose=true;
+ await assert.rejects(store.transaction(tx=>tx.put('value',2)));assert.equal(lose,false,'fault must follow the actual durable journal-slot PUT');assert.equal(store.acquired,false);
+ assert.equal(await store.ownerRead(tx=>tx.get('value')),2);
+});

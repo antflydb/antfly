@@ -31,6 +31,7 @@ const CliConfig = struct {
     wal_uri: ?[]const u8 = null,
     indexed_wal: ?bool = null,
     native_read_state: ?bool = null,
+    resident_points: ?bool = null,
     wal_document_index: ?bool = null,
     wal_packed_pages: ?bool = null,
     wal_deferred_indexes: ?bool = null,
@@ -172,6 +173,7 @@ pub fn runFromIterator(
         .progress_uri = try resolveRequired(init.environ_map, cli.progress_uri, configured_uris.progress, "ANTFLY_SERVERLESS_PROGRESS_URI"),
         .catalog_uri = try resolveRequired(init.environ_map, cli.catalog_uri, configured_uris.catalog, "ANTFLY_SERVERLESS_CATALOG_URI"),
         .indexed_wal = cli.indexed_wal orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_INDEXED_WAL", false),
+        .resident_points = cli.resident_points orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_RESIDENT_POINTS", false),
         .native_read_state = cli.native_read_state orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_NATIVE_READ_STATE", false),
         .wal_document_index = cli.wal_document_index orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_DOCUMENT_INDEX", false),
         .wal_packed_pages = cli.wal_packed_pages orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_PACKED_PAGES", false),
@@ -360,6 +362,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--indexed-wal")) {
             cfg.indexed_wal = try parseBoolArg(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--resident-points")) {
+            cfg.resident_points = try parseBoolArg(args.next() orelse return error.InvalidArguments);
             continue;
         }
         if (std.mem.eql(u8, arg, "--native-read-state")) {
@@ -750,6 +756,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --progress-uri <uri>
         \\  --catalog-uri <uri>
         \\  --indexed-wal <bool> (requires an indexed or empty WAL prefix)
+        \\  --resident-points <bool>
         \\  --native-read-state <bool>
         \\  --wal-deferred-indexes <bool>
         \\  --wal-packed-pages <bool>

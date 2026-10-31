@@ -33,7 +33,7 @@ export async function withPointReadLane(kernel,run,options={}){
    let transferred=0;
    const limited={...host,request:(input,requestOptions={})=>{
     if(input.op!=="lookup")throw Error("PointReadOperationUnsupported");
-    planned=input.native_read_plan_mode===true;
+    planned=input.native_read_plan_mode===true||input.resident_cut!=null;
     operationLimit=requestOptions.maxOperations??1024;transferLimit=requestOptions.maxTransferBytes??32*MiB;
     workingSetLimited=input.working_set_bytes==null||input.working_set_bytes>128*KiB;
     return accounting(host,{...input,working_set_bytes:Math.min(input.working_set_bytes??128*KiB,128*KiB)},{...requestOptions,maxTransferBytes:Math.min(requestOptions.maxTransferBytes??MiB,MiB),transport:async(request,body)=>{

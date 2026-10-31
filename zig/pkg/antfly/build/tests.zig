@@ -2970,7 +2970,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const read_state_tests = b.addTest(.{
         .root_module = document_facts_test_mod,
-        .filters = selectTestFilters(b, &.{ "native read plan", "indexed WAL document projection" }),
+        .filters = selectTestFilters(b, &.{ "native read plan", "indexed WAL document projection", "resident serving shard" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-read-state-test", "Run native read-state ownership, point projection and retention contracts").dependOn(&addFilteredTestRunArtifact(b, read_state_tests).step);

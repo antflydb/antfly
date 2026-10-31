@@ -48,6 +48,10 @@ async function run(env,input,signal,collection,trace,direct=false,backgroundTask
 }
 async function runStep(env,input,signal,collection,trace,direct,backgroundTasks){
  const read=readOperations.has(input.op);
+ if(env.RESIDENT_SERVING==="true"&&input.op==="lookup"&&!input.cursor){
+  if(env.COORDINATOR_BACKEND!=="r2"||env.SPLIT_RUNTIME!=="true")throw Error("InvalidResidentServingProfile");
+  const call=()=>takeRpcData(env.COMMITS.getByName(env.ANTFLY_INCARNATION).lookupResident(input,{trace_id:trace?.id}));return trace?trace.span("resident_rpc",call):call();
+ }
  if(read&&direct&&env.DIRECT_READS==="true"){
   if(env.COORDINATOR_BACKEND!=="r2"||env.SPLIT_RUNTIME!=="true")throw Error("InvalidDirectReaderProfile");
   enableAppReads();const release=reserveInput(32768);

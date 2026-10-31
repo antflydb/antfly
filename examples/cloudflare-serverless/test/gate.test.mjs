@@ -330,7 +330,7 @@ test('canonical body provenance is explicit without changing historical optimiza
 test('native protocol flags bind new profiles without changing historical optimization profiles',async()=>{
  const{runtimePlacement}=await import('../qualification/gate-provenance.mjs');
  const prior=runtimePlacement({vars:{INLINE_POINT_BODIES:'true'}}).native_optimizations;assert.equal(Object.hasOwn(prior,'NATIVE_READ_PLAN'),false);assert.equal(runtimePlacement({vars:{PUBLICATION_UNITS:'32'}}).publication_units,32);
- for(const flag of['METADATA_COMMIT_HINTS','NATIVE_METADATA_CONTINUATIONS','READ_VIEW_CACHE_SEEDING','NATIVE_POINT_CONTINUATIONS','IMMUTABLE_PREPARED_REUSE','REPLAY_COST_CHECKPOINTS','INLINE_FACTS_LEAVES','NATIVE_WRITE_OVERLAP','NATIVE_READ_PLAN','NATIVE_READ_DETACHED','FUSED_READ_ADMISSION','DETACHED_METADATA_PROOFS','NATIVE_READ_STATE','NATIVE_READ_AFFINITY','WAL_DOCUMENT_INDEX','FOREGROUND_CACHE_POLICY','OPPORTUNISTIC_READ_PREPARE','NATIVE_WRITE_PLAN','PUBLICATION_CONTINUATIONS','PUBLICATION_CONTINUATION_FORCE']){
+ for(const flag of['RESIDENT_SERVING','METADATA_COMMIT_HINTS','NATIVE_METADATA_CONTINUATIONS','READ_VIEW_CACHE_SEEDING','NATIVE_POINT_CONTINUATIONS','IMMUTABLE_PREPARED_REUSE','REPLAY_COST_CHECKPOINTS','INLINE_FACTS_LEAVES','NATIVE_WRITE_OVERLAP','NATIVE_READ_PLAN','NATIVE_READ_DETACHED','FUSED_READ_ADMISSION','DETACHED_METADATA_PROOFS','NATIVE_READ_STATE','NATIVE_READ_AFFINITY','WAL_DOCUMENT_INDEX','FOREGROUND_CACHE_POLICY','OPPORTUNISTIC_READ_PREPARE','NATIVE_WRITE_PLAN','PUBLICATION_CONTINUATIONS','PUBLICATION_CONTINUATION_FORCE']){
   assert.equal(runtimePlacement({vars:{[flag]:'true'}}).native_optimizations[flag],true);
   assert.equal(runtimePlacement({vars:{[flag]:'false'}}).native_optimizations[flag],false);
  }
