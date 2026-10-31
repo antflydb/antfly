@@ -25,7 +25,8 @@ export async function openAuthority(env, mode, {allowRetired = false, allowExist
   const resident=env.RESIDENT_SERVING==="true";
   if(resident&&(mode!=="r2-bounded"||env.COORDINATOR_BACKEND!=="r2"||env.INLINE_METADATA_ROOTS!=="true"||!env.COMMITS?.idFromName))throw Error("InvalidResidentServingProfile");
   if(env.RESIDENT_MVCC==="true"&&!resident)throw Error("InvalidResidentConfiguration");
-  const serving=resident?{protocol:env.RESIDENT_MVCC==="true"?"serialized-owner-v2":"serialized-owner-v1",owner_id:env.COMMITS.idFromName(namespace).toString()}:null;
+  if(env.RESIDENT_DURABLE_BOOTSTRAP==="true"&&(!resident||env.RESIDENT_MVCC!=="true"||env.RESIDENT_COLD_PIPELINE!=="true"))throw Error("InvalidDurableBootstrapProfile");
+  const serving=resident?{...(env.RESIDENT_DURABLE_BOOTSTRAP==="true"?{authority_storage:"provider-native-v1"}:{}),protocol:env.RESIDENT_DURABLE_BOOTSTRAP==="true"?"serialized-owner-v3":env.RESIDENT_MVCC==="true"?"serialized-owner-v2":"serialized-owner-v1",owner_id:env.COMMITS.idFromName(namespace).toString()}:null;
   if(serving&&!/^[a-f0-9]{64}$/i.test(serving.owner_id))throw Error("InvalidResidentServingOwner");
   if (!namespace || !env.DATABASE) throw new Error("CoordinatorNamespaceRequired");
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(namespace)));
@@ -51,7 +52,7 @@ export async function openAuthority(env, mode, {allowRetired = false, allowExist
   descriptor = await callR2Binding(()=>object.json());
   if(descriptor.read_lease_policy!=null&&!validReadLeasePolicy(descriptor.read_lease_policy))throw Error("CoordinatorAuthorityInvalid");
   if((descriptor.mode==="r2-conditional"||descriptor.mode==="r2-bounded")&&descriptor.read_lease_policy?.format!==2)throw Error("CoordinatorAuthorityInvalid");
-  if(resident){if(descriptor.format!==2||descriptor.serving?.protocol!==serving.protocol||descriptor.serving?.owner_id!==serving.owner_id)throw Error("ResidentServingMigrationRequired");}
+  if(resident){if(descriptor.format!==2||descriptor.serving?.protocol!==serving.protocol||descriptor.serving?.owner_id!==serving.owner_id||descriptor.serving?.authority_storage!==serving.authority_storage)throw Error("ResidentServingMigrationRequired");}
   else if(descriptor.format!==1)throw Error("CoordinatorAuthorityInvalid");
   if (![1,2].includes(descriptor.format) || descriptor.namespace !== namespace) throw new Error("CoordinatorAuthorityInvalid");
   if (descriptor.mode !== mode) {

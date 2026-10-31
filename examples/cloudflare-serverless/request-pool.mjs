@@ -91,4 +91,4 @@ export class RequestPool {
  memoryBytes(){return this.slots.reduce((n,slot)=>n+(slot.host?.memoryBytes()??0),0);}
 }
 let inputBytes=0;
-export function reserveInput(bytes){if(inputBytes+bytes>8*1024*1024)throw new Error("CoordinatorCommitBusy");inputBytes+=bytes;let released=false;return()=>{if(!released){released=true;inputBytes-=bytes;}};}
+export function reserveInput(bytes,{floorBytes=0}={}){if(!Number.isSafeInteger(bytes)||bytes<0||!Number.isSafeInteger(floorBytes)||floorBytes<0||floorBytes>8*1024*1024)throw Error("InvalidInputReservation");if(inputBytes+bytes>8*1024*1024-floorBytes)throw new Error("CoordinatorCommitBusy");inputBytes+=bytes;let released=false;return()=>{if(!released){released=true;inputBytes-=bytes;}};}

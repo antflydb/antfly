@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import{readByteMetrics}from'./read-byte-budget.mjs';
 import {ObjectStoreError} from './r2.mjs';
 import {proofPrefetchBytes,ReadAheadBudget} from './read-ahead.mjs';
 // These are the existing point-read lanes, independently bounded from
@@ -25,7 +26,7 @@ export function pointDependencyBudgetFor(kernel){
 }
 export function pointDependencyMetrics(kernel){
  const b=pointBudgets.get(kernel);
- return{point_dependency_active:b?.active??0,point_dependency_queued:b?.pending.length??0,point_dependency_bytes:b?.bytes??0,point_dependency_peak_bytes:b?.peakBytes??0,point_dependency_limit_bytes:b?b.limit*proofPrefetchBytes:0};
+ return{...readByteMetrics(kernel),point_dependency_active:b?.active??0,point_dependency_queued:b?.pending.length??0,point_dependency_bytes:b?.bytes??0,point_dependency_peak_bytes:b?.peakBytes??0,point_dependency_limit_bytes:b?b.limit*proofPrefetchBytes:0};
 }
 const encoder=new TextEncoder();
 const replayFields=new Set(["op","bucket","key","range","if_match_etag","max_response_bytes","version_id"]);

@@ -50,6 +50,12 @@ export fn antfly_host_immutable_preparation_abi() u32 {
     return 1;
 }
 
+export fn antfly_host_serving_capsule_v1() u32 {
+    return 1;
+}
+export fn antfly_host_read_graph_abi() u32 {
+    return 1;
+}
 export fn antfly_host_resident_state_abi() u32 {
     return 1;
 }
@@ -215,6 +221,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         resident_docs: []const struct { doc_id: []const u8, required_visibility: ?[]const u8 = null } = &.{},
         native_immutable_manifest_version: ?[]const u8 = null,
         native_read_yield: bool = false,
+        native_read_graph: bool = false,
         native_read_resume: ?[16]u8 = null,
         native_read_spent_bytes: u64 = 0,
         native_read_plan: ?@import("serverless/query/read_plan.zig").Plan = null,
@@ -697,6 +704,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
                     a.free(items);
                 }
                 for (items) |*item| item.* = .{ .visibility = live.view.token.encode() };
+                var needs_data = false;
                 for (req.resident_docs, items) |doc, *item| {
                     try cancellation.check();
                     if (doc.required_visibility) |encoded| {
@@ -709,12 +717,19 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
                             continue;
                         };
                     }
-                    const body = try live.lookupAlloc(doc.doc_id);
+                    const body = live.lookupAlloc(doc.doc_id) catch |err| {
+                        if (err == error.ImmutableReadDependency and req.native_read_yield and req.native_read_graph) {
+                            needs_data = true;
+                            continue;
+                        }
+                        return err;
+                    };
                     if (body != null and body.?.len > 16 * 1024) {
                         a.free(body.?);
                         item.individual = true;
                     } else item.body = body;
                 }
+                if (needs_data) return error.ImmutableReadDependency;
                 return std.json.Stringify.valueAlloc(a, .{ .results = items }, .{});
             }
             const body = if (prepared_read) |prepared| try prepared.lookupAlloc(live, req.doc_id) else try live.lookupAlloc(req.doc_id);

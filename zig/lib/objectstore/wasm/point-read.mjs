@@ -13,14 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import{ReadGraph}from'./read-graph.mjs';
+import{readByteBudgetFor}from'./read-byte-budget.mjs';
 import {ReadDependencies,pointDependencyBudgetFor} from './read-dependencies.mjs';
 
 // A miss may retain an immutable transcript while its native stack unwinds.
 // Acquire that retention permit only after a miss: warm reads must not queue
 // behind external I/O. The caller supplies its ordinary bounded native lane.
-export async function withPointReadDependencies({kernel,acquire,execute,transport,wrapTransport=t=>t,fairKey,deadlineMs,remainingMs=()=>deadlineMs-Date.now(),signal,background,onMetrics=()=>{},onNativeMetrics=()=>{},onUsage=()=>{},onStage=()=>{},onLateError=error=>console.error('Antfly detached point I/O failed',String(error))}){
+export async function withPointReadDependencies({graphRead=false,reserveTranscript,kernel,acquire,execute,transport,wrapTransport=t=>t,fairKey,deadlineMs,remainingMs=()=>deadlineMs-Date.now(),signal,background,onMetrics=()=>{},onNativeMetrics=()=>{},onUsage=()=>{},onStage=()=>{},onLateError=error=>console.error('Antfly detached point I/O failed',String(error))}){
  if(typeof background!=='function')throw Error('PointReadLifetimeRequired');
- const dependencies=new ReadDependencies({deadlineMs,signal,onMetrics});
+ const dependencies=graphRead?new ReadGraph({deadlineMs,signal,onMetrics,reserve:reserveTranscript,budget:readByteBudgetFor(kernel),fairKey}):new ReadDependencies({deadlineMs,signal,onMetrics});
  const usage={operations:0,bytes:0};let ticket,release,draining=false;
  const check=()=>{const remaining=remainingMs();if(!Number.isFinite(remaining)||remaining<=0||signal?.aborted)throw Error('DeadlineExceeded');dependencies.deadlineMs=Math.min(dependencies.deadlineMs,Date.now()+remaining);dependencies.check();return remaining;};
  const clear=()=>{dependencies.clear();if(release)release();else ticket?.cancel();};
@@ -30,10 +32,10 @@ export async function withPointReadDependencies({kernel,acquire,execute,transpor
    if(usage.operations>=1024||usage.bytes>=32*1024*1024)throw Error('ObjectIoBudgetExceeded');
    const value=await acquire(host=>{
     check();const enabled=host.readDependencyABI===1;
-    return execute(host,{transport:wrapTransport(dependencies.wrap(transport,{enabled})),nativeReadYield:enabled,maxOperations:1024-usage.operations,maxTransferBytes:32*1024*1024-usage.bytes,onMetrics:sample=>{usage.operations+=sample.operations;usage.bytes+=sample.transferred_bytes;onNativeMetrics(sample);}});
+    return execute(host,{transport:wrapTransport(dependencies.wrap(transport,{enabled})),nativeReadYield:enabled,nativeReadGraph:graphRead&&host.readGraphABI===1,maxOperations:1024-usage.operations,maxTransferBytes:32*1024*1024-usage.bytes,onMetrics:sample=>{usage.operations+=sample.operations;usage.bytes+=sample.transferred_bytes;onNativeMetrics(sample);}});
    });
    check();if(value?.__read_dependency!==true)return value;
-   if(!release){
+   if(!graphRead&&!release){
     const queuedAt=performance.now();ticket=pointDependencyBudgetFor(kernel).acquire(fairKey,{concurrent:true});
     let timer,cancel;
     try{release=await Promise.race([ticket.ready,new Promise((_,reject)=>{cancel=()=>reject(Error('DeadlineExceeded'));timer=setTimeout(cancel,check());signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();})]);}
@@ -45,7 +47,7 @@ export async function withPointReadDependencies({kernel,acquire,execute,transpor
   }
   throw Error('ObjectIoBudgetExceeded');
  }catch(error){
-  if(error.ioSettled&&release){
+  if(error.ioSettled&&(release||graphRead)){
    draining=true;const id=crypto.randomUUID();onMetrics({io_draining:true,io_lifecycle_id:id});
    const task=error.ioSettled.catch(onLateError).finally(()=>{clear();onMetrics({event:'antfly.io_settled',io_lifecycle_id:id});});
    try{background(task);}catch{await task;}

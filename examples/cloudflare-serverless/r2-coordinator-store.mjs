@@ -67,11 +67,24 @@ export class R2CoordinatorStore {
     if(!["r2","r2-conditional","r2-bounded","sqlite"].includes(descriptor?.mode))throw Error("CoordinatorAuthorityMismatch");const backend=descriptor.mode==="r2-conditional"?"conditional":descriptor.mode==="r2-bounded"?"bounded_journal":"journal";
     if(this.rootBackend!==backend){if(this.state||this.observedState||this.acquired||this.running||this.pending.length)throw Error("CoordinatorMigrationRequired");this.rootBackend=backend;this.rootCursor=null;this.journalProof=null;this.rootProofScope=Array.from(crypto.getRandomValues(new Uint8Array(16)));this.rootProofKey=Array.from(crypto.getRandomValues(new Uint8Array(32)));if(backend==="conditional")this.idleCheckpoint=null;}
     if(descriptor.format===2){
-      this.ownerMvcc=descriptor.serving?.protocol==="serialized-owner-v2";
-      if(descriptor.mode!=="r2-bounded"||!["serialized-owner-v1","serialized-owner-v2"].includes(descriptor.serving?.protocol)||typeof descriptor.serving.owner_id!=="string"||this.exclusiveOwnerId!=null&&descriptor.serving.owner_id!==this.exclusiveOwnerId)throw Error("ResidentServingOwnerMismatch");
+      this.ownerMvcc=["serialized-owner-v2","serialized-owner-v3"].includes(descriptor.serving?.protocol);
+      if(descriptor.serving?.protocol==="serialized-owner-v3"&&this.exclusiveOwnerId!=null&&!this.durableBootstrap)throw Error("DurableBootstrapStorageRequired");
+      if(descriptor.mode!=="r2-bounded"||!["serialized-owner-v1","serialized-owner-v2","serialized-owner-v3"].includes(descriptor.serving?.protocol)||typeof descriptor.serving.owner_id!=="string"||this.exclusiveOwnerId!=null&&descriptor.serving.owner_id!==this.exclusiveOwnerId)throw Error("ResidentServingOwnerMismatch");
       this.requiresExclusiveOwner=true;this.ownerServing=this.exclusiveOwnerId===descriptor.serving.owner_id;
     }
     this.readLeasePolicy=descriptor.read_lease_policy;
+  }
+  async servingCodec(action,extra={}){
+    return(this.kernel??this.snapshotKernel).request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{root_backend:"bounded_journal",action,owner:this.owner,serving_scope:this.exclusiveOwnerId,...extra}},{transport:()=>{throw Error("ServingCapsuleIoForbidden");},deadlineMs:this.deadline??this.clock()+5000,fairKey:this.namespace,priority:"commit"});
+  }
+  async restoreDurableRead(){
+    if(!this.durableBootstrap)return;
+    if(!WebAssembly.Module.exports(this.module).some(entry=>entry.name==="antfly_host_serving_capsule_v1"))throw Error("ServingCapsuleModuleRequired");
+    if(this.durableRestore){while(!this.durableRestore.done)await new Promise(r=>setTimeout(r,2));if(this.durableRestore.error)throw Error(this.durableRestore.error);return;}
+    const ticket=this.durableRestore={done:false,error:null};
+    try{const restored=await this.durableBootstrap.restore((action,extra)=>this.servingCodec(action,extra));
+      if(restored){this.durableReadState=restored;this.durableWriteCursor=restored.state;this.observedState=restored.state;this.base=restored.base;this.pagePrefix=restored.page_prefix;}
+    }catch(error){ticket.error=String(error.message??error);throw error;}finally{ticket.done=true;}
   }
   // Scheduling hint only: native MAC, clocks, floor and slot checks remain
   // mandatory. Refresh before preparation when an idle certificate cannot
@@ -196,15 +209,17 @@ export class R2CoordinatorStore {
     if(names.some(name=>!map.has(name)))return null;
     return new Map([...map].map(([key,value])=>[key,value==null?undefined:JSON.parse(value,(_,v)=>v&&Object.keys(v).length===1&&typeof v.__antfly_utf8==="string"?utf8.encode(v.__antfly_utf8):v&&Object.keys(v).length===1&&Array.isArray(v.__antfly_bytes)?Uint8Array.from(v.__antfly_bytes):v)]));
   }
-  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background,deadlineMs:outerDeadlineMs=Infinity,readKeys,readPrefix,ownerCurrent=false,ownerCold=false}={}){
+  async readOnly(run,{traceId,traceIds=[],onAdmission,priority="interactive",background,deadlineMs:outerDeadlineMs=Infinity,readKeys,readPrefix,ownerCurrent=false,ownerCold=false,ownerDurable=false}={}){
+    if(this.freezeRequested)throw Error("CoordinatorMigrationRequired");
     if(this.ownerReady)await this.ownerReady;
+    if(ownerDurable&&(!this.durableReadState||this.recovering||this.ioDrain))throw Error("ReadSnapshotNeedsAdmission");
     if(ownerCurrent&&(!this.ownerMvcc||!this.acquired||this.recovering||this.ioDrain||!this.state))throw Error("ReadSnapshotNeedsAdmission");
     if(ownerCurrent&&(readKeys||readPrefix))throw Error("InvalidOwnerSnapshotProjection");
     // Seal admission membership before capturing the immutable committed root.
     if(ownerCurrent)onAdmission?.();
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
     const capturedHint=this.rootHint?{epoch:[...this.rootHint.epoch],next:this.rootHint.next,revision:this.rootHint.revision}:null;
-    const owned=this.acquired,captured=structuredClone(owned?this.state:(this.rootBackend==="bounded_journal"||this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=Math.min(this.clock()+5000,outerDeadlineMs),started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false,capsuleMetrics={};
+    const owned=this.acquired,captured=structuredClone(ownerDurable?this.durableReadState.state:owned?this.state:(this.rootBackend==="bounded_journal"||this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=Math.min(this.clock()+5000,outerDeadlineMs),started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false,capsuleMetrics={};
     const monotonicDeadline=started+Math.max(0,Math.min(5000,deadlineMs-this.clock()));
     let proofPermit,failure,finalization;
     const reserve=(operations,bytes)=>{if(usedOperations+operations>=254||usedBytes+bytes>=8*1024*1024){admissionBudgetExceeded=true;throw Error("ReadSnapshotNeedsAdmission");}usedOperations+=operations;usedBytes+=bytes;};
@@ -239,7 +254,7 @@ export class R2CoordinatorStore {
       }finally{
         proofPermit?.();this.snapshotReaders--;
         if(outcome==="ok"&&(this.clock()>=deadlineMs||proofPermit&&performance.now()>=monotonicDeadline))outcome="error";
-        try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,owner_current:ownerCurrent,owner_cold:ownerCold,proof_prefetch:!!proofPermit,proof_prefetch_reserved_bytes:proofPermit?proofPrefetchBytes:0,...capsuleMetrics,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}
+        try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,owner_current:ownerCurrent,owner_cold:ownerCold,owner_durable:ownerDurable,proof_prefetch:!!proofPermit,proof_prefetch_reserved_bytes:proofPermit?proofPrefetchBytes:0,...capsuleMetrics,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}
       }
       })();
     };
@@ -276,8 +291,8 @@ export class R2CoordinatorStore {
         if(!result||result.observation_fallback){proofPermit();proofPermit=null;return null;}
         return result;
       };
-      let observed=ownerCurrent?{state:captured,base:this.base,page_prefix:this.pagePrefix,has_more:false}:null,state=captured;
-      for(let attempt=0;!ownerCurrent&&attempt<4;attempt++){
+      let observed=ownerCurrent||ownerDurable?{state:captured,base:this.base,page_prefix:this.pagePrefix,has_more:false}:null,state=captured;
+      for(let attempt=0;!ownerCurrent&&!ownerDurable&&attempt<4;attempt++){
         const coordinate=readKeys?{action:"observe_read",observe_owned:owned,commands:readKeys.map(key=>({kind:"get",key})),read_prefix:readPrefix??null} :{action:owned?"observe":"observe_committed"};
         observed=readKeys?await plannedObservation(state,coordinate):null;
         observed??=await native(state,coordinate);state=observed.state;
@@ -294,7 +309,7 @@ export class R2CoordinatorStore {
         if(observed.selected){if(!readPrefix||!observed.selected.key.startsWith(readPrefix))throw Error("InvalidCoordinatorReadProjection");rows.set(observed.selected.key,decode(observed.selected.value));}
       }
       Object.assign(capsuleMetrics,rootMetrics(observed.state));
-      if(!ownerCurrent&&(!this.observedState||observed.state.revision>=this.observedState.revision)){this.observedState=structuredClone(observed.state);this.observedProof=structuredClone(snapshotProof);}
+      if(!ownerCurrent&&!ownerDurable&&(!this.observedState||observed.state.revision>=this.observedState.revision)){this.observedState=structuredClone(observed.state);this.observedProof=structuredClone(snapshotProof);}
       this.base??=observed.base;this.pagePrefix??=observed.page_prefix;
       const tx={getMany:async names=>{
         // A decoded row is reusable only after a fresh matching observation.
@@ -331,15 +346,17 @@ export class R2CoordinatorStore {
       if(!failure&&outcome!=="ok")throw Error("DeadlineExceeded");
     }
   }
-  async ownerRead(run,{deadlineMs=this.clock()+30000,traceId}={}){
+  async ownerRead(run,{deadlineMs=this.clock()+30000,traceId,prefetchKeys}={}){
+    if(this.freezeRequested)throw Error("CoordinatorMigrationRequired");
     if(!this.ownerServing)throw Error("ResidentServingOwnerRequired");
-    if(this.ownerMvcc&&!this.acquired&&!this.running&&!this.recovering&&!this.ioDrain&&!this.pending.length){
-      const admission=this.writeAdmission??0n;
+    if(prefetchKeys){if(!Array.isArray(prefetchKeys)||prefetchKeys.length>8)throw Error("InvalidOwnerSnapshotProjection");const callback=run;run=async tx=>{await tx.getMany(prefetchKeys);return callback(tx);};}
+    if(this.ownerMvcc&&!this.acquired&&!this.recovering&&!this.ioDrain&&(this.durableReadState||!this.running&&!this.pending.length)){
+      const admission=this.writeAdmission??0n,durable=!!this.durableReadState;
       try{
-        const result=await this.readOnly(run,{ownerCold:true,traceId,deadlineMs});
+        const result=await this.readOnly(run,{ownerCold:true,ownerDurable:durable,traceId,deadlineMs});
         // Fresh observation is sufficient for reads before write takeover. A
         // concurrent write admission invalidates this result even if it fails.
-        if((this.writeAdmission??0n)!==admission||this.acquired||this.running||this.recovering||this.ioDrain||this.pending.length)throw Error("ReadSnapshotNeedsAdmission");
+        if(!durable&&((this.writeAdmission??0n)!==admission||this.acquired||this.running||this.recovering||this.ioDrain||this.pending.length))throw Error("ReadSnapshotNeedsAdmission");
         return result;
       }catch(error){if(!/^ReadSnapshotNeeds(?:Admission|Pin)$/.test(error.message))throw error;}
     }
@@ -362,6 +379,7 @@ export class R2CoordinatorStore {
     return this.enqueue({run,priority,traceId,deadlineMs,ioBudget});
   }
   enqueue(input) {
+    if(this.freezeRequested)return Promise.reject(Error("CoordinatorMigrationRequired"));
     if(input.kind!=="owner_read")this.writeAdmission=(this.writeAdmission??0n)+1n;
     if(this.requiresExclusiveOwner&&!this.ownerServing)return Promise.reject(Error("ResidentServingOwnerRequired"));
     if(this.ioDrain)return Promise.reject(new Error("CoordinatorRecovering"));
@@ -392,12 +410,13 @@ export class R2CoordinatorStore {
     this.running=true;this.pending[0].startBatch();
   }
   async batch() {
-    const started=performance.now();this.trace=new CriticalPath({id:this.pending[0]?.traceId,scope:"coordinator"});this.deadline = this.clock()+30000;
+    const started=performance.now(),wallStarted=this.clock();this.trace=new CriticalPath({id:this.pending[0]?.traceId,scope:"coordinator"});this.deadline = this.clock()+30000;
     const ioBudget=this.pending[0]?.ioBudget,creditedOperations=ioBudget?.operations??0,creditedBytes=ioBudget?.bytes??0;
     this.physical={};this.usedOperations=creditedOperations; this.usedBytes=creditedBytes;this.nativeCpuMs=0;this.prefetchReservedBytes=0;let beginMs=0,commitMs=0,maxQueueMs=0;
     // The selected owner remains first until consumed. Arrivals during begin
     // cannot defer its callback and strand a consumed batch permit.
     this.groupPriority=this.pending[0]?.priority;this.readingOwner=this.pending[0]?.kind==="owner_read";
+    const checkDurableDeadline=()=>{const now=this.clock();if(now<wallStarted||now>=this.deadline||performance.now()-started>=this.deadline-wallStarted)throw Error("DeadlineExceeded");};
     const completed=[];
     try {
       if(this.ioDrain)throw new Error("CoordinatorRecovering");
@@ -413,13 +432,20 @@ export class R2CoordinatorStore {
       // In descriptor-v2 mode the live provider instance owns the confirmed
       // state. Expired append certificates are renewed by writers, not readers.
       const warmOwnerRead=this.pending[0]?.kind==="owner_read"&&this.ownerServing&&this.acquired&&!this.recovering&&this.state;
+      if(this.durableBootstrap&&!warmOwnerRead){
+        await this.durableBootstrap.begin();
+        // A clean, actor-local checkpoint proves no accepted-prefix PUT was
+        // outstanding. Reuse only its identity/cursor after a new durable
+        // intent; begin must still obtain fresh native admission and proofs.
+        if(!this.acquired&&this.durableWriteCursor){this.state=this.durableWriteCursor;this.owner=[...this.state.owner];this.durableWriteCursor=null;}
+      }
       const recovered = warmCommit||warmOwnerRead?{state:this.state,base:this.base,page_prefix:this.pagePrefix,has_more:false}:await this.trace.span("recovery",()=>this.native({action: "begin"}));
       beginMs=performance.now()-started;
-      if(this.acquired&&hex(recovered.state.owner)!==hex(this.owner))throw new Error("ImmutableLogFenced");
+      if(!recovered.has_more&&hex(recovered.state.owner)!==hex(this.owner))throw new Error("ImmutableLogFenced");
       this.state = recovered.state; this.base = recovered.base; this.pagePrefix = recovered.page_prefix;
       this.recovering=Boolean(recovered.has_more);
       if (recovered.has_more) throw new Error("CoordinatorRecovering");
-      this.acquired=true;
+      this.acquired=true;this.durableReadState=null;
       if(this.rowRevision!==this.state.revision){this.rows.clear();this.rowBytes=0;this.rowRevision=this.state.revision;}
       if(this.pending[0]?.kind==="commit_wal"){
         const item=this.pending.shift();completed.push(item);
@@ -430,6 +456,7 @@ export class R2CoordinatorStore {
         commitMs=performance.now()-commitStarted;
         if(this.idleCheckpoint?.replayCost)this.replayBytes=Math.min(64*1024,(this.replayBytes??0)+utf8.encode(JSON.stringify(item.commit)).byteLength);
         this.state=committed.state;this.rows.clear();this.rowBytes=0;this.rowRevision=this.state.revision;
+        if(this.durableBootstrap){await this.durableBootstrap.finish(this.state,(action,extra)=>this.servingCodec(action,extra));checkDurableDeadline();}
         item.result=committed;return completed;
       }
       const overlay = new Map();
@@ -496,8 +523,9 @@ export class R2CoordinatorStore {
         for(const [key,value]of overlay)this.remember(key,value);
         this.rowRevision=this.state.revision;
       }
+      if(this.durableBootstrap&&!warmOwnerRead){await this.durableBootstrap.finish(this.state,(action,extra)=>this.servingCodec(action,extra));checkDurableDeadline();}
     } catch(error) {
-      {this.acquired=false;this.clearServingTail?.();this.rows.clear();this.rowBytes=0;this.rowRevision=null;}
+      {this.acquired=false;this.durableReadState=null;this.durableWriteCursor=null;this.clearServingTail?.();this.rows.clear();this.rowBytes=0;this.rowRevision=null;}
       for(const item of completed)item.batchError=error;
       // Recovery advances a bounded cursor before returning backpressure.
       // Reject queued callers rather than retaining an unbounded request set.

@@ -24,9 +24,9 @@ export async function metadataKeys(namespace){
  const progress=`antfly/progress/${namespace}/`;
  return {namespace,hints:`__antfly_read_hints/${namespace}`,progress,head:progress+"HEAD",wal:`antfly/wal-v1/${hash}/HEAD`,floor:progress+"MANIFEST_GC_FLOOR"};
 }
-export async function inlineReadSet(namespace){
+export async function inlineReadSet(namespace,{servingBootstrap=false}={}){
  const keys=await metadataKeys(namespace);
- return{keys:[MIGRATION,keys.head,keys.wal,keys.floor,keys.hints],prefix:keys.progress+"READ_PINS/"};
+ return{keys:[...(servingBootstrap?["__antfly_serving_boot/"+namespace]:[]),MIGRATION,keys.head,keys.wal,keys.floor,keys.hints],prefix:keys.progress+"READ_PINS/"};
 }
 export async function openReadView(store,namespace,{version,trace_id,immutable}={},now=Date.now){
  const keys=await metadataKeys(namespace);

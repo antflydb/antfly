@@ -42,7 +42,9 @@ pub const Request = struct {
     observation_response: ?journal.ObservationResponse = null,
     root_proof_scope: [16]u8 = @splat(0),
     root_proof_key: ?[32]u8 = null,
-    action: enum { begin, observe, observe_committed, observe_read, observe_step, read, commit, commit_wal, checkpoint, checkpoint_hint, trace, retire_logs },
+    serving_scope: ?[]const u8 = null,
+    serving_capsule: ?[]const u8 = null,
+    action: enum { serving_export, serving_import, begin, observe, observe_committed, observe_read, observe_step, read, commit, commit_wal, checkpoint, checkpoint_hint, trace, retire_logs },
     owner: [16]u8,
     state: ?journal.State = null,
     commands: []const Command = &.{},
@@ -342,6 +344,38 @@ pub const Context = struct {
         std.crypto.hash.sha2.Sha256.hash(self.namespace, &digest, .{});
         const base = try std.fmt.allocPrint(m, "{s}/{s}/{s}", .{ self.prefix, if (req.root_backend == .conditional) "coord-v2" else "coord-v1", std.fmt.bytesToHex(digest, .lower) });
         const domain = Pages.domainForNamespace(base);
+        // A provider-admitted clean capsule is durable read state, not a write
+        // proof. Import never restores clocks, append authority or ownership.
+        if (req.action == .serving_export or req.action == .serving_import) {
+            if (req.root_backend != .bounded_journal or req.commands.len != 0) return error.InvalidServingCapsule;
+            const scope = req.serving_scope orelse return error.InvalidServingCapsule;
+            if (scope.len != 64) return error.InvalidServingCapsule;
+            for (scope) |byte| if (!std.ascii.isHex(byte)) return error.InvalidServingCapsule;
+            const Payload = struct { format: u8 = 1, namespace: []const u8, bucket: []const u8, prefix: []const u8, scope: []const u8, state: journal.State };
+            const Capsule = struct { payload: []const u8, checksum: [32]u8 };
+            const accepted = if (req.action == .serving_import) blk: {
+                const encoded = req.serving_capsule orelse return error.InvalidServingCapsule;
+                if (encoded.len > 65536) return error.InvalidServingCapsule;
+                const capsule = try std.json.parseFromSliceLeaky(Capsule, m, encoded, .{});
+                var checksum: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(capsule.payload, &checksum, .{});
+                if (!std.mem.eql(u8, &checksum, &capsule.checksum)) return error.InvalidServingCapsule;
+                const payload = try std.json.parseFromSliceLeaky(Payload, m, capsule.payload, .{});
+                if (payload.format != 1 or !std.mem.eql(u8, payload.namespace, self.namespace) or !std.mem.eql(u8, payload.bucket, self.bucket) or !std.mem.eql(u8, payload.prefix, self.prefix) or !std.mem.eql(u8, payload.scope, scope)) return error.InvalidServingCapsule;
+                break :blk payload.state;
+            } else req.state orelse return error.InvalidServingCapsule;
+            if (accepted.format != 1 or accepted.next > 64 or accepted.root.len > journal.max_root_bytes) return error.InvalidServingCapsule;
+            _ = try Root.load(m, accepted.root);
+            if (req.action == .serving_export) {
+                if (!std.mem.eql(u8, &accepted.owner, &req.owner)) return error.ImmutableLogFenced;
+                const payload = try std.json.Stringify.valueAlloc(m, Payload{ .namespace = self.namespace, .bucket = self.bucket, .prefix = self.prefix, .scope = scope, .state = accepted }, .{});
+                var checksum: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(payload, &checksum, .{});
+                return std.json.Stringify.valueAlloc(self.alloc, .{ .serving_capsule = try std.json.Stringify.valueAlloc(m, Capsule{ .payload = payload, .checksum = checksum }, .{}) }, .{});
+            }
+            return std.json.Stringify.valueAlloc(self.alloc, .{ .state = accepted, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
+        }
+
         var journal_observation = journal.ObservationMetrics{};
         const journal_log = journal.Log{ .client = self.client, .bucket = self.bucket, .prefix = base, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .checkpoint_commits = req.checkpoint_commits, .read_batch = req.root_backend == .bounded_journal and req.journal_read_batch, .observation_metrics = &journal_observation };
         var log = authority.Authority{ .log = journal_log, .cursor = req.root_cursor, .journal_proof = req.journal_proof, .journal_read_batch = req.journal_read_batch, .journal_hint = req.journal_hint, .journal_auth = if (req.root_backend == .bounded_journal and req.root_proof_key != null) journal.ProofAuthority{ .key = req.root_proof_key.?, .scope = req.root_proof_scope } else null, .root = if (req.root_backend == .conditional) conditional.Context{ .client = self.client, .bucket = self.bucket, .prefix = base, .namespace = self.namespace, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .proofs = &conditional_proofs, .proof_scope = req.root_proof_scope, .proof_key = req.root_proof_key } else null };

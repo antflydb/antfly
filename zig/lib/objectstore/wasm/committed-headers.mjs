@@ -18,24 +18,43 @@
 import{ObjectStoreError}from'./r2.mjs';
 const text=new TextDecoder(),encoder=new TextEncoder();
 export class CommittedHeaders {
- constructor(namespace,version){this.namespace=namespace;this.version=version;this.records=[];}
+ constructor(namespace,version,{routing=false}={}){this.routing=routing;this.namespace=namespace;this.version=version;this.records=[];}
  offer(request,result){
   if(request.op!=='get'||request.range!=null||request.bucket!=='database'||!(result.body instanceof Uint8Array)||(typeof result.json?.etag!=='string'||!result.json.etag.length||result.json.etag.length>128))return;
   const body=result.body,key=request.key,manifest=`antfly/manifests/${this.namespace}/manifests/${this.version}.bin`;
-  if(key!==manifest&&!(/^antfly\/artifacts\/(sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(key)&&/^AFDFACT[3-9ABCDE]$/.test(text.decode(body.subarray(0,8)))))return;
-  if(this.records.length>=2||body.byteLength>8192||this.records.some(r=>r.key===key))return;
+  if(key!==manifest&&!(/^antfly\/artifacts\/(sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(key)&&(/^AFDFACT[3-9ABCDE]$/.test(text.decode(body.subarray(0,8)))||this.routing&&body.length<=4096)))return;
+  if(this.records.length>=(this.routing?8:2)||body.byteLength>8192||this.records.some(r=>r.key===key))return;
   const row={key,etag:result.json.etag,body:btoa(String.fromCharCode(...body))};
   if(encoder.encode(JSON.stringify([...this.records,row])).byteLength>16384)return;
   this.records.push(row);
  }
- encode(){return this.records.some(r=>r.key===`antfly/manifests/${this.namespace}/manifests/${this.version}.bin`)?{format:1,namespace:this.namespace,version:this.version,records:this.records}:null;}
+ encode(){return this.records.some(r=>r.key===`antfly/manifests/${this.namespace}/manifests/${this.version}.bin`)?{format:this.routing?3:1,namespace:this.namespace,version:this.version,records:this.records}:null;}
+ async encodeCompressed(){
+  const value=this.encode();if(!value)return null;
+  const source=encoder.encode(JSON.stringify(value)),stream=new Blob([source]).stream().pipeThrough(new CompressionStream('gzip')),bytes=new Uint8Array(await new Response(stream).arrayBuffer());
+  const compressed={format:2,namespace:this.namespace,version:this.version,encoding:'gzip',payload:btoa(String.fromCharCode(...bytes))};
+  return JSON.stringify(compressed).length<source.length?compressed:value;
+ }
  static wrap(transport,value,namespace,version){
   if(value==null||value.version!==version)return transport;
-  if(value.format!==1||value.namespace!==namespace||!Array.isArray(value.records)||value.records.length>2||encoder.encode(JSON.stringify(value)).byteLength>17000)throw Error('InvalidCommittedHeaders');
+  if(value.format===2){
+   if(value.namespace!==namespace||value.encoding!=='gzip'||typeof value.payload!=='string'||value.payload.length>17000)throw Error('InvalidCommittedHeaders');
+   let decoded;
+   return async(request,body)=>{
+    if(!decoded){
+     const source=Uint8Array.from(atob(value.payload),c=>c.charCodeAt(0)),reader=new Blob([source]).stream().pipeThrough(new DecompressionStream('gzip')).getReader();let count=0;const parts=[];
+     try{for(;;){const{done,value:part}=await reader.read();if(done)break;count+=part.length;if(count>17000)throw Error('InvalidCommittedHeaders');parts.push(part);}}finally{await reader.cancel();}
+     const bytes=new Uint8Array(count);let offset=0;for(const part of parts){bytes.set(part,offset);offset+=part.length;}
+     const plain=JSON.parse(text.decode(bytes));if(![1,3].includes(plain.format)||plain.version!==version)throw Error('InvalidCommittedHeaders');decoded=CommittedHeaders.wrap(transport,plain,namespace,version);
+    }
+    return decoded(request,body);
+   };
+  }
+  if(![1,3].includes(value.format)||value.namespace!==namespace||!Array.isArray(value.records)||value.records.length>(value.format===3?8:2)||encoder.encode(JSON.stringify(value)).byteLength>17000)throw Error('InvalidCommittedHeaders');
   const map=new Map();
   for(const row of value.records){
    if(typeof row.key!=='string'||typeof row.body!=='string'||typeof row.etag!=='string'||map.has(row.key))throw Error('InvalidCommittedHeaders');
-   const body=Uint8Array.from(atob(row.body),c=>c.charCodeAt(0)),check=new CommittedHeaders(namespace,version);check.offer({op:'get',bucket:'database',key:row.key},{json:{etag:row.etag},body});if(check.records.length!==1)throw Error('InvalidCommittedHeaders');map.set(row.key,{body,etag:row.etag});
+   const body=Uint8Array.from(atob(row.body),c=>c.charCodeAt(0)),check=new CommittedHeaders(namespace,version,{routing:value.format===3});check.offer({op:'get',bucket:'database',key:row.key},{json:{etag:row.etag},body});if(check.records.length!==1)throw Error('InvalidCommittedHeaders');map.set(row.key,{body,etag:row.etag});
   }
   return async(request,body)=>{
    const row=request.bucket==='database'&&['get','head'].includes(request.op)&&map.get(request.key);

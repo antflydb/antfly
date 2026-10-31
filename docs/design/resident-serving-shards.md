@@ -527,3 +527,5 @@ overlay installation cost, stronger repetitions without competing builds and
 live whole-window qualification remain work. Historical `SQLITE_NOMEM` is not
 resolved by these local results. All new flags remain opt-in; the original
 hosted resource, error, duration and latency thresholds are unchanged.
+
+The subsequent opt-in cold pipeline and provider-local durability protocol are specified in [Cold serving plans and durable native bootstrap](cold-serving-bootstrap.md). Its clean/dirty recovery and authority contract differs from the R2-only v2 baseline above; results must remain separately qualified.
