@@ -533,3 +533,61 @@ errors and captured observer resource failures are empty, but coverage remains
 incomplete. This does not demonstrate that `SQLITE_NOMEM` is fixed.
 See [the hosted result](cloudflare-twofold-trial.md) for provenance, placement,
 selected native I/O traces and cleanup inventory. The original gate remains unpassed.
+
+## Bounded delivery, complete replay and startup readiness
+
+The next collector advertises window inventories and ETag-pinned grouped object
+reads. Four request-owned calls pipeline groups under the original 32-object /
+4 MiB response, 8 KiB request, per-window byte/object and aggregate time caps.
+Small inventories include their objects directly. Independent second observations
+re-list and re-read storage; there is no cross-observation cache. One reader page
+reservation survives serialization until HTTP EOF or cancellation, preventing
+four outstanding callers from retaining four decoded evidence pages. All started
+calls settle on errors, including recovered resource failures.
+
+On the same frozen 28-minute source (5,178 verified objects), modeled 50 ms HTTP /
+20 ms storage delay falls from about 20 seconds to 10–11 seconds in both orders.
+Physical GET counts remain equal; metadata LISTs fall 207 → 60. This is local
+retrieval throughput, not live export completeness or allocator qualification.
+
+Actual-workerd replay of all eight historical source catalogs now completes two
+observations in 301,132 ms, within the original 600,000 ms budget. **It still
+fails six sources' reconciliation.** Missing canonical terminals concentrate in
+the first 0.8–16 seconds after the initial witness, including six candidate HTTP
+200 acknowledgements present in native evidence but absent from canonical
+export. Two control-reader extra terminals occur near the final boundary and
+have approximately 30-second RPC wall times. Startup delivery and RPC lifetime
+are hypotheses, not established causes. Original reports and all gaps remain
+unchanged; late historical source preservation is never qualification evidence.
+
+A separately generated, explicitly synthetic known-complete fixture exercises
+all eight sources over 28 minutes, 16,384 terminals and 32,808 R2 objects. Both
+independent observations reconcile all eight sources in 463,780 ms (7m44s), with
+four client calls outstanding, one decoded reader page and zero active calls at
+completion. This proves bounded collection of complete input fits the existing
+deadline in this local model. It does not demonstrate complete hosted delivery.
+
+The driver now requires a preflight before database setup: each of eight sources
+must provide a positive intermediate witness terminal in both independent native
+and canonical observations, with the original versions and boundary witnesses.
+Empty reconciled sources are insufficient. Closure remains 60 seconds and
+observations remain separated by 30 seconds. At most two fresh, five-minute
+preflight attempts are allowed; every failed attempt is retained. Resource
+failures terminate preflight immediately and remain in the whole-run resource
+ledger. Qualification workload, original ten-minute settlement, cold epochs and
+latency thresholds are unchanged. Preflight is explicitly outside qualification
+and does not claim physical cold startup performance.
+
+Data-only RPC results now materialize caller-owned bytes and explicitly dispose
+both the pipelined promise and result group on success or failure. The workerd
+test verifies real RPC object disposal and invalidation of unexpected returned
+capabilities. It does not establish a bound on remote destructor scheduling or
+prove that this fixes the historical long RPC tails or `SQLITE_NOMEM`.
+[Cloudflare's RPC lifecycle documentation](https://developers.cloudflare.com/workers/runtime-apis/rpc/lifecycle/)
+recommends explicit disposal and describes asynchronous remote cleanup.
+
+All 515 Node tests pass, including preflight gaps/retry preservation, positive
+both-plane evidence, cancellation and resource-failure rejection. The hosted
+memory error remains unresolved until a new complete live capture covers the
+original workload without recovered resource failures. No cloud resources were
+created for these local experiments.

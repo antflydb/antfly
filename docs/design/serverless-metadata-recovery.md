@@ -272,3 +272,63 @@ supply a complete second observation or repair the original failure. Whole-windo
 resource coverage, historical `SQLITE_NOMEM` and the hosted gate remain open.
 [The hosted record](cloudflare-twofold-trial.md) retains the report hash,
 placement measurements, deployed artifact closure and cleanup status.
+
+## Transport-sized recovery and advisory physical locations
+
+The next implementation is shared native storage work, rather than an R2-only
+index format. Native clients advertise a preferred speculative read window
+(default eight; the WASM transport uses its four-call window). Cold and expired
+short tails stop paying for a second speculative transport wave; warm tails
+through seven commits retain their original serial behavior.
+
+Checkpoint repair now has a separate `checkpoint_hint` action. It reuses a still
+valid native accepted-state certificate, freshly reads the checkpoint floor and
+ownership seal together, validates monotonicity and typed conditional publication,
+and rechecks the original certificate after publication. The strict checkpoint
+operation used by garbage collection is unchanged. Native capability advertisement
+keeps old modules on the original path. Four alternating paired samples with
+100 ms injected binding delay measure 505–510 ms control versus 303–307 ms
+candidate, reducing four GETs plus one PUT to three GETs plus one PUT.
+
+An opt-in `METADATA_COMMIT_HINTS` path shares a physical journal location after a
+successful commit: epoch, next slot and revision only. It carries no accepted
+root, timestamp or authority. A cold or sufficiently lagged native observer
+reads the current checkpoint floor and the actual hinted frame together. Only
+an authenticated frame newer than the fresh floor can accelerate discovery;
+stale, missing, malformed or retired hints fall back to the floor. A fresh end
+probe and original pre-I/O certificate anchor remain mandatory. Ownership seals,
+collector grace, typed revisions and cumulative budgets remain authoritative.
+Warm short tails and old hints retain the ordinary path.
+
+Private writer acknowledgements carry hints only when enabled. The app strips
+the private field before returning JSON and offers a cloned, namespace-scoped
+cursor to its local reader. At most one cursor, charged at up to 4 KiB against
+the existing row-cache allowance, survives requests. No I/O, caller capability,
+clock or proof is cached with it. Eviction removes it; a restarted reader remains
+correct without it. The actual-workerd test forbids writer SQL/KV, verifies private
+field removal and native acceptance, then recreates all isolates and verifies a
+correct cold read with no retained cursor.
+
+The final native 32-entry cold/expired metadata-only experiment at 100 ms storage
+delay reduces 37 GETs to four and about 1,220–1,319 ms to 306–307 ms. An advanced
+checkpoint is unchanged at about 307 ms. These are component dependency-depth
+measurements, not an app or hosted SLO. S3/GCS clients can use the same native
+proof protocol with serial transport fallback; no new live-provider performance
+result is claimed.
+
+Point lookup sessions now defer opening the immutable base facts root until an
+unresolved document actually needs it. Fresh WAL updates, tombstones and resumed
+point plans avoid the obsolete base root; base-backed misses still validate it.
+Source format, identity, domain, visibility and pin checks remain. Alternating
+100 ms binding-delay tests save one GET for fresh updates/deletes (about
+1,112 → 1,012 ms); stable and absent documents retain their required reads.
+This does not by itself halve end-to-end read latency.
+
+Native implementation is `66263e40d9`; final full/compact/observe module hashes are
+`dc33e4a0ad350e2ea48baca675d2e4a08065f5f4cccc9dd2d32dfd8f970029e2`,
+`a599e6a5fc8665bc091fe4dad85c1ff25941aea73325379a9a6b027d79445f74`,
+`4f74ff72fa67755a02dcee5e50470ac5242536993fb7b958191eb05d7b05458a`.
+Frozen final copies are in `dist/qualification/next-serving-final/modules` under
+the Cloudflare example. The shared object-store suite passes 192 tests with two
+live-provider cases skipped; 38 focused native checks pass. Full application
+comparisons remain separate from these component results.
