@@ -65,17 +65,31 @@ The record states are:
    operation that can advance accepted metadata, including ownership recovery.
 2. **R2 committed:** native durable metadata finalization succeeds. R2 acceptance
    and idempotency receipts remain unchanged.
-3. **Clean capsule:** native exports the confirmed state; the provider record is
-   persisted and synchronized before the application write is acknowledged.
-4. **Frozen:** new admission stops, queued work and outstanding I/O drain, then a
+3. **Acknowledgment:** the application write returns after native R2 commit.
+   A confirmed dirty interval coalesces subsequent intents without another local
+   write. No optional clean checkpoint is on this acknowledgment path.
+4. **Clean capsule:** after one quiet second, native exports confirmed state on
+   the coordinator's existing serialized maintenance queue. The provider record
+   is persisted and synchronized before a clean checkpoint is confirmed.
+5. **Frozen:** new admission stops, queued work and outstanding I/O drain, then a
    durable blocked record is installed before namespace retirement/migration.
 
-A crash before step 3 leaves dirty intent and requires native R2 recovery.
-Failure to persist clean state never produces a successful ACK. If a clean
-record was actually durable despite a lost local acknowledgement, its state is
-already R2 committed and remains safe to read. Corrupt capsules are marked dirty
-before fallback; resource failures are not hidden as corruption. Local durability
-remains on the original operation's wall/monotonic deadline.
+A crash before a confirmed clean checkpoint leaves dirty intent and requires
+native R2 recovery. A checkpoint failure cannot revoke an already accepted R2
+write; it remains visible in diagnostics and invalidates qualification. The
+scheduler does not retry checkpoint exceptions automatically, and busy admission
+is bounded to four checks within ten seconds. A future write can schedule another
+attempt. The owner never installs a clean checkpoint concurrently with a write.
+
+Before every local PUT/sync, the in-memory confirmed-dirty latch is cleared.
+Only successful synchronization confirms it. This matters when a clean PUT took
+effect but its sync failed: the next write must persist dirty intent again, even
+though the last confirmed in-memory record was dirty. A lost clean acknowledgment
+is safe because the capsule only contains state already committed in R2. Corrupt
+capsules are marked dirty before fallback; resource failures are not treated as
+corruption. Mandatory dirty durability is checked against the original operation
+deadline before R2 advancement. Checkpoints have their own bounded deadline.
+Freeze drains pending checkpoints before installing the blocked record.
 
 A clean physical restart can serve its confirmed snapshot while first-write
 admission is pending. The snapshot is immutable and linearizes before the
@@ -118,3 +132,20 @@ namespace freeze, and original role/input/I/O bounds. Measure write p95 as well
 as cold and warm read p95. Use both execution orders and the approved fixed
 control for hosted qualification; current-module local comparisons are design
 experiments. Do not reinterpret warm local-cache results as physically cold data.
+
+## Dense-load design correction
+
+The synchronous prototype at `546a104e9a` passed its focused correctness suite
+and the first 48-case local matrix, but failed the denser 512-read/128-write run
+with `database is busy` (102 failed offered operations; a repeated diagnostic
+run failed 46). Those reports are retained under `cold-v4-final-dense32-forward`
+and `cold-v4-dense-diagnostic-2`. Instrumented provider get/put/sync calls did not
+attribute that error to local capsule storage. It would be incorrect to call
+the platform error resolved based on that evidence.
+
+The corrected design removes synchronous per-write clean exports and durability
+barriers. Dirty intent and R2 acknowledgment remain mandatory; clean checkpoints
+are a coalesced recovery accelerator. Dense offered-load runs, both execution
+orders, recovered-error histories and actual-workerd restart tests are required
+to evaluate this correction. Earlier synchronous measurements remain historical
+and must not be combined with corrected measurements as a single passing run.

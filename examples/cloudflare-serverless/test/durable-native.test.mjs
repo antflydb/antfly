@@ -24,22 +24,22 @@ async function fixture(){
  return{bucket,env,local,reopen,calls:()=>calls,intercept:fn=>intercept=fn};
 }
 test('native durable capsule restores cold reads with zero R2 I/O and no append authority',async()=>{
- const f=await fixture(),first=await f.reopen();await first.transaction(tx=>tx.put('value',1));const capsule=f.local.value.capsule;
+ const f=await fixture(),first=await f.reopen();await first.transaction(tx=>tx.put('value',1));await first.flushDurableCheckpoint();const capsule=f.local.value.capsule;
  const cold=await f.reopen(),before=f.calls();assert.equal(await cold.ownerRead(tx=>tx.get('value')),1);assert.equal(f.calls(),before);assert.equal(cold.acquired,false);assert.equal(cold.state,null);assert.equal(cold.journalProof,null);
  await assert.rejects(cold.servingCodec('serving_import',{serving_scope:'f'.repeat(64),serving_capsule:capsule}),/InvalidServingCapsule/);
  const corrupt=JSON.parse(capsule);corrupt.checksum[0]^=1;await assert.rejects(cold.servingCodec('serving_import',{serving_capsule:JSON.stringify(corrupt)}),/InvalidServingCapsule/);await assert.rejects(cold.servingCodec('serving_import',{serving_capsule:'x'.repeat(65537)}),/InvalidServingCapsule/);
  await cold.transaction(tx=>tx.put('value',2));assert.ok(f.calls()>before);assert.equal(await cold.ownerRead(tx=>tx.get('value')),2);assert.deepEqual(cold.state.owner,first.state.owner);assert.notDeepEqual(cold.journalProof.auth,first.journalProof.auth);
 });
 test('R2 commit followed by local durability failure remains dirty and recovers the committed value',async()=>{
- const f=await fixture(),first=await f.reopen();await first.transaction(tx=>tx.put('value',1));f.local.failClean=true;await assert.rejects(first.transaction(tx=>tx.put('value',2)),/InjectedLocalCommitFailure/);assert.equal(f.local.value.dirty,true);
+ const f=await fixture(),first=await f.reopen();await first.transaction(tx=>tx.put('value',1));await first.flushDurableCheckpoint();f.local.failClean=true;await first.transaction(tx=>tx.put('value',2));await assert.rejects(first.flushDurableCheckpoint(),/InjectedLocalCommitFailure/);assert.equal(f.local.value.dirty,true);
  f.local.failClean=false;const recovered=await f.reopen(),before=f.calls();assert.equal(recovered.durableReadState,undefined);assert.equal(await recovered.ownerRead(tx=>tx.get('value')),2);assert.ok(f.calls()>before);
 });
 test('dirty precommit crash keeps the last value and corrupt clean capsules fall back to recovery',async()=>{
- const f=await fixture(),first=await f.reopen();await first.transaction(tx=>tx.put('value',1));await first.durableBootstrap.begin();const dirty=await f.reopen();assert.equal(await dirty.ownerRead(tx=>tx.get('value')),1);
- await dirty.transaction(tx=>tx.put('value',3));f.local.value.capsule='invalid';const corrupted=await f.reopen();assert.equal(f.local.value.dirty,true);assert.equal(await corrupted.ownerRead(tx=>tx.get('value')),3);
+ const f=await fixture(),first=await f.reopen();await first.transaction(tx=>tx.put('value',1));await first.flushDurableCheckpoint();await first.durableBootstrap.begin();const dirty=await f.reopen();assert.equal(await dirty.ownerRead(tx=>tx.get('value')),1);
+ await dirty.transaction(tx=>tx.put('value',3));await dirty.flushDurableCheckpoint();f.local.value.capsule='invalid';const corrupted=await f.reopen();assert.equal(f.local.value.dirty,true);assert.equal(await corrupted.ownerRead(tx=>tx.get('value')),3);
 });
 test('a clean confirmed snapshot remains readable while first-write fresh admission waits on R2',async()=>{
- const f=await fixture(),first=await f.reopen();await first.transaction(tx=>tx.put('value',1));const cold=await f.reopen();let armed=true,atIO,release;const ready=new Promise(r=>atIO=r),gate=new Promise(r=>release=r);f.intercept(async()=>{if(armed){armed=false;atIO();await gate;}});
+ const f=await fixture(),first=await f.reopen();await first.transaction(tx=>tx.put('value',1));await first.flushDurableCheckpoint();const cold=await f.reopen();let armed=true,atIO,release;const ready=new Promise(r=>atIO=r),gate=new Promise(r=>release=r);f.intercept(async()=>{if(armed){armed=false;atIO();await gate;}});
  const write=cold.transaction(tx=>tx.put('value',2));await ready;
  try{const before=f.calls();assert.equal(await cold.ownerRead(tx=>tx.get('value')),1);assert.equal(f.calls(),before);}finally{release();await write;}
  assert.equal(await cold.ownerRead(tx=>tx.get('value')),2);
@@ -47,8 +47,8 @@ test('a clean confirmed snapshot remains readable while first-write fresh admiss
 test('incompatible WASM rejects durable activation before accepted metadata writes',async()=>{
  const f=await fixture(),empty=await WebAssembly.compile(Uint8Array.of(0,97,115,109,1,0,0,0)),store=new R2CoordinatorStore(empty,f.bucket,f.env.ANTFLY_INCARNATION,{exclusiveOwnerId:actor});store.durableBootstrap=new DurableServingBootstrap(f.local,f.env,actor);const authority=await openAuthority(f.env,'r2-bounded');await store.durableBootstrap.adopt(authority);store.configureAuthority(authority.descriptor);await assert.rejects(store.restoreDurableRead(),/ServingCapsuleModuleRequired/);assert.equal((await f.bucket.list({prefix:'antfly/coord-v1/'})).objects.length,0);
 });
-test('local durability cannot acknowledge beyond the original write deadline',async()=>{
- const f=await fixture(),store=await f.reopen(),clock=store.clock;f.local.sync=async function(){if(!this.value.dirty)store.clock=()=>clock()+31000;};
- await assert.rejects(store.transaction(tx=>tx.put('value',9),{deadlineMs:clock()+10000}),/DeadlineExceeded/);assert.equal(f.local.value.dirty,false);
- const recovered=await f.reopen();assert.equal(await recovered.ownerRead(tx=>tx.get('value')),9);
+test('an intent durability deadline cannot advance accepted R2 metadata',async()=>{
+ const f=await fixture(),store=await f.reopen(),clock=store.clock;await store.transaction(tx=>tx.put('value',1));await store.flushDurableCheckpoint();const before=f.calls();f.local.sync=async function(){if(this.value.dirty)store.clock=()=>clock()+31000;};
+ await assert.rejects(store.transaction(tx=>tx.put('value',9),{deadlineMs:clock()+10000}),/DeadlineExceeded/);assert.equal(f.calls(),before);assert.equal(f.local.value.dirty,true);
+ const recovered=await f.reopen();assert.equal(await recovered.ownerRead(tx=>tx.get('value')),1);
 });

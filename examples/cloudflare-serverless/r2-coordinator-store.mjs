@@ -74,6 +74,16 @@ export class R2CoordinatorStore {
     }
     this.readLeasePolicy=descriptor.read_lease_policy;
   }
+  configureDurableCheckpoint(){
+    if(!this.durableBootstrap||!this.background||this.durableCheckpoint)return;
+    this.durableCheckpoint=new IdleCheckpoint({clock:this.clock,revision:()=>this.state?.revision??0,delay:1000,retryDelay:1000,maxAttempts:4,shouldRetry:()=>false,
+      isIdle:()=>this.acquired&&!this.running&&!this.pending.length&&!this.recovering&&!this.ioDrain&&!this.freezeRequested&&performance.now()-(this.durableBootstrap.lastActivity??0)>=1000,
+      checkpoint:options=>this.flushDurableCheckpoint(options),background:this.background,onError:error=>{try{this.onMetrics?.({event:"antfly.durable_checkpoint_error",error_message:String(error.message??error).slice(0,2048)});}catch{}}});
+  }
+  flushDurableCheckpoint({deadlineMs=this.clock()+5000}={}){
+    if(!this.durableBootstrap)return Promise.reject(Error("DurableBootstrapStorageRequired"));
+    return this.enqueue({kind:"durable_checkpoint",priority:"maintenance",deadlineMs,run:()=>{}});
+  }
   async servingCodec(action,extra={}){
     return this.snapshotKernel.withHost(host=>{
       if(host.servingCapsuleABI!==1)throw Error("ServingCapsuleModuleRequired");
@@ -83,6 +93,7 @@ export class R2CoordinatorStore {
   }
   async restoreDurableRead(){
     if(!this.durableBootstrap)return;
+    this.configureDurableCheckpoint();
     if(!WebAssembly.Module.exports(this.module).some(entry=>entry.name==="antfly_host_serving_capsule_v1"))throw Error("ServingCapsuleModuleRequired");
     if(this.durableRestore){while(!this.durableRestore.done)await new Promise(r=>setTimeout(r,2));if(this.durableRestore.error)throw Error(this.durableRestore.error);return;}
     const ticket=this.durableRestore={done:false,error:null};
@@ -384,7 +395,7 @@ export class R2CoordinatorStore {
   }
   enqueue(input) {
     if(this.freezeRequested)return Promise.reject(Error("CoordinatorMigrationRequired"));
-    if(input.kind!=="owner_read")this.writeAdmission=(this.writeAdmission??0n)+1n;
+    if(input.kind!=="owner_read"&&input.kind!=="durable_checkpoint")this.writeAdmission=(this.writeAdmission??0n)+1n;
     if(this.requiresExclusiveOwner&&!this.ownerServing)return Promise.reject(Error("ResidentServingOwnerRequired"));
     if(this.ioDrain)return Promise.reject(new Error("CoordinatorRecovering"));
     if(this.pending.length>=64)return Promise.reject(new Error("CoordinatorCommitBusy"));
@@ -428,6 +439,13 @@ export class R2CoordinatorStore {
         this.deadline=Math.min(this.deadline,this.pending[0].deadlineMs);
         if(this.clock()>=this.deadline){completed.push(this.pending.shift());throw new Error("DeadlineExceeded");}
       }
+      if(this.pending[0]?.kind==="durable_checkpoint"){
+        const item=this.pending.shift();completed.push(item);
+        if(this.freezeRequested||!this.acquired||this.recovering||this.ioDrain||!this.state){item.result={done:false,revision:this.state?.revision??0};return completed;}
+        if(this.durableBootstrap.entry?.dirty===false){item.result={done:true,revision:this.state.revision};return completed;}
+        await this.durableBootstrap.finish(this.state,(action,extra)=>this.servingCodec(action,extra));checkDurableDeadline();
+        item.result={done:true,revision:this.state.revision};return completed;
+      }
       // Commit-only native plans expose no read result before append. A warm
       // retained root is authenticated by append's before/after floor and seal
       // checks, then linearized by its immutable conditional journal slot.
@@ -437,7 +455,7 @@ export class R2CoordinatorStore {
       // state. Expired append certificates are renewed by writers, not readers.
       const warmOwnerRead=this.pending[0]?.kind==="owner_read"&&this.ownerServing&&this.acquired&&!this.recovering&&this.state;
       if(this.durableBootstrap&&!warmOwnerRead){
-        await this.durableBootstrap.begin();
+        await this.durableBootstrap.begin();checkDurableDeadline();
         // A clean, actor-local checkpoint proves no accepted-prefix PUT was
         // outstanding. Reuse only its identity/cursor after a new durable
         // intent; begin must still obtain fresh native admission and proofs.
@@ -460,7 +478,6 @@ export class R2CoordinatorStore {
         commitMs=performance.now()-commitStarted;
         if(this.idleCheckpoint?.replayCost)this.replayBytes=Math.min(64*1024,(this.replayBytes??0)+utf8.encode(JSON.stringify(item.commit)).byteLength);
         this.state=committed.state;this.rows.clear();this.rowBytes=0;this.rowRevision=this.state.revision;
-        if(this.durableBootstrap){await this.durableBootstrap.finish(this.state,(action,extra)=>this.servingCodec(action,extra));checkDurableDeadline();}
         item.result=committed;return completed;
       }
       const overlay = new Map();
@@ -527,9 +544,8 @@ export class R2CoordinatorStore {
         for(const [key,value]of overlay)this.remember(key,value);
         this.rowRevision=this.state.revision;
       }
-      if(this.durableBootstrap&&!warmOwnerRead){await this.durableBootstrap.finish(this.state,(action,extra)=>this.servingCodec(action,extra));checkDurableDeadline();}
     } catch(error) {
-      {this.acquired=false;this.durableReadState=null;this.durableWriteCursor=null;this.clearServingTail?.();this.rows.clear();this.rowBytes=0;this.rowRevision=null;}
+      if(completed[0]?.kind!=="durable_checkpoint"){this.acquired=false;this.durableReadState=null;this.durableWriteCursor=null;this.clearServingTail?.();this.rows.clear();this.rowBytes=0;this.rowRevision=null;}
       for(const item of completed)item.batchError=error;
       // Recovery advances a bounded cursor before returning backpressure.
       // Reject queued callers rather than retaining an unbounded request set.
@@ -538,7 +554,7 @@ export class R2CoordinatorStore {
       if(ioBudget){ioBudget.operations=this.usedOperations;ioBudget.bytes=this.usedBytes;}
       try{this.onMetrics?.({event:"antfly.coordinator_group",owner_read:this.readingOwner===true,operations:this.usedOperations-creditedOperations,transferred_bytes:this.usedBytes-creditedBytes,elapsed_ms:performance.now()-started,physical_r2:{...this.physical},trace:this.trace.report(),prefetch_reserved_bytes:this.prefetchReservedBytes,begin_ms:beginMs,commit_ms:commitMs,native_cpu_ms:this.nativeCpuMs,queue_wait_max_ms:maxQueueMs,row_cache_bytes:this.rowBytes,callbacks:completed.length,trace_ids:completed.map(item=>item.traceId).filter(Boolean)});}catch{}
       this.deadline = null;this.readingOwner=false;
-      this.idleCheckpoint?.schedule();
+      this.idleCheckpoint?.schedule();this.durableCheckpoint?.schedule();
     }
     return completed;
   }

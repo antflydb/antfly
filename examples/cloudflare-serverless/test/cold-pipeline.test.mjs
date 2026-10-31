@@ -34,7 +34,7 @@ test('compressed bootstrap round trips and rejects corrupt payloads',async()=>{
 });
 const owner='d'.repeat(64),env={ANTFLY_INCARNATION:'native-durable'},authority={descriptor:{format:2,namespace:env.ANTFLY_INCARNATION,mode:'r2-bounded',storage_id:env.ANTFLY_INCARNATION,serving:{protocol:'serialized-owner-v3',owner_id:owner,authority_storage:'provider-native-v1'},read_lease_policy:conditionalReadLeasePolicy}};
 const storage=()=>({value:null,writes:[],async get(){return structuredClone(this.value);},async put(key,value){this.value=structuredClone(value);this.writes.push(value.dirty?'intent':'clean');},async sync(){this.writes.push('sync');}});
-test('durable bootstrap persists intent before commit and clean native bytes before ACK',async()=>{
+test('durable bootstrap confirms dirty intent and explicitly checkpoints clean native bytes',async()=>{
  const s=storage(),b=new DurableServingBootstrap(s,env,owner);await b.adopt(authority);assert.deepEqual(s.writes,['intent','sync']);await b.begin();let exported=false;await b.finish({owner:[]},async action=>{assert.equal(action,'serving_export');exported=true;return{serving_capsule:'native bytes'};});assert.equal(exported,true);assert.deepEqual(s.writes.slice(-2),['clean','sync']);
  const restored=new DurableServingBootstrap(s,env,owner);await restored.authority();assert.deepEqual(await restored.restore(async(action,data)=>{assert.equal(action,'serving_import');assert.equal(data.serving_capsule,'native bytes');return{state:'restored'};}),{state:'restored'});
  await restored.begin();const dirty=new DurableServingBootstrap(s,env,owner);await dirty.authority();assert.equal(await dirty.restore(()=>{throw Error('must recover R2');}),null);
@@ -54,4 +54,16 @@ test('app read-view adapters preserve durable protocol selection in their cache 
 });
 test('compressed bootstrap carries bounded native routing headers with the manifest',async()=>{
  const h=new CommittedHeaders('ns','3',{routing:true}),manifest='antfly/manifests/ns/manifests/3.bin',route='antfly/artifacts/sha256/aa/'+'e'.repeat(62),body=new TextEncoder().encode('native routing '.repeat(100));h.offer({op:'get',bucket:'database',key:manifest},{body:Uint8Array.of(1),json:{etag:'manifest'}});h.offer({op:'get',bucket:'database',key:route},{body,json:{etag:'route'}});assert.equal(h.encode().format,3);const read=CommittedHeaders.wrap(()=>{throw Error('unexpected I/O');},await h.encodeCompressed(),'ns','3');assert.deepEqual((await read({op:'get',bucket:'database',key:route})).body,body);
+});
+
+test('dirty intervals coalesce intents but uncertain clean durability requires a new intent',async()=>{
+ const s=storage(),b=new DurableServingBootstrap(s,env,owner);await b.adopt(authority);
+ await b.begin();await b.begin();assert.deepEqual(s.writes,['intent','sync']);
+ const sync=s.sync;s.sync=async()=>{throw Error('UncertainCleanSync');};
+ await assert.rejects(b.finish({owner:[]},async()=>({serving_capsule:'native'})),/UncertainCleanSync/);
+ assert.equal(s.value.dirty,false);assert.equal(b.dirtyConfirmed,false);
+ s.sync=sync;await b.begin();assert.equal(s.value.dirty,true);assert.equal(b.dirtyConfirmed,true);
+ assert.deepEqual(s.writes.slice(-2),['intent','sync']);
+ await b.freeze();assert.equal(s.value.blocked,true);
+ await assert.rejects(new DurableServingBootstrap(s,env,owner).authority(),/MigrationRequired/);
 });

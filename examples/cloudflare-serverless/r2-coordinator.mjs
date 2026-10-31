@@ -84,15 +84,16 @@ export class R2CommitCoordinator extends DurableObject {
     this.publication=new PublicationScheduler(this.maintenanceStore,env.ANTFLY_INCARNATION);
     this.maintenance=new MaintenanceTickets(this.maintenanceStore);
     this.journal = new R2CollectionJournal(this.maintenanceStore);
-    if(env.RESIDENT_DURABLE_BOOTSTRAP==="true")this.store.durableBootstrap=new DurableServingBootstrap(ctx.storage,env,ctx.id.toString());
+    if(env.RESIDENT_DURABLE_BOOTSTRAP==="true")this.store.durableBootstrap=new DurableServingBootstrap(ctx.storage,env,ctx.id.toString(),{onError:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify(sample));}});
     this.authorityAdmission=new AuthorityAdmission(async()=>{if(this.store.ownerReady)await this.store.ownerReady;const local=await this.store.durableBootstrap?.authority();if(local)return local;const result=await openAuthority(env,coordinatorAuthorityMode(env));await this.store.durableBootstrap?.adopt(result);return result;});
     if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.actor_started",role:"writer",actor_id:ctx.id.toString(),actor_instance_id:instanceId,version:env.WORKER_VERSION?.id,owner_identity:env.RESIDENT_SERVING==="true"?"instance-term":owner?"actor-version":"ephemeral",...kernelMetrics()}));
   }
   async ensureAuthority(){if(this.store.durableBootstrap?.entry?.blocked)throw Error("CoordinatorMigrationRequired");if(!this.authority){const authority=await this.authorityAdmission.get();this.store.configureAuthority(authority.descriptor);await this.store.restoreDurableRead();this.authority??=authority;}return this.authority;}
+  async checkpointDurableServing(){await this.ensureAuthority();return this.store.flushDurableCheckpoint();}
   async freezeDurableServing(){
     await this.ensureAuthority();if(!this.store.durableBootstrap)throw Error("DurableBootstrapStorageRequired");this.store.freezeRequested=true;
     const deadline=Date.now()+30000;
-    while(this.store.running||this.store.pending.length||this.store.snapshotReaders||this.store.ioDrain){if(Date.now()>=deadline)throw Error("DeadlineExceeded");await new Promise(r=>setTimeout(r,2));}
+    while(this.store.running||this.store.pending.length||this.store.snapshotReaders||this.store.ioDrain||this.store.durableCheckpoint?.pending){if(Date.now()>=deadline)throw Error("DeadlineExceeded");await new Promise(r=>setTimeout(r,2));}
     await this.store.durableBootstrap.freeze();this.store.durableReadState=null;this.store.acquired=false;return{frozen:true};
   }
   async lookupResident(input,{trace_id,cohort,requestWall:submittedWall,requestMono:submittedMono}={}) {

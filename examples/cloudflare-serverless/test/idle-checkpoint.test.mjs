@@ -24,3 +24,8 @@ test('replay scheduling bounds quiet age and advances high debt without changing
  assert.equal(replayCheckpointDelay({commits:1,ageMs:100}),900);assert.equal(replayCheckpointDelay({commits:8}),0);assert.equal(replayCheckpointDelay({bytes:65536}),0);assert.equal(replayCheckpointDelay({waves:4}),0);assert.equal(replayCheckpointDelay({ageMs:1001}),0);assert.throws(()=>replayCheckpointDelay({waves:NaN}),/InvalidCheckpointReplayCost/);
  let deadline;const f=fixture(async options=>{deadline=options.deadlineMs;return{done:true,revision:7};},{replayCost:()=>({bytes:65536}),delay:250});f.state.schedule();await f.work[0];assert.equal(f.state.last,7);assert.equal(deadline,11000);
 });
+
+test('optional durable checkpoints report errors without transparent retries',async()=>{
+ const f=fixture(async()=>{throw Error('database is busy');},{shouldRetry:()=>false});
+ f.state.schedule();await f.work[0];assert.equal(f.state.attempts,1);assert.equal(f.state.last,0);assert.equal(f.state.pending,false);assert.deepEqual(f.errors,['database is busy']);
+});
