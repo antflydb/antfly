@@ -132,3 +132,31 @@ variants; a HEAD probe alone cannot establish application improvement.
 The hosted gate, complete live diagnostic coverage, historical `SQLITE_NOMEM`,
 three paired hour-long trials and physical cold samples remain open. Successful
 injected-error lifetime tests do not identify or fix the historical memory error.
+
+### Separate setup profiles and report completeness
+
+The local harness defaults to injecting the same storage delay during setup and
+measurement. `--setup-delay=0` selects an explicitly different warm-setup profile:
+the same native writes/publications build the same corpus without injected delay,
+then bounded, data-only readiness RPCs wait for all tenants' writer checkpoint
+work and role I/O to drain before the measurement delay is enabled. Setup delay,
+drain time and profile name are retained in the report. Setup resource failures
+remain visible; resetting measured counters does not clear failure history.
+
+Within-profile pairs use identical setup, corpus, operations and capacities.
+Absolute timings across different setup profiles are not interchangeable: the
+longer setup can expire authority before the first measured write. Independent
+31-second idle cases exercise that condition explicitly. Full-delay confirmation
+runs remain separate from the faster warm-setup feature matrix. Reports now
+record expected case count, completion and success, so an interrupted multi-case
+run cannot be mistaken for a complete experiment. Earlier interrupted reports
+and their explicit cancellation records remain preserved.
+
+The placement collector also records a bounded recognized `cf-placement` header,
+without promoting hinted geography to verified bucket or actor geography.
+[Cloudflare's placement documentation](https://developers.cloudflare.com/workers/configuration/placement/)
+states that Smart Placement affects fetch handlers and does not move RPC methods
+or named entrypoints; it can require up to 15 minutes of analysis. Thus an app
+fetch placement experiment and Durable Object location hints are separate
+controls. A short single-location probe cannot establish the benefit of Smart
+Placement for the RPC path.

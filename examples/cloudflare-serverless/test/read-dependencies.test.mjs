@@ -50,3 +50,8 @@ test('capacity fallback drops transcripts before using the ordinary native respo
  const d=fixture(),t=d.wrap(async()=>({body:new Uint8Array(1)}));await assert.rejects(t(request),e=>e.status===10);await d.load();assert.ok(d.bytes>0);
  await t({...request,key:request.key.replace('/aa/','/bb/'),max_response_bytes:128*1024});assert.equal(d.disabled,true);assert.equal(d.bytes,0);assert.equal(d.values.size,0);await t(request);
 });
+
+test('future provider conditions pass through and malformed response buffers fail closed',async()=>{
+ let calls=0;const d=fixture(),t=d.wrap(async()=>{calls++;return{body:new Uint8Array()};});await t({...request,if_match_revision:{kind:'gcs-generation',value:'12'}});await t({...request,if_generation_match:'12'});assert.equal(calls,2);assert.equal(d.pending,undefined);
+ const invalid=fixture(),bad=invalid.wrap(async()=>({body:'not bytes'}));await assert.rejects(bad(request),e=>e.status===10);await assert.rejects(invalid.load(),/InvalidReadDependency/);
+});

@@ -273,3 +273,48 @@ test "serverless native read plan immutable reuse owns bytes and binds exact sem
     again.deinit(a);
     try std.testing.expect(cache.bytes <= PreparedCache.max_bytes);
 }
+
+test "serverless native read plan reusable cache allocation failures retain owned state" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            var cache: PreparedCache = .{};
+            defer cache.deinit(a);
+            const value: Prepared = .{ .id = @constCast("one"), .fact = null, .root = .{ .domain = PageStore.namespaceDomain("docs"), .policy_fingerprint = @splat(0) }, .body = @constCast("body") };
+            if (!try cache.remember(a, "docs", value)) return error.TestUnexpectedResult;
+            var copy = (try cache.get(a, "docs", "one", value.root)) orelse return error.TestUnexpectedResult;
+            defer copy.deinit(a);
+            try std.testing.expectEqualStrings("body", copy.body.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "serverless native read plan reusable preparation removes repeated immutable path reads" {
+    const a = std.testing.allocator;
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var object_store = try @import("../artifacts/object_store.zig").ObjectStore.initWithClient(a, memory.client(), "database", "artifacts");
+    var artifacts = object_store.artifactStore();
+    defer artifacts.deinit();
+    const domain = PageStore.namespaceDomain("docs");
+    artifacts.upload_scope = try @import("../artifacts/store.zig").UploadScope.forPublication(domain, 1, std.testing.io);
+    var reads: u64 = 4 * 1024 * 1024;
+    var writes: u64 = reads;
+    var pages = PageStore{ .domain = domain, .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const doc = @import("materializer.zig").Document{ .doc_id = @constCast("one"), .body = @constCast("{\"text\":\"reused\"}"), .last_lsn = 1, .last_timestamp_ns = 1 };
+    const ref = try @import("../build/document_facts_builder.zig").publishAlloc(a, &pages, null, &.{doc}, null, .{}, "{}", 1);
+    defer @import("../build/builder.zig").freeArtifactRef(a, ref);
+    const plan = Plan{ .domain = domain, .source = ref };
+    var retained: PreparedCache = .{};
+    defer retained.deinit(a);
+    memory.resetOperationCount();
+    var first = try plan.prepareCached(a, "docs", "one", &pages, &retained);
+    defer first.deinit(a);
+    try std.testing.expect(memory.operationCount() > 1);
+    try std.testing.expect(try retained.remember(a, "docs", first));
+    memory.resetOperationCount();
+    var second = try plan.prepareCached(a, "docs", "one", &pages, &retained);
+    defer second.deinit(a);
+    try std.testing.expectEqualStrings(doc.body, second.body.?);
+    try std.testing.expectEqual(@as(u64, 1), memory.operationCount());
+}

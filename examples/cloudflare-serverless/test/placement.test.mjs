@@ -36,3 +36,8 @@ test('placement collection checks immutable configuration and preserves measured
 test('placement HTTP resource causes remain in failed evidence without raw exception disclosure',async()=>{
  const{collectPlacement}=await import('../qualification/probe-placement.mjs');await assert.rejects(collectPlacement('https://worker.invalid','token',{fetcher:async()=>Response.json({error:'PlacementProbeFailed',failure_code:'SQLITE_NOMEM'},{status:503})}),/PlacementProbeHttp503:SQLITE_NOMEM/);
 });
+
+test('placement collection retains only recognized routing headers without treating hints as verified actor geography',async()=>{
+ const{collectPlacement}=await import('../qualification/probe-placement.mjs');const value={qualification:false,consumes_compute_identities:true,actual_bucket_region:null,runtime_generation:'generation',bucket_location_hint:'wnam',compute_location_hint:'wnam',samples:['app','writer','reader','builder'].map(role=>({role,worker_version:'v',storage_head_ms:3,rpc_ms:5,actual_actor_region:null}))};let count=0;
+ const report=await collectPlacement('https://worker.invalid','private-token',{samples:3,fetcher:async()=>Response.json(value,{headers:{'cf-placement':['remote-LHR','local-SFO','unrecognized-private-value'][count++]}})});assert.deepEqual(report.samples.map(s=>s.placement_header),['remote-LHR','local-SFO',null]);assert.ok(report.samples.every(s=>s.placement_header_present));assert.equal(report.actual_geography_verified,false);assert.ok(!JSON.stringify(report).includes('unrecognized-private-value'));
+});

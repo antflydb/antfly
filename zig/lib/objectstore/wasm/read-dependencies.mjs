@@ -28,6 +28,7 @@ export function pointDependencyMetrics(kernel){
  return{point_dependency_active:b?.active??0,point_dependency_queued:b?.pending.length??0,point_dependency_bytes:b?.bytes??0,point_dependency_peak_bytes:b?.peakBytes??0,point_dependency_limit_bytes:b?b.limit*proofPrefetchBytes:0};
 }
 const encoder=new TextEncoder();
+const replayFields=new Set(["op","bucket","key","range","if_match_etag","max_response_bytes","version_id"]);
 // A bounded, request-owned immutable dependency transcript. Native execution
 // unwinds before external I/O; resumption revalidates the original read view.
 // No authority, absence inference, live session or native pointer is retained.
@@ -41,7 +42,7 @@ export class ReadDependencies {
   this.check();
   if(!['get','head','bucket_exists','read_view_barrier'].includes(request.op))throw Error('PointReadWriteForbidden');
   if(request.op==='read_view_barrier')return{}; // admission already completed
-  const immutable=request.bucket==='database'&&request.op==='get'&&request.version_id==null&&request.if_match_etag==null&&(/\/artifacts\/(?:sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(request.key??'')||/\/manifests\/[^/]+\/manifests\/[0-9]+\.bin$/.test(request.key??'')||/\/wal-v1\/[a-f0-9]{64}\/pages\/(?:[a-f0-9]{32}\/)?[a-f0-9]{64}$/.test(request.key??''));
+  const immutable=Object.keys(request).every(key=>replayFields.has(key))&&request.bucket==='database'&&request.op==='get'&&request.version_id==null&&request.if_match_etag==null&&(/\/artifacts\/(?:sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(request.key??'')||/\/manifests\/[^/]+\/manifests\/[0-9]+\.bin$/.test(request.key??'')||/\/wal-v1\/[a-f0-9]{64}\/pages\/(?:[a-f0-9]{32}\/)?[a-f0-9]{64}$/.test(request.key??''));
   if(!enabled||!immutable||this.disabled)return transport(request,body);
   const key=JSON.stringify(request),prior=this.values.get(key);
   if(prior){this.onMetrics({point_dependency_replays:1});if(prior.error)throw prior.error;return{json:structuredClone(prior.value.json),body:prior.value.body.slice()};}
@@ -61,6 +62,7 @@ export class ReadDependencies {
   // This task belongs to the caller, including after logical cancellation.
   const task=Promise.resolve().then(()=>transport(request,new Uint8Array())).then(value=>{
    const json=structuredClone(value.json??{}),body=value.body??new Uint8Array();
+   if(!(body instanceof Uint8Array))throw Error('InvalidReadDependency');
    if(body.byteLength>request.max_response_bytes||encoder.encode(JSON.stringify(json)).byteLength>4096)throw Error('ObjectIoBudgetExceeded');
    this.values.set(key,{value:{json,body:body.slice()}});
   },error=>{if(error instanceof ObjectStoreError&&error.status===1){this.values.set(key,{error});return;}throw error;});
