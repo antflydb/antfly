@@ -207,6 +207,8 @@ fn scalarFailure(err: anyerror) anyerror {
 pub const marker = "__antfly_projection";
 pub const Entry = struct { name: []const u8, expression: V };
 pub const Request = struct { fields: []const V, params: V = .{ .object = .empty } };
+pub const ValueProof = struct { digest: [32]u8, encoded_length: usize };
+pub const OutputMember = struct { offset: usize, length: usize, proof: ?ValueProof = null };
 pub const Source = struct {
     context: *anyopaque,
     read: *const fn (*anyopaque, A, []const u8, sql.ColumnRead) anyerror!sql.Datum,
@@ -214,6 +216,7 @@ pub const Source = struct {
     /// Only immutable native extents with strict syntax/value-shape evidence.
     /// Unqualified ports retain the scanner and typed-number normalizer.
     read_normalized: ?*const fn (*anyopaque, []const u8) anyerror!?sql.NormalizedOutput = null,
+    value_proof: ?*const fn (*anyopaque, []const u8, []const u8) ?ValueProof = null,
     prefetch: ?*const fn (*anyopaque, []const []const u8) anyerror!void = null,
 };
 const Dependency = union(enum) { field: []const u8, binding: usize };
@@ -232,6 +235,12 @@ pub const Receipt = struct {
     bytes: []const u8,
     fingerprint: [64]u8,
     members_end: usize,
+    members: []const OutputMember = &.{},
+    /// Only for allocator-owned receipt pointers returned by the producer.
+    pub fn deinit(self: *@This(), a: A) void {
+        if (self.members.len != 0) a.free(self.members);
+        a.destroy(self);
+    }
     pub fn matches(self: @This(), bytes: []const u8, fingerprint: [64]u8) bool {
         return self.bytes.ptr == bytes.ptr and self.bytes.len == bytes.len and std.mem.eql(u8, &self.fingerprint, &fingerprint);
     }
@@ -240,12 +249,152 @@ pub const Receipt = struct {
         if (!self.matches(previous, self.fingerprint) or previous.len != bytes.len) return null;
         var copied = self;
         copied.bytes = bytes;
+        copied.members = &.{};
         return copied;
+    }
+    /// Trusted callers have just copied the immutable byte extent. Clone the
+    /// descriptor owner too; serialized JSON alone cannot establish witnesses.
+    pub fn ownAfterCopy(self: @This(), a: A, previous: []const u8, bytes: []const u8) !?*Receipt {
+        const value = self.afterCopy(previous, bytes) orelse return null;
+        const owned = try a.create(Receipt);
+        owned.* = value;
+        errdefer a.destroy(owned);
+        if (self.members.len != 0) owned.members = try a.dupe(OutputMember, self.members);
+        return owned;
     }
     pub fn output(self: @This(), transport: bool) @import("antfly-json").RawObject {
         return @import("antfly-json").RawObject.fromImmutableValidated(self.bytes, if (transport) null else self.members_end);
     }
 };
+/// In-process only, after ordinary query authorization and final selection.
+/// Borrowed names, tokens and native witnesses expire with synchronous delivery.
+pub const ComputedView = struct {
+    plan: *const Plan,
+    receipt: *const Receipt,
+    bytes: []const u8,
+    fn valid(self: @This()) bool {
+        return self.receipt.matches(self.bytes, self.plan.fingerprint) and self.receipt.members.len == self.plan.bindings.len;
+    }
+    pub fn proof(self: @This(), name: []const u8) ?ValueProof {
+        if (!self.valid()) return null;
+        for (self.plan.bindings, self.receipt.members) |binding, member| if (std.mem.eql(u8, binding.name, name)) {
+            if (member.offset > self.bytes.len or member.length > self.bytes.len - member.offset) return null;
+            const value = member.proof orelse return null;
+            if (value.encoded_length != member.length) return null;
+            return value;
+        };
+        return null;
+    }
+    pub fn object(self: @This(), a: A) !V {
+        if (!self.valid()) return error.InvalidQueryResponse;
+        var result: std.json.ObjectMap = .empty;
+        for (self.plan.bindings, self.receipt.members) |binding, member| {
+            if (member.offset > self.bytes.len or member.length > self.bytes.len - member.offset) return error.InvalidQueryResponse;
+            const bytes = self.bytes[member.offset..][0..member.length];
+            const value: V = if (bytes.len >= 2 and bytes[0] == '"' and bytes[bytes.len - 1] == '"' and std.mem.indexOfScalar(u8, bytes[1 .. bytes.len - 1], '\\') == null)
+                .{ .string = bytes[1 .. bytes.len - 1] }
+            else
+                try std.json.parseFromSliceLeaky(V, a, bytes, .{ .allocate = .alloc_if_needed });
+            try result.put(a, binding.name, value);
+        }
+        return .{ .object = result };
+    }
+};
+
+/// Only an acknowledged in-process storage-owner return may carry this prefix.
+/// Public/remote JSON is never an authority for restoring producer receipts.
+pub const NativeTransport = struct {
+    version: u32,
+    records: []const NativeRecord,
+};
+pub const NativeRecord = struct {
+    row: usize,
+    id: []const u8,
+    fingerprint: [64]u8,
+    members_end: usize,
+    encoded_bytes: usize,
+    members: []const OutputMember,
+};
+pub const native_transport_key = "_native_field_views";
+pub const native_transport_max_bytes = 1024 * 1024;
+pub const native_transport_max_rows = 1024;
+
+/// Small metadata borrows immutable output descriptors through serialization.
+/// The payload is encoded once; it is neither reconstructed nor hashed here.
+pub fn nativeTransport(a: A, hits: anytype, plan: ?*const Plan) !NativeTransport {
+    var records: std.ArrayList(NativeRecord) = .empty;
+    var remaining: usize = native_transport_max_bytes - 128;
+    if (plan) |program| for (hits, 0..) |hit, index| {
+        if (records.items.len == native_transport_max_rows) break;
+        const bytes = hit.computed_json orelse continue;
+        const receipt = hit.computed_receipt orelse continue;
+        if (!receipt.matches(bytes, program.fingerprint) or receipt.members.len == 0 or receipt.members.len != program.bindings.len) continue;
+        // Includes worst-case JSON escaping, integer and digest spelling.
+        const size = 512 +| hit.id.len *| 6 +| receipt.members.len *| 512;
+        if (size > remaining) continue;
+        remaining -= size;
+        try records.append(a, .{ .row = index, .id = hit.id, .fingerprint = receipt.fingerprint, .members_end = receipt.members_end, .encoded_bytes = bytes.len, .members = receipt.members });
+    };
+    return .{ .version = 1, .records = records.items };
+}
+
+/// Validate only descriptor gaps and the small completion tail. The ordinary
+/// result parser already checked value syntax; no second payload scan is needed.
+pub fn restoreNativeTransport(a: A, scratch: A, bytes: []const u8, plan: ?*const Plan, hits: anytype) !void {
+    var scanner = std.json.Scanner.initCompleteInput(scratch, bytes);
+    defer scanner.deinit();
+    if ((try scanner.next()) != .object_begin) return error.InvalidQueryResponse;
+    const key_token = try scanner.nextAllocMax(scratch, .alloc_if_needed, native_transport_key.len);
+    const key = switch (key_token) {
+        .string, .allocated_string => |value| value,
+        else => return error.InvalidQueryResponse,
+    };
+    if (!std.mem.eql(u8, key, native_transport_key)) return error.InvalidQueryResponse;
+    var begin = scanner.cursor;
+    while (begin < bytes.len and (std.ascii.isWhitespace(bytes[begin]) or bytes[begin] == ':')) : (begin += 1) {}
+    var validator = @import("antfly-json").ValueScanner.init(scratch);
+    defer validator.deinit();
+    try validator.scan(&scanner, native_transport_max_bytes, null);
+    if (scanner.cursor - begin > native_transport_max_bytes) return error.InvalidQueryResponse;
+    const frame = try std.json.parseFromSliceLeaky(NativeTransport, scratch, bytes[begin..scanner.cursor], .{ .allocate = .alloc_if_needed });
+    if (frame.version != 1 or frame.records.len > native_transport_max_rows) return error.InvalidQueryResponse;
+    if (frame.records.len == 0) return;
+    const program = plan orelse return error.InvalidQueryResponse;
+    const names = try scratch.alloc([]const u8, program.bindings.len);
+    for (program.bindings, names, 0..) |binding, *name, i| {
+        const encoded = try std.json.Stringify.valueAlloc(scratch, binding.name, .{});
+        name.* = try std.fmt.allocPrint(scratch, "{s}{s}:", .{ if (i == 0) "" else ",", encoded });
+    }
+    var tail: std.Io.Writer.Allocating = .init(scratch);
+    defer tail.deinit();
+    if (program.bindings.len != 0) try tail.writer.writeByte(',');
+    try std.json.Stringify.value(marker, .{}, &tail.writer);
+    try tail.writer.writeByte(':');
+    try std.json.Stringify.value(&program.fingerprint, .{}, &tail.writer);
+    try tail.writer.writeByte('}');
+    var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    for (frame.records) |record| {
+        if (record.row >= hits.len or record.members.len != program.bindings.len or !std.mem.eql(u8, &record.fingerprint, &program.fingerprint)) return error.InvalidQueryResponse;
+        const hit = &hits[record.row];
+        if (!std.mem.eql(u8, hit.id, record.id) or (try seen.getOrPut(scratch, record.row)).found_existing) return error.InvalidQueryResponse;
+        const output = hit.computed_json orelse return error.InvalidQueryResponse;
+        if (output.len != record.encoded_bytes or output.len < 2 or output[0] != '{') return error.InvalidQueryResponse;
+        var previous: usize = 1;
+        for (record.members, names) |member, name| {
+            if (member.offset > output.len or member.length == 0 or member.length > output.len - member.offset or member.offset < previous or member.offset - previous != name.len) return error.InvalidQueryResponse;
+            if (!std.mem.eql(u8, output[previous..member.offset], name)) return error.InvalidQueryResponse;
+            if (member.proof) |proof| if (proof.encoded_length != member.length) return error.InvalidQueryResponse;
+            previous = member.offset + member.length;
+        }
+        if (previous != record.members_end or !std.mem.eql(u8, output[previous..], tail.written())) return error.InvalidQueryResponse;
+        const owned = try a.create(Receipt);
+        errdefer a.destroy(owned);
+        const members = try a.dupe(OutputMember, record.members);
+        if (hit.computed_receipt) |old| old.deinit(a);
+        owned.* = .{ .bytes = output, .fingerprint = program.fingerprint, .members_end = record.members_end, .members = members };
+        hit.computed_receipt = owned;
+    }
+}
 pub const Plan = struct {
     arena: *std.heap.ArenaAllocator,
     source_fields: []const []const u8 = &.{},
@@ -484,7 +633,21 @@ pub const Plan = struct {
     }
     /// Native delivery keeps borrowed JSON through pure output expressions;
     /// aliases materialize once only when a consuming operator requires Datum.
+    pub fn evaluateRetained(self: *const Plan, a: A, output: A, source: Source, previous: ?V, limits: sql.EvalLimits, views: bool) !struct { bytes: []u8, receipt: ?*Receipt } {
+        const members = if (views and previous == null) try a.alloc(OutputMember, self.bindings.len) else null;
+        const bytes = try self.evaluateEncodedTracked(a, output, source, previous, limits, members);
+        errdefer output.free(bytes);
+        const owned = if (previous == null) try self.ownValidatedReceipt(output, bytes) else null;
+        errdefer if (owned) |receipt_| receipt_.deinit(output);
+        if (owned) |receipt_| if (members) |items| {
+            receipt_.members = try output.dupe(OutputMember, items);
+        };
+        return .{ .bytes = bytes, .receipt = owned };
+    }
     pub fn evaluateEncoded(self: *const Plan, a: A, output: A, source: Source, previous: ?V, limits: sql.EvalLimits) ![]u8 {
+        return self.evaluateEncodedTracked(a, output, source, previous, limits, null);
+    }
+    fn evaluateEncodedTracked(self: *const Plan, a: A, output: A, source: Source, previous: ?V, limits: sql.EvalLimits, members: ?[]OutputMember) ![]u8 {
         if (previous != null) return std.json.Stringify.valueAlloc(output, try self.evaluate(a, source, previous, limits), .{});
         if (limits.checkpoint) |poll| try poll(limits.checkpoint_context);
         if (source.prefetch) |prefetch| try prefetch(source.context, self.unconditional_fields);
@@ -526,9 +689,18 @@ pub const Plan = struct {
             if (i != 0) try encoded.writer.writeByte(',');
             try std.json.Stringify.value(binding.name, .{}, &encoded.writer);
             try encoded.writer.writeByte(':');
+            const value_start = encoded.written().len;
             if (raw_values[i]) |raw| try encoded.writer.writeAll(raw.bytes) else {
                 const value = binding.program.?.resultJson(a, values[i].?, limits) catch |err| return scalarFailure(err);
                 try std.json.Stringify.value(value, .{}, &encoded.writer);
+            }
+            if (members) |items| {
+                items[i] = .{ .offset = value_start, .length = encoded.written().len - value_start };
+                if (raw_values[i]) |raw| {
+                    if (origins[i]) |path| if (source.value_proof) |proven| {
+                        items[i].proof = proven(source.context, path, raw.bytes);
+                    };
+                }
             }
             if (encoded.written().len > limits.output_bytes) return error.DecisionLimitExceeded;
         }
@@ -1174,4 +1346,125 @@ test "api query contract canonical transport fingerprint owns encoded input" {
     @memset(encoded.json, 'x');
     try std.testing.expectEqual(@as(u8, '{'), transported.encoded[0]);
     try std.testing.expectEqual(@as(usize, 2), transported.bindings.len);
+}
+
+test "api query contract native computed views retain tokens and never reconstruct witnesses from wire" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const fields = try std.json.parseFromSliceLeaky([]const V, temp, "[{\"name\":\"value\",\"expression\":{\"field\":\"image\"}}]", .{});
+    var plan = try Plan.init(a, .{ .fields = fields });
+    defer plan.deinit();
+    const Mock = struct {
+        bytes: []const u8,
+        fn read(_: *anyopaque, _: A, _: []const u8, _: sql.ColumnRead) !sql.Datum {
+            return error.UnexpectedMaterialization;
+        }
+        fn normalized(raw: *anyopaque, _: []const u8) !?sql.NormalizedOutput {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .bytes = self.bytes, .original = self.bytes, .nodes = 1, .height = 1 };
+        }
+        fn proof(raw: *anyopaque, _: []const u8, bytes: []const u8) ?ValueProof {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.bytes.ptr != bytes.ptr) return null;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            return .{ .digest = digest, .encoded_length = bytes.len };
+        }
+    };
+    for ([_][]const u8{ "\"data:image/png;base64,YQ==\"", "\"escaped\\u0020text\"" }) |token| {
+        var mock: Mock = .{ .bytes = token };
+        const source: Source = .{ .context = &mock, .read = Mock.read, .read_normalized = Mock.normalized, .value_proof = Mock.proof };
+        const result = try plan.evaluateRetained(temp, a, source, null, .{}, true);
+        defer a.free(result.bytes);
+        defer result.receipt.?.deinit(a);
+        const view: ComputedView = .{ .plan = &plan, .receipt = result.receipt.?, .bytes = result.bytes };
+        const object = try view.object(temp);
+        const expected = try std.json.parseFromSliceLeaky(V, temp, token, .{});
+        try std.testing.expectEqualStrings(expected.string, object.object.get("value").?.string);
+        try std.testing.expectEqual(token.len, view.proof("value").?.encoded_length);
+        const copy = try a.dupe(u8, result.bytes);
+        defer a.free(copy);
+        const rebound = result.receipt.?.afterCopy(result.bytes, copy).?;
+        try std.testing.expectEqual(@as(usize, 0), rebound.members.len);
+        const cloned = (try result.receipt.?.ownAfterCopy(a, result.bytes, copy)).?;
+        defer cloned.deinit(a);
+        try std.testing.expect(cloned.members.ptr != result.receipt.?.members.ptr);
+        const cloned_view: ComputedView = .{ .plan = &plan, .receipt = cloned, .bytes = copy };
+        try std.testing.expectEqual(token.len, cloned_view.proof("value").?.encoded_length);
+        const Hit = @import("../storage/db/types.zig").SearchHit;
+        const producer = [_]struct { id: []const u8, computed_json: ?[]const u8, computed_receipt: ?*Receipt }{.{ .id = "row", .computed_json = result.bytes, .computed_receipt = result.receipt }};
+        const native = try nativeTransport(temp, &producer, &plan);
+        var rows = [_]Hit{.{ .id = try a.dupe(u8, "row"), .computed_json = try a.dupe(u8, result.bytes) }};
+        defer rows[0].deinit(a);
+        const packet = try std.json.Stringify.valueAlloc(temp, .{ ._native_field_views = native, .responses = .{} }, .{});
+        try restoreNativeTransport(a, temp, packet, &plan, &rows);
+        const restored: ComputedView = .{ .plan = &plan, .receipt = rows[0].computed_receipt.?, .bytes = rows[0].computed_json.? };
+        try std.testing.expectEqual(token.len, restored.proof("value").?.encoded_length);
+        try std.testing.expect(restored.receipt.members.ptr != result.receipt.?.members.ptr);
+        for (0..2) |fail_index| {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+            var target = [_]Hit{.{ .id = @constCast("row"), .computed_json = result.bytes }};
+            try std.testing.expectError(error.OutOfMemory, restoreNativeTransport(failing.allocator(), temp, packet, &plan, &target));
+            try std.testing.expect(target[0].computed_receipt == null);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+        const corrupt = try temp.dupe(NativeRecord, native.records);
+        for (0..4) |kind| {
+            corrupt[0] = native.records[0];
+            switch (kind) {
+                0 => corrupt[0].row = 1,
+                1 => corrupt[0].encoded_bytes += 1,
+                2 => corrupt[0].members_end += 1,
+                3 => corrupt[0].fingerprint[0] ^= 1,
+                else => unreachable,
+            }
+            const bad = try std.json.Stringify.valueAlloc(temp, .{ ._native_field_views = NativeTransport{ .version = 1, .records = corrupt }, .responses = .{} }, .{});
+            try std.testing.expectError(error.InvalidQueryResponse, restoreNativeTransport(a, temp, bad, &plan, &rows));
+        }
+        const duplicates = [_]NativeRecord{ native.records[0], native.records[0] };
+        const duplicate_packet = try std.json.Stringify.valueAlloc(temp, .{ ._native_field_views = NativeTransport{ .version = 1, .records = &duplicates }, .responses = .{} }, .{});
+        try std.testing.expectError(error.InvalidQueryResponse, restoreNativeTransport(a, temp, duplicate_packet, &plan, &rows));
+        const from_wire = try plan.ownValidatedReceipt(a, result.bytes);
+        defer from_wire.?.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), from_wire.?.members.len);
+        var forged = view;
+        forged.bytes = copy;
+        try std.testing.expect(forged.proof("value") == null);
+        try std.testing.expectError(error.InvalidQueryResponse, forged.object(temp));
+    }
+}
+
+test "api query contract native capability preserves reserved owner ABI layout and fallback" {
+    const abi = @import("kernel_owner_abi");
+    const LegacyOptions = extern struct {
+        enabled: u8,
+        include_stored: u8,
+        raw_search_result: u8,
+        reserved: u8,
+        return_mode: abi.LocalQueryReturnMode,
+        max_chunks_per_parent: u32,
+        response_table_name: abi.BorrowedBytes,
+    };
+    const LegacyResponse = extern struct {
+        buffer: abi.OwnedBytes,
+        generation: u64,
+        has_generation: u8,
+        reserved: [7]u8,
+    };
+    try std.testing.expectEqual(@sizeOf(LegacyOptions), @sizeOf(abi.LocalQueryExecutionOptions));
+    try std.testing.expectEqual(@alignOf(LegacyOptions), @alignOf(abi.LocalQueryExecutionOptions));
+    try std.testing.expectEqual(@offsetOf(LegacyOptions, "reserved"), @offsetOf(abi.LocalQueryExecutionOptions, "native_field_views"));
+    try std.testing.expectEqual(@sizeOf(LegacyResponse), @sizeOf(abi.QueryOwnedResponse));
+    try std.testing.expectEqual(@offsetOf(LegacyResponse, "reserved"), @offsetOf(abi.QueryOwnedResponse, "native_field_views"));
+    const controls = @import("../storage/query_controls.zig");
+    var req: @import("../storage/db/types.zig").SearchRequest = .{ .field_projection_value_views = true };
+    const options = controls.executionOptions(req);
+    try std.testing.expectEqual(@as(u8, 1), options.native_field_views);
+    req.field_projection_value_views = false;
+    controls.applyExecutionOptions(&req, options);
+    try std.testing.expect(req.field_projection_value_views and req.field_projection_transport);
+    controls.applyExecutionOptions(&req, .{ .enabled = 1 });
+    try std.testing.expect(!req.field_projection_value_views);
 }

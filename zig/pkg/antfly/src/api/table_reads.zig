@@ -2915,7 +2915,8 @@ pub const BoundTableReadSource = struct {
         try checkQueryDeadline(req);
 
         const collection_req = aggregationOnlyCollectionRequest(req);
-        const search_req = decisionCollectionRequest(collection_req orelse req);
+        var search_req = decisionCollectionRequest(collection_req orelse req);
+        search_req.field_projection_value_views = if (delivery) |sink| sink.typed_result != null else false;
         const start_ns = platform_time.monotonicNs();
         const phase_profile = benchQueryApiPhaseProfileEnabled();
         const prepare_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
@@ -4901,10 +4902,12 @@ pub const ProvisionedTableReadSource = struct {
         self: *ProvisionedTableReadSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
-        req: db_mod.types.SearchRequest,
+        requested: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !?query_api.QueryResponse {
+        var req = requested;
+        req.field_projection_value_views = if (delivery) |sink| sink.typed_result != null else false;
         try checkQueryDeadline(req);
         try distributed_graph.validateIncomingStartIdentities(alloc, self.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
@@ -7412,6 +7415,7 @@ pub const HostedProvisionedTableReadSource = struct {
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !?query_api.QueryResponse {
         var req = requested;
+        req.field_projection_value_views = if (delivery) |sink| sink.typed_result != null else false;
         try checkQueryDeadline(req);
         try distributed_graph.validateIncomingStartIdentities(alloc, hosted.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
@@ -9111,17 +9115,14 @@ fn hydrateDistributedDocumentWindow(source: anytype, alloc: std.mem.Allocator, r
                     errdefer if (!move) alloc.free(bytes);
                     const receipt = if (move) hit.computed_receipt else copied: {
                         const previous = hit.computed_receipt orelse break :copied null;
-                        const value = previous.afterCopy(computed, bytes) orelse break :copied null;
-                        const owned = try alloc.create(@import("antfly_local_sources").api_query_contract.ProjectionReceipt);
-                        owned.* = value;
-                        break :copied owned;
+                        break :copied try previous.ownAfterCopy(alloc, computed, bytes);
                     };
                     if (move) {
                         document.computed_json = null;
                         document.computed_receipt = null;
                     }
                     if (selected.computed_json) |prior| alloc.free(prior);
-                    if (selected.computed_receipt) |prior| alloc.destroy(prior);
+                    if (selected.computed_receipt) |prior| prior.deinit(alloc);
                     selected.computed_json = bytes;
                     selected.computed_receipt = receipt;
                 }

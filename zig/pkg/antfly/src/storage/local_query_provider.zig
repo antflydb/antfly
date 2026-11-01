@@ -224,6 +224,7 @@ fn executeSearch(
     const bytes = response.json;
     out_response.* = .{
         .buffer = .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) },
+        .native_field_views = @intFromBool(captured.request.field_projection_value_views and captured.request.field_projection_transport),
         .identity_read_generation = response.identity_read_generation orelse 0,
         .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
     };

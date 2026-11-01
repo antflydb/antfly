@@ -22,6 +22,7 @@ const error_identity = @import("kernel_error_identity");
 pub const QueryResponse = struct {
     json: []u8,
     identity_read_generation: ?u64,
+    native_field_views: bool = false,
 };
 
 pub fn executeJsonAlloc(
@@ -91,8 +92,11 @@ fn executeAlloc(
         logProviderFailure("local query", failure);
         return err;
     };
+    if (provider_response.native_field_views > 1 or
+        (provider_response.native_field_views != 0 and (request.execution_options.enabled == 0 or request.execution_options.native_field_views != 1))) return error.InvalidQueryResponse;
     return .{
         .json = try alloc.dupe(u8, provider_response.buffer.slice()),
+        .native_field_views = provider_response.native_field_views == 1,
         .identity_read_generation = if (provider_response.has_identity_read_generation != 0)
             provider_response.identity_read_generation
         else

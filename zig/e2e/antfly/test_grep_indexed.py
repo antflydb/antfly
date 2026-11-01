@@ -3349,3 +3349,178 @@ def test_select_batches_preserve_array_positions_across_byte_and_row_windows(
             "original_second": i * 3 + 1,
             "copy": i * 3 + 1,
         }
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+@e2e_resource("antfly_process")
+def test_covering_metadata_new_writes_survive_older_readers(num_shards):
+    """Derived covering metadata may change while primary data stays portable."""
+    from conftest import StandaloneAntflyServer, find_free_port, resolve_binary_path
+
+    baseline = os.environ.get("ANTFLY_BASELINE_BIN")
+    current = os.environ.get("ANTFLY_BIN")
+    if not baseline or not current:
+        pytest.skip("Set baseline/current binaries for metadata compatibility checks")
+    server = StandaloneAntflyServer(
+        resolve_binary_path(current), "127.0.0.1", find_free_port()
+    )
+    try:
+        table = server.api_url + "/tables/covering_compatibility"
+        requests.post(
+            table, json={"num_shards": num_shards}, timeout=60
+        ).raise_for_status()
+        deadline = time.monotonic() + 30
+        while requests.get(table, timeout=5).status_code != 200:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        payload = "unchanged-payload-" * 4096
+        request = {
+            "query": {"match_all": {}},
+            "fields": ["metadata"],
+            "select": conditional_select("body"),
+            "params": {"known": {}},
+            "limit": 10,
+        }
+
+        def write(revision):
+            document = {
+                "metadata": {"revision": revision, "values": [1, None, 3]},
+                "body": payload,
+            }
+            requests.post(
+                table + "/batch",
+                json={"inserts": {"a": document}, "sync_level": "full_index"},
+                timeout=60,
+            ).raise_for_status()
+
+        def read(revision):
+            response = requests.post(table + "/query", json=request, timeout=60)
+            response.raise_for_status()
+            result = response.json()["responses"][0]
+            assert result["status"] == 200, result
+            hit = result["hits"]["hits"][0]
+            assert hit["_source"] == {
+                "metadata": {"revision": revision, "values": [1, None, 3]}
+            }
+            return hit["_computed"]
+
+        write("r1")
+        original = read("r1")
+        assert original["value"] == payload
+        token = original["identity"]
+        request["params"]["known"] = {"a": token}
+        # A second new-writer mutation exercises identity reuse with covering
+        # metadata before an older process can repair/rebuild any sidecar.
+        write("r2")
+        assert read("r2")["identity"] == token
+        for binary, revision in [(baseline, "r2"), (current, "r2")]:
+            server.pause()
+            server.binary = resolve_binary_path(binary)
+            server.resume()
+            value = read(revision)
+            assert value["identity"] == token
+            assert value["value"] is None and value["changed"] is False
+        write("r3")
+        server.pause()
+        server.binary = resolve_binary_path(baseline)
+        server.resume()
+        assert read("r3")["identity"] == token
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_covering_projection_crosses_transaction_windows(stateful_api, num_shards):
+    """Borrowed scopes retire before transaction rollover and final teardown."""
+    table = f"covering_windows_{time.time_ns()}"
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    documents = {
+        f"row-{index:04d}": {
+            "metadata": {"revision": f"revision-{index}", "values": [1, None, 3]},
+            "padding": "x" * 32768,
+        }
+        for index in range(129)
+    }
+    stateful_api.batch_write(table, inserts=documents, sync_level="full_index")
+    request = {
+        "query": {"match_all": {}},
+        "fields": ["metadata"],
+        "select": conditional_select("metadata.revision"),
+        "params": {"known": {}},
+        "limit": len(documents),
+    }
+
+    def query(body):
+        response = requests.post(
+            stateful_api.url + f"/tables/{table}/query", json=body, timeout=60
+        )
+        response.raise_for_status()
+        result = response.json()["responses"][0]
+        assert result["status"] == 200, result
+        hits = result["hits"]["hits"]
+        assert {hit["_id"] for hit in hits} == set(documents)
+        return hits
+
+    first = query(request)
+    known = {}
+    for hit in first:
+        expected = documents[hit["_id"]]["metadata"]
+        assert hit["_source"] == {"metadata": expected}
+        assert hit["_computed"]["value"] == expected["revision"]
+        known[hit["_id"]] = hit["_computed"]["identity"]
+    request["params"]["known"] = known
+    for fields in (["metadata"], ["*"]):
+        for hit in query({**request, "fields": fields}):
+            document = documents[hit["_id"]]
+            expected = (
+                document if fields == ["*"] else {"metadata": document["metadata"]}
+            )
+            assert hit["_source"] == expected
+            assert hit["_computed"]["identity"] == known[hit["_id"]]
+            assert hit["_computed"]["value"] is None
+            assert hit["_computed"]["changed"] is False
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+@e2e_resource("antfly_process")
+def test_native_source_receipts_reach_provisioned_consumers(tmp_path, num_shards):
+    """Require the real routed producer/consumer path, beyond codec unit tests."""
+    import sys
+
+    binary = os.environ.get("ANTFLY_BIN")
+    if not binary:
+        pytest.skip("Set ANTFLY_BIN for isolated native source receipt checks")
+    report = tmp_path / "native-receipts.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).with_name("bench_media_materialization.py")),
+            binary,
+            "--baseline",
+            binary,
+            "--rounds",
+            "1",
+            "--queries-per-phase",
+            "2",
+            "--shards",
+            str(num_shards),
+            "--workload",
+            "large_shared_duplicates",
+            "--native-source-path",
+            "--profile-source-reuse",
+            "--output",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    data = json.loads(report.read_text())
+    assert data["paired"]["attribution_only"]
+    assert len(data["source_reuse_counts"]) == 2
+    for sample in data["source_reuse_counts"]:
+        assert sample["counters"], sample
+        assert sum(row["verifications"] for row in sample["counters"]) >= 1, sample
+        for key in ("native_results", "native_views", "native_witnesses", "proof_hits"):
+            assert sum(row[key] for row in sample["counters"]) >= 1, sample

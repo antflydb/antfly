@@ -5129,3 +5129,27 @@ not change. The design retains complete whole-query controls and independent
 repeats, including slower cases. These are scoped preparation/allocation gains,
 not universal query latency, RSS or provider-billing improvements. Public API,
 document format and ASCH25 remain unchanged.
+
+
+The [covering metadata and native field-view design](../../../docs/design/antfly-grep.md#covering-metadata-and-native-field-views-2026-10-31)
+avoids primary fetches for bounded small fields and lets projection operators
+consume authenticated spans directly. DPD3 stores at most four KiB of covering
+metadata, further limited to 1/64 of the source and existing directory capacity.
+New writes/rebuilds can use it; existing DPD2 remains valid and older binaries
+retain primary-read fallback. Primary document format and public APIs do not
+change.
+
+Native consumers can reuse producer field witnesses after the first codec was
+verified. Revision, identity, permission and per-reference claims still apply;
+wire/caller metadata cannot create these witnesses. Copies of small covering
+values persist on disk, while verification witnesses and codecs remain local to
+the request. Uncovered values still read complete storage blocks. The linked
+design records qualification, allocation/read costs and balanced benchmark
+methodology; these mechanisms do not establish universal latency or memory wins.
+
+Compiled storage owners negotiate native descriptors through previously reserved
+ABI bytes, preserving layout and version 84. A bounded private metadata prefix
+shares the existing response serialization pass. Only an acknowledged owner
+response can restore receipts; public/remote JSON cannot. Older owners retain
+ordinary verification. Large native media groups request scalar views, while
+small groups keep the existing source path.

@@ -52,22 +52,90 @@ pub const ReadProfile = struct {
     }
 };
 
+/// Borrowed, authenticated selected extents. The read scope/window owns the
+/// bytes. Exact selected fields retain their checked content digest; opaque
+/// descendants can use ordinary JSON traversal without manufacturing a proof.
+pub const ValueProof = struct { digest: [32]u8, encoded_length: usize };
+pub const SelectedView = struct {
+    directory: projection.Directory,
+    fields: []const projection.Field,
+    values: []const []const u8,
+    pub fn serves(self: @This(), roots: []const []const u8) bool {
+        if (roots.len == 0) return false;
+        for (roots) |path| {
+            const target = self.directory.resolve(path) orelse continue;
+            const found = for (self.fields) |field| {
+                if (target.offset >= field.offset and target.offset - field.offset <= field.length and target.length <= field.length - (target.offset - field.offset)) break true;
+            } else false;
+            if (!found) return false;
+        }
+        return true;
+    }
+    pub fn raw(self: @This(), path: []const u8) ?[]const u8 {
+        const target = self.directory.resolveExact(path) orelse return null;
+        for (self.fields, self.values) |field, bytes| {
+            if (target.offset < field.offset) continue;
+            const delta = std.math.cast(usize, target.offset - field.offset) orelse continue;
+            const len = std.math.cast(usize, target.length) orelse continue;
+            if (delta <= bytes.len and len <= bytes.len - delta) {
+                const value = bytes[delta..][0..len];
+                if (target.index != field.index) {
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+                    if (!std.mem.eql(u8, &digest, &target.digest)) return null;
+                }
+                return value;
+            }
+        }
+        return null;
+    }
+    pub fn proof(self: @This(), path: []const u8, bytes: []const u8) ?ValueProof {
+        const target = self.directory.resolveExact(path) orelse return null;
+        for (self.fields, self.values) |field, value| {
+            if (field.index == target.index and value.ptr == bytes.ptr and value.len == bytes.len)
+                return .{ .digest = field.digest, .encoded_length = bytes.len };
+        }
+        return null;
+    }
+    pub fn materialize(self: @This(), a: A) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        var writer = SelectedWriter{ .directory = self.directory, .values = self.values };
+        for (self.fields, 0..) |field, slot| {
+            writer.slots[field.index] = @intCast(slot);
+            var index = field.index;
+            while (true) {
+                writer.needed[index] = true;
+                const parent = self.directory.fields[index].parent;
+                if (parent == projection.no_parent) break;
+                index = parent;
+            }
+        }
+        writer.object(&out.writer, 0, self.directory.root_count) catch |err|
+            return if (err == error.WriteFailed) error.OutOfMemory else err;
+        return out.toOwnedSlice();
+    }
+};
+
 pub const Row = struct {
     bytes: ?[]u8,
     // Logical work is charged on original size, never on projected payload.
     original_bytes: u64,
     projected: bool = false,
     repair_authority: bool = false,
+    selected: ?SelectedView = null,
 };
 
 /// Full rows borrow their final read scope; reconstructed projections are owned.
-/// Consume all views before another read on that scope or before scope.close().
+/// Backend ReadScope loans survive reads until reset/close. Generic adapters
+/// retain their own loan contract; consume before its next invalidating call.
 /// Keeping this separate from Row prevents changing the owned-read contract.
 pub const BorrowedRow = struct {
     bytes: ?[]const u8,
     original_bytes: u64,
     projected: bool = false,
     repair_authority: bool = false,
+    selected: ?SelectedView = null,
     pub fn deinit(self: BorrowedRow, a: A) void {
         if (self.projected) if (self.bytes) |bytes| a.free(bytes);
     }
@@ -146,13 +214,21 @@ pub const Selection = struct {
         if (bytes >= proof.bytes / 2) return null;
         const fields = try a.alloc(projection.Field, count);
         errdefer a.free(fields);
-        const ranges = try a.alloc(ranges_mod.Range, count);
+        var range_count: usize = 0;
+        for (directory.fields) |field| if (chosen[field.index] and directory.covered(field) == null) {
+            range_count += 1;
+        };
+        const ranges = try a.alloc(ranges_mod.Range, range_count);
         errdefer a.free(ranges);
         var needed: [projection.maximum_fields]bool = @splat(false);
         var slot: usize = 0;
+        var range_slot: usize = 0;
         for (directory.fields) |field| if (chosen[field.index]) {
             fields[slot] = field;
-            ranges[slot] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
+            if (directory.covered(field) == null) {
+                ranges[range_slot] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
+                range_slot += 1;
+            }
             slot += 1;
             var index = field.index;
             while (true) {
@@ -175,15 +251,18 @@ pub const Selection = struct {
     }
 };
 pub fn loadPrepared(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authorities: []const Authority) ![]Row {
-    return loadInternal(false, a, scratch, scope, physical, ids, roots, true, null, authorities);
+    return loadInternal(false, false, a, scratch, scope, physical, ids, roots, true, null, authorities);
+}
+pub fn loadPreparedViews(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authorities: []const Authority) ![]BorrowedRow {
+    return loadInternal(true, true, a, scratch, scope, physical, ids, roots, true, null, authorities);
 }
 pub fn loadPreparedBorrowed(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authorities: []const Authority) ![]BorrowedRow {
-    return loadInternal(true, a, scratch, scope, physical, ids, roots, true, null, authorities);
+    return loadInternal(true, false, a, scratch, scope, physical, ids, roots, true, null, authorities);
 }
 pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool, profile: ?*ReadProfile) ![]Row {
-    return loadInternal(false, a, scratch, scope, physical, ids, roots, authenticated, profile, null);
+    return loadInternal(false, false, a, scratch, scope, physical, ids, roots, authenticated, profile, null);
 }
-fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool, profile: ?*ReadProfile, authorities: ?[]const Authority) ![]RowType(borrow_full) {
+fn loadInternal(comptime borrow_full: bool, comptime views: bool, a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool, profile: ?*ReadProfile, authorities: ?[]const Authority) ![]RowType(borrow_full) {
     const started = ReadProfile.clock(profile);
     defer ReadProfile.add(profile, "total_ns", started);
     if (profile) |p| _ = p.calls.fetchAdd(1, .monotonic);
@@ -233,6 +312,7 @@ fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, ph
         fields: []projection.Field,
         ranges: []ranges_mod.Range,
         values: [][]const u8,
+        read_values: [][]const u8,
     };
     var prepared: [64]Prepared = undefined;
     var requests: [64]ranges_mod.Request = undefined;
@@ -244,7 +324,7 @@ fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, ph
         } else null;
         if (duplicate) |prior| {
             repair[i] = repair[prior.index];
-            prepared[prepared_count] = .{ .index = i, .directory = prior.directory, .fields = prior.fields, .ranges = prior.ranges, .values = prior.values };
+            prepared[prepared_count] = .{ .index = i, .directory = prior.directory, .fields = prior.fields, .ranges = prior.ranges, .values = prior.values, .read_values = prior.read_values };
             prepared_count += 1;
             continue;
         }
@@ -271,10 +351,11 @@ fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, ph
         };
         const ranges = selection.ranges;
         const values = try scratch.alloc([]const u8, selection.fields.len);
-        prepared[prepared_count] = .{ .index = i, .directory = directory, .fields = selection.fields, .ranges = ranges, .values = values };
+        const read_values = if (ranges.len == values.len) values else try scratch.alloc([]const u8, ranges.len);
+        prepared[prepared_count] = .{ .index = i, .directory = directory, .fields = selection.fields, .ranges = ranges, .values = values, .read_values = read_values };
         prepared_count += 1;
         if (ranges.len != 0) {
-            requests[request_count] = .{ .key = physical[i], .ranges = ranges, .output = values };
+            requests[request_count] = .{ .key = physical[i], .ranges = ranges, .output = read_values };
             request_count += 1;
         }
     }
@@ -292,27 +373,20 @@ fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, ph
         const values = for (prepared[0..n]) |prior| {
             if (std.mem.eql(u8, physical[prior.index], physical[item.index])) break prior.values;
         } else item.values;
-        var out: std.Io.Writer.Allocating = .init(a);
-        defer out.deinit();
+        var read_slot: usize = 0;
+        for (item.fields, 0..) |field, slot| {
+            if (item.directory.covered(field)) |bytes| values[slot] = bytes else {
+                values[slot] = item.read_values[read_slot];
+                read_slot += 1;
+            }
+        }
         for (item.fields, values) |field, value| {
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
             if (!std.mem.eql(u8, &digest, &field.digest)) return error.InvalidDocumentContentAuthority;
         }
-        var writer = SelectedWriter{ .directory = item.directory, .values = values };
-        for (item.fields, 0..) |field, slot| {
-            writer.slots[field.index] = @intCast(slot);
-            var index = field.index;
-            while (true) {
-                writer.needed[index] = true;
-                const parent = item.directory.fields[index].parent;
-                if (parent == projection.no_parent) break;
-                index = parent;
-            }
-        }
-        writer.object(&out.writer, 0, item.directory.root_count) catch |err|
-            return if (err == error.WriteFailed) error.OutOfMemory else err;
-        result[item.index] = .{ .bytes = try out.toOwnedSlice(), .original_bytes = proofs[item.index].?.bytes, .projected = true, .repair_authority = repair[item.index] };
+        const view: SelectedView = .{ .directory = item.directory, .fields = item.fields, .values = values };
+        result[item.index] = .{ .bytes = if (views) null else try view.materialize(a), .selected = if (views) view else null, .original_bytes = proofs[item.index].?.bytes, .projected = true, .repair_authority = repair[item.index] };
     }
     ReadProfile.add(profile, "reconstruct_ns", phase);
     phase = ReadProfile.clock(profile);
@@ -569,4 +643,54 @@ test "logical value shared selection batches large bodies without full reads" {
         try std.testing.expect(!row.projected);
         try std.testing.expectEqualStrings(body, row.bytes.?);
     }
+}
+
+test "api query contract covered selected views avoid primary reads and preserve mixed spans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const large = try a.alloc(u8, 128 * 1024);
+    @memset(large, 'x');
+    const image = try a.alloc(u8, 8192);
+    @memset(image, 'a');
+    const source = try std.fmt.allocPrint(a, "{{\"metadata\":{{\"revision\":\"r1\",\"list\":[1,null,3]}},\"image\":\"{s}\",\"large\":\"{s}\"}}", .{ image, large });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
+    const proof: revision.Content = .{ .revision = 1, .bytes = source.len, .kind = @import("internal_keys.zig").primary_kind, .digest = digest };
+    const encoded = (try projection.buildAuthority(a, source, proof.kind, digest)).?;
+    const directory = (try projection.Directory.open(a, encoded, proof)).?;
+    const authority: Authority = .{ .proof = proof, .directory = directory };
+    const Fake = struct {
+        bytes: []const u8,
+        calls: usize = 0,
+        corrupt: bool = false,
+        pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+            return error.UnexpectedPrimaryRead;
+        }
+        pub fn getRangesMany(self: *@This(), requests: []const ranges_mod.Request) !void {
+            self.calls += 1;
+            for (requests) |request| for (request.ranges, request.output) |range, *out| {
+                out.* = if (self.corrupt) self.bytes[0..range.length] else self.bytes[@intCast(range.offset)..][0..range.length];
+            };
+        }
+    };
+    var scope: Fake = .{ .bytes = source };
+    const physical = try @import("internal_keys.zig").documentKeyAlloc(a, "row");
+    const metadata = try loadPreparedViews(a, a, &scope, &.{physical}, &.{"row"}, &.{"metadata"}, &.{authority});
+    try std.testing.expectEqual(@as(usize, 0), scope.calls);
+    try std.testing.expect(metadata[0].bytes == null);
+    const selected = metadata[0].selected.?;
+    try std.testing.expectEqualStrings("\"r1\"", selected.raw("metadata.revision").?);
+    try std.testing.expectEqualStrings("{\"metadata\":{\"revision\":\"r1\",\"list\":[1,null,3]}}", try selected.materialize(a));
+    const mixed = try loadPreparedViews(a, a, &scope, &.{physical}, &.{"row"}, &.{ "metadata.revision", "image" }, &.{authority});
+    try std.testing.expectEqual(@as(usize, 1), scope.calls);
+    const view = mixed[0].selected.?;
+    const raw = view.raw("image").?;
+    try std.testing.expectEqual(@as(usize, image.len + 2), raw.len);
+    const witness = view.proof("image", raw).?;
+    try std.testing.expectEqual(raw.len, witness.encoded_length);
+    try std.testing.expect(view.proof("image", try a.dupe(u8, raw)) == null);
+    try std.testing.expect(view.raw("large") == null);
+    scope.corrupt = true;
+    try std.testing.expectError(error.InvalidDocumentContentAuthority, loadPreparedViews(a, a, &scope, &.{physical}, &.{"row"}, &.{"image"}, &.{authority}));
 }

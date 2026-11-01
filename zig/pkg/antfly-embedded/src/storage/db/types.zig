@@ -1966,6 +1966,8 @@ pub const SearchRequest = struct {
     field_projection_plan: ?@import("../../api/field_projection.zig").BorrowedPlan = null,
     /// Trusted private worker delivery, never accepted at public ingress.
     field_projection_transport: bool = false,
+    /// Trusted in-process delivery hint; never decoded from public/wire JSON.
+    field_projection_value_views: bool = false,
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -2154,6 +2156,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "field_projection_json",
     "field_projection_plan",
     "field_projection_transport",
+    "field_projection_value_views",
     "value_search_work",
     "value_search_scope",
     "document_authority_mode",
@@ -2733,7 +2736,7 @@ pub const SearchHit = struct {
             alloc.free(cloned.id);
             if (cloned.document_authority) |proof| alloc.destroy(proof);
             if (cloned.computed_json) |data| alloc.free(data);
-            if (cloned.computed_receipt) |receipt| alloc.destroy(receipt);
+            if (cloned.computed_receipt) |receipt| receipt.deinit(alloc);
             if (cloned.source_table) |table| alloc.free(table);
             if (cloned.score_details) |*details| details.deinit(alloc);
             freeIndexScores(alloc, cloned.index_scores);
@@ -2753,11 +2756,7 @@ pub const SearchHit = struct {
         }
         cloned.computed_json = if (self.computed_json) |data| try alloc.dupe(u8, data) else null;
         if (self.computed_receipt) |receipt| if (self.computed_json) |previous| {
-            if (cloned.computed_json) |bytes| if (receipt.afterCopy(previous, bytes)) |value| {
-                const owned = try alloc.create(@import("../../api/field_projection.zig").Receipt);
-                owned.* = value;
-                cloned.computed_receipt = owned;
-            };
+            if (cloned.computed_json) |bytes| cloned.computed_receipt = try receipt.ownAfterCopy(alloc, previous, bytes);
         };
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
         cloned.doc_ordinal = self.doc_ordinal;
@@ -2810,7 +2809,7 @@ pub const SearchHit = struct {
         alloc.free(self.id);
         if (self.document_authority) |proof| alloc.destroy(proof);
         if (self.computed_json) |data| alloc.free(data);
-        if (self.computed_receipt) |receipt| alloc.destroy(receipt);
+        if (self.computed_receipt) |receipt| receipt.deinit(alloc);
         if (self.source_table) |table| alloc.free(table);
         if (self.score_details) |*details| details.deinit(alloc);
         freeIndexScores(alloc, self.index_scores);

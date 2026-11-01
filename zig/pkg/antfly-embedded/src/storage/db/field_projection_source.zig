@@ -57,12 +57,18 @@ fn hasPath(paths: []const []const u8, path: []const u8) bool {
     for (paths) |value| if (std.mem.eql(u8, value, path)) return true;
     return false;
 }
+fn selectiveRoots(roots: []const []const u8) bool {
+    return roots.len != 0 and roots.len <= 64 and for (roots) |path| {
+        if (!projection.validPath(path)) break false;
+    } else true;
+}
 /// Selected rows only. Ownership is bounded by a byte window, not page count;
 /// unknown/large afterimages retain ordinary lazy per-row reads.
 pub const Batch = struct {
     a: A,
     arena: std.heap.ArenaAllocator,
-    rows: []logical.Row = &.{},
+    rows: []logical.BorrowedRow = &.{},
+    scope: ?@import("../backend_erased.zig").ReadScope = null,
     start: usize = 0,
     end: usize = 0,
     profile: bool = false,
@@ -76,24 +82,41 @@ pub const Batch = struct {
     }
     pub fn deinit(self: *Batch) void {
         if (self.profile) std.log.info("antfly_bench_source_batch attempts={d} admitted={d} rows={d} planned_rows={d} preflight_rejects={d}", .{ self.attempts, self.admitted, self.admitted_rows, self.planned_rows, self.preflight_rejects });
+        if (self.scope) |*scope| scope.close();
         self.arena.deinit();
     }
     pub fn reset(self: *Batch) void {
+        if (self.scope) |*scope| scope.close();
+        self.scope = null;
         _ = self.arena.reset(.free_all);
         self.rows = &.{};
         self.start = 0;
         self.end = 0;
     }
-    fn pairFits(authorities: []const conditional.Authority) bool {
+    fn physicalWorkBytes(authority: conditional.Authority, full: bool, paths: []const []const u8) ?u64 {
+        const proof = authority.source.proof orelse return null;
+        if (!full) if (authority.source.directory) |directory| {
+            const covered = for (paths) |path| {
+                const field = directory.resolve(path) orelse {
+                    if (directory.version < 2) break false;
+                    continue;
+                };
+                if (directory.covered(field) == null) break false;
+            } else true;
+            if (covered) return 0;
+        };
+        return proof.bytes;
+    }
+    fn pairFits(authorities: []const conditional.Authority, full: bool, paths: []const []const u8) bool {
         var remaining: u64 = 1024 * 1024;
         for (authorities) |authority| {
-            const proof = authority.source.proof orelse return false;
-            if (proof.bytes > remaining) return false;
-            remaining -= proof.bytes;
+            const bytes = physicalWorkBytes(authority, full, paths) orelse return false;
+            if (bytes > remaining) return false;
+            remaining -= bytes;
         }
         return true;
     }
-    pub fn at(self: *Batch, txn: *@import("../docstore.zig").DocStore.Txn, index: usize, physical: []const []const u8, ids: []const []const u8, authorities: []const conditional.Authority, req: @import("types.zig").SearchRequest, operands: *const OperandPlans) !?logical.Row {
+    pub fn at(self: *Batch, txn: *@import("../docstore.zig").DocStore.Txn, index: usize, physical: []const []const u8, ids: []const []const u8, authorities: []const conditional.Authority, req: @import("types.zig").SearchRequest, operands: *const OperandPlans) !?logical.BorrowedRow {
         if (!req.include_all_fields and operands.read_set.len == 0) return null;
         if (index < self.end) return self.rows[index - self.start];
         self.reset();
@@ -101,10 +124,10 @@ pub const Batch = struct {
         const capacity = @min(ids.len - index, 64);
         if (capacity < 2) return null;
         if (self.profile) self.attempts += 1;
-        const first = authorities[index].source.proof orelse return null;
+        const first_bytes = physicalWorkBytes(authorities[index], full, operands.read_set) orelse return null;
         // Capability metadata is available before opening a scope. Unsupported
         // and whole-value adapters keep the original cheap per-row fallback.
-        if (first.bytes > 1024 * 1024 and
+        if (first_bytes > 1024 * 1024 and
             (full or (if (txn.readScopeRangeMode()) |hint| hint != .selected_read else false)))
         {
             if (self.profile) self.preflight_rejects += 1;
@@ -115,26 +138,27 @@ pub const Batch = struct {
         // Unknown capabilities must defer this decision: selected_read may
         // legitimately admit small spans from much larger physical values.
         if (full or (if (txn.readScopeRangeMode()) |hint| hint != .selected_read else false)) {
-            if (!pairFits(authorities[index..][0..2])) {
+            if (!pairFits(authorities[index..][0..2], full, operands.read_set)) {
                 if (self.profile) self.preflight_rejects += 1;
                 return null;
             }
         }
         const a = self.arena.allocator();
         var scope = try txn.openReadScope(a);
-        defer scope.close();
+        var retained_scope = false;
+        defer if (!retained_scope) scope.close();
         // Unsupported adapters may retain entire values behind range-shaped
         // APIs. Keep whole-document admission unless ownership is explicit.
         const mode = scope.rangeReadMode();
-        if ((full or mode != .selected_read) and !pairFits(authorities[index..][0..2])) {
+        if ((full or mode != .selected_read) and !pairFits(authorities[index..][0..2], full, operands.read_set)) {
             if (self.profile) self.preflight_rejects += 1;
             return null;
         }
         // A copied span still requires a whole-value read. Reject oversized
         // copy-backed batches before allocating/planning every remaining row.
-        if (mode != .selected_read) if (authorities[index].source.proof) |proof| {
-            if (proof.bytes > 1024 * 1024) return null;
-        };
+        if (mode != .selected_read) {
+            if (physicalWorkBytes(authorities[index], full, operands.read_set).? > 1024 * 1024) return null;
+        }
         // Used synchronously by loadPrepared; plans/returned rows live in the
         // arena, while these bounded headers need no allocation or teardown.
         var selected: [64]logical.Authority = undefined;
@@ -148,7 +172,8 @@ pub const Batch = struct {
             var authority = authorities[end].source;
             const proof = authority.proof orelse break;
             const original_bytes = std.math.cast(usize, proof.bytes) orelse break;
-            if (mode != .selected_read and original_bytes > 1024 * 1024 -| physical_bytes) break;
+            const physical_work = std.math.cast(usize, physicalWorkBytes(authorities[end], full, operands.read_set).?) orelse break;
+            if (mode != .selected_read and physical_work > 1024 * 1024 -| physical_bytes) break;
             var count = original_bytes;
             var range_count: usize = 1;
             if (full) {
@@ -170,13 +195,15 @@ pub const Batch = struct {
             }
             if (count > 1024 * 1024 -| bytes or range_count > 256 -| ranges) break;
             bytes += count;
-            physical_bytes +|= original_bytes;
+            physical_bytes +|= physical_work;
             ranges += range_count;
             selected[end - index] = authority;
         }
         if (end - index < 2) return null;
         var checked: CheckedScope = .{ .upstream = &scope, .mode = mode, .request = &req };
-        self.rows = try logical.loadPrepared(a, a, &checked, physical[index..end], ids[index..end], if (full) &.{} else operands.read_set, selected[0 .. end - index]);
+        self.rows = try logical.loadPreparedViews(a, a, &checked, physical[index..end], ids[index..end], if (full) &.{} else operands.read_set, selected[0 .. end - index]);
+        self.scope = scope;
+        retained_scope = true;
         self.start = index;
         self.end = end;
         if (self.profile) {
@@ -212,6 +239,38 @@ const CheckedScope = struct {
     }
 };
 
+/// Opt-in aggregate attribution; never includes document identifiers or data.
+pub const NativeViewProfile = struct {
+    enabled: bool = false,
+    rows: usize = 0,
+    requested: usize = 0,
+    authority: usize = 0,
+    full: usize = 0,
+    bytes_match: usize = 0,
+    selected: usize = 0,
+    members: usize = 0,
+    witnesses: usize = 0,
+    pub fn observe(self: *@This(), row: Row, receipt: ?*const projection.Receipt) void {
+        if (!self.enabled) return;
+        self.rows += 1;
+        self.requested += @intFromBool(row.req.field_projection_value_views);
+        self.authority += @intFromBool(row.authority.source.directory != null);
+        self.full += @intFromBool(row.full_bytes != null);
+        self.selected += @intFromBool(row.selected_view != null);
+        if (row.full_bytes) |bytes| if (row.authority.source.proof) |proof| {
+            self.bytes_match += @intFromBool(bytes.len == proof.bytes);
+        };
+        if (receipt) |owned| {
+            self.members += owned.members.len;
+            for (owned.members) |member| if (member.proof != null) {
+                self.witnesses += 1;
+            };
+        }
+    }
+    pub fn finish(self: @This()) void {
+        if (self.enabled) std.log.info("antfly_bench_field_view rows={d} requested={d} authority={d} full={d} bytes_match={d} selected={d} members={d} witnesses={d}", .{ self.rows, self.requested, self.authority, self.full, self.bytes_match, self.selected, self.members, self.witnesses });
+    }
+};
 pub const Row = struct {
     a: A,
     txn: ?*@import("../docstore.zig").DocStore.Txn,
@@ -223,6 +282,7 @@ pub const Row = struct {
     operands: ?*const OperandPlans = null,
     raw_sources: std.StringHashMapUnmanaged([]const u8) = .empty,
     raw_operands: std.StringHashMapUnmanaged([]const u8) = .empty,
+    selected_view: ?logical.SelectedView = null,
     full_view: ?OperandPlans.View = null,
     scope: ?@import("../backend_erased.zig").ReadScope = null,
     prefetched: ?[]const u8 = null,
@@ -230,6 +290,9 @@ pub const Row = struct {
     prefetched_view: ?OperandPlans.View = null,
     prefetched_root: ?V = null,
     values: std.StringHashMapUnmanaged(V) = .empty,
+    /// Exact authenticated operands, distinct from containing-object roots.
+    /// Repeated value/identity expressions share one parse per row.
+    token_values: std.StringHashMapUnmanaged(V) = .empty,
     identities: std.StringHashMapUnmanaged(sql.Datum) = .empty,
     metadata_hits: usize = 0,
     certificate_hits: usize = 0,
@@ -237,7 +300,7 @@ pub const Row = struct {
     full_bytes: ?[]const u8 = null,
     full_root: ?V = null,
     pub fn source(self: *Row) projection.Source {
-        return .{ .context = self, .read = read, .read_raw = readRaw, .read_normalized = readNormalized, .prefetch = prefetch };
+        return .{ .context = self, .read = read, .read_raw = readRaw, .read_normalized = readNormalized, .value_proof = valueProof, .prefetch = prefetch };
     }
     pub fn deinit(self: *Row) void {
         if (self.scope) |*scope| scope.close();
@@ -248,7 +311,11 @@ pub const Row = struct {
         const cached = self.prefetched orelse return false;
         return bytes.ptr == cached.ptr and bytes.len == cached.len;
     }
-    pub fn attach(self: *Row, prepared: logical.Row) void {
+    pub fn attach(self: *Row, prepared: logical.BorrowedRow) void {
+        if (prepared.selected) |view| {
+            self.selected_view = view;
+            return;
+        }
         if (!prepared.projected) self.full_bytes = prepared.bytes else {
             self.prefetched = prepared.bytes;
             self.base_prefetched = true;
@@ -256,11 +323,18 @@ pub const Row = struct {
     }
     fn prefetch(raw: *anyopaque, paths: []const []const u8) !void {
         const self: *Row = @ptrCast(@alignCast(raw));
-        if (self.full_bytes != null) return;
+        if (self.full_bytes != null or self.selected_view != null) return;
         const read_set = if (self.operands) |operands| operands.read_set else paths;
         if (!self.req.include_all_fields and read_set.len == 0) return;
         const full = self.req.include_all_fields or (if (self.operands) |operands| operands.full_read else false);
-        const bytes = self.prefetched orelse try self.load(if (full) &.{} else read_set);
+        if (self.prefetched == null) {
+            // Acquire an authenticated selection or a full-value loan. A
+            // prefetch must not index/parse a full fallback just to discard the
+            // first token; decoded consumers need one ordinary root parse.
+            try self.acquire(if (full) &.{} else read_set);
+            return;
+        }
+        const bytes = self.prefetched.?;
         if (self.full_bytes != null) return;
         self.prefetched = bytes;
         self.base_prefetched = self.operands != null;
@@ -269,22 +343,61 @@ pub const Row = struct {
     fn load(self: *Row, roots: []const []const u8) ![]const u8 {
         try @import("query/search_exec.zig").checkSearchRequestDeadline(self.req);
         if (self.full_bytes) |bytes| return bytes;
+        if (selectiveRoots(roots)) if (self.selected_view) |view| if (view.serves(roots)) {
+            return view.materialize(self.a);
+        };
+        try self.acquire(roots);
+        if (self.full_bytes) |bytes| return bytes;
+        if (self.selected_view) |view| return view.materialize(self.a);
+        return error.DocumentNotFound;
+    }
+    /// Populate a selected view/full loan without constructing JSON or an
+    /// operand index. The eventual consumer decides whether bytes or Datum is
+    /// needed; full decoded values must not pay for both representations.
+    fn acquire(self: *Row, roots: []const []const u8) !void {
+        try @import("query/search_exec.zig").checkSearchRequestDeadline(self.req);
+        if (self.full_bytes != null) return;
+        const selective = selectiveRoots(roots);
+        if (selective) if (self.selected_view) |view| if (view.serves(roots)) return;
         if (self.scope == null) self.scope = try (self.txn orelse return error.DocumentNotFound).openReadScope(self.a);
         var authority = self.authority.source;
-        const selective = roots.len != 0 and roots.len <= 64 and for (roots) |path| {
-            if (!projection.validPath(path)) break false;
-        } else true;
         if (!selective) authority.directory = null;
-        const rows = try logical.loadPrepared(self.a, self.a, &self.scope.?, &.{self.physical}, &.{self.id}, if (selective) roots else &.{}, &.{authority});
+        const rows = try logical.loadPreparedViews(self.a, self.a, &self.scope.?, &.{self.physical}, &.{self.id}, if (selective) roots else &.{}, &.{authority});
         self.value_reads += 1;
+        if (rows[0].selected) |view| {
+            self.selected_view = view;
+            return;
+        }
         const bytes = rows[0].bytes orelse return error.DocumentNotFound;
         if (!rows[0].projected) self.full_bytes = bytes;
-        return bytes;
+        if (rows[0].projected) {
+            self.prefetched = bytes;
+            self.base_prefetched = self.operands != null;
+        }
+    }
+    /// Exact selected tokens can be consumed directly. A full fallback is
+    /// deliberately left unindexed here: typed reads parse its root once.
+    fn selectedToken(self: *Row, path: []const u8) !?[]const u8 {
+        if (self.raw_operands.get(path)) |value| return value;
+        if (!std.mem.eql(u8, path, "_id") and projection.validPath(path)) {
+            if (self.full_bytes == null and self.prefetched == null and self.txn != null and (if (self.selected_view) |view| !view.serves(&.{path}) else true)) {
+                const operands = self.operands;
+                const read_set: []const []const u8 = if (self.selected_view == null and operands != null and operands.?.read_set.len != 0) operands.?.read_set else &.{path};
+                if (selectiveRoots(read_set)) {
+                    try self.acquire(read_set);
+                }
+            }
+            if (self.selected_view) |view| if (view.raw(path)) |bytes| {
+                try self.raw_operands.put(self.a, path, bytes);
+                return bytes;
+            };
+        }
+        return null;
     }
     fn readRaw(raw: *anyopaque, _: A, path: []const u8) !?[]const u8 {
         const self: *Row = @ptrCast(@alignCast(raw));
         try @import("query/search_exec.zig").checkSearchRequestDeadline(self.req);
-        if (self.raw_operands.get(path)) |value| return value;
+        if (try self.selectedToken(path)) |bytes| return bytes;
         // A prior operator may already have materialized this source. Reuse
         // that value rather than building a second index for small/mixed rows.
         if (self.full_root != null or self.values.contains(path) or (self.prefetched_root != null and self.prefetchedPath(path))) return null;
@@ -326,6 +439,27 @@ pub const Row = struct {
         try self.raw_operands.put(self.a, path, node.raw);
         return node.raw;
     }
+    fn valueProof(raw: *anyopaque, path: []const u8, bytes: []const u8) ?projection.ValueProof {
+        const self: *Row = @ptrCast(@alignCast(raw));
+        if (self.selected_view) |view| if (view.proof(path, bytes)) |proven| {
+            return .{ .digest = proven.digest, .encoded_length = proven.encoded_length };
+        };
+        // A full value and its metadata come from the same authenticated,
+        // pinned transaction. Bind the actual strict node extent, not a
+        // caller's identity claim or an independently fetched directory.
+        const full = self.full_bytes orelse return null;
+        const authority = self.authority.source;
+        const proof = authority.proof orelse return null;
+        if (full.len != proof.bytes) return null;
+        const directory = authority.directory orelse return null;
+        const field = directory.resolveExact(path) orelse return null;
+        const offset = std.math.cast(usize, field.offset) orelse return null;
+        const len = std.math.cast(usize, field.length) orelse return null;
+        if (offset > full.len or len > full.len - offset) return null;
+        const actual = full[offset..][0..len];
+        if (actual.ptr != bytes.ptr or actual.len != bytes.len) return null;
+        return .{ .digest = field.digest, .encoded_length = bytes.len };
+    }
     fn readNormalized(raw: *anyopaque, path: []const u8) !?sql.NormalizedOutput {
         const self: *Row = @ptrCast(@alignCast(raw));
         // readRaw establishes strict immutable node extents with the row's
@@ -362,12 +496,25 @@ pub const Row = struct {
                         return value;
                     };
                 }
-            } else if (directory.version == 2 and directory.resolve(path) == null) {
+            } else if (directory.version >= 2 and directory.resolve(path) == null) {
                 self.metadata_hits += 1;
                 return if (kind == .missing) sql.Datum.json(.{ .bool = true }) else .{};
             }
         };
         if (kind == .missing) if (try readRaw(self, a, path)) |_| return sql.Datum.json(.{ .bool = false });
+        if (kind != .missing and self.full_root == null and !self.values.contains(path) and !(self.prefetched_root != null and self.prefetchedPath(path))) if (try self.selectedToken(path)) |bytes| {
+            const value = self.token_values.get(path) orelse parsed: {
+                const value = try @import("antfly-json").parseFromSliceLeaky(V, self.a, bytes, .{ .allocate = .alloc_if_needed });
+                try self.token_values.put(self.a, path, value);
+                break :parsed value;
+            };
+            if (kind == .identity) {
+                const identity = sql.Datum.json(.{ .string = try self.a.dupe(u8, &(try @import("../../common/value_identity.zig").identity(value))) });
+                try self.identities.put(self.a, path, identity);
+                return identity;
+            }
+            return sql.Datum.json(value);
+        };
         const root = self.full_root orelse self.values.get(path) orelse (if (self.prefetchedPath(path)) self.prefetched_root else null) orelse loaded: {
             const bytes = self.raw_sources.get(path) orelse try self.load(&.{path});
             // The authenticated range loader preserves opaque array positions.
@@ -380,9 +527,50 @@ pub const Row = struct {
         var source_value: projection.JsonSource = .{ .id = self.id, .root = root };
         return source_value.source().read(&source_value, a, path, kind);
     }
+    /// Public output can reuse a small checked mask even after scalar
+    /// evaluation needed the complete source. Keep this separate from load():
+    /// decoded consumers must distinguish their whole-root cache from masks.
+    fn publicSourceBytes(self: *Row) ![]const u8 {
+        const roots = self.req.fields;
+        if (selectiveRoots(roots)) {
+            const prepared: ?logical.SelectedView = if (self.selected_view) |view| if (view.serves(roots)) view else null else null;
+            if (prepared) |view| {
+                var bytes: usize = 0;
+                for (view.values) |value| bytes +|= value.len;
+                if (bytes <= @import("../document_projection.zig").covering_max_bytes) return view.materialize(self.a);
+            }
+            if (self.authority.source.proof) |proof| if (self.authority.source.directory) |directory| {
+                if (directory.version >= 3 and proof.kind == @import("../internal_keys.zig").primary_kind) covered: {
+                    for (roots) |path| {
+                        const field = directory.resolve(path) orelse continue;
+                        if (directory.covered(field) == null) break :covered;
+                    }
+                    const selection = (try logical.Selection.init(self.a, directory, proof, roots)) orelse break :covered;
+                    defer self.a.free(selection.fields);
+                    defer self.a.free(selection.ranges);
+                    if (selection.ranges.len != 0) break :covered;
+                    const values = try self.a.alloc([]const u8, selection.fields.len);
+                    defer self.a.free(values);
+                    for (selection.fields, values) |field, *value| {
+                        value.* = directory.covered(field) orelse return error.InvalidDocumentContentAuthority;
+                        var digest: [32]u8 = undefined;
+                        std.crypto.hash.sha2.Sha256.hash(value.*, &digest, .{});
+                        if (!std.mem.eql(u8, &digest, &field.digest)) return error.InvalidDocumentContentAuthority;
+                    }
+                    const view: logical.SelectedView = .{ .directory = directory, .fields = selection.fields, .values = values };
+                    return view.materialize(self.a);
+                }
+            };
+            // Covering can avoid copying a large selected scalar that the
+            // public mask does not need. Otherwise reuse the existing view.
+            if (prepared) |view| return view.materialize(self.a);
+        }
+        if (self.base_prefetched) return self.prefetched.?;
+        return self.load(if (self.req.include_all_fields) &.{} else self.req.fields);
+    }
     pub fn base(self: *Row, output: A) ![]u8 {
         if (!self.req.include_all_fields and self.req.fields.len == 0) return output.dupe(u8, "{}");
-        const bytes = if (self.base_prefetched) self.prefetched.? else try self.load(if (self.req.include_all_fields) &.{} else self.req.fields);
+        const bytes = try self.publicSourceBytes();
         if (self.public_plan) |plan| return (try plan.apply(self.a, output, bytes)).json;
         var plan = try query.PublicPlan.init(self.a, .{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields });
         defer plan.deinit();
@@ -668,4 +856,234 @@ test "api query contract controlled copy batch retains one owner and stops betwe
         try std.testing.expectError(expected, upstream.getRangesManyControlled(&requests, .{ .ptr = &code, .poll = Poll.check }));
         try std.testing.expectEqual(@as(usize, 1), calls);
     }
+}
+
+test "api query contract direct scalar spans preserve proof without reconstructing containing JSON" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const token = "\"data:image/png;base64,YQ==\"";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
+    const fields = [_]@import("../document_projection.zig").Field{.{ .name = "image", .offset = 10, .length = token.len, .digest = digest }};
+    const values = [_][]const u8{token};
+    var row: Row = .{ .a = a, .txn = null, .physical = "key", .id = "row", .req = .{}, .authority = .{}, .selected_view = .{ .directory = .{ .fields = &fields, .root_count = 1, .version = 2 }, .fields = &fields, .values = &values } };
+    const source = row.source();
+    const raw = (try source.read_normalized.?(source.context, "image")).?;
+    try std.testing.expectEqual(token.ptr, raw.bytes.ptr);
+    try std.testing.expect(source.value_proof.?(source.context, "image", raw.bytes) != null);
+    try std.testing.expect(row.prefetched == null);
+    try std.testing.expect(row.scope == null);
+    const datum = try source.read(source.context, a, "image", .value);
+    try std.testing.expectEqualStrings(token[1 .. token.len - 1], datum.value.string);
+}
+
+test "api query contract borrowed projection windows keep scopes until reset" {
+    const backend = @import("../backend_erased.zig");
+    const Fake = struct {
+        const Scope = struct {
+            pub const range_read_mode = backend.RangeReadMode.selected_copy;
+            closes: *usize,
+            pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+                return error.UnexpectedPrimaryRead;
+            }
+            pub fn close(self: *@This()) void {
+                self.closes.* += 1;
+            }
+        };
+        fn abort(_: A, _: *anyopaque) void {}
+        fn get(_: *anyopaque, _: []const u8) ![]const u8 {
+            return error.UnexpectedPrimaryRead;
+        }
+        fn cursor(_: A, _: *anyopaque) !backend.Cursor {
+            return error.UnexpectedCursor;
+        }
+        fn open(a: A, raw: *anyopaque) !backend.ReadScope {
+            return backend.readScopeFrom(a, Scope{ .closes = @ptrCast(@alignCast(raw)) });
+        }
+    };
+    const a = std.testing.allocator;
+    var closes: usize = 0;
+    const vtable: backend.ReadTxn.VTable = .{ .read_scope_range_mode = .selected_copy, .abort = Fake.abort, .get = Fake.get, .open_cursor = Fake.cursor, .open_read_scope = Fake.open };
+    var txn: @import("../docstore.zig").DocStore.Txn = .{ .alloc = a, .read = .{ .allocator = a, .ptr = &closes, .vtable = &vtable } };
+    const metadata = "{\"revision\":\"r1\"}";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(metadata, &digest, .{});
+    const fields = [_]@import("../document_projection.zig").Field{.{ .name = "metadata", .offset = 1, .length = metadata.len, .digest = digest, .covering_offset = 1 }};
+    const authority: conditional.Authority = .{ .source = .{ .proof = .{ .revision = 1, .bytes = 2 * 1024 * 1024, .kind = @import("../internal_keys.zig").primary_kind, .digest = @splat(0) }, .directory = .{ .fields = &fields, .root_count = 1, .version = 3, .encoded = "x" ++ metadata } } };
+    var operands: OperandPlans = .{ .selector = undefined, .read_set = &.{"metadata"} };
+    var batch = Batch.init(a);
+    defer batch.deinit();
+    const authorities = [_]conditional.Authority{ authority, authority };
+    const keys = [_][]const u8{ try @import("../internal_keys.zig").documentKeyAlloc(a, "a"), try @import("../internal_keys.zig").documentKeyAlloc(a, "b") };
+    defer for (keys) |key| a.free(key);
+    const request: @import("types.zig").SearchRequest = .{ .include_all_fields = false };
+    const first = (try batch.at(&txn, 0, &keys, &keys, &authorities, request, &operands)).?;
+    try std.testing.expectEqual(@as(usize, 0), closes);
+    try std.testing.expectEqualStrings(metadata, first.selected.?.raw("metadata").?);
+    _ = (try batch.at(&txn, 1, &keys, &keys, &authorities, request, &operands)).?;
+    try std.testing.expectEqual(@as(usize, 0), closes);
+    batch.reset();
+    try std.testing.expectEqual(@as(usize, 1), closes);
+}
+
+test "api query contract nested full source fields retain native output witnesses" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const image = try temp.alloc(u8, 64 * 1024);
+    @memset(image, 'A');
+    const bytes = try std.fmt.allocPrint(temp, "{{\"images\":{{\"preview\":\"data:image/png;base64,{s}\"}},\"revision\":\"r1\",\"permissions\":{{\"public\":true}}}}", .{image});
+    const directory_mod = @import("../document_projection.zig");
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const kind = @import("../internal_keys.zig").primary_kind;
+    const proof: @import("../document_mutation_revision.zig").Content = .{ .revision = 1, .bytes = bytes.len, .kind = kind, .digest = digest };
+    const encoded = (try directory_mod.buildAuthority(temp, bytes, kind, digest)).?;
+    const directory = (try directory_mod.Directory.open(temp, encoded, proof)).?;
+    const field = directory.resolveExact("images.preview").?;
+    const fields = try std.json.parseFromSliceLeaky([]const V, temp,
+        \\[{"name":"v0","expression":{"field":"images.preview"}},
+        \\ {"name":"v1","expression":{"field":"revision"}},
+        \\ {"name":"v2","expression":{"field":"permissions"}},
+        \\ {"name":"m0","expression":{"call":"is_missing","args":[{"field":"images.preview"}]}}]
+    , .{});
+    var plan = try projection.Plan.init(a, .{ .fields = fields });
+    defer plan.deinit();
+    var operands = try OperandPlans.init(temp, &plan);
+    var row: Row = .{ .a = temp, .txn = null, .physical = "row", .id = "row", .req = .{ .include_all_fields = false }, .authority = .{ .source = .{ .proof = proof, .directory = directory } }, .full_bytes = bytes, .operands = &operands };
+    const result = try plan.evaluateRetained(temp, a, row.source(), null, .{}, true);
+    defer a.free(result.bytes);
+    defer result.receipt.?.deinit(a);
+    const view: projection.ComputedView = .{ .plan = &plan, .receipt = result.receipt.?, .bytes = result.bytes };
+    try std.testing.expect(view.proof("v0") != null);
+    try std.testing.expectEqualSlices(u8, &field.digest, &view.proof("v0").?.digest);
+    try std.testing.expectEqual(field.length, view.proof("v0").?.encoded_length);
+    const object = try view.object(temp);
+    try std.testing.expectEqual(image.len + "data:image/png;base64,".len, object.object.get("v0").?.string.len);
+    try std.testing.expect(!object.object.get("m0").?.bool);
+}
+
+test "api query contract native repeated token values and identities share one parse" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var row: Row = .{ .a = a, .txn = null, .physical = "a", .id = "a", .req = .{}, .authority = .{} };
+    try row.raw_operands.put(a, "body.image", "\"escaped\\u0020text\"");
+    const source_value = row.source();
+    const first = try source_value.read(&row, a, "body.image", .value);
+    const second = try source_value.read(&row, a, "body.image", .value);
+    try std.testing.expectEqualStrings("escaped text", first.value.string);
+    try std.testing.expect(first.value.string.ptr == second.value.string.ptr);
+    const identity = try source_value.read(&row, a, "body.image", .identity);
+    try std.testing.expectEqualStrings(&(try @import("../../common/value_identity.zig").identity(first.value)), identity.value.string);
+    const again = try source_value.read(&row, a, "body.image", .identity);
+    try std.testing.expect(identity.value.string.ptr == again.value.string.ptr);
+    try std.testing.expectEqual(@as(usize, 1), row.token_values.count());
+    try std.testing.expectEqual(@as(usize, 0), row.values.count());
+    try std.testing.expectEqual(@as(usize, 0), row.value_reads);
+    try std.testing.expect(row.full_root == null and row.full_view == null);
+}
+
+test "api query contract decoded full values do not build a second raw index" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = try std.json.parseFromSliceLeaky([]const V, a, "[{\"name\":\"value\",\"expression\":{\"field\":\"body.image\"}}]", .{});
+    var plan = try projection.Plan.init(std.testing.allocator, .{ .fields = fields });
+    defer plan.deinit();
+    const operands = try OperandPlans.init(a, &plan);
+    var row: Row = .{ .a = a, .txn = null, .physical = "a", .id = "a", .req = .{}, .authority = .{}, .operands = &operands, .full_bytes = "{\"body\":{\"image\":\"escaped\\u0020text\"}}" };
+    const first = try row.source().read(&row, a, "body.image", .value);
+    const again = try row.source().read(&row, a, "body.image", .value);
+    try std.testing.expectEqualStrings("escaped text", first.value.string);
+    try std.testing.expect(first.value.string.ptr == again.value.string.ptr);
+    try std.testing.expect(row.full_root != null);
+    try std.testing.expect(row.full_view == null);
+    try std.testing.expectEqual(@as(usize, 0), row.token_values.count());
+}
+
+/// Diagnostic first/repeated decoded-field access, excluding I/O, SQL VM,
+/// identity hashing and output. Called only by the optimized preparation target.
+pub fn benchmarkDecodedAccess() !void {
+    var corpus = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer corpus.deinit();
+    const a = corpus.allocator();
+    const fields = try std.json.parseFromSliceLeaky([]const V, a, "[{\"name\":\"value\",\"expression\":{\"field\":\"body.image\"}}]", .{});
+    var plan = try projection.Plan.init(std.testing.allocator, .{ .fields = fields });
+    defer plan.deinit();
+    const operands = try OperandPlans.init(a, &plan);
+    for ([_]usize{ 16384, 262144, 1048576 }) |size| {
+        const payload = try a.alloc(u8, size);
+        @memset(payload, 'x');
+        const body = try std.fmt.allocPrint(a, "{{\"body\":{{\"image\":\"{s}\"}},\"metadata\":{{\"revision\":\"r1\"}}}}", .{payload});
+        for (0..8) |round| for (0..2) |slot| {
+            const native = (if (round % 2 == 0) slot else 1 - slot) == 1;
+            var measured = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{});
+            const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            for (0..32) |_| {
+                var scratch = std.heap.ArenaAllocator.init(measured.allocator());
+                defer scratch.deinit();
+                const temp = scratch.allocator();
+                var row: Row = .{ .a = temp, .txn = null, .physical = "a", .id = "a", .req = .{}, .authority = .{}, .operands = &operands, .full_bytes = body };
+                defer row.deinit();
+                var reference: projection.JsonSource = .{ .id = "a", .root = .null };
+                if (!native) reference.root = try @import("antfly-json").parseFromSliceLeaky(V, temp, body, .{ .allocate = .alloc_if_needed });
+                const source = if (native) row.source() else reference.source();
+                const first = try source.read(source.context, temp, "body.image", .value);
+                const repeated = try source.read(source.context, temp, "body.image", .value);
+                try std.testing.expectEqual(size, first.value.string.len);
+                try std.testing.expect(first.value.string.ptr == repeated.value.string.ptr);
+                std.mem.doNotOptimizeAway(first.value.string);
+                std.mem.doNotOptimizeAway(repeated.value.string);
+            }
+            const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - started;
+            try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+            std.debug.print("source_decoded value_bytes={d} round={d} mode={s} iterations=32 ns={d} allocated_bytes={d}\n", .{ size, round, if (native) "native" else "whole", elapsed, measured.allocated_bytes });
+        };
+    }
+}
+
+test "api query contract public masks reuse checked selections after a full fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const padding = try a.alloc(u8, 65536);
+    @memset(padding, 'x');
+    const metadata = "{\"revision\":\"r1\",\"allowed\":true}";
+    const bytes = try std.fmt.allocPrint(a, "{{\"metadata\":{s},\"payload\":{{\"large\":\"{s}\"}},\"padding\":\"{s}{s}\"}}", .{ metadata, padding, padding, padding });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const directory_module = @import("../document_projection.zig");
+    const kind = @import("../internal_keys.zig").primary_kind;
+    const encoded = (try directory_module.build(a, bytes, kind, digest)).?;
+    const directory = (try directory_module.Directory.open(a, encoded, .{ .bytes = @as(u64, bytes.len), .kind = kind, .digest = digest })).?;
+    const field = directory.resolveExact("metadata").?;
+    var row: Row = .{ .a = a, .txn = null, .physical = "a", .id = "a", .req = .{ .fields = &.{ "metadata.revision", "metadata.allowed" }, .include_all_fields = false }, .authority = .{}, .full_bytes = bytes, .selected_view = .{ .directory = directory, .fields = &.{field}, .values = &.{metadata} } };
+    const prepared = try row.publicSourceBytes();
+    try std.testing.expectEqualStrings("{\"metadata\":{\"revision\":\"r1\",\"allowed\":true}}", prepared);
+    const output = try row.base(a);
+    try std.testing.expectEqualStrings(prepared, output);
+    // Whole-source and wildcard masks still require the complete document.
+    try std.testing.expect((try row.load(&.{})).ptr == bytes.ptr);
+    try std.testing.expect((try row.load(&.{"metadata.*"})).ptr == bytes.ptr);
+    const covering = (try directory_module.buildAuthorityObserved(a, bytes, kind, digest, null)).?;
+    const proof = @import("../document_mutation_revision.zig").Content{ .revision = 1, .bytes = bytes.len, .kind = kind, .digest = digest };
+    row.authority.source = .{ .proof = proof, .directory = (try directory_module.Directory.open(a, covering, proof)).? };
+    row.selected_view = null;
+    const from_covering = try row.publicSourceBytes();
+    try std.testing.expect(from_covering.len < 128);
+    const parsed = try std.json.parseFromSliceLeaky(V, a, from_covering, .{});
+    const result_metadata = parsed.object.get("metadata").?.object;
+    try std.testing.expectEqualStrings("r1", result_metadata.get("revision").?.string);
+    try std.testing.expect(result_metadata.get("allowed").?.bool);
+    const payload_field = row.authority.source.directory.?.resolveExact("payload.large").?;
+    row.full_bytes = null;
+    row.selected_view = .{ .directory = row.authority.source.directory.?, .fields = &.{ field, payload_field }, .values = &.{ metadata, bytes[@intCast(payload_field.offset)..][0..@intCast(payload_field.length)] } };
+    try std.testing.expect((try row.publicSourceBytes()).len < 128);
+    row.full_bytes = bytes;
+    // A projected public mask must never become the decoded whole-root cache.
+    const whole = try row.source().read(&row, a, "payload.large", .value);
+    try std.testing.expectEqual(padding.len, whole.value.string.len);
 }

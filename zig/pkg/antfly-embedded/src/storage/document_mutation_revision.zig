@@ -430,7 +430,7 @@ pub const Capture = struct {
             return err;
         };
         if (raw_directory.len > projection.maximum_bytes) return self.touchValuePrepared(alloc, physical, value, null);
-        if (!std.mem.startsWith(u8, raw_directory, "DPD2")) return self.touchValuePrepared(alloc, physical, value, null);
+        if (!std.mem.startsWith(u8, raw_directory, "DPD2") and !std.mem.startsWith(u8, raw_directory, "DPD3")) return self.touchValuePrepared(alloc, physical, value, null);
         const directory = try scratch.dupe(u8, raw_directory);
         const raw_certificate = reader.get(&value_identity.keyForRevision(key)) catch |err| {
             if (err == error.NotFound) return self.touchValuePrepared(alloc, physical, value, null);

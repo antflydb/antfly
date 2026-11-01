@@ -1141,5 +1141,10 @@ test "api query contract public selector strips private roots with one array pro
         }
     };
     try Fixture.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    // In-place arena/writer growth depends on the backing heap layout. Force
+    // growth through allocations so each injected failure has the same index
+    // in optimized builds too; keep the checked allocator underneath.
+    var fixed_growth = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(fixed_growth.allocator(), Fixture.run, .{});
+    try std.testing.expectEqual(fixed_growth.allocated_bytes, fixed_growth.freed_bytes);
 }

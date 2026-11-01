@@ -1647,11 +1647,12 @@ routing metadata.
 
 ### Conditional source value certificates
 
-Source-only query delivery may use the optional `SVI1` canonical-value sidecar
+Source-only query delivery may use the optional `SVI2` canonical-value sidecar (with legacy SVI1 compatibility)
 in `storage/source_value_identity.zig`. It is installed in the same transaction
-as primary JSON bytes, the existing DPD2 projection directory, content proof and
-mutation revision. It does not change DPD2 coverage or admission limits; rows
-below the existing 16 KiB threshold do not receive certificates.
+as primary JSON bytes, the DPD2/DPD3 projection directory, content proof and
+mutation revision. Rows below the existing 16 KiB threshold do not receive
+certificates. DPD3 additionally carries bounded covering values as described
+below. The primary document representation remains unchanged.
 
 A certificate binds primary byte length/SHA-256, source kind, exact directory
 SHA-256 and semantic canonicalizer ABI. Up to 512 sorted directory-index/digest
@@ -1688,8 +1689,8 @@ storage owners. Source-dependent operators retain complete values. Unsupported
 layouts and missing/stale certificates retain reference projection and hashing;
 existing bounded authority backfill installs certificates without advancing the
 logical revision. ABI changes invalidate old certificates and trigger safe
-fallback/repair. This is an internal storage optimization of the existing public
-`source_projection` contract, not another caller-managed proof field.
+fallback/repair. This is an internal storage optimization of the public `fields`/`select`
+contract; it introduces no caller-managed proof field.
 
 Qualify native delivery with `e2e/antfly/bench_source_projection.py` using pinned
 baseline/candidate servers. Its certificate-hit counters establish proof reuse,
@@ -1705,7 +1706,50 @@ fixed status codes. Failure leaves partial outputs that the caller must discard.
 
 The [batch and physical-read qualification](../docs/design/antfly-grep.md#batch-cancellation-and-structured-native-media-2026-10-30)
 records 32.3% fewer scratch allocations in its persisted-row fixture. Reopened
-storage probes also confirm that selecting 32 bytes currently reads the same
-checksummed/compressed blocks as a full value. Physical I/O improvements require
-separate integrity-preserving evidence; selected output ownership alone cannot
-justify changing physical-byte admission or introducing a persistent format.
+storage probes confirm that uncovered ranges still read complete
+checksummed/compressed blocks. DPD3 can avoid primary fetches for covered small
+fields; selected ownership does not imply arbitrary sparse primary I/O.
+
+
+### Covering metadata and borrowed projection fields
+
+DPD3 is an extension of disposable, revision-bound projection metadata. New
+writes and explicit metadata rebuilds can persist small JSON subtrees within the
+existing metadata key. The total extension, including framing, is bounded by
+four KiB, 1/64 of primary bytes, and remaining directory capacity; each subtree
+is at most one KiB. Ancestors cover descendants without duplicating their bytes.
+The reader validates indices, lengths, parent extents and content hashes.
+
+DPD1/DPD2 remain readable, and existing DPD2 metadata stays valid. An older reader
+ignores DPD3 and falls back to primary values. No primary format rewrite or eager
+table migration is required. Mutation/replay, identity reuse, deletion,
+compaction and distributed snapshots use the existing atomic metadata path.
+Canonical value identities and ASCH25 are unchanged. Covering values are persisted
+copies; native output witnesses and codec caches remain request-local.
+
+A selected-field view borrows checked ranges or covering values. A logical
+projection window retains its read scope through consumption, closes it before
+arena reset and retires before the transaction. Full-value fallback also borrows
+the scope, while callers of the existing owned-row APIs keep their contract.
+Scalar operators consume direct tokens; containing JSON is reconstructed only
+when a source mask or another consumer needs it. Covered read sets consume zero
+primary-value work in batch admission. Uncovered copied ranges retain the
+original physical-size bounds.
+
+Synchronous native result delivery can carry completed output token offsets and
+storage-producer field witnesses. Exact owned copies clone descriptor ownership.
+The encoded compiled-owner adapter negotiates a version-one metadata prefix in
+previously reserved request/response ABI bytes, retaining layout and version 84.
+Only an acknowledged owner response can restore receipts; public/remote JSON and
+caller-provided identity claims cannot create witnesses. The prefix is bounded
+by one MiB and 1,024 rows and shares the existing response serialization pass.
+Restoration validates row/program identity, member boundaries and completion
+tails without rescanning payloads. Older owners retain ordinary verification.
+Media reuse requires an already verified codec and a matching trusted field
+witness. Each reference still checks membership, revision, permissions, identity,
+SHA/MIME/length and pixel claims. Unsupported producers use byte comparison and
+ordinary verification. The bounded witness table expires with the invocation.
+
+See the [design and qualification](../docs/design/antfly-grep.md#covering-metadata-and-native-field-views-2026-10-31)
+for ownership, compatibility and measured tradeoffs. Benchmark comparisons use
+balanced even AB/BA rounds and summarize independent server runs.

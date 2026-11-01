@@ -42076,6 +42076,8 @@ pub const DB = struct {
     /// Final scalar projection shares one pinned transaction per bounded window.
     fn hydrateFieldProjection(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {
         const protocol = @import("../../api/field_projection.zig");
+        var profile_native_views: @import("field_projection_source.zig").NativeViewProfile = .{ .enabled = platform.env.getenvBool("ANTFLY_BENCH_SOURCE_REUSE") };
+        defer profile_native_views.finish();
         var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer arena.deinit();
         const borrowed = if (req.field_projection_plan) |shared| shared.get(req.field_projection_json) else null;
@@ -42122,16 +42124,18 @@ pub const DB = struct {
                 defer row.deinit();
                 if (try source_batch.at(&txn, i, keys[0 .. end - start], ids[0 .. end - start], authorities.rows[0 .. end - start], req, &operands)) |prepared| row.attach(prepared);
                 const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
-                const encoded = try plan.evaluateEncoded(a, alloc, row.source(), previous, protocol.requestLimits(&req));
+                const evaluated = try plan.evaluateRetained(a, alloc, row.source(), previous, protocol.requestLimits(&req), req.field_projection_value_views);
+                profile_native_views.observe(row, evaluated.receipt);
+                const encoded = evaluated.bytes;
                 errdefer alloc.free(encoded);
-                const receipt = if (previous == null) try plan.ownValidatedReceipt(alloc, encoded) else null;
-                errdefer if (receipt) |owned| alloc.destroy(owned);
+                const receipt = evaluated.receipt;
+                errdefer if (receipt) |owned| owned.deinit(alloc);
                 const source = try row.base(alloc);
                 if (row.metadata_hits != 0) metadata_rows += 1 else fallback_rows += 1;
                 if (row.certificate_hits != 0) certificate_rows += 1;
                 hit.clearSource(alloc);
                 if (hit.computed_json) |bytes| alloc.free(bytes);
-                if (hit.computed_receipt) |owned| alloc.destroy(owned);
+                if (hit.computed_receipt) |owned| owned.deinit(alloc);
                 hit.computed_json = encoded;
                 hit.computed_receipt = receipt;
                 hit.stored_data = source;
@@ -42155,6 +42159,8 @@ pub const DB = struct {
         if (req.document_authority_mode == .none) return;
         if (req.document_output_allocator != null and req.document_authority_mode != .hydrate) return error.InvalidQueryRequest;
         const scalar = @import("../../api/field_projection.zig");
+        var profile_native_views: @import("field_projection_source.zig").NativeViewProfile = .{ .enabled = platform.env.getenvBool("ANTFLY_BENCH_SOURCE_REUSE") };
+        defer profile_native_views.finish();
         var scalar_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer scalar_arena.deinit();
         const native_json = if (schema_view) |view| view.tableSchema().storage_mode != .relational and view.tableSchema().external_base_source == null else true;
@@ -42167,8 +42173,6 @@ pub const DB = struct {
         defer if (scalar_public_plan) |*plan| plan.deinit();
         const scalar_operands = if (scalar_plan) |plan| try @import("field_projection_source.zig").OperandPlans.init(scalar_arena.allocator(), plan) else null;
         var scalar_authorities: @import("../conditional_source.zig").Window = .{};
-        var scalar_batch = @import("field_projection_source.zig").Batch.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
-        defer scalar_batch.deinit();
         var scalar_metadata_rows: usize = 0;
         var scalar_certificate_rows: usize = 0;
         var scalar_fallback_rows: usize = 0;
@@ -42183,6 +42187,10 @@ pub const DB = struct {
         defer projection_scratch.deinit();
         var primary_window = DocumentPrimaryReadWindow.init(alloc);
         defer primary_window.deinit();
+        // Borrowed scalar scopes must retire before their parent transaction
+        // and before either metadata or projection scratch is released.
+        var scalar_batch = @import("field_projection_source.zig").Batch.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer scalar_batch.deinit();
         var physical: [64][]const u8 = undefined;
         var ids: [64][]const u8 = undefined;
         var contents: [64]?@import("../document_mutation_revision.zig").Content = undefined;
@@ -42198,6 +42206,7 @@ pub const DB = struct {
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             // Apply-shared fences ordinary reads; captured dense reads fork
             // the original visibility cut. Retire page scratch every 64 hits.
+            if (index % 64 == 0) scalar_batch.reset();
             if (index != 0 and index % 64 == 0) {
                 primary_window.retire();
                 read.?.abort();
@@ -42205,7 +42214,6 @@ pub const DB = struct {
                 read = if (pinned) |captured_read| try captured_read.forkRead() else try self.core.store.beginReadTxn();
             }
             if (index % 64 == 0) {
-                scalar_batch.reset();
                 if (!metadata_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = metadata_scratch.reset(.free_all);
                 const m = metadata_scratch.allocator();
                 const count = @min(@as(usize, 64), result.hits.len - index);
@@ -42279,13 +42287,15 @@ pub const DB = struct {
                     if (try scalar_batch.at(&read.?, index % 64, physical[0..count], ids[0..count], scalar_authorities.rows[0..count], req, operands)) |prepared| row.attach(prepared);
                 };
                 const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
-                const encoded = try plan.evaluateEncoded(a, alloc, row.source(), previous, scalar.requestLimits(&req));
+                const evaluated = try plan.evaluateRetained(a, alloc, row.source(), previous, scalar.requestLimits(&req), req.field_projection_value_views);
+                profile_native_views.observe(row, evaluated.receipt);
+                const encoded = evaluated.bytes;
                 errdefer alloc.free(encoded);
-                const receipt = if (previous == null) try plan.ownValidatedReceipt(alloc, encoded) else null;
-                errdefer if (receipt) |owned| alloc.destroy(owned);
+                const receipt = evaluated.receipt;
+                errdefer if (receipt) |owned| owned.deinit(alloc);
                 const source = try row.base(body_allocator);
                 if (hit.computed_json) |bytes| alloc.free(bytes);
-                if (hit.computed_receipt) |owned| alloc.destroy(owned);
+                if (hit.computed_receipt) |owned| owned.deinit(alloc);
                 hit.computed_json = encoded;
                 hit.computed_receipt = receipt;
                 if (row.metadata_hits != 0) scalar_metadata_rows += 1 else scalar_fallback_rows += 1;

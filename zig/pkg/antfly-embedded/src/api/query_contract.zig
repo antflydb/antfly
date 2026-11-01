@@ -86,7 +86,7 @@ fn finalizeCompletedProjectionSources(a: std.mem.Allocator, req: db_mod.types.Se
             hit.finalized_source = .{ .bytes = stored };
             if (hit.computed_receipt == null or !hit.computed_receipt.?.matches(bytes, plan.fingerprint)) {
                 const owned = try plan.ownValidatedReceipt(a, bytes);
-                if (hit.computed_receipt) |previous| a.destroy(previous);
+                if (hit.computed_receipt) |previous| previous.deinit(a);
                 hit.computed_receipt = owned;
             }
         };
@@ -4328,6 +4328,28 @@ fn writeWireField(w: *std.json.Stringify, comptime name: []const u8, value: anyt
     try w.objectField(name);
     try w.write(value);
 }
+fn encodeQueryEnvelope(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, responses: anytype, hits: []db_mod.types.SearchHit, projection: ?*const field_projection.Plan) ![]u8 {
+    const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    if (req.field_projection_value_views and req.field_projection_transport) {
+        var metadata = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer metadata.deinit();
+        const native = try field_projection.nativeTransport(metadata.allocator(), hits, projection);
+        // Prefix small native metadata so its reader never scans payloads to
+        // find it. The ordinary result and all source bytes are encoded once.
+        return std.json.Stringify.valueAlloc(alloc, .{ ._native_field_views = native, .responses = responses }, options);
+    }
+    return std.json.Stringify.valueAlloc(alloc, .{ .responses = responses }, options);
+}
+
+/// Called only for an acknowledged in-process storage-owner response.
+pub fn restoreNativeProjectionReceipts(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, json: []const u8, hits: []db_mod.types.SearchHit) !void {
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const lease = try prepareFieldProjection(scratch, req);
+    defer if (lease) |value| value.deinit(scratch);
+    try field_projection.restoreNativeTransport(alloc, scratch, json, if (lease) |value| value.plan else null, hits);
+}
 fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req: db_mod.types.SearchRequest, base: anytype, hits: []db_mod.types.SearchHit, delivery: ?@import("query_response.zig").Delivery, delivered: *?usize, projection: ?*const field_projection.Plan) ![]u8 {
     var failure: ?anyerror = null;
     var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -4385,7 +4407,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
         return empty;
     }
     const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .alloc = alloc, .failure = &failure };
-    return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, options) catch |err| return failure orelse err;
+    return encodeQueryEnvelope(alloc, req, &.{wrapped}, hits, projection) catch |err| return failure orelse err;
 }
 
 pub fn encodeQueryResponses(
@@ -4419,8 +4441,14 @@ pub fn encodeQueryResponsesWithDelivery(
     const typed_delivery = req.graph_queries.len == 0 and (if (delivery) |sink| sink.typed_result != null else false);
     const encoded_sources: []?ant_json.RawObject = if (typed_delivery) try arena.alloc(?ant_json.RawObject, emitted_hits.len) else &.{};
     @memset(encoded_sources, null);
+    const computed_views: []?field_projection.ComputedView = if (typed_delivery) try arena.alloc(?field_projection.ComputedView, emitted_hits.len) else &.{};
+    @memset(computed_views, null);
     const hits = try arena.alloc(metadata_openapi.QueryHit, emitted_hits.len);
     for (emitted_hits, 0..) |*hit, i| {
+        if (typed_delivery) if (projection) |plan| if (hit.computed_json) |bytes| if (hit.computed_receipt) |receipt_| {
+            if (receipt_.matches(bytes, plan.fingerprint) and receipt_.members.len == plan.bindings.len)
+                computed_views[i] = .{ .plan = plan, .receipt = receipt_, .bytes = bytes };
+        };
         // Preserve the existing validated raw-wire representation instead of
         // parsing/cloning large source values just to enter an in-process port.
         // Column/typed sources must still apply their public source masks.
@@ -4473,15 +4501,11 @@ pub fn encodeQueryResponsesWithDelivery(
             if (graph_results == null and typed_delivery) if (delivery) |sink| if (sink.typed_result) |target| {
                 if (sink.hydrator != null) return error.InvalidArgument;
                 if (req.cancellation) |token| try token.check();
-                target.consume(target.ptr, .{ .result = query_results[0], .encoded_sources = encoded_sources }) catch return error.QueryDeliveryFailed;
+                target.consume(target.ptr, .{ .result = query_results[0], .encoded_sources = encoded_sources, .computed_views = computed_views }) catch return error.QueryDeliveryFailed;
                 delivered = 0;
                 break :blk try alloc.alloc(u8, 0);
             };
-            break :blk if (graph_results != null or hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) encodeColumnWire(alloc, graph_results, req, query_results[0], emitted_hits, delivery, &delivered, projection) catch |err| return graph_wire_failure orelse err else try std.json.Stringify.valueAlloc(
-                alloc,
-                metadata_openapi.QueryResponses{ .responses = query_results },
-                .{ .emit_null_optional_fields = false },
-            );
+            break :blk if (graph_results != null or hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) encodeColumnWire(alloc, graph_results, req, query_results[0], emitted_hits, delivery, &delivered, projection) catch |err| return graph_wire_failure orelse err else try encodeQueryEnvelope(alloc, req, query_results, emitted_hits, projection);
         },
         .legacy => blk: {
             const graph_results = try buildGraphQueryResults(
@@ -4509,11 +4533,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
-            break :blk if (hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try std.json.Stringify.valueAlloc(
-                alloc,
-                metadata_openapi.StatefulQueryResponses{ .responses = query_results },
-                .{ .emit_null_optional_fields = false },
-            );
+            break :blk if (hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try encodeQueryEnvelope(alloc, req, query_results, emitted_hits, projection);
         },
     };
 

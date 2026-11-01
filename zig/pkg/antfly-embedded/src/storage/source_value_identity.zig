@@ -97,7 +97,7 @@ pub fn buildAuthority(a: std.mem.Allocator, body: []const u8, kind: u8, digest: 
     var collector: Collector = .{ .a = arena.allocator() };
     const directory = try projection.buildAuthorityObserved(a, body, kind, digest, .{ .ctx = &collector, .visit = Collector.visit });
     errdefer if (directory) |value| a.free(value);
-    const identities = if (directory) |paths| if (std.mem.startsWith(u8, paths, "DPD2"))
+    const identities = if (directory) |paths| if (std.mem.startsWith(u8, paths, "DPD2") or std.mem.startsWith(u8, paths, "DPD3"))
         try collector.encode(a, body.len, kind, digest, paths)
     else
         null else null;
@@ -114,7 +114,7 @@ pub fn buildAuthorityReusing(a: std.mem.Allocator, body: []const u8, kind: u8, d
     if (kind != prior.kind) return buildAuthority(a, body, kind, digest);
     const old = (try projection.Directory.open(temp, prior.directory, prior)) orelse return buildAuthority(a, body, kind, digest);
     const certificate = Certificate.open(prior.identities, prior.directory, prior) orelse return buildAuthority(a, body, kind, digest);
-    if (old.version != 2) return buildAuthority(a, body, kind, digest);
+    if (old.version < 2) return buildAuthority(a, body, kind, digest);
     // Keep the fused reference writer for layouts with no worthwhile leaf.
     // Metadata-only rows should not pay for a second directory decode.
     const worthwhile = for (old.fields) |field| {

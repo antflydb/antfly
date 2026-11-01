@@ -6237,6 +6237,7 @@ pub fn searchStorageKernelQueryJson(
         };
         out_response.* = .{
             .buffer = .{ .ptr = response.json.ptr, .len = @intCast(response.json.len) },
+            .native_field_views = @intFromBool(response.native_field_views),
             .identity_read_generation = response.identity_read_generation orelse 0,
             .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
         };
@@ -6285,6 +6286,7 @@ pub fn searchStorageKernelQueryJson(
         return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
     out_response.* = .{
         .buffer = .{ .ptr = buffer.ptr, .len = @intCast(buffer.len) },
+        .native_field_views = @intFromBool(owned.req.field_projection_value_views and owned.req.field_projection_transport),
         .identity_read_generation = response.identity_read_generation orelse 0,
         .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
     };

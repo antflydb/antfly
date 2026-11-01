@@ -24,6 +24,66 @@ const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
+test "storage owner native field receipts survive acknowledged local queries" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    var owner = try client.Owner.open(.{ .context = context.handle, .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 77, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 77, .identity_range_id = 77, .schema_json = .fromSlice("{}") });
+    defer owner.deinit();
+    const image = try a.alloc(u8, 64 * 1024);
+    defer a.free(image);
+    @memset(image, 'A');
+    const batch = try std.fmt.allocPrint(a, "{{\"inserts\":{{\"a\":{{\"images\":{{\"preview\":\"data:image/png;base64,{s}\"}},\"revision\":\"r1\",\"permissions\":{{\"public\":true}}}}}},\"sync_level\":\"full_index\"}}", .{image});
+    defer a.free(batch);
+    var written = try owner.batchJson("docs", batch);
+    written.deinit();
+    const query = @import("antfly_local_sources").api_query_contract;
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const controls = @import("antfly_local_sources").storage_local_query_controls;
+    var parsed = try query.parsePublicQueryRequest(a, null, "docs",
+        \\{"query":{"match_all":{}},"fields":[],"select":{"image":{"field":"images.preview"},"revision":{"field":"revision"},"permissions":{"field":"permissions"}},"limit":1}
+    );
+    defer parsed.deinit(a);
+    try parsed.prepareEncodedDelivery(a);
+    var req = parsed.req;
+    req.field_projection_value_views = true;
+    const wire = try contract.encodeStorageKernelQueryRequestForExecution(a, req, true);
+    defer a.free(wire);
+    var execution = controls.executionOptions(req);
+    execution.raw_search_result = 1;
+    var response = try owner.queryJsonWithOptions("docs", wire, .{ .execution = execution });
+    defer response.deinit();
+    try std.testing.expect(response.hasNativeFieldViews());
+    try std.testing.expectError(error.InvalidRemoteResponse, contract.parseStorageKernelSearchResult(a, response.bytes()));
+    var result = try contract.parseAcknowledgedNativeSearchResult(a, response.bytes());
+    defer result.deinit();
+    try query.restoreNativeProjectionReceipts(a, req, response.bytes(), result.hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    const plan = parsed.projection_plan.?;
+    const view: @import("antfly_local_sources").api_query_response.ComputedView = .{ .plan = plan, .receipt = result.hits[0].computed_receipt.?, .bytes = result.hits[0].computed_json.? };
+    try std.testing.expect(view.proof("image") != null);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const object = try view.object(scratch.allocator());
+    try std.testing.expectEqual(image.len + "data:image/png;base64,".len, object.object.get("image").?.string.len);
+    try std.testing.expectEqualStrings("r1", object.object.get("revision").?.string);
+    // An older caller does not request the reserved capability byte. It gets
+    // the established response and cannot reconstruct native witnesses.
+    execution.native_field_views = 0;
+    var ordinary = try owner.queryJsonWithOptions("docs", wire, .{ .execution = execution });
+    defer ordinary.deinit();
+    try std.testing.expect(!ordinary.hasNativeFieldViews());
+    try std.testing.expect(std.mem.indexOf(u8, ordinary.bytes(), "_native_field_views") == null);
+    var legacy = try contract.parseStorageKernelSearchResult(a, ordinary.bytes());
+    defer legacy.deinit();
+    try std.testing.expect(legacy.hits[0].computed_receipt == null);
+}
+
 test "opaque owner retained relational read crosses checked archive boundary" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

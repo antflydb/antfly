@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import platform
 import statistics
+from benchmark_pairing import summarize, validate_rounds
 import time
 import requests
 from bench_source_projection import file_info, measure
@@ -36,7 +37,7 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--documents", type=int, default=64)
     p.add_argument("--value-bytes", type=int, default=1048576)
-    p.add_argument("--rounds", type=int, default=5)
+    p.add_argument("--rounds", type=int, default=8)
     p.add_argument(
         "--metadata-shape",
         choices=("scalar", "nested"),
@@ -45,6 +46,10 @@ def main():
     )
     p.add_argument("--queries-per-phase", type=int, default=5)
     args = p.parse_args()
+    try:
+        validate_rounds(args.rounds, attribution=False)
+    except ValueError as error:
+        p.error(str(error))
     if not (
         1 <= args.documents <= 64
         and 16384 <= args.value_bytes <= 1048576
@@ -215,7 +220,8 @@ def main():
             }
         )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "paired": summarize(samples, (), attribution=False),
         "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "scope": "Identity-only warmup then conditional hits; metadata shape distinguishes scalar receipts from nested object/array reconstruction. No large payload output or model; one shard; shared host; CPU whole process, RSS sampled",
         "platform": platform.platform(),

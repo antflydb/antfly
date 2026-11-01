@@ -4851,6 +4851,7 @@ fn rawObjectSourceRange(workspace: *@import("antfly-json").ValueScanner, scanner
 
 const RemoteSearchParser = struct {
     authority_group: ?u64 = null,
+    native_field_views: bool = false,
     // Borrow ranges until capability metadata has been checked. Old providers
     // may put arbitrary user documents in _source; never interpret them early.
     pending_sources: std.ArrayListUnmanaged(?db_mod.types.document_authority.Pending) = .empty,
@@ -5012,8 +5013,17 @@ const RemoteSearchParser = struct {
         try self.expect(.object_begin);
         var result: ?metadata_openapi.QueryResult = null;
         var seen: u64 = 0;
+        var native_seen = false;
         const a = self.metadata.allocator();
         while (try self.key(a)) |name| {
+            if (self.native_field_views and std.mem.eql(u8, name, "_native_field_views")) {
+                if (native_seen or seen != 0) return error.InvalidQueryResponse;
+                native_seen = true;
+                const begin = self.scanner.cursor;
+                try self.source_workspace.scan(&self.scanner, 1024 * 1024, null);
+                if (self.scanner.cursor - begin > 1024 * 1024) return error.InvalidQueryResponse;
+                continue;
+            }
             _ = try index(metadata_openapi.QueryResponses, name, &seen);
             if (try self.scanner.peekNextTokenType() == .null) {
                 _ = try self.scanner.next();
@@ -5029,6 +5039,7 @@ const RemoteSearchParser = struct {
             try self.expect(.array_end);
         }
         try self.expect(.end_of_document);
+        if (self.native_field_views and !native_seen) return error.InvalidQueryResponse;
         return result orelse error.InvalidQueryRequest;
     }
 };
@@ -5042,16 +5053,17 @@ pub fn parseRemoteSearchResultWithScratch(alloc: std.mem.Allocator, scratch: std
 }
 
 fn parseRemoteSearchResultInnerWithScratch(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
-    return parseRemoteSearchResultOwned(alloc, scratch, body, null, null);
+    return parseRemoteSearchResultOwned(alloc, scratch, body, null, null, false);
 }
 
 /// Private authenticated transport: decode the proof from wire and copy only
 /// the document range into its final owner, never an intermediate envelope.
 pub fn parseRemoteSearchResultWithAuthority(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8, group: u64, document_allocator: ?std.mem.Allocator) !db_mod.types.SearchResult {
-    return parseRemoteSearchResultOwned(alloc, scratch, body, group, document_allocator) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRemoteResponse;
+    return parseRemoteSearchResultOwned(alloc, scratch, body, group, document_allocator, false) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRemoteResponse;
 }
-fn parseRemoteSearchResultOwned(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8, authority_group: ?u64, document_allocator: ?std.mem.Allocator) !db_mod.types.SearchResult {
+fn parseRemoteSearchResultOwned(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8, authority_group: ?u64, document_allocator: ?std.mem.Allocator, native_field_views: bool) !db_mod.types.SearchResult {
     var parser: RemoteSearchParser = .{
+        .native_field_views = native_field_views,
         .authority_group = authority_group,
         .source_workspace = .init(@import("antfly_platform").allocator.reclaimingScratch(scratch)),
         .alloc = alloc,
@@ -5177,6 +5189,23 @@ fn remoteSortProfile(wire: metadata_openapi.SortProfile) !db_mod.types.SortProfi
 
 pub fn parseStorageKernelSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
     return try parseRemoteSearchResult(alloc, body);
+}
+
+/// The caller must have received the native capability acknowledgement from
+/// the in-process owner, independently of any JSON supplied by a remote peer.
+pub fn parseAcknowledgedNativeSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return parseRemoteSearchResultOwned(alloc, @import("antfly_platform").allocator.reclaimingScratch(alloc), body, null, null, true) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRemoteResponse;
+}
+
+test "api query contract native receipt prefix requires an owner acknowledgement" {
+    const a = std.testing.allocator;
+    const json = "{\"_native_field_views\":{\"version\":1,\"records\":[]},\"responses\":[{\"took\":0,\"status\":200,\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"a\",\"_score\":1}]}}]}";
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, json));
+    var native = try parseAcknowledgedNativeSearchResult(a, json);
+    defer native.deinit();
+    try std.testing.expectEqualStrings("a", native.hits[0].id);
+    try std.testing.expect(native.hits[0].computed_receipt == null);
+    try std.testing.expectError(error.InvalidRemoteResponse, parseAcknowledgedNativeSearchResult(a, "{\"responses\":[]}"));
 }
 
 /// Decode private sources only for an admitted internal request. Both HTTP

@@ -23,6 +23,7 @@ import os
 import platform
 import re
 import statistics
+from benchmark_pairing import summarize, validate_rounds
 import threading
 import time
 from pathlib import Path
@@ -88,7 +89,7 @@ def main():
         type=Path,
         help="Optional comparison binary supporting select; defaults to candidate",
     )
-    parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--rounds", type=int, default=8)
     parser.add_argument(
         "--metadata-outputs",
         type=int,
@@ -142,6 +143,10 @@ def main():
         default="ascii",
     )
     args = parser.parse_args()
+    try:
+        validate_rounds(args.rounds, attribution=args.profile_source_batch)
+    except ValueError as error:
+        parser.error(str(error))
     if (
         not 1 <= args.shards <= 32
         or not 1 <= args.documents <= 64
@@ -558,7 +563,8 @@ def main():
                 }
             )
     report = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "paired": summarize(samples, ("phase",), attribution=args.profile_source_batch),
         "profile_source_batch": args.profile_source_batch,
         "source_batch_counts": source_batch_counts,
         "workload": args.workload,

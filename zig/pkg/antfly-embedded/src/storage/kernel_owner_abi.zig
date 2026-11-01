@@ -69,7 +69,9 @@ pub const QueryOwnedResponse = extern struct {
     buffer: OwnedBytes = .{},
     identity_read_generation: u64 = 0,
     has_identity_read_generation: u8 = 0,
-    _reserved0: [7]u8 = @splat(0),
+    /// Negotiated private receipt prefix; zero retains ordinary JSON.
+    native_field_views: u8 = 0,
+    _reserved0: [6]u8 = @splat(0),
 };
 
 /// The WAL boundary owns the physical ordered store in the storage archive.
@@ -264,7 +266,9 @@ pub const LocalQueryExecutionOptions = extern struct {
     /// Return a raw shard result for coordinator finalization. Keep aggregation
     /// specifications during search: they also govern exact candidate totals.
     raw_search_result: u8 = 0,
-    _reserved0: u8 = 0,
+    /// Version one uses one previously reserved byte. Older owners ignore it
+    /// and return native_field_views=0, preserving ordinary verification.
+    native_field_views: u8 = 0,
     return_mode: LocalQueryReturnMode = .parent,
     max_chunks_per_parent: u32 = 0,
     /// Presentation only; never used for storage lookup or authorization.

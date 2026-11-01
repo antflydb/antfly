@@ -4300,6 +4300,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var cancellation = req.cancellation;
         var execution = @import("antfly_local_sources").storage_local_query_controls.executionOptions(scoped);
         execution.raw_search_result = @intFromBool(raw_search_result);
+        execution.native_field_views = @intFromBool(raw_search_result and scoped.field_projection_value_views);
         var response = try lease.owner().queryJsonWithOptions(table_name, request_json, .{
             .execution_deadline_ns = req.execution_deadline_ns,
             .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
@@ -6330,8 +6331,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         // queryGroupLocal instead requests a complete local response.
         var response = try self.executeQuery(alloc, group_id, table_name, req, consistency, true);
         defer response.deinit();
-        var result = try table_reads.parseStorageKernelSearchResult(alloc, response.bytes());
+        var result = if (response.hasNativeFieldViews())
+            try @import("antfly_local_sources").api_local_query_contract.parseAcknowledgedNativeSearchResult(alloc, response.bytes())
+        else
+            try table_reads.parseStorageKernelSearchResult(alloc, response.bytes());
         errdefer result.deinit();
+        if (response.hasNativeFieldViews()) {
+            if (!req.field_projection_value_views) return error.InvalidQueryResponse;
+            try @import("antfly_local_sources").api_query_contract.restoreNativeProjectionReceipts(alloc, req, response.bytes(), result.hits);
+        }
         try table_reads.restoreDocumentAuthority(alloc, alloc, group_id, req.document_authority_mode, &result);
         result.identity_read_generation = response.identityReadGeneration();
         if (req.identity_read_generation) |expected| {

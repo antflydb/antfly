@@ -39,7 +39,7 @@ test "verified source repeated verification benchmark" {
         const reference: Source.Reference = .{ .table = "docs", .document_id = "row", .field = "image", .revision_field = "revision", .revision = "r1", .sha256 = &hex, .mime_type = "image/png", .byte_length = codec.len, .max_pixels = @as(u64, side) * side };
         // Both modes start after the first identical source was verified.
         const prior = try Source.verifyInfoRetained(a, reference, url, a);
-        for (0..7) |round| for (0..2) |slot| {
+        for (0..8) |round| for (0..2) |slot| {
             const reuse = (if (round % 2 == 0) slot else 1 - slot) == 1;
             var measured = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{});
             const heap = measured.allocator();
@@ -75,7 +75,7 @@ test "verified source segmented envelope construction benchmark" {
             @memset(parts, .{});
             const body = try std.json.Stringify.valueAlloc(a, .{ .model = "fixture", .messages = .{.{ .role = "user", .content = parts }} }, .{});
             const media = [_]Execution.VerifiedMedia{.{ .url = "verified", .bytes = codec, .mime_type = "image/png" }};
-            for (0..7) |round| for (0..2) |slot| {
+            for (0..8) |round| for (0..2) |slot| {
                 const segmented = (if (round % 2 == 0) slot else 1 - slot) == 1;
                 var measured = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{});
                 const heap = measured.allocator();
@@ -96,4 +96,9 @@ test "verified source segmented envelope construction benchmark" {
             };
         }
     }
+}
+
+test "verified source decoded field access benchmark" {
+    if (!@import("antfly_platform").env.getenvBool("ANTFLY_BENCH_SOURCE_MEDIA")) return error.SkipZigTest;
+    try @import("antfly_local_sources").storage_db_field_projection_source.benchmarkDecodedAccess();
 }
