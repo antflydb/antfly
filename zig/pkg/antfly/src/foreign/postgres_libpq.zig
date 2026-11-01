@@ -2994,7 +2994,16 @@ fn sanitizeConnectionErrorAlloc(alloc: Allocator, message: []const u8, dsn: []co
     }
     try collectDsnQuotedCandidatesAlloc(alloc, dsn, &quoted_candidates);
 
+    // `working` changes owner at every reassignment below: the old buffer is
+    // freed explicitly right after each pass succeeds, immediately before
+    // `working` is pointed at the new one, so there is never a moment where
+    // `working` names a stale or already-freed buffer. That means a single
+    // `errdefer` registered here, naming the variable (not a snapshot of its
+    // current value), correctly frees whichever buffer is live if any later
+    // pass fails -- including the truncation path at the end of this
+    // function, which allocates one more buffer before freeing `working`.
     var working = try redactLiteralSecretsAlloc(alloc, message, secrets.items);
+    errdefer alloc.free(working);
 
     const quoted_redacted = try redactQuotedCredentialTokensAlloc(alloc, working, quoted_candidates.items);
     alloc.free(working);
@@ -3099,10 +3108,10 @@ fn collectUriCredentialsAlloc(
     if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| {
         const userinfo = authority[0..at];
         if (userinfo.len != 0) {
-            if (include_userinfo) try out.append(alloc, try alloc.dupe(u8, userinfo));
+            if (include_userinfo) try appendOwnedDupe(alloc, out, userinfo);
             if (std.mem.indexOfScalar(u8, userinfo, ':')) |colon| {
                 const password = userinfo[colon + 1 ..];
-                if (password.len >= min_password_len) try out.append(alloc, try alloc.dupe(u8, password));
+                if (password.len >= min_password_len) try appendOwnedDupe(alloc, out, password);
             }
         }
     }
@@ -3111,6 +3120,25 @@ fn collectUriCredentialsAlloc(
     // `postgresql://localhost/db?password=secret`; `rest[authority_len..]`
     // is the `/path?query#fragment` tail that follows the authority.
     try collectUriQueryCredentialsAlloc(alloc, rest[authority_len..], min_password_len, out);
+}
+
+/// Duplicates `value` and appends it to `out`, transferring ownership of the
+/// duplicate to `out` only once the append has actually succeeded. Appending
+/// `try alloc.dupe(...)` directly as a call argument would instead leak the
+/// duplicate if `dupe` succeeds but the list's subsequent growth fails.
+fn appendOwnedDupe(alloc: Allocator, out: *std.ArrayListUnmanaged([]const u8), value: []const u8) !void {
+    const owned = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned);
+    try out.append(alloc, owned);
+}
+
+/// Duplicates `value` moved out of `buf` (whose storage `buf.toOwnedSlice`
+/// transfers) and appends it to `out`, freeing the slice rather than leaking
+/// it if the append fails.
+fn appendOwnedSlice(alloc: Allocator, out: *std.ArrayListUnmanaged([]const u8), buf: *std.ArrayListUnmanaged(u8)) !void {
+    const owned = try buf.toOwnedSlice(alloc);
+    errdefer alloc.free(owned);
+    try out.append(alloc, owned);
 }
 
 /// libpq URI query-parameter keywords that carry credential material: the
@@ -3162,7 +3190,7 @@ fn collectUriQueryCredentialsAlloc(
         }
         if (!is_credential) continue;
 
-        if (value.len >= min_password_len) try out.append(alloc, try alloc.dupe(u8, value));
+        if (value.len >= min_password_len) try appendOwnedDupe(alloc, out, value);
 
         var decoded = percentDecodeIfValidAlloc(alloc, value) catch |err| switch (err) {
             error.InvalidPercentEncoding => continue,
@@ -3170,7 +3198,7 @@ fn collectUriQueryCredentialsAlloc(
         };
         defer decoded.deinit(alloc);
         if (decoded.items.len >= min_password_len and !std.mem.eql(u8, decoded.items, value)) {
-            try out.append(alloc, try decoded.toOwnedSlice(alloc));
+            try appendOwnedSlice(alloc, out, &decoded);
         }
     }
 }
@@ -3236,9 +3264,9 @@ fn collectConninfoCredentialsAlloc(alloc: Allocator, dsn: []const u8, min_passwo
             if (i < dsn.len) i += 1; // consume closing quote
             if (is_password) {
                 const raw = dsn[raw_start..raw_end];
-                if (raw.len >= min_password_len) try out.append(alloc, try alloc.dupe(u8, raw));
+                if (raw.len >= min_password_len) try appendOwnedDupe(alloc, out, raw);
                 if (decoded.items.len >= min_password_len) {
-                    try out.append(alloc, try decoded.toOwnedSlice(alloc));
+                    try appendOwnedSlice(alloc, out, &decoded);
                 }
             }
         } else {
@@ -3246,7 +3274,7 @@ fn collectConninfoCredentialsAlloc(alloc: Allocator, dsn: []const u8, min_passwo
             while (i < dsn.len and !std.ascii.isWhitespace(dsn[i])) i += 1;
             if (is_password) {
                 const value = dsn[value_start..i];
-                if (value.len >= min_password_len) try out.append(alloc, try alloc.dupe(u8, value));
+                if (value.len >= min_password_len) try appendOwnedDupe(alloc, out, value);
             }
         }
     }
@@ -3638,6 +3666,41 @@ test "postgres libpq connection-error sanitizer handles a real libpq malformed U
     const sanitized = try sanitizeConnectionErrorAlloc(alloc, raw, dsn);
     defer alloc.free(sanitized);
     try std.testing.expect(std.mem.indexOf(u8, sanitized, "supersecret") == null);
+}
+
+fn sanitizeConnectionErrorAllocationFixture(alloc: Allocator) !void {
+    const Case = struct { dsn: []const u8, message: []const u8 };
+    const cases = [_]Case{
+        .{
+            .dsn = "postgres://u:p%zzw0rd@h/db",
+            .message = "invalid percent-encoded token: \"p%zzw0rd\"",
+        },
+        .{
+            .dsn = "postgresql://localhost/db?password=supersecret%zz",
+            .message = "invalid percent-encoded token: \"supersecret%zz\"",
+        },
+        .{
+            .dsn = "postgresql://localhost/db?sslmode=require&password=sup%zzer&connect_timeout=5",
+            .message = "invalid percent-encoded token: \"sup%zzer\"",
+        },
+        .{
+            .dsn = "host=h dbname=db user=u password='sec ret'",
+            .message = "connection info string contains password='sec ret' near \"password\": " ++
+                "FATAL: password authentication failed",
+        },
+        .{
+            .dsn = "postgres://u:realpass@host:5432/db",
+            .message = "connection to server at \"host\" (1.2.3.4), port 5432 failed: Connection refused",
+        },
+    };
+    for (cases) |case| {
+        const sanitized = try sanitizeConnectionErrorAlloc(alloc, case.message, case.dsn);
+        alloc.free(sanitized);
+    }
+}
+
+test "postgres libpq connection-error sanitizer is allocation-failure safe" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sanitizeConnectionErrorAllocationFixture, .{});
 }
 
 /// Drive libpq's nonblocking command protocol without ever calling
