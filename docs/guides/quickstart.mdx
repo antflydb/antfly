@@ -251,9 +251,17 @@ antfly query --table wikipedia \
   --limit 5
 ```
 
-## Hybrid Search
+## Hybrid Search & Reranking
 
-One query can run the keyword and semantic searches together; Antfly fuses the two ranked lists with Reciprocal Rank Fusion, so documents that match both the words and the meaning rise to the top.
+One query can run the keyword and semantic searches together; Antfly fuses the two ranked lists with Reciprocal Rank Fusion. The Qwen3 text reranker then rescores each query-document pair to improve the ordering of those candidates.
+
+Pull the reranker model:
+
+```bash
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
+```
+
+The first query loads the model, so it can take tens of seconds.
 
 ```bash
 antfly query --table wikipedia \
@@ -261,10 +269,16 @@ antfly query --table wikipedia \
   --semantic-search "theory of relativity and physics" \
   --indexes "title_body" \
   --fields "title,url" \
-  --limit 10
+  --limit 10 \
+  --reranker '{
+      "provider": "antfly",
+      "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+      "field": "body"
+    }' \
+  --pruner '{"min_score_ratio": 0.01}'
 ```
 
-EmbeddingGemma2 ranks well enough here that this page doesn't need a separate reranker model. To add one, or to trim weak results with pruning, see [Tune Hybrid Search](/docs/guides/hybrid-search).
+Reranking changes the order and keeps the count. Pruning changes the count: `min_score_ratio` keeps only results scoring at least that fraction of the top result, and `max_score_gap_percent` stops at the first sharp drop. [Tune Hybrid Search](/docs/guides/hybrid-search) covers both in depth.
 
 ## Image Search
 
@@ -554,7 +568,7 @@ You have a running instance, an indexed table, and an agent that knows Antfly. E
 - [Use Antfly from n8n](/docs/guides/n8n): an n8n agent that answers from your table over hosted MCP
 - [Route Tickets with Retrieval](/docs/guides/ticket-routing): tickets stream out of Postgres and get a team from the resolved ones that look like them
 - [Power a Coding Copilot's Retrieval](/docs/guides/coding-copilot-retrieval): a repo index that answers symbol lookups and intent questions, sized to a context budget
-- [Tune Hybrid Search](/docs/guides/hybrid-search): fusion weights, plus optional reranking and pruning when your data needs them
+- [Tune Hybrid Search](/docs/guides/hybrid-search): fusion, reranking, and pruning, and which of them your data needs
 - [Multimodal Embeddings](/docs/guides/multimodal): the image index from this page in depth, plus audio and your own vectors
 
 For production, the [Antfly Operator](/docs/operator/getting-started/quickstart) deploys on Kubernetes, and [backup and restore](/docs/api/data-operations) protects what you loaded.
