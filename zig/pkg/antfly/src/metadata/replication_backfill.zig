@@ -1337,6 +1337,40 @@ fn roundOrdinalRange(
         .{ .begin = resume_at, .end = source_count };
 }
 
+/// Where a round's cursor should resume after a (table, source) pair's turn
+/// ends *without finishing* for a reason other than quantum expiry -- e.g. a
+/// snapshot that exhausted its own batch quantum mid-snapshot and yielded.
+/// Unlike the quantum-expiry paths, which point back at the very pair that
+/// never got to run this round, this points at the *next* pair in the
+/// round's walk order (see `roundTableIsWrapVisit`/`roundOrdinalRange`): the
+/// pair that just yielded already got its turn and resumes its own progress
+/// from its durable checkpoint whenever it's next reached, so skipping past
+/// it here loses no work while giving every later pair in the sequence a
+/// turn instead of letting one perpetually-yielding source monopolize every
+/// round.
+fn nextCursorAfterYield(
+    tables: []const metadata_table_manager.TableRecord,
+    start_table_index: usize,
+    visited_tables: usize,
+    is_wrap: bool,
+    table: metadata_table_manager.TableRecord,
+    source_count: usize,
+    ordinal: usize,
+) SourceRoundCursor {
+    const next_ordinal = ordinal + 1;
+    // On the wrap visit, `next_ordinal` reaching the end of its range just
+    // closes the loop back to the round's original resume point -- the same
+    // table/ordinal pair the cursor already names -- so no table lookup is
+    // needed either way.
+    if (is_wrap or next_ordinal < source_count) {
+        return .{ .valid = true, .table_id = table.table_id, .source_ordinal = @intCast(next_ordinal) };
+    }
+    // The yielding pair was the last source in its table's slice: the next
+    // pair in the walk order is the first source of the next table.
+    const next_table = tables[(start_table_index + visited_tables + 1) % tables.len];
+    return .{ .valid = true, .table_id = next_table.table_id, .source_ordinal = 0 };
+}
+
 pub const SnapshotBackfillCoordinator = struct {
     alloc: Allocator,
     runner: SnapshotBackfillRunner,
@@ -1486,6 +1520,13 @@ pub const SnapshotBackfillCoordinator = struct {
                     summary.sources_completed += 1;
                 } else {
                     summary.sources_yielded += 1;
+                    // This pair already had its turn this round; resume at
+                    // the next one so a large snapshot that always has more
+                    // batches can't monopolize every round and starve the
+                    // sources after it (see `nextCursorAfterYield`). Its own
+                    // durable checkpoint means it loses no progress by being
+                    // skipped past here.
+                    self.cursor = nextCursorAfterYield(tables, start_table_index, visited_tables, is_wrap, table, source_count, ordinal);
                     return summary;
                 }
             }
@@ -6180,6 +6221,287 @@ test "metadata replication backfill production round entry point rotates across 
         if (record.table_id == 23 and record.source_ordinal == 0 and completed) saw_fast_table2_complete = true;
     }
     try std.testing.expect(saw_fast_table1_complete and saw_fast_table2_complete);
+}
+
+test "metadata replication backfill round persists the cursor past a source that yields mid-snapshot so later sources are not starved" {
+    const alloc = std.testing.allocator;
+
+    // This test is about round rotation when a *single* source's own
+    // snapshot never finishes in one quantum (every batch is full, so the
+    // inner batch loop in `runTableSourceInner` always has "more"), not
+    // write routing, so it accepts a batch for any table name.
+    const AcceptAllWriteSource = struct {
+        var sentinel: u8 = 0;
+
+        fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return {};
+        }
+    };
+
+    const FakeExecutor = struct {
+        // Each call advances past the last: the keyset cursor must strictly
+        // advance between pages (see "metadata replication keyset cursor
+        // must advance before applying a page"), so a source that never
+        // finishes has to keep handing back new, larger ids, exactly like a
+        // real continuously growing table would.
+        var large_source_next_id: usize = 0;
+
+        // `large_source` simulates a continuously growing source: every
+        // query sleeps past the round's quantum and always returns a full
+        // page, so `runTableSourceInner`'s batch loop never breaks out on
+        // `result.rows.len < self.batch_size` and instead yields via
+        // `quantum_exhausted` -- the path `nextCursorAfterYield` exists for.
+        // `fast_b`/`fast_c` return a single row each, well under the batch
+        // size, so they always complete in one batch without ever touching
+        // the quantum check.
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64, _: ?CancellationToken) !foreign_mod.QueryResult {
+            var owned = prepared;
+            defer owned.deinit(inner_alloc);
+            if (std.mem.indexOf(u8, owned.sql_text, "large_source") != null) {
+                platform_time.sleepNs(600 * std.time.ns_per_ms);
+                const first_id = large_source_next_id;
+                large_source_next_id += 2;
+                const rows = try inner_alloc.alloc(std.json.Value, 2);
+                const json_a = try std.fmt.allocPrint(inner_alloc, "{{\"id\":\"large:{:0>6}\"}}", .{first_id});
+                defer inner_alloc.free(json_a);
+                const json_b = try std.fmt.allocPrint(inner_alloc, "{{\"id\":\"large:{:0>6}\"}}", .{first_id + 1});
+                defer inner_alloc.free(json_b);
+                rows[0] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, json_a, .{});
+                rows[1] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, json_b, .{});
+                return .{ .rows = rows, .total = 2 };
+            }
+            if (std.mem.indexOf(u8, owned.sql_text, "fast_b") != null) {
+                const rows = try inner_alloc.alloc(std.json.Value, 1);
+                rows[0] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"fastb:1\"}", .{});
+                return .{ .rows = rows, .total = 1 };
+            }
+            const rows = try inner_alloc.alloc(std.json.Value, 1);
+            rows[0] = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"fastc:1\"}", .{});
+            return .{ .rows = rows, .total = 1 };
+        }
+
+        fn statistics(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !foreign_mod.TableStatistics {
+            return .{ .row_count = 1, .size_bytes = 32 };
+        }
+
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_mod.Column {
+            const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
+            columns[0] = .{
+                .name = try inner_alloc.dupe(u8, "id"),
+                .data_type = try inner_alloc.dupe(u8, "text"),
+                .nullable = false,
+            };
+            return columns;
+        }
+    };
+
+    var registry = foreign_mod.Registry{};
+    defer registry.deinit(alloc);
+    try foreign_mod.registerPostgresExecutor(alloc, &registry, .{
+        .ptr = undefined,
+        .vtable = &.{
+            .query = FakeExecutor.query,
+            .statistics = FakeExecutor.statistics,
+            .discover_columns = FakeExecutor.discoverColumns,
+        },
+    });
+
+    const write_source = table_writes_api.TableWriteSource{
+        .ptr = &AcceptAllWriteSource.sentinel,
+        .vtable = &.{
+            .batch = AcceptAllWriteSource.batch,
+        },
+    };
+
+    const FakeService = struct {
+        alloc: Allocator,
+        table: metadata_table_manager.TableRecord,
+        statuses: std.ArrayListUnmanaged(metadata_table_manager.ReplicationSourceStatusRecord) = .empty,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.statuses.items) |record| metadata_table_manager.freeReplicationSourceStatus(self.alloc, record);
+            self.statuses.deinit(self.alloc);
+        }
+
+        pub fn metadataStatus(_: *@This()) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        pub fn listProjectedTables(self: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.TableRecord {
+            const out = try inner_alloc.alloc(metadata_table_manager.TableRecord, 1);
+            out[0] = .{
+                .table_id = self.table.table_id,
+                .name = try inner_alloc.dupe(u8, self.table.name),
+                .replication_sources_json = try inner_alloc.dupe(u8, self.table.replication_sources_json),
+            };
+            return out;
+        }
+
+        pub fn freeProjectedTables(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.TableRecord) void {
+            for (records) |record| {
+                inner_alloc.free(record.name);
+                inner_alloc.free(record.replication_sources_json);
+            }
+            inner_alloc.free(records);
+        }
+
+        // No ranges declared: tableReadyForReplication treats a rangeless
+        // table as ready without needing placement/health fixtures.
+        pub fn listProjectedRanges(_: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.RangeRecord {
+            return try inner_alloc.alloc(metadata_table_manager.RangeRecord, 0);
+        }
+
+        pub fn freeProjectedRanges(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.RangeRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedStores(_: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.StoreRecord {
+            return try inner_alloc.alloc(metadata_table_manager.StoreRecord, 0);
+        }
+
+        pub fn freeProjectedStores(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.StoreRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedPlacementIntents(_: *@This(), inner_alloc: Allocator) ![]raft_reconciler.PlacementIntent {
+            return try inner_alloc.alloc(raft_reconciler.PlacementIntent, 0);
+        }
+
+        pub fn freeProjectedPlacementIntents(_: *@This(), inner_alloc: Allocator, records: []raft_reconciler.PlacementIntent) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedSplitTransitions(_: *@This(), inner_alloc: Allocator) ![]metadata_transition_state.SplitTransitionRecord {
+            return try inner_alloc.alloc(metadata_transition_state.SplitTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedSplitTransitions(_: *@This(), inner_alloc: Allocator, records: []metadata_transition_state.SplitTransitionRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedMergeTransitions(_: *@This(), inner_alloc: Allocator) ![]metadata_transition_state.MergeTransitionRecord {
+            return try inner_alloc.alloc(metadata_transition_state.MergeTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedMergeTransitions(_: *@This(), inner_alloc: Allocator, records: []metadata_transition_state.MergeTransitionRecord) void {
+            inner_alloc.free(records);
+        }
+
+        pub fn listProjectedReplicationSourceStatuses(self: *@This(), inner_alloc: Allocator) ![]metadata_table_manager.ReplicationSourceStatusRecord {
+            const out = try inner_alloc.alloc(metadata_table_manager.ReplicationSourceStatusRecord, self.statuses.items.len);
+            for (self.statuses.items, 0..) |record, i| out[i] = try metadata_table_manager.cloneReplicationSourceStatus(inner_alloc, record);
+            return out;
+        }
+
+        pub fn freeProjectedReplicationSourceStatuses(_: *@This(), inner_alloc: Allocator, records: []metadata_table_manager.ReplicationSourceStatusRecord) void {
+            for (records) |record| metadata_table_manager.freeReplicationSourceStatus(inner_alloc, record);
+            if (records.len > 0) inner_alloc.free(records);
+        }
+
+        pub fn upsertReplicationSourceStatus(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+            for (self.statuses.items) |*existing| {
+                if (existing.table_id == record.table_id and existing.source_ordinal == record.source_ordinal) {
+                    metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing.*);
+                    existing.* = try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record);
+                    return;
+                }
+            }
+            try self.statuses.append(self.alloc, try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record));
+        }
+    };
+
+    var service: FakeService = .{
+        .alloc = alloc,
+        .table = .{
+            .table_id = 44,
+            .name = "docs",
+            .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"large_source\",\"key_template\":\"id\"}," ++
+                "{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"fast_b\",\"key_template\":\"id\"}," ++
+                "{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"fast_c\",\"key_template\":\"id\"}]",
+        },
+    };
+    defer service.deinit();
+
+    // Seed an in-progress "snapshot" status with a prepared checkpoint for
+    // each source, like the rotation test above, so every source resumes
+    // straight through `query()` instead of first negotiating a slot.
+    for ([_]u32{ 0, 1, 2 }) |ordinal| {
+        try service.upsertReplicationSourceStatus(.{
+            .table_id = 44,
+            .source_ordinal = ordinal,
+            .source_kind = "postgres",
+            .external_table = "docs",
+            .phase = "snapshot",
+            .cutover_mode = "exported_snapshot",
+            .prepared_checkpoint = "lsn:resume",
+            .last_error = "",
+            .lag_records = 0,
+            .updated_at_ms = 1,
+        });
+    }
+
+    var cursor: SourceRoundCursor = .{};
+    const runner_config = SnapshotBackfillRunner{
+        .alloc = alloc,
+        .registry = &registry,
+        .write_source = write_source,
+        .batch_size = 2,
+    };
+    // Generous relative to `large_source`'s 600ms call so the deadline is
+    // never exceeded before a batch is actually applied, but tight enough
+    // that `large_source` always yields after exactly one batch.
+    const quantum_ns: u64 = 200 * std.time.ns_per_ms;
+
+    // Round 1: `large_source` alone fills the whole quantum with a single
+    // full batch and yields -- without a persisted cursor past the pair
+    // that yielded, every later round would restart at this same source and
+    // `fast_b`/`fast_c` would never run.
+    const round1 = try runSnapshotRound(alloc, &service, runner_config, quantum_ns, &cursor);
+    try std.testing.expectEqual(@as(usize, 1), round1.sources_considered);
+    try std.testing.expectEqual(@as(usize, 0), round1.sources_completed);
+    try std.testing.expect(cursor.valid);
+    try std.testing.expectEqual(@as(u64, 44), cursor.table_id);
+    try std.testing.expectEqual(@as(u32, 1), cursor.source_ordinal);
+    const offset_after_round1 = service.statuses.items[0].snapshot_offset;
+    try std.testing.expectEqual(@as(u64, 2), offset_after_round1);
+
+    // Round 2: resumes at `fast_b`, not `large_source` again -- both
+    // `fast_b` and `fast_c` get their turn and complete within this single
+    // round, satisfying "later sources get their turn within N rounds."
+    // The round then wraps back to `large_source`'s still-unvisited prefix,
+    // which yields again, making further progress rather than restarting.
+    const round2 = try runSnapshotRound(alloc, &service, runner_config, quantum_ns, &cursor);
+    try std.testing.expectEqual(@as(usize, 3), round2.sources_considered);
+    try std.testing.expectEqual(@as(usize, 2), round2.sources_completed);
+
+    var saw_fast_b_complete = false;
+    var saw_fast_c_complete = false;
+    var large_source_offset: u64 = 0;
+    for (service.statuses.items) |record| {
+        const completed = std.mem.eql(u8, record.phase, "cutover_prepared") or
+            std.mem.eql(u8, record.phase, "snapshot_complete");
+        if (record.source_ordinal == 1 and completed) saw_fast_b_complete = true;
+        if (record.source_ordinal == 2 and completed) saw_fast_c_complete = true;
+        if (record.source_ordinal == 0) large_source_offset = record.snapshot_offset;
+    }
+    try std.testing.expect(saw_fast_b_complete and saw_fast_c_complete);
+    // `large_source` resumed from its durable checkpoint and made further
+    // progress -- it did not restart from offset 0.
+    try std.testing.expect(large_source_offset > offset_after_round1);
+
+    // Round 3: with both fast sources already complete, `large_source`
+    // keeps making progress every round instead of being starved out or
+    // looping in place. `fast_b` and `fast_c` are still visited (and
+    // quickly skipped as already complete) on the way back around to
+    // `large_source`'s prefix.
+    const round3 = try runSnapshotRound(alloc, &service, runner_config, quantum_ns, &cursor);
+    try std.testing.expectEqual(@as(usize, 3), round3.sources_considered);
+    try std.testing.expectEqual(@as(usize, 2), round3.sources_skipped_complete);
+    var large_source_offset_round3: u64 = 0;
+    for (service.statuses.items) |record| {
+        if (record.source_ordinal == 0) large_source_offset_round3 = record.snapshot_offset;
+    }
+    try std.testing.expect(large_source_offset_round3 > large_source_offset);
 }
 
 test "metadata replication backfill marks existing-slot fallback as slot_resumed" {
