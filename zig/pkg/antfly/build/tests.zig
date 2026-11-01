@@ -5231,7 +5231,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
             "standalone table storage defaults persist",
-            "standalone rejects Postgres CDC replication sources it cannot run",
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
