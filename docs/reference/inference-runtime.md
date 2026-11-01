@@ -122,6 +122,15 @@ The outer qualification harness must separately record verified checkpoint
 bytes, binaries, configuration, engine versions, GPU identity and exclusive GPU
 ownership; the comparator cannot verify those declarations from output hashes.
 
+Grouped LightOn attention estimates useful chunk work against the device's
+reported SM count. This permits long small cohorts to reuse KV loads across
+query heads while short cohorts retain the ordinary split path. Future reserved
+chunks do not count as active work. Device capacity is queried once at module
+initialization; unknown capacity keeps the ordinary kernel. Existing geometry
+and artifact guards still apply. Benchmark diagnostics report grouped calls and
+SM count; graph replay can reuse those captured launches without additional
+host submission counts.
+
 CUDA model loads log host preparation, device initialization, weight upload and
 total elapsed time. Host preparation may map rather than read all weight bytes:
 subsequent page faults and conversions can appear in the upload phase. These

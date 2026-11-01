@@ -164,13 +164,60 @@ were verified before each server started; every server released the GPU before
 the next capture. Startup used locally cached artifacts and is separate from
 warm serving time. No A100 or production-container qualification is implied.
 
-The separate graph candidate removes the two-token decoder-graph assumption
-in favor of the existing bounded continuation width and remaining output
-allowance. Independent attention/graph oracle tests pass 72 cases across depths
-3, 4 and 8, both model geometries and 2–128 rows, including complete KV contents,
-unused slots, reset/replay, positions/progress and canaries. Maximum absolute
-error is `3.52e-6`, below the unchanged `2e-5` F32 tolerance. Full-model candidate
-measurements and lifecycle qualification remain pending.
+A wider four-token graph experiment did not improve full-model throughput:
+4B concurrent median was 41.014 seconds and 0.8B was 10.096 seconds. Both
+captured/replayed four-step graphs with no trace-capacity denials, so absent
+activation does not explain the result. The change was removed. Its lifecycle
+check passes with the public client's canonical status normalization: an
+8-second request gets `504 INFERENCE_TIMEOUT`, its peer completes with the
+expected hash, all 36 readiness probes pass, and recovery/unload/reload succeed.
+The initial lifecycle harness rejected the API's valid `complete` spelling;
+that assertion was corrected and rerun separately. Graph depth remains two.
+
+Independent attention/graph oracle tests pass 72 cases across depths 3, 4 and 8,
+both model geometries and 2–128 rows, including complete KV contents, unused
+slots, reset/replay, positions/progress and canaries. Maximum absolute error is
+`3.52e-6`, below the unchanged `2e-5` F32 tolerance. These kernel/metadata checks
+are separate from full-model graph ownership and do not establish a wider graph
+serving default.
+
+### Workload-based grouped attention candidate
+
+The old dispatch used row count alone. The new candidate estimates useful CTA
+work from active KV chunks and KV heads, selecting grouping only when that work
+can populate four waves of the device's reported SM count. It excludes empty
+future-reservation chunks. Unknown device capacity and unsupported geometry
+retain ordinary split attention; no GPU model-name allowlist is involved.
+The selected kernels retain their existing supported GQA geometry and artifact
+requirements. Precision, graph depth and resource ceilings are unchanged.
+
+The [synthetic timing receipt](attention-dispatch-2026-11-01.json) covers 42
+cases across one to 32 rows, both model geometries and 256–8,192-token contexts.
+All outputs pass an independent FP64 oracle (maximum absolute error `3.57e-7`),
+read-only input checks and output/scratch canaries. CUDA graph replay and timing
+events share one explicit stream. Each trial executes 100 complete
+attention/combine operations; five device-time trials exclude Python dispatch
+and CPU oracle work. All 27 cases selected by the new heuristic were faster in
+this matrix; the smallest measured reduction was approximately 14%. This is a
+kernel result, not a full-model throughput claim or A100 qualification.
+
+Reproduce using the CUDA qualification Python environment:
+
+```bash
+python zig/pkg/inference/scripts/lightonocr3/benchmark_cuda_attention_dispatch.py \
+  --artifact zig/pkg/inference/src/ops/cuda/lighton_attention.ptx \
+  --output attention-dispatch.json
+```
+
+Full-model candidate measurements and lifecycle checks are pending. The existing
+BF16-vision diagnostic remains separate: 0.8B takes 8.214 seconds for four
+requests and still matches exactly. The 4B diagnostic with a 1,024-row prefill
+chunk starts at 36.356 seconds but its two measured cohorts take
+51.133/51.313 seconds. Admission logs show `domain_scratch` pressure near the
+8 GiB ceiling, and observed width narrows to two or three rows. This
+configuration is not a four-row serving recommendation and was not promoted.
+Both diagnostics preserve the same 34 GiB device ceiling; no budget was raised
+to hide admission pressure. Their serial performance is unmeasured here.
 
 ### Current large-page investigation
 
