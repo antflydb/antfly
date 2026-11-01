@@ -25,8 +25,34 @@ const enrichment_config_validation = @import("antfly_local_sources").storage_db_
 const public_index_contract = @import("public_index_contract.zig");
 const table_index_config = @import("antfly_local_sources").api_table_index_config;
 
+// `std.fmt.allocPrint` (via `std.Io.Writer.Allocating`) starts from a tiny
+// capacity and grows the buffer as it writes, then shrinks it back down in
+// `toOwnedSlice` by attempting a `remap` and falling back to alloc+copy+free
+// when the remap fails. Under `std.testing.checkAllAllocationFailures`, that
+// final shrink's resize/remap outcome is state the test does not control the
+// same way on every pass, so the exact number of allocator calls this
+// produces is not guaranteed to match across runs, which trips
+// `error.NondeterministicMemoryUsage` even though the function itself is
+// pure. Measure the exact output length first with a throwaway `Discarding`
+// writer, then allocate precisely once and format directly into that buffer
+// with a `Writer.fixed`, so there is never a grow-then-shrink step.
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    var measure_buf: [256]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&measure_buf);
+    discarding.writer.print("{f}", .{std.json.fmt(value, .{})}) catch |err| switch (err) {
+        // Discarding.drain never reports a short write.
+        error.WriteFailed => unreachable,
+    };
+    const len = std.math.cast(usize, discarding.fullCount()) orelse return error.OutOfMemory;
+    const out = try alloc.alloc(u8, len);
+    errdefer alloc.free(out);
+    var fixed_writer = std.Io.Writer.fixed(out);
+    fixed_writer.print("{f}", .{std.json.fmt(value, .{})}) catch |err| switch (err) {
+        // The buffer was sized exactly for this output by the measuring pass above.
+        error.WriteFailed => unreachable,
+    };
+    std.debug.assert(fixed_writer.end == len);
+    return out;
 }
 
 pub const CreateTableRequestErrorDisposition = enum {
