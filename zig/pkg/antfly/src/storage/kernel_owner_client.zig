@@ -471,6 +471,18 @@ pub const Owner = struct {
         );
     }
 
+    /// Experimental ordinary-document path. All input buffers are borrowed
+    /// until this synchronous call returns; no generic DB types cross the ABI.
+    pub fn batchBorrowedDocuments(self: *Owner, request: abi.BorrowedDocumentBatchRequest) !Response {
+        var response: Response = .{};
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_batch_borrowed_documents(self.handle, &request, &response.buffer, &failure);
+        errdefer response.deinit();
+        try error_identity.validateFailureEnvelope(status, &failure, abi.abi_version);
+        try statusToError(status);
+        return response;
+    }
+
     pub fn batchJsonWithDocumentChildRangeDispatcher(
         self: *Owner,
         table_name: []const u8,

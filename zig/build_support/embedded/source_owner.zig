@@ -167,7 +167,7 @@ fn needsStorageProvider(b: *std.Build, module: *std.Build.Module, provider: *std
     if (module == provider.root_module or (seen.getOrPut(.{ .module = module, .testing = testing }) catch @panic("OOM")).found_existing) return false;
     if (!testing) if (module.root_source_file) |root| {
         if (@import("../antfly/source_paths.zig").authored(b, root)) |path| {
-            if (module.import_table.contains("storage_engine_options") and
+            if (usesSharedStorageEngine(module) and
                 std.mem.indexOf(u8, path, "pkg/antfly-embedded/src/") != null and
                 !std.mem.endsWith(u8, path, "source_catalog_control.zig")) return true;
         }
@@ -185,4 +185,16 @@ fn needsStorageProvider(b: *std.Build, module: *std.Build.Module, provider: *std
     var imports = module.import_table.iterator();
     while (imports.next()) |entry| if (needsStorageProvider(b, entry.value_ptr.*, provider, testing, seen)) return true;
     return false;
+}
+
+/// Match engine_selection.zig: a physical implementation owner does not call
+/// the shared engine. Merely declaring storage source used to pull the entire
+/// engine and inference dependency chain into independently compiled owners.
+fn usesSharedStorageEngine(module: *std.Build.Module) bool {
+    const options_module = module.import_table.get("storage_engine_options") orelse return false;
+    const root = options_module.root_source_file orelse return true;
+    const step = @import("../antfly/source_paths.zig").producer(options_module.owner, root) orelse return true;
+    const options = step.cast(std.Build.Step.Options) orelse return true;
+    return std.mem.indexOf(u8, options.contents.items, "storage_engine_owner: bool = true;") == null and
+        std.mem.indexOf(u8, options.contents.items, "shared_storage_core: bool = false;") == null;
 }

@@ -19,9 +19,9 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-// Version 84 adds durable job-state, scheduling and owner-quota projections.
+// Version 85 adds a borrowed ordinary-document batch experiment.
 // Older owners must reject their operation identifiers before dispatch.
-pub const abi_version: u32 = 84;
+pub const abi_version: u32 = 85;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1297,6 +1297,31 @@ pub const BatchJsonOperationRequest = extern struct {
     committed_batch_effects_fn: ?CommittedBatchEffectsFn = null,
 };
 
+/// Synchronous ordinary-document transport. Payload bytes stay with the
+/// caller; the provider owns descriptor scratch and the returned response.
+/// Advanced/internal commands continue to use their existing operation APIs.
+pub const BorrowedDocumentWrite = extern struct {
+    key: BorrowedBytes,
+    document_json: BorrowedBytes,
+};
+
+pub const BorrowedDocumentBatchRequest = extern struct {
+    version: u32 = abi_version,
+    sync_level: enum(u32) { propose = 0, write = 1, full_text = 2, enrichments = 3, full_index = 4, _ } = .write,
+    table_name: BorrowedBytes = .{},
+    writes: ?[*]const BorrowedDocumentWrite = null,
+    write_count: u64 = 0,
+    deletes: ?[*]const BorrowedBytes = null,
+    delete_count: u64 = 0,
+    timestamp_ns: u64 = 0,
+};
+
+pub const BorrowedBatchOperation = enum(u32) {
+    validate = 0x42420001,
+    commit = 0x42420002,
+    response = 0x42420003,
+};
+
 /// Replace the catalog-owned physical schema/index contract on one resident
 /// group owner. Both byte slices are borrowed for this synchronous call.
 pub const ConfigureRequest = extern struct {
@@ -2015,6 +2040,13 @@ pub extern fn antfly_storage_owner_batch_json(
     owner: ?*anyopaque,
     request: *const BatchJsonOperationRequest,
     out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_batch_borrowed_documents(
+    owner: ?*anyopaque,
+    request: *const BorrowedDocumentBatchRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_replicated_batch_json(

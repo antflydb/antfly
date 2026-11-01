@@ -804,6 +804,9 @@ pub const Status = enum(u32) {
     gcs_connection_not_found_or_out_of_scope = 845,
     ambiguous_gcs_connection = 846,
     invalid_connection_credentials = 847,
+    invalid_algebraic_config = 848,
+    invalid_rope_table = 849,
+    invalid_geglu = 850,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

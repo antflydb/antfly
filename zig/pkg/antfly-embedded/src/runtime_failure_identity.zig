@@ -30,6 +30,9 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_algebraic_config, .err = error.InvalidAlgebraicConfig },
+    .{ .status = .invalid_rope_table, .err = error.InvalidRopeTable },
+    .{ .status = .invalid_geglu, .err = error.InvalidGeglu },
     .{ .status = .read_transient_failure, .err = error.ReadTransientFailure },
     .{ .status = .read_request_failed, .err = error.ReadRequestFailed },
     .{ .status = .invalid_gcs_url, .err = error.InvalidGcsUrl },

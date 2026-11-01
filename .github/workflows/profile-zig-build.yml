@@ -7,7 +7,7 @@ on:
       step:
         type: choice
         default: memory-test
-        options: [memory-test, unit-storage-compile, antfly]
+        options: [memory-test, unit-storage-compile, architecture-probe-test, antfly]
       optimize:
         type: choice
         default: debug
@@ -87,6 +87,11 @@ jobs:
           llvm-strip --strip-all -o .benchmark-results/compile-costs/antfly.stripped zig/zig-out/bin/antfly
           stat -c '%s' .benchmark-results/compile-costs/antfly.stripped > .benchmark-results/compile-costs/postlink-stripped-bytes.txt
           rm .benchmark-results/compile-costs/antfly.stripped
+      - name: Verify architecture provider and consumer cache isolation
+        if: ${{ success() && inputs.step == 'architecture-probe-test' }}
+        run: |
+          python3 zig/tools/check_architecture_probe_cache.py --family index --report .benchmark-results/compile-costs/index-cache.json
+          python3 zig/tools/check_architecture_probe_cache.py --family inference --report .benchmark-results/compile-costs/inference-cache.json
       - name: Retain measurements even on compiler failure
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

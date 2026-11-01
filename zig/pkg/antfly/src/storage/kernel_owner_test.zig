@@ -24,6 +24,47 @@ const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
+test "borrowed document batches cross compiled owner without payload ownership transfer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 1 });
+    defer owner.deinit();
+    const document = try alloc.dupe(u8, "{\"id\":9007199254740993,\"text\":\"borrowed\"}");
+    defer alloc.free(document);
+    const writes = [_]abi.BorrowedDocumentWrite{.{ .key = .fromSlice("a"), .document_json = .fromSlice(document) }};
+    var inserted = try owner.batchBorrowedDocuments(.{ .table_name = .fromSlice("docs"), .writes = &writes, .write_count = writes.len });
+    inserted.deinit();
+    @memset(document, 'x');
+    var persisted = try owner.lookupJson("docs", "{\"key\":\"a\"}");
+    defer persisted.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, persisted.bytes(), "9007199254740993") != null);
+
+    const invalid = [_]abi.BorrowedDocumentWrite{
+        .{ .key = .fromSlice("not-committed"), .document_json = .fromSlice("{}") },
+        .{ .key = .fromSlice("bad"), .document_json = .fromSlice("[]") },
+    };
+    try std.testing.expectError(error.InvalidBatchRequest, owner.batchBorrowedDocuments(.{ .table_name = .fromSlice("docs"), .writes = &invalid, .write_count = invalid.len }));
+    try std.testing.expectError(error.NotFound, owner.lookupJson("docs", "{\"key\":\"not-committed\"}"));
+    var output: abi.OwnedBytes = .{};
+    var failure: abi.FailureIdentity = .{};
+    const invalid_status = abi.antfly_storage_owner_batch_borrowed_documents(owner.handle, &.{ .table_name = .fromSlice("docs"), .write_count = 1 }, &output, &failure);
+    try error_identity.validateFailureEnvelope(invalid_status, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("InvalidArgument", failure.errorName());
+    try std.testing.expectEqual(@backingInt(abi.BorrowedBatchOperation.validate), failure.operation);
+    try std.testing.expect(output.ptr == null);
+    const old_status = abi.antfly_storage_owner_batch_borrowed_documents(owner.handle, &.{ .version = abi.abi_version - 1 }, &output, &failure);
+    try error_identity.validateFailureEnvelope(old_status, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("InvalidAbiVersion", failure.errorName());
+
+    const deletes = [_]abi.BorrowedBytes{.fromSlice("a")};
+    var deleted = try owner.batchBorrowedDocuments(.{ .table_name = .fromSlice("docs"), .deletes = &deletes, .delete_count = deletes.len });
+    defer deleted.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, deleted.bytes(), "\"deleted\":1") != null);
+}
+
 test "opaque owner retained relational read crosses checked archive boundary" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

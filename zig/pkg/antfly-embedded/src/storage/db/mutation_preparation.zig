@@ -215,27 +215,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Only transforms whose first base comes from storage need a read-set
             // predicate. Writes/deletes and an earlier transform establish an
             // entirely request-local base.
-            var request_keys = std.StringHashMapUnmanaged(void).empty;
-            defer request_keys.deinit(alloc);
-            for (writes) |write| try request_keys.put(alloc, write.key, {});
-            for (deletes) |key| try request_keys.put(alloc, key, {});
-
-            var keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer keys.deinit(alloc);
-            for (transforms) |transform| {
-                if (request_keys.contains(transform.key)) continue;
-                try request_keys.put(alloc, transform.key, {});
-                try keys.append(alloc, transform.key);
-            }
-            if (keys.items.len == 0) return .{};
+            var plan: @import("transform_read_plan.zig").Plan = .{};
+            defer plan.deinit(alloc);
+            for (writes) |write| try plan.establish(alloc, write.key);
+            for (deletes) |key| try plan.establish(alloc, key);
+            for (transforms) |transform| try plan.transform(alloc, transform.key);
+            if (plan.durable_bases.items.len == 0) return .{};
 
             // Only request-key collection depends on the write/receiver type.
             // Share MVCC reads and row reconstruction across DB, recovery and
             // prepared receivers, just as the commit path shares its owner.
             if (@TypeOf(self) == *S.PreparedBatchOwner)
-                return captureTransformReadSnapshotForKeys(self, alloc, keys.items);
+                return captureTransformReadSnapshotForKeys(self, alloc, plan.durable_bases.items);
             var owner = S.PreparedBatchOwner.from(self);
-            return captureTransformReadSnapshotForKeys(&owner, alloc, keys.items);
+            return captureTransformReadSnapshotForKeys(&owner, alloc, plan.durable_bases.items);
         }
 
         noinline fn captureTransformReadSnapshotForKeys(

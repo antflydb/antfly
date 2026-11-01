@@ -22,6 +22,7 @@ const batch = @import("antfly_local_sources").api_batch;
 const types = @import("antfly_local_sources").storage_db_types;
 const query_contract = @import("antfly_local_sources").api_local_query_contract;
 const client = @import("storage/kernel_owner_client.zig");
+const abi = @import("kernel_owner_abi");
 
 pub fn main(init: std.process.Init) !void {
     const alloc = std.heap.c_allocator;
@@ -74,13 +75,28 @@ pub fn main(init: std.process.Init) !void {
             std.mem.doNotOptimizeAway(decoded.req);
         }
         const codec_ns = time.monotonicNs() - codec_start;
-        const owner_start = time.monotonicNs();
+        // Give both owner timings existing rows with the same initial value.
+        // The JSON owner timing excludes consumer encoding; borrowed timing
+        // below includes descriptor construction.
+        var warm = try owner.batchJson("docs", payloads[1]);
+        warm.deinit();
+        const descriptors = try alloc.alloc(abi.BorrowedDocumentWrite, count);
+        defer alloc.free(descriptors);
+        var owner_ns: u64 = 0;
+        var borrowed_ns: u64 = 0;
+        // Alternate transport order. Both calls change every row, rather than
+        // letting the second transport benchmark an already-applied value.
         for (0..rounds) |round| {
-            var result = try owner.batchJson("docs", payloads[round % 2]);
-            result.deinit();
+            if (round % 2 == 0) {
+                owner_ns += try timedJsonBatch(&owner, payloads[0]);
+                borrowed_ns += try timedBorrowedBatch(&owner, descriptors, writes[0..count], documents[1]);
+            } else {
+                borrowed_ns += try timedBorrowedBatch(&owner, descriptors, writes[0..count], documents[0]);
+                owner_ns += try timedJsonBatch(&owner, payloads[1]);
+            }
         }
-        const owner_ns = time.monotonicNs() - owner_start;
         std.debug.print("{{\"case\":\"batch\",\"documents\":{d},\"bytes\":{d},\"rounds\":{d},\"encode_decode_ns\":{d},\"owner_batch_ns\":{d}}}\n", .{ count, payloads[0].len, rounds, codec_ns, owner_ns });
+        std.debug.print("{{\"case\":\"borrowed_document_batch\",\"documents\":{d},\"descriptor_bytes\":{d},\"rounds\":{d},\"owner_batch_ns\":{d}}}\n", .{ count, count * @sizeOf(abi.BorrowedDocumentWrite), rounds, borrowed_ns });
     }
     for ([_]usize{ 10, 100, 1000 }) |limit| {
         const query = try std.fmt.allocPrint(alloc, "{{\"query\":{{\"match_all\":{{}}}},\"limit\":{d}}}", .{limit});
@@ -103,6 +119,22 @@ pub fn main(init: std.process.Init) !void {
         const query_ns = time.monotonicNs() - query_start;
         std.debug.print("{{\"case\":\"query\",\"limit\":{d},\"bytes\":{d},\"rounds\":{d},\"consumer_decode_ns\":{d},\"owner_query_ns\":{d}}}\n", .{ limit, response.bytes().len, rounds, decode_ns, query_ns });
     }
+}
+
+fn timedJsonBatch(owner: *client.Owner, payload: []const u8) !u64 {
+    const started = time.monotonicNs();
+    var result = try owner.batchJson("docs", payload);
+    result.deinit();
+    return time.monotonicNs() - started;
+}
+
+fn timedBorrowedBatch(owner: *client.Owner, descriptors: []abi.BorrowedDocumentWrite, writes: []const types.BatchWrite, document: []const u8) !u64 {
+    const started = time.monotonicNs();
+    for (descriptors, writes) |*descriptor, write|
+        descriptor.* = .{ .key = .fromSlice(write.key), .document_json = .fromSlice(document) };
+    var result = try owner.batchBorrowedDocuments(.{ .table_name = .fromSlice("docs"), .writes = descriptors.ptr, .write_count = descriptors.len });
+    result.deinit();
+    return time.monotonicNs() - started;
 }
 
 /// Implementation source choices for this compilation root.

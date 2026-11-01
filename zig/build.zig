@@ -94,6 +94,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_fixtures = shared.conformance_fixtures;
     const target = shared.target;
     const optimize = shared.optimize;
+    @import("build_support/architecture_experiments.zig").add(b, target, optimize, shared.production_antfly_imports, shared.inference_graph.inference_linalg_mod);
     const memory_tests = b.addTest(.{
         .name = "memory-policy-tests",
         .root_module = b.createModule(.{
@@ -1110,7 +1111,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         owner_tests.integration_test_step.dependOn(&run.step);
     }
 
-    b.top_level_steps.get("antfly-storage-bench").?.step.dependOn(&b.addInstallArtifact(storage_owner_runs.benchmark, .{}).step);
+    const install_storage_boundary_bench = b.addInstallArtifact(storage_owner_runs.benchmark, .{});
+    b.top_level_steps.get("antfly-storage-bench").?.step.dependOn(&install_storage_boundary_bench.step);
+    b.step("storage-boundary-bench", "Build only the production storage-owner transport benchmark").dependOn(&install_storage_boundary_bench.step);
 
     const antfly_main_tests = runtime.antfly_main_tests;
     const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
