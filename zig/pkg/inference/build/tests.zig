@@ -37,14 +37,16 @@ pub fn create(ctx: Context) Suite {
     // Native CPU Debug peaked at 12,070,764,544 bytes with cold compiler
     // caches. 12,672 MiB retains 10% headroom rounded up to 128 MiB.
     // Accelerator and other-host reservations retain their existing profiles.
-    const native_cpu_debug = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
-        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and
+    const native_cpu_macos = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and
         !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
+    // The optimized native CPU closeout scope peaked at 11,435,048,960
+    // bytes. 12,032 MiB retains 10% headroom rounded up to 128 MiB.
     // CUDA serving reached 19.57 GB on Linux; dual-backend macOS reached
     // 20.66 GB. Reserve 24 GiB for CUDA and 20 GiB for the measured 17.56 GB
     // single-Metal suite. These are compiler scheduler reservations only.
     const tests = b.addTest(.{
-        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (native_cpu_macos) @as(usize, if (ctx.optimize == .debug) 12_672 else 12_032) * 1024 * 1024 else @as(usize, if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024,
 
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),

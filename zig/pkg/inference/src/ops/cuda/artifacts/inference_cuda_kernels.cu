@@ -2524,20 +2524,20 @@ __device__ __forceinline__ void termite_bert_prefill_hd64_impl(
     dst[q_base + lane + 32u] = acc1 / denom;
 }
 
-// tile-codegen:begin attention.bert_prefill.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+// tile-codegen:begin attention.f32_hd64_prefill.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q8(ANTFLY_CUDA_DENSE_ATTENTION_PARAMS) {
     termite_bert_prefill_hd64_impl<8, unsigned int>(dst, q, k, v, mask, bias, batch, seq_len, num_heads, head_dim, causal, has_mask, bias_mode, head_major);
 }
-// tile-codegen:end attention.bert_prefill.0 family
+// tile-codegen:end attention.f32_hd64_prefill.0 family
 
 // Sixteen-query version of the exact q8 schedule above. It preserves every
 // per-row arithmetic and reduction order, but doubles query rows per launch
 // block to reduce grid traffic and improve occupancy on encoder prefill.
-// tile-codegen:begin attention.bert_prefill.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+// tile-codegen:begin attention.f32_hd64_prefill.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q16(ANTFLY_CUDA_DENSE_ATTENTION_PARAMS) {
     termite_bert_prefill_hd64_impl<16, unsigned long long>(dst, q, k, v, mask, bias, batch, seq_len, num_heads, head_dim, causal, has_mask, bias_mode, head_major);
 }
-// tile-codegen:end attention.bert_prefill.1 family
+// tile-codegen:end attention.f32_hd64_prefill.1 family
 
 // Opt-in WMMA candidate for full BERT/XLM-R prefill attention. A block owns
 // 16 query rows for one [batch, head] pair and streams all 256 keys in four

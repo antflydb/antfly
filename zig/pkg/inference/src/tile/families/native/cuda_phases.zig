@@ -16,6 +16,7 @@
 //! Exact numerical and ownership phases shared before CUDA compilation.
 
 const program = @import("../../native_program.zig");
+const row_schedules = @import("../../q4_q8_schedule.zig");
 
 pub const attention = .{
     .online_softmax_shared_half = program.render(online_softmax, .{ .probability_store = "                probabilities[row * N + lane + j * 32u] = __float2half_rn(p);" }),
@@ -101,8 +102,22 @@ pub const attention = .{
 };
 
 pub const projection = .{
-    .q4q8_rows_linear = program.render(q4q8_rows, .{ .array_rows = "Rows", .warp_count = "8" }),
-    .q4q8_rows_qkv = program.render(q4q8_rows, .{ .array_rows = "4", .warp_count = "4" }),
+    .q4q8_linear2_entry = row_schedules.linear2.entry(),
+    .q4q8_linear2_abi = row_schedules.linear2.cppAbi(),
+    .q4q8_linear2_rows = @import("std").fmt.comptimePrint("{d}", .{row_schedules.linear2.rows}),
+    .q4q8_linear_columns = @import("std").fmt.comptimePrint("{d}", .{row_schedules.linear4.columns}),
+    .q4q8_linear_warps = @import("std").fmt.comptimePrint("{d}", .{row_schedules.linear4.warps}),
+    .q4q8_linear_last_column = @import("std").fmt.comptimePrint("{d}", .{row_schedules.linear4.columns - 1}),
+    .q4q8_linear4_rows = @import("std").fmt.comptimePrint("{d}", .{row_schedules.linear4.rows}),
+    .q4q8_linear8_rows = @import("std").fmt.comptimePrint("{d}", .{row_schedules.linear8.rows}),
+    .q4q8_qkv_columns = @import("std").fmt.comptimePrint("{d}", .{row_schedules.qkv4.columns}),
+    .q4q8_qkv_rows = @import("std").fmt.comptimePrint("{d}", .{row_schedules.qkv4.rows}),
+    .q4q8_qkv_warps = @import("std").fmt.comptimePrint("{d}", .{row_schedules.qkv4.warps}),
+    .q4q8_qkv_last_column = @import("std").fmt.comptimePrint("{d}", .{row_schedules.qkv4.columns - 1}),
+    .q4q8_qkv_entry = row_schedules.qkv4.entry(),
+    .q4q8_qkv_abi = row_schedules.qkv4.cppAbi(),
+    .q4q8_rows_linear = program.render(q4q8_rows, row_schedules.linear4.phase()),
+    .q4q8_rows_qkv = program.render(q4q8_rows, row_schedules.qkv4.phase()),
     .q4q8_pair_dot_u32_inner = program.render(q4q8_pair_dot, .{ .indent = "                ", .index_cast = "" }),
     .q4q8_pair_dot_u64_inner = program.render(q4q8_pair_dot, .{ .indent = "                ", .index_cast = "(size_t)" }),
     .q4q8_pair_dot_u32_tail = program.render(q4q8_pair_dot, .{ .indent = "                    ", .index_cast = "" }),

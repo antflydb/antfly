@@ -126,6 +126,7 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("tile/q4_q8_schedule.zig");
     // Keep host-only ownership/descriptor tests reachable under narrow filters.
     if (!build_options.enable_wasm) _ = @import("ops/cuda/embedded_module.zig");
     _ = @import("ops/kernel_geometry.zig");

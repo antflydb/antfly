@@ -28,7 +28,7 @@ const whisper_model = @import("whisper_model.zig");
 
 const File = struct { path: []const u8, data: []const u8 };
 
-const files = [_]File{
+pub const files = [_]File{
     .{ .path = "src/ops/metal/generated/tile_whisper_logits_partials.metal", .data = gpu.renderMetal(whisper.kernel) },
     .{ .path = "src/ops/metal/generated/tile_whisper_logits_partials.msl.h", .data = gpu.renderMetalHeader(whisper.kernel, "antfly_tile_whisper_logits_partials_msl") },
     .{ .path = "src/ops/cuda/generated/tile_whisper_logits.cu", .data = gpu.renderCuda(whisper.kernel) },
@@ -65,13 +65,18 @@ pub fn main(init: std.process.Init) !void {
             const file = try std.fmt.allocPrint(allocator, "{s}/regions.tsv", .{args[i]});
             try cwd.writeFile(io, .{ .sub_path = file, .data = manifest.items });
             return;
+        } else if (std.mem.eql(u8, arg, "--inventory") and i + 1 < args.len) {
+            i += 1;
+            const data = try @import("inventory.zig").render(allocator, &regions, &.{});
+            try cwd.writeFile(io, .{ .sub_path = args[i], .data = data });
+            return;
         } else if (std.mem.eql(u8, arg, "--emit-opencl") and i + 1 < args.len) {
             i += 1;
             try cwd.writeFile(io, .{ .sub_path = args[i], .data = opencl_source });
             std.debug.print("wrote {s}\n", .{args[i]});
             return;
         } else if (!std.mem.eql(u8, arg, "--check")) {
-            std.debug.print("usage: tile-kernel-codegen [--check|--write|--emit-opencl <path>]\n", .{});
+            std.debug.print("usage: tile-kernel-codegen [--check|--write|--inventory <path>|--dump-regions <dir>|--emit-opencl <path>]\n", .{});
             return error.InvalidArguments;
         }
     }
@@ -90,6 +95,10 @@ pub fn main(init: std.process.Init) !void {
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file or !(std.mem.endsWith(u8, entry.path, ".zig") or std.mem.endsWith(u8, entry.path, ".cu") or std.mem.endsWith(u8, entry.path, ".metal") or std.mem.endsWith(u8, entry.path, ".m")) or
             std.mem.eql(u8, entry.path, "source_inputs.zig")) continue;
+        if (std.mem.startsWith(u8, entry.path, "families/native/") and !@import("region.zig").operationFamilyName(std.fs.path.stem(entry.basename))) {
+            std.debug.print("native source owner must use an operation/layout name: {s}\n", .{entry.path});
+            return error.ModelSpecificNativeOwner;
+        }
         try inputs.append(allocator, try std.fmt.allocPrint(allocator, "src/tile/{s}", .{entry.path}));
     }
     std.mem.sort([]const u8, inputs.items, {}, struct {

@@ -40,6 +40,7 @@ const Mode = enum {
     check,
     write,
     check_metal,
+    inventory,
     inspect_model,
     check_model,
 };
@@ -47,6 +48,7 @@ const Mode = enum {
 const Options = struct {
     mode: Mode,
     model_path: ?[]const u8 = null,
+    inventory_path: ?[]const u8 = null,
 };
 
 const GeneratedFile = struct {
@@ -84,6 +86,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             }
             return;
         },
+        .inventory => {
+            const data = try renderOwnershipInventory(allocator);
+            defer allocator.free(data);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = options.inventory_path.?, .data = data });
+            return;
+        },
         .check, .write, .check_metal => {},
     }
     const files = try generatedFiles(allocator);
@@ -92,7 +100,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         switch (mode) {
             .check, .check_metal => try checkSource(allocator, io, source),
             .write => try writeSource(allocator, io, source),
-            .inspect_model, .check_model => unreachable,
+            .inspect_model, .check_model, .inventory => unreachable,
         }
     }
     try processNativeOwnedSources(allocator, io, mode == .write);
@@ -214,6 +222,45 @@ fn nativeOwnedRegionCount() usize {
     for (native_source_files) |file| count += file.owners.len;
     return count;
 }
+// Read the same owners that perform regeneration; no parallel dispatch catalog.
+fn renderOwnershipInventory(allocator: std.mem.Allocator) ![]u8 {
+    const inventory = @import("tile/inventory.zig");
+    const files = try generatedFiles(allocator);
+    defer freeGeneratedFiles(allocator, files);
+    var entries = std.ArrayListUnmanaged(inventory.Entry).empty;
+    defer {
+        for (entries.items) |entry| allocator.free(entry.sha256);
+        entries.deinit(allocator);
+    }
+    for (native_source_files) |file| for (file.owners) |owner| {
+        const data = try owner.render(allocator);
+        defer allocator.free(data);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        const hash = try allocator.dupe(u8, &hex);
+        errdefer allocator.free(hash);
+        try entries.append(allocator, .{ .family_region = owner.begin, .output = file.path, .bytes = data.len, .sha256 = hash, .owner = .quant_region });
+    };
+    for (files) |file| {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(file.data, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        const hash = try allocator.dupe(u8, &hex);
+        errdefer allocator.free(hash);
+        try entries.append(allocator, .{ .family_region = file.path, .output = file.path, .bytes = file.data.len, .sha256 = hash, .owner = .generated_file });
+    }
+    for (@import("tile/codegen_main.zig").files) |file| {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(file.data, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        const hash = try allocator.dupe(u8, &hex);
+        errdefer allocator.free(hash);
+        try entries.append(allocator, .{ .family_region = file.path, .output = file.path, .bytes = file.data.len, .sha256 = hash, .owner = .generated_file });
+    }
+    return inventory.render(allocator, &@import("tile/families.zig").regions, entries.items);
+}
+
 fn processNativeOwnedSources(allocator: std.mem.Allocator, io: std.Io, write: bool) !void {
     for (native_source_files) |file| try processOwnedSourceRegions(allocator, io, write, file.path, file.owners);
 }
@@ -334,6 +381,7 @@ fn parseMode(args: []const []const u8) !Mode {
 }
 
 fn parseOptions(args: []const []const u8) !Options {
+    if (args.len == 2 and std.mem.eql(u8, args[0], "--inventory")) return .{ .mode = .inventory, .inventory_path = args[1] };
     if (args.len == 0) return .{ .mode = .check };
     if (args.len == 1 and std.mem.eql(u8, args[0], "--check")) return .{ .mode = .check };
     if (args.len == 1 and std.mem.eql(u8, args[0], "--write")) return .{ .mode = .write };
@@ -351,6 +399,7 @@ fn parseOptions(args: []const []const u8) !Options {
 fn printUsage() void {
     print(
         \\usage: antfly inference quant-kernel-codegen [--check|--write|--check-metal]
+        \\       antfly inference quant-kernel-codegen --inventory <report.json>
         \\       antfly inference quant-kernel-codegen --inspect-model <model.gguf>
         \\       antfly inference quant-kernel-codegen --check-model <model.gguf>
         \\  Rewrites or verifies dev-generated quant kernel sources, manifests, and Metal artifacts.
@@ -785,6 +834,9 @@ test "quant kernel codegen defaults to check mode" {
     try std.testing.expectEqual(Mode.check, try parseMode(&.{"--check"}));
     try std.testing.expectEqual(Mode.write, try parseMode(&.{"--write"}));
     try std.testing.expectEqual(Mode.check_metal, try parseMode(&.{"--check-metal"}));
+    const inventory = try parseOptions(&.{ "--inventory", "owners.json" });
+    try std.testing.expectEqual(Mode.inventory, inventory.mode);
+    try std.testing.expectEqualStrings("owners.json", inventory.inventory_path.?);
 }
 
 test "quant kernel codegen parses read-only model catalog modes" {

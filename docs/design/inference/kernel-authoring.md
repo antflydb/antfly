@@ -249,3 +249,35 @@ are per-family precision policies. `cuda-standalone-check -- --family <name>`
 checks one exact family without requiring unrelated producer dependencies.
 Historical image filenames and exported symbols are compatibility contracts;
 new producer names describe operations and physical schedules.
+
+## Consumed ownership inventory
+
+`zig build check-kernel-ownership` runs both generator freshness checks, exports
+an inventory from their actual registries, and verifies every recorded region
+and generated file against the shipped source. CI runs this check and its
+negative controls. An absent, stale, duplicated, overlapping or unregistered
+region fails the check. Native owner paths and registered families reject known
+model-name tokens; use operation, dtype, layout and static schedule names when
+adding an implementation. Compatibility symbols can retain their historical ABI.
+
+For a retained report, run from the inference package:
+
+```sh
+zig build quant-kernel-codegen -- --inventory /tmp/kernel-ownership-inputs.json
+python3 -B scripts/kernel_ownership_inventory.py --root ../../.. \
+  --inventory /tmp/kernel-ownership-inputs.json --output /tmp/kernel-ownership.json
+```
+
+The report includes both registries' regions/files, standalone CUDA producers,
+Tile source identities and the Q4/Q8 row schedule contracts. Canonical source
+surrounds and recursively included native leaves are hashed and classified as
+retained authored implementation. Include/template/macro references remain
+consumers; a textual single-reference count never authorizes deletion.
+
+`tile/q4_q8_schedule.zig` supplies the qualified two/four/eight-row linear and
+four-row QKV extents to native emission and actual launch adapters. The native
+ABI determines the named argument records. Its shared-memory sizes describe
+static compiled storage, not additional dynamic launch scratch. Keep the named
+two-row operands: replacing them with arrays increased registers in qualification.
+New schedules require independent output/tail/replay checks and resource/performance
+evidence before extending this contract.

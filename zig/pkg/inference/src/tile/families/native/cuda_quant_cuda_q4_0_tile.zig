@@ -16,6 +16,7 @@
 //! Qualified native program instances and specialization exports.
 
 const program = @import("../../native_program.zig");
+const row_schedules = @import("../../q4_q8_schedule.zig");
 
 const program_0 =
     \\extern "C" __global__ void {{name}}(ANTFLY_CUDA_Q8_INPUT_LINEAR_PARAMS) {
@@ -128,21 +129,23 @@ pub const source_1 = program.join(&.{
 });
 
 pub const source_2 = program.join(&.{
-    \\extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows4(ANTFLY_CUDA_Q8_INPUT_LINEAR_PARAMS) {
-    \\    termite_q4_0_q8_1_rows_impl<4u>(dst, q8_input, weight, rows, in_dim, out_dim);
-    \\}
-    \\
-    ,
+    program.render(
+        \\extern "C" __global__ void {{entry}}({{abi}}) {
+        \\    termite_q4_0_q8_1_rows_impl<{{rows}}u>(dst, q8_input, weight, rows, in_dim, out_dim);
+        \\}
+        \\
+    , row_schedules.linear4.native()),
 
     \\
     \\
     ,
 
-    \\extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows8_c4(ANTFLY_CUDA_Q8_INPUT_LINEAR_PARAMS) {
-    \\    termite_q4_0_q8_1_rows_impl<8u>(dst, q8_input, weight, rows, in_dim, out_dim);
-    \\}
-    \\
-    ,
+    program.render(
+        \\extern "C" __global__ void {{entry}}({{abi}}) {
+        \\    termite_q4_0_q8_1_rows_impl<{{rows}}u>(dst, q8_input, weight, rows, in_dim, out_dim);
+        \\}
+        \\
+    , row_schedules.linear8.native()),
 
     \\
     \\

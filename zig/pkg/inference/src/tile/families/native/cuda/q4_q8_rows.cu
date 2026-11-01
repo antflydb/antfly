@@ -23,8 +23,8 @@ __device__ __forceinline__ void termite_q4_0_q8_1_rows_impl(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    static_assert(Rows == 4u || Rows == 8u, "the two-row operand schedule is independently specialized");
-    const unsigned int cols = 4u;
+    static_assert(Rows == {{q4q8_linear4_rows}}u || Rows == {{q4q8_linear8_rows}}u, "the two-row operand schedule is independently specialized");
+    const unsigned int cols = {{q4q8_linear_columns}}u;
     const unsigned int rows_per_block = Rows;
     unsigned int col_tile = blockIdx.x * cols;
     unsigned int row_base = blockIdx.y * rows_per_block;
@@ -33,9 +33,9 @@ __device__ __forceinline__ void termite_q4_0_q8_1_rows_impl(
     unsigned int lane = tid & 31u;
     unsigned int warp = tid >> 5;
     unsigned int row_blocks = in_dim / 32u;
-    __shared__ float warp_partial[Rows][4][8];
-    bool full_tile = col_tile + 3u < out_dim;
-    float acc[Rows][4];
+    __shared__ float warp_partial[Rows][{{q4q8_linear_columns}}][{{q4q8_linear_warps}}];
+    bool full_tile = col_tile + {{q4q8_linear_last_column}}u < out_dim;
+    float acc[Rows][{{q4q8_linear_columns}}];
 {{q4q8_rows_linear}}
 
 }

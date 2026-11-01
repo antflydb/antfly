@@ -366,6 +366,23 @@ pub fn build(b: *std.Build) void {
     const tile_kernel_codegen_run = workflow_ctx.addRunArtifact(tile_kernel_codegen_exe);
     tile_kernel_codegen_run.addPassthruArgs();
     b.step("tile-kernel-codegen", "Verify (or --write) sources rendered from tile kernels").dependOn(&tile_kernel_codegen_run.step);
+    // Keep ownership reporting a consumed contract, using the same registries
+    // and the source freshness checks rather than another dispatch list.
+    const ownership_inventory = workflow_ctx.addRunArtifact(quant_kernel_codegen_exe);
+    ownership_inventory.addArg("--inventory");
+    const ownership_input = ownership_inventory.addOutputFileArg("kernel-ownership-inputs.json");
+    ownership_inventory.step.dependOn(&quant_kernel_codegen_test_check.step);
+    const ownership_tile_check = workflow_ctx.addRunArtifact(tile_kernel_codegen_exe);
+    ownership_tile_check.addArg("--check");
+    ownership_inventory.step.dependOn(&ownership_tile_check.step);
+    const ownership_verify = b.addSystemCommand(&.{ "python3", "-B" });
+    ownership_verify.addFileArg(workflow_ctx.path("scripts/kernel_ownership_inventory.py"));
+    ownership_verify.addArgs(&.{ "--root", "../../..", "--inventory" });
+    ownership_verify.setCwd(workflow_ctx.path("."));
+    ownership_verify.addFileArg(ownership_input);
+    ownership_verify.addArg("--output");
+    _ = ownership_verify.addOutputFileArg("kernel-ownership.json");
+    b.step("check-kernel-ownership", "Verify the consumed native ownership inventory and canonical source closure").dependOn(&ownership_verify.step);
     // The CPU lowering is @Vector code: without -Dcpu it targets the build
     // host's CPU rather than the baseline (no AVX/FMA) the default implies.
     const tile_whisper_target = if (target.query.cpu_model == .determined_by_arch_os and

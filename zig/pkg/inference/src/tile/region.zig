@@ -131,6 +131,19 @@ fn regionCount(comptime families: []const Family) usize {
     }
 }
 
+/// Numerical source owners describe operations/layouts, not checkpoint families.
+/// Historical exported symbols remain compatibility names inside these owners.
+pub fn operationFamilyName(name: []const u8) bool {
+    var tokens = std.mem.tokenizeAny(u8, name, "._-/");
+    while (tokens.next()) |token| {
+        inline for (.{ "bert", "modernbert", "roberta", "gemma", "qwen", "lighton", "florence", "whisper", "gliner", "clip", "e2b", "e4b", "a4b" }) |model| {
+            if (std.mem.eql(u8, token, model)) return false;
+            if (std.mem.startsWith(u8, token, model) and token.len > model.len and std.ascii.isDigit(token[model.len])) return false;
+        }
+    }
+    return true;
+}
+
 /// Flatten family descriptions once; do not repeatedly concatenate arrays.
 pub fn regions(comptime families: []const Family) [regionCount(families)]Region {
     comptime {
@@ -138,6 +151,7 @@ pub fn regions(comptime families: []const Family) [regionCount(families)]Region 
         var result: [regionCount(families)]Region = undefined;
         var cursor: usize = 0;
         for (families) |item| {
+            if (!operationFamilyName(item.name)) @compileError("native numerical family must use an operation/layout name: " ++ item.name);
             const count = sourceCount(item.source);
             for (0..count) |i| {
                 const key = if (count == 1) item.name else std.fmt.comptimePrint("{s}.{d}", .{ item.name, i });
@@ -173,4 +187,9 @@ test "native family descriptors retain numbered keys and custom source paths" {
     })});
     try std.testing.expectEqualStrings(metal_indent, single[0].begin[0..metal_indent.len]);
     try std.testing.expect(std.mem.indexOf(u8, single[0].begin, "single family") != null);
+}
+
+test "numerical family names reject model owners and retain operation vocabulary" {
+    for ([_][]const u8{ "attention.f16_hd64_prefill", "projection.q4q8.rows", "elementwise.clipping", "vision.flash" }) |name| try std.testing.expect(operationFamilyName(name));
+    for ([_][]const u8{ "attention.bert_prefill", "gemma4.projection", "cuda_qwen3vl_rope", "e4b_ffn" }) |name| try std.testing.expect(!operationFamilyName(name));
 }

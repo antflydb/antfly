@@ -357,3 +357,8 @@ test "native template tags preserve aggregate initializers and nested sections" 
         actual,
     );
 }
+
+test {
+    _ = @import("q4_q8_schedule.zig");
+    _ = @import("inventory.zig");
+}

@@ -126,9 +126,9 @@ extern "C" __global__ void termite_linear_q4_0_f32(ANTFLY_CUDA_QUANT_LINEAR_PARA
     dst[idx] = acc;
 }
 // native-program:entry termite_linear_q4_0_q8_1_f32_tile4_w8_rows2
-extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_w8_rows2(ANTFLY_CUDA_Q8_INPUT_LINEAR_PARAMS) {
-    const unsigned int cols = 4u;
-    const unsigned int rows_per_block = 2u;
+extern "C" __global__ void {{q4q8_linear2_entry}}({{q4q8_linear2_abi}}) {
+    const unsigned int cols = {{q4q8_linear_columns}}u;
+    const unsigned int rows_per_block = {{q4q8_linear2_rows}}u;
     unsigned int col_tile = blockIdx.x * cols;
     unsigned int row0 = blockIdx.y * rows_per_block;
     if (row0 >= rows) return;
@@ -682,9 +682,9 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8(ANTFLY_
     termite_packed_qkv_projection_impl<8u>(dst_q, dst_k, dst_v, q8_input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
 }
 // native-program:entry termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4
-extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4(ANTFLY_CUDA_Q8_INPUT_QKV_PARAMS) {
-    const unsigned int cols = 8u;
-    const unsigned int rows_per_block = 4u;
+extern "C" __global__ void {{q4q8_qkv_entry}}({{q4q8_qkv_abi}}) {
+    const unsigned int cols = {{q4q8_qkv_columns}}u;
+    const unsigned int rows_per_block = {{q4q8_qkv_rows}}u;
     unsigned int q_tiles = (q_out_dim + cols - 1u) / cols;
     unsigned int kv_tiles = (kv_out_dim + cols - 1u) / cols;
     unsigned int tiles_per_row_group = q_tiles + kv_tiles * 2u;
@@ -700,9 +700,9 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4(A
     unsigned int lane = tid & 31u;
     unsigned int warp = tid >> 5;
     unsigned int row_blocks = in_dim / 32u;
-    __shared__ float warp_partial[4][8][4];
-    float acc[4][8];
-    bool full_tile = col_tile + 7u < out_dim;
+    __shared__ float warp_partial[{{q4q8_qkv_rows}}][{{q4q8_qkv_columns}}][{{q4q8_qkv_warps}}];
+    float acc[{{q4q8_qkv_rows}}][{{q4q8_qkv_columns}}];
+    bool full_tile = col_tile + {{q4q8_qkv_last_column}}u < out_dim;
 {{q4q8_rows_qkv}}
 }
 // native-program:entry termite_linear_q4_k_qkv_nobias_f32_tiled

@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const launch_abi = @import("launch_abi.zig");
+const row_schedules = @import("../../tile/q4_q8_schedule.zig");
 const build_options = @import("build_options");
 const cuda_identity = if (build_options.enable_cuda) @import("cuda_jit_identity") else struct {
     pub const baseline = z17RepeatString("0", 64);
@@ -4200,6 +4201,12 @@ pub const KernelModule = struct {
         return arguments;
     }
 
+    inline fn launchQ4Q8Rows(comptime profile: row_schedules.Schedule, function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, dst: driver_mod.CUdeviceptr, input: driver_mod.CUdeviceptr, weight: driver_mod.CUdeviceptr, rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!void {
+        var arguments: launch_abi.ArgumentsFor(profile.abi()) = .{ .dst = dst, .q8_input = input, .weight = weight, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor(profile.abi(), &arguments);
+        try launch2d(function, ctx, profile.columnGroups(out_dim), profile.rowGroups(rows), profile.threads(), &params);
+    }
+
     const QuantProjectionLaunch = struct {
         kernel: []const u8,
         values_per_block: usize,
@@ -4207,7 +4214,7 @@ pub const KernelModule = struct {
         columns: ?usize,
         threads: usize,
         packed_input: bool = false,
-        rows4_kernel: ?[]const u8 = null,
+        rows4_schedule: ?row_schedules.Schedule = null,
     };
 
     inline fn checkProjectionInput(comptime spec: QuantProjectionLaunch, input: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize) driver_mod.Error!void {
@@ -4217,7 +4224,7 @@ pub const KernelModule = struct {
     }
 
     inline fn launchQuantPair(self: *KernelModule, comptime spec: QuantProjectionLaunch, ctx: *context_mod.CudaContext, dst_a: buffer_mod.DeviceBuffer, dst_b: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight_a: buffer_mod.DeviceBuffer, weight_b: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!void {
-        comptime std.debug.assert(spec.columns != null and spec.rows4_kernel == null);
+        comptime std.debug.assert(spec.columns != null and spec.rows4_schedule == null);
         const function = @field(self, spec.kernel) orelse return error.CudaKernelUnavailable;
         if (in_dim == 0 or in_dim % spec.values_per_block != 0 or (spec.packed_input and spec.values_per_block != q8_1_values_per_block)) return error.InvalidCudaState;
         const row_blocks = in_dim / spec.values_per_block;
@@ -4248,10 +4255,10 @@ pub const KernelModule = struct {
     }
 
     inline fn launchQuantQkv(self: *KernelModule, comptime spec: QuantProjectionLaunch, ctx: *context_mod.CudaContext, dst_q: buffer_mod.DeviceBuffer, dst_k: buffer_mod.DeviceBuffer, dst_v: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight_q: buffer_mod.DeviceBuffer, weight_k: buffer_mod.DeviceBuffer, weight_v: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, q_out_dim: usize, kv_out_dim: usize) driver_mod.Error!void {
-        comptime std.debug.assert(spec.rows4_kernel == null or (spec.columns != null and spec.packed_input));
+        comptime std.debug.assert(spec.rows4_schedule == null or (spec.columns != null and spec.packed_input));
         // Row-specialized dispatch historically checks availability only after
         // admission and empty-output handling. Other adapters check it first.
-        const early_function = if (spec.rows4_kernel == null) @field(self, spec.kernel) orelse return error.CudaKernelUnavailable else null;
+        const early_function = if (spec.rows4_schedule == null) @field(self, spec.kernel) orelse return error.CudaKernelUnavailable else null;
         if (in_dim == 0 or in_dim % spec.values_per_block != 0 or (spec.packed_input and spec.values_per_block != q8_1_values_per_block)) return error.InvalidCudaState;
         const row_blocks = in_dim / spec.values_per_block;
         const q_count = try checkedTensorElements(rows, q_out_dim);
@@ -4279,20 +4286,21 @@ pub const KernelModule = struct {
 
         var arguments = try quantQkvArguments(spec.packed_input, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
         const family = if (spec.packed_input) "Q8_INPUT_QKV" else "QUANT_QKV";
-        if (spec.rows4_kernel) |field| {
-            if (rows > 1) if (@field(self, field)) |function| {
+        if (spec.rows4_schedule) |profile| {
+            comptime std.debug.assert(profile.columns == spec.columns.? and profile.threads() == spec.threads and std.mem.eql(u8, profile.abi(), family));
+            if (rows > 1) if (@field(self, profile.kernel_field)) |function| {
                 var params = launch_abi.fieldsFor(family, &arguments);
-                try launchBlocks(function, ctx, try checkedTensorElements((rows + 3) / 4, tiles_with_v), spec.threads, &params);
+                try launchBlocks(function, ctx, try checkedTensorElements(profile.rowGroups(rows), tiles_with_v), profile.threads(), &params);
                 return;
             };
         }
-        const function = if (spec.rows4_kernel != null) @field(self, spec.kernel) orelse return error.CudaKernelUnavailable else early_function;
+        const function = if (spec.rows4_schedule != null) @field(self, spec.kernel) orelse return error.CudaKernelUnavailable else early_function;
         var params = launch_abi.fieldsFor(family, &arguments);
         try launchBlocks(function, ctx, total_tiles, spec.threads, &params);
     }
 
     inline fn launchQuantArgmax(self: *KernelModule, comptime spec: QuantProjectionLaunch, comptime per_row: bool, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, partial_values: buffer_mod.DeviceBuffer, partial_indices: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight_raw: buffer_mod.DeviceBuffer, suppress_token_ids: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize, suppress_count: usize) driver_mod.Error!void {
-        comptime std.debug.assert(!spec.packed_input and spec.columns != null and spec.rows4_kernel == null);
+        comptime std.debug.assert(!spec.packed_input and spec.columns != null and spec.rows4_schedule == null);
         const stage1 = @field(self, spec.kernel) orelse return error.CudaKernelUnavailable;
         const reduce = @field(self, if (per_row) "argmax_reduce_rows_pairs_f32" else "argmax_reduce_pairs_f32") orelse return error.CudaKernelUnavailable;
         if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % spec.values_per_block != 0) return error.InvalidCudaState;
@@ -11360,30 +11368,15 @@ pub const KernelModule = struct {
         var weight_ptr = weight_raw.ptr;
         if (rows > 1) {
             if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_ROWS8_C4", false)) {
-                if (self.linear_q4_0_q8_1_f32_tile4_w8_rows8_c4) |function| {
-                    var rows_u32 = try toU32(rows);
-                    var in_dim_u32 = try toU32(in_dim);
-                    var out_dim_u32 = try toU32(out_dim);
-                    var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
-                    try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 7) / 8, q4_0_tiled_threads, &params);
-                    return;
+                if (@field(self, row_schedules.linear8.kernel_field)) |function| {
+                    return launchQ4Q8Rows(row_schedules.linear8, function, ctx, dst_ptr, input_ptr, weight_ptr, rows, in_dim, out_dim);
                 }
             }
-            if (self.linear_q4_0_q8_1_f32_tile4_w8_rows4) |function| {
-                var rows_u32 = try toU32(rows);
-                var in_dim_u32 = try toU32(in_dim);
-                var out_dim_u32 = try toU32(out_dim);
-                var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
-                try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 3) / 4, q4_0_tiled_threads, &params);
-                return;
+            if (@field(self, row_schedules.linear4.kernel_field)) |function| {
+                return launchQ4Q8Rows(row_schedules.linear4, function, ctx, dst_ptr, input_ptr, weight_ptr, rows, in_dim, out_dim);
             }
-            if (self.linear_q4_0_q8_1_f32_tile4_w8_rows2) |function| {
-                var rows_u32 = try toU32(rows);
-                var in_dim_u32 = try toU32(in_dim);
-                var out_dim_u32 = try toU32(out_dim);
-                var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
-                try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 1) / 2, q4_0_tiled_threads, &params);
-                return;
+            if (@field(self, row_schedules.linear2.kernel_field)) |function| {
+                return launchQ4Q8Rows(row_schedules.linear2, function, ctx, dst_ptr, input_ptr, weight_ptr, rows, in_dim, out_dim);
             }
         }
         if (in_dim == 10240 and out_dim == 2560) {
@@ -13314,7 +13307,7 @@ pub const KernelModule = struct {
         q_out_dim: usize,
         kv_out_dim: usize,
     ) driver_mod.Error!void {
-        return self.launchQuantQkv(.{ .kernel = "linear_q4_0_qkv_nobias_q8_1_f32_tile8", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = q4_0_col_tile8, .threads = q4_0_tiled_threads_w4, .packed_input = true, .rows4_kernel = "linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4" }, ctx, dst_q, dst_k, dst_v, input_q8_1, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
+        return self.launchQuantQkv(.{ .kernel = "linear_q4_0_qkv_nobias_q8_1_f32_tile8", .values_per_block = q4_0_values_per_block, .block_bytes = q4_0_block_bytes, .columns = row_schedules.qkv4.columns, .threads = row_schedules.qkv4.threads(), .packed_input = true, .rows4_schedule = row_schedules.qkv4 }, ctx, dst_q, dst_k, dst_v, input_q8_1, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
     }
 
     pub fn launchLinearQ4_0QkvNoBiasQ8_1Tile8W8F32(
@@ -21911,4 +21904,85 @@ test "CUDA projection launch descriptors preserve native contracts" {
 test "CUDA projection device results and graph replay" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     try @import("testing/projection_launch.zig").device(KernelModule, KernelModule);
+}
+
+test "CUDA Q4 Q8 row schedules preserve independent dots tails and captured inputs" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    const rows = 9;
+    const columns = 9;
+    const count = rows * columns;
+    var packed_bytes: [rows * q8_1_block_bytes]u8 = undefined;
+    var raw: [columns * q4_0_block_bytes]u8 = undefined;
+    for (0..columns) |col| writeQ4_0SmokeRow(raw[col * q4_0_block_bytes ..][0..q4_0_block_bytes], 1, @intCast(@as(i32, @intCast(col)) - 4));
+    var input = try buffer_mod.DeviceBuffer.alloc(&ctx, packed_bytes.len);
+    defer input.free(&ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(&ctx, raw.len);
+    defer weight.free(&ctx);
+    try weight.copyFromHost(&ctx, &raw);
+    var outputs: [3]buffer_mod.DeviceBuffer = undefined;
+    var initialized: usize = 0;
+    defer for (outputs[0..initialized]) |*output| output.free(&ctx);
+    for (&outputs) |*output| {
+        output.* = try buffer_mod.DeviceBuffer.alloc(&ctx, (count + 2) * 4);
+        initialized += 1;
+    }
+    const Verify = struct {
+        fn replay(ctx_i: *context_mod.CudaContext, graph: anytype, input_i: buffer_mod.DeviceBuffer, packed_i: *[rows * q8_1_block_bytes]u8, result: []const buffer_mod.DeviceBuffer) !void {
+            for (1..4) |factor| {
+                for (0..rows) |row| {
+                    const block = packed_i[row * q8_1_block_bytes ..][0..q8_1_block_bytes];
+                    std.mem.writeInt(u16, block[0..2], 0x3800, .little); // d = 0.5
+                    std.mem.writeInt(u16, block[2..4], @bitCast(@as(f16, @floatFromInt((row + 1) * 16 * factor))), .little);
+                    @memset(block[4..], @intCast((row + 1) * factor));
+                }
+                try input_i.copyFromHost(ctx_i, packed_i);
+                try graph.launch(ctx_i);
+                for (result) |output| {
+                    var actual: [count + 2]f32 = undefined;
+                    try output.copyToHost(ctx_i, std.mem.sliceAsBytes(&actual));
+                    try ctx_i.synchronize();
+                    // Independent integer dot oracle for binary-exact scales.
+                    for (actual[0..count], 0..) |value, index| {
+                        const expected = @as(i32, @intCast(16 * (index / columns + 1) * factor)) * (@as(i32, @intCast(index % columns)) - 4);
+                        try std.testing.expectEqual(@as(f32, @floatFromInt(expected)), value);
+                    }
+                    try std.testing.expectEqual(@as(f32, -777), actual[count]);
+                    try std.testing.expectEqual(@as(f32, -777), actual[count + 1]);
+                }
+            }
+        }
+    };
+    const graph_mod = @import("graph.zig");
+    inline for (.{ row_schedules.linear2, row_schedules.linear4, row_schedules.linear8 }) |profile| {
+        const function = @field(module, profile.kernel_field) orelse return error.CudaKernelUnavailable;
+        try graph_mod.beginCapture(&ctx);
+        var capturing = true;
+        errdefer if (capturing) {
+            const abandoned = ctx.endStreamCapture() catch null;
+            if (abandoned != null) ctx.destroyGraph(abandoned);
+        };
+        try module.launchFillF32(&ctx, outputs[0], count + 2, -777);
+        try KernelModule.launchQ4Q8Rows(profile, function, &ctx, outputs[0].ptr, input.ptr, weight.ptr, rows, 32, columns);
+        var graph = try graph_mod.endCapture(&ctx);
+        capturing = false;
+        defer graph.deinit(&ctx);
+        try Verify.replay(&ctx, &graph, input, &packed_bytes, outputs[0..1]);
+    }
+    try std.testing.expect(@field(module, row_schedules.qkv4.kernel_field) != null);
+    try graph_mod.beginCapture(&ctx);
+    var capturing = true;
+    errdefer if (capturing) {
+        const abandoned = ctx.endStreamCapture() catch null;
+        if (abandoned != null) ctx.destroyGraph(abandoned);
+    };
+    for (outputs) |output| try module.launchFillF32(&ctx, output, count + 2, -777);
+    try module.launchLinearQ4_0QkvNoBiasQ8_1Tile8F32(&ctx, outputs[0], outputs[1], outputs[2], input, weight, weight, weight, rows, 32, columns, columns);
+    var graph = try graph_mod.endCapture(&ctx);
+    capturing = false;
+    defer graph.deinit(&ctx);
+    try Verify.replay(&ctx, &graph, input, &packed_bytes, &outputs);
 }

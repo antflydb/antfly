@@ -101,7 +101,7 @@ pub const regions = r.regions(&.{
     r.metalFamily("attention.dense_causal_sg", @import("native/metal_attention_dense_causal_sg.zig")),
     r.metalFamily("attention.gqa_split", @import("native/metal_attention_gqa_split.zig")),
     r.cudaFamily("attention.block", @import("native/cuda_attention_block.zig")),
-    r.cudaFamily("attention.bert_prefill", @import("native/cuda_attention_bert_prefill.zig")),
+    r.cudaFamily("attention.f32_hd64_prefill", @import("native/cuda_attention_f32_hd64_prefill.zig")),
     r.cudaFamily("attention.gqa_fast", @import("native/cuda_attention_gqa_fast.zig")),
     r.cudaFamily("attention.gqa_decode", @import("native/cuda_attention_gqa_decode.zig")),
     r.cudaFamily("attention.qkv_tiled", @import("native/cuda_attention_qkv_tiled.zig")),

@@ -467,7 +467,11 @@ test "prepared physical views keep their source live through publication and com
         try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0, 0, 1, 2, 3 }, first);
         const other = try cb.toFloat32(result.outputs[1], a);
         defer a.free(other);
-        for (other, [_]f32{ 4, 3, 2, 1, 0, -1, -2, -3 }) |value, exponent| try std.testing.expectApproxEqAbs(@exp(exponent), value, 1e-6);
+        // Compare the vector F32 exponential against an independent F64
+        // oracle. One F32 ULP at exp(4) already exceeds 1e-6 absolute.
+        for (other, [_]f64{ 4, 3, 2, 1, 0, -1, -2, -3 }) |value, exponent| {
+            try std.testing.expectApproxEqRel(@exp(exponent), @as(f64, value), 2 * std.math.floatEps(f32));
+        }
     }
 }
 
