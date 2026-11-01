@@ -9,7 +9,7 @@ probes and superseded measurements, is preserved in the
 
 ## Status at a glance
 
-Production builds seven runtime archives plus shared Apache storage and inference
+Production builds eight runtime archives plus shared Apache storage and inference
 owners and links them into one Antfly executable. The executable and `libantfly`
 use the same compiled physical engine and inference implementations. The C API
 links the Apache owners without server coordination. Native owner sharing is the
@@ -172,7 +172,7 @@ The work has two related objectives:
 
 ## Current compilation architecture
 
-The production topology produces seven independently code-generated static
+The production topology produces eight independently code-generated runtime static
 libraries and links them into one executable:
 
 ```text
@@ -184,6 +184,8 @@ thin linked antfly executable
 │   └── public C API and handle registry
 ├── antfly-storage-kernel (Apache-2.0)
 │   └── server/Raft adapters over the compiled physical engine
+├── antfly-runtime-local_query
+│   └── complete query parsing, leased execution, aggregation and response encoding
 ├── antfly-runtime-distributed
 │   ├── data, metadata and hot-standby control
 │   └── standalone lifecycle and product composition
@@ -208,11 +210,35 @@ one implementation of each owned subsystem.
 The former combined storage/application layout is retained in repository
 history for comparison; it is no longer a supported build topology.
 
+The [query-owner implementation record](../docs/design/compilation/history/query-owner-redesign-2026-11-01.md)
+describes the completed production split and its verification. The query ABI is
+storage-free; the provider resolves a synchronous native DB borrow only after
+checking its type/layout/compiler descriptor. The storage caller retains its
+readable-handle lease. The query provider keeps all derived read leases, retained
+cuts, cancellation/deadline checks, aggregation work and response allocation
+within the complete call, and destroys its response with its own allocator.
+
+Query implementation and storage-adapter implementation edits reuse the opposite
+archive. Shared physical DB sources remain dependencies of their consumers;
+this split does not promise that editing a shared DB declaration rebuilds only
+one archive. The physical search/index loops remain emitted by the shared engine.
+
+```sh
+cd zig
+zig build local-query-contract-test local-query-owner-test antfly-storage-owner-test
+zig build query-owner-archives -Doptimize=fast -Dstrip=true
+# zig-out/lib/libantfly-storage-kernel.a and libantfly-runtime-local_query.a
+cd ..
+python3 zig/tools/check_query_owner_cache.py --report .benchmark-results/compile-costs/query-owner-cache.json
+```
+
 ### Unit ownership
 
 | Unit | Owns | Must not own |
 |---|---|---|
-| Storage/local query | Physical table and shard handles, DB/LSM/index execution, local planning, batches, transaction participants, snapshots, restore publication, maintenance, Lite and CAPI exports | HTTP, auth, cluster routing, remote topology, model execution |
+| Physical storage | Table/shard lifetime, DB/LSM/index loops, local plans, batches, transactions, snapshots, restore, maintenance, Lite and public CAPI exports | HTTP, auth, cluster routing, remote topology, model execution |
+| Server storage adapter | Server/Raft adaptation over the physical owner, live DB ownership and admission | Complete local-query code generation |
+| Local query owner | Complete search/graph/text/algebraic/preflight operations, parsing, read-generation leases, aggregations and response ownership | DB lifetime, per-record cross-owner callbacks, a second index implementation |
 | Distributed/standalone | Table routing, topology, leadership, fanout, merge, distributed transactions, HA control, standalone startup/shutdown | Physical DB, index-manager, LSM, enrichment implementation or a second inference implementation |
 | API kernel | HTTP, auth, public validation, request translation and protocol handlers | Provisioned DB ownership, physical query execution or Raft apply |
 | Serverless | Published-artifact orchestration and serverless requests | Provisioned storage ownership, physical index execution or cluster Raft apply |
@@ -295,8 +321,11 @@ warm builds, then verifies these source changes:
 
 | Changed source | Required rebuild | Required reuse |
 |---|---|---|
-| Read/write coordination | Distributed runtime and affected consumer objects/links | Every other runtime archive and unrelated test objects |
-| Physical DB/local query | Storage archive and final test links | Other runtime archives and consumer/owner test objects |
+| Read coordination | Distributed and local-query archives, affected consumer objects/links | Storage adapter and unrelated runtime/test objects |
+| Write coordination | Distributed runtime and affected consumer objects/links | Other runtime archives and unrelated test objects |
+| Query-provider implementation | Local-query archive and final links | Storage adapter and consumer objects |
+| Storage-adapter implementation | Storage adapter and final links | Local-query archive and consumer objects |
+| Physical DB/local query | Storage and local-query archives and final test links | Unrelated runtime archives and consumer/owner test objects |
 | Owner or consumer test root | Its test object and final link | Every runtime archive and unrelated test objects |
 | Storage ABI contract | Storage, distributed runtime, owner tests | CLI, inference, enrichment |
 
@@ -718,9 +747,12 @@ shorten one of those two critical paths without unacceptable aggregate work.
 
 ### Priority 1: storage/local query
 
-Storage was the largest compiler in the historical six-unit baseline at 482.880 seconds. The next credible
-experiment is inside the physical owner, not another source facade or top-level
-role split.
+Storage was the largest compiler in the historical six-unit baseline at 482.880 seconds.
+Complete server queries now have a production archive with checked DB borrows;
+its cache and release results are in the query-owner record above. That isolates
+query orchestration edits and retains physical index/search loops in the shared
+engine. It does not establish a lower whole-product peak or cold build time.
+Further physical-engine cuts need complete-operation measurements.
 
 The leading candidate is a coarse local-index subsystem built from exact
 production entry points. It should own a complete, coherent family such as:
@@ -837,7 +869,7 @@ from local Apple-Silicon cross-builds.
 
 - One static `antfly` executable contains every required command and embedded
   standalone inference.
-- `libantfly` remains below 80 MiB (see the raised gate above) and exposes
+- `libantfly` remains below the current 88 MiB release gate and exposes
   only the public C API.
 - Production artifacts contain no LMDB implementation symbols or entry-point
   strings.
@@ -846,8 +878,9 @@ from local Apple-Silicon cross-builds.
 
 ### Architecture and behavior
 
-- Storage/local query implementation is emitted once and reused by the
-  executable and C API.
+- Physical storage/index/search implementations are emitted once and reused
+  by the executable and C API. Complete server-query orchestration has its own
+  checked archive; repeated helper emission is reported separately.
 - API, distributed control, standalone composition, and serverless do not
   analyze physical storage implementation roots.
 - Calls remain coarse and ownership-safe.
