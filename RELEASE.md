@@ -575,6 +575,22 @@ Releases. Their immutable recovery source is R2. npm tarballs and Python wheels
 are still produced and ledger-verified by the common build, but are retained as
 release artifacts rather than published package-registry versions.
 
+## Homebrew Publishing Credentials
+
+The stable formula publisher uses the organization-owned Homebrew publisher
+GitHub App. Install the App only on `antflydb/homebrew-taps` with repository
+Contents read/write access. Share the organization Actions variable
+`HOMEBREW_APP_CLIENT_ID` with `antfly` and `antfly-cloud`. Restrict the organization
+secret `HOMEBREW_APP_PRIVATE_KEY` (the full PEM) to `antfly`; Cloud keeps its copy
+in the protected `antfly-cloud-cli-release` environment so it requires release
+approval. The Antfly release workflow creates a short-lived token restricted to
+the tap immediately before checkout and revokes it when the job ends.
+
+Rotate the App key by generating a replacement, updating Antfly's organization
+secret and Cloud's protected environment secret, and verifying publishing access
+before deleting the old App key. Remove legacy PAT secrets after publishing is
+verified.
+
 ## Object Retention
 
 Stable R2 releases are retained forever. A nightly remains recoverable for at
