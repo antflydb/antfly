@@ -35,17 +35,19 @@ export class CommittedHeaders {
   const compressed={format:2,namespace:this.namespace,version:this.version,encoding:'gzip',payload:btoa(String.fromCharCode(...bytes))};
   return JSON.stringify(compressed).length<source.length?compressed:value;
  }
- static wrap(transport,value,namespace,version){
+ static wrap(transport,value,namespace,version,{onStage}={}){
   if(value==null||value.version!==version)return transport;
   if(value.format===2){
    if(value.namespace!==namespace||value.encoding!=='gzip'||typeof value.payload!=='string'||value.payload.length>17000)throw Error('InvalidCommittedHeaders');
    let decoded;
    return async(request,body)=>{
     if(!decoded){
+     const started=performance.now();try{
      const source=Uint8Array.from(atob(value.payload),c=>c.charCodeAt(0)),reader=new Blob([source]).stream().pipeThrough(new DecompressionStream('gzip')).getReader();let count=0;const parts=[];
      try{for(;;){const{done,value:part}=await reader.read();if(done)break;count+=part.length;if(count>17000)throw Error('InvalidCommittedHeaders');parts.push(part);}}finally{await reader.cancel();}
      const bytes=new Uint8Array(count);let offset=0;for(const part of parts){bytes.set(part,offset);offset+=part.length;}
      const plain=JSON.parse(text.decode(bytes));if(![1,3].includes(plain.format)||plain.version!==version)throw Error('InvalidCommittedHeaders');decoded=CommittedHeaders.wrap(transport,plain,namespace,version);
+     }finally{onStage?.({name:"bootstrap_decode",duration_ms:performance.now()-started});}
     }
     return decoded(request,body);
    };

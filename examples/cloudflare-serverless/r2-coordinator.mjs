@@ -85,10 +85,27 @@ export class R2CommitCoordinator extends DurableObject {
     this.maintenance=new MaintenanceTickets(this.maintenanceStore);
     this.journal = new R2CollectionJournal(this.maintenanceStore);
     if(env.RESIDENT_DURABLE_BOOTSTRAP==="true")this.store.durableBootstrap=new DurableServingBootstrap(ctx.storage,env,ctx.id.toString(),{onError:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify(sample));}});
-    this.authorityAdmission=new AuthorityAdmission(async()=>{if(this.store.ownerReady)await this.store.ownerReady;const local=await this.store.durableBootstrap?.authority();if(local)return local;const result=await openAuthority(env,coordinatorAuthorityMode(env));await this.store.durableBootstrap?.adopt(result);return result;});
+    this.authorityAdmission=new AuthorityAdmission(async()=>{
+      const trace=new CriticalPath({scope:"bootstrap:config"});
+      try{
+        if(this.store.ownerReady)await trace.span("owner_identity",()=>this.store.ownerReady);
+        const local=await trace.span("provider_storage_get",()=>this.store.durableBootstrap?.authority());if(local)return local;
+        const result=await trace.span("object_authority",()=>openAuthority(env,coordinatorAuthorityMode(env)));
+        await trace.span("provider_storage_adopt",()=>this.store.durableBootstrap?.adopt(result));return result;
+      }finally{trace.emit(env.LOG_METRICS==="true");}
+    });
     if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.actor_started",role:"writer",actor_id:ctx.id.toString(),actor_instance_id:instanceId,version:env.WORKER_VERSION?.id,owner_identity:env.RESIDENT_SERVING==="true"?"instance-term":owner?"actor-version":"ephemeral",...kernelMetrics()}));
   }
-  async ensureAuthority(){if(this.store.durableBootstrap?.entry?.blocked)throw Error("CoordinatorMigrationRequired");if(!this.authority){const authority=await this.authorityAdmission.get();this.store.configureAuthority(authority.descriptor);await this.store.restoreDurableRead();this.authority??=authority;}return this.authority;}
+  async ensureAuthority(trace){
+    if(this.store.durableBootstrap?.entry?.blocked)throw Error("CoordinatorMigrationRequired");
+    if(!this.authority){
+      const authority=await(trace?trace.span("authority_config",()=>this.authorityAdmission.get()):this.authorityAdmission.get());
+      this.store.configureAuthority(authority.descriptor);
+      const restore=()=>this.store.restoreDurableRead({onStage:trace?sample=>trace.stage({...sample,name:"bootstrap_"+sample.name}):undefined});
+      await(trace?trace.span("bootstrap_restore",restore):restore());this.authority??=authority;
+    }
+    return this.authority;
+  }
   async checkpointDurableServing(){await this.ensureAuthority();return this.store.flushDurableCheckpoint();}
   async freezeDurableServing(){
     await this.ensureAuthority();if(!this.store.durableBootstrap)throw Error("DurableBootstrapStorageRequired");this.store.freezeRequested=true;
@@ -110,7 +127,7 @@ export class R2CommitCoordinator extends DurableObject {
     const requestWall=submittedWall??Date.now(),requestMono=submittedMono??performance.now(),deadlineMs=requestWall+30000,trace=new CriticalPath({id:trace_id,scope:"resident:lookup"});
     const physical={};let metrics,succeeded=false,promotions=0;
     try{
-    await this.ensureAuthority();
+    await trace.span("authority_ready",()=>this.ensureAuthority(trace));
     const keys=this.residentKeys??=await metadataKeys(this.env.ANTFLY_INCARNATION);
     const captured=await trace.span("owner_admission",()=>this.store.ownerRead(async tx=>{
       const migration=await tx.get(MIGRATION);
@@ -120,11 +137,11 @@ export class R2CommitCoordinator extends DurableObject {
     },{deadlineMs,traceId:trace.id,...(this.env.RESIDENT_COLD_PIPELINE==="true"?{prefetchKeys:[MIGRATION,keys.head,keys.wal,keys.floor,...(this.env.RESIDENT_BOOTSTRAP==="true"?["__antfly_serving_boot/"+this.env.ANTFLY_INCARNATION]:[])]}:{})}));
     // Hash only owned captured bytes outside the sequencing queue.
     const raw=new TextEncoder().encode(JSON.stringify(["antfly.resident.cut.v1",this.env.ANTFLY_INCARNATION,this.authority.descriptor.serving.owner_id,this.store.namespace,captured.epoch,captured.view.version,captured.view.entries.filter(([key])=>key===keys.head||key===keys.wal||key===keys.floor)]));
-    captured.cut=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",raw)));
+    captured.cut=Array.from(new Uint8Array(await trace.span("cut_hash",()=>crypto.subtle.digest("SHA-256",raw))));
     if(captured.view.lease&&!bindReadLease(captured.view,{started:requestMono}))throw Error("ManifestReadLeaseExpired");
     let lastWall=requestWall,lastMono=requestMono;
     const check=()=>{const wall=Date.now(),mono=performance.now();if(wall<lastWall||mono<lastMono||wall>=deadlineMs||mono-requestMono>=30000||captured.view.lease&&readLeaseRemaining(captured.view)<=0)throw Error("ManifestReadLeaseExpired");lastWall=wall;lastMono=mono;return Math.min(deadlineMs-wall,requestMono+30000-mono,captured.view.lease?readLeaseRemaining(captured.view):Infinity);};
-    const rawTransport=instrumentTransport(createR2Transport({database:this.env.DATABASE}),physical),wrapTransport=up=>withReadView(this.store.dataCache.wrap(CommittedHeaders.wrap(up,captured.boot,this.env.ANTFLY_INCARNATION,captured.view.version),this.env.ANTFLY_INCARNATION,{protect:true}),{openReadView:()=>{throw Error("ResidentReadViewMissing");}},this.env.ANTFLY_INCARNATION,{initial:captured.view});
+    const rawTransport=instrumentTransport(createR2Transport({database:this.env.DATABASE}),physical),wrapTransport=up=>withReadView(this.store.dataCache.wrap(CommittedHeaders.wrap(up,captured.boot,this.env.ANTFLY_INCARNATION,captured.view.version,{onStage:sample=>trace.stage(sample)}),this.env.ANTFLY_INCARNATION,{protect:true}),{openReadView:()=>{throw Error("ResidentReadViewMissing");}},this.env.ANTFLY_INCARNATION,{initial:captured.view});
       let loadTransport=wrapTransport(rawTransport);
       if(this.env.RESIDENT_FETCH_COALESCE==="true"){
         this.immutableFlights??=new ImmutableFlights({reserve:reserveInput,onCharge:bytes=>{this.store.servingFlightBytes=bytes;}});

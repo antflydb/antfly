@@ -67,3 +67,14 @@ test('dirty intervals coalesce intents but uncertain clean durability requires a
  await b.freeze();assert.equal(s.value.blocked,true);
  await assert.rejects(new DurableServingBootstrap(s,env,owner).authority(),/MigrationRequired/);
 });
+test('qualification native artifacts share immutable bytes without linking mutable build outputs',async()=>{
+ const{mkdtemp,mkdir,readFile,rm,stat,writeFile}=await import('node:fs/promises');const{join}=await import('node:path');const{retainNativeModules}=await import('../qualification/native-artifacts.mjs');
+ const dir=await mkdtemp(new URL('../dist/qualification/native-artifact-test-',import.meta.url));
+ try{
+  const one=join(dir,'one'),two=join(dir,'two'),cache=join(dir,'cache');await mkdir(one);await mkdir(two);
+  const contents=Buffer.from('immutable wasm fixture'),modules=[{path:'build/module.wasm',contents}];
+  const first=await retainNativeModules(modules,one,cache),second=await retainNativeModules(modules,two,cache);assert.deepEqual(first,second);assert.equal((await stat(join(one,'module.wasm'))).ino,(await stat(join(two,'module.wasm'))).ino);
+  contents.fill(0);assert.equal((await readFile(join(one,'module.wasm'))).toString(),'immutable wasm fixture');
+  const hash=first['module.wasm'];await rm(join(cache,hash+'.wasm'));await writeFile(join(cache,hash+'.wasm'),'corrupt');const three=join(dir,'three');await mkdir(three);await assert.rejects(retainNativeModules([{path:'module.wasm',contents:Buffer.from('immutable wasm fixture')}],three,cache),/NativeArtifactHashMismatch/);
+ }finally{await rm(dir,{recursive:true,force:true});}
+});

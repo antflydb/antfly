@@ -84,22 +84,22 @@ export class R2CoordinatorStore {
     if(!this.durableBootstrap)return Promise.reject(Error("DurableBootstrapStorageRequired"));
     return this.enqueue({kind:"durable_checkpoint",priority:"maintenance",deadlineMs,run:()=>{}});
   }
-  async servingCodec(action,extra={},{tryOnly=false}={}){
-    const run=host=>{
+  async servingCodec(action,extra={},{tryOnly=false,onStage}={}){
+    const run=async host=>{
       if(host.servingCapsuleABI!==1)throw Error("ServingCapsuleModuleRequired");
       if(action==="probe")return;
-      return host.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{root_backend:"bounded_journal",action,owner:this.owner,serving_scope:this.exclusiveOwnerId,...extra}},{transport:()=>{throw Error("ServingCapsuleIoForbidden");},deadlineMs:this.deadline??this.clock()+5000});
+      const started=performance.now();try{return await host.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{root_backend:"bounded_journal",action,owner:this.owner,serving_scope:this.exclusiveOwnerId,...extra}},{transport:()=>{throw Error("ServingCapsuleIoForbidden");},deadlineMs:this.deadline??this.clock()+5000});}finally{onStage?.({name:action+"_native",duration_ms:performance.now()-started});}
     };
-    const options={deadlineMs:this.deadline??this.clock()+5000,fairKey:this.namespace,priority:action==="serving_export"?"maintenance":action==="serving_import"?"interactive":"commit"};
+    const options={onStage,deadlineMs:this.deadline??this.clock()+5000,fairKey:this.namespace,priority:action==="serving_export"?"maintenance":action==="serving_import"?"interactive":"commit"};
     return tryOnly?this.snapshotKernel.tryWithHost(run,options):this.snapshotKernel.withHost(run,options);
   }
-  async restoreDurableRead(){
+  async restoreDurableRead({onStage}={}){
     if(!this.durableBootstrap)return;
     this.configureDurableCheckpoint();
     if(!WebAssembly.Module.exports(this.module).some(entry=>entry.name==="antfly_host_serving_capsule_v1"))throw Error("ServingCapsuleModuleRequired");
     if(this.durableRestore){while(!this.durableRestore.done)await new Promise(r=>setTimeout(r,2));if(this.durableRestore.error)throw Error(this.durableRestore.error);return;}
     const ticket=this.durableRestore={done:false,error:null};
-    try{if(this.durableBootstrap.entry?.dirty)await this.servingCodec("probe");const restored=await this.durableBootstrap.restore((action,extra)=>this.servingCodec(action,extra));
+    try{if(this.durableBootstrap.entry?.dirty)await this.servingCodec("probe",{},{onStage});const restored=await this.durableBootstrap.restore((action,extra)=>this.servingCodec(action,extra,{onStage}));
       if(restored){this.durableReadState=restored;this.durableWriteCursor=restored.state;this.observedState=restored.state;this.base=restored.base;this.pagePrefix=restored.page_prefix;}
     }catch(error){ticket.error=String(error.message??error);throw error;}finally{ticket.done=true;}
   }

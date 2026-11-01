@@ -16,6 +16,7 @@
 // Controlled actual-workerd/WASM experiment. Injected delays characterize
 // dependency depth, including preparation; they do not measure cloud SLOs.
 // Use a new report directory to preserve the earlier sealed latency evidence.
+import{retainNativeModules}from'./native-artifacts.mjs';
 import{execFileSync}from'node:child_process';
 import{build}from'esbuild';import{Miniflare,convertV4MiniflareOptions}from'miniflare';
 import{readFile,writeFile,mkdir,mkdtemp,rm}from'node:fs/promises';import{resolve,join}from'node:path';import{createHash}from'node:crypto';import assert from'node:assert/strict';
@@ -59,8 +60,7 @@ for(const variant of variants){
  if(twofold)console.log(JSON.stringify({event:'lab_progress',variant:variant.name,phase:'bundle'}));
  const nativeModules=moduleSets.get(!!variant.baseline);
  const sealed=join(out,outputName.replace('.json','')+'-'+variant.name);await mkdir(sealed,{recursive:true});
- for(const module of nativeModules)await writeFile(join(sealed,module.path.split('/').at(-1)),module.contents);
- const nativeHashes=Object.fromEntries(nativeModules.map(m=>[m.path.split('/').at(-1),createHash('sha256').update(m.contents).digest('hex')]));
+ const nativeHashes=await retainNativeModules(nativeModules,sealed,join(root,'dist/qualification/native-artifacts'));
  const bindings={API_TOKEN:'local-latency',ANTFLY_INCARNATION:'latency-'+(twofold?'uniform-v1':variant.name),COORDINATOR_BACKEND:'r2',SPLIT_RUNTIME:'true',DIRECT_READS:'true',LOCAL_METADATA_READS:'true',INLINE_METADATA_ROOTS:'true',WAL_INLINE_TAIL:'true',PAGED_TEXT:'true',PAGED_PROJECTIONS:'true',PUBLICATION_RECORDS:'64',LOG_METRICS:'true',WORKER_VERSION:{id:'01234567-0123-4567-89ab-0123456789ab'},ANTFLY_TENANTS:JSON.stringify(Object.fromEntries(['a','b','c','d'].map(t=>[t,{incarnation:'latency-'+(twofold?'uniform-v1':variant.name)+'-'+t,storage_id:'latency-'+(twofold?'uniform-v1':variant.name)+'-'+t}]))),...Object.fromEntries(Object.entries(variant).filter(([k])=>k===k.toUpperCase()))};
  await writeFile(join(sealed,'bindings.json'),JSON.stringify(bindings,null,2));
  const classes={writer:'R2CommitCoordinator',reader:'R2ReadRuntime',builder:'R2BuildRuntime'},durableObjects=Object.fromEntries(Object.entries({COMMITS:'writer',READERS:'reader',BUILDERS:'builder'}).map(([binding,role])=>[binding,{className:classes[role],scriptName:role,useSQLite:true}]));
