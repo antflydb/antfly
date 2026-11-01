@@ -17583,6 +17583,14 @@ export interface components {
          * @enum {string}
          */
         DistanceMetric: "l2_squared" | "inner_product" | "cosine";
+        /**
+         * @description How a dense index with quantization_bits above 1 uses its extended codes.
+         *     near_cutoff scores with 1-bit codes and rescores only candidates that could still
+         *     enter the result candidates; all rescores every scanned vector.
+         * @default near_cutoff
+         * @enum {string}
+         */
+        QuantizationRefine: "near_cutoff" | "all";
         /** @description Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted. */
         IndexExecutionConfig: {
             /** @description Chunk producer batching for shorthand-created chunk enrichments. */
@@ -17626,6 +17634,16 @@ export interface components {
             distance_metric?: components["schemas"]["DistanceMetric"];
             /** @description Whether to use in-memory only storage (dense only) */
             mem_only?: boolean;
+            /**
+             * @description RaBitQ bits per dimension for dense indexes (dense only). The default of 1 keeps
+             *     the compact 1-bit codes. Larger values also store extended RaBitQ codes and use them
+             *     to rescore candidates, which improves recall and reduces exact reranking at the cost
+             *     of index size (about dims * bits / 8 extra bytes per vector). Values above 1 enable a
+             *     random rotation of vectors. Fixed when the index is created.
+             * @default 1
+             */
+            quantization_bits?: number;
+            quantization_refine?: components["schemas"]["QuantizationRefine"];
             /** @description Configuration for the embeddings plugin (managed indexes only; not allowed when external=true) */
             embedder?: components["schemas"]["IndexEmbedderConfig"];
             /** @description Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing. */

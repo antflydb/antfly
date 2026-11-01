@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
 from ..models.index_publication_policy import IndexPublicationPolicy
+from ..models.quantization_refine import QuantizationRefine
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -66,6 +67,17 @@ class EmbeddingsIndexConfig:
                 models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
                 product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
             mem_only (bool | Unset): Whether to use in-memory only storage (dense only)
+            quantization_bits (int | Unset): RaBitQ bits per dimension for dense indexes (dense only). The default of 1
+                keeps
+                the compact 1-bit codes. Larger values also store extended RaBitQ codes and use them
+                to rescore candidates, which improves recall and reduces exact reranking at the cost
+                of index size (about dims * bits / 8 extra bytes per vector). Values above 1 enable a
+                random rotation of vectors. Fixed when the index is created.
+                 Default: 1.
+            quantization_refine (QuantizationRefine | Unset): How a dense index with quantization_bits above 1 uses its
+                extended codes.
+                near_cutoff scores with 1-bit codes and rescores only candidates that could still
+                enter the result candidates; all rescores every scanned vector.
             embedder (AntflyEmbedderConfig | BedrockEmbedderConfig | CloudflareEmbedderConfig | CohereEmbedderConfig |
                 GoogleEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig | OpenRouterEmbedderConfig | Unset |
                 VertexEmbedderConfig): Embedding provider configuration accepted when Antfly creates and
@@ -93,6 +105,8 @@ class EmbeddingsIndexConfig:
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
     mem_only: bool | Unset = UNSET
+    quantization_bits: int | Unset = 1
+    quantization_refine: QuantizationRefine | Unset = UNSET
     embedder: (
         AntflyEmbedderConfig
         | BedrockEmbedderConfig
@@ -157,6 +171,12 @@ class EmbeddingsIndexConfig:
 
         mem_only = self.mem_only
 
+        quantization_bits = self.quantization_bits
+
+        quantization_refine: str | Unset = UNSET
+        if not isinstance(self.quantization_refine, Unset):
+            quantization_refine = self.quantization_refine.value
+
         embedder: dict[str, Any] | Unset
         if isinstance(self.embedder, Unset):
             embedder = UNSET
@@ -220,6 +240,10 @@ class EmbeddingsIndexConfig:
             field_dict["distance_metric"] = distance_metric
         if mem_only is not UNSET:
             field_dict["mem_only"] = mem_only
+        if quantization_bits is not UNSET:
+            field_dict["quantization_bits"] = quantization_bits
+        if quantization_refine is not UNSET:
+            field_dict["quantization_refine"] = quantization_refine
         if embedder is not UNSET:
             field_dict["embedder"] = embedder
         if chunker is not UNSET:
@@ -296,6 +320,15 @@ class EmbeddingsIndexConfig:
             distance_metric = DistanceMetric(_distance_metric)
 
         mem_only = d.pop("mem_only", UNSET)
+
+        quantization_bits = d.pop("quantization_bits", UNSET)
+
+        _quantization_refine = d.pop("quantization_refine", UNSET)
+        quantization_refine: QuantizationRefine | Unset
+        if isinstance(_quantization_refine, Unset):
+            quantization_refine = UNSET
+        else:
+            quantization_refine = QuantizationRefine(_quantization_refine)
 
         def _parse_embedder(
             data: object,
@@ -418,6 +451,8 @@ class EmbeddingsIndexConfig:
             template=template,
             distance_metric=distance_metric,
             mem_only=mem_only,
+            quantization_bits=quantization_bits,
+            quantization_refine=quantization_refine,
             embedder=embedder,
             chunker=chunker,
             top_k=top_k,

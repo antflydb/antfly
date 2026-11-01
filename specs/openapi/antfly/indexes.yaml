@@ -2259,6 +2259,20 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether to use in-memory only storage (dense only)"
+        quantization_bits:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          maximum: 8
+          default: 1
+          description: |
+            RaBitQ bits per dimension for dense indexes (dense only). The default of 1 keeps
+            the compact 1-bit codes. Larger values also store extended RaBitQ codes and use them
+            to rescore candidates, which improves recall and reduces exact reranking at the cost
+            of index size (about dims * bits / 8 extra bytes per vector). Values above 1 enable a
+            random rotation of vectors. Fixed when the index is created.
+        quantization_refine:
+          $ref: "#/components/schemas/QuantizationRefine"
         embedder:
           description: "Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)"
           $ref: "embeddings.yaml#/components/schemas/IndexEmbedderConfig"
@@ -2286,6 +2300,16 @@ components:
         execution:
           $ref: "#/components/schemas/IndexExecutionConfig"
           description: "Non-semantic execution policy for shorthand-created chunking or embedding producers."
+    QuantizationRefine:
+      type: string
+      enum:
+        - near_cutoff
+        - all
+      default: near_cutoff
+      description: |
+        How a dense index with quantization_bits above 1 uses its extended codes.
+        near_cutoff scores with 1-bit codes and rescores only candidates that could still
+        enter the result candidates; all rescores every scanned vector.
     DerivedCoveragePolicy:
       type: string
       enum:
