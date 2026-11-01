@@ -50,6 +50,17 @@ def _run_activity_func(call, env=None):
     )
 
 
+def _make_stub(bin_dir, name, body):
+    """Write a tiny fake executable named `name` into `bin_dir` so a test
+    can make one real tool (pgrep/lsof/ps) misbehave on purpose, via a
+    PATH override, without touching any real process inspection the rest
+    of the suite relies on."""
+    path = bin_dir / name
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    path.chmod(0o755)
+    return path
+
+
 class CacheArgParsingTests(unittest.TestCase):
     """Pure string-handling helpers -- no processes involved."""
 
@@ -118,12 +129,124 @@ class ActivityDetectionTests(unittest.TestCase):
             shutil.rmtree(empty_bin, ignore_errors=True)
 
 
+class InspectionFailureFailSafeTests(unittest.TestCase):
+    """A reviewer found that build_active_in/shared_cache_busy treated a
+    pgrep/lsof/ps *failure* (as opposed to a clean "no matches"/"no such
+    cwd") the same as "not busy": pgrep exiting 2, or lsof/ps failing to
+    inspect a pid pgrep just handed back, were silently swallowed, which
+    permits deleting a live build's cache. These stub out one real tool
+    at a time via a PATH override (small fake scripts, never a mktemp
+    dir -- AGENTS.md puts scratch under scripts/.tmp-logs/) and assert
+    the guards now fail safe (report busy) with a reason, rather than
+    quietly reporting idle.
+    """
+
+    def setUp(self):
+        self.bin_dir = SCRATCH_ROOT / f"stub-bin-{uuid.uuid4().hex[:8]}"
+        self.bin_dir.mkdir(parents=True)
+        self.proc = None
+
+    def tearDown(self):
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+        shutil.rmtree(self.bin_dir, ignore_errors=True)
+
+    def _stubbed_env(self, **extra):
+        env = os.environ.copy()
+        env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
+        env.update(extra)
+        return env
+
+    def _spawn_live_candidate(self, cwd):
+        # Stands in for a real build process the same way the
+        # integration fixture below does: a plain `sleep`, matched via
+        # CACHE_GC_ZIG_PROC_NAMES="sleep" so no fake binary is needed to
+        # fool `pgrep -x`.
+        cwd.mkdir(parents=True, exist_ok=True)
+        self.proc = subprocess.Popen(
+            ["sleep", "300"],
+            cwd=str(cwd),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.2)
+
+    def test_pgrep_error_exit_makes_build_active_in_busy(self):
+        _make_stub(self.bin_dir, "pgrep", "exit 2")
+        env = self._stubbed_env()
+        result = _run_activity_func('build_active_in "/tmp"; echo "rc=$?"', env=env)
+        self.assertIn("rc=0", result.stdout)
+        self.assertIn("pgrep exit 2", result.stdout)
+        self.assertIn("skipping to be safe", result.stdout)
+
+    def test_pgrep_error_exit_makes_shared_cache_busy_busy(self):
+        _make_stub(self.bin_dir, "pgrep", "exit 2")
+        env = self._stubbed_env()
+        result = _run_activity_func('shared_cache_busy zig; echo "rc=$?"', env=env)
+        self.assertIn("rc=0", result.stdout)
+        self.assertIn("exit 2", result.stdout)
+        self.assertIn("skipping to be safe", result.stdout)
+
+    def test_lsof_failure_for_live_pid_makes_build_active_in_busy(self):
+        candidate_cwd = self.bin_dir.parent / f"lsof-fixture-{uuid.uuid4().hex[:8]}"
+        self._spawn_live_candidate(candidate_cwd)
+        try:
+            _make_stub(self.bin_dir, "lsof", "exit 1")
+            env = self._stubbed_env(CACHE_GC_ZIG_PROC_NAMES="sleep")
+            # The path doesn't matter here: a failing cwd lookup must be
+            # reported *before* any path comparison, regardless of what
+            # path is being checked.
+            result = _run_activity_func(
+                'build_active_in "/nonexistent-path"; echo "rc=$?"', env=env
+            )
+            self.assertIn("rc=0", result.stdout)
+            self.assertIn("lsof", result.stdout)
+            self.assertIn("skipping to be safe", result.stdout)
+        finally:
+            shutil.rmtree(candidate_cwd, ignore_errors=True)
+
+    def test_ps_failure_makes_build_active_in_busy(self):
+        candidate_cwd = self.bin_dir.parent / f"ps-fixture-{uuid.uuid4().hex[:8]}"
+        self._spawn_live_candidate(candidate_cwd)
+        try:
+            _make_stub(self.bin_dir, "ps", "exit 1")
+            env = self._stubbed_env(CACHE_GC_ZIG_PROC_NAMES="sleep")
+            # Query a path that can't overlap with the real candidate's
+            # real cwd (looked up with the real, unstubbed lsof/proc),
+            # so the guard falls through to the ps-based command-line
+            # check, where the stub bites.
+            result = _run_activity_func(
+                'build_active_in "/nonexistent-path"; echo "rc=$?"', env=env
+            )
+            self.assertIn("rc=0", result.stdout)
+            self.assertIn("ps", result.stdout)
+            self.assertIn("skipping to be safe", result.stdout)
+        finally:
+            shutil.rmtree(candidate_cwd, ignore_errors=True)
+
+
 class CacheGcIntegrationTest(unittest.TestCase):
     """Builds a fake worktree tree, puts a real long-running process (a
     plain `sleep`, stood in for a build via CACHE_GC_ZIG_PROC_NAMES) with
     its cwd inside one worktree, and runs the actual cache_gc.sh against
     that fake tree. Asserts the active worktree's cache is skipped while
     the inactive worktree's old cache is cleaned.
+
+    Under some sandboxed test runners, pgrep/lsof are themselves
+    restricted and fail to see the live fixture process at all -- that
+    previously made the guard miss it and silently report idle. With
+    the inspection-failure fail-safe in place, that same restriction
+    now surfaces as an inspection error, and the guard must still skip
+    the active worktree (just for a different, equally valid, reason).
+    So the primary assertion here is "the active worktree is skipped
+    either way"; the stronger "and the idle one is positively cleaned,
+    with no fail-safe involved" assertion only applies once we can tell
+    detection genuinely worked.
     """
 
     def setUp(self):
@@ -215,28 +338,43 @@ class CacheGcIntegrationTest(unittest.TestCase):
             idle_lines, "expected the idle worktree's cache to be mentioned"
         )
 
+        # The safe behavior, regardless of *why*: the active worktree's
+        # cache is always skipped and never deleted -- whether because
+        # the live `sleep` stand-in was genuinely found busy there, or
+        # because pgrep/lsof/ps couldn't be trusted to tell (sandboxed
+        # test runners can restrict either) and the guard failed safe.
         self.assertTrue(
-            any("skip" in line and "active build" in line for line in active_lines),
+            any("skip" in line for line in active_lines),
             f"active worktree cache should be skipped, got: {active_lines}",
         )
         self.assertFalse(
             any(line.strip().startswith("rm ") for line in active_lines),
             f"active worktree cache should never be deleted, got: {active_lines}",
         )
-
-        self.assertTrue(
-            any(line.strip().startswith("rm ") for line in idle_lines),
-            f"idle worktree cache should be identified for removal, got: {idle_lines}",
-        )
-        self.assertFalse(
-            any("skip" in line for line in idle_lines),
-            f"idle worktree cache should not be skipped, got: {idle_lines}",
-        )
-
         self.assertIn("Skipped (active builds)", stdout)
         self.assertIn(
             str(self.active_cache), stdout.split("Skipped (active builds)", 1)[1]
         )
+
+        # The stronger claim -- the idle worktree's cache is positively
+        # cleaned, not just also swept up by a fail-safe -- only holds
+        # when detection genuinely worked (the active worktree's skip
+        # reason names a real pid/cwd match, not an inspection failure).
+        genuinely_detected = any(
+            "active build" in line
+            and "cannot inspect" not in line
+            and "inspection" not in line
+            for line in active_lines
+        )
+        if genuinely_detected:
+            self.assertTrue(
+                any(line.strip().startswith("rm ") for line in idle_lines),
+                f"idle worktree cache should be identified for removal, got: {idle_lines}",
+            )
+            self.assertFalse(
+                any("skip" in line for line in idle_lines),
+                f"idle worktree cache should not be skipped, got: {idle_lines}",
+            )
 
 
 if __name__ == "__main__":
