@@ -133,6 +133,45 @@ kernel comparison but do not qualify the A100 serving deployment or its containe
 libraries. Require the paired released runtime/operator and an A100 canary before
 changing the live shared reader pool.
 
+### Fresh HTTP parity baseline (2026-11-01)
+
+The follow-up starts from merged main `1004ca0325`. The two engines use the
+same HTTP client, original hash-verified checkpoint bytes, two hash-verified
+private pages, image-only greedy decoding and 2,048 output tokens. Each shape
+has one excluded warm-up and two measured rounds; warm-up output still
+participates in exact correctness. The serial cohort contains two pages; the
+concurrent cohort contains two copies of each page and four overlapping
+requests. These different cohort sizes must not be compared as serial speedup.
+
+| Model and serving shape | Native median seconds | vLLM HTTP median seconds | Exact output agreement |
+| --- | ---: | ---: | --- |
+| 4B, two serial pages | 51.688 | 57.159 | No: dense page differs |
+| 4B, four concurrent pages | 40.787 | 32.846 | No: dense page differs |
+| 0.8B, two serial pages | 12.588 | 10.571 | Yes |
+| 0.8B, four concurrent pages | 10.138 | 6.994 | Yes |
+
+Both engines are internally stable between serial and concurrent shapes in
+these new HTTP captures. This differs from the older in-process evidence below;
+no result was normalized to hide that difference. The 4B native serial latency
+is lower, while its exact-output and concurrent-throughput gates fail. The 0.8B
+outputs match exactly, while both throughput gates fail. This baseline does not
+establish overall parity.
+
+The [hash-only evidence receipt](reader-parity-2026-11-01.json) records the
+upstream tree, imported source snapshot, binary/configuration/capture hashes,
+verified checkpoint provenance, engine versions and GPU identity. Model bytes
+were verified before each server started; every server released the GPU before
+the next capture. Startup used locally cached artifacts and is separate from
+warm serving time. No A100 or production-container qualification is implied.
+
+The separate graph candidate removes the two-token decoder-graph assumption
+in favor of the existing bounded continuation width and remaining output
+allowance. Independent attention/graph oracle tests pass 72 cases across depths
+3, 4 and 8, both model geometries and 2–128 rows, including complete KV contents,
+unused slots, reset/replay, positions/progress and canaries. Maximum absolute
+error is `3.52e-6`, below the unchanged `2e-5` F32 tolerance. Full-model candidate
+measurements and lifecycle qualification remain pending.
+
 ### Current large-page investigation
 
 The concurrent throughput target is not met yet. The isolated DGX Spark tests

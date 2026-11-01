@@ -1,0 +1,165 @@
+{
+  "schema": "antfly.reader-parity-evidence/v1",
+  "scope": "Fresh isolated HTTP captures; original BF16 checkpoints; private hash-verified pages; greedy image-only; 2048 output tokens; one excluded warm-up and two measured rounds",
+  "upstream_baseline_commit": "1004ca0325a83047e141c13b058a3bb537a13084",
+  "upstream_baseline_tree": "50ed11cad248ac3c03963c3b5e3deb79325af727",
+  "remote_import_commit": "4ee0e16b57cee78e2b2b850f58def0c11af312a7",
+  "baselines": {
+    "4b": {
+      "comparison": {
+        "schema": "antfly.reader-parity/v1",
+        "model_revision": "b71010f095dc3735de7ee6b9969bff8f8f50b39a",
+        "concurrency": 4,
+        "max_tokens": 2048,
+        "correctness": {
+          "serial_exact": false,
+          "concurrent_exact": false,
+          "native_batch_stable": true,
+          "reference_batch_stable": true
+        },
+        "timings": {
+          "serial": {
+            "native_median_seconds": 51.688,
+            "reference_median_seconds": 57.158500000000004,
+            "native_pages_per_second": 0.03869370066553165,
+            "reference_pages_per_second": 0.034990421372149375,
+            "native_over_reference_latency": 0.9042924499418284,
+            "parity": true
+          },
+          "concurrent": {
+            "native_median_seconds": 40.786500000000004,
+            "reference_median_seconds": 32.846000000000004,
+            "native_pages_per_second": 0.09807166586983437,
+            "reference_pages_per_second": 0.12178042988491748,
+            "native_over_reference_latency": 1.2417493758752969,
+            "parity": false
+          }
+        },
+        "passed": false,
+        "capture_sha256": {
+          "native_serial": "21a30e0093e535d0564edc1fc18e691a0b33d430e8bce02cce571b30e60e8e31",
+          "native_batch": "5f61ebd25f9e0069c27cbff38f73cd5643f65a1fc56228eed85e034c72c40f95",
+          "reference_serial": "9fedb3c931d2cf0d5a85a4042a2e1761b7910f6186b166751568cb790b716881",
+          "reference_batch": "4c1912f81a43ac06bde1834a7d80198599dfd04f2754df70250d67b70a208e2a"
+        }
+      },
+      "native_binary_sha256": "343b6590a58b2dc8d306d755e44e0669af47a48fce930a061ac211f7c596f751",
+      "native_config_sha256": "43bebd78fc0e8dc95ec8323b249a62327216ed210e2cd1871aa858dc722d0f14",
+      "model": {
+        "repository": "lightonai/LightOnOCR-3-4B",
+        "revision": "b71010f095dc3735de7ee6b9969bff8f8f50b39a",
+        "sha256": "6b0dab74a2dab02d5b10ca56322255024ed8dca35c02746b42e9f296aaeb4e67"
+      },
+      "model_sha256_verified": "6b0dab74a2dab02d5b10ca56322255024ed8dca35c02746b42e9f296aaeb4e67",
+      "gpu": "NVIDIA GB10, 580.178.04",
+      "reference_versions": {
+        "torch": "2.13.0",
+        "vllm": "0.32.0",
+        "transformers": "5.19.0"
+      },
+      "both_stopped": true,
+      "native_startup_seconds": 11.282,
+      "reference_startup_seconds": 95.043
+    },
+    "08": {
+      "comparison": {
+        "schema": "antfly.reader-parity/v1",
+        "model_revision": "36d8636925327c671bd8e479c517a004f7566bd9",
+        "concurrency": 4,
+        "max_tokens": 2048,
+        "correctness": {
+          "serial_exact": true,
+          "concurrent_exact": true,
+          "native_batch_stable": true,
+          "reference_batch_stable": true
+        },
+        "timings": {
+          "serial": {
+            "native_median_seconds": 12.588000000000001,
+            "reference_median_seconds": 10.571000000000002,
+            "native_pages_per_second": 0.1588814744200826,
+            "reference_pages_per_second": 0.18919685933213506,
+            "native_over_reference_latency": 1.190805032636458,
+            "parity": false
+          },
+          "concurrent": {
+            "native_median_seconds": 10.1375,
+            "reference_median_seconds": 6.994,
+            "native_pages_per_second": 0.39457459926017263,
+            "reference_pages_per_second": 0.5719187875321704,
+            "native_over_reference_latency": 1.4494566771518445,
+            "parity": false
+          }
+        },
+        "passed": false,
+        "capture_sha256": {
+          "native_serial": "1f188659d5a323d93424519455ff45fbb023ab723c81e0294e384f214476d3e5",
+          "native_batch": "e69ecd597709a86c4be2b4f2d93e137ecf867ad9af5595078fbe27556059cbdc",
+          "reference_serial": "42591f267719d86ae0e6bdf0c1582e6da2e0a635dd504080d0b9b14c3c1fdbb7",
+          "reference_batch": "410e17a29f00c87813611cba98850734edf9446c2d7b20533ac377b15ce8a019"
+        }
+      },
+      "native_binary_sha256": "343b6590a58b2dc8d306d755e44e0669af47a48fce930a061ac211f7c596f751",
+      "native_config_sha256": "6308fea3731e009e0f8ef32ff3db66907b2ad2539bd7558d72d0ecb001cfed73",
+      "model": {
+        "repository": "lightonai/LightOnOCR-3-0.8B",
+        "revision": "36d8636925327c671bd8e479c517a004f7566bd9",
+        "sha256": "ae46aa6fd7136d57297ac006ed9ec345b7a2083feb2e99501bedcb014ca3efdf"
+      },
+      "model_sha256_verified": "ae46aa6fd7136d57297ac006ed9ec345b7a2083feb2e99501bedcb014ca3efdf",
+      "gpu": "NVIDIA GB10, 580.178.04",
+      "reference_versions": {
+        "torch": "2.13.0",
+        "vllm": "0.32.0",
+        "transformers": "5.19.0"
+      },
+      "both_stopped": true,
+      "native_startup_seconds": 3.117,
+      "reference_startup_seconds": 50.675
+    }
+  },
+  "oracles": {
+    "3": {
+      "status": "passed",
+      "artifact_sha256": "70b654de13949d525c1108f53035b0b89ec70842243284d5beb7b8efde2d6056",
+      "cases": 24,
+      "max_abs": 1.9073486328125e-06,
+      "rows": [
+        2,
+        4,
+        16,
+        64,
+        66,
+        128
+      ]
+    },
+    "4": {
+      "status": "passed",
+      "artifact_sha256": "70b654de13949d525c1108f53035b0b89ec70842243284d5beb7b8efde2d6056",
+      "cases": 24,
+      "max_abs": 2.1457672119140625e-06,
+      "rows": [
+        2,
+        4,
+        16,
+        64,
+        66,
+        128
+      ]
+    },
+    "8": {
+      "status": "passed",
+      "artifact_sha256": "70b654de13949d525c1108f53035b0b89ec70842243284d5beb7b8efde2d6056",
+      "cases": 24,
+      "max_abs": 3.516674041748047e-06,
+      "rows": [
+        2,
+        4,
+        16,
+        64,
+        66,
+        128
+      ]
+    }
+  }
+}
