@@ -1,0 +1,1044 @@
+{
+  "schema_version": 1,
+  "status": "partial_qualification",
+  "pr": 1436,
+  "base_revision": "f91c9c0e4682a3ff20e39fce9a44d67b658a7b55",
+  "before_revision": "5872f2795c50f6b1feb24f40658d0200117aac02",
+  "code_revision": "96d732fc81b690c9ca3cc53e808709de4e021bc8",
+  "change": "Amortized pending-map rehashing during removal bounds lookup work within retirement turns and allocator journal replay, before persistence cleanup.",
+  "build": {
+    "zig_version": "0.17.0",
+    "libraries": "ReleaseFast, strip=true, native CPU and default Metal/BLAS settings for both libraries",
+    "command": "ZIG_GLOBAL_CACHE_DIR=$PWD/../.tools/perf1436/cache/global zig build capi -j1 -Doptimize=ReleaseFast -Dstrip=true --cache-dir ../.tools/perf1436/cache/local",
+    "global_cache": "../.tools/perf1436/cache/global relative to zig/",
+    "capi_contracts": "Debug, strip=true; allocator proof, issue1431, issue1362 and manual text producers"
+  },
+  "validation": {
+    "allocator_tests_passed": 19,
+    "negative_control": "Disabling removal-time rehashing fails the extended retirement churn test at the <=16 metadata probe assertion.",
+    "lite_storage": {
+      "passed": 670,
+      "skipped": 5,
+      "failed": 0,
+      "leaked": 0,
+      "expected_logged_errors": 8,
+      "unexpected_logged_errors": 0
+    },
+    "capi_contracts": {
+      "passed": 26,
+      "failed": 0,
+      "leaked": 0
+    },
+    "sdk": {
+      "passed": 201,
+      "failed": 0,
+      "suites": [
+        "test_sql.py",
+        "test_sql_catalog_search.py",
+        "test_concurrency.py"
+      ]
+    },
+    "exports": {
+      "public_functions": 134,
+      "internal_exports": 0
+    }
+  },
+  "fixture": {
+    "records_generated": 12288,
+    "retained_payload_bytes": 3019898880,
+    "file_bytes": 3466833920,
+    "sha256": "12bcac1b0557fa3a15a9da6f43dbf2d6b0d596d20cfc3af68522b96bd980e0ad",
+    "generation_revision": "14d57ca1caf6f8cdb9c12363c3078180d98adfc6",
+    "generation_library_sha256": "4e6cfc759bb5b014b681f80d12883760160b74dbca03f053e576af6de786df42",
+    "note": "Generated once with the retained compatible optimized library, closed and checked. This library is only the seed generator; timed trials use the before/after libraries identified below. Each trial gets an independent APFS clone."
+  },
+  "warm_comparison": {
+    "status": "passed",
+    "system": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu_count": 14,
+    "before_revision": "5872f2795c50f6b1feb24f40658d0200117aac02",
+    "library_sha256": {
+      "before": "2d78a35afeb8ed30ebe1e1881cb76198731f17527c7524fc5bed604fa80e1aff",
+      "after": "ba9b2630d612ab416ee62455f065a4c6d9e8517d691dd0879c9a641c8aad1415"
+    },
+    "fixture_sha256": "12bcac1b0557fa3a15a9da6f43dbf2d6b0d596d20cfc3af68522b96bd980e0ad",
+    "fixture_bytes": 3466833920,
+    "records": 12288,
+    "iterations_per_operation": 1024,
+    "candidate_source_sha256": {
+      "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "74c3f72e4549d69c962c49c908b7fde028d662597a508e9599c9cf4b048bf0d6",
+      "zig/pkg/antfly-embedded/src/storage/lite/allocator_v4.zig": "eeba01cd8d4621c971ad328549cf6c384c5f0b48e59e943bf3e26c693c7962f0",
+      "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "038190b6a268573273efd3163cddc788f9aae638725e3e5621a010f7a3803913",
+      "scripts/bench/lite_large_graph.py": "e1496247f20d1737aaf90ba834dae188342d213e189cbc39dfd8da4caf9f76ad",
+      "scripts/bench/lite_warm_comparison.py": "6aeb144583bf16aab780e37b0bbb680f77d5d3c7a4ab9e3bef8464b21bdb5fe2"
+    },
+    "runs": [
+      {
+        "library": "before",
+        "repeat": 0,
+        "exit_code": 0,
+        "passed": true,
+        "load_before": [
+          9.07666015625,
+          8.93408203125,
+          10.08154296875
+        ],
+        "load_after": [
+          8.69921875,
+          8.88525390625,
+          10.01220703125
+        ],
+        "samples": [
+          {
+            "calls": 1024,
+            "calls_per_second": 77.73012278036127,
+            "cpu_seconds": 11.861827,
+            "kind": "warm_operation",
+            "max_ns": 2404685041,
+            "operation": "batch",
+            "p50_ns": 1041583,
+            "p95_ns": 9665333,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 13.173785958031658
+          },
+          {
+            "calls": 1024,
+            "calls_per_second": 72.7721070799217,
+            "cpu_seconds": 13.641623000000003,
+            "kind": "warm_operation",
+            "max_ns": 200948167,
+            "operation": "sql",
+            "p50_ns": 1720958,
+            "p95_ns": 93974334,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 14.071325416967738
+          }
+        ]
+      },
+      {
+        "library": "after",
+        "repeat": 0,
+        "exit_code": 0,
+        "passed": true,
+        "load_before": [
+          8.69921875,
+          8.88525390625,
+          10.01220703125
+        ],
+        "load_after": [
+          8.5751953125,
+          8.8427734375,
+          9.97021484375
+        ],
+        "samples": [
+          {
+            "calls": 1024,
+            "calls_per_second": 240.80807810650072,
+            "cpu_seconds": 3.179179,
+            "kind": "warm_operation",
+            "max_ns": 139707625,
+            "operation": "batch",
+            "p50_ns": 978375,
+            "p95_ns": 10500125,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 4.252349040994886
+          },
+          {
+            "calls": 1024,
+            "calls_per_second": 181.48672766468786,
+            "cpu_seconds": 5.2379799999999985,
+            "kind": "warm_operation",
+            "max_ns": 74059500,
+            "operation": "sql",
+            "p50_ns": 1656042,
+            "p95_ns": 44339541,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 5.642285874986555
+          }
+        ]
+      },
+      {
+        "library": "after",
+        "repeat": 1,
+        "exit_code": 0,
+        "passed": true,
+        "load_before": [
+          8.5751953125,
+          8.8427734375,
+          9.97021484375
+        ],
+        "load_after": [
+          8.04833984375,
+          8.7060546875,
+          9.89453125
+        ],
+        "samples": [
+          {
+            "calls": 1024,
+            "calls_per_second": 262.0642849587582,
+            "cpu_seconds": 2.947054,
+            "kind": "warm_operation",
+            "max_ns": 140596375,
+            "operation": "batch",
+            "p50_ns": 1037542,
+            "p95_ns": 8219167,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 3.907438207999803
+          },
+          {
+            "calls": 1024,
+            "calls_per_second": 169.86451216772502,
+            "cpu_seconds": 5.436801,
+            "kind": "warm_operation",
+            "max_ns": 152625208,
+            "operation": "sql",
+            "p50_ns": 1596542,
+            "p95_ns": 47991500,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 6.028333917027339
+          }
+        ]
+      },
+      {
+        "library": "before",
+        "repeat": 1,
+        "exit_code": 0,
+        "passed": true,
+        "load_before": [
+          8.04833984375,
+          8.7060546875,
+          9.89453125
+        ],
+        "load_after": [
+          8.076171875,
+          8.66650390625,
+          9.83251953125
+        ],
+        "samples": [
+          {
+            "calls": 1024,
+            "calls_per_second": 75.98646140118777,
+            "cpu_seconds": 12.181116999999999,
+            "kind": "warm_operation",
+            "max_ns": 2355680584,
+            "operation": "batch",
+            "p50_ns": 974584,
+            "p95_ns": 9657083,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 13.476084832975175
+          },
+          {
+            "calls": 1024,
+            "calls_per_second": 86.41488158302339,
+            "cpu_seconds": 11.470424999999999,
+            "kind": "warm_operation",
+            "max_ns": 267333125,
+            "operation": "sql",
+            "p50_ns": 1636084,
+            "p95_ns": 81596792,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 11.84981083398452
+          }
+        ]
+      },
+      {
+        "library": "before",
+        "repeat": 2,
+        "exit_code": 0,
+        "passed": true,
+        "load_before": [
+          8.076171875,
+          8.66650390625,
+          9.83251953125
+        ],
+        "load_after": [
+          7.1279296875,
+          8.38134765625,
+          9.68212890625
+        ],
+        "samples": [
+          {
+            "calls": 1024,
+            "calls_per_second": 74.55146762732525,
+            "cpu_seconds": 12.625035,
+            "kind": "warm_operation",
+            "max_ns": 2926770875,
+            "operation": "batch",
+            "p50_ns": 971584,
+            "p95_ns": 9528833,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 13.735477417008951
+          },
+          {
+            "calls": 1024,
+            "calls_per_second": 88.88062383980231,
+            "cpu_seconds": 11.132586000000003,
+            "kind": "warm_operation",
+            "max_ns": 364611625,
+            "operation": "sql",
+            "p50_ns": 1606000,
+            "p95_ns": 76755625,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 11.521071249968372
+          }
+        ]
+      },
+      {
+        "library": "after",
+        "repeat": 2,
+        "exit_code": 0,
+        "passed": true,
+        "load_before": [
+          7.1279296875,
+          8.38134765625,
+          9.68212890625
+        ],
+        "load_after": [
+          7.02294921875,
+          8.27490234375,
+          9.61328125
+        ],
+        "samples": [
+          {
+            "calls": 1024,
+            "calls_per_second": 275.74001203816624,
+            "cpu_seconds": 2.856075,
+            "kind": "warm_operation",
+            "max_ns": 136945000,
+            "operation": "batch",
+            "p50_ns": 992500,
+            "p95_ns": 7521500,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 3.7136431250255555
+          },
+          {
+            "calls": 1024,
+            "calls_per_second": 173.93041043606516,
+            "cpu_seconds": 5.266440000000001,
+            "kind": "warm_operation",
+            "max_ns": 175428791,
+            "operation": "sql",
+            "p50_ns": 1704708,
+            "p95_ns": 45575500,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 5.887412082985975
+          }
+        ]
+      },
+      {
+        "library": "after",
+        "repeat": 3,
+        "exit_code": 0,
+        "passed": true,
+        "load_before": [
+          7.02294921875,
+          8.27490234375,
+          9.61328125
+        ],
+        "load_after": [
+          6.79931640625,
+          8.10986328125,
+          9.51318359375
+        ],
+        "samples": [
+          {
+            "calls": 1024,
+            "calls_per_second": 248.61012113951628,
+            "cpu_seconds": 3.122472,
+            "kind": "warm_operation",
+            "max_ns": 139799000,
+            "operation": "batch",
+            "p50_ns": 1005083,
+            "p95_ns": 9011250,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 4.1188990830560215
+          },
+          {
+            "calls": 1024,
+            "calls_per_second": 164.6755020274262,
+            "cpu_seconds": 5.8659810000000006,
+            "kind": "warm_operation",
+            "max_ns": 68090666,
+            "operation": "sql",
+            "p50_ns": 1592667,
+            "p95_ns": 49159833,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 6.2182898329920135
+          }
+        ]
+      },
+      {
+        "library": "before",
+        "repeat": 3,
+        "exit_code": 0,
+        "passed": true,
+        "load_before": [
+          6.79931640625,
+          8.10986328125,
+          9.51318359375
+        ],
+        "load_after": [
+          6.8271484375,
+          7.97021484375,
+          9.40380859375
+        ],
+        "samples": [
+          {
+            "calls": 1024,
+            "calls_per_second": 96.41446582791464,
+            "cpu_seconds": 9.668334999999999,
+            "kind": "warm_operation",
+            "max_ns": 2152198875,
+            "operation": "batch",
+            "p50_ns": 936584,
+            "p95_ns": 7847625,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 10.620812874985859
+          },
+          {
+            "calls": 1024,
+            "calls_per_second": 93.92099278922576,
+            "cpu_seconds": 10.536298000000002,
+            "kind": "warm_operation",
+            "max_ns": 193305959,
+            "operation": "sql",
+            "p50_ns": 1605125,
+            "p95_ns": 65168166,
+            "proof_walks": 0,
+            "status": "ok",
+            "timing_scope": "single writer after batch and SQL warmup; no foreign publications",
+            "wall_seconds": 10.902780833013821
+          }
+        ]
+      }
+    ],
+    "medians": {
+      "batch": {
+        "before": {
+          "p50_ns": 973084.0,
+          "p95_ns": 9592958.0,
+          "calls_per_second": 76.85829209077451,
+          "cpu_seconds": 12.021472
+        },
+        "after": {
+          "p50_ns": 998791.5,
+          "p95_ns": 8615208.5,
+          "calls_per_second": 255.33720304913726,
+          "cpu_seconds": 3.034763
+        },
+        "p50_after_over_before": 1.0264185825684113
+      },
+      "sql": {
+        "before": {
+          "p50_ns": 1621042.0,
+          "p95_ns": 79176208.5,
+          "calls_per_second": 87.64775271141285,
+          "cpu_seconds": 11.301505500000001
+        },
+        "after": {
+          "p50_ns": 1626292.0,
+          "p95_ns": 46783500.0,
+          "calls_per_second": 171.89746130189508,
+          "cpu_seconds": 5.351620500000001
+        },
+        "p50_after_over_before": 1.003238657604183
+      }
+    }
+  },
+  "warm_ratios": {
+    "batch": {
+      "throughput_after_over_before": 3.322181590342495,
+      "cpu_after_over_before": 0.2524452080410785,
+      "p50_after_over_before": 1.0264185825684113,
+      "p95_after_over_before": 0.8980763284901279
+    },
+    "sql": {
+      "throughput_after_over_before": 1.961230676020651,
+      "cpu_after_over_before": 0.4735316458501923,
+      "p50_after_over_before": 1.003238657604183,
+      "p95_after_over_before": 0.5908782560609732
+    }
+  },
+  "indexed_native_soak": {
+    "qualification": "progress_and_integrity_passed; capacity_and_background_maintenance_remain_unqualified",
+    "duration_seconds_requested": 600,
+    "concurrency": 8,
+    "seed_records_requested": 1024,
+    "watchdog_seconds": 180,
+    "started_at_utc": "2026-10-31T19:27:13Z",
+    "source_sha256": {
+      "scripts/bench/lite_contention.py": "04ab557a24139ab1f776b350190cb1bad5a5eef7461426de088bfb071a18a0b6",
+      "scripts/bench/lite_queue.zig": "378ba7ae70715936bf5d6e8197b149c5f6921cfe0a83f3725c6f10b7554a7af1",
+      "zig/lib/platform/src/sync.zig": "51276d9eba3e7cd784ad793fb06e800433f69c8b01826cb190fdf54bccaba8d9",
+      "zig/pkg/antfly-embedded/src/capi/db.zig": "3c33196a5a861d8535f2f594c7b628302c5089708773114bf1a8132d14b503a1",
+      "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "038190b6a268573273efd3163cddc788f9aae638725e3e5621a010f7a3803913"
+    },
+    "host": {
+      "system": "macOS-27.0.1-arm64-arm-64bit",
+      "cpu_count": 14,
+      "python": "3.12.11",
+      "load_average": [
+        7.12744140625,
+        7.93505859375,
+        9.3330078125
+      ],
+      "swap_usage": "total = 21504.00M  used = 20027.56M  free = 1476.44M  (encrypted)"
+    },
+    "result": {
+      "admission_count": 9922,
+      "admission_log2_ns": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        52,
+        1066,
+        1438,
+        2269,
+        2617,
+        889,
+        1472,
+        114,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "admission_max_ns": 4611710875,
+      "admission_mean_ns": 483603457.7542834,
+      "admission_metric_scope": "successful positive-timeout mutation admission before its body; percentile bounds from log2 nanosecond buckets",
+      "admission_ns": 4798313507838,
+      "admission_p50_lower_ns": 268435456,
+      "admission_p50_upper_ns": 536870911,
+      "admission_p95_lower_ns": 1073741824,
+      "admission_p95_upper_ns": 2147483647,
+      "admission_p99_lower_ns": 2147483648,
+      "admission_p99_upper_ns": 4294967295,
+      "allocator_proof_failures": 0,
+      "allocator_proof_ns": 0,
+      "allocator_proof_walks": 0,
+      "busy_calls": 0,
+      "busy_fraction": 0.0,
+      "busy_max_ns": null,
+      "busy_p50_ns": null,
+      "busy_p95_ns": null,
+      "busy_p99_ns": null,
+      "concurrency": 8,
+      "cpu_seconds": 558.571541,
+      "elapsed_seconds": 601.7685365829966,
+      "file_bytes": 22525304832,
+      "involuntary_context_switches": 287191,
+      "kind": "native",
+      "last_maintenance_errors": [
+        "EnrichmentWaitCanceled",
+        "EnrichmentWaitCanceled",
+        "EnrichmentWaitCanceled",
+        "EnrichmentWaitCanceled",
+        "EnrichmentWaitCanceled",
+        "EnrichmentWaitCanceled",
+        "EnrichmentWaitCanceled"
+      ],
+      "latency_scope": "whole batch call including admission and mutation",
+      "library_sha256": "ba9b2630d612ab416ee62455f065a4c6d9e8517d691dd0879c9a641c8aad1415",
+      "no_index": false,
+      "no_sync": false,
+      "observed_proof_walks_per_success": 0.0,
+      "per_worker_background_publication_deltas": [
+        {
+          "attempts": 91,
+          "generated_attempts": 0,
+          "generated_refused": 0,
+          "maintenance_errors": 6,
+          "maintenance_rounds": 3,
+          "rebased": 79,
+          "refused": 12,
+          "replay_attempts": 0,
+          "replay_refused": 0
+        },
+        {
+          "attempts": 20,
+          "generated_attempts": 0,
+          "generated_refused": 0,
+          "maintenance_errors": 2,
+          "maintenance_rounds": 1,
+          "rebased": 19,
+          "refused": 1,
+          "replay_attempts": 0,
+          "replay_refused": 0
+        },
+        {
+          "attempts": 171,
+          "generated_attempts": 0,
+          "generated_refused": 0,
+          "maintenance_errors": 10,
+          "maintenance_rounds": 5,
+          "rebased": 141,
+          "refused": 30,
+          "replay_attempts": 0,
+          "replay_refused": 0
+        },
+        {
+          "attempts": 0,
+          "generated_attempts": 0,
+          "generated_refused": 0,
+          "maintenance_errors": 0,
+          "maintenance_rounds": 0,
+          "rebased": 0,
+          "refused": 0,
+          "replay_attempts": 0,
+          "replay_refused": 0
+        },
+        {
+          "attempts": 84,
+          "generated_attempts": 0,
+          "generated_refused": 0,
+          "maintenance_errors": 6,
+          "maintenance_rounds": 3,
+          "rebased": 74,
+          "refused": 10,
+          "replay_attempts": 0,
+          "replay_refused": 0
+        },
+        {
+          "attempts": 60,
+          "generated_attempts": 0,
+          "generated_refused": 0,
+          "maintenance_errors": 4,
+          "maintenance_rounds": 2,
+          "rebased": 52,
+          "refused": 8,
+          "replay_attempts": 0,
+          "replay_refused": 0
+        },
+        {
+          "attempts": 90,
+          "generated_attempts": 0,
+          "generated_refused": 0,
+          "maintenance_errors": 4,
+          "maintenance_rounds": 2,
+          "rebased": 68,
+          "refused": 22,
+          "replay_attempts": 0,
+          "replay_refused": 0
+        },
+        {
+          "attempts": 121,
+          "generated_attempts": 0,
+          "generated_refused": 0,
+          "maintenance_errors": 6,
+          "maintenance_rounds": 3,
+          "rebased": 113,
+          "refused": 8,
+          "replay_attempts": 0,
+          "replay_refused": 0
+        }
+      ],
+      "per_worker_proof_walks": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "per_worker_successful_calls": [
+        1228,
+        1301,
+        1147,
+        1323,
+        1235,
+        1260,
+        1232,
+        1196
+      ],
+      "proof_counter_scope": "process-owner totals between diagnostic snapshots; includes readiness wait, background work, and final diagnostic admission",
+      "proof_observation_seconds": 603.705510208034,
+      "proof_walks_per_second": 0.0,
+      "repeat": 0,
+      "seed_seconds": 0.2843037089915015,
+      "seed_stats": {
+        "compact": {
+          "compacted": true,
+          "vacuum": {
+            "after_size": 5070848,
+            "before_size": 13283328,
+            "live_bytes": 2411192,
+            "live_file_count": 7213,
+            "reclaimed_bytes": 8212480
+          }
+        },
+        "database": {
+          "doc_count": 512,
+          "enrichment": {
+            "acquisition_count": 0,
+            "applied_sequence": 0,
+            "artifact_bytes_written": 0,
+            "chunk_artifact_bytes_written": 0,
+            "codec_decode_failures": 0,
+            "dense_artifact_bytes_written": 0,
+            "enabled": false,
+            "error_count": 0,
+            "fatal_error_count": 0,
+            "has_lease": false,
+            "last_acquired_ms": 0,
+            "last_error_code": "",
+            "lease_acquire_failures": 0,
+            "lease_owned": true,
+            "lost_leases": 0,
+            "processed_requests": 0,
+            "retryable_error_count": 0,
+            "retrying": false,
+            "skip_by_hash_count": 0,
+            "skipped_source_count": 0,
+            "sparse_artifact_bytes_written": 0,
+            "stall_reason": "",
+            "stalled": false,
+            "target_sequence": 0,
+            "worker_failed": false
+          },
+          "index_count": 1,
+          "indexes": [
+            {
+              "catch_up_active": false,
+              "catch_up_phase": "idle",
+              "coverage_produced_count": 0,
+              "coverage_skipped_count": 0,
+              "coverage_summary_ready": true,
+              "coverage_terminal_failed_count": 0,
+              "doc_count": 512,
+              "edge_count": 0,
+              "graph_counts_pending": false,
+              "kind": "full_text",
+              "name": "full_text_index_v0",
+              "node_count": 0,
+              "repair_degraded": false,
+              "repair_issue_count": 0,
+              "repair_issue_count_estimated": false,
+              "repair_summary_ready": true,
+              "replay_applied_sequence": 32,
+              "replay_catch_up_required": false,
+              "replay_target_sequence": 32,
+              "term_count": 2
+            }
+          ],
+          "indexes_available": true,
+          "repair_degraded": false,
+          "repair_issue_count": 0,
+          "repair_issue_count_estimated": false,
+          "repair_summary_ready": true,
+          "term_doc_freq_cache_hits": 0,
+          "term_doc_freq_cache_misses": 0,
+          "text_merge": {
+            "active_indexes": 1,
+            "active_segments": 1,
+            "backpressure_events": 0,
+            "backpressure_ns": 0,
+            "completed_merges": 0,
+            "enabled": true,
+            "failed_merges": 0,
+            "in_flight_merges": 0,
+            "in_flight_segments": 0,
+            "last_merge_error": "",
+            "max_active_segments_per_index": 1,
+            "max_pending_bytes": 268435456,
+            "max_pending_segments": 64,
+            "pending_bytes": 0,
+            "pending_indexes": 0,
+            "pending_segments": 0,
+            "quarantined_merges": 0,
+            "quarantined_segments": 0,
+            "skipped_stale_merges": 0
+          },
+          "transaction_recovery": {
+            "acquisition_count": 0,
+            "auto_aborted": 0,
+            "cleaned_records": 0,
+            "deferred_unresolved": 0,
+            "enabled": false,
+            "error_count": 0,
+            "has_lease": false,
+            "kept_recent_pending": 0,
+            "last_acquired_ms": 0,
+            "last_run_ns": 0,
+            "lease_acquire_failures": 0,
+            "lease_owned": false,
+            "lost_leases": 0,
+            "notification_attempts": 0,
+            "notification_failures": 0,
+            "notification_successes": 0,
+            "resolved_finalized": 0,
+            "runs": 0,
+            "scanned_records": 0
+          },
+          "ttl_cleanup": {
+            "acquisition_count": 0,
+            "deleted_docs": 0,
+            "enabled": true,
+            "error_count": 0,
+            "has_lease": true,
+            "last_acquired_ms": 0,
+            "last_run_ns": 1793474833570687000,
+            "lease_acquire_failures": 0,
+            "lease_owned": false,
+            "lost_leases": 0,
+            "runs": 1,
+            "scanned_timestamps": 0
+          }
+        },
+        "retained_seed_records": 512
+      },
+      "status": "ok",
+      "success_max_ns": 4622258709,
+      "success_p50_ns": 278823458,
+      "success_p95_ns": 1620075625,
+      "success_p99_ns": 2293361084,
+      "successful_calls": 9922,
+      "successful_calls_per_second": 16.48806708363282,
+      "timeout_ms": 5000,
+      "verification": {
+        "checked_last_writes": 8,
+        "database": {
+          "doc_count": 1536,
+          "enrichment": {
+            "acquisition_count": 0,
+            "applied_sequence": 0,
+            "artifact_bytes_written": 0,
+            "chunk_artifact_bytes_written": 0,
+            "codec_decode_failures": 0,
+            "dense_artifact_bytes_written": 0,
+            "enabled": false,
+            "error_count": 0,
+            "fatal_error_count": 0,
+            "has_lease": false,
+            "last_acquired_ms": 0,
+            "last_error_code": "",
+            "lease_acquire_failures": 0,
+            "lease_owned": true,
+            "lost_leases": 0,
+            "processed_requests": 0,
+            "retryable_error_count": 0,
+            "retrying": false,
+            "skip_by_hash_count": 0,
+            "skipped_source_count": 0,
+            "sparse_artifact_bytes_written": 0,
+            "stall_reason": "",
+            "stalled": false,
+            "target_sequence": 0,
+            "worker_failed": false
+          },
+          "index_count": 1,
+          "indexes": [
+            {
+              "catch_up_active": false,
+              "catch_up_phase": "idle",
+              "coverage_produced_count": 0,
+              "coverage_skipped_count": 0,
+              "coverage_summary_ready": true,
+              "coverage_terminal_failed_count": 0,
+              "doc_count": 1536,
+              "edge_count": 0,
+              "graph_counts_pending": false,
+              "kind": "full_text",
+              "name": "full_text_index_v0",
+              "node_count": 0,
+              "repair_degraded": false,
+              "repair_issue_count": 0,
+              "repair_issue_count_estimated": false,
+              "repair_summary_ready": true,
+              "replay_applied_sequence": 9354,
+              "replay_catch_up_required": true,
+              "replay_target_sequence": 9954,
+              "term_count": 14
+            }
+          ],
+          "indexes_available": true,
+          "repair_degraded": false,
+          "repair_issue_count": 0,
+          "repair_issue_count_estimated": false,
+          "repair_summary_ready": true,
+          "term_doc_freq_cache_hits": 0,
+          "term_doc_freq_cache_misses": 0,
+          "text_merge": {
+            "active_indexes": 1,
+            "active_segments": 4,
+            "backpressure_events": 0,
+            "backpressure_ns": 0,
+            "completed_merges": 0,
+            "enabled": true,
+            "failed_merges": 0,
+            "in_flight_merges": 0,
+            "in_flight_segments": 0,
+            "last_merge_error": "",
+            "max_active_segments_per_index": 4,
+            "max_pending_bytes": 268435456,
+            "max_pending_segments": 64,
+            "pending_bytes": 145792,
+            "pending_indexes": 1,
+            "pending_segments": 4,
+            "quarantined_merges": 0,
+            "quarantined_segments": 0,
+            "skipped_stale_merges": 0
+          },
+          "transaction_recovery": {
+            "acquisition_count": 0,
+            "auto_aborted": 0,
+            "cleaned_records": 0,
+            "deferred_unresolved": 0,
+            "enabled": false,
+            "error_count": 0,
+            "has_lease": false,
+            "kept_recent_pending": 0,
+            "last_acquired_ms": 0,
+            "last_run_ns": 0,
+            "lease_acquire_failures": 0,
+            "lease_owned": false,
+            "lost_leases": 0,
+            "notification_attempts": 0,
+            "notification_failures": 0,
+            "notification_successes": 0,
+            "resolved_finalized": 0,
+            "runs": 0,
+            "scanned_records": 0
+          },
+          "ttl_cleanup": {
+            "acquisition_count": 0,
+            "deleted_docs": 0,
+            "enabled": true,
+            "error_count": 0,
+            "has_lease": true,
+            "last_acquired_ms": 0,
+            "last_run_ns": 0,
+            "lease_acquire_failures": 0,
+            "lease_owned": false,
+            "lost_leases": 0,
+            "runs": 0,
+            "scanned_timestamps": 0
+          }
+        },
+        "integrity": {
+          "compact_size": 7966720,
+          "file_size": 22525304832,
+          "issue": null,
+          "live_bytes": 4247337,
+          "live_file_count": 19449,
+          "reclaimable_bytes": 22517338112,
+          "record_count": 170848,
+          "tail_bytes": 0,
+          "valid": true,
+          "valid_prefix_size": 22525304832
+        }
+      },
+      "voluntary_context_switches": 1387461,
+      "worker_lifetime_seconds": 603.9690132499672,
+      "workers_without_success": 0,
+      "workload": "churn"
+    }
+  },
+  "reproduction": {
+    "fixture": "python3.12 scripts/bench/lite_large_graph.py --library SEED_LIBRARY.dylib --directory SEED --records 12288 --operations read --certified-handoff",
+    "warm": "python3.12 scripts/bench/lite_warm_comparison.py --before BEFORE.dylib --after AFTER.dylib --before-revision 5872f2795c50f6b1feb24f40658d0200117aac02 --fixture SEED/large.aflite --directory FRESH_DIRECTORY --records 12288 --iterations 1024 --repeats 4",
+    "soak": "python3.12 scripts/bench/lite_contention.py native --library AFTER.dylib --output FRESH_OUTPUT.jsonl --concurrency 8 --repeats 1 --seconds 600 --timeout-ms 5000 --seed-records 1024 --workload churn --watchdog 180"
+  },
+  "outstanding_qualification": {
+    "file_bytes_after_indexed_soak": 22525304832,
+    "compact_size_after_indexed_soak": 7966720,
+    "last_maintenance_errors": [
+      "EnrichmentWaitCanceled",
+      "EnrichmentWaitCanceled",
+      "EnrichmentWaitCanceled",
+      "EnrichmentWaitCanceled",
+      "EnrichmentWaitCanceled",
+      "EnrichmentWaitCanceled",
+      "EnrichmentWaitCanceled"
+    ],
+    "note": "All eight workers progressed and final writes/integrity passed, but the indexed churn file grew to 22.5 GB with about 8 MB compact size. Seven workers retained EnrichmentWaitCanceled. Reclamation admission deliberately yields on gate/path contention or a changed captured header (lite_connection.zig enterMaintenanceWriter); these observations do not establish the cause of growth or a regression from this patch. Capacity/background maintenance qualification is not closed."
+  },
+  "scope_notes": [
+    "Paired trials alternate order, use the same closed immutable fixture and require zero warm proof walks, valid integrity and successful reopen checks. Four repeats per library; all eight trials passed.",
+    "These are shared-host measurements. No task-owned compiler or other task-owned test ran during the paired trials. Per-trial host load is retained.",
+    "Median latency is approximately unchanged; throughput and CPU gains remove long replay stalls. Ratios include p50 and p95 so these gains are not presented as a uniform per-call latency improvement.",
+    "The historical guard control 2011275565877bae7deff19b786b82f371a45345 predates live allocator certificates. Its earlier reported ~30% difference is not proof of a regression introduced by this PR. This receipt compares the actual pre-fix PR head.",
+    "Warm-write qualification passed. The ten-minute indexed native soak passed progress and integrity checks, but exposed file growth and canceled background maintenance; overall qualification remains partial. Full semantic/model/factory release qualification was not rerun; older partial qualification receipts retain their original scope."
+  ]
+}

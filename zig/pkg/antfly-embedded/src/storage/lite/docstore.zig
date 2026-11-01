@@ -149,6 +149,56 @@ test "lite empty write commits preserve checkpoints and release writer admission
     try std.testing.expectEqualStrings("progress", try read.get("after"));
 }
 
+test "issue1362 background assessments preserve same-owner page reuse" {
+    const Hook = struct {
+        store: *Store,
+        calls: usize = 0,
+        fn notify(ptr: *anyopaque, phase: Store.MaintenancePhase) !void {
+            if (phase != .assessment) return;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const before = (try self.store.file.allocatorStats()).?.reused_pages;
+            const value: [8192]u8 = @splat('w');
+            for (0..16) |i| {
+                var key: [40]u8 = undefined;
+                try self.store.file.putDocument(try std.fmt.bufPrint(&key, "during-assessment-{d}", .{i}), &value);
+            }
+            try std.testing.expect((try self.store.file.allocatorStats()).?.reused_pages > before);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "assessment-reuse.aflite");
+    defer a.free(path);
+    var coordinator = native.ReaderCoordinator.init(a, std.testing.io);
+    defer coordinator.deinit();
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    store.file.reader_coordinator = &coordinator;
+    const value: [8192]u8 = @splat('v');
+    try store.file.putDocument("keep", "kept");
+    for (0..128) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.putDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+    }
+    for (0..128) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.deleteDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+    }
+    _ = try store.file.reclaimPages(8192);
+    try std.testing.expect((try store.file.allocatorStats()).?.reusable_pages > 64);
+    store.maintenance_policy = try reclamation.Policy.init(.{ .minimum_reclaim_bytes = 4096, .assessment_bytes = 4096, .amplification = 1024 });
+    var hook: Hook = .{ .store = &store };
+    store.test_maintenance_hook = .{ .ptr = &hook, .notify = Hook.notify };
+    defer store.test_maintenance_hook = null;
+    try store.maintainOnce(true);
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
 test "lite reclamation stale quota estimates expire after roots shrink" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1366,7 +1416,7 @@ var next_score_cache_owner: std.atomic.Value(u64) = .init(1);
 /// Optional owner admission around every document/index publication.
 /// Detached computation can retain this Store without retaining a file
 /// writer lease; admission must validate its checkpoint before mutation.
-pub const PublicationScope = enum { primary, index, reclamation, artifact_lease };
+pub const PublicationScope = enum { primary, index, reclamation, artifact_lease, allocator_service };
 
 pub const WriterAdmission = struct {
     ptr: *anyopaque,
@@ -1726,6 +1776,23 @@ pub const Store = struct {
         return registry.open(key);
     }
 
+    pub fn recordArtifactSourceOpen(self: *Store, reused: bool) void {
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (reused) self.file.allocator_work.artifact_source_reuses +|= 1 else self.file.allocator_work.artifact_source_opens +|= 1;
+    }
+
+    pub fn artifactPoolLookupAllowed(self: *Store) bool {
+        lockStore(self);
+        defer self.mutex.unlock();
+        // A private transaction can hold its own exclusive reuse lock. Its
+        // normal source publication must not first request a kernel read pin.
+        // A bounded Store must own every retained-inode claim in its own
+        // registry. Cross-Store pooling is reserved for unbounded owners.
+        return self.file.transaction_header == null and !self.file.checkpoint_publication_uncertain and
+            self.maintenance_policy.options.max_storage_bytes == 0 and self.maintenance_policy.options.capacity_probe == null;
+    }
+
     fn currentGenerationHasReaders(self: *Store) bool {
         const io = self.file.runtime();
         self.read_mutex.lockUncancelable(io);
@@ -1981,7 +2048,17 @@ pub const Store = struct {
                 retry_at = .zero;
                 const more = self.maintenanceNeedsService() catch false;
                 if (self.maintenance_cancel.requested.load(.acquire)) break;
-                if (!more) self.maintenance_wake.waitUncancelable(io);
+                if (!more) {
+                    lockStore(self);
+                    const rewrite_retry = self.maintenance_policy.rewrite_retry_at_ns;
+                    self.mutex.unlock();
+                    if (rewrite_retry) |deadline| {
+                        self.maintenance_wake.waitTimeout(io, .{ .duration = .{
+                            .raw = std.Io.Clock.awake.now(io).durationTo(.{ .nanoseconds = deadline }),
+                            .clock = .awake,
+                        } }) catch {};
+                    } else self.maintenance_wake.waitUncancelable(io);
+                }
             }
         }
     }
@@ -2033,7 +2110,7 @@ pub const Store = struct {
             return;
         }
         {
-            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
+            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .allocator_service);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
             lockStore(self);
             defer self.mutex.unlock();
@@ -2078,13 +2155,14 @@ pub const Store = struct {
             }
             const size = (try self.file.file.stat(self.file.runtime())).size;
             self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
-            if (!force and !self.maintenance_policy.due(size)) return;
+            const retry_due = self.maintenance_policy.rewriteRetryDue(std.Io.Clock.awake.now(self.file.runtime()).nanoseconds);
+            if (!force and !self.maintenance_policy.due(size) and !retry_due) return;
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
             assessed_checkpoint = self.file.activeCheckpoint();
             assessed_size = size;
             assessed_indexed = self.file.header.indexed_reclamation or self.file.vacuum_target_indexed;
             assessed_generation = self.assessment_generation;
-            if (force) {
+            if (force or retry_due) {
                 if (self.assessment_cache) |cache| {
                     if (cache.generation == assessed_generation and cache.indexed == assessed_indexed and std.meta.eql(cache.checkpoint, assessed_checkpoint)) {
                         cached_stats = cache.stats;
@@ -2099,8 +2177,7 @@ pub const Store = struct {
                 }
             }
             if (cached_stats == null) {
-                snapshot = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true, .resource_manager = self.resource_manager });
-                snapshot.?.header = self.file.header;
+                snapshot = try self.file.captureFullReadSnapshot();
                 snapshot.?.page_cache_policy = .metadata_only;
             }
             self.maintenance_running = true;
@@ -2135,7 +2212,11 @@ pub const Store = struct {
             self.maintenance_policy.status.state = .idle;
             self.maintenance_policy.status.reason = .none;
             self.maintenance_policy.status.last_error = null;
-            if (!due) break :blk false;
+            if (!due) {
+                self.maintenance_policy.rewrite_retry_at_ns = null;
+                break :blk false;
+            }
+            self.maintenance_policy.scheduleRewriteRetry(scan_finished.nanoseconds, if (cached_stats == null) scan_started.durationTo(scan_finished).nanoseconds else null);
             const workspace = (try self.admitShrinkWorkspaceAssumeLocked(stats.compact_size, cancel)) orelse break :blk false;
             self.maintenance_policy.status.state = .rewriting;
             self.maintenance_policy.status.temporary_bytes = workspace;
@@ -2340,6 +2421,20 @@ pub const Store = struct {
             status.pending_data_retirement_objects = stats.pending_data_objects;
             status.reused_pages = stats.reused_pages;
             status.retired_objects_serviced = stats.serviced_objects;
+            status.allocator_journal_bytes = stats.journal_bytes;
+            status.data_reuse_frontier = stats.data_frontier;
+            status.metadata_reuse_frontier = stats.metadata_frontier;
+            status.oldest_data_retirement_epoch = stats.oldest_data_epoch;
+            status.oldest_metadata_retirement_epoch = stats.oldest_metadata_epoch;
+        }
+        status.allocator_work = self.file.allocator_work;
+        if (self.file.reader_coordinator) |coordinator| {
+            const readers = coordinator.readerStats((try self.file.file.stat(self.file.runtime())).inode);
+            status.coordinated_reader_count = readers.count;
+            status.poisoned_coordinated_readers = readers.poisoned;
+            status.oldest_coordinated_reader_age_ms = readers.oldest_age_ms;
+            status.data_reuse_frontier = @min(status.data_reuse_frontier, readers.frontier.data orelse status.data_reuse_frontier);
+            status.metadata_reuse_frontier = @min(status.metadata_reuse_frontier, readers.frontier.metadata orelse status.metadata_reuse_frontier);
         }
         return status;
     }
@@ -2402,9 +2497,8 @@ pub const Store = struct {
                 return error.FileBusy;
             }
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
-            var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = self.file.no_sync, .resource_manager = self.resource_manager });
+            var snapshot = try self.file.captureFullReadSnapshot();
             snapshot.page_cache_policy = .metadata_only;
-            snapshot.header = self.file.header;
             snapshot.vacuum_target_indexed = self.file.vacuum_target_indexed;
             self.file.change_capture = &capture;
             break :blk snapshot;
@@ -2592,14 +2686,12 @@ pub const Store = struct {
     fn takeResidualVacuumChangesAssumeLocked(self: *Store, capture: *native.ChangeCapture, changes: *native.ChangeCapture) !native.NativeFile {
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
-        const io = self.file.runtime();
         if (capture.overflow) {
             std.log.warn("lite vacuum gave up: change capture overflowed before catch-up captured={d} key_bytes={d}", .{ capture.count, capture.key_bytes });
             return error.FileBusy;
         }
-        var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = true, .resource_manager = self.resource_manager });
+        var snapshot = try self.file.captureFullReadSnapshot();
         snapshot.page_cache_policy = .metadata_only;
-        snapshot.header = self.file.header;
         std.mem.swap(native.ChangeCapture, changes, capture);
         return snapshot;
     }
@@ -2735,6 +2827,18 @@ pub const Store = struct {
 
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
         return self.submitScopedMutation(context, apply, durable, true, false);
+    }
+
+    /// A durability barrier allocates no pages and requires no allocator
+    /// admission, retirement service, or synthetic mutation transaction.
+    pub fn syncIndexContents(self: *Store) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .index);
+        defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeUnknown;
+        try self.file.sync();
     }
 
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
@@ -3798,6 +3902,13 @@ pub const Txn = struct {
         const lookup_key = try self.prefixedKey(key);
         defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
         return (try self.readFile()).documentReferenceAtCheckpoint(self.checkpoint, lookup_key);
+    }
+
+    pub fn valueFingerprint(self: *Txn, key: []const u8) !?[32]u8 {
+        if (!self.read_only or self.pending_count != 0) return error.InvalidArgument;
+        const lookup_key = try self.prefixedKey(key);
+        defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
+        return (try self.readFile()).documentFingerprintAtCheckpoint(self.checkpoint, lookup_key);
     }
 
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
@@ -5989,6 +6100,48 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+test "lite index sync skips allocator admission and redundant durability barriers" {
+    const Probe = struct {
+        var calls: usize = 0;
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            calls += 1;
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+    };
+    const a = std.testing.allocator;
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Probe.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "sync-without-allocator.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = io, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const checkpoint = store.file.header;
+    const loads = store.file.allocator_work.full_loads;
+    try store.syncIndexContents();
+    const synced = Probe.calls;
+    try store.syncIndexContents();
+    try std.testing.expectEqual(synced, Probe.calls);
+    try std.testing.expectEqual(loads, store.file.allocator_work.full_loads);
+    try std.testing.expectEqual(checkpoint, store.file.header);
+    // The shortcut must not swallow an unpublished durability boundary.
+    try store.file.beginTransaction();
+    try store.file.putDocument("deferred", "durable after sync");
+    try store.file.commitTransactionWithDurability(false);
+    try std.testing.expect(store.file.durable_header != null);
+    try store.syncIndexContents();
+    try std.testing.expect(Probe.calls > synced);
+    try std.testing.expect(store.file.durable_header == null);
+    var reopened = try native.NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+    defer reopened.close();
+    const value = (try reopened.getDocumentAlloc(a, "deferred")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("durable after sync", value);
+}
+
 test "lite grouped durability failures recover all roots at one checkpoint" {
     const Fault = struct {
         var remaining: usize = 0;
@@ -7167,33 +7320,34 @@ test "lite cached source teardown and retirement progress while publication is b
     const registry = store.artifact_registry.?;
     const old_bytes = (try store.file.file.stat(io)).size;
     const Worker = struct {
-        fn close(owned: *@import("../../segment_source.zig").Source) void {
-            owned.close();
+        source: *@import("../../segment_source.zig").Source,
+        done: std.Io.Event = .unset,
+        fn close(self: *@This()) void {
+            self.source.close();
+            self.done.set(std.testing.io);
         }
     };
     lockStore(&store);
     var locked = true;
     defer if (locked) store.mutex.unlock();
-    const thread = try std.Thread.spawn(.{}, Worker.close, .{&source});
+    var worker: Worker = .{ .source = &source };
+    const thread = try std.Thread.spawn(.{}, Worker.close, .{&worker});
     source_open = false;
-    defer thread.join();
-    // The final source release is queued behind the owner mutex. Retiring the
-    // same source must progress without waiting for that publication callback.
-    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
-    var callback_started = false;
-    while (!callback_started and std.Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
-        registry.mutex.lockUncancelable(io);
-        callback_started = registry.callbacks != 0;
-        registry.mutex.unlock(io);
-        if (!callback_started) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    defer {
+        if (locked) {
+            store.mutex.unlock();
+            locked = false;
+        }
+        thread.join();
     }
-    if (callback_started) {
-        registry.expireIdle(store.assessment_generation);
-        registry.retire(store.assessment_generation, old_bytes, false);
-    }
+    // Final release must finish even while publication holds the owner mutex.
+    // Alias removal is deferred to bounded orphan service, not queued here.
+    const closed = worker.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+    registry.expireIdle(store.assessment_generation);
+    registry.retire(store.assessment_generation, old_bytes, false);
     store.mutex.unlock();
     locked = false;
-    try std.testing.expect(callback_started);
+    try closed;
     try std.testing.expectEqual(@as(u64, 0), registry.retired_bytes.load(.acquire));
 }
 
@@ -11543,4 +11697,54 @@ test "lite typed score spans admit exact encoder after warmed graph scratch" {
     _ = try scope.readSortedScoreColumn("", nodes, &values);
     try std.testing.expectEqual(@as(f64, 1), values[0]);
     for (values[1..]) |value| try std.testing.expect(std.math.isNan(value));
+}
+
+test "lite reclamation issue1431 canceled automatic rewrites retry without file growth" {
+    const Admission = struct {
+        captures: usize = 0,
+        refuse_copy: bool = true,
+        fn enter(ptr: *anyopaque, scope: PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (scope == .reclamation) {
+                self.captures += 1;
+                if (self.refuse_copy and self.captures == 2) return error.EnrichmentWaitCanceled;
+            }
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "canceled-automatic-rewrite.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    for (0..64) |_| try store.file.putDocument("doc", "retained value");
+    store.maintenance_policy = try reclamation.Policy.init(.{ .page_reuse = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 128 * 1024 });
+    var admission: Admission = .{};
+    store.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer store.writer_admission = null;
+    const before = (try store.file.file.stat(std.testing.io)).size;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, store.maintainOnce(false));
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    try std.testing.expect(!store.maintenance_policy.due(before));
+    try std.testing.expect(store.maintenance_policy.rewrite_retry_at_ns != null);
+    // Simulate the detached owner's next checkpoint refresh: preserve policy,
+    // discard physical roots/estimates. Retry must not depend on that cache.
+    store.assessment_cache = null;
+    admission.refuse_copy = false;
+    for (0..3) |_| try store.maintainOnce(false);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(before, (try store.file.file.stat(std.testing.io)).size);
+    store.maintenance_policy.rewrite_retry_at_ns = 0;
+    try store.maintainOnce(false);
+    try std.testing.expectEqual(@as(u64, 2), store.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.rewrite_count);
+    try std.testing.expect(store.maintenance_policy.rewrite_retry_at_ns == null);
+    try std.testing.expect((try store.file.file.stat(std.testing.io)).size < before);
+    const value = (try store.file.getDocumentAlloc(a, "doc")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("retained value", value);
+    try std.testing.expect((try store.file.check()).valid);
 }
