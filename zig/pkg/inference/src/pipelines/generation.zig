@@ -4143,7 +4143,7 @@ pub const QwenVisionBatchHook = struct {
 
 pub const NativeGenerationPipeline = struct {
     /// Token publication is bounded; GPU steps reuse two frame/logit banks.
-    pub const max_gpu_token_burst_width: usize = @import("../ops/cuda/lighton_decode_graph.zig").max_steps;
+    pub const max_gpu_token_burst_width: usize = 8;
     allocator: std.mem.Allocator,
     io: ?std.Io = null,
     cb: ComputeBackend,
@@ -13496,7 +13496,7 @@ pub const NativeGenerationPipeline = struct {
         } else try burst.read(output);
     }
 
-    /// Execute only inside the reader epoch's model lane. The bounded multi-token graph
+    /// Execute only inside the reader epoch's model lane. The two-step graph
     /// returns through the existing bounded-burst publication contract.
     fn declineLightOnGraph(self: *NativeGenerationPipeline, reason: u3) ?StepForwardResult {
         self.lighton_graph_declines[reason] += 1;
@@ -13538,12 +13538,17 @@ pub const NativeGenerationPipeline = struct {
         defer context.deinit();
         context.context.prepared_lighton_decode = true;
         const result = (try self.tryOrderedLightOnCudaDecodeGraph(ordered_claims[0..claimed.len], ordered_items[0..claimed.len], ordered_ids[0..claimed.len], &context.context)) orelse return null;
-        errdefer {
-            self.allocator.free(result.greedy_tokens.?);
-            self.allocator.free(result.second_greedy_tokens.?);
+        const first = result.greedy_tokens.?;
+        const second = result.second_greedy_tokens.?;
+        std.debug.assert(first.len == claimed.len and second.len == claimed.len);
+        var first_original: [128]u32 = undefined;
+        var second_original: [128]u32 = undefined;
+        for (order[0..claimed.len], 0..) |original, row| {
+            first_original[original] = first[row];
+            second_original[original] = second[row];
         }
-        try @import("../ops/cuda/lighton_decode_graph.zig").restoreTokenColumns(result.greedy_tokens.?, order[0..claimed.len]);
-        try @import("../ops/cuda/lighton_decode_graph.zig").restoreTokenColumns(result.second_greedy_tokens.?, order[0..claimed.len]);
+        @memcpy(first, first_original[0..claimed.len]);
+        @memcpy(second, second_original[0..claimed.len]);
         return result;
     }
 
@@ -13580,7 +13585,6 @@ pub const NativeGenerationPipeline = struct {
         defer kv_lock.unlock();
         var future: [128]usize = undefined;
         var max_future: usize = 0;
-        var steps = std.math.clamp(@as(usize, if (self.gpu_token_burst_lighton_decode) self.gpu_token_burst_width else 2), 2, max_gpu_token_burst_width);
         for (claimed, items, 0..) |item, mixed, i| {
             const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
             const sequence = work.sequence orelse return self.declineLightOnGraph(2);
@@ -13592,7 +13596,6 @@ pub const NativeGenerationPipeline = struct {
                 mixed.kv_position_offset != 0 or mixed.kv_sequence_len != mixed.total_sequence_len or
                 mixed.state.qwen35_linear_cache == null) return self.declineLightOnGraph(2);
             const remaining = @min(sequence.max_tokens - sequence.generated, sequence.token_ids.len - sequence.seq_len.*);
-            steps = @import("../ops/cuda/lighton_decode_graph.zig").boundedSteps(steps, remaining) orelse return self.declineLightOnGraph(2);
             future[i] = try std.math.add(usize, item.total_sequence_len, remaining);
             if (future[i] > @import("../ops/cuda/lighton_attention.zig").max_native_context_tokens) return self.declineLightOnGraph(3);
             if (storage.storage.config.sliding_window_size) |window|
@@ -13606,7 +13609,6 @@ pub const NativeGenerationPipeline = struct {
         const embedding_pointer = C.lightOnGraphWeightPointer(&self.cb, embedding) orelse return self.declineLightOnGraph(4);
         const head_pointer = C.lightOnGraphWeightPointer(&self.cb, head) orelse return self.declineLightOnGraph(4);
         try key.add(self.lighton_cuda_execution_id);
-        try key.add(steps);
         try key.add(claimed.len);
         try key.add(self.gpt_config.hidden_size);
         try key.add(self.gpt_config.vocab_size);
@@ -13668,7 +13670,7 @@ pub const NativeGenerationPipeline = struct {
         var kv_words: [193]u64 = undefined;
         const kv_count = try C.lightOnGraphKvWords(&self.cb, storage, items[0].state.sequence_id.?, max_future, attention_layers[0..attention_count], &kv_words);
         for (kv_words[0..kv_count]) |word| try key.add(word);
-        const prepared = (try C.beginLightOnDecodeGraph(&self.cb, self.lighton_cuda_execution_id, key.words[0..key.len], positions, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size, steps, max_future, attention_count, self.gpt_config.num_hidden_layers - attention_count)) orelse return self.declineLightOnGraph(7);
+        const prepared = (try C.beginLightOnDecodeGraph(&self.cb, self.lighton_cuda_execution_id, key.words[0..key.len], positions, claimed.len, self.gpt_config.hidden_size, self.gpt_config.vocab_size, max_future, attention_count, self.gpt_config.num_hidden_layers - attention_count)) orelse return self.declineLightOnGraph(7);
         var graph = prepared;
         defer graph.deinit();
         errdefer {
@@ -13681,7 +13683,7 @@ pub const NativeGenerationPipeline = struct {
         defer burst.deinit();
         const first = try self.allocator.alloc(u32, claimed.len);
         errdefer self.allocator.free(first);
-        const second = try self.allocator.alloc(u32, (steps - 1) * claimed.len);
+        const second = try self.allocator.alloc(u32, claimed.len);
         errdefer self.allocator.free(second);
         const embedded = try self.cb.embeddingLookup(embedding, input_ids, claimed.len, self.gpt_config.hidden_size);
         defer self.cb.free(embedded);
@@ -13690,7 +13692,6 @@ pub const NativeGenerationPipeline = struct {
             pipeline: *NativeGenerationPipeline,
             items: []MixedBatchDecodeItem,
             max_tokens: usize = 0,
-            steps: usize,
             burst: *C.LightOnTokenBurst,
             head: ops.CT,
             fn advanceCpu(render: *@This()) !void {
@@ -13707,9 +13708,9 @@ pub const NativeGenerationPipeline = struct {
             fn run(raw: *anyopaque, claim: *C.LightOnGraphClaim) !void {
                 const render: *@This() = @ptrCast(@alignCast(raw));
                 const pipeline = render.pipeline;
-                for (0..render.steps) |step| {
+                for (0..2) |step| {
                     try pipeline.cb.checkExecutionControl();
-                    if (step > 0) try render.advanceCpu();
+                    if (step == 1) try render.advanceCpu();
                     const metadata_bytes = 128 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
                     var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
                     var fba = std.heap.FixedBufferAllocator.init(&metadata);
@@ -13718,7 +13719,7 @@ pub const NativeGenerationPipeline = struct {
                     defer context.deinit();
                     context.context.prepared_lighton_decode = true;
                     claim.beginStep(step);
-                    const input = if (step == 0) try claim.input() else try render.burst.embedding(step - 1);
+                    const input = if (step == 0) try claim.input() else try render.burst.embedding(0);
                     const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(&pipeline.cb, pipeline.allocator, pipeline.gpt_config, input, .{}, if (render.items.len > 64) 1 else render.items.len, if (render.items.len > 64) render.items.len else 1, &context.context, null);
                     defer pipeline.cb.free(hidden.hidden);
                     const logits = try claim.projectHead(&pipeline.cb, hidden.hidden, render.head);
@@ -13728,16 +13729,16 @@ pub const NativeGenerationPipeline = struct {
                 }
             }
         };
-        var render = Render{ .pipeline = self, .items = items, .burst = &burst, .head = head, .steps = steps };
-        if (graph.compute.lighton_decode_graph.phase == .replay) for (1..steps) |_| try render.advanceCpu();
+        var render = Render{ .pipeline = self, .items = items, .burst = &burst, .head = head };
+        if (graph.compute.lighton_decode_graph.phase == .replay) try render.advanceCpu();
         try self.cb.checkExecutionControl();
         try graph.run(&render, Render.run);
         graph.noteKvTokens(storage, render.max_tokens);
-        var host: [128 * max_gpu_token_burst_width]u32 = undefined;
-        try graph.read(&burst, host[0 .. steps * claimed.len]);
+        var host: [256]u32 = undefined;
+        try graph.read(&burst, host[0 .. 2 * claimed.len]);
         try self.cb.checkExecutionControl();
         @memcpy(first, host[0..claimed.len]);
-        @memcpy(second, host[claimed.len .. steps * claimed.len]);
+        @memcpy(second, host[claimed.len .. 2 * claimed.len]);
         burst.noteCompleted();
         return .{ .logits = null, .greedy_tokens = first, .second_greedy_tokens = second, .max_query_seq_len = 1 };
     }
