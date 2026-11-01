@@ -2613,6 +2613,8 @@ pub const LiteResolvedOpenOptions = struct {
     reader_coordinator: ?*lite_backend.native.ReaderCoordinator = null,
     /// Borrowed only during open, under the connection's publication fence.
     allocator_verification_owner: ?*lite_backend.native.NativeFile = null,
+    /// Exclusive temporary verifier; consumes its cache before DB.open.
+    allocator_state_donor: ?*lite_backend.native.NativeFile = null,
 };
 
 pub fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -2860,6 +2862,10 @@ pub fn openLiteHandleAllocWithSharedInference(
     if (resolved.allocator_verification_owner) |verified| {
         if (!resolved.externally_locked) return error.InvalidArgument;
         try backend.native_docstore.?.file.inheritAllocatorVerification(verified);
+    }
+    if (resolved.allocator_state_donor) |donor| {
+        if (!resolved.externally_locked) return error.InvalidArgument;
+        _ = try backend.native_docstore.?.file.takeVerifiedAllocator(donor);
     }
     if (resolved.externally_locked) {
         backend.native_docstore.?.file.externally_locked = true;

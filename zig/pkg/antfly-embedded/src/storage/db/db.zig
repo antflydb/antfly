@@ -55502,8 +55502,14 @@ fn replayPendingDerivedBatches(
                 .progress_fn = if (use_dense_catch_up) DenseReplayProgressContext.run else null,
                 .persist_ctx = &persist_progress_ctx,
                 .persist_progress_fn = PersistReplayProgress.run,
-                .max_records_per_window = if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxRecords() else derived_worker.catch_up_max_records_per_window_default,
-                .max_chunk_bytes = if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxChunkBytes() else derived_worker.catch_up_max_chunk_bytes_default,
+                .max_records_per_window = @min(
+                    if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxRecords() else derived_worker.catch_up_max_records_per_window_default,
+                    if (options.bounded_replay) derived_worker.catch_up_background_max_records else std.math.maxInt(usize),
+                ),
+                .max_chunk_bytes = @min(
+                    if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxChunkBytes() else derived_worker.catch_up_max_chunk_bytes_default,
+                    if (options.bounded_replay) derived_worker.catch_up_background_max_chunk_bytes else std.math.maxInt(u64),
+                ),
                 .max_windows_per_call = options.max_windows_per_index,
                 .deadline_ns = options.deadline_ns,
             },

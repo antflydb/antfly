@@ -53,6 +53,29 @@ pub const CapacityProbe = struct {
 pub const State = enum { disabled, idle, assessing, rewriting, deferred, failed };
 pub const Reason = enum { none, disabled, concurrency_unavailable, writer_busy, retained_readers, storage_budget, low_disk, canceled, maintenance_error };
 
+/// Counts follow the allocator cache across serving replacements. Appended
+/// pages include attempted allocation in subsequently rolled-back work.
+pub const AllocatorWork = struct {
+    full_loads: u64 = 0,
+    full_load_ns: u64 = 0,
+    journal_rebases: u64 = 0,
+    journal_rebase_ns: u64 = 0,
+    cache_transfers: u64 = 0,
+    artifact_source_opens: u64 = 0,
+    artifact_source_reuses: u64 = 0,
+    digest_rebuilds: u64 = 0,
+    digest_rebuild_ns: u64 = 0,
+    reuse_lock_refusals: u64 = 0,
+    appended_pages: u64 = 0,
+    reuse_blocked_append_pages: u64 = 0,
+
+    pub fn absorb(self: *AllocatorWork, source: *AllocatorWork) void {
+        if (self == source) return;
+        inline for (comptime std.meta.fieldNames(AllocatorWork)) |name| @field(self, name) +|= @field(source, name);
+        source.* = .{};
+    }
+};
+
 pub const Status = struct {
     state: State = .idle,
     reason: Reason = .none,
@@ -63,6 +86,15 @@ pub const Status = struct {
     pending_retirement_objects: u64 = 0,
     pending_data_retirement_objects: u64 = 0,
     reused_pages: u64 = 0,
+    allocator_work: AllocatorWork = .{},
+    allocator_journal_bytes: u64 = 0,
+    data_reuse_frontier: u64 = 0,
+    metadata_reuse_frontier: u64 = 0,
+    oldest_data_retirement_epoch: ?u64 = null,
+    oldest_metadata_retirement_epoch: ?u64 = null,
+    coordinated_reader_count: u64 = 0,
+    poisoned_coordinated_readers: u64 = 0,
+    oldest_coordinated_reader_age_ms: u64 = 0,
     retired_objects_serviced: u64 = 0,
     retirement_activity_bytes: u64 = 0,
     retired_file_bytes: u64 = 0,

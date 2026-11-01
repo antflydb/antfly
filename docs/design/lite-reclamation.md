@@ -8,12 +8,82 @@ Native Lite owns incremental retirement, page reuse, maintenance scheduling,
 shrinking, atomic publication, and retained-reader accounting. Applications supply
 budgets; ordinary overwrite workloads do not require a full rewrite.
 
-The owner creates revision-4 files (`AFLITE\x04P`) by default. Writable revision-3
+### Checkpoint adoption and indexed reader lifetimes
+
+Connection refresh transfers an exclusively owned temporary verifier's loaded
+allocator and digest cache into the replacement before index initialization can
+publish leases. An idle serving wrapper can donate its previous checked cache
+as a validation base. Compatible foreign tips replay at most 128 journal pages
+and update dirty digest chunks; the current checkpoint certificate must match
+before reuse is enabled. Partial checkpoint builders retain their durable heads
+and cursors across adoption. Snapshot-anchor changes, long suffixes, and
+incompatible caches use an independent full reload. A journal
+anchor's physical page identity alone never establishes ancestry.
+
+Checked connection commits seal the unpublished allocator root itself. Root
+encoding version 3 extends the 128-byte version-2 root with the planned complete
+header fingerprint and allocator ownership digest (192 bytes total). The seal
+excludes its own bytes from the canonical ownership hash and covers both recovery
+slots through the header fingerprint. It is written before the existing data-sync
+and checkpoint-publication barriers. Allocator-only service therefore remains
+checked without allocating certificate records or generating new certificate
+retirement debt. Unchecked writes produce an unsealed root. Catalog certificates
+remain readable for older files. Older binaries reject root encoding version 3;
+this is another unreleased encoding change.
+
+Catalog publication proofs own logical content fingerprints, not reader pins.
+Metadata document records may carry a 32-byte BLAKE3 digest under document flag
+`0x08`, following the namespace link and preceding the key. New metadata writes
+compute the digest from their logical value. Records without the flag remain
+readable and compute their fingerprint on demand. Older binaries that do not
+understand the flag reject these records; this is an unreleased encoding change.
+Content identity remains valid when physical record pages are reused.
+
+Detached index replay uses durable immutable-artifact leases, while retaining a
+primary data snapshot through its bounded replay turn. Replay can open primary
+reads lazily; dropping that snapshot before those reads finish permits stale page
+access. Background derived windows admit at most 64 records or 1 MiB, retaining
+the existing one-oversized-record progress exception. Explicit/foreground drains
+keep their larger amortization bounds. Generated producers and resolvers also keep their source guards. General
+integrity readers retain full allocator metadata
+protection, including recovery slots. Revision-5 cooperating readers publish cross-process epochs. Unregistered readers
+retain their ordinary inode locks and conservatively block physical reuse.
+
+Within a process, serving replacements can share a leased immutable source and
+its concurrent block cache. The weak pool keys the database path, artifact path,
+inode, value root, length, and inline bytes. An open durable alias prevents root
+page reuse, so this identity is safe while the entry is reusable. Closed entries
+are never reused. Each returned source owns a reference; the last close releases
+resources and the original registry/resource owner. Inode-fenced sources never
+enter the pool. Shared sources remain valid when their originating Store closes;
+changing an artifact's value or the database inode creates an independent source.
+Stores with an explicit storage quota or custom capacity probe retain independent
+leases and registries so their retained-inode admission accounting remains local.
+The final source close releases its marker and descriptor without entering writer
+admission. The bounded orphan collector batches durable alias deletion later.
+This avoids a separate release commit per source and allows runtime teardown
+while the connection gate or another maintenance/proof lane is occupied.
+
+Index durability barriers do not enter allocator mutation admission. A handle
+may skip a repeated barrier only for the exact checkpoint it has already synced;
+deferred publication and uncertain outcomes cannot use that shortcut.
+
+`reclamation.allocator_work` reports full-load and digest-rebuild counts/times,
+bounded journal rebases, cache transfers, reuse-lock refusals, attempted append
+pages, source opens/reuses, and append pages allocated while reusable space was lock-blocked. Reader
+frontiers, coordinated reader ages/poisoning, pending retirement epochs, and
+journal bytes help distinguish retention from collector debt. These counters
+include diagnostic work and rolled-back allocation attempts. Benchmark collection
+is opt-in with `--allocator-diagnostics` and happens after all timed work; status
+reads can themselves refresh runtimes, so they are not passive idle probes.
+
+The owner creates revision-5 files (`AFLITE\x05P`) by default. Writable revision-3
 owners migrate through an explicitly identified compact image and atomic generation
 adoption. Read-only opens preserve revision 3. Raw native format primitives retain
 their revision-3 default for compatibility; `CreateOptions.indexed_reclamation`
-selects revision 4. Older binaries reject the new signature. `page_reuse = false`
-opts out of creating/migrating revision 4; an existing revision-4 file still uses
+selects revision 5. Revision-4 prototypes are rejected rather than silently mixing reader protocols;
+these formats have not shipped. Older binaries reject the new signature. `page_reuse = false`
+opts out of creating/migrating revision 5; an existing revision-5 file still uses
 its required ownership machinery.
 
 The implementation uses journaled ownership counters and a hierarchical free-page
@@ -258,8 +328,8 @@ Previous metadata snapshots retire as at most three chain-head events. Service
 reads and retires one chain page per work unit, rather than enqueueing an entire
 snapshot. Metadata roots and chains have separate queues. Their visibility fence
 is the recovery/durability slots: internal data transactions never read allocator
-metadata. External snapshot and audit handles still prevent physical overwrite
-through the inode lock. Each service batch retires at most
+metadata. Registered full snapshots also retain their metadata epoch;
+unregistered snapshot and audit handles prevent overwrite through the inode lock. Each service batch retires at most
 `max(8, retirement_work_pages)` allocator-chain pages. Completed data and
 chain objects retain zero-count physical pages as single-page metadata events
 until the completion epoch crosses both recovery/durability slots. This preserves
@@ -288,7 +358,7 @@ construction and publication are divided into bounded maintenance batches.
 ## Checkpoint, reader, and crash safety
 
 Reuse waits for both valid recovery slots, durable roots retained behind unsynced
-commits, and the oldest in-process reader epoch. Retirement is stamped with the
+commits, and the oldest registered reader epoch, including cooperating peer processes. Retirement is stamped with the
 actual transaction's next publication epoch, including multiple private index
 materializations. Data and allocator roots use the same sync and checksummed slot
 publication barriers. Failed transactions reload the previous ledger; partial
@@ -307,12 +377,12 @@ The owner invalidates both writer and generation-reader caches before reusing a
 physical ID, including decoded views and cached links. It can reuse pages older
 than all pins while newer readers remain active.
 
-External readers retain the conservative whole-file shared lock. If the owner
-cannot acquire the exclusive rewrite lock, allocations append while the durable
-free bitmap remains intact. This preserves external snapshots without pretending
-to provide cross-process epoch registration. Generation rewrites keep old inode
-descriptors alive until their final reader exits; those bytes remain charged to
-the aggregate storage budget.
+Cooperating indexed readers use the cross-process epoch protocol described
+below. Unregistered readers retain the conservative whole-file shared lock. If
+the owner cannot acquire the exclusive scan/rewrite lock, allocations append and
+retirement promotion waits. Generation rewrites keep old inode descriptors alive
+until their final reader exits; the existing retained-generation accounting
+continues to charge those bytes to their owning resource budget.
 
 Opening an allocator verifies root bounds and checks metadata checksums, cycles,
 queue IDs, and counter encoding. Before first reuse, a protected-graph validation
@@ -323,15 +393,12 @@ perform a whole-file trace. Private vacuum publication rebases retirement epochs
 and writes a metadata checkpoint when discarding earlier private recovery roots.
 
 Checked native connection owners carry that invariant across live commits using
-a private allocator certificate in the physical index catalog. The certificate
-binds both recovery slots and the complete canonical ownership state. Its own
-pages are included before the fingerprint is filled, and publication shares the
+the version-3 allocator-root seal described above. The seal binds both recovery
+slots and the complete canonical ownership state. Its publication shares the
 caller's existing transaction and durability barrier. An unchecked or deferred
-writer cannot produce a trusted seal. Allocator-only retirement service does not
-replace the certificate: doing so would create new retirement work while
-consuming the old work and prevent quiescence. A peer admitting such a tip uses
-the existing protected-graph proof. Legacy clean-close certificates in the
-primary catalog remain readable and are still published at clean close.
+writer cannot produce a trusted seal. Allocator-only retirement service seals
+its new private root without adding catalog records or fresh retirement debt.
+Legacy catalog certificates remain readable for older checked publications.
 
 Before opening a replacement runtime, native admission checks the current tip's
 certificate even when the previous runtime had a valid proof for an older tip.
@@ -352,7 +419,7 @@ orphan artifact leases. The foreground may adopt that housekeeping only when
 both captures started at the same header, the current foreground is unchanged,
 and the published inode and complete checkpoint still match the maintenance
 result. Reclamation admission never rebases across an external publication.
-These fences allow the certificate catalog root to advance without reopening
+These fences allow allocator and lease housekeeping to advance without reopening
 the database runtime and creating another set of leases.
 
 Contended path-lease admission uses randomized short sleeps, capped at four
@@ -368,7 +435,7 @@ Sidecar creation retains its inode fence. Qualification records CPU cost and
 progress for every writer rather than accepting aggregate throughput alone.
 
 A persistent, path-hashed maintenance sidecar serializes detached background
-turns across processes. Opening an uncertified revision-4 runtime and admitting
+turns across processes. Opening an uncertified indexed runtime and admitting
 its allocator proof also retain this turn, preventing peer index-lease opens
 from continually invalidating the captured tip. Nested work shares the turn
 within an owner; certified foreground callers retain their ordinary path-lease
@@ -411,7 +478,7 @@ from inheriting an open's deferred scan while retaining validation before reuse.
 Page reuse is the routine mechanism. Optional automatic shrinking retains the
 owner's conservative amplification, absolute-savings, hysteresis, resource,
 cancellation, and publication policy. Explicit vacuum is also available. Shrinking
-rewrites live indexed data into a compact revision-4 generation, bootstraps its
+rewrites live indexed data into a compact revision-5 generation, bootstraps its
 ownership ledger once, streams concurrent changes, and atomically adopts it.
 It therefore returns internal holes and packed-page slack to the filesystem
 independently of routine retirement. This implementation uses generation rewriting
@@ -497,27 +564,36 @@ cancellation from the owner's worker shutdown token.
 
 ### Reuse during detached native turns
 
-A detached runtime used to hold shared locks on the entire inode through replay
-and provider work. Those locks correctly protected snapshots but also disabled
-reuse of pages already free before capture. Rapid native writes could append
-throughout the lifetime of a worker turn, including in short-lived processes.
+Revision-5 readers with a coordinator publish immutable 64-byte epoch markers in
+`<canonical database path>.readers/`. Each marker binds the inode, oldest captured
+sequence, and data/full-metadata scope with a BLAKE3 checksum. The reader holds a
+shared data-inode lock from capture until its marker is complete and exclusively
+locked, then releases the data lock. The marker lock remains until reader close.
 
-The connection now coordinates its data-reader fences. While holding the same
-cross-process path-writer lease used for publication, a verified writer accounts
-for their oldest checkpoint, suspends only its own shared inode locks, and tries
-the normal exclusive inode lock. Retirement retains the captured reader frontier
-for the entire allocation window. Remaining external readers still deny exclusive
-reuse. Shared locks are restored before releasing the path-writer lease. Reader
-registration and close remain serialized without retaining the registry mutex
-through allocator callbacks, so reclaiming an idle source can release its fence.
+Every indexed writer acquires the exclusive data-inode lock before scanning the
+reader directory and promoting retirement. This fences the entire scan-to-reuse
+window against new registrations. The oldest active data and metadata sequences
+bound their respective retirement queues. A writer without the exclusive scan
+fence performs no retirement promotion, including logical promotion into the free
+pool. Otherwise a registering old reader could lose protection between promotion
+and the next writer. Unregistered readers continue to block exclusive reuse.
 
-An unrecognized checkpoint publication permanently disqualifies existing readers
-from coordinated suspension: an external writer may have promoted retirement
-without knowing their local frontier. Their ordinary shared locks remain until
-close. The next reader generation can coordinate again. Allocator verification
-and integrity readers retain their original whole-inode locks; the coordinated
-frontier applies to data readers, which do not inspect historical allocator pages.
-This changes no file format and requires no cooperation from older processes.
+A crashed reader leaves an unlocked UUID marker, which the next fenced scan
+removes. No PID, timeout, heartbeat, or wall clock decides whether pages are safe.
+Unlinking a live marker occurs only after its reader has finished. Markers need no
+fsync because readers cannot survive a machine crash. A live malformed marker
+fails closed. Each scan visits at most 4096 entries; excess registrations deny
+reuse conservatively. Work depends on current readers, not retained database size.
+Canonical paths and inode checks separate aliases and replaced generations.
+Read-only owners keep their inode authority, including in directories where no
+sidecar can be created; making the directory writable does not switch it mid-read. An
+in-place vacuum refuses any registered reader; online generation replacement can
+retain the old inode through existing descriptor and resource accounting.
+
+The format signature is bumped to revision 5 so a revision-4 writer cannot ignore
+these epoch markers and reuse pages underneath a reader. Legacy same-process
+inode-fence suspension remains for non-indexed/internal compatibility paths, with
+its existing unrecognized-publication poisoning rules.
 
 Allocator ownership validation reads packed tree records through one bounded
 physical-page reader. It verifies each loaded bundle and each requested record

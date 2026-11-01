@@ -13,11 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Same-owner reader fences, serialized by the connection's path-writer lease.
-//! Other processes still see ordinary shared inode locks. Only a writer which
-//! accounts for every known publication can suspend its own locks; an external
-//! publication permanently poisons existing fences until their readers close.
+//! Reader fence lifetimes. Revision-5 epochs protect snapshots across processes;
+//! legacy inode fences can be suspended only by their own trusted coordinator.
+//! A writer's exclusive data lock fences epoch registration and page reuse.
 const std = @import("std");
+const epochs = @import("reader_epochs.zig");
 pub const Coordinator = struct {
     allocator: std.mem.Allocator,
     /// Must outlive the last reader, not merely the writer. C ABI owners use
@@ -34,10 +34,12 @@ pub const Coordinator = struct {
         file: std.Io.File,
         inode: u64,
         sequence: u64,
+        captured_at_ns: i96 = 0,
         /// Full graph scans also retain allocator/recovery metadata pages.
         metadata: bool = false,
         poisoned: bool = false,
         suspended: bool = false,
+        epoch: ?epochs.Lease = null,
     };
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Coordinator {
         return .{ .allocator = allocator, .io = io };
@@ -62,12 +64,26 @@ pub const Coordinator = struct {
     /// The descriptor already holds its kernel shared lock. Registration may
     /// wait for a writer, which then treats this unregistered lock as external.
     pub fn register(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
-        return self.registerWithScope(file, inode, sequence, tip, false);
+        return self.registerWithScope(file, inode, sequence, tip, false, null);
     }
     pub fn registerFull(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
-        return self.registerWithScope(file, inode, sequence, tip, true);
+        return self.registerWithScope(file, inode, sequence, tip, true, null);
     }
-    fn registerWithScope(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, metadata: bool) !*Fence {
+    /// The caller holds the data inode shared lock through registration.
+    pub fn registerEpoch(self: *Coordinator, file: std.Io.File, path: []const u8, inode: u64, sequence: u64, tip: [32]u8, metadata: bool) !*Fence {
+        const epoch = epochs.register(self.allocator, self.io, path, inode, sequence, metadata) catch |err| switch (err) {
+            // Immutable read-only snapshots must work without creating any
+            // sidecars. Retain their original kernel fence if registration
+            // cannot write its directory; every writer still respects it.
+            error.AccessDenied, error.ReadOnlyFileSystem => return self.registerWithScope(file, inode, sequence, tip, metadata, null),
+            else => return err,
+        };
+        errdefer epoch.close(self.allocator, self.io);
+        const fence = try self.registerWithScope(file, inode, sequence, tip, metadata, epoch);
+        file.unlock(self.io);
+        return fence;
+    }
+    fn registerWithScope(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, metadata: bool, epoch: ?epochs.Lease) !*Fence {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const fence = try self.allocator.create(Fence);
@@ -75,8 +91,8 @@ pub const Coordinator = struct {
         // The shared lock may have blocked physical reuse before registration,
         // while an external writer promoted retirement. A delayed old reader
         // must never become eligible merely by arriving after that detection.
-        const stale = if (self.known) |known| known.inode != inode or !std.mem.eql(u8, &known.tip, &tip) else false;
-        fence.* = .{ .file = file, .inode = inode, .sequence = sequence, .metadata = metadata, .poisoned = stale };
+        const stale = epoch == null and if (self.known) |known| known.inode != inode or !std.mem.eql(u8, &known.tip, &tip) else false;
+        fence.* = .{ .file = file, .inode = inode, .sequence = sequence, .captured_at_ns = std.Io.Clock.awake.now(self.io).nanoseconds, .metadata = metadata, .poisoned = stale, .epoch = epoch };
         try self.readers.append(self.allocator, fence);
         _ = self.references.fetchAdd(1, .monotonic);
         if (self.known == null) self.known = .{ .inode = inode, .tip = tip };
@@ -86,6 +102,7 @@ pub const Coordinator = struct {
         self.mutex.lockUncancelable(self.io);
         for (self.readers.items, 0..) |item, i| if (item == fence) {
             _ = self.readers.swapRemove(i);
+            if (fence.epoch) |epoch| epoch.close(self.allocator, self.io);
             self.allocator.destroy(fence);
             self.mutex.unlock(self.io);
             self.release();
@@ -100,13 +117,34 @@ pub const Coordinator = struct {
         return self.beginWithMetadata(inode, tip, reuse).data;
     }
     pub const Frontier = struct { data: ?u64 = null, metadata: ?u64 = null };
+    pub const ReaderStats = struct {
+        frontier: Frontier = .{},
+        count: u64 = 0,
+        poisoned: u64 = 0,
+        oldest_age_ms: u64 = 0,
+    };
+    /// Observation only: never suspend locks or advance the known tip.
+    pub fn readerStats(self: *Coordinator, inode: u64) ReaderStats {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var result: ReaderStats = .{};
+        const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+        for (self.readers.items) |fence| if (fence.inode == inode) {
+            result.count += 1;
+            result.poisoned += @intFromBool(fence.poisoned);
+            result.frontier.data = @min(result.frontier.data orelse fence.sequence, fence.sequence);
+            if (fence.metadata) result.frontier.metadata = @min(result.frontier.metadata orelse fence.sequence, fence.sequence);
+            result.oldest_age_ms = @max(result.oldest_age_ms, @as(u64, @intCast(@divTrunc(@max(0, now - fence.captured_at_ns), std.time.ns_per_ms))));
+        };
+        return result;
+    }
     pub fn beginWithMetadata(self: *Coordinator, inode: u64, tip: [32]u8, reuse: bool) Frontier {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.windows += 1;
         if (self.known) |known| {
             if (known.inode != inode or !std.mem.eql(u8, &known.tip, &tip)) {
-                for (self.readers.items) |fence| if (fence.inode == inode) {
+                for (self.readers.items) |fence| if (fence.inode == inode and fence.epoch == null) {
                     fence.poisoned = true;
                 };
             }
@@ -117,9 +155,9 @@ pub const Coordinator = struct {
         for (self.readers.items) |fence| if (fence.inode == inode) {
             frontier.data = @min(frontier.data orelse fence.sequence, fence.sequence);
             if (fence.metadata) frontier.metadata = @min(frontier.metadata orelse fence.sequence, fence.sequence);
-            can_suspend = can_suspend and !fence.poisoned;
+            if (fence.epoch == null) can_suspend = can_suspend and !fence.poisoned;
         };
-        if (can_suspend and self.windows == 1) for (self.readers.items) |fence| if (fence.inode == inode) {
+        if (can_suspend and self.windows == 1) for (self.readers.items) |fence| if (fence.inode == inode and fence.epoch == null) {
             fence.file.unlock(self.io);
             fence.suspended = true;
         };
@@ -152,7 +190,7 @@ pub const Coordinator = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const changed = if (self.known) |known| known.inode != inode or !std.mem.eql(u8, &known.tip, &previous_tip) else false;
-        if (uncertain or changed) for (self.readers.items) |fence| if (fence.inode == inode) {
+        if (uncertain or changed) for (self.readers.items) |fence| if (fence.inode == inode and fence.epoch == null) {
             fence.poisoned = true;
         };
         self.known = .{ .inode = inode, .tip = tip };

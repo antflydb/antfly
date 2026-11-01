@@ -348,6 +348,12 @@ def native_worker(config, index, ready, start, results, finish=None):
                 "last_write": last_write,
                 **usage,
             }
+            if config.get("allocator_diagnostics", False):
+                # Admission/status reads can perturb storage. Collect only
+                # after every timed worker and proof snapshot has finished.
+                result["allocator_diagnostics"] = (
+                    db.status().get("storage", {}).get("reclamation", {})
+                )
         # close()/__exit__ is part of worker success. Emit exactly one terminal
         # result so a close failure cannot follow an already accepted success.
         results.put(result)
@@ -498,6 +504,11 @@ def aggregate(workers: list[dict]) -> dict:
         "involuntary_context_switches",
     ):
         result[field] = sum(row[field] for row in workers)
+    if any("allocator_diagnostics" in row for row in workers):
+        result["allocator_diagnostics_after_workload"] = [
+            {"index": row["index"], **row.get("allocator_diagnostics", {})}
+            for row in workers
+        ]
     return result
 
 
@@ -562,6 +573,7 @@ def native_cases(args):
                 "seconds": args.seconds,
                 "watchdog": args.watchdog,
                 "workload": args.workload,
+                "allocator_diagnostics": args.allocator_diagnostics,
             }
             processes = [
                 context.Process(
@@ -741,6 +753,11 @@ def main():
     parser.add_argument("--seed-records", type=int, default=1024)
     parser.add_argument("--workload", choices=("append", "churn"), default="churn")
     parser.add_argument("--no-sync", action="store_true")
+    parser.add_argument(
+        "--allocator-diagnostics",
+        action="store_true",
+        help="collect allocator counters after timed work; status reads can perturb storage",
+    )
     parser.add_argument(
         "--no-index",
         action="store_true",
