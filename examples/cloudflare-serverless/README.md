@@ -858,3 +858,9 @@ Its GitHub-hosted workflow uses disposable application/observer credentials;
 account authorization remains local. Client success alone cannot close missing
 service/resource or provider delivery windows. Local checks do not establish a
 hosted gate pass.
+
+
+For primitive latency baselines, inline owner/HTTP attribution and bounded storage
+pressure isolation, see [platform baseline diagnostics](../../docs/design/cloudflare-platform-baselines.md).
+The primitive fixture measures provider costs separately from Antfly. Neither
+local emulator results nor a minimum sample is a hosted latency floor.

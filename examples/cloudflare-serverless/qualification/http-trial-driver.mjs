@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import{readPhaseProfile}from'../phase-profile.mjs';
 import{attemptParameter,versionIdentity}from'./attempt-token.mjs';
 const tenants=new Set(['a','b','c','d']),ops=new Set(['lookup','mutate','count','status','publish']);
 const visibility=v=>typeof v==='string'&&/^[a-f0-9]{82}$/.test(v);
@@ -25,7 +26,7 @@ export function validatePlan(plan){
  return plan;
 }
 export function documentBody(tenant,id,revision){return JSON.stringify({tenant,i:id,payload:'x'.repeat(1024),...(revision==null?{}:{revision})});}
-export async function runPlan(plan,{origin,token,fetch:send=fetch,onResponse,clock=()=>performance.now(),kind='Cloudflare-to-public-Worker HTTP; excludes internet-client transit',clockDescription='I/O-advanced Worker wall clock around awaited HTTP'}={}){
+export async function runPlan(plan,{origin,token,fetch:send=fetch,onResponse,clock=()=>performance.now(),kind='Cloudflare-to-public-Worker HTTP; excludes internet-client transit',clockDescription='I/O-advanced Worker wall clock around awaited HTTP',requireProfile=false}={}){
  validatePlan(plan);const url=new URL(origin);if(url.protocol!=='https:'||!/^antfly-1278-cold-[a-z0-9]+-[a-f0-9]{4}\.[a-z0-9-]+\.workers\.dev$/.test(url.hostname)||url.pathname!=='/'||url.search||url.hash||url.port||url.username||url.password||!/^[a-f0-9]{64}$/.test(token??''))throw Error('InvalidTrialDestination');
  const samples=await Promise.all(plan.steps.map(async(s,index)=>{
   const started=clock(),sample={attempt_id:s.attempt_id??crypto.randomUUID(),index,tenant:s.tenant,op:s.op,id:s.id,sequence:s.sequence,outcome:'error'};
@@ -33,7 +34,7 @@ export async function runPlan(plan,{origin,token,fetch:send=fetch,onResponse,clo
   try{
    const response=await send(new URL('/api?__antfly_qualification_attempt='+attemptParameter(sample.attempt_id),origin),{method:'POST',redirect:'manual',cache:'no-store',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json','X-Antfly-Tenant':s.tenant},body:JSON.stringify(input),signal:AbortSignal.timeout(60000)});await onResponse?.(sample.attempt_id,response);sample.status=response.status;sample.version=response.headers.get('X-Antfly-Version');sample.trace_id=response.headers.get('X-Antfly-Trace-Id');sample.colo=/\b([A-Z]{3})$/.exec(response.headers.get('CF-Ray')??'')?.[1]??null;
    if(response.status>=300&&response.status<400){await response.body?.cancel();throw Error('TrialRedirectRejected');}
-   const value=await response.json();sample.ms=Math.max(0,clock()-started);
+   const value=await response.json();const profile=readPhaseProfile(response.headers.get('X-Antfly-Profile'));if(requireProfile&&!profile?.owner)throw Error('TrialPhaseProfileMissing');if(profile)sample.profile=profile;sample.ms=Math.max(0,clock()-started);
    if(!response.ok){sample.error=/\b(SQLITE_NOMEM|OutOfMemory|MemoryLimitExceeded|CPULimitExceeded|CoordinatorRecovering|CoordinatorCommitBusy|DeadlineExceeded|ManifestReadLeaseExpired)\b/.exec(String(value.error??''))?.[1]??'HTTP'+response.status;return sample;}
    if(sample.version!==plan.version)throw Error('TrialVersionMismatch');
    if(s.op==='lookup'){if(value.body!==documentBody(s.tenant,s.id,s.revision))throw Error('TrialBodyMismatch');if(!visibility(value.visibility)||value.visibility.slice(0,66)!==s.visibility.slice(0,66)||BigInt('0x'+value.visibility.slice(-16))<BigInt('0x'+s.visibility.slice(-16)))throw Error('TrialFenceMismatch');}

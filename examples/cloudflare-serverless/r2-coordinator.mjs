@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import{profileResult}from'./phase-profile.mjs';
 import {bindReadLease,readLeaseRemaining} from "../../zig/lib/objectstore/wasm/read-view-lease.mjs";
 import {withReadView} from "./read-view.mjs";
 import {ObjectStoreError} from "../../zig/lib/objectstore/wasm/r2.mjs";
@@ -155,7 +156,7 @@ export class R2CommitCoordinator extends DurableObject {
         check();return host.request({op:"lookup",doc_id:input.doc_id,...(!cohort?.length&&input.required_visibility!=null?{required_visibility:input.required_visibility}:{}),resident_cut:captured.cut,...(cohort?.length?{resident_docs:cohort.map(m=>({doc_id:m.input.doc_id,required_visibility:m.input.required_visibility??null}))}:{}),...(this.env.RESIDENT_READ_STATE==="true"?{resident_read_state:true,resident_tail:captured.tail,...(phase.nativeReadGraph?{native_read_graph:true}:{})}:{}),...(phase.nativeReadYield?{native_read_yield:true}:{}),native_read_state:true,wal_document_index:this.env.WAL_DOCUMENT_INDEX==="true",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",bounded_manifest_reads:true,working_set_bytes:Math.min(8*1024*1024,Number(this.env.READER_WORKING_SET_BYTES??8*1024*1024)),bucket:"database",prefix:"antfly",namespace:this.env.ANTFLY_INCARNATION},{...phase,background:p=>this.ctx.waitUntil(p),deadlineMs,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",onMetrics:sample=>{phase.onMetrics?.(sample);const prior=metrics;metrics=prior?{...sample,operations:prior.operations+sample.operations,transferred_bytes:prior.transferred_bytes+sample.transferred_bytes,elapsed_ms:prior.elapsed_ms+sample.elapsed_ms,io_wait_ms:prior.io_wait_ms+sample.io_wait_ms,resident_read_cache_hits:prior.resident_read_cache_hits+sample.resident_read_cache_hits,working_set_peak_bytes:Math.max(prior.working_set_peak_bytes??0,sample.working_set_peak_bytes??0)}:sample;},onIoSettled:sample=>{if(this.env.LOG_METRICS==="true")console.log(JSON.stringify(sample));}});
       };
       const result=this.env.NATIVE_POINT_CONTINUATIONS==="true"?await withPointReadDependencies({graphRead:this.env.RESIDENT_COLD_PIPELINE==="true",reserveTranscript:bytes=>reserveInput(bytes,{floorBytes:4*1024*1024}),kernel:residentKernel,acquire,execute,transport:loadTransport,wrapTransport,fairKey:this.env.ANTFLY_INCARNATION,deadlineMs,remainingMs:check,onStage:s=>trace.stage(s),background:p=>this.ctx.waitUntil(p),onUsage:usage=>{if(metrics)metrics={...metrics,...usage};},onMetrics:sample=>{if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.point_dependency",trace_id:trace.id,...sample}));}}):await acquire(host=>execute(host));
-      check();succeeded=true;return result;
+      check();succeeded=true;return profileResult(result,trace,this.env,{physical,metrics,callers:cohort?.length??1,traceIds:cohort?.map(m=>m.traceId)});
     }catch(error){trace.error("resident",error);throw error;}finally{if(metrics&&this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.operation",resident_owner:true,resident_cohort_size:cohort?.length??1,resident_cohort_trace_ids:cohort?.map(m=>m.traceId)??null,resident_capacity_promotions:promotions,op:"lookup",role:"interactive",trace_id:trace.id,...metrics,...kernelMetrics(),physical,operation_outcome:succeeded?"ok":"error"}));trace.emit(this.env.LOG_METRICS==="true");}
   }
   requestMaintenance(kind,jobId){return this.maintenance.request(kind,jobId);}
@@ -430,7 +431,7 @@ export class R2CommitCoordinator extends DurableObject {
         trace.publicationId=committed.id;
         if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,prepare_attempts:attempt+1,physical_r2:physical}));
         trace.emit(this.env.LOG_METRICS==="true");
-        return result.results.map((rawItem,i)=>{const {__resident_tail,...item}=rawItem;if(this.env.RESIDENT_READ_STATE==="true")this.servingTail.install(__resident_tail,this.store.state.owner);return({...item,...(this.env.METADATA_COMMIT_HINTS==="true"?{__metadata_hint:this.store.exportRootHint()}:{}),__publication:i===0?committed:{...committed,enqueue:false}});});
+        return result.results.map((rawItem,i)=>{const {__resident_tail,...item}=rawItem;if(this.env.RESIDENT_READ_STATE==="true")this.servingTail.install(__resident_tail,this.store.state.owner);return profileResult({...item,...(this.env.METADATA_COMMIT_HINTS==="true"?{__metadata_hint:this.store.exportRootHint()}:{}),__publication:i===0?committed:{...committed,enqueue:false}},trace,this.env,{physical,callers:inputs.length,traceIds:inputs.map(v=>v.__trace_id)});});
       }
       this.optimisticWal.clear();
     }
@@ -481,7 +482,7 @@ export class R2CommitCoordinator extends DurableObject {
       if(!committed.applied){prepared=null;await refresh();continue;}
       trace.publicationId=committed.publication.id;
       if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",trace_id:trace.id,trace_ids:inputs.map(input=>input.__trace_id).filter(Boolean),callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,native_write_plan:true,prepare_attempts:prepareAttempts,finalize_attempts:finalizeAttempts,operations:ioBudget.operations,transferred_bytes:ioBudget.bytes,physical_r2:physical}));
-      return prepared.results.map((rawItem,i)=>{const {__resident_tail,...item}=rawItem;if(this.env.RESIDENT_READ_STATE==="true")this.servingTail.install(__resident_tail,this.store.state.owner);return({...item,...(this.env.METADATA_COMMIT_HINTS==="true"?{__metadata_hint:this.store.exportRootHint()}:{}),__publication:i===0?committed.publication:{...committed.publication,enqueue:false}});});
+      return prepared.results.map((rawItem,i)=>{const {__resident_tail,...item}=rawItem;if(this.env.RESIDENT_READ_STATE==="true")this.servingTail.install(__resident_tail,this.store.state.owner);return profileResult({...item,...(this.env.METADATA_COMMIT_HINTS==="true"?{__metadata_hint:this.store.exportRootHint()}:{}),__publication:i===0?committed.publication:{...committed.publication,enqueue:false}},trace,this.env,{physical,callers:inputs.length,traceIds:inputs.map(v=>v.__trace_id)});});
     }
     throw Error("WalCommitContended");
     }finally{if(refreshing)await Promise.allSettled([refreshing]);trace.emit(this.env.LOG_METRICS==="true");}

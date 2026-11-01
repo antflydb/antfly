@@ -16,6 +16,7 @@
 // Controlled actual-workerd/WASM experiment. Injected delays characterize
 // dependency depth, including preparation; they do not measure cloud SLOs.
 // Use a new report directory to preserve the earlier sealed latency evidence.
+import{readPhaseProfile}from'../phase-profile.mjs';
 import{retainNativeModules}from'./native-artifacts.mjs';
 import{execFileSync}from'node:child_process';
 import{build}from'esbuild';import{Miniflare,convertV4MiniflareOptions}from'miniflare';
@@ -50,6 +51,7 @@ const hosted={DIRECT_READS:'true',LOCAL_METADATA_READS:'true',INLINE_METADATA_RO
 {...hosted,name:'serving-all',NATIVE_WRITE_OVERLAP:'true',NATIVE_READ_AFFINITY:'false',NATIVE_METADATA_CONTINUATIONS:'true',NATIVE_POINT_CONTINUATIONS:'true',REPLAY_COST_CHECKPOINTS:'true',IMMUTABLE_PREPARED_REUSE:'true',INLINE_FACTS_LEAVES:'true'},
 {...hosted,name:'twofold-commit-hints',NATIVE_READ_AFFINITY:'false',METADATA_COMMIT_HINTS:'true'},{...hosted,name:'twofold-affinity',NATIVE_READ_AFFINITY:'true'},{...hosted,name:'twofold-read-ahead',NATIVE_READ_AFFINITY:'true',NATIVE_WRITE_READ_AHEAD:'true'}].filter(v=>!process.argv.some(a=>a.startsWith('--only='))||process.argv.find(a=>a.startsWith('--only=')).slice(7).split(',').includes(v.name)):ordinaryVariants;if(!variants.length)throw Error('NoSelectedLifecycleVariants');
 if(process.argv.includes('--reverse'))variants.reverse();
+const phaseProfiles=process.argv.includes('--phase-profile');
 const rounds=Number(process.argv.find(a=>a.startsWith('--rounds='))?.slice(9)??16);if(!Number.isInteger(rounds)||rounds<8||rounds>64)throw Error('InvalidPointRounds');
 const outputName='lifecycle-latency-'+Date.now()+'.json';
 const experiment=await readFile(new URL(import.meta.url));await writeFile(join(out,outputName.replace('.json','-experiment.mjs')),experiment);
@@ -71,7 +73,7 @@ for(const variant of variants){
  const sealed=join(out,outputName.replace('.json','')+'-'+variant.name);await mkdir(sealed,{recursive:true});
  const nativeHashes=await retainNativeModules(nativeModules,sealed,join(root,'dist/qualification/native-artifacts'));
  if(variant.name==='serving-durable-control')for(const[name,hash]of Object.entries(nativeHashes))assert.equal(hash,frozenControl.native_sha256[name],'FrozenControlNativeHashMismatch');
- const bindings={API_TOKEN:'local-latency',ANTFLY_INCARNATION:'latency-'+(twofold?'uniform-v1':variant.name),COORDINATOR_BACKEND:'r2',SPLIT_RUNTIME:'true',DIRECT_READS:'true',LOCAL_METADATA_READS:'true',INLINE_METADATA_ROOTS:'true',WAL_INLINE_TAIL:'true',PAGED_TEXT:'true',PAGED_PROJECTIONS:'true',PUBLICATION_RECORDS:'64',LOG_METRICS:'true',WORKER_VERSION:{id:'01234567-0123-4567-89ab-0123456789ab'},ANTFLY_TENANTS:JSON.stringify(Object.fromEntries(['a','b','c','d'].map(t=>[t,{incarnation:'latency-'+(twofold?'uniform-v1':variant.name)+'-'+t,storage_id:'latency-'+(twofold?'uniform-v1':variant.name)+'-'+t}]))),...Object.fromEntries(Object.entries(variant).filter(([k])=>k===k.toUpperCase()))};
+ const bindings={...(phaseProfiles?{QUALIFICATION_PHASE_PROFILE:'true'}:{}),API_TOKEN:'local-latency',ANTFLY_INCARNATION:'latency-'+(twofold?'uniform-v1':variant.name),COORDINATOR_BACKEND:'r2',SPLIT_RUNTIME:'true',DIRECT_READS:'true',LOCAL_METADATA_READS:'true',INLINE_METADATA_ROOTS:'true',WAL_INLINE_TAIL:'true',PAGED_TEXT:'true',PAGED_PROJECTIONS:'true',PUBLICATION_RECORDS:'64',LOG_METRICS:'true',WORKER_VERSION:{id:'01234567-0123-4567-89ab-0123456789ab'},ANTFLY_TENANTS:JSON.stringify(Object.fromEntries(['a','b','c','d'].map(t=>[t,{incarnation:'latency-'+(twofold?'uniform-v1':variant.name)+'-'+t,storage_id:'latency-'+(twofold?'uniform-v1':variant.name)+'-'+t}]))),...Object.fromEntries(Object.entries(variant).filter(([k])=>k===k.toUpperCase()))};
  if(variant.name==='serving-durable-control')assert.deepEqual(bindings,JSON.parse(await readFile(join(frozenControl.sealed_artifacts,'bindings.json'),'utf8')),'FrozenControlBindingsMismatch');
  await writeFile(join(sealed,'bindings.json'),JSON.stringify(bindings,null,2));
  const classes={writer:'R2CommitCoordinator',reader:'R2ReadRuntime',builder:'R2BuildRuntime'},durableObjects=Object.fromEntries(Object.entries({COMMITS:'writer',READERS:'reader',BUILDERS:'builder'}).map(([binding,role])=>[binding,{className:classes[role],scriptName:role,useSQLite:true}]));
@@ -87,7 +89,7 @@ for(const variant of variants){
  if(report.bundle_only){report.cases.push({variant:variant.name,bundled:true,sealed_artifacts:sealed,native_sha256:nativeHashes,bundle_sha256:bundleHashes});await writeFile(join(out,outputName),JSON.stringify(report,null,2));continue;}
  const dir=await mkdtemp(join(out,'worker-'+variant.name+'-')),workerOptions=convertV4MiniflareOptions({workers,resourcePersistencePath:join(dir,'resources'),isolatedResourcePersistencePath:join(dir,'isolated')});let mf=new Miniflare(workerOptions);
  let phase='preparation';
- const call=async(tenant,input,path='/api')=>{const started=performance.now(),response=await mf.dispatchFetch('https://latency.invalid'+path,{method:'POST',headers:{Authorization:'Bearer local-latency','X-Antfly-Tenant':tenant},body:JSON.stringify(strongLatest&&input.op==='lookup'?{...input,fresh:true}:input)}),value=await response.json();assert.equal(response.status,200,JSON.stringify(value));return{value,ms:performance.now()-started,trace_id:response.headers.get("X-Antfly-Trace-Id")};};
+ const call=async(tenant,input,path='/api')=>{const started=performance.now(),response=await mf.dispatchFetch('https://latency.invalid'+path,{method:'POST',headers:{Authorization:'Bearer local-latency','X-Antfly-Tenant':tenant},body:JSON.stringify(strongLatest&&input.op==='lookup'?{...input,fresh:true}:input)}),value=await response.json();assert.equal(response.status,200,JSON.stringify(value));let profile;try{profile=readPhaseProfile(response.headers.get('X-Antfly-Profile'));}catch(error){await writeFile(join(sealed,'invalid-inline-profile-'+crypto.randomUUID()+'.json'),JSON.stringify({qualification:false,op:input.op,header:response.headers.get('X-Antfly-Profile')},null,2));throw error;}if(phaseProfiles&&path==='/api'&&['lookup','mutate'].includes(input.op))assert.ok(profile?.owner,'Missing inline owner phase profile');return{value,profile,ms:performance.now()-started,trace_id:response.headers.get("X-Antfly-Trace-Id")};};
  try{
   const body=(t,i,text='document '+i)=>JSON.stringify({tenant:t,text,payload:'x'.repeat(1024)});
   await call('a',{delay:setupDelay},'/_lab');const preparationStarted=performance.now(),seedWrites=[],publications=[];
@@ -104,7 +106,7 @@ for(const variant of variants){
    coldPreparation=(await call('a',{seed_ready:true},'/_lab')).value;
    if(variant.RESIDENT_DURABLE_BOOTSTRAP==='true')assert.ok(coldPreparation.states.filter((_,i)=>i%2===0).every(s=>s.durable_clean),'CleanBootstrapNotConfirmed');
    await mf.dispose();mf=new Miniflare(workerOptions);if(!coldStartup)await call('a',{delay},'/_lab');
-   await Promise.all(['a','b','c','d'].flatMap(tenant=>coldIds.map(async id=>{const result=await call(tenant,{op:'lookup',doc_id:'doc/'+id,required_visibility:receipts[tenant]});assert.equal(result.value.body,body(tenant,id));assert.ok(BigInt('0x'+result.value.visibility.slice(-16))>=BigInt('0x'+receipts[tenant].slice(-16)));coldSamples.push({tenant,id,ms:result.ms,trace_id:result.trace_id});})));
+   await Promise.all(['a','b','c','d'].flatMap(tenant=>coldIds.map(async id=>{const result=await call(tenant,{op:'lookup',doc_id:'doc/'+id,required_visibility:receipts[tenant]});assert.equal(result.value.body,body(tenant,id));assert.ok(BigInt('0x'+result.value.visibility.slice(-16))>=BigInt('0x'+receipts[tenant].slice(-16)));coldSamples.push({tenant,id,ms:result.ms,trace_id:result.trace_id,profile:result.profile});})));
    coldPhysical=(await call('a',{counters:true},'/_lab')).value;
    for(const sample of coldSamples){const http=coldPhysical.app.http_traces?.find(t=>t.trace_id===sample.trace_id);if(http){sample.worker_http_ms=http.elapsed_ms;sample.client_outside_http_trace_ms=sample.ms-http.elapsed_ms;}}
    await writeFile(join(sealed,'cold-start.json'),JSON.stringify({qualification:false,kind:coldStartup?'first API requests after local workerd reconstruction, persistent local R2, no delay-setting warmup':'recreated workers with persistent local R2 and cold application caches',samples:coldSamples,physical:coldPhysical},null,2));
@@ -117,7 +119,7 @@ for(const variant of variants){
     const dispatched=performance.now();try{const result=await call(tenant,input),elapsed=performance.now()-offered;
      if(op==='read'){assert.equal(result.value.body,body(tenant,Number(input.doc_id.slice(4))));assert.ok(BigInt('0x'+result.value.visibility.slice(-16))>=BigInt('0x'+input.required_visibility.slice(-16)));reads.push(elapsed);}
      else{writes.push(elapsed);if(BigInt('0x'+result.value.visibility.slice(-16))>=BigInt('0x'+receipts[tenant].slice(-16))){receipts[tenant]=result.value.visibility;expected[tenant]=input.mutations[0].body;}}
-     samples.push({op,tenant,ms:elapsed,service_ms:result.ms,dispatch_lag_ms:dispatched-offered,offered_ms:offered-began,outcome:'ok'});
+     samples.push({op,tenant,ms:elapsed,service_ms:result.ms,dispatch_lag_ms:dispatched-offered,offered_ms:offered-began,profile:result.profile,outcome:'ok'});
     }catch(error){offeredFailures.push({op,tenant,error:String(error),offered_ms:offered-began});samples.push({op,tenant,ms:performance.now()-offered,dispatch_lag_ms:dispatched-offered,offered_ms:offered-began,outcome:'error'});}
    })().finally(()=>pending.delete(task));pending.add(task);all.push(task);};
    for(let i=0;i<offeredReads;i++){
@@ -142,8 +144,8 @@ for(const variant of variants){
    const jobs=[];
    for(const tenant of['a','b','c','d']){
     const currentBody=body(tenant,0,'round '+round),fence=receipts[tenant];
-    jobs.push(call(tenant,{op:'mutate',operation_id:'update/'+round,mutations:[{kind:'upsert',doc_id:'doc/0',body:currentBody}]}).then(result=>{writes.push(result.ms);receipts[tenant]=result.value.visibility;expected[tenant]=currentBody;samples.push({round,tenant,op:'write',ms:result.ms});}));
-    for(let i=0;i<3;i++){const id=hotReads?1+i%(documents-1):1+(round*37+i)%(documents-1);jobs.push(call(tenant,{op:'lookup',doc_id:'doc/'+id,required_visibility:fence}).then(result=>{assert.equal(result.value.body,body(tenant,id));assert.ok(BigInt('0x'+result.value.visibility.slice(-16))>=BigInt('0x'+fence.slice(-16)));reads.push(result.ms);samples.push({round,tenant,op:'read',ms:result.ms});}));}
+    jobs.push(call(tenant,{op:'mutate',operation_id:'update/'+round,mutations:[{kind:'upsert',doc_id:'doc/0',body:currentBody}]}).then(result=>{writes.push(result.ms);receipts[tenant]=result.value.visibility;expected[tenant]=currentBody;samples.push({round,tenant,op:'write',ms:result.ms,profile:result.profile});}));
+    for(let i=0;i<3;i++){const id=hotReads?1+i%(documents-1):1+(round*37+i)%(documents-1);jobs.push(call(tenant,{op:'lookup',doc_id:'doc/'+id,required_visibility:fence}).then(result=>{assert.equal(result.value.body,body(tenant,id));assert.ok(BigInt('0x'+result.value.visibility.slice(-16))>=BigInt('0x'+fence.slice(-16)));reads.push(result.ms);samples.push({round,tenant,op:'read',ms:result.ms,profile:result.profile});}));}
    }
    const results=await Promise.allSettled(jobs);for(const result of results)if(result.status==='rejected')throw result.reason;
    if(round%4===3)for(const tenant of['a','b','c','d'])for(let steps=0;;steps++){if(steps>=128)throw Error('PublicationDidNotConverge');const published=await call(tenant,{op:'publish'});publicationUpdates.push(published.ms);if(!published.value.has_more)break;}
