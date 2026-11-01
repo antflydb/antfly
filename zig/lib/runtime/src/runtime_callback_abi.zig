@@ -46,6 +46,7 @@ test "boundary dispatcher preserves graph metric readiness and storage contentio
     };
     for ([_]anyerror{ error.MetricNotReady, error.MetricStale, error.FileBusy, error.WouldBlock }) |err| {
         try std.testing.expectError(err, TestBoundary.call("query", &Callbacks.foreignDispatch, &Callbacks.query, .{&err}));
+        try std.testing.expectError(err, TestBoundary.callRemote("query", &Callbacks.foreignDispatch, &Callbacks.query, .{&err}));
     }
 }
 
@@ -78,6 +79,26 @@ fn BoundaryImpl(comptime VTable: type) type {
             callback: anytype,
             args: anytype,
         ) CallReturn(@TypeOf(callback)) {
+            // Only source-local callbacks need the local Zig error fast path.
+            // Foreign engine consumers must not instantiate this dispatcher's
+            // methods and native layouts merely to compare its address.
+            if (dispatch == local_dispatch) {
+                const Args = std.meta.ArgsTuple(functionType(@TypeOf(callback)));
+                const typed_args: Args = args;
+                return @call(.auto, callback, typed_args);
+            }
+            return callRemote(field_name, dispatch, callback, args);
+        }
+
+        /// Caller-only half of a compiled boundary. Unlike `call`, this never
+        /// references local_dispatch, so only the invoked method's contracts
+        /// and argument/result adapters are analyzed in foreign consumers.
+        pub fn callRemote(
+            comptime field_name: []const u8,
+            dispatch: Dispatch,
+            callback: anytype,
+            args: anytype,
+        ) CallReturn(@TypeOf(callback)) {
             const Callback = @TypeOf(callback);
             const Function = functionType(Callback);
             const Args = std.meta.ArgsTuple(Function);
@@ -85,12 +106,6 @@ fn BoundaryImpl(comptime VTable: type) type {
             _ = std.meta.fieldIndex(VTable, field_name) orelse
                 @compileError("unknown boundary vtable field: " ++ field_name);
             var typed_args: Args = args;
-
-            // A vtable created and consumed in this compilation unit retains
-            // normal Zig error and return semantics. Only a dispatcher owned
-            // by another runtime unit takes the C ABI path below.
-            if (dispatch == local_dispatch)
-                return @call(.auto, callback, typed_args);
 
             if (Payload == void) {
                 const contract = native_abi.CallContract.of(field_name, Callback, Args, Payload);

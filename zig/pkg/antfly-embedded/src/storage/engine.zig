@@ -661,7 +661,7 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
             break :blk BackupPlan{ .value = plan, .io = io };
         } else value;
     }
-    const outcome = try Boundary.call(name, descriptor.dispatch, method, wire_args);
+    const outcome = try Boundary.callRemote(name, descriptor.dispatch, method, wire_args);
     if (outcome.failure.ptr) |ptr| return @import("storage_engine_errors").fromName(ptr[0..outcome.failure.len]);
     return outcome.value;
 }
