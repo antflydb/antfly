@@ -152,6 +152,9 @@ pub const OutputPlacement = enum {
 };
 
 pub const ExecuteOptions = struct {
+    /// Borrowed semantic-role mask, prepared once from ModelProgram bindings.
+    /// Input/state values can change each invocation even at a stable address.
+    mutable_parameters: ?[]const bool = null,
     output_placement: OutputPlacement = .default_backend,
     /// Enforce actual device/host access at transfer boundaries. Final output
     /// materialization happens after submission and outside this scope.
@@ -791,6 +794,7 @@ pub fn execute(
 
     // 5. Mutable execution state
     var exec_state = ExecState{
+        .allocator = allocator,
         .attention_layer = 0,
         .options = options,
         .last_use = donation_last_use,
@@ -1123,6 +1127,7 @@ pub fn captureNodeValues(
     }
 
     var exec_state = ExecState{
+        .allocator = allocator,
         .attention_layer = 0,
         .options = options,
         .last_use = donation_last_use,
@@ -1447,6 +1452,8 @@ const MoeGroupedState = struct {
 /// Mutable state carried across node executions within a single
 /// execute() call. Tracks counters for side-channel consumption.
 pub const ExecState = struct {
+    /// Borrowed invocation allocator for shared temporary materialization.
+    allocator: ?std.mem.Allocator = null,
     /// Auto-incremented for each attention node, so each layer gets
     /// the correct layer_index in its AttentionContext.
     attention_layer: usize,
@@ -2641,7 +2648,7 @@ pub fn executeNode(
 
         .fused_embedding_lookup => |attrs| {
             const host_ids = if (graph.node(ins[1]).op == .fused_from_float32) state.options.embedding_ids orelse return error.MissingRuntimeInput else null;
-            return executeEmbeddingLookup(cb, V.get(ins[0]), V.get(ins[1]), host_ids, attrs.total, attrs.dim);
+            return executeEmbeddingLookup(state.allocator orelse graph.allocator, cb, V.get(ins[0]), V.get(ins[1]), host_ids, attrs.total, attrs.dim);
         },
 
         .fused_layer_norm => |attrs| {
@@ -8775,37 +8782,37 @@ test "native GatherND widens floating weight slices when exact import is unavail
 
 /// Shared resident-first embedding dispatch. Legacy host ID tensors use exact
 /// integer export when a resident implementation is unavailable.
-pub fn executeEmbeddingLookup(cb: *const ComputeBackend, weight: CT, indices: CT, host_ids: ?[]const i64, total: usize, dim: usize) !CT {
+pub fn executeEmbeddingLookup(allocator: std.mem.Allocator, cb: *const ComputeBackend, weight: CT, indices: CT, host_ids: ?[]const i64, total: usize, dim: usize) !CT {
     if (try cb.embeddingLookupTensor(weight, indices, total, dim)) |device_result| {
         return device_result;
     }
     var owned_ids: ?[]i64 = null;
-    defer if (owned_ids) |buf| std.heap.page_allocator.free(buf);
+    defer if (owned_ids) |buf| allocator.free(buf);
     const ids = blk: {
         if (host_ids != null) {
             break :blk host_ids.?;
         }
         const dtype = try cb.tensorDType(indices);
         if (dtype == .i64 or dtype == .i32) {
-            const exported = (try cb.exportTensorData(indices, std.heap.page_allocator)) orelse return error.UnsupportedIntegerTensor;
+            const exported = (try cb.exportTensorData(indices, allocator)) orelse return error.UnsupportedIntegerTensor;
             const bytes = switch (exported.payload) {
                 .bytes => |bytes| bytes,
                 .quantized_f32 => |quantized| {
-                    std.heap.page_allocator.free(quantized.raw_bytes);
-                    std.heap.page_allocator.free(quantized.shape);
+                    allocator.free(quantized.raw_bytes);
+                    allocator.free(quantized.shape);
                     return error.UnsupportedIntegerTensor;
                 },
             };
-            defer std.heap.page_allocator.free(bytes);
+            defer allocator.free(bytes);
             if (exported.dtype != dtype or bytes.len != try std.math.mul(usize, total, dtype.byteSize())) return error.InvalidTensorShape;
-            const converted = try std.heap.page_allocator.alloc(i64, total);
+            const converted = try allocator.alloc(i64, total);
             for (converted, 0..) |*id, i| id.* = if (dtype == .i64) std.mem.readInt(i64, bytes[i * 8 ..][0..8], .little) else std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little);
             owned_ids = converted;
             break :blk converted;
         }
-        const raw = try cb.toFloat32(indices, std.heap.page_allocator);
-        defer std.heap.page_allocator.free(raw);
-        const converted = try std.heap.page_allocator.alloc(i64, raw.len);
+        const raw = try cb.toFloat32(indices, allocator);
+        defer allocator.free(raw);
+        const converted = try allocator.alloc(i64, raw.len);
         for (converted, raw) |*dst, value| dst.* = @intFromFloat(@round(value));
         owned_ids = converted;
         break :blk converted;

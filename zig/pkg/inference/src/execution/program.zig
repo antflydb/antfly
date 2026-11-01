@@ -31,6 +31,8 @@ pub const ModelProgram = struct {
     id_map: []NodeId,
     bindings: []Binding,
     binding_names: []u8,
+    /// Prepared once; external/state parameters must never become cached weights.
+    mutable_parameters: ?[]bool = null,
     analysis: interpreter.CachedAnalysis,
     optimization_stats: ml.graph.passes.pipeline.Stats,
 
@@ -63,13 +65,25 @@ pub const ModelProgram = struct {
             mapped.name = owned_name;
             mapped.node_id = optimized.id_map[binding.node_id];
         }
+        var mutable_parameters: ?[]bool = null;
+        errdefer if (mutable_parameters) |flags| allocator.free(flags);
+        for (mapped_bindings) |binding| {
+            if ((binding.kind != .input and binding.kind != .state_input) or binding.node_id == ml.graph.null_node) continue;
+            if (mutable_parameters == null) {
+                const flags = try allocator.alloc(bool, optimized.graph.nodeCount());
+                @memset(flags, false);
+                mutable_parameters = flags;
+            }
+            mutable_parameters.?[binding.node_id] = true;
+        }
         const analysis = try interpreter.CachedAnalysis.compute(allocator, &optimized.graph);
-        return .{ .graph = optimized.graph, .id_map = optimized.id_map, .bindings = mapped_bindings, .binding_names = names, .analysis = analysis, .optimization_stats = optimized.stats };
+        return .{ .graph = optimized.graph, .id_map = optimized.id_map, .bindings = mapped_bindings, .binding_names = names, .mutable_parameters = mutable_parameters, .analysis = analysis, .optimization_stats = optimized.stats };
     }
 
     pub fn deinit(self: *ModelProgram) void {
         const allocator = self.graph.allocator;
         self.analysis.deinit(allocator);
+        if (self.mutable_parameters) |flags| allocator.free(flags);
         allocator.free(self.binding_names);
         allocator.free(self.bindings);
         allocator.free(self.id_map);
@@ -110,6 +124,7 @@ test "ModelProgram preserves public and state bindings through optimization" {
     try std.testing.expectEqual(ml.graph.null_node, program.bindings[0].node_id);
     try std.testing.expectEqual(program.graph.outputs.items[0], program.bindings[2].node_id);
     try std.testing.expectEqual(program.bindings[1].node_id, program.bindings[2].node_id);
+    try std.testing.expect(program.mutable_parameters.?[program.bindings[1].node_id]);
     const owner: *const @import("../ops/ops.zig").ComputeBackend = @ptrFromInt(4096);
     var values = [_]interpreter.RuntimeInput{
         .{ .node_id = unused, .value = @ptrFromInt(8) },
@@ -120,4 +135,21 @@ test "ModelProgram preserves public and state bindings through optimization" {
     try std.testing.expectEqual(owner, mapped[0].source_backend.?);
     try std.testing.expectEqual(program.bindings[1].node_id, mapped[0].node_id);
     try std.testing.expectError(error.UnrootedProgramOutput, ModelProgram.init(a, &graph, &.{.{ .name = "unrooted", .node_id = unused, .kind = .state_output }}));
+}
+
+test "ModelProgram mutable binding roles clean up every preparation allocation failure" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 4 }));
+    try graph.markOutput(try b.mul(x, try b.scalarConst(.f32, 2)));
+    const Prepare = struct {
+        fn run(allocator: std.mem.Allocator, source: *const ml.graph.Graph, input: NodeId) !void {
+            var program = try ModelProgram.init(allocator, source, &.{.{ .name = "x", .node_id = input, .kind = .state_input }});
+            defer program.deinit();
+            try std.testing.expect(program.mutable_parameters.?[program.bindings[0].node_id]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Prepare.run, .{ &graph, x });
 }

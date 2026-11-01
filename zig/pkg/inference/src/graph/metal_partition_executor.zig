@@ -1731,6 +1731,7 @@ pub const MetalPartitionExecutor = struct {
         var chunk_executed: usize = 0;
 
         var exec_state = interpreter.ExecState{
+            .allocator = allocator,
             .attention_layer = if (exec_ctx.attention_layer) |layer| layer.* else 0,
             .options = options,
             .last_use = last_use,
@@ -14047,12 +14048,12 @@ fn tryExecuteMetalCommand(
         .conv_general => |attrs| try executeRuntimeConvGeneral(graph, cb, values, inputs, attrs),
         .fused_conv1d => |attrs| try executeRuntimeConv1d(graph, cb, values, inputs, attrs),
         .fused_conv2d => |attrs| try executeRuntimeConv2d(graph, cb, values, inputs, attrs),
-        .fused_linear => |attrs| try executeRuntimeLinear(graph, cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, true, op_plan),
+        .fused_linear => |attrs| try executeRuntimeLinear(graph, cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, true, op_plan, exec_state.options.mutable_parameters),
         .fused_linear_no_bias => |attrs| blk: {
             if (attrs.num_projections != 0) {
                 break :blk try executeRuntimeLinearNoBiasGrouped(cb, values, inputs, attrs);
             }
-            break :blk try executeRuntimeLinear(graph, cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, false, op_plan);
+            break :blk try executeRuntimeLinear(graph, cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, false, op_plan, exec_state.options.mutable_parameters);
         },
         .fused_linear_no_bias_pair => |attrs| try executeRuntimeLinearNoBiasPair(cb, values, inputs, attrs, exec_state),
         .fused_to_float32 => blk: {
@@ -14062,7 +14063,7 @@ fn tryExecuteMetalCommand(
             }
             break :blk valueFor(values, inputs[0]);
         },
-        .fused_embedding_lookup => |attrs| try executeRuntimeEmbeddingLookup(graph, cb, values, inputs, attrs, exec_state),
+        .fused_embedding_lookup => |attrs| try executeRuntimeEmbeddingLookup(allocator, graph, cb, values, inputs, attrs, exec_state),
         .fused_take_rows => |attrs| try executeRuntimeTakeRows(cb, values, inputs, attrs.rows, attrs.dim, op_plan, exec_state),
         .fused_zero_tensor => |attrs| try executeRuntimeZeroTensor(cb, attrs.rows, attrs.out_dim),
         .fused_rope => |attrs| try executeRuntimeRope(cb, values, inputs, attrs, exec_state),
@@ -14385,6 +14386,7 @@ fn executeRuntimeConvertDType(
 }
 
 fn executeRuntimeEmbeddingLookup(
+    allocator: std.mem.Allocator,
     graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
@@ -14395,7 +14397,7 @@ fn executeRuntimeEmbeddingLookup(
     const weight = valueFor(values, inputs[0]) orelse return null;
     const indices = valueFor(values, inputs[1]) orelse return null;
     const host_ids = if (graph.node(inputs[1]).op == .fused_from_float32) exec_state.options.embedding_ids orelse return error.MissingRuntimeInput else null;
-    return interpreter.executeEmbeddingLookup(cb, weight, indices, host_ids, attrs.total, attrs.dim) catch |err| switch (err) {
+    return interpreter.executeEmbeddingLookup(allocator, cb, weight, indices, host_ids, attrs.total, attrs.dim) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
@@ -14645,13 +14647,17 @@ fn executeRuntimeSlice(
     };
 }
 
-fn parameterBackedMatrix(graph: *const Graph, node_id: NodeId) bool {
+fn parameterBackedMatrix(graph: *const Graph, node_id: NodeId, mutable_parameters: ?[]const bool) bool {
     var id = node_id;
     var remaining = graph.nodeCount();
     while (remaining != 0) : (remaining -= 1) {
         const node = graph.node(id);
         switch (node.op) {
-            .parameter, .constant => return true,
+            .constant => return true,
+            .parameter => {
+                if (mutable_parameters) |flags| if (id < flags.len and flags[id]) return false;
+                return true;
+            },
             .reshape, .transpose => id = node.inputs[0],
             else => return false,
         }
@@ -14669,13 +14675,14 @@ fn executeRuntimeLinear(
     out_dim: usize,
     comptime has_bias: bool,
     op_plan: ?OperatorPlan,
+    mutable_parameters: ?[]const bool,
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     const weight = valueFor(values, inputs[1]) orelse return null;
     // A fused linear is algebraically a matrix product; its RHS need not be
     // an immutable checkpoint. Computed operands (notably K/V) must remain live
     // device operands, never private packed weights keyed by buffer identity.
-    if (!parameterBackedMatrix(graph, inputs[1]) and !weightRequiresPlannedLinear(cb, weight)) {
+    if (!parameterBackedMatrix(graph, inputs[1], mutable_parameters) and !weightRequiresPlannedLinear(cb, weight)) {
         const lhs_shape = [_]i64{ @intCast(rows), @intCast(in_dim) };
         const rhs_shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
         const output = try cb.primDotGeneral(input, weight, &lhs_shape, &rhs_shape, &.{1}, &.{1}, &.{}, &.{});
@@ -14791,7 +14798,7 @@ fn executeRuntimeDotGeneral(
         const in_dim = positiveI64ToUsize(lhs_shape[1]) orelse return null;
         const out_dim = positiveI64ToUsize(rhs_shape[0]) orelse return null;
         if (rhs_shape[1] == lhs_shape[1]) {
-            return executeRuntimeLinear(graph, cb, values, inputs, rows, in_dim, out_dim, false, op_plan);
+            return executeRuntimeLinear(graph, cb, values, inputs, rows, in_dim, out_dim, false, op_plan, null);
         }
     }
     const output = cb.primDotGeneral(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch) catch |err| switch (err) {

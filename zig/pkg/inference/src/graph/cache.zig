@@ -62,15 +62,6 @@ pub const CacheKey = struct {
     seq_len: u32,
     attention_mode: AttentionMode,
 
-    fn hash(self: CacheKey) u64 {
-        var h = std.hash.Wyhash.init(0);
-        h.update(std.mem.asBytes(&self.config_hash));
-        h.update(std.mem.asBytes(&self.batch));
-        h.update(std.mem.asBytes(&self.seq_len));
-        h.update(std.mem.asBytes(&self.attention_mode));
-        return h.final();
-    }
-
     fn eql(a: CacheKey, b: CacheKey) bool {
         return a.config_hash == b.config_hash and
             a.batch == b.batch and
@@ -554,7 +545,7 @@ test "CacheKey different modes are distinct" {
     const k1 = CacheKey{ .config_hash = 1, .batch = 1, .seq_len = 1, .attention_mode = .paged_decode };
     const k2 = CacheKey{ .config_hash = 1, .batch = 1, .seq_len = 1, .attention_mode = .paged_prefill };
     try std.testing.expect(!CacheKey.eql(k1, k2));
-    try std.testing.expect(CacheKey.hash(k1) != CacheKey.hash(k2));
+    try std.testing.expect(!CacheKey.eql(k1, k2));
 }
 
 test "bucketSeqLenConstrained bounded" {

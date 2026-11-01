@@ -368,11 +368,12 @@ fn graphCacheKey(
     decode_context: *const gpt_arch.DecodeContext,
 ) cache_mod.CacheKey {
     const attn_mode = cacheAttentionMode(decode_context);
-    const query_seq_len = decode_context.query_sequence_len;
     return .{
         .config_hash = cache_mod.hashConfigBytes(std.mem.asBytes(&pipeline.gpt_config)),
         .batch = @intCast(batch),
-        .seq_len = if (attn_mode == .paged_prefill) cache_mod.bucketSeqLen(@intCast(query_seq_len)) else @intCast(query_seq_len),
+        // Key the shape actually traced. Bucketing is safe only when the
+        // caller has padded the physical inputs to that bucket first.
+        .seq_len = @intCast(decode_context.query_sequence_len),
         .attention_mode = attn_mode,
     };
 }
@@ -385,7 +386,7 @@ pub fn ensureGraphEntry(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !*cache_mod.CacheEntry {
-    const allocator = pipeline.allocator;
+    const allocator = cache.allocator;
     cache.selectBackend(pipeline.cb);
     const key = graphCacheKey(pipeline, batch, decode_context);
 
@@ -419,22 +420,25 @@ pub fn ensureGraphEntry(
             }
         };
 
-        var tc = tracing_compute.TracingCompute.initWithWeightResolver(allocator, .{
-            .context = @ptrCast(@constCast(pipeline)),
-            .resolve = &Resolver.resolve,
-        });
-        tc.setRuntimeEmbeddingIds(input_ids);
-        var tc_cb = tc.backend();
+        var raw_graph = trace: {
+            var tc = tracing_compute.TracingCompute.initWithWeightResolver(allocator, .{
+                .context = @ptrCast(@constCast(pipeline)),
+                .resolve = &Resolver.resolve,
+            });
+            defer tc.deinit();
+            tc.setRuntimeEmbeddingIds(input_ids);
+            var tc_cb = tc.backend();
+            var trace_dc = decode_context.*;
+            trace_dc.moe_runtime = null;
+            const dummy_logits = try gpt_arch.forward(&tc_cb, allocator, pipeline.gpt_config, input_ids, batch, seq_len, &trace_dc);
+            defer allocator.free(dummy_logits);
+            break :trace tc.extractGraph();
+        };
 
-        var trace_dc = decode_context.*;
-        trace_dc.moe_runtime = null;
-        const dummy_logits = try gpt_arch.forward(&tc_cb, allocator, pipeline.gpt_config, input_ids, batch, seq_len, &trace_dc);
-        allocator.free(dummy_logits);
-
-        var raw_graph = tc.extractGraph();
-        tc.deinit();
-
-        const optimized = try graph_passes.pipeline.Pipeline.default.run(allocator, &raw_graph);
+        const optimized = graph_passes.pipeline.Pipeline.default.run(allocator, &raw_graph) catch |err| {
+            raw_graph.deinit();
+            return err;
+        };
         defer allocator.free(optimized.id_map);
         raw_graph.deinit();
         errdefer {
@@ -847,4 +851,57 @@ test "cached decoder graph preparation reuses native and Metal executables acros
             }
         }
     }
+}
+
+test "decoder graph cache owns tracing allocations and failed traces remain retryable" {
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var request = std.heap.FixedBufferAllocator.init(&.{});
+    const Pipeline = struct {
+        allocator: std.mem.Allocator,
+        cb: *const ops.ComputeBackend,
+        gpt_config: @import("../models/gpt.zig").Config,
+        missing_norm: bool = true,
+        pub fn graphWeight(self: *@This(), name: []const u8) !ops.CT {
+            if (std.mem.endsWith(u8, name, "norm.weight")) {
+                if (self.missing_norm) return error.MissingWeight;
+                return self.cb.fromFloat32Shape(&.{ 1, 1, 1, 1 }, &.{4});
+            }
+            if (std.mem.endsWith(u8, name, "embed_tokens.weight") or std.mem.eql(u8, name, "lm_head.weight"))
+                return self.cb.fromFloat32Shape(&@as([32]f32, @splat(1)), &.{ 8, 4 });
+            return error.MissingWeight;
+        }
+    };
+    var pipeline = Pipeline{ .allocator = request.allocator(), .cb = &cb, .gpt_config = .{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .num_key_value_heads = 1, .intermediate_size = 8, .vocab_size = 8, .position_encoding = .rope, .norm_type = .rms_norm, .activation = .silu } };
+    var cache = cache_mod.GraphCache.init(a);
+    defer cache.deinit();
+    const decode_context = gpt_arch.DecodeContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
+    try std.testing.expectError(error.MissingWeight, ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 1, &decode_context));
+    try std.testing.expectEqual(@as(usize, 0), cache.count());
+    pipeline.missing_norm = false;
+    const entry = try ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 1, &decode_context);
+    // The request allocator has zero capacity; persistent graph creation and
+    // a subsequent cache hit must use the cache's owner and remain usable.
+    try std.testing.expect(entry.graph.nodeCount() > 0);
+    try std.testing.expect(entry == try ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 1, &decode_context));
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+    const first_ids: [12]i64 = @splat(0);
+    const second_ids: [13]i64 = @splat(0);
+    var prefill = gpt_arch.DecodeContext{ .attention_mode = .paged_prefill, .total_sequence_len = 12, .query_sequence_len = 12, .kv_sequence_len = 12 };
+    const first = try ensureGraphEntry(&pipeline, &cache, &first_ids, 1, 12, &prefill);
+    prefill.total_sequence_len = 13;
+    prefill.query_sequence_len = 13;
+    prefill.kv_sequence_len = 13;
+    const second = try ensureGraphEntry(&pipeline, &cache, &second_ids, 1, 13, &prefill);
+    const last = second.graph.outputs.items[second.graph.outputs.items.len - 1];
+    try std.testing.expectEqual(@as(i64, 13 * 8), second.graph.node(last).output_shape.numElements().?);
+    try std.testing.expect(first != second);
+    var decode = gpt_arch.DecodeContext{ .attention_mode = .paged_decode, .total_sequence_len = 14, .query_sequence_len = 1, .kv_sequence_len = 14 };
+    const decode_entry = try ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 14, &decode);
+    decode.total_sequence_len = 15;
+    decode.kv_sequence_len = 15;
+    // Total KV length changes each step; the physical query remains one row.
+    try std.testing.expect(decode_entry == try ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 15, &decode));
 }

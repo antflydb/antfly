@@ -28,12 +28,14 @@ pub const Executable = struct {
     diagnostics: @import("diagnostics.zig").Diagnostics = .{},
     graph: *const @import("ml").graph.Graph,
     analysis: interpreter.CachedAnalysis,
+    mutable_parameters: ?[]const bool = null,
     runtime: runtime_module.Runtime,
 
     pub fn run(self: *Executable, allocator: std.mem.Allocator, options: interpreter.ExecuteOptions) !runtime_module.Result {
         const before = self.diagnostics.begin(self.runtime.default_backend);
         var prepared_options = options;
         prepared_options.cached_analysis = self.analysis;
+        prepared_options.mutable_parameters = self.mutable_parameters;
         if (self.runtime.default_backend.kind() == .metal) prepared_options.planned_device_execution = true;
         if (self.diagnostics.isEnabled()) prepared_options.collect_partition_stats = true;
         const result = try self.runtime.execute(allocator, self.graph, prepared_options);
@@ -57,7 +59,9 @@ pub fn prepare(allocator: std.mem.Allocator, program: *const ModelProgram, backe
 }
 
 pub fn prepareWithOptions(allocator: std.mem.Allocator, program: *const ModelProgram, backend: *const ops.ComputeBackend, strategy: runtime_module.Strategy, options: PrepareOptions) !Executable {
-    return prepareAnalyzedGraph(allocator, &program.graph, program.analysis, backend, strategy, options);
+    var prepared = try prepareAnalyzedGraph(allocator, &program.graph, program.analysis, backend, strategy, options);
+    prepared.mutable_parameters = program.mutable_parameters;
+    return prepared;
 }
 
 /// Borrow canonical IR and its cached analysis from an existing semantic owner.
@@ -780,4 +784,54 @@ test "equivalent stateful decoder ONNX safetensors GGUF and Q8 snapshots share M
 test "equivalent stateful decoder ONNX safetensors GGUF and Q8 snapshots share CUDA preparation" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     try @import("testing/model_formats.zig").runDecoder(.cuda);
+}
+
+test "prepared state matrix bindings stay live without immutable weight packing on Metal" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 4 }));
+    const state = try b.parameter("state", ml.graph.Shape.init(.f32, &.{ 4, 4 }));
+    try graph.markOutput(try b.matmul(x, try b.transpose(state, &.{ 1, 0 })));
+    var program = try ModelProgram.init(a, &graph, &.{
+        .{ .name = "x", .node_id = x, .kind = .input },
+        .{ .name = "state", .node_id = state, .kind = .state_input },
+    });
+    defer program.deinit();
+    var prepared = try prepare(a, &program, &cb, .partitioned);
+    defer prepared.deinit();
+    const input_values = [_]f32{ -4, -3, -2, -1, 0, 1, 2, 3 };
+    var tensor = try Tensor.initFloat32(a, "x", &.{ 2, 4 }, &input_values);
+    defer tensor.deinit();
+    const input = try context.importHostTensor(a, &tensor);
+    defer cb.free(input);
+    var held: [3]runtime_module.Result = undefined;
+    var initialized: usize = 0;
+    defer for (held[0..initialized]) |*result| result.deinit(&prepared.runtime);
+    for (0..held.len) |iteration| {
+        var weights: [16]f32 = @splat(0);
+        for (0..4) |i| weights[i * 4 + i] = @floatFromInt(iteration + 1);
+        var rhs = try Tensor.initFloat32(a, "state", &.{ 4, 4 }, &weights);
+        defer rhs.deinit();
+        const value = try context.importHostTensor(a, &rhs);
+        defer cb.free(value);
+        var inputs = [_]interpreter.RuntimeInput{ .{ .node_id = x, .value = input }, .{ .node_id = state, .value = value } };
+        held[iteration] = try prepared.run(a, .{ .runtime_inputs = try program.remapInputs(&inputs), .output_placement = .producer, .activation_readbacks = .forbidden, .collect_partition_stats = true });
+        initialized += 1;
+        try std.testing.expectEqual(@as(u64, 0), held[iteration].stats.device_host_accesses);
+    }
+    for (&held, 0..) |*result, iteration| {
+        const owner = result.backendFor(&prepared.runtime, 0);
+        try std.testing.expectEqual(ops.BackendKind.metal, owner.kind());
+        const values = try owner.toFloat32(result.outputs[0], a);
+        defer a.free(values);
+        for (values, input_values) |value, expected| try std.testing.expectApproxEqAbs(expected * @as(f32, @floatFromInt(iteration + 1)), value, 1e-5);
+    }
 }

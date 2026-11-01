@@ -119,12 +119,13 @@ pub const ImportedOnnxSession = struct {
         }
         self.allocator.free(self.output_info);
 
+        // Captures/executors retire before releasing initializer addresses.
+        self.executable.deinit();
         for (self.static_runtime_inputs) |ri| self.cb.free(ri.value);
         self.allocator.free(self.static_runtime_inputs);
         for (self.static_names) |name| self.allocator.free(name);
         self.allocator.free(self.static_names);
         self.allocator.free(self.input_node_ids);
-        self.executable.deinit();
         self.program.deinit();
 
         self.shared_backend_ctx.release();
