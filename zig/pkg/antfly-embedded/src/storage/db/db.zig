@@ -138408,7 +138408,13 @@ test "db graph endpoint cleanup pages cancellation stops between commits" {
         }
     };
     var capture = Capture{};
-    try std.testing.expectError(error.EnrichmentWaitCanceled, db.batchInternal(.{ .writes = &.{.{ .key = "unrelated", .value = "{}" }}, .sync_level = .full_index }, null, .{ .committed_batch_effects_observer = .{ .ptr = &capture, .apply = Capture.observe }, .visibility_cancellation = .fromAtomic(&capture.canceled) }));
+    // batchInternal's primary_committed tracking now remaps a post-commit
+    // visibility-layer cancellation (the primary write already landed; only
+    // the graph-endpoint-cleanup effects observer was canceled) to
+    // error.CommitVisibilityNotSatisfied, rather than surfacing the raw
+    // error.EnrichmentWaitCanceled, so a caller never mistakes this for a
+    // reason to replay the whole batch.
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, db.batchInternal(.{ .writes = &.{.{ .key = "unrelated", .value = "{}" }}, .sync_level = .full_index }, null, .{ .committed_batch_effects_observer = .{ .ptr = &capture, .apply = Capture.observe }, .visibility_cancellation = .fromAtomic(&capture.canceled) }));
     try std.testing.expectEqual(@as(usize, 2), capture.calls);
     try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
     const committed_key = try encodeStoreLookupKeyAlloc(&db, alloc, "unrelated");
