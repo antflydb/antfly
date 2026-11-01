@@ -720,7 +720,7 @@ pub fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_
         var cancellation = req.cancellation;
         const response = try local_query_client.executeJsonAlloc(
             handle.alloc,
-            handle.database(),
+            .borrow(handle.database()),
             "docs",
             request_json,
             .internal,
@@ -5879,7 +5879,7 @@ pub fn searchPublicQueryJson(
             var failure: kernel_owner_abi.FailureIdentity = .{};
             const response = local_query_client.executeJsonAlloc(
                 std.heap.c_allocator,
-                handle.database(),
+                .borrow(handle.database()),
                 table_name,
                 request_json.bytes(),
                 .public,

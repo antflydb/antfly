@@ -224,25 +224,7 @@ pub const Response = struct {
     }
 };
 
-pub const QueryResponse = struct {
-    response: abi.QueryOwnedResponse = .{},
-
-    pub fn bytes(self: QueryResponse) []const u8 {
-        return self.response.buffer.slice();
-    }
-
-    pub fn identityReadGeneration(self: QueryResponse) ?u64 {
-        return if (self.response.has_identity_read_generation != 0)
-            self.response.identity_read_generation
-        else
-            null;
-    }
-
-    pub fn deinit(self: *QueryResponse) void {
-        abi.antfly_storage_owner_buffer_destroy(&self.response.buffer);
-        self.* = undefined;
-    }
-};
+pub const QueryResponse = @import("local_query_client").OwnedQueryResponse;
 
 pub const VersionedResponse = struct {
     response: abi.VersionedOwnedBytes = .{},
@@ -718,40 +700,10 @@ pub const Owner = struct {
     }
 
     pub fn queryJsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !QueryResponse {
-        var response: QueryResponse = .{};
-        var failure: abi.FailureIdentity = .{};
-        const status = abi.antfly_storage_owner_query_json(
-            self.handle,
-            &.{
-                .control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
-                .execution_options = options.execution,
-            },
-            &response.response,
-            &failure,
-        );
-        error_identity.validateFailureEnvelope(status, &failure, abi.abi_version) catch |err| {
-            std.log.err(
-                "storage-owner query returned inconsistent failure identity status={s} identity_status={s} identity_boundary={s} identity_version={d} operation={d}",
-                .{ @tagName(status), @tagName(failure.status), @tagName(failure.boundary), failure.boundary_version, failure.operation },
-            );
-            return err;
-        };
-        if (status != .ok and failure.boundary != .storage_owner and failure.boundary != .local_query) {
-            std.log.err("storage-owner query returned failure from unexpected boundary={s}", .{@tagName(failure.boundary)});
-            return error.InvalidBoundaryFailureIdentity;
-        }
-        statusToError(status) catch |err| {
-            std.log.debug("storage-owner query rejected provider_error={s} boundary={s} operation={d}", .{ failure.errorName(), @tagName(failure.boundary), failure.operation });
-            if (status == .internal) {
-                std.log.err("storage-owner query failed provider_error={s} hash={x} operation={d}", .{
-                    failure.errorName(),
-                    failure.error_name_hash,
-                    failure.operation,
-                });
-            }
-            return err;
-        };
-        return response;
+        return @import("local_query_client").executeOwner(self.handle, .{
+            .control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+            .execution_options = options.execution,
+        });
     }
 
     pub fn lookupJson(self: *Owner, table_name: []const u8, request_json: []const u8) !VersionedResponse {

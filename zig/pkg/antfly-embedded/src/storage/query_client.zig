@@ -19,6 +19,41 @@ const std = @import("std");
 const abi = @import("local_query_abi");
 const error_identity = @import("kernel_error_identity");
 
+/// A complete operation on an owner-issued opaque capability. This consumer
+/// knows neither the DB type nor its native layout. The owner controls handle
+/// validity, admission, generation leases, query execution and response memory.
+pub const OwnedQueryResponse = struct {
+    response: abi.QueryOwnedResponse = .{},
+
+    pub fn bytes(self: OwnedQueryResponse) []const u8 {
+        return self.response.buffer.slice();
+    }
+
+    pub fn identityReadGeneration(self: OwnedQueryResponse) ?u64 {
+        return if (self.response.has_identity_read_generation != 0) self.response.identity_read_generation else null;
+    }
+
+    pub fn deinit(self: *OwnedQueryResponse) void {
+        abi.antfly_storage_owner_buffer_destroy(&self.response.buffer);
+        self.* = undefined;
+    }
+};
+
+pub fn executeOwner(owner: ?*anyopaque, request: abi.QueryOperationRequest) !OwnedQueryResponse {
+    var response: OwnedQueryResponse = .{};
+    errdefer response.deinit();
+    var failure: abi.FailureIdentity = .{};
+    const status = abi.antfly_storage_owner_query_json(owner, &request, &response.response, &failure);
+    try error_identity.validateFailureEnvelope(status, &failure, abi.abi_version);
+    if (status != .ok and failure.boundary != .storage_owner and failure.boundary != .local_query)
+        return error.InvalidBoundaryFailureIdentity;
+    error_identity.statusToError(status) catch |err| {
+        logProviderFailure("storage-owner query", failure);
+        return err;
+    };
+    return response;
+}
+
 pub const QueryResponse = struct {
     json: []u8,
     identity_read_generation: ?u64,
@@ -26,7 +61,7 @@ pub const QueryResponse = struct {
 
 pub fn executeJsonAlloc(
     alloc: std.mem.Allocator,
-    db: anytype,
+    db: abi.LocalQueryDb,
     table_name: []const u8,
     request_json: []const u8,
     dialect: abi.LocalQueryDialect,
@@ -39,7 +74,7 @@ pub fn executeJsonAlloc(
     return executeAlloc(alloc, .{
         .dialect = dialect,
         .kind = .search,
-        .db = .borrow(db),
+        .db = db,
         .table_name = .fromSlice(table_name),
         .request_json = .fromSlice(request_json),
         .execution_options = execution_options,
@@ -53,7 +88,7 @@ pub fn executeJsonAlloc(
 pub fn executeControlledJsonAlloc(
     alloc: std.mem.Allocator,
     kind: abi.LocalQueryKind,
-    db: anytype,
+    db: abi.LocalQueryDb,
     table_name: []const u8,
     request_json: []const u8,
     execution_deadline_ns: ?u64,
@@ -64,7 +99,7 @@ pub fn executeControlledJsonAlloc(
     std.debug.assert(kind != .search);
     const response = try executeAlloc(alloc, .{
         .kind = kind,
-        .db = .borrow(db),
+        .db = db,
         .table_name = .fromSlice(table_name),
         .request_json = .fromSlice(request_json),
         .has_execution_deadline = @intFromBool(execution_deadline_ns != null),

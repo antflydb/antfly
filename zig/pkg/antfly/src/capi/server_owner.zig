@@ -5592,7 +5592,7 @@ pub fn executeStorageOwnerCompiledQueryOperation(
     const response = local_query_client.executeControlledJsonAlloc(
         std.heap.c_allocator,
         kind,
-        &handle.db,
+        .borrow(&handle.db),
         table_name,
         request_json,
         null,
@@ -5761,7 +5761,7 @@ pub fn executeStorageOwnerCompiledGraph(
     const response = local_query_client.executeControlledJsonAlloc(
         std.heap.c_allocator,
         kind,
-        &handle.db,
+        .borrow(&handle.db),
         table_name,
         request.request_json.slice(),
         if (request.has_execution_deadline != 0) request.execution_deadline_ns else null,
@@ -6292,7 +6292,7 @@ pub fn searchStorageKernelQueryJson(
         };
         const response = local_query_client.executeJsonAlloc(
             std.heap.c_allocator,
-            &handle.db,
+            .borrow(&handle.db),
             table_name,
             request_json.bytes(),
             .internal,

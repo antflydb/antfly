@@ -1536,17 +1536,7 @@ pub const SnapshotPublishResult = extern struct {
 /// JSON operation with synchronous local execution controls. The cancellation
 /// callback and its opaque context remain borrowed for the duration of the
 /// call; neither is retained by the storage owner.
-pub const ControlledJsonOperationRequest = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    table_name: BorrowedBytes = .{},
-    request_json: BorrowedBytes = .{},
-    execution_deadline_ns: u64 = 0,
-    has_execution_deadline: u8 = 0,
-    _reserved1: [7]u8 = @splat(0),
-    cancellation_ctx: ?*anyopaque = null,
-    cancellation_fn: ?CancellationCheckFn = null,
-};
+pub const ControlledJsonOperationRequest = query_abi.ControlledJsonOperationRequest;
 
 /// Prepare one scoped restore step inside an already leased physical owner.
 /// The response contains at most one encoded batch, never applies it. The
@@ -1566,10 +1556,7 @@ pub extern fn antfly_storage_owner_restore_control_json(
 /// Search-specific scalars and borrowed execution controls. Keep controls out
 /// of JSON: process-local callbacks and absolute monotonic deadlines must not
 /// be lost or reconstructed as a fresh timeout at a compiled boundary.
-pub const QueryOperationRequest = extern struct {
-    control: ControlledJsonOperationRequest = .{},
-    execution_options: LocalQueryExecutionOptions = .{},
-};
+pub const QueryOperationRequest = query_abi.QueryOperationRequest;
 
 pub const ArtifactOperation = enum(u32) {
     corrupt_embedding = 0,
@@ -2035,12 +2022,7 @@ pub extern fn antfly_storage_snapshot_rollback(snapshot: ?*anyopaque) callconv(.
 
 pub extern fn antfly_storage_snapshot_destroy(snapshot: ?*anyopaque) callconv(.c) void;
 
-pub extern fn antfly_storage_owner_query_json(
-    owner: ?*anyopaque,
-    request: *const QueryOperationRequest,
-    out_response: *QueryOwnedResponse,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
+pub const antfly_storage_owner_query_json = query_abi.antfly_storage_owner_query_json;
 
 pub extern fn antfly_storage_owner_lookup_json(
     owner: ?*anyopaque,
@@ -2245,9 +2227,7 @@ pub extern fn antfly_storage_wal_last_lsn(
     out_last_lsn: *u64,
 ) callconv(.c) Status;
 
-pub extern fn antfly_storage_owner_buffer_destroy(
-    buffer: *OwnedBytes,
-) callconv(.c) void;
+pub const antfly_storage_owner_buffer_destroy = query_abi.antfly_storage_owner_buffer_destroy;
 
 pub const antfly_local_query_execute = query_abi.antfly_local_query_execute;
 pub const antfly_local_query_buffer_destroy = query_abi.antfly_local_query_buffer_destroy;

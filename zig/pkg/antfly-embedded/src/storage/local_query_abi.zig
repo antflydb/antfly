@@ -207,3 +207,31 @@ test "query DB borrow rejects incompatible contracts before pointer use" {
     misaligned.ptr = @ptrFromInt(1);
     try std.testing.expectError(error.InvalidArgument, misaligned.resolve(DB));
 }
+
+pub const ControlledJsonOperationRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    execution_deadline_ns: u64 = 0,
+    has_execution_deadline: u8 = 0,
+    _reserved1: [7]u8 = @splat(0),
+    cancellation_ctx: ?*anyopaque = null,
+    cancellation_fn: ?CancellationCheckFn = null,
+};
+
+pub const QueryOperationRequest = extern struct {
+    control: ControlledJsonOperationRequest = .{},
+    execution_options: LocalQueryExecutionOptions = .{},
+};
+
+pub extern fn antfly_storage_owner_query_json(
+    owner: ?*anyopaque,
+    request: *const QueryOperationRequest,
+    out_response: *QueryOwnedResponse,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_buffer_destroy(
+    buffer: *OwnedBytes,
+) callconv(.c) void;

@@ -107,24 +107,25 @@ pub fn add(
                 module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
         }
     }
-    const query_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/local_query_owner_test_root.zig"), .target = target, .optimize = optimize });
-    imports.configureStorage(b, query_module, true);
-    imports.storage_boundary.configureProfile(query_module, false, true, .all);
-    query_module.addImport("antfly_storage_root", query_module);
-    const query_options = b.addOptions();
-    query_options.addOption(bool, "linked_storage", true);
-    query_options.addOption(bool, "inference_enabled", true);
-    query_module.addOptions("capi_build_options", query_options);
-    const query_tests = @import("linked_tests.zig").add(b, .{
-        .name = "local-query-owner-tests",
-        .root_module = query_module,
-        .filters = &.{"compiled query owner"},
+    const opaque_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/opaque_query_owner_test_root.zig"), .target = target, .optimize = optimize });
+    opaque_module.link_libc = true;
+    opaque_module.addImport("kernel_owner_abi", imports.storage_boundary.owner);
+    opaque_module.addImport("kernel_error_identity", imports.storage_boundary.identity);
+    opaque_module.addImport("local_query_client", imports.storage_boundary.query_client);
+    opaque_module.addImport("antfly_platform", imports.platform);
+    const opaque_tests = @import("linked_tests.zig").add(b, .{
+        .name = "opaque-query-owner-tests",
+        .root_module = opaque_module,
+        .filters = &.{"opaque query owner"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
     });
-    query_tests.executable.root_module.addObject(test_metadata.object);
+    opaque_tests.executable.root_module.addObject(test_metadata.object);
     inline for (.{ .storage_kernel, .local_query, .enrichment_compute, .inference }) |unit|
-        query_tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
-    runs[3] = query_tests.run(b);
-    b.step("local-query-owner-test", "Check retained-generation continuation through the production query archive").dependOn(&runs[3].step);
+        opaque_tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
+    runs[3] = opaque_tests.run(b);
+    b.step("opaque-query-owner-test", "Test complete queries, retained generations and controls from an opaque consumer").dependOn(&runs[3].step);
+    b.step("local-query-owner-test", "Check retained-generation continuation through the production query owner").dependOn(&runs[3].step);
+    b.step("opaque-query-consumer-compile", "Compile the query integration caller without compiling any physical provider").dependOn(&opaque_tests.object.step);
 
     const physical_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage_kernel_owner_physical_test_root.zig"),
