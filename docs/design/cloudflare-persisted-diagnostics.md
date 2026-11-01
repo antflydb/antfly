@@ -241,7 +241,7 @@ Worker totals alone cannot cover mixed builder invocations. Confidence sample
 sizes corroborate two active DO scopes, but quiet-role and whole-execution
 coverage are still unproven. The collector cannot pass the qualification gate.
 
-See [the live diagnostic](cloudflare-native-live.md) for immutable report IDs,
+See [the live diagnostic](cloudflare-platform-baselines.md) for immutable report IDs,
 latencies, the preserved setup-cutoff failure and the validated idempotent seed
 resume. Metrics sanitization now retains bounded publication progress, native
 WAL plan spans, numeric CPU/wall times and deployment UUIDs; it still discards

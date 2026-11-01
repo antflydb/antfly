@@ -531,8 +531,8 @@ Two missing sources were preserved afterward as explicitly non-qualifying
 postmortem captures; they do not repair that original failure. Client resource
 errors and captured observer resource failures are empty, but coverage remains
 incomplete. This does not demonstrate that `SQLITE_NOMEM` is fixed.
-See [the hosted result](cloudflare-twofold-trial.md) for provenance, placement,
-selected native I/O traces and cleanup inventory. The original gate remains unpassed.
+The original gate remains unpassed. Current coverage requirements are in
+[independent HTTP qualification](cloudflare-independent-http.md).
 
 ## Bounded delivery, complete replay and startup readiness
 

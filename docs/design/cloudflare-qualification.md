@@ -1526,7 +1526,7 @@ The live point-1 profile remains unchanged while these tests run.
 The frozen control's caller-context and admission-clock defects were reproduced
 independently against its unmodified source/native artifacts. A correctness-only
 replacement and hashed evidence are prepared for review in
-[the control proposal](cloudflare-control-correctness.md). This is not permission
+[the control proposal](cloudflare-control-callers.md). This is not permission
 to modify an existing frozen comparison or reinterpret its failed reports.
 
 Latest main was merged through `9d553bc925` in `f71498ec3f`, including the
@@ -1621,7 +1621,7 @@ candidate fix hands each group to a selected waiting submitter and defers a
 failed owner's response until its surviving group commits or rolls back. All
 217 Node checks and 13 persisted Worker checks pass. A correctness-only control
 proposal with unchanged original native artifacts passes its 90 original Node
-checks; see [the transaction control proposal](cloudflare-control-transactions.md).
+checks; see [the transaction control proposal](cloudflare-control-callers.md).
 These local correctness results do not qualify live latency or retroactively
 repair the failed control comparisons.
 
@@ -1898,8 +1898,7 @@ HTTP resource errors. It uses no cold epochs and is not qualification evidence.
 
 The post-merge in-memory 50,000-document fixture is incomplete after host exit
 137; its logs and a 22.6-GB host-footprint sample are preserved. It must not be
-substituted for the earlier complete report. The new
-[file-backed local fixture](cloudflare-local-scale-fixtures.md) avoids retaining
+substituted for the earlier complete report. The file-backed local fixture avoids retaining
 the emulated R2 payloads in host RAM, with exact model-corpus equivalence checks.
 Its refreshed 50,000-document run completes all nine stages, including cold
 text/vector/sparse reads, point updates, deletion and compaction. Peak native
@@ -1992,6 +1991,6 @@ Reports and frozen bundle provenance remain local, and the 300 reserved cold
 attempts were never used. This is cleanup, not successful qualification; a new
 run needs freshly provisioned stacks.
 
-The [latency experiment record](cloudflare-latency-experiments.md) describes
+The [latency experiment record](cloudflare-platform-baselines.md) describes
 measured outcomes and teardown safeguards. The proposed next implementation
 order is in [Cloudflare runtime architecture steps](cloudflare-runtime-target.md).

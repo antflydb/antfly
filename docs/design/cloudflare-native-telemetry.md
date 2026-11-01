@@ -131,7 +131,7 @@ not deployed and their recovery epochs remain unused.
 
 ## Representative database workload
 
-The [October 29 paired rehearsal](cloudflare-paired-rehearsal.md) completed all
+The [October 29 paired rehearsal](cloudflare-independent-http.md) completed all
 exact data/receipt checks and measured lower candidate latency, while still
 missing both latency targets. Received terminal records identify read admission
 and coordinator fallback as concrete profiling priorities. Bulk canonical export

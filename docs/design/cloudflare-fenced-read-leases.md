@@ -83,12 +83,9 @@ The next write optimization must be justified by these phase measurements.
 
 ## Validation and rollout
 
-`node qualification/local-worker-latency.mjs --fenced-read-leases --documents=512
---delay=20` compares identical native modules and resource limits with reuse off
-and on. It verifies exact bodies, counts, latest reads after writes, and a new
-visibility fence. It records warm and overall latency and physical app R2 calls.
-Injected delay measures dependency depth, not Cloudflare placement or an SLO.
-Failed cases are saved explicitly and never converted to successful samples.
+Current local comparisons use `qualification/read-state-latency.mjs` with identical
+native modules, resource limits and explicit variant activation. Verify exact
+bodies, counts, latest reads and visibility fences before interpreting timings.
 
 A Cloudflare comparison requires fresh disposable namespaces, approved corrected
 control `c44896ac8c`, a sealed candidate, and a functioning dedicated bulk export

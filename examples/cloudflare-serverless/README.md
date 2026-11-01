@@ -649,7 +649,7 @@ Defaults match the host's 4 MiB upload cap, 16-record publication prefix,
 documents use a disk-backed local bucket so emulated R2 artifact payloads do not
 accumulate in the test process's RAM; `--file-bucket` selects it for smaller
 fixtures. This storage belongs to the test harness, outside native request
-budgets. See the [fixture design](../../docs/design/cloudflare-local-scale-fixtures.md).
+budgets. See [qualification requirements](../../docs/design/cloudflare-qualification.md).
 For example, the measured
 5,000-document compaction case uses `--compaction-documents=5000`; the default
 host still rejects that compaction unless configured for it.
@@ -802,16 +802,14 @@ continuations enabled. Its root namespace must be empty. The driver writes a
 private source snapshot and report, uses root epochs 0–2, and leaves tenants a–d
 untouched. Retire that root identity and purge its pending test notifications
 before measuring the tenant corpus. Clean up the disposable deployment with the
-gate lifecycle tool afterward. Results and qualification limits are documented
-in [the live native diagnostic](../../docs/design/cloudflare-native-live.md).
+gate lifecycle tool afterward. Current diagnostic procedures and limits are documented
+in [platform baselines](../../docs/design/cloudflare-platform-baselines.md).
 
 Prepared continuation slices and adaptive posting batches are opt-in through
 `PUBLICATION_PREPARED_SLICES=true` and `PUBLICATION_ADAPTIVE_SLICES=true`, alongside
 `PUBLICATION_CONTINUATIONS=true`. Deploy compatible modules and collectors across
 all roles first, and drain/cancel active adaptive jobs before binary downgrade.
-Local comparisons use `qualification/shared-publication-latency.mjs` and
-`qualification/shared-pipeline-latency.mjs`; copy hash-verified previous modules
-to `dist/qualification/shared-pipeline-lab/before/` before comparing. See
+Current local serving comparisons use `qualification/read-state-latency.mjs`. See
 [the shared engine design](../../docs/design/shared-object-publication.md).
 
 
@@ -843,8 +841,8 @@ The `--control-report=PATH` local latency option reuses and hash-checks saved
 `serving-durable` bundles and exact bindings; it does not select or alter the
 approved hosted control.
 
-For a small approved-control comparison driven from Cloudflare, see the
-[paired HTTP diagnostic trial](../../docs/design/cloudflare-paired-http-trial.md).
+For current external-client comparison requirements, see
+[independent HTTP qualification](../../docs/design/cloudflare-independent-http.md).
 `qualification/paired-http-trial.mjs` coordinates two sealed stacks and a bounded
 HTTP driver. Its timings exclude the local host and external client transit;
 these are separate from the full gate. The driver rejects redirects, pins

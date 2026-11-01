@@ -229,7 +229,7 @@ correct: the certificate must bind an anchor preceding the I/O. This continuatio
 protocol is not implemented or claimed as part of the measured result here.
 
 The frozen candidate has now run on the original paired hosted offered workload;
-see the hosted results below and [the deployment record](cloudflare-twofold-trial.md).
+see the hosted results below and [the deployment record](cloudflare-independent-http.md).
 Complete independent whole-window diagnostics and passing rehearsal latency are
 still required before three hour-long trials and 100 physical cold samples.
 The historical live `SQLITE_NOMEM` and the hosted gate remain unresolved.
@@ -270,7 +270,7 @@ The independent collector exhausted its original aggregate deadline after six
 first-pass source catalogs. Late preservation of two missing sources does not
 supply a complete second observation or repair the original failure. Whole-window
 resource coverage, historical `SQLITE_NOMEM` and the hosted gate remain open.
-[The hosted record](cloudflare-twofold-trial.md) retains the report hash,
+[The hosted record](cloudflare-independent-http.md) retains the report hash,
 placement measurements, deployed artifact closure and cleanup status.
 
 ## Transport-sized recovery and advisory physical locations
@@ -385,7 +385,7 @@ binary closures remain unavailable and are not final qualification evidence.
 The corrected 517-artifact hosted closure and prior 568/1,069-artifact closures
 all reverify with zero missing files or hash changes. The invalid original
 516-artifact hosted seal and its summary discrepancy remain preserved and
-explicitly superseded in [the hosted record](cloudflare-twofold-trial.md).
+explicitly superseded in [the hosted record](cloudflare-independent-http.md).
 The older 163-artifact availability gap remains historical. Credentials,
 including local fixture token files, are excluded. No hosted gate pass or
 resolution of the historical live memory error is claimed.

@@ -1,12 +1,10 @@
 # Cloudflare runtime: next architecture steps
 
-This is the implementation order following the
-[latency experiments](cloudflare-latency-experiments.md). The latest
-[live native protocol diagnostic](cloudflare-native-live.md) publishes the full
-2,048-document corpus and completes large-record recovery. Qualification remains
-incomplete: read p95 exceeds one second, large-record publication has substantial
-checkpoint overhead, and invocation accounting does not yet cover every event
-population. Sections below distinguish implemented protocols from proposed work.
+This document describes the runtime architecture and implementation constraints.
+See [platform baselines](cloudflare-platform-baselines.md) for current diagnostic
+measurements and [independent HTTP qualification](cloudflare-independent-http.md)
+for the remaining performance and evidence requirements. The full hosted gate
+and historical memory error remain unresolved.
 
 ## Keep one native engine and one durable truth
 
@@ -418,12 +416,9 @@ promotion with tenant isolation,
 fresh epoch takeover/recovery, native write receipt replay, publication
 cancellation, both collector frontiers and erased platform storage.
 
-`qualification/native-protocol-latency.mjs` measures baseline, native read,
-native write and combined variants using injected uniform/bursty storage delay
-from the first write. New evidence belongs in `native-protocol-lab`; earlier
-sealed evidence stays unchanged. Local timing characterizes dependency depth,
-not Cloudflare latency or a gate pass. Cloud qualification still needs fresh
-authorized disposable stacks and the unchanged corrected-control comparison.
+Use `qualification/read-state-latency.mjs` for current local serving comparisons
+with pinned modules and explicit variant activation. Injected storage latency
+characterizes dependency depth; it does not qualify hosted performance.
 
 
 ### Final local protocol measurements
@@ -479,8 +474,8 @@ complete accounting and the unchanged paired hour-long/cold populations.
 The fresh native protocol deployment completes large-record publication across
 actor replacement and substantially improves the full-corpus paired diagnostic.
 Read p95 is still 1,138 ms and invocation accounting remains incomplete, so this
-is not a gate pass. The evidence, limitations and next design changes are in
-[the live native protocol diagnostic](cloudflare-native-live.md).
+is not a gate pass. For current measurement procedures and limitations, see
+[platform baselines](cloudflare-platform-baselines.md).
 
 ### Shared packed publication follow-up
 

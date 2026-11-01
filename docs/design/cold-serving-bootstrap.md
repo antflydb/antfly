@@ -471,7 +471,7 @@ those builds are forcibly removed.
 
 ## Approved-control paired follow-up
 
-A subsequent [paired Cloudflare HTTP trial](cloudflare-paired-http-trial.md)
+A subsequent paired Cloudflare HTTP trial
 compares the exact approved `c44896ac8c` control against this candidate using a
 separate Cloudflare request driver. All four roles are reconstructed on both
 sides, including the control's reader actors. Both orders complete 944 timed
