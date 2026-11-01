@@ -37,6 +37,12 @@ const transient_names = [_][]const u8{
     "ConnectionResetByPeer",
     "ConnectionTimedOut",
     "Timeout",
+    // The managed embedding adapters' normalized name for a local provider's
+    // admission refusal (see managed_embedder.normalizeLocalEmbeddingError).
+    // Distinct from EmbedTransientFailure, which stays a real provider
+    // failure (5xx, timeout, connection error) and must keep spending the
+    // document's attempt budget.
+    "EmbedAdmissionRefused",
 };
 
 const transient_suffixes = [_][]const u8{
@@ -67,7 +73,12 @@ pub fn isTransient(err: anyerror) bool {
 pub fn isAdmissionRefusalName(name: []const u8) bool {
     if (std.mem.eql(u8, name, "ResourceTemporarilyUnavailable") or
         std.mem.eql(u8, name, "InferenceCapacityUnavailable") or
-        std.mem.eql(u8, name, "QueueFull")) return true;
+        std.mem.eql(u8, name, "QueueFull") or
+        // The managed embedding adapters' distinct identity for a local
+        // provider's admission refusal, preserved separately from
+        // EmbedTransientFailure precisely so this exemption does not also
+        // cover real provider transient failures.
+        std.mem.eql(u8, name, "EmbedAdmissionRefused")) return true;
     return std.mem.endsWith(u8, name, "Busy") or std.mem.endsWith(u8, name, "TemporarilyUnavailable");
 }
 
@@ -347,11 +358,16 @@ test "a budget that can never fit is permanent and names the flag" {
 }
 
 test "admission refusals are the transient failures that never ran" {
-    for ([_][]const u8{ "ResourceTemporarilyUnavailable", "InferenceCapacityUnavailable", "QueueFull", "AppleNativeBusy" }) |name| {
+    for ([_][]const u8{ "ResourceTemporarilyUnavailable", "InferenceCapacityUnavailable", "QueueFull", "AppleNativeBusy", "EmbedAdmissionRefused" }) |name| {
         try std.testing.expect(isAdmissionRefusalName(name));
         try std.testing.expect(isTransientName(name));
     }
     try std.testing.expect(!isAdmissionRefusalName("EmbedRateLimited"));
     try std.testing.expect(!isAdmissionRefusalName("Timeout"));
     try std.testing.expect(!isAdmissionRefusalName("MemoryBudgetExceeded"));
+    // The managed embedding adapter's normalized name for a local admission
+    // refusal is exempt; its sibling for a real provider transient failure
+    // (5xx, timeout, connection error) is not.
+    try std.testing.expect(isAdmissionRefusal(error.EmbedAdmissionRefused));
+    try std.testing.expect(!isAdmissionRefusalName("EmbedTransientFailure"));
 }

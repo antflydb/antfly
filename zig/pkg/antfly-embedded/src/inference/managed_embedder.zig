@@ -5151,6 +5151,7 @@ fn validateSparseEmbeddingForEntry(
         error.InvalidEmbeddingResponse,
         error.EmbedRateLimited,
         error.EmbedTransientFailure,
+        error.EmbedAdmissionRefused,
         error.QueueFull,
         error.EmbedRequestFailed,
         => return error.InvalidCreateTableRequest,
@@ -5319,6 +5320,12 @@ fn isOperationalEmbeddingProbeError(err: anyerror) bool {
         // permanent configuration failure.
         error.ConcurrencyUnavailable,
         error.QueueFull,
+        // normalizeLocalEmbeddingError's distinct identity for a local
+        // provider's admission refusal. The dimension probe must keep
+        // retrying it exactly like the EmbedTransientFailure it used to
+        // report, without probeEmbeddingDimensionsRetryingTransient needing
+        // to know about the finer-grained distinction.
+        error.EmbedAdmissionRefused,
         => true,
         else => false,
     };
@@ -5327,6 +5334,7 @@ fn isOperationalEmbeddingProbeError(err: anyerror) bool {
 test "managed embedder treats normalized capability discovery failure as operational" {
     try std.testing.expect(isOperationalEmbeddingProbeError(error.RemoteCapabilityDiscoveryTransient));
     try std.testing.expect(!isOperationalEmbeddingProbeError(error.RemoteCapabilityDiscoveryRejected));
+    try std.testing.expect(isOperationalEmbeddingProbeError(error.EmbedAdmissionRefused));
 }
 
 fn inferEmbeddingDimensionsFromEntry(
@@ -5706,8 +5714,15 @@ fn validateSparseBatch(embeddings: []const db_embedder.SparseEmbedding, expected
 
 fn normalizeLocalEmbeddingError(err: anyerror) anyerror {
     return switch (err) {
+        // The request never ran: the local provider refused admission, not a
+        // real provider failure. Keep this distinct from
+        // error.EmbedTransientFailure (5xx, timeouts, connection errors) so
+        // the enrichment retry-budget exemption
+        // (repair_failure.isAdmissionRefusal) can spare the document's
+        // attempt budget for admission contention without also exempting a
+        // genuinely failing provider.
         error.ResourceTemporarilyUnavailable,
-        => error.EmbedTransientFailure,
+        => error.EmbedAdmissionRefused,
         else => err,
     };
 }
@@ -7033,7 +7048,17 @@ fn withQueryEmbeddingRetry(comptime Result: type, alloc: std.mem.Allocator, entr
     while (true) : (attempt += 1) {
         try ensureEntryDeadline(&bounded);
         return @call(.auto, invoke, .{ alloc, &bounded } ++ args) catch |err| {
-            if (err != error.EmbedTransientFailure or attempt >= 3) return err;
+            // An interactive query does not care whether the local provider
+            // never ran the request (EmbedAdmissionRefused) or a provider
+            // failed outright (EmbedTransientFailure): either retries the
+            // same way here. Only the document enrichment retry-budget
+            // accounting needs the finer-grained identity, so collapse it
+            // back once this retry gives up, keeping every caller outside
+            // this loop seeing the one query-path unavailable error it saw
+            // before that distinction existed.
+            const admission_refused = err == error.EmbedAdmissionRefused;
+            const retryable = err == error.EmbedTransientFailure or admission_refused;
+            if (!retryable or attempt >= 3) return if (admission_refused) error.EmbedTransientFailure else err;
             try waitQueryEmbeddingRetry(&bounded, deadline);
             continue;
         };
@@ -10405,9 +10430,15 @@ pub fn testLocalAdmissionOverloadNormalization() !void {
     try std.testing.expectError(error.QueueFull, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
 
     local.failure = error.ResourceTemporarilyUnavailable;
+    // A query retries an admission refusal exactly like a provider transient
+    // failure and collapses the identity back once it gives up (see
+    // withQueryEmbeddingRetry), so the dense query path still surfaces
+    // EmbedTransientFailure here. Sparse and media document embedding never
+    // go through that retry wrapper, so they surface the adapter's distinct
+    // admission-refusal identity directly.
     try std.testing.expectError(error.EmbedTransientFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
-    try std.testing.expectError(error.EmbedTransientFailure, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
-    try std.testing.expectError(error.EmbedTransientFailure, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+    try std.testing.expectError(error.EmbedAdmissionRefused, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.EmbedAdmissionRefused, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
 
     local.failure = error.ResourceLimitExceeded;
     try std.testing.expectError(error.ResourceLimitExceeded, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
@@ -11545,4 +11576,10 @@ test "managed embedder cold activation precedes default probe and query inferenc
         if (!case.bounded) try std.testing.expectEqual(@as(u32, 1), service.activations.load(.monotonic));
         try std.testing.expectEqual(@as(u32, if (case.bounded) 0 else 1), service.embeddings.load(.monotonic));
     }
+}
+
+test "managed embedder review retains admission refusal classification" {
+    const normalized = normalizeLocalEmbeddingError(error.ResourceTemporarilyUnavailable);
+    std.debug.print("review embedding admission becomes {s}, exempt={}\n", .{ @errorName(normalized), repair_failure.isAdmissionRefusal(normalized) });
+    try std.testing.expect(repair_failure.isAdmissionRefusal(normalized));
 }

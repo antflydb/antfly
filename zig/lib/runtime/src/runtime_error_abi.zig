@@ -950,6 +950,8 @@ pub const Detail = enum(c_int) {
     unsupported_pioneer_input,
     standalone_replication_sources_unsupported,
     ha_catalog_replication_sources_unsupported,
+    // Append-only: numeric Detail values are part of the stable C ABI.
+    embed_admission_refused,
 };
 
 pub const Status = extern struct {
@@ -1820,6 +1822,13 @@ pub fn statusFromError(err: anyerror) Status {
         error.ReadScopeResetUnsupported => status(.unsupported, .read_scope_reset_unsupported),
         error.ReadSnapshotForkUnsupported => status(.unsupported, .read_snapshot_fork_unsupported),
         error.SourceVisitorFailed => status(.internal, .source_visitor_failed),
+        // A local provider's admission refusal (the request never ran)
+        // distinct from a real provider transient failure. Keep this
+        // retryable like EmbedTransientFailure so callers that only check
+        // the Code still back off, while callers that need the distinct
+        // identity (the enrichment retry-budget exemption) can tell them
+        // apart by name.
+        error.EmbedAdmissionRefused => status(.retryable, .embed_admission_refused),
         else => status(.internal, .none),
     };
 }
@@ -2710,6 +2719,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .runtime_failed => "RuntimeFailed",
         .runtime_stopping => "RuntimeStopping",
         .runtime_already_ready => "RuntimeAlreadyReady",
+        .embed_admission_refused => "EmbedAdmissionRefused",
     };
 }
 
