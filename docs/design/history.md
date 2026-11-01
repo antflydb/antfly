@@ -31,6 +31,7 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 
 | Area | Document | Design doc | Summary |
 |------|----------|------------|---------|
+| Compilation | [work reduction](compilation/history/work-reduction-2026-11-01.md) | [zig/COMPILATION.md](../../zig/COMPILATION.md) | Canonical mutation values, concrete request planner, shared common test compilation, and reachable compiler inventory |
 | VOPR | [vopr/status-history.md](vopr/history/status-history.md) | [zig/VOPR.md](../../zig/VOPR.md) | Scenario-version status preamble (v9–v53) and verification-audit narrative |
 | VOPR | [vopr/defects-found.md](vopr/history/defects-found.md) | [zig/VOPR.md](../../zig/VOPR.md) | Per-defect ledger of production and harness bugs VOPR found |
 | VOPR | [vopr/follow-ups-2026-09.md](vopr/history/follow-ups-2026-09.md) | [zig/VOPR.md](../../zig/VOPR.md) | Dated runtime-correctness, merge, and deadline follow-ups (2026-09-06/07) |

@@ -74,6 +74,23 @@ are sampled lower bounds; exact step durations remain in the Zig summary.
 Response files preserve argument boundaries, whereas `ps` output may lose
 quoting. A cached or very short compilation can have no samples.
 
+The follow-up implementation shares common/provider/parser test artifacts and
+extracts the full concrete mutation coalescer from DB receivers. Its measured
+scope and verification are recorded in the
+[work reduction record](../docs/design/compilation/history/work-reduction-2026-11-01.md).
+
+Inventory the actual compilers reachable from a gate without compiling it:
+
+```sh
+cd zig
+zig build test-build-graph -Dtest-graph-step=unit-test
+# zig-out/share/antfly/test-build-graph.json
+```
+
+The inventory deduplicates compiler steps, includes test objects and the native
+source partitions, and records optimization, filters, and memory reservations.
+It counts compiler jobs, not whole-program recompilations or measured costs.
+
 Current experiments:
 
 - `memory-test` and `memory-dependency-test` share one compiled policy artifact;
@@ -81,11 +98,19 @@ Current experiments:
   (370 named policy tests and 37 dependency tests). The shared Debug compilation
   reported 11 seconds and sampled 1,266,941,952 bytes peak RSS. This is one small
   consolidation, not evidence that merging the large storage shards lowers RSS.
-- Transform preparation shares its MVCC reads and relational reconstruction
-  through one concrete `PreparedBatchOwner` helper. Only request-key collection
-  remains specialized by write/receiver type. Allocation ownership and schema
-  pin lifetimes stay inside the existing preparation scope. Release binary size
-  and request throughput still require matched qualification.
+- Batch and transaction writes use one canonical value type. The full
+  coalescer, document transform resolution, and projected graph effects live
+  in a concrete `mutation_plan.prepare` function with explicit snapshot input.
+  It has no DB/backend/schema/inference imports and does not specialize by
+  receiver. MVCC reads and relational reconstruction share the concrete
+  `PreparedBatchOwner` helper. The existing preparation scope retains schema
+  pins and read-set validation. Release binary size and request throughput
+  still require matched qualification.
+- Common, configuration, preload parser, provider-default, and secret suites
+  share one artifact per source partition and keep separate runtime filters and
+  environment policies. The reachable `unit-test` compiler count fell from 225
+  to 217 for the same native CPU-only configuration. This is a job-count
+  reduction; it does not establish the wall-time or peak-RSS change.
 - `-Dcli-optimize=small` changes only the CLI runtime entry module. Shared
   dependencies retain the product mode. Default releases remain `fast`.
   A native Apple Silicon Zig 0.17.0 CPU-only, stripped `fast` product experiment
