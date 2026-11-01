@@ -415,6 +415,7 @@ pub fn rerankContentWithOptions(
                         var attempt: u32 = 1;
                         var remaining_budget_ns: u64 = options.admission_retry_budget_ns orelse repair_failure.default_admission_retry_budget_ns;
                         while (true) {
+                            try repair_failure.checkAdmissionDispatch(request_context);
                             if (managed_embedder.AntflyProviderBoundary.call(
                                 "rerank_documents_with_context",
                                 local.boundary_dispatch,
@@ -430,11 +431,8 @@ pub fn rerankContentWithOptions(
                                 // and probe paths, instead of failing the query
                                 // immediately on a transient model-loading race.
                                 if (!repair_failure.isAdmissionRefusal(err)) return err;
-                                try request_context.check();
-                                const delay_ns = repair_failure.repairTransientBackoffNs(attempt);
-                                if (delay_ns > remaining_budget_ns) return err;
-                                remaining_budget_ns -= delay_ns;
-                                platform_time.sleepNs(delay_ns);
+                                const delay_ns = (try repair_failure.nextAdmissionRetryDelayNs(request_context, attempt, &remaining_budget_ns)) orelse return err;
+                                try repair_failure.admissionRetryWaitNs(request_context, delay_ns);
                                 attempt += 1;
                             }
                         }
@@ -448,6 +446,7 @@ pub fn rerankContentWithOptions(
                     var attempt: u32 = 1;
                     var remaining_budget_ns: u64 = options.admission_retry_budget_ns orelse repair_failure.default_admission_retry_budget_ns;
                     while (true) {
+                        try repair_failure.checkAdmissionDispatch(request_context);
                         const attempt_result = if (linked_context_reranker) |rerank|
                             managed_embedder.AntflyProviderBoundary.call(
                                 "rerank_texts_with_context",
@@ -465,11 +464,8 @@ pub fn rerankContentWithOptions(
                         if (attempt_result) |value| break :admit_text value else |err| {
                             // Same admission-refusal exemption as the media path above.
                             if (!repair_failure.isAdmissionRefusal(err)) return err;
-                            try request_context.check();
-                            const delay_ns = repair_failure.repairTransientBackoffNs(attempt);
-                            if (delay_ns > remaining_budget_ns) return err;
-                            remaining_budget_ns -= delay_ns;
-                            platform_time.sleepNs(delay_ns);
+                            const delay_ns = (try repair_failure.nextAdmissionRetryDelayNs(request_context, attempt, &remaining_budget_ns)) orelse return err;
+                            try repair_failure.admissionRetryWaitNs(request_context, delay_ns);
                             attempt += 1;
                         }
                     }
@@ -1595,4 +1591,35 @@ test "reranking runtime sends image documents to linked rerankers that accept im
 
     local.rerank_documents_with_context = null;
     try std.testing.expectError(error.RerankerMediaUnsupported, rerankContentWithOptions(alloc, &client, cfg, .{ .antfly_provider = local }, "invoice total", content));
+}
+
+test "reranking runtime review retry must not dispatch after deadline" {
+    const a = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    const Fake = struct {
+        calls: usize = 0,
+        fn dense(_: *anyopaque, al: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return al.alloc([]f32, 0);
+        }
+        fn sparse(_: *anyopaque, al: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return al.alloc(db_embedder.SparseEmbedding, 0);
+        }
+        fn rerank(raw: *anyopaque, al: std.mem.Allocator, _: []const u8, _: []const u8, docs: []const []const u8) anyerror![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1) return error.ResourceTemporarilyUnavailable;
+            const scores = try al.alloc(f32, docs.len);
+            @memset(scores, 0.5);
+            return scores;
+        }
+    };
+    var fake = Fake{};
+    const started = platform_time.monotonicNs();
+    const result = rerankDocumentsWithOptions(a, &client, .{ .provider = .antfly, .model = "fake", .field = "body" }, .{
+        .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = Fake.dense, .embed_sparse_texts = Fake.sparse, .rerank_texts = Fake.rerank },
+        .execution = .{ .deadline_ns = started + 50 * std.time.ns_per_ms },
+    }, "query", &.{"doc"});
+    if (result) |scores| a.free(scores) else |err| std.debug.print("review deadline error={s} calls={d} elapsed_ms={d}\n", .{ @errorName(err), fake.calls, (platform_time.monotonicNs() - started) / std.time.ns_per_ms });
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }

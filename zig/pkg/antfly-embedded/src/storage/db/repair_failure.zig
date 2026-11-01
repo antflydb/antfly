@@ -19,6 +19,13 @@
 //! operator change. Repair summaries use the same table for their hints, so
 //! the retry policy and the advice shown to operators cannot disagree.
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
+const execution_context = @import("antfly_inference_execution_context");
+
+/// Query-time request context admission retries wait against. Shared here
+/// so every admission-retry caller (reranking, generation) checks and waits
+/// the same way instead of inventing its own sleep.
+pub const RequestContext = execution_context.RequestContext;
 
 const transient_names = [_][]const u8{
     "ResourceTemporarilyUnavailable",
@@ -86,6 +93,80 @@ pub const default_admission_retry_budget_ns: u64 = 45 * std.time.ns_per_s;
 pub fn repairTransientBackoffNs(attempt: u32) u64 {
     const shift: u6 = @intCast(@min(attempt -| 1, 3));
     return @min((@as(u64, 500) * std.time.ns_per_ms) << shift, 4 * std.time.ns_per_s);
+}
+
+/// Interval between cancellation/deadline polls while waiting out an
+/// admission-retry backoff. Backoffs grow to `repairTransientBackoffNs`'s
+/// 4s cap, so a plain unconditional sleep would hold a cancelled or expired
+/// query-time request (and its worker thread) for seconds after it should
+/// have stopped; polling at this granularity bounds that to one interval.
+pub const admission_retry_poll_ns: u64 = 25 * std.time.ns_per_ms;
+
+/// Minimum time that must remain before a request deadline to make
+/// starting another admission-retry dispatch worth it. Below this, treat
+/// the request the same as already expired instead of starting it.
+pub const admission_retry_min_remaining_ns: u64 = 5 * std.time.ns_per_ms;
+
+/// Checked immediately before every admission-retry provider dispatch --
+/// the first attempt and every retry. Surfaces the request's own
+/// cancellation/timeout error, never a provider error, once the request is
+/// cancelled, has expired, or has too little time left before its deadline
+/// to usefully try again.
+pub fn checkAdmissionDispatch(context: RequestContext) !void {
+    try context.check();
+    const deadline = context.deadline_ns orelse return;
+    if (deadline -| platform_time.monotonicNs() <= admission_retry_min_remaining_ns) return error.Timeout;
+}
+
+/// Waits out one admission-retry backoff of `delay_ns`. The wait is
+/// cancellable and bounded by whichever is sooner, `delay_ns` or the
+/// request's remaining deadline: it polls in `admission_retry_poll_ns`
+/// steps, clipped to the remaining deadline, so a cancelled or expiring
+/// request is noticed within one poll interval instead of only after the
+/// full backoff elapses. Returns the request's own cancellation/timeout
+/// error, never a provider error, if either fires during the wait.
+pub fn admissionRetryWaitNs(context: RequestContext, delay_ns: u64) !void {
+    var remaining_ns = delay_ns;
+    while (remaining_ns > 0) {
+        try checkAdmissionDispatch(context);
+        var step_ns = @min(remaining_ns, admission_retry_poll_ns);
+        if (context.deadline_ns) |deadline| {
+            step_ns = @min(step_ns, @max(deadline -| platform_time.monotonicNs(), 1));
+        }
+        // The Io's own cancellation is a distinct signal from the request's
+        // CancellationToken (checked above via checkAdmissionDispatch); a
+        // bare wake here just shortens this step, and the loop re-checks
+        // the request's context before sleeping again.
+        context.io.sleep(std.Io.Duration.fromNanoseconds(@intCast(step_ns)), .awake) catch {};
+        remaining_ns -= step_ns;
+    }
+    try checkAdmissionDispatch(context);
+}
+
+/// Decides whether an admission-refusal failure should be retried again.
+/// Returns the backoff to wait before the next attempt, consuming it from
+/// `remaining_budget_ns` (mutated in place); returns `null` once the
+/// admission-retry budget itself is spent, telling the caller to surface
+/// the provider's refusal unchanged. The request's deadline is always
+/// checked first and wins: a request that would expire before the next
+/// backoff completes returns the request's own timeout/cancellation error
+/// instead, since retrying past the deadline would both dispatch work that
+/// can never be used and mislead the caller about why the call failed. This
+/// makes the effective retry budget the earlier of the configured
+/// admission-retry budget and the request's remaining deadline.
+pub fn nextAdmissionRetryDelayNs(context: RequestContext, attempt: u32, remaining_budget_ns: *u64) !?u64 {
+    try checkAdmissionDispatch(context);
+    const delay_ns = repairTransientBackoffNs(attempt);
+    if (context.deadline_ns) |deadline| {
+        const deadline_remaining_ns = deadline -| platform_time.monotonicNs();
+        if (delay_ns > deadline_remaining_ns) {
+            try context.check();
+            return error.Timeout;
+        }
+    }
+    if (delay_ns > remaining_budget_ns.*) return null;
+    remaining_budget_ns.* -= delay_ns;
+    return delay_ns;
 }
 
 pub const transient_hint = "temporary failure; run repair again";
