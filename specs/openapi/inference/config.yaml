@@ -459,10 +459,12 @@ components:
           example: "<s_cord-v2>"
         max_tokens:
           type: integer
-          description: Maximum tokens to generate
+          description: |
+            Maximum output tokens per page. When omitted, the selected reader
+            model supplies its default, bounded by deployment limits. Explicit
+            values override the model default and must fit model and server limits.
           minimum: 1
-          maximum: 1024
-          default: 256
+          maximum: 8192
           example: 256
 
     TextRegion:
