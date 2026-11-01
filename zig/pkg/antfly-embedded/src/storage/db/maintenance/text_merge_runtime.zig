@@ -74,6 +74,18 @@ pub var test_wait_for_producer_shutdown: std.atomic.Value(bool) = .init(false);
 pub var test_producer_shutdown_wait_entered: std.atomic.Value(bool) = .init(false);
 /// Test-only outcome: 1 means shutdown wake, 2 means ordinary deadline.
 pub var test_producer_shutdown_wait_outcome: std.atomic.Value(u8) = .init(0);
+/// Parks `runAssistedOnce()`'s fallback right after it releases
+/// `lifecycle_mutex` (concurrent dispatch was unavailable) and before it
+/// calls `self.runOnce()`, so a test can deterministically land a concurrent
+/// `stop()` in between — reproducing the race the `lifecycle_mutex`-free
+/// `runOnce()` read above is required to survive.
+pub var test_block_before_fallback_run_once: std.atomic.Value(bool) = .init(false);
+pub var test_fallback_run_once_entered: std.atomic.Value(bool) = .init(false);
+pub var test_release_before_fallback_run_once: std.atomic.Value(bool) = .init(false);
+/// Forces `runAssistedOnce()`'s concurrent dispatch to behave as though the
+/// executor had no spare concurrency, without depending on actually
+/// exhausting (or faking failure of) the real backend's thread pool.
+pub var test_force_concurrency_unavailable: std.atomic.Value(bool) = .init(false);
 
 // Named branches keep native ABI identities stable across LLVM owners.
 pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) UnsupportedTextMergeRuntime else PlatformTextMergeRuntime;
@@ -185,7 +197,10 @@ const PlatformTextMergeRuntime = struct {
     active_assistance: usize = 0,
     active_producers: usize = 0,
     active_manual_turns: usize = 0,
-    desired_running: bool = false,
+    // Read in `runOnce()` without `lifecycle_mutex` (see the comment there);
+    // every writer below already holds that mutex, so the atomic ordering
+    // only has to satisfy the cross-thread reader.
+    desired_running: std.atomic.Value(bool) = .init(false),
     paused: bool = false,
     shutdown: bool = false,
     notified: bool = false,
@@ -298,7 +313,7 @@ const PlatformTextMergeRuntime = struct {
         if (!self.config.enabled) return;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
-        self.desired_running = true;
+        self.desired_running.store(true, .release);
         self.paused = false;
         self.setAdmissionClosedLocked(false);
         try self.startLocked();
@@ -310,7 +325,7 @@ const PlatformTextMergeRuntime = struct {
     pub fn stop(self: *TextMergeRuntime) bool {
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
-        self.desired_running = false;
+        self.desired_running.store(false, .release);
         self.paused = true;
         self.setAdmissionClosedLocked(true);
         const stopped = self.stopLocked();
@@ -339,7 +354,7 @@ const PlatformTextMergeRuntime = struct {
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
         self.paused = false;
-        if (self.desired_running) {
+        if (self.desired_running.load(.acquire)) {
             try self.startLocked();
         } else {
             const io = self.io orelse return;
@@ -357,7 +372,7 @@ const PlatformTextMergeRuntime = struct {
         if (!self.config.enabled) return true;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
-        if (!self.desired_running) return true;
+        if (!self.desired_running.load(.acquire)) return true;
         if (self.paused) return false;
         try self.startLocked();
         return true;
@@ -370,7 +385,7 @@ const PlatformTextMergeRuntime = struct {
     }
 
     fn startLocked(self: *TextMergeRuntime) !void {
-        if (self.future != null or self.paused or !self.desired_running) return;
+        if (self.future != null or self.paused or !self.desired_running.load(.acquire)) return;
         const io = self.io orelse return error.MissingBackendRuntimeIo;
         if (builtin.is_test and consumeTestStartFailure()) return error.TestTransientMaintenanceRestart;
         self.mutex.lockUncancelable(io);
@@ -453,7 +468,10 @@ const PlatformTextMergeRuntime = struct {
             }
             const work = try self.alloc.create(AssistedMerge);
             work.* = .{ .runtime = self, .alloc = self.alloc, .io = io, .next = self.assisted_merges };
-            work.group.concurrent(io, AssistedMerge.run, .{work}) catch |err| {
+            (if (builtin.is_test and test_force_concurrency_unavailable.load(.acquire))
+                @as(anyerror!void, error.ConcurrencyUnavailable)
+            else
+                work.group.concurrent(io, AssistedMerge.run, .{work})) catch |err| {
                 work.drain();
                 self.alloc.destroy(work);
                 if (err == error.ConcurrencyUnavailable) break :register null;
@@ -465,7 +483,18 @@ const PlatformTextMergeRuntime = struct {
             self.mutex.unlock(io);
             break :register work;
         };
-        const registered = task orelse return self.runOnce();
+        const registered = task orelse {
+            // Test-only: hold this fallback open exactly in the window the
+            // [P1] review finding identified — `lifecycle_mutex` has already
+            // been released above, but `runOnce()` has not yet been called —
+            // so a test can deterministically race a `stop()` into that gap.
+            if (builtin.is_test and test_block_before_fallback_run_once.load(.acquire)) {
+                test_fallback_run_once_entered.store(true, .release);
+                while (!test_release_before_fallback_run_once.load(.acquire))
+                    std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            }
+            return self.runOnce();
+        };
         defer {
             // Free caller-owned state before allowing permanent shutdown to
             // destroy the runtime/allocator. No lifecycle lock is needed here.
@@ -505,9 +534,30 @@ const PlatformTextMergeRuntime = struct {
         // only a genuine stop() — which also clears `desired_running` — may
         // refuse it here. `active_manual_turns` still makes this turn visible
         // to a concurrent stop()/pause() drain regardless of this check.
-        lockAtomicWithBackoff(&self.lifecycle_mutex);
-        const terminated = !self.desired_running;
-        self.lifecycle_mutex.unlock();
+        //
+        // This must NOT take `lifecycle_mutex`: `runAssistedOnce()` falls
+        // back to calling `runOnce()` directly after it has already released
+        // `lifecycle_mutex` (its concurrent dispatch failed), while the
+        // calling producer is still counted in `active_producers`. `stop()`
+        // holds `lifecycle_mutex` for its *entire* body, including the tail
+        // wait for `active_producers`/`active_assistance` to drain. If this
+        // function also took `lifecycle_mutex` here, a `stop()` that wins the
+        // race for the lock between that release and this call would park
+        // waiting on this producer while this producer parks waiting on
+        // `lifecycle_mutex` — deadlock. Reading `desired_running` as a plain
+        // atomic sidesteps that cycle entirely: every writer (`start()`,
+        // `stop()`) stores it with `.release` while already holding
+        // `lifecycle_mutex`, and this load uses `.acquire`, so a `false` seen
+        // here is always ordered after the write that produced it, with no
+        // need to also hold the lock. A load that races *concurrently* with
+        // an in-flight `stop()` is harmless either way: `stop()` always sets
+        // `self.shutdown` under `self.mutex` (via `stopLocked()`) before it
+        // waits on `active_manual_turns`/`active_producers`, so if this call
+        // is let through on a stale (pre-stop) view of `desired_running`, the
+        // `self.shutdown`/`active_manual_turns` bookkeeping below — guarded
+        // by `self.mutex`, not `lifecycle_mutex` — still makes it visible to,
+        // and awaited by, that drain.
+        const terminated = !self.desired_running.load(.acquire);
         self.mutex.lockUncancelable(io);
         if (self.shutdown and terminated) {
             self.mutex.unlock(io);
