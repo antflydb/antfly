@@ -141,7 +141,8 @@ export class R2CommitCoordinator extends DurableObject {
     if(captured.view.lease&&!bindReadLease(captured.view,{started:requestMono}))throw Error("ManifestReadLeaseExpired");
     let lastWall=requestWall,lastMono=requestMono;
     const check=()=>{const wall=Date.now(),mono=performance.now();if(wall<lastWall||mono<lastMono||wall>=deadlineMs||mono-requestMono>=30000||captured.view.lease&&readLeaseRemaining(captured.view)<=0)throw Error("ManifestReadLeaseExpired");lastWall=wall;lastMono=mono;return Math.min(deadlineMs-wall,requestMono+30000-mono,captured.view.lease?readLeaseRemaining(captured.view):Infinity);};
-    const rawTransport=instrumentTransport(createR2Transport({database:this.env.DATABASE}),physical),wrapTransport=up=>withReadView(this.store.dataCache.wrap(CommittedHeaders.wrap(up,captured.boot,this.env.ANTFLY_INCARNATION,captured.view.version,{onStage:sample=>trace.stage(sample)}),this.env.ANTFLY_INCARNATION,{protect:true}),{openReadView:()=>{throw Error("ResidentReadViewMissing");}},this.env.ANTFLY_INCARNATION,{initial:captured.view});
+    const bootstrapHeaders=await trace.span("bootstrap_headers",()=>CommittedHeaders.prepare(captured.boot,this.env.ANTFLY_INCARNATION,captured.view.version,{onStage:sample=>trace.stage(sample)}));
+    const rawTransport=instrumentTransport(createR2Transport({database:this.env.DATABASE}),physical),wrapTransport=up=>withReadView(this.store.dataCache.wrap(bootstrapHeaders(up),this.env.ANTFLY_INCARNATION,{protect:true}),{openReadView:()=>{throw Error("ResidentReadViewMissing");}},this.env.ANTFLY_INCARNATION,{initial:captured.view});
       let loadTransport=wrapTransport(rawTransport);
       if(this.env.RESIDENT_FETCH_COALESCE==="true"){
         this.immutableFlights??=new ImmutableFlights({reserve:reserveInput,onCharge:bytes=>{this.store.servingFlightBytes=bytes;}});

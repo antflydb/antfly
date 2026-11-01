@@ -78,3 +78,20 @@ test('qualification native artifacts share immutable bytes without linking mutab
   const hash=first['module.wasm'];await rm(join(cache,hash+'.wasm'));await writeFile(join(cache,hash+'.wasm'),'corrupt');const three=join(dir,'three');await mkdir(three);await assert.rejects(retainNativeModules([{path:'module.wasm',contents:Buffer.from('immutable wasm fixture')}],three,cache),/NativeArtifactHashMismatch/);
  }finally{await rm(dir,{recursive:true,force:true});}
 });
+
+test('prepared bootstrap reuses decoded owned bytes across transports while preserving request checks',async()=>{
+ const h=new CommittedHeaders('ns','2'),key='antfly/manifests/ns/manifests/2.bin',bytes=new TextEncoder().encode('repeat '.repeat(800));h.offer({op:'get',bucket:'database',key},{body:bytes,json:{etag:'one'}});
+ const pack=await h.encodeCompressed(),stages=[],prepare=await CommittedHeaders.prepare(pack,'ns','2',{onStage:s=>stages.push(s)});pack.payload='mutated after preparation';
+ let first=0,second=0;const a=prepare(async()=>{first++;return{fallback:1};}),b=prepare(async()=>{second++;return{fallback:2};});
+ const request={op:'get',bucket:'database',key};(await a(request)).body.fill(0);assert.deepEqual((await b(request)).body,bytes);assert.equal(stages.filter(s=>s.name==='bootstrap_decode').length,1);
+ assert.deepEqual((await a({...request,range:{offset:2,length:5}})).body,bytes.slice(2,7));assert.equal((await b({...request,op:'head',max_response_bytes:0})).body,undefined);
+ await assert.rejects(a({...request,if_match_etag:'wrong'}),/condition/);await assert.rejects(b({...request,max_response_bytes:1}),/budget/);await assert.rejects(b({...request,range:{offset:-1}}),/range/);
+ assert.equal((await a({...request,version_id:'other'})).fallback,1);assert.equal((await b({...request,bucket:'other'})).fallback,2);assert.equal(first,1);assert.equal(second,1);
+ const plain=h.encode(),prepared=await CommittedHeaders.prepare(plain,'ns','2');plain.records[0].body='';assert.deepEqual((await prepared(a)(request)).body,bytes);
+ assert.equal((await (await CommittedHeaders.prepare(h.encode(),'ns','3'))(async()=>42)(request)),42);
+ await assert.rejects(CommittedHeaders.prepare(h.encode(),'other','2'),/InvalidCommittedHeaders/);
+});
+test('prepared compressed bootstrap rejects decompression expansion beyond the original bound',async()=>{
+ const stream=new Blob([new TextEncoder().encode('x'.repeat(18000))]).stream().pipeThrough(new CompressionStream('gzip')),bytes=new Uint8Array(await new Response(stream).arrayBuffer());
+ await assert.rejects(CommittedHeaders.prepare({format:2,namespace:'ns',version:'2',encoding:'gzip',payload:btoa(String.fromCharCode(...bytes))},'ns','2'),/InvalidCommittedHeaders/);
+});

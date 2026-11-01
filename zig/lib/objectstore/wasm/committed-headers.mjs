@@ -35,30 +35,39 @@ export class CommittedHeaders {
   const compressed={format:2,namespace:this.namespace,version:this.version,encoding:'gzip',payload:btoa(String.fromCharCode(...bytes))};
   return JSON.stringify(compressed).length<source.length?compressed:value;
  }
- static wrap(transport,value,namespace,version,{onStage}={}){
+ // Preparation owns only immutable bytes. Reusing the factory across native
+ // continuations never retains a transport, request context, or decode promise.
+ static async prepare(value,namespace,version,{onStage}={}){
+  if(value==null||value.version!==version)return transport=>transport;
+  if(value.format!==2)return CommittedHeaders.preparePlain(value,namespace,version);
+  if(value.namespace!==namespace||value.encoding!=='gzip'||typeof value.payload!=='string'||value.payload.length>17000)throw Error('InvalidCommittedHeaders');
+  const started=performance.now();try{
+   const source=Uint8Array.from(atob(value.payload),c=>c.charCodeAt(0)),reader=new Blob([source]).stream().pipeThrough(new DecompressionStream('gzip')).getReader();let count=0;const parts=[];
+   try{for(;;){const{done,value:part}=await reader.read();if(done)break;count+=part.length;if(count>17000)throw Error('InvalidCommittedHeaders');parts.push(part);}}finally{await reader.cancel();}
+   const bytes=new Uint8Array(count);let offset=0;for(const part of parts){bytes.set(part,offset);offset+=part.length;}
+   const plain=JSON.parse(text.decode(bytes));if(![1,3].includes(plain.format)||plain.version!==version)throw Error('InvalidCommittedHeaders');
+   return CommittedHeaders.preparePlain(plain,namespace,version);
+  }finally{onStage?.({name:"bootstrap_decode",duration_ms:performance.now()-started});}
+ }
+ static wrap(transport,value,namespace,version,options={}){
   if(value==null||value.version!==version)return transport;
-  if(value.format===2){
-   if(value.namespace!==namespace||value.encoding!=='gzip'||typeof value.payload!=='string'||value.payload.length>17000)throw Error('InvalidCommittedHeaders');
-   let decoded;
-   return async(request,body)=>{
-    if(!decoded){
-     const started=performance.now();try{
-     const source=Uint8Array.from(atob(value.payload),c=>c.charCodeAt(0)),reader=new Blob([source]).stream().pipeThrough(new DecompressionStream('gzip')).getReader();let count=0;const parts=[];
-     try{for(;;){const{done,value:part}=await reader.read();if(done)break;count+=part.length;if(count>17000)throw Error('InvalidCommittedHeaders');parts.push(part);}}finally{await reader.cancel();}
-     const bytes=new Uint8Array(count);let offset=0;for(const part of parts){bytes.set(part,offset);offset+=part.length;}
-     const plain=JSON.parse(text.decode(bytes));if(![1,3].includes(plain.format)||plain.version!==version)throw Error('InvalidCommittedHeaders');decoded=CommittedHeaders.wrap(transport,plain,namespace,version);
-     }finally{onStage?.({name:"bootstrap_decode",duration_ms:performance.now()-started});}
-    }
-    return decoded(request,body);
-   };
-  }
+  if(value.format!==2)return CommittedHeaders.preparePlain(value,namespace,version)(transport);
+  if(value.namespace!==namespace||value.encoding!=='gzip'||typeof value.payload!=='string'||value.payload.length>17000)throw Error('InvalidCommittedHeaders');
+  // Compatibility for lazy callers. No promise is shared across I/O contexts.
+  let prepared;
+  return async(request,body)=>{
+   const factory=prepared??await CommittedHeaders.prepare(value,namespace,version,options);
+   prepared=factory;return factory(transport)(request,body);
+  };
+ }
+ static preparePlain(value,namespace,version){
   if(![1,3].includes(value.format)||value.namespace!==namespace||!Array.isArray(value.records)||value.records.length>(value.format===3?8:2)||encoder.encode(JSON.stringify(value)).byteLength>17000)throw Error('InvalidCommittedHeaders');
   const map=new Map();
   for(const row of value.records){
    if(typeof row.key!=='string'||typeof row.body!=='string'||typeof row.etag!=='string'||map.has(row.key))throw Error('InvalidCommittedHeaders');
    const body=Uint8Array.from(atob(row.body),c=>c.charCodeAt(0)),check=new CommittedHeaders(namespace,version,{routing:value.format===3});check.offer({op:'get',bucket:'database',key:row.key},{json:{etag:row.etag},body});if(check.records.length!==1)throw Error('InvalidCommittedHeaders');map.set(row.key,{body,etag:row.etag});
   }
-  return async(request,body)=>{
+  return transport=>async(request,body)=>{
    const row=request.bucket==='database'&&['get','head'].includes(request.op)&&map.get(request.key);
    if(!row||request.version_id!=null||Object.keys(request).some(k=>!['op','bucket','key','range','if_match_etag','max_response_bytes'].includes(k)))return transport(request,body);
    if(request.if_match_etag!=null&&request.if_match_etag!==row.etag)throw new ObjectStoreError(2,'committed header condition failed');

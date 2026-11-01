@@ -153,7 +153,7 @@ export default {
       if (args.op === "collect") {
         const result = await background(env,{op:"collect",job_id:args.job_id});
         if (result.has_more) await enqueue(env, "collect", result.job_id, result.delay_seconds);
-        return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
+        return Response.json(result,{headers:{...(env.WORKER_VERSION?{"X-Antfly-Version":env.WORKER_VERSION.id}:{}),...(env.LOG_METRICS==="true"?{"X-Antfly-Trace-Id":trace.id}:{})}});
       }
       if (!["mutate", "lookup", "list", "search", "count", "status", "publish", "compact", "enrich", "latest", "reindex"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
       rejectPrivateScanInput(args);
@@ -178,7 +178,7 @@ export default {
           console.error("Antfly maintenance enqueue failed", String(error));
         }
       }
-      return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
+      return Response.json(result,{headers:{...(env.WORKER_VERSION?{"X-Antfly-Version":env.WORKER_VERSION.id}:{}),...(env.LOG_METRICS==="true"?{"X-Antfly-Trace-Id":trace.id}:{})}});
     } catch (error) {
       trace.error("http",error);
       const retryable = error instanceof Busy || retryableRuntimeFailure(error);
