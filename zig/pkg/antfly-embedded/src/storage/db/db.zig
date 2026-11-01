@@ -5997,7 +5997,9 @@ pub const DB = struct {
         if (opts.transaction_recovery.enabled) {
             try self.initOptionalTransactionRuntime(opts.transaction_recovery);
         }
-        try self.initOptionalTextMergeRuntime(opts.text_merge);
+        var text_merge = opts.text_merge;
+        text_merge.manual_producer_assistance = !opts.start_optional_runtime_workers;
+        try self.initOptionalTextMergeRuntime(text_merge);
         try self.initOptionalSparseCompactionRuntime(opts.sparse_compaction);
         try self.initOptionalGraphMetricRuntime(opts.graph_metric_maintenance);
     }
@@ -8614,6 +8616,46 @@ pub const DB = struct {
     /// turning one request into unbounded CPU/provider work.
     pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (comptime storage_engine.enabled) return storage_engine.call("batchInternal", .{ self, req, profile, opts });
+        var committed = false;
+        var tracked = opts;
+        tracked.primary_committed = opts.primary_committed orelse &committed;
+        self.batchInternalWithVisibility(req, profile, tracked) catch |err| {
+            if (tracked.primary_committed.?.*) switch (err) {
+                error.TextMergeBackpressureTimeout,
+                error.TextMergeRuntimeShutdown,
+                error.InferenceProviderCallCapacityExhausted,
+                error.EmbeddingProbeUnavailable,
+                error.MemoryConfigurationTransition,
+                error.MemoryRetryNotReady,
+                error.Busy,
+                error.WouldBlock,
+                error.WriterLocked,
+                error.FileBusy,
+                error.LiteRetirementBacklogExceeded,
+                error.SourceFileChanged,
+                error.GenerationTransitionActive,
+                error.IndexArtifactCleanupPending,
+                error.ResolverCurationConflict,
+                error.RowPolicyCatalogChanged,
+                error.RowPolicyReadersActive,
+                error.InvalidRowPolicyReceipt,
+                error.InvalidRowPolicyBundle,
+                error.PortableImportPublicationInProgress,
+                error.PortableRuntimeActivationPending,
+                error.VersionConflict,
+                error.Canceled,
+                error.Cancelled,
+                error.EnrichmentWaitCanceled,
+                error.EnrichmentWaitTimeout,
+                error.EnrichmentRetryInProgress,
+                => return error.CommitVisibilityNotSatisfied,
+                else => {},
+            };
+            return err;
+        };
+    }
+
+    fn batchInternalWithVisibility(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (opts.visibility_completion != null or !opts.wait_for_sync_level or
             (req.sync_level != .enrichments and req.sync_level != .full_index) or !self.core.index_manager.hasGroupSources())
             return self.batchInternalCommit(req, profile, opts);
@@ -55474,8 +55516,14 @@ fn replayPendingDerivedBatches(
                 .progress_fn = if (use_dense_catch_up) DenseReplayProgressContext.run else null,
                 .persist_ctx = &persist_progress_ctx,
                 .persist_progress_fn = PersistReplayProgress.run,
-                .max_records_per_window = if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxRecords() else derived_worker.catch_up_max_records_per_window_default,
-                .max_chunk_bytes = if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxChunkBytes() else derived_worker.catch_up_max_chunk_bytes_default,
+                .max_records_per_window = @min(
+                    if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxRecords() else derived_worker.catch_up_max_records_per_window_default,
+                    if (options.bounded_replay) derived_worker.catch_up_background_max_records else std.math.maxInt(usize),
+                ),
+                .max_chunk_bytes = @min(
+                    if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxChunkBytes() else derived_worker.catch_up_max_chunk_bytes_default,
+                    if (options.bounded_replay) derived_worker.catch_up_background_max_chunk_bytes else std.math.maxInt(u64),
+                ),
                 .max_windows_per_call = options.max_windows_per_index,
                 .deadline_ns = options.deadline_ns,
             },
@@ -120183,10 +120231,38 @@ test "db text merge producer admission isolates quarantined dimensions" {
     };
     db.core.unlockApply();
 
-    var failed_task = (try resources.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
-    defer failed_task.deinit(alloc);
-    try std.testing.expectEqualStrings("quarantined", failed_task.index_name);
-    resources.index_manager.noteTextMergeFailure(&failed_task, error.InvalidChunk);
+    {
+        var assistant = try text_merge_runtime_mod.TextMergeRuntime.init(
+            alloc,
+            resources.index_manager,
+            resources.apply_mutex,
+            db.backend_runtime,
+            .{
+                .enabled = true,
+                .manual_producer_assistance = true,
+                .max_pending_segments = 3,
+                .max_pending_bytes = 0,
+                .backpressure_max_wait_ms = 100,
+            },
+        );
+        defer assistant.deinit();
+        // The healthy producer is blocked only by an in-flight reservation.
+        // Its assistance selects the other index's pending merge. Failure of
+        // that source must not escape as a corruption error on this producer.
+        var held = try assistant.acquireProducerPermit("healthy", 3, 0);
+        defer held.release();
+        text_merge_runtime_mod.test_task_failure_error = error.InvalidChunk;
+        defer text_merge_runtime_mod.test_task_failure_error = error.PersistentDescriptorAdmissionExhausted;
+        text_merge_runtime_mod.test_execute_admission_failures_remaining.store(1, .release);
+        defer text_merge_runtime_mod.test_execute_admission_failures_remaining.store(0, .release);
+        try std.testing.expectError(error.TextMergeBackpressureTimeout, assistant.acquireProducerPermit("healthy", 1, 0));
+        try std.testing.expectEqual(@as(u32, 0), text_merge_runtime_mod.test_execute_admission_failures_remaining.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 1), resources.index_manager.textMergeStatsSnapshot().failed_merges);
+        held.release();
+        var healthy = try assistant.acquireProducerPermit("healthy", 3, 0);
+        defer healthy.release();
+        try std.testing.expectError(error.TextMergeBackpressureUnavailable, assistant.acquireProducerPermit("quarantined", 2, 0));
+    }
 
     const quarantined_stats = resources.index_manager.textMergeStatsSnapshotForIndex("quarantined");
     try std.testing.expectEqual(@as(u64, 2), quarantined_stats.pending_segments);
@@ -120257,6 +120333,74 @@ test "db text merge producer admission isolates quarantined dimensions" {
         byte_runtime.acquireProducerPermit("healthy", 0, 1),
     );
     oversized_disk_permit.release();
+}
+
+test "db manual text producers merge capacity without optional workers" {
+    const alloc = std.testing.allocator;
+    text_merge_runtime_mod.test_manual_merge_delay_ms.store(150, .release);
+    defer text_merge_runtime_mod.test_manual_merge_delay_ms.store(0, .release);
+    var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime_owner.deinit();
+    var path_tmp = try TestDirectory.init("manual-text-admission");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime_owner.ptr(),
+        .executor = .{ .backend = .manual },
+        .start_optional_runtime_workers = false,
+        .text_merge = .{
+            .enabled = true,
+            .max_pending_segments = 12,
+            .resume_pending_segments = 6,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 100,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!runtime.isStarted());
+    for (0..30) |i| {
+        var key_buffer: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "doc:{d}", .{i});
+        const fields = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "manual merge admission" }};
+        const docs = [_]introducer_mod.TextDocument{.{
+            .id = key,
+            .stored_data = "{}",
+            .text_fields = &fields,
+            .doc_ordinal = @intCast(i + 1),
+        }};
+        _ = try db.indexTextKernelDocuments("ft_v1", &docs);
+        try std.testing.expect(db.core.index_manager.textActiveSegmentCountSnapshot("ft_v1") <= 12);
+    }
+    try std.testing.expect(!runtime.isStarted());
+    try std.testing.expect(runtime.stats().backpressure_events > 0);
+    try std.testing.expectEqual(@as(u64, 0), runtime.stats().backpressure_timeouts);
+    try std.testing.expect(db.core.index_manager.textMergeStatsSnapshot().completed_merges > 0);
+    {
+        // Work held by a different turn cannot be serviced by this producer.
+        // Assistance must retain the bounded refusal instead of spinning.
+        var held = (try db.core.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+        defer held.deinit(alloc);
+        defer db.core.index_manager.cancelTextMergeTask(&held);
+        try std.testing.expectError(error.TextMergeBackpressureTimeout, runtime.acquireProducerPermit("ft_v1", 6, 0));
+    }
+    {
+        // A shared resource refusal signals admission but frees no capacity.
+        // It must back off rather than consume a core until the deadline.
+        text_merge_runtime_mod.test_task_failure_error = error.ResourceBudgetExceeded;
+        defer text_merge_runtime_mod.test_task_failure_error = error.PersistentDescriptorAdmissionExhausted;
+        text_merge_runtime_mod.test_execute_admission_failures_remaining.store(1000, .release);
+        defer text_merge_runtime_mod.test_execute_admission_failures_remaining.store(0, .release);
+        try std.testing.expectError(error.TextMergeBackpressureTimeout, runtime.acquireProducerPermit("ft_v1", 6, 0));
+        try std.testing.expect(text_merge_runtime_mod.test_execute_admission_failures_remaining.load(.acquire) >= 990);
+    }
+    var result = try db.searchTextKernel(alloc, "ft_v1", .{
+        .term = .{ .field = "body", .term = "manual" },
+    }, .{ .limit = 40 });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 30), result.hits.len);
 }
 
 test "db text kernel admits natural segments below hard segment limit" {
@@ -144897,4 +145041,154 @@ test "db managed index repair summary reports a newer provider failure after reo
     var summary = (try db.indexEnrichmentFailureSummary(a, "dv_a")).?;
     defer summary.deinit(a);
     try std.testing.expectEqualStrings("InvalidEmbeddingResponse", types.repair_failure.issueErrorCode(summary.latest));
+}
+
+test "db manual text producers merge capacity without optional workers lifecycle drains structural mutations" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const ActionKind = enum { pause, create, delete, stop };
+    for (std.meta.tags(ActionKind)) |kind| {
+        const a = std.testing.allocator;
+        var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(a, .{});
+        defer runtime_owner.deinit();
+        var tmp = try TestDirectory.init("manual-merge-lifecycle");
+        defer tmp.cleanup();
+        const path = tmp.path().ptr;
+        defer cleanupTempDir(path);
+        var db = try DB.open(a, std.mem.span(path), .{
+            .backend_runtime = runtime_owner.ptr(),
+            .executor = .{ .backend = .manual },
+            .start_optional_runtime_workers = false,
+            .text_merge = .{ .enabled = true, .max_pending_segments = 12, .resume_pending_segments = 6, .max_pending_bytes = 0, .backpressure_max_wait_ms = 2000 },
+        });
+        defer db.close();
+        // Removing this first index moves the assisted task's inline index.
+        try db.addIndex(.{ .name = "other-ft", .kind = .full_text, .config_json = "{}" });
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+        const runtime = db.text_merge_runtime.?;
+        for (0..12) |i| {
+            var buffer: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&buffer, "doc:{d}", .{i});
+            _ = try db.indexTextKernelDocuments("ft_v1", &.{.{ .id = key, .stored_data = "{}", .text_fields = &.{.{ .field_name = "body", .text = "manual merge lifecycle" }}, .doc_ordinal = @intCast(i + 1) }});
+        }
+        text_merge_runtime_mod.test_task_begin_entered.store(false, .release);
+        text_merge_runtime_mod.test_stop_entered.store(false, .release);
+        text_merge_runtime_mod.test_release_after_task_begin.store(false, .release);
+        text_merge_runtime_mod.test_block_after_task_begin.store(true, .release);
+        defer {
+            text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+            text_merge_runtime_mod.test_block_after_task_begin.store(false, .release);
+        }
+        const Assist = struct {
+            runtime: *text_merge_runtime_mod.TextMergeRuntime,
+            failure: ?anyerror = null,
+            fn run(self: *@This()) void {
+                var permit = self.runtime.acquireProducerPermit("ft_v1", 1, 0) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                permit.release();
+            }
+        };
+        var assist: Assist = .{ .runtime = runtime };
+        var assisting = try std.testing.io.concurrent(Assist.run, .{&assist});
+        defer assisting.await(std.testing.io);
+        defer text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+        for (0..5000) |_| {
+            if (text_merge_runtime_mod.test_task_begin_entered.load(.acquire)) break;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(text_merge_runtime_mod.test_task_begin_entered.load(.acquire));
+        const Action = struct {
+            db: *DB,
+            runtime: *text_merge_runtime_mod.TextMergeRuntime,
+            kind: ActionKind,
+            returned: std.atomic.Value(bool) = .init(false),
+            failure: ?anyerror = null,
+            resume_needed: bool = false,
+            fn run(self: *@This()) void {
+                self.perform() catch |err| {
+                    self.failure = err;
+                };
+                self.returned.store(true, .release);
+            }
+            fn perform(self: *@This()) !void {
+                switch (self.kind) {
+                    .pause => self.resume_needed = self.runtime.pause(),
+                    .create => try self.db.addIndex(.{ .name = "new-ft", .kind = .full_text, .config_json = "{}" }),
+                    .delete => try std.testing.expect(try self.db.deleteIndex("other-ft")),
+                    .stop => {
+                        _ = self.runtime.stop();
+                    },
+                }
+            }
+        };
+        var action: Action = .{ .db = &db, .runtime = runtime, .kind = kind };
+        var mutation = try std.testing.io.concurrent(Action.run, .{&action});
+        defer mutation.await(std.testing.io);
+        defer text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+        for (0..5000) |_| {
+            if (action.returned.load(.acquire) or text_merge_runtime_mod.test_stop_entered.load(.acquire)) break;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(text_merge_runtime_mod.test_stop_entered.load(.acquire));
+        try std.testing.expect(!action.returned.load(.acquire));
+        text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
+        mutation.await(std.testing.io);
+        assisting.await(std.testing.io);
+        text_merge_runtime_mod.test_block_after_task_begin.store(false, .release);
+        if (action.failure) |err| return err;
+        if (assist.failure) |err| switch (err) {
+            error.Canceled, error.TextMergeRuntimeShutdown => {},
+            else => return err,
+        };
+        if (kind == .pause) {
+            try std.testing.expect(action.resume_needed);
+            try runtime.resumeAfterPause();
+        }
+        try std.testing.expect(!runtime.isStarted());
+        if (kind == .stop) {
+            try std.testing.expectError(error.TextMergeRuntimeShutdown, runtime.acquireProducerPermit("ft_v1", 1, 0));
+        } else {
+            var resumed = try runtime.acquireProducerPermit("ft_v1", 1, 0);
+            resumed.release();
+        }
+    }
+}
+
+test "db manual text producers merge capacity without optional workers visibility timeout preserves a committed transform" {
+    const alloc = std.testing.allocator;
+    var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime_owner.deinit();
+    var path_tmp = try TestDirectory.init("review1436-postcommit-busy");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime_owner.ptr(),
+        .executor = .{ .backend = .manual },
+        .start_optional_runtime_workers = false,
+        .text_merge = .{ .enabled = true, .max_pending_segments = 12, .max_pending_bytes = 0, .backpressure_max_wait_ms = 100 },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"body\":\"counter\",\"count\":0}" }}, .sync_level = .write });
+    var held = try db.text_merge_runtime.?.acquireProducerPermit("ft_v1", 12, 0);
+    defer held.release();
+    const request: types.BatchRequest = .{
+        .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }},
+        .sync_level = .full_text,
+    };
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, db.batch(request));
+    const raw = (try db.get(alloc, "counter")).?;
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
+    held.release();
+    try db.runUntilIdle();
+    const visible = (try db.get(alloc, "counter")).?;
+    defer alloc.free(visible);
+    var completed = try std.json.parseFromSlice(std.json.Value, alloc, visible, .{});
+    defer completed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), completed.value.object.get("count").?.integer);
 }

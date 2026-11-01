@@ -35,6 +35,9 @@ pub const Phase = enum {
     cursor_retention,
     result_delivery,
     hydration,
+    // Nested delivery batches distinguish physical reads from covered native fields.
+    hydration_source,
+    hydration_native,
     highlight,
     total,
     // Composed timings enclose leaf timings; native leaves include durable

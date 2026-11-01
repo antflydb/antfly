@@ -1,0 +1,761 @@
+{
+  "schema_version": 1,
+  "code_revision": "0448c8c27cdad50f48f043b039d63ddb18b22201",
+  "scope": "PR 1436 review corrections and remaining indexed-churn qualification; refs issues 1362 and 1431",
+  "qualification": "partial; correctness regressions pass, sustained indexed storage growth and throughput degradation remain unresolved",
+  "artifact": {
+    "base_revision": "b842d342ebebc95f3a9ef43a944326ca8bc3f190",
+    "optimization": "debug",
+    "library_sha256": "454a348821a16ee524505e8bfec5e2ad8c78bb296ebe4ffa72606523a8b9d1d3",
+    "source_sha256": {
+      "go/pkg/embedded/errors.go": "7a5d4efaa8423b8f4bc2cccbcdca1e884135000fac3f28b4ed7aab83fb10d5ce",
+      "go/pkg/embedded/include/antfly.h": "c36b4f2ff99c8667ccff36cc282c8df96808bcfe624b152b7b358d8c65749f83",
+      "py/packages/embedded/src/antfly_embedded/errors.py": "427a3e5d9c78ee903bb75b6829769c370dc82ff380a6b601902f1ae688bf9a55",
+      "rs/crates/embedded/src/error.rs": "65faff581de9ecb21cca142ef9c77739ba12f0da7eb0dce007f12ecb839443fc",
+      "scripts/bench/lite_contention.py": "9e4690f1c1cbd59e5a0cfa50bdfe37c4e45e8a5613ddf7d31f0ed524c528ada7",
+      "scripts/bench/test_lite_contention.py": "57094c9c076940d0409d440fdf4a6247c5a846aa385124f5fce2bfbfd332c4ee",
+      "ts/packages/embedded/src/errors.ts": "8856982f78f4b17cb1dde8e6a2f5de815ba9bfce574745e0c048f3436c5349c3",
+      "zig/LITE.md": "12cdc478c2735827c587ded2b8841afbbae7ba596337714d9fb0b85ca90710ca",
+      "zig/pkg/antfly-embedded/include/antfly.h": "c36b4f2ff99c8667ccff36cc282c8df96808bcfe624b152b7b358d8c65749f83",
+      "zig/pkg/antfly-embedded/src/capi/db.zig": "96a2ded4d3dc80ea883029e11c73a973aaf7a0d49f79b59cd6efe680817c8cbb",
+      "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "2feb3fed97e0e192831edbc37cf57244abd955d0dc3e017a027fdc7624f90456",
+      "zig/pkg/antfly-embedded/src/capi/types.zig": "88b5f2852a5a894aea5d553298de4ff1264b97df170d907734ac607ee8eb2fd2",
+      "zig/pkg/antfly-embedded/src/source_catalog.zig": "797c52c1991d62cebb20afde4f9f6e4cb43a84259731d963c5be75aeec822fff",
+      "zig/pkg/antfly-embedded/src/source_catalog_control.zig": "4155cbd108e4465f6bb8ae830a8bc445759015e74de740c4edc97dfd70b4f339",
+      "zig/pkg/antfly-embedded/src/storage/db/db.zig": "c5b833815b350f3d54bf2d219ec41a418488bba940109caf81f4e3f95fc3e844",
+      "zig/pkg/antfly-embedded/src/storage/db/execution_resources.zig": "164dbee3f297077d459f9ed2b5a0b26e59ec488c2e4b95518e48687e413fdfc2",
+      "zig/pkg/antfly-embedded/src/storage/db/maintenance/text_merge_runtime.zig": "0390555f12497c1317c397d8baecacbad06ca5c8a820a3d6e1d300153eb11e89",
+      "zig/pkg/antfly-embedded/src/storage/db/mutation_commit.zig": "e331762f875bc9800e6375df61e4985033a06a944789433abbc20944f1b0ed6d",
+      "zig/pkg/antfly-embedded/src/storage/lite/docstore.zig": "447844282c86c71e48f1b8a89fa683b91915d5e26ea723a2f543bef3b239a9d0",
+      "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "bb58fd7004ba3901f142ba6f9fcd509c119b4e84e055f5eb1870309590122de9",
+      "zig/pkg/antfly-embedded/src/storage/lite/reclamation.zig": "b616df018aa4226e6d7fa5906c0c246d166b8d239de81ed09ce4cc5ec8c8380d",
+      "zig/pkg/antfly/src/storage/test_manifest.zig": "7bf08c82d36b8030223b0260aa2e3e8b11255cc770f029b5e63c65ca36df8d95"
+    },
+    "source_note": "Artifact compiled from b842d342eb plus the runtime patch committed as 0448c8c27c. Every changed native Zig source hash matches the committed code. The commit hook only reformatted the benchmark harness; its measured and committed ASTs are equal."
+  },
+  "measurement_harness": {
+    "measured_sha256": "9e4690f1c1cbd59e5a0cfa50bdfe37c4e45e8a5613ddf7d31f0ed524c528ada7",
+    "committed_sha256": "af9adb9f57ef2ea56c977a20a0e50ed71397a662dc555bab48b1bea4e695e06d",
+    "ast_equal_after_formatting": true,
+    "file_sampling": "filesystem stat only, approximately once per second; no native diagnostic observer during timed calls",
+    "progress_requirement": "at least one successful request from each worker in every 60-second window",
+    "growth_metric_scope": "file bytes minus post-seed compact bytes, divided by successful calls; includes readiness, background, close, and diagnostic publications, not just primary data"
+  },
+  "fixes": [
+    "Lifecycle admission and draining cover assisted and explicit manual merges before pause, structural index mutation, and shutdown; shutdown also drains producer bookkeeping.",
+    "Known primary commit is tracked before derived completion. Retryable post-commit failures become CommitVisibilityNotSatisfied / ANTFLY_STALLED with a committed/do-not-retry diagnostic. Pre-commit batch refusal remains Busy. SDK guidance is updated without enum/schema changes.",
+    "Ordinary coordinated read-only opens retain full allocator metadata frontiers. Logical data-only readers opt into that scope explicitly.",
+    "Detached catalog/source pins close before physical maintenance. Bounded allocator service admits the current checkpoint through the fair writer queue; prepared vacuum keeps stale-tip rejection.",
+    "Worthwhile shrink assessments retain a budgeted retry deadline across checkpoint refresh; canceled publication can retry without further growth. Scan retries wait at least 30 seconds or 64 times the prior scan duration."
+  ],
+  "validation": {
+    "native_owner_suite": {
+      "host": "wolfspider",
+      "zig": "0.17.0",
+      "optimization": "debug",
+      "descriptor_limit": 4096,
+      "passed": 714,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "expected_error_logs": 8,
+      "unexpected_error_logs": 0,
+      "targets": [
+        "capi",
+        "capi-smoke",
+        "capi-contract-owner-test-build"
+      ],
+      "filters": [
+        "issue1431",
+        "issue1362",
+        "storage.lite.",
+        "db manual text producers",
+        "db text merge",
+        "db delete full text index drains",
+        "scheduled text merges",
+        "text merge publication handoff",
+        "capi error"
+      ],
+      "note": "Physical implementation-owner suite, not the repository-wide aggregate unit gate."
+    },
+    "c_consumer_and_export_boundary": {
+      "status": "passed",
+      "public_functions": 134
+    },
+    "python_sdk": {
+      "passed": 201,
+      "seconds": 76.8,
+      "files": [
+        "test_sql.py",
+        "test_sql_catalog_search.py",
+        "test_concurrency.py"
+      ],
+      "native_library_sha256": "454a348821a16ee524505e8bfec5e2ad8c78bb296ebe4ffa72606523a8b9d1d3",
+      "localhost_fixture": "permitted"
+    },
+    "benchmark_report_tests": {
+      "passed": 8,
+      "includes": "late worker stalls cannot qualify based only on early progress"
+    },
+    "policy_tests": {
+      "passed": 3
+    },
+    "tooling_tests": {
+      "storage_shard_audit": 13,
+      "storage_compilation_checker": 32
+    },
+    "initial_broad_run": {
+      "passed": 712,
+      "failed": 2,
+      "details": [
+        "The old generic-reader reuse fixture assumed a data-only fence; it now requests that scope explicitly, alongside the separate ordinary-reader metadata-integrity regression.",
+        "Backup round-trip reached the host descriptor limit; its isolated rerun and the complete 714-test rerun passed with limit 4096."
+      ]
+    },
+    "local_build_interruption": "The active local Zig cache was removed during compilation. Those incomplete builds were discarded; final native qualification ran in the isolated wolfspider worktree."
+  },
+  "original_frozen_critical_append": {
+    "status": "ok",
+    "revision": "0448c8c27c",
+    "library_sha256": "454a348821a16ee524505e8bfec5e2ad8c78bb296ebe4ffa72606523a8b9d1d3",
+    "optimization": "debug",
+    "before": {
+      "file_bytes": 4933730304,
+      "reusable_bytes": 1121112064
+    },
+    "after": {
+      "file_bytes": 4933730304,
+      "reusable_bytes": 375246848
+    },
+    "growth_bytes": 0,
+    "seconds": 944.2788960000034,
+    "exit_code": 0,
+    "all_expected_threads_present": true,
+    "integrity_valid": true,
+    "busy_errors": 0,
+    "capacity_errors": 0,
+    "fixture": "Exact saved pre-critical multi-GB checkpoint and archived rollout inputs; private payloads and identifiers omitted",
+    "expected_thread_count": 11,
+    "note": "Existing importer executable used with the final Debug native library; semantic enrichment disabled, as in the earlier reproduction.",
+    "before_critical_database_sha256": "fd4f0067130d3dd182773e1ce5d5bd01b26b919b1991eae3a30ee34f756896c6",
+    "importer_sha256": "f8c48e309c207f6d550805eef8929bffb3c4ce5ad5bc098659160b30224ef1f3",
+    "frozen_source_sqlite_sha256": "c9c9ec70fd6ea23e3107e93bb205d47b6d27d7ffaf504ca77628f8dc87ff8eba",
+    "frozen_rollout_file_count": 35,
+    "frozen_rollout_content_set_sha256": "4635b66c352a19a8babb393f2a3850b2bfb9ba58e2840a1c08f8f8269c14bc1f"
+  },
+  "controlled_optimized_growth_comparison": {
+    "workload": {
+      "writers": 8,
+      "seconds": 20,
+      "seed_records": 1024,
+      "churn_keys_per_writer": 128,
+      "busy_timeout_ms": 5000,
+      "indexed": true
+    },
+    "before_retirement_replay_map_fix": {
+      "status": "ok",
+      "library_sha256": "2d78a35afeb8ed30ebe1e1881cb76198731f17527c7524fc5bed604fa80e1aff",
+      "successful_calls": 2203,
+      "busy_calls": 0,
+      "file_bytes": 1122521088,
+      "allocator_proof_walks": 0,
+      "seed_file_bytes": 5070848,
+      "growth_bytes_per_success_including_background_work": 507240.23604176124,
+      "code_revision": "5872f2795c"
+    },
+    "after_retirement_replay_map_fix": {
+      "status": "ok",
+      "library_sha256": "ba9b2630d612ab416ee62455f065a4c6d9e8517d691dd0879c9a641c8aad1415",
+      "successful_calls": 2266,
+      "busy_calls": 0,
+      "file_bytes": 1103675392,
+      "allocator_proof_walks": 0,
+      "seed_file_bytes": 5070848,
+      "growth_bytes_per_success_including_background_work": 484821.0697263901,
+      "code_revision": "96d732fc81; same runtime as receipt-only b842d342eb"
+    },
+    "interpretation": "Both versions grew to about 1.1 GB. This does not establish that the latest retirement/replay map fix introduced growth; it also does not qualify bounded growth.",
+    "idle_recovery_after_optimized_comparison": {
+      "initial_bytes": 1103675392,
+      "within_five_seconds_bytes": 7712768,
+      "after_512_additional_single_writer_updates_bytes": 14909440,
+      "compact_size_bytes": 7950336,
+      "integrity_valid": true
+    }
+  },
+  "final_indexed_debug_soak": {
+    "host": "wolfspider",
+    "seconds": 600,
+    "writers": 8,
+    "busy_timeout_ms": 5000,
+    "seed_records": 1024,
+    "churn_keys_per_writer": 128,
+    "status": "ok",
+    "library_sha256": "454a348821a16ee524505e8bfec5e2ad8c78bb296ebe4ffa72606523a8b9d1d3",
+    "successful_calls": 4231,
+    "busy_calls": 0,
+    "file_bytes": 2491547648,
+    "allocator_proof_walks": 0,
+    "seed_file_bytes": 5070848,
+    "growth_bytes_per_success_including_background_work": 587680.642874025,
+    "peak_file_bytes": 2491547648,
+    "file_size_sampling_errors": [],
+    "workers_without_success": 0,
+    "workers_with_stalled_windows": 0,
+    "per_worker_successful_calls": [
+      512,
+      562,
+      539,
+      562,
+      500,
+      531,
+      533,
+      492
+    ],
+    "per_worker_success_windows": [
+      [
+        136,
+        67,
+        59,
+        49,
+        42,
+        37,
+        34,
+        31,
+        29,
+        28
+      ],
+      [
+        173,
+        80,
+        59,
+        49,
+        42,
+        37,
+        34,
+        31,
+        29,
+        28
+      ],
+      [
+        149,
+        80,
+        59,
+        49,
+        42,
+        37,
+        35,
+        30,
+        30,
+        28
+      ],
+      [
+        173,
+        80,
+        59,
+        49,
+        42,
+        37,
+        34,
+        31,
+        29,
+        28
+      ],
+      [
+        173,
+        56,
+        52,
+        33,
+        26,
+        38,
+        34,
+        31,
+        29,
+        28
+      ],
+      [
+        172,
+        80,
+        59,
+        49,
+        42,
+        37,
+        28,
+        15,
+        21,
+        28
+      ],
+      [
+        172,
+        81,
+        38,
+        41,
+        41,
+        37,
+        35,
+        30,
+        30,
+        28
+      ],
+      [
+        150,
+        81,
+        59,
+        49,
+        38,
+        19,
+        26,
+        31,
+        24,
+        15
+      ]
+    ],
+    "successful_calls_per_minute": [
+      1298,
+      605,
+      444,
+      368,
+      315,
+      279,
+      260,
+      230,
+      221,
+      211
+    ],
+    "first_minute_over_last_minute_success_ratio": 6.151658767772512,
+    "sampled_growth": [
+      {
+        "elapsed_seconds": 0.0,
+        "file_bytes": 5636096
+      },
+      {
+        "elapsed_seconds": 66.003,
+        "file_bytes": 598933504
+      },
+      {
+        "elapsed_seconds": 131.859,
+        "file_bytes": 958029824
+      },
+      {
+        "elapsed_seconds": 197.813,
+        "file_bytes": 1238118400
+      },
+      {
+        "elapsed_seconds": 264.066,
+        "file_bytes": 1493045248
+      },
+      {
+        "elapsed_seconds": 329.553,
+        "file_bytes": 1693376512
+      },
+      {
+        "elapsed_seconds": 394.83,
+        "file_bytes": 1881354240
+      },
+      {
+        "elapsed_seconds": 460.142,
+        "file_bytes": 2094833664
+      },
+      {
+        "elapsed_seconds": 525.569,
+        "file_bytes": 2248937472
+      },
+      {
+        "elapsed_seconds": 591.072,
+        "file_bytes": 2450415616
+      }
+    ],
+    "primary_verification": {
+      "last_acknowledged_writes_checked_after_worker_close": 8,
+      "integrity": {
+        "compact_size": 7704576,
+        "file_size": 2491547648,
+        "issue": null,
+        "live_bytes": 4073310,
+        "live_file_count": 17810,
+        "reclaimable_bytes": 2483843072,
+        "record_count": 58375,
+        "tail_bytes": 0,
+        "valid": true,
+        "valid_prefix_size": 2491547648
+      }
+    },
+    "background_publications": [
+      {
+        "allocator_service_admissions": 4,
+        "attempts": 51,
+        "generated_attempts": 0,
+        "generated_refused": 0,
+        "maintenance_errors": 4,
+        "maintenance_rounds": 2,
+        "rebased": 49,
+        "refused": 2,
+        "replay_attempts": 0,
+        "replay_refused": 0
+      },
+      {
+        "allocator_service_admissions": 0,
+        "attempts": 0,
+        "generated_attempts": 0,
+        "generated_refused": 0,
+        "maintenance_errors": 0,
+        "maintenance_rounds": 0,
+        "rebased": 0,
+        "refused": 0,
+        "replay_attempts": 0,
+        "replay_refused": 0
+      },
+      {
+        "allocator_service_admissions": 2,
+        "attempts": 24,
+        "generated_attempts": 0,
+        "generated_refused": 0,
+        "maintenance_errors": 2,
+        "maintenance_rounds": 1,
+        "rebased": 22,
+        "refused": 2,
+        "replay_attempts": 0,
+        "replay_refused": 0
+      },
+      {
+        "allocator_service_admissions": 0,
+        "attempts": 0,
+        "generated_attempts": 0,
+        "generated_refused": 0,
+        "maintenance_errors": 0,
+        "maintenance_rounds": 0,
+        "rebased": 0,
+        "refused": 0,
+        "replay_attempts": 0,
+        "replay_refused": 0
+      },
+      {
+        "allocator_service_admissions": 4,
+        "attempts": 65,
+        "generated_attempts": 0,
+        "generated_refused": 0,
+        "maintenance_errors": 4,
+        "maintenance_rounds": 2,
+        "rebased": 57,
+        "refused": 8,
+        "replay_attempts": 0,
+        "replay_refused": 0
+      },
+      {
+        "allocator_service_admissions": 2,
+        "attempts": 32,
+        "generated_attempts": 0,
+        "generated_refused": 0,
+        "maintenance_errors": 2,
+        "maintenance_rounds": 1,
+        "rebased": 28,
+        "refused": 4,
+        "replay_attempts": 0,
+        "replay_refused": 0
+      },
+      {
+        "allocator_service_admissions": 2,
+        "attempts": 29,
+        "generated_attempts": 0,
+        "generated_refused": 0,
+        "maintenance_errors": 2,
+        "maintenance_rounds": 1,
+        "rebased": 26,
+        "refused": 3,
+        "replay_attempts": 0,
+        "replay_refused": 0
+      },
+      {
+        "allocator_service_admissions": 4,
+        "attempts": 75,
+        "generated_attempts": 0,
+        "generated_refused": 0,
+        "maintenance_errors": 4,
+        "maintenance_rounds": 2,
+        "rebased": 68,
+        "refused": 5,
+        "replay_attempts": 0,
+        "replay_refused": 0
+      }
+    ],
+    "last_maintenance_errors": [
+      "EnrichmentWaitCanceled",
+      "EnrichmentWaitCanceled",
+      "EnrichmentWaitCanceled",
+      "EnrichmentWaitCanceled",
+      "EnrichmentWaitCanceled",
+      "EnrichmentWaitCanceled"
+    ],
+    "automatic_idle_recovery": {
+      "status": "ok",
+      "observer": "OS stat only; native diagnostics after observation",
+      "seconds_to_observed_shrink": 2.200465084053576,
+      "observed_final_file_bytes": 7704576,
+      "integrity": {
+        "valid": true,
+        "file_size": 7704576,
+        "valid_prefix_size": 7704576,
+        "tail_bytes": 0,
+        "record_count": 16442,
+        "live_file_count": 16438,
+        "live_bytes": 3946018,
+        "compact_size": 7483392,
+        "reclaimable_bytes": 221184,
+        "issue": null
+      },
+      "rewrite_count": 1
+    },
+    "index_catchup_after_load": {
+      "status": "ok",
+      "drain_seconds": 0.01013308297842741,
+      "canary_seconds": 0.02410454209893942,
+      "canary_survives_reopen": true,
+      "integrity": {
+        "compact_size": 7479296,
+        "file_size": 8163328,
+        "issue": null,
+        "live_bytes": 3938387,
+        "live_file_count": 16444,
+        "reclaimable_bytes": 684032,
+        "record_count": 16462,
+        "tail_bytes": 0,
+        "valid": true,
+        "valid_prefix_size": 8163328
+      },
+      "index_replay_debt": [
+        {
+          "applied_sequence": 4264,
+          "catch_up_required": false,
+          "index_name": "full_text_index_v0",
+          "kind": "full_text",
+          "replay_document_not_visible_skipped": 0,
+          "target_sequence": 4264
+        }
+      ]
+    },
+    "acceptance": {
+      "workers_progress_each_minute": "passed",
+      "last_acknowledged_write_per_worker_survives_close": "passed",
+      "physical_integrity": "passed",
+      "index_catchup_and_canary_after_reopen": "passed",
+      "automatic_idle_recovery_within_180_seconds": "passed",
+      "sustained_churn_growth_stabilizes": "not demonstrated; file grew throughout the timed run",
+      "stable_throughput_as_logical_data_set_stays_fixed": "not demonstrated; first-minute successful-call count was 6.15 times the final minute"
+    },
+    "interpretation": "Debug measurements on a different host are not an optimized before/after performance comparison. Growth and throughput degradation remain release qualification gaps. Zero graph-proof walks do not imply zero ledger-reload or certificate-adoption work."
+  },
+  "other_limits": [
+    "Full semantic drain previously failed with GlinerBoundaryPaddedSequenceLimitExceeded even with Metal. Qualified model bounds were not weakened.",
+    "The earlier real three-importer run at a five-second Busy budget completed only one importer and returned Busy for two; integrity remained valid.",
+    "The repository-wide aggregate unit gate previously recorded inference/OCR and compiler-memory-limit failures and was stopped early; this follow-up does not claim that gate passed.",
+    "No healthy final-candidate shared-factory soak receipt is available.",
+    "Earlier optimized retirement/replay map throughput measurements belong to the revisions/artifacts in lite-pending-probes-20261031.json, not this final Debug artifact."
+  ],
+  "latest_code_revision": "eecf942e8898f29b8bae4ccbbd490eb099558ad5",
+  "reader_tip_followup": {
+    "code_revision": "eecf942e8898f29b8bae4ccbbd490eb099558ad5",
+    "problem": "After an unrecognized peer publication, a reader captured at the freshly admitted checkpoint could inherit a stale coordinator tip and become poisoned, disabling same-owner reuse.",
+    "change": "Observe the authoritative disk header under the path-writer lease before opening fresh reader pins. Already captured readers from the unknown publication remain poisoned and inode-fenced.",
+    "negative_control": {
+      "runtime_revision": "0448c8c27c",
+      "passed": 22,
+      "failed": 1,
+      "leaked": 0,
+      "assertion": "a reader captured after refresh must not be poisoned"
+    },
+    "positive_regression": {
+      "passed": 23,
+      "failed": 0,
+      "leaked": 0,
+      "coverage": [
+        "fresh reader permits verified reuse",
+        "an older reader is poisoned after another peer publication",
+        "the older reader retains its original document",
+        "reuse resumes after that reader closes"
+      ]
+    },
+    "artifact": {
+      "base_revision": "b842d342ebebc95f3a9ef43a944326ca8bc3f190",
+      "optimization": "debug",
+      "library_sha256": "c0e35cb5dbb2f582e8cd8088fbea22af566c5cfa7010fb0ad9c579a61825ed2d",
+      "source_sha256": {
+        "go/pkg/embedded/errors.go": "7a5d4efaa8423b8f4bc2cccbcdca1e884135000fac3f28b4ed7aab83fb10d5ce",
+        "go/pkg/embedded/include/antfly.h": "c36b4f2ff99c8667ccff36cc282c8df96808bcfe624b152b7b358d8c65749f83",
+        "py/packages/embedded/src/antfly_embedded/errors.py": "427a3e5d9c78ee903bb75b6829769c370dc82ff380a6b601902f1ae688bf9a55",
+        "rs/crates/embedded/src/error.rs": "65faff581de9ecb21cca142ef9c77739ba12f0da7eb0dce007f12ecb839443fc",
+        "scripts/bench/lite_contention.py": "9e4690f1c1cbd59e5a0cfa50bdfe37c4e45e8a5613ddf7d31f0ed524c528ada7",
+        "scripts/bench/test_lite_contention.py": "57094c9c076940d0409d440fdf4a6247c5a846aa385124f5fce2bfbfd332c4ee",
+        "ts/packages/embedded/src/errors.ts": "8856982f78f4b17cb1dde8e6a2f5de815ba9bfce574745e0c048f3436c5349c3",
+        "zig/LITE.md": "4337f0767852c08af41e7791abff4d85b6f4adb5b52141851685a16fd722454e",
+        "zig/pkg/antfly-embedded/include/antfly.h": "c36b4f2ff99c8667ccff36cc282c8df96808bcfe624b152b7b358d8c65749f83",
+        "zig/pkg/antfly-embedded/src/capi/db.zig": "96a2ded4d3dc80ea883029e11c73a973aaf7a0d49f79b59cd6efe680817c8cbb",
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "f842c0643061681fd77acf78d53971c96b948922603af67fb4d8b09efd5e5d07",
+        "zig/pkg/antfly-embedded/src/capi/types.zig": "88b5f2852a5a894aea5d553298de4ff1264b97df170d907734ac607ee8eb2fd2",
+        "zig/pkg/antfly-embedded/src/source_catalog.zig": "797c52c1991d62cebb20afde4f9f6e4cb43a84259731d963c5be75aeec822fff",
+        "zig/pkg/antfly-embedded/src/source_catalog_control.zig": "4155cbd108e4465f6bb8ae830a8bc445759015e74de740c4edc97dfd70b4f339",
+        "zig/pkg/antfly-embedded/src/storage/db/db.zig": "c5b833815b350f3d54bf2d219ec41a418488bba940109caf81f4e3f95fc3e844",
+        "zig/pkg/antfly-embedded/src/storage/db/execution_resources.zig": "164dbee3f297077d459f9ed2b5a0b26e59ec488c2e4b95518e48687e413fdfc2",
+        "zig/pkg/antfly-embedded/src/storage/db/maintenance/text_merge_runtime.zig": "0390555f12497c1317c397d8baecacbad06ca5c8a820a3d6e1d300153eb11e89",
+        "zig/pkg/antfly-embedded/src/storage/db/mutation_commit.zig": "e331762f875bc9800e6375df61e4985033a06a944789433abbc20944f1b0ed6d",
+        "zig/pkg/antfly-embedded/src/storage/lite/docstore.zig": "447844282c86c71e48f1b8a89fa683b91915d5e26ea723a2f543bef3b239a9d0",
+        "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "a6343d9306f3e571563cae51af38c9a87a152a4b4565237da04789046f4ae792",
+        "zig/pkg/antfly-embedded/src/storage/lite/reader_coordinator.zig": "074f179702a0a4d4d0463ac1cb0640f1c27ffcefd1ad3b41ff8b0da5e4beeeb7",
+        "zig/pkg/antfly-embedded/src/storage/lite/reclamation.zig": "b616df018aa4226e6d7fa5906c0c246d166b8d239de81ed09ce4cc5ec8c8380d",
+        "zig/pkg/antfly/src/storage/test_manifest.zig": "7bf08c82d36b8030223b0260aa2e3e8b11255cc770f029b5e63c65ca36df8d95"
+      }
+    },
+    "validation": {
+      "native_owner_suite": {
+        "passed": 715,
+        "skipped": 0,
+        "failed": 0,
+        "leaked": 0,
+        "descriptor_limit": 4096
+      },
+      "python_sql_concurrency": {
+        "passed": 201,
+        "seconds": 63.4
+      },
+      "c_consumer_and_export_boundary": {
+        "status": "passed",
+        "public_functions": 134
+      }
+    },
+    "indexed_debug_run": {
+      "seconds": 90,
+      "writers": 8,
+      "status": "ok",
+      "library_sha256": "c0e35cb5dbb2f582e8cd8088fbea22af566c5cfa7010fb0ad9c579a61825ed2d",
+      "successful_calls": 1640,
+      "busy_calls": 0,
+      "file_bytes": 733917184,
+      "allocator_proof_walks": 0,
+      "seed_file_bytes": 5070848,
+      "growth_bytes_per_success_including_background_work": 444418.4975609756,
+      "peak_file_bytes": 733917184,
+      "workers_with_stalled_windows": 0,
+      "per_worker_success_windows": [
+        [
+          172,
+          45
+        ],
+        [
+          150,
+          46
+        ],
+        [
+          172,
+          46
+        ],
+        [
+          173,
+          45
+        ],
+        [
+          149,
+          46
+        ],
+        [
+          147,
+          46
+        ],
+        [
+          160,
+          32
+        ],
+        [
+          172,
+          39
+        ]
+      ],
+      "last_acknowledged_writes_checked": 8,
+      "integrity": {
+        "compact_size": 7581696,
+        "file_size": 733917184,
+        "issue": null,
+        "live_bytes": 3998515,
+        "live_file_count": 16970,
+        "reclaimable_bytes": 726335488,
+        "record_count": 27542,
+        "tail_bytes": 0,
+        "valid": true,
+        "valid_prefix_size": 733917184
+      },
+      "sampled_growth": [
+        {
+          "elapsed_seconds": 4.577450454235077e-07,
+          "file_bytes": 5636096
+        },
+        {
+          "elapsed_seconds": 16.37961362488568,
+          "file_bytes": 247496704
+        },
+        {
+          "elapsed_seconds": 32.449043166823685,
+          "file_bytes": 374853632
+        },
+        {
+          "elapsed_seconds": 48.836369374766946,
+          "file_bytes": 477040640
+        },
+        {
+          "elapsed_seconds": 65.00915504153818,
+          "file_bytes": 591192064
+        },
+        {
+          "elapsed_seconds": 81.59933887468651,
+          "file_bytes": 671182848
+        }
+      ]
+    },
+    "passive_idle_recovery": {
+      "status": "ok",
+      "observer": "OS stat only during observation; native diagnostics afterward",
+      "seconds": 3.227174375206232,
+      "file_bytes": 7725056,
+      "integrity_valid": true
+    },
+    "indexed_after_load": {
+      "status": "ok",
+      "drain_seconds": 0.011016999837011099,
+      "canary_seconds": 0.034000459127128124,
+      "canary_survives_reopen": true,
+      "integrity": {
+        "compact_size": 7495680,
+        "file_size": 8208384,
+        "issue": null,
+        "live_bytes": 3940137,
+        "live_file_count": 16446,
+        "reclaimable_bytes": 712704,
+        "record_count": 16470,
+        "tail_bytes": 0,
+        "valid": true,
+        "valid_prefix_size": 8208384
+      },
+      "index_replay_debt": [
+        {
+          "applied_sequence": 1673,
+          "catch_up_required": false,
+          "index_name": "full_text_index_v0",
+          "kind": "full_text",
+          "replay_document_not_visible_skipped": 0,
+          "target_sequence": 1673
+        }
+      ]
+    },
+    "unindexed_control_on_0448": {
+      "seconds": 20,
+      "writers": 8,
+      "status": "ok",
+      "library_sha256": "454a348821a16ee524505e8bfec5e2ad8c78bb296ebe4ffa72606523a8b9d1d3",
+      "successful_calls": 1662,
+      "busy_calls": 0,
+      "file_bytes": 13373440,
+      "allocator_proof_walks": 0,
+      "seed_file_bytes": 5124096,
+      "growth_bytes_per_success_including_background_work": 4963.504211793021
+    },
+    "interpretation": "This independently reproduced reuse bug is fixed, but the 90-second indexed run still grew continuously to 734 MB. It does not close sustained-growth qualification. The complete ten-minute soak and original frozen critical replay above belong to 0448; neither is presented as a full-duration test of eecf942e88.",
+    "remaining_cost_to_investigate": "Foreign-tip certificate adoption still loads the allocator state and rebuilds its fingerprint. Indexed snapshot pin lifetime and ledger-refresh costs need isolated attribution; zero graph-proof walks do not measure those costs."
+  }
+}

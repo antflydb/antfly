@@ -51,8 +51,16 @@ pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellati
 /// Range cache identities bind the pack, offset, length and page digest. A cold
 /// seek reads only that page; it never downloads the whole navigation pack.
 pub fn readPageRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead) ![]u8 {
+    return readBoundedRange(a, store, ref, offset, length, digest, cancellation, cached, @import("../serverless/graph_segment/page_tree.zig").max_page_bytes);
+}
+/// Typed cover stripes share the verified range/cache machinery while retaining
+/// their own 4 MiB block bound. Navigation pages keep their narrower hard cap.
+pub fn readColumnRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead) ![]u8 {
+    return readBoundedRange(a, store, ref, offset, length, digest, cancellation, cached, max_block_bytes);
+}
+fn readBoundedRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead, maximum: usize) ![]u8 {
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
-    if (offset > ref.byte_len or length > ref.byte_len - offset or length > @import("../serverless/graph_segment/page_tree.zig").max_page_bytes) return error.InvalidGraphPage;
+    if (offset > ref.byte_len or length > ref.byte_len - offset or length > maximum) return error.InvalidGraphPage;
     if (offset == 0 and length == ref.byte_len) {
         const object_digest = try stores.sha256DigestFromChecksum(ref.checksum);
         if (!std.mem.eql(u8, &object_digest, &digest)) return error.ArtifactIntegrityMismatch;
@@ -408,6 +416,7 @@ pub fn publishKeyed(a: A, out: A, store: *stores.ArtifactStore, names: []const [
     }
     if (!admitted) {
         var input: PartialStream = .{ .encoded_sort = &sort, .recipe = recipe, .state_layout = 1 };
+        defer input.deinit();
         var pool = try spill.Partitions.init(manager);
         defer pool.deinit();
         return publishRadixStream(a, out, store, names, &input, recipe, &pool, token, 0, null);
@@ -416,11 +425,9 @@ pub fn publishKeyed(a: A, out: A, store: *stores.ArtifactStore, names: []const [
     access.initPublication(store.*, scope.domain, token);
     var builder: state_tree.tree.SortedBuilder = .{ .alloc = a, .store = access.backing() };
     defer builder.deinit();
-    while (true) {
-        _ = scratch.reset(.free_all);
-        const input = (try sort.next(scratch.allocator())) orelse break;
-        try builder.add(input.keys[0].value.string, input.values[0].value.string);
-    }
+    var records: @import("lake_index_sort_stream.zig").Records = .{ .sort = &sort };
+    defer records.deinit();
+    while (try records.next()) |record| try builder.add(record.key, record.value);
     const page = try builder.finish();
     return publishTree(a, out, store, names, recipe, .{ .domain = scope.domain, .layout = 2, .page = page }, token);
 }
@@ -498,6 +505,7 @@ const PartialStream = struct {
     rows: ?[]const operators.Row = null,
     file: ?*spill.Sequential = null,
     encoded_sort: ?*spill.Sort = null,
+    encoded_window: ?@import("lake_index_sort_stream.zig").Window = null,
     retirement: ?struct { pool: *spill.Partitions, index: usize } = null,
     offset: u64 = 0,
     finished: bool = false,
@@ -506,6 +514,11 @@ const PartialStream = struct {
             if (!native_partial.physicalEligible(input.spec)) break false;
         } else true;
         return .{ .group = group, .recipe = recipe, .state_layout = @intFromBool(native) };
+    }
+    fn deinit(self: *PartialStream) void {
+        self.finish();
+        if (self.encoded_window) |*window| window.deinit();
+        self.encoded_window = null;
     }
     fn finish(self: *PartialStream) void {
         if (self.retirement) |owner| owner.pool.close(owner.index);
@@ -516,17 +529,26 @@ const PartialStream = struct {
     fn next(self: *PartialStream, a: A) ![]const operators.Row {
         if (self.finished) return &.{};
         if (self.encoded_sort) |sort| {
-            var rows: std.ArrayList(operators.Row) = .empty;
-            while (rows.items.len < 256) {
-                const input = (try sort.next(a)) orelse break;
-                const block = try state_tree.block(a, input.values[0].value.string, self.recipe);
+            if (self.encoded_window == null) self.encoded_window = .{ .sort = sort };
+            const window = &self.encoded_window.?;
+            // Radix publication drains variable physical batches until EOF.
+            // Keep output pins through synchronous consumption, including a
+            // caller closing the stream before consuming its final row views.
+            const count = try window.read(256, 512 * 1024);
+            if (count == 0) return &.{};
+            if (window.width != 1 or window.key_width != 1) return error.InvalidNativeAggregateArtifact;
+            const rows = try a.alloc(operators.Row, count);
+            for (window.rows, rows) |lease, *row| {
+                const value = try lease.cell(0);
+                if (value.sql_null or value.value != .string) return error.InvalidNativeAggregateArtifact;
+                const block = try state_tree.block(a, value.value.string, self.recipe);
                 const key_cells = try a.alloc(local.sql_scalar.Datum, block.keys.len);
                 const cells = try a.alloc(local.sql_scalar.Datum, block.values.len);
                 for (key_cells, 0..) |*cell, i| cell.* = try block.keyCell(0, i);
                 for (cells, 0..) |*cell, i| cell.* = try block.cell(0, i);
-                try rows.append(a, .{ .keys = key_cells, .values = cells, .ordinal = input.ordinal });
+                row.* = .{ .keys = key_cells, .values = cells, .ordinal = lease.row.ordinal };
             }
-            return rows.items;
+            return rows;
         }
         if (self.rows) |rows| {
             const begin: usize = @intCast(self.offset);

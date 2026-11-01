@@ -39,7 +39,9 @@ const (
 	// capability that is unavailable. Retrying unchanged will not succeed.
 	Unsupported ErrorCode = 8
 	// Stalled reports stalled derived work or a failed derived worker. Inspect
-	// pending-work diagnostics and repair or reopen the database.
+	// pending-work diagnostics and repair or reopen the database. A batch may
+	// already have committed: inspect its error detail and do not replay it
+	// when reported as committed.
 	Stalled ErrorCode = 9
 	// Cancelled means the operation was cancelled, including cancellation
 	// of a pending replacement or a false progress/stream callback result
