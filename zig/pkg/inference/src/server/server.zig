@@ -14727,7 +14727,7 @@ pub const Node = struct {
         // it can construct an HTTP response or a deferred terminal callback.
         defer if (native_transfer) |transfer| transfer.releaseOwnedState();
         var completion: ?DeferredGenerationCompletion = null;
-        const response = try self.generateContentScoped(ctx, &completion, native_transfer);
+        const response = try self.generateContentScoped(ctx, &completion, native_transfer, null);
         if (completion) |*pending| {
             try pending.finish(native_transfer);
         } else if (native_transfer) |transfer| {
@@ -14736,14 +14736,25 @@ pub const Node = struct {
         return response;
     }
 
-    fn generateContentScoped(self: *Node, ctx: *httpx.Context, completion: *?DeferredGenerationCompletion, native_transfer: ?*NativeCheckpointTransfer) !httpx.Response {
+    /// Internal synchronous route: payloads are borrowed only until return;
+    /// metadata, admission, reference validation and model execution are shared
+    /// with ordinary generation. No deferred upload ownership crosses this API.
+    pub fn generateContentWithBorrowedAttachments(self: *Node, ctx: *httpx.Context, attachments: []const httpx.attachment_envelope.Attachment) !httpx.Response {
+        var completion: ?DeferredGenerationCompletion = null;
+        var response = try self.generateContentScoped(ctx, &completion, null, attachments);
+        errdefer response.deinit();
+        if (completion) |*pending| try pending.finish(null);
+        return response;
+    }
+
+    fn generateContentScoped(self: *Node, ctx: *httpx.Context, completion: *?DeferredGenerationCompletion, native_transfer: ?*NativeCheckpointTransfer, borrowed: ?[]const httpx.attachment_envelope.Attachment) !httpx.Response {
         const admission_started: ?i96 = if (serverGenerateTimingEnabled()) std.Io.Clock.awake.now(ctx.io).nanoseconds else null;
         defer if (admission_started) |started| {
             std.debug.print("native_request_timing_ms: scope_total={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
         };
         const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
-        const uses_attachment_envelope = native_transfer == null and requestUsesAttachmentEnvelope(ctx);
+        const uses_attachment_envelope = native_transfer == null and borrowed == null and requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
         if (uses_attachment_envelope) {
@@ -14761,6 +14772,14 @@ pub const Node = struct {
         else
             (try ctx.body()) orelse
                 return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        if (borrowed) |items| httpx.attachment_envelope.validateBorrowed(request_json, items, .{
+            .max_metadata_bytes = @min(ctx.max_request_body_size, (httpx.attachment_envelope.Limits{}).max_metadata_bytes),
+            .max_attachment_bytes = requestMediaMaxBytes(self),
+            .max_total_attachment_bytes = requestMediaMaxBytes(self),
+        }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+            .@"error" = attachmentEnvelopeErrorCode(err),
+            .message = attachmentEnvelopeErrorMessage(err),
+        });
         // Single JSON parse per request: only bodies that can carry
         // chat_template_kwargs (substring pre-gate, false positives harmless)
         // are parsed as an untyped Value, which then doubles as the kwargs
@@ -14786,6 +14805,7 @@ pub const Node = struct {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid generation request" });
         defer parsed.deinit();
         const body = parsed.value;
+        if (borrowed != null and (body.stream orelse false)) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "borrowed generation is synchronous" });
         if (native_transfer) |transfer| {
             if ((transfer.prepare == null) == (transfer.resume_request == null) or body.context_management != null or
                 body.kv_cache != null or body.cache_compaction_ratio != null or body.prompt_cache_key != null or
@@ -14810,7 +14830,7 @@ pub const Node = struct {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "kv_cache and cache_compaction_ratio are mutually exclusive" });
         }
         const selected_kv = if (body.kv_cache) |policy| std.mem.eql(u8, policy.mode, "select_v1") else false;
-        const attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
+        const attachments: []const httpx.attachment_envelope.Attachment = if (borrowed) |items| items else if (attachment_envelope) |envelope|
             envelope.attachments
         else
             &.{};

@@ -7728,7 +7728,7 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             // Both projections use the original captured cut, after update/delete.
             const projected_before = if (file) |native_file| native_file.test_backing_read_bytes.load(.monotonic) else 0;
             const projected = try reader.lookupProjectedBatch(&.{ "a", "b" }, &.{"body"}, 256 * 1024);
-            try std.testing.expectEqual(@as(usize, if (is_lite) 2 else 1), projected.consumed);
+            try std.testing.expectEqual(@as(usize, 2), projected.consumed);
             if (is_lite) try std.testing.expectEqualStrings("\"beta\"", projected.values[1].fields[0].value);
             try std.testing.expectEqualStrings("body", projected.values[0].fields[0].name);
             try std.testing.expectEqualStrings("\"alpha\"", projected.values[0].fields[0].value);
@@ -7741,11 +7741,9 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             reader.releasePage();
             const repeated_projection = try reader.lookupProjectedBatch(&.{ "b", "a", "b" }, &.{"body"}, 256 * 1024);
             try std.testing.expectEqualStrings("\"beta\"", repeated_projection.values[0].fields[0].value);
-            if (is_lite) {
-                try std.testing.expectEqual(@as(usize, 3), repeated_projection.consumed);
-                try std.testing.expectEqualStrings("\"alpha\"", repeated_projection.values[1].fields[0].value);
-                try std.testing.expectEqual(repeated_projection.values[0].fields.ptr, repeated_projection.values[2].fields.ptr);
-            }
+            try std.testing.expectEqual(@as(usize, 3), repeated_projection.consumed);
+            try std.testing.expectEqualStrings("\"alpha\"", repeated_projection.values[1].fields[0].value);
+            try std.testing.expectEqual(repeated_projection.values[0].fields.ptr, repeated_projection.values[2].fields.ptr);
             reader.releasePage();
             const bounded_projection = try reader.lookupProjectedBatch(&.{ "b", "a" }, &.{"body"}, 8);
             try std.testing.expectEqual(@as(usize, 1), bounded_projection.consumed);

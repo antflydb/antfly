@@ -20,6 +20,7 @@ pub fn executionOptions(req: types.SearchRequest) abi.LocalQueryExecutionOptions
     return .{
         .enabled = 1,
         .include_stored = @intFromBool(req.include_stored),
+        .native_field_views = @intFromBool(req.field_projection_value_views),
         .return_mode = switch (req.return_mode) {
             .parent => .parent,
             .chunk => .chunk,
@@ -35,6 +36,9 @@ pub fn executionOptions(req: types.SearchRequest) abi.LocalQueryExecutionOptions
 
 pub fn applyExecutionOptions(req: *types.SearchRequest, options: abi.LocalQueryExecutionOptions) void {
     if (options.enabled != 0) {
+        req.field_projection_value_views = options.native_field_views >= 1 and options.native_field_views <= 2;
+        if (req.field_projection_value_views) req.field_projection_transport = true;
+        req.field_projection_native_spans = options.native_field_views == 2;
         req.include_stored = options.include_stored != 0;
         req.return_mode = switch (options.return_mode) {
             .parent => .parent,

@@ -90,6 +90,10 @@ pub const Namespace = struct {
     /// Opt-in owner-bounded local point borrowing; ordinary point APIs keep
     /// their owned-result contract. This hint is not namespace identity.
     borrow_local_point_results: bool = false,
+    /// A single temporary point consumer copies its selected spans before
+    /// releasing the value. May adopt one fully admitted uncached block; no
+    /// batch-wide payload retention is permitted. Not namespace identity.
+    transient_point_result: bool = false,
     /// Current-tip batch readers release source generations at the end of the
     /// call. Copy source-owned values at resolution; disk results already carry
     /// a block pin or transaction allocation. Not part of namespace identity.

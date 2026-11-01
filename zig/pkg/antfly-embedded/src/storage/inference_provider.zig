@@ -17,6 +17,7 @@
 //! standalone use one implementation for cancellation, progress, binary media,
 //! numeric results, and invocation lifetime; the inference node stays opaque.
 const std = @import("std");
+const httpx = @import("httpx");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const platform_time = platform.time;
@@ -525,6 +526,7 @@ pub fn embeddedMemoryAdmissionStats(handle: *anyopaque) !inference_bridge.Memory
 
 pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) inference.managed_embedder.AntflyProvider {
     return .{
+        .accepts_verified_media_handles = true,
         .ptr = lifetime,
         .owns_invocation_admission = true,
         .typed_dense_results = true,
@@ -552,6 +554,7 @@ pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) i
         .rewrite_texts = inferenceProviderRewriteTexts,
         .classify_texts = inferenceProviderClassifyTexts,
         .generate_json = inferenceProviderGenerateJson,
+        .generate_json_with_attachments = if (supportsStructuredAttachments()) inferenceProviderGenerateJsonWithAttachments else null,
         .decide_json = inferenceProviderDecideJson,
         .document_json = inferenceProviderDocumentJson,
         .read_images = inferenceProviderReadImages,
@@ -616,6 +619,20 @@ pub fn requestContextFromControls(deadline_ns: ?u64, cancellation: CancellationT
     };
 }
 
+// A present context with no deadline explicitly requests unbounded execution.
+// Only compatibility calls without a context acquire the historical default.
+fn providerDeadline(context: ?inference.RequestContext, now_ns: u64) ?u64 {
+    return if (context) |active| active.deadline_ns else now_ns +| 5 * std.time.ns_per_min;
+}
+
+test "provider registry gateway preserves explicit optional deadlines" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.testing.expectEqual(@as(?u64, 123 + 5 * std.time.ns_per_min), providerDeadline(null, 123));
+    try std.testing.expectEqual(@as(?u64, null), providerDeadline(.{ .io = io, .deadline_ns = null }, 123));
+    try std.testing.expectEqual(@as(?u64, 0), providerDeadline(.{ .io = io, .deadline_ns = 0 }, 123));
+    try std.testing.expectEqual(@as(?u64, 456), providerDeadline(.{ .io = io, .deadline_ns = 456 }, 123));
+}
+
 pub fn invokeInferenceProviderWithBinaryContext(
     comptime Result: type,
     alloc: std.mem.Allocator,
@@ -636,10 +653,7 @@ pub fn invokeInferenceProviderWithBinaryContext(
     var response_handle: ?*anyopaque = null;
     var response_json: inference_bridge.String = undefined;
     var numeric_result = inference_bridge.NumericResult{};
-    const effective_deadline_ns = if (request_context) |active|
-        active.deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min
-    else
-        platform_time.monotonicNs() +| 5 * std.time.ns_per_min;
+    const effective_deadline_ns = providerDeadline(request_context, platform_time.monotonicNs());
     const RequestCancellation = struct {
         pub fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
             const context: *const ?inference.RequestContext = @ptrCast(@alignCast(raw orelse return 1));
@@ -668,8 +682,8 @@ pub fn invokeInferenceProviderWithBinaryContext(
         .handle = handle,
         .operation = @backingInt(operation),
         .request_json = inference_bridge.String.init(request_json),
-        .deadline_ns = effective_deadline_ns,
-        .has_deadline = 1,
+        .deadline_ns = effective_deadline_ns orelse 0,
+        .has_deadline = @intFromBool(effective_deadline_ns != null),
         .out_response_handle = &response_handle,
         .out_response_json = &response_json,
         .out_numeric_result = if (Result == [][]f32 or Result == []f32) &numeric_result else null,
@@ -715,7 +729,7 @@ pub fn invokeInferenceProviderWithBinaryContext(
         }
     }
     if (comptime Result == []u8) {
-        if (operation == .document_read or operation == .document_extract) return alloc.dupe(u8, response_json.slice());
+        if (operation == .document_read or operation == .document_extract or operation == .generate_json_with_attachments) return alloc.dupe(u8, response_json.slice());
     }
     return try std.json.parseFromSliceLeaky(Result, alloc, response_json.slice(), .{
         .allocate = .alloc_always,
@@ -1276,6 +1290,8 @@ pub fn inferenceProviderGenerateJson(
     const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(ptr));
     var guard = try lifetime.acquire();
     defer guard.deinit();
+    var encoded = try verifiedGenerateJson(alloc, body, if (request) |context| context.verified_media else &.{});
+    defer encoded.deinit();
     var target = LocalInferenceConnectionContext{ .handle = lifetime.handle };
     var abi_alloc = inference_connection_abi.Allocator.fromStd(&alloc);
     var response: inference_connection_abi.InvokeResponse = .{};
@@ -1285,7 +1301,8 @@ pub fn inferenceProviderGenerateJson(
         .target_context = &target,
         .allocator = &abi_alloc,
         .operation = .init("generate"),
-        .body = .init(body),
+        .body = .init(encoded.value.bytes),
+        .content_type = .init(encoded.value.content_type),
         .deadline_ns = if (request) |context| context.deadline_ns orelse 0 else platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
         .cancellation = .{ .context = &request, .is_cancelled = struct {
             pub fn cancelled(raw: ?*const anyopaque) callconv(.c) u8 {
@@ -1350,6 +1367,11 @@ pub fn inferenceProviderGenerateMessagesWithContext(
     options: inference.GenerationOptions,
     context: inference.RequestContext,
 ) anyerror![]u8 {
+    if (try verifiedGenerateMessages(alloc, messages, context.verified_media)) |value| {
+        var adapted = value;
+        defer adapted.deinit();
+        return generateMessagesWithAttachmentsOptions(handle, alloc, model, adapted.messages, adapted.attachments, options, context);
+    }
     return try invokeInferenceProvider([]u8, alloc, handle, .generate_messages, inference.types.GenerateMessagesRequest{
         .model = model,
         .messages = messages,
@@ -1404,35 +1426,87 @@ pub fn inferenceProviderGenerateMessagesWithAttachmentsControlled(
     attachments: []const inference.work.Attachment,
     request_context: ?inference.RequestContext,
 ) anyerror![]u8 {
-    const payloads = try alloc.alloc(inference_bridge.ProviderBinaryPayload, attachments.len);
-    defer alloc.free(payloads);
-    const refs = try alloc.alloc(inference_bridge.ProviderAttachmentRef, attachments.len);
-    defer alloc.free(refs);
-    for (attachments, 0..) |attachment, i| {
-        try attachment.validate();
-        payloads[i] = .{
-            .bytes = inference_bridge.String.init(attachment.bytes),
-            .content_type = inference_bridge.String.init(attachment.content_type),
-        };
-        refs[i] = .{
-            .attachment_index = i,
-            .item_index = 0,
-            .item_id = inference_bridge.OptionalString.init(if (attachment.identity.item_id.len > 0) attachment.identity.item_id else null),
-            .source_fingerprint = inference_bridge.OptionalString.init(attachment.identity.source_fingerprint),
-            .page_number = attachment.identity.page_number orelse 0,
-            .has_page_number = @intFromBool(attachment.identity.page_number != null),
-        };
+    return generateMessagesWithAttachmentsOptions(handle, alloc, model, messages, attachments, .{}, request_context);
+}
+
+/// Invocation-owned descriptor headers; codec bytes and source identities
+/// remain borrowed until the synchronous provider invocation returns.
+const ProviderAttachmentViews = struct {
+    alloc: std.mem.Allocator,
+    payloads: []inference_bridge.ProviderBinaryPayload,
+    refs: []inference_bridge.ProviderAttachmentRef,
+    fn initCanonical(alloc: std.mem.Allocator, attachments: []const inference.work.Attachment) !@This() {
+        if (attachments.len > (httpx.attachment_envelope.Limits{}).max_attachments) return error.InvalidArguments;
+        return init(alloc, attachments);
     }
+    fn init(alloc: std.mem.Allocator, attachments: []const inference.work.Attachment) !@This() {
+        const payloads = try alloc.alloc(inference_bridge.ProviderBinaryPayload, attachments.len);
+        errdefer alloc.free(payloads);
+        const refs = try alloc.alloc(inference_bridge.ProviderAttachmentRef, attachments.len);
+        errdefer alloc.free(refs);
+        for (attachments, 0..) |attachment, i| {
+            try attachment.validate();
+            payloads[i] = .{
+                .bytes = inference_bridge.String.init(attachment.bytes),
+                .content_type = inference_bridge.String.init(attachment.content_type),
+            };
+            refs[i] = .{
+                .attachment_index = i,
+                .item_index = 0,
+                .item_id = inference_bridge.OptionalString.init(if (attachment.identity.item_id.len > 0) attachment.identity.item_id else null),
+                .source_fingerprint = inference_bridge.OptionalString.init(attachment.identity.source_fingerprint),
+                .page_number = attachment.identity.page_number orelse 0,
+                .has_page_number = @intFromBool(attachment.identity.page_number != null),
+            };
+        }
+        return .{ .alloc = alloc, .payloads = payloads, .refs = refs };
+    }
+    fn deinit(self: *@This()) void {
+        self.alloc.free(self.refs);
+        self.alloc.free(self.payloads);
+    }
+};
+
+fn generateMessagesWithAttachmentsOptions(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    messages: []const inference.ChatMessage,
+    attachments: []const inference.work.Attachment,
+    options: inference.GenerationOptions,
+    request_context: ?inference.RequestContext,
+) anyerror![]u8 {
+    var views = try ProviderAttachmentViews.init(alloc, attachments);
+    defer views.deinit();
     return try invokeInferenceProviderWithBinaryContext(
         []u8,
         alloc,
         handle,
         .generate_messages_with_attachments,
-        .{ .model = model, .messages = messages, .attachment_count = attachments.len },
+        .{ .model = model, .messages = messages, .attachment_count = attachments.len, .options = options },
         request_context,
-        payloads,
-        refs,
+        views.payloads,
+        views.refs,
     );
+}
+
+fn supportsStructuredAttachments() bool {
+    if (comptime inline_inference_codegen) return true;
+    _ = linkedInferenceApi(inference_bridge.Capability.provider | inference_bridge.Capability.structured_attachments) catch return false;
+    return true;
+}
+
+pub fn inferenceProviderGenerateJsonWithAttachments(handle: *anyopaque, alloc: std.mem.Allocator, body: []const u8, attachments: []const inference.work.Attachment, request_context: ?inference.RequestContext) ![]u8 {
+    if (request_context) |context| try context.check();
+    var views = try ProviderAttachmentViews.initCanonical(alloc, attachments);
+    defer views.deinit();
+    const Raw = struct {
+        bytes: []const u8,
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            try writer.print("{s}", .{self.bytes});
+        }
+    };
+    return invokeInferenceProviderWithBinaryContext([]u8, alloc, handle, .generate_json_with_attachments, Raw{ .bytes = body }, request_context, views.payloads, views.refs);
 }
 
 pub fn inferenceProviderModelCapabilities(
@@ -2020,4 +2094,133 @@ fn inferenceProviderDocumentJson(ptr: *anyopaque, a: std.mem.Allocator, bytes: [
         }
     };
     return invokeInferenceProvider([]u8, a, ptr, if (extract) .document_extract else .document_read, Raw{ .bytes = bytes }, context);
+}
+
+const verified_messages = @import("../inference/verified_messages.zig");
+const VerifiedMessages = verified_messages.VerifiedMessages;
+fn verifiedGenerateMessages(a: std.mem.Allocator, messages: []const inference.ChatMessage, media: []const inference.execution_context.VerifiedMedia) !?VerifiedMessages {
+    return verified_messages.prepare(@import("../sql/memory_budget.zig").reclaimingAllocator(a), messages, media, false);
+}
+
+test "provider registry verified generation messages borrow attachments and preserve mixed media" {
+    try testVerifiedGenerateMessages();
+}
+pub fn testVerifiedGenerateMessages() !void {
+    const a = std.testing.allocator;
+    const url = "data:image/png;base64,aW1hZ2U=";
+    const parts = [_]inference.ContentPart{
+        .{ .text = "inspect" },
+        .{ .image_url = .{ .url = url } },
+        .{ .image_url = .{ .url = url } },
+        .{ .image_url = .{ .url = url, .detail = "high" } },
+        .{ .image_url = .{ .url = "https://example.org/other.png" } },
+    };
+    const messages = [_]inference.ChatMessage{.{ .role = .user, .content = .{ .parts = &parts } }};
+    const bytes = "image";
+    var adapted = (try verifiedGenerateMessages(a, &messages, &.{.{ .url = url, .mime_type = "image/png", .bytes = bytes }})).?;
+    defer adapted.deinit();
+    try std.testing.expectEqual(@as(usize, 2), adapted.attachments.len);
+    for (adapted.attachments) |attachment| try std.testing.expect(attachment.bytes.ptr == @as([]const u8, bytes).ptr);
+    const result = adapted.messages[0].content.?.parts;
+    try std.testing.expect(result[1] == .media and result[1].media.data.len == 0);
+    try std.testing.expectEqualStrings("high", result[3].image_url.detail.?);
+    try std.testing.expectEqualStrings("https://example.org/other.png", result[4].image_url.url);
+    try std.testing.expect(parts[1] == .image_url);
+    try std.testing.expect(try verifiedGenerateMessages(a, &messages, &.{}) == null);
+    var explicit = (try verified_messages.prepare(a, &messages, &.{.{ .url = url, .mime_type = "image/png", .bytes = bytes }}, true)).?;
+    defer explicit.deinit();
+    const explicit_parts = explicit.messages[0].content.?.parts;
+    try std.testing.expectEqualStrings("attachment:0", explicit_parts[1].media.data);
+    try std.testing.expectEqualStrings("attachment:1", explicit_parts[2].media.data);
+    try std.testing.expectEqualStrings("high", explicit_parts[3].image_url.detail.?);
+    for ([_][]const u8{ "", "attachment:0", "attachment:01" }) |data| {
+        const unsafe_parts = [_]inference.ContentPart{ parts[1], .{ .media = .{ .mime_type = "image/png", .data = data } } };
+        const unsafe_messages = [_]inference.ChatMessage{.{ .role = .user, .content = .{ .parts = &unsafe_parts } }};
+        try std.testing.expect(try verified_messages.prepare(a, &unsafe_messages, &.{.{ .url = url, .mime_type = "image/png", .bytes = bytes }}, true) == null);
+    }
+    var no_alloc = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    for ([_]inference.ContentPart{
+        .{ .text = "no image" },
+        .{ .image_url = .{ .url = url, .detail = "high" } },
+        .{ .image_url = .{ .url = "data:image/png;base64,b3RoZXI=" } },
+    }) |part| {
+        const input = [_]inference.ChatMessage{.{ .role = .user, .content = .{ .parts = &.{part} } }};
+        try std.testing.expect(try verified_messages.prepare(no_alloc.allocator(), &input, &.{.{ .url = url, .mime_type = "image/png", .bytes = bytes }}, true) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), no_alloc.allocations);
+    // Reject oversized canonical transport descriptors before allocating
+    // headers or inspecting payloads, independently of the model runtime.
+    const oversized = try a.alloc(inference.work.Attachment, (httpx.attachment_envelope.Limits{}).max_attachments + 1);
+    defer a.free(oversized);
+    try std.testing.expectError(error.InvalidArguments, ProviderAttachmentViews.initCanonical(no_alloc.allocator(), oversized));
+    try std.testing.expectEqual(@as(usize, 0), no_alloc.allocations);
+    const cloned_url = try a.dupe(u8, url);
+    defer a.free(cloned_url);
+    const mixed = [_]inference.ChatMessage{
+        .{ .role = .user, .content = .{ .parts = &.{.{ .image_url = .{ .url = "https://example.org/other.png" } }} } },
+        .{ .role = .assistant, .content = .{ .text = "inspect the next image" } },
+        .{ .role = .user, .content = .{ .parts = &.{.{ .image_url = .{ .url = cloned_url } }} } },
+    };
+    var later = (try verified_messages.prepare(a, &mixed, &.{.{ .url = url, .mime_type = "image/png", .bytes = bytes }}, true)).?;
+    defer later.deinit();
+    try std.testing.expectEqualStrings("https://example.org/other.png", later.messages[0].content.?.parts[0].image_url.url);
+    try std.testing.expectEqualStrings("inspect the next image", later.messages[1].content.?.text);
+    try std.testing.expectEqualStrings("attachment:0", later.messages[2].content.?.parts[0].media.data);
+    try std.testing.expect(later.attachments[0].bytes.ptr == bytes.ptr);
+    const Failure = struct {
+        fn exercise(allocator: std.mem.Allocator) !void {
+            const content = [_]inference.ContentPart{ .{ .image_url = .{ .url = url } }, .{ .image_url = .{ .url = url } } };
+            const input = [_]inference.ChatMessage{.{ .role = .user, .content = .{ .parts = &content } }};
+            var prepared = (try verified_messages.prepare(allocator, &input, &.{.{ .url = url, .mime_type = "image/png", .bytes = bytes }}, true)).?;
+            defer prepared.deinit();
+            try std.testing.expectEqual(@as(usize, 2), prepared.attachments.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.exercise, .{});
+}
+
+const VerifiedJson = struct {
+    allocator: std.mem.Allocator,
+    value: inference.execution_context.MediaEncoding,
+    fn deinit(self: *@This()) void {
+        self.value.deinit(self.allocator);
+    }
+};
+fn verifiedGenerateJson(a: std.mem.Allocator, body: []const u8, media: []const inference.execution_context.VerifiedMedia) !VerifiedJson {
+    // The synchronous bridge borrows this frame only until invocation returns.
+    // Both frame and parser scratch must refund admission even when the caller
+    // uses an arena spanning many decisions or agent turns.
+    const scratch = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
+    return .{ .allocator = scratch, .value = try inference.execution_context.encodeVerifiedGenerate(scratch, scratch, body, null, media) };
+}
+
+test "provider registry native JSON frames release budget between invocations" {
+    try testVerifiedGenerateJsonScratch();
+}
+pub fn testVerifiedGenerateJsonScratch() !void {
+    const a = std.testing.allocator;
+    var fixture = std.heap.ArenaAllocator.init(a);
+    defer fixture.deinit();
+    const f = fixture.allocator();
+    const bytes = try f.alloc(u8, 65536);
+    @memset(bytes, 'x');
+    const base64 = try f.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    _ = std.base64.standard.Encoder.encode(base64, bytes);
+    const url = try std.fmt.allocPrint(f, "data:image/png;base64,{s}", .{base64});
+    const body = try std.json.Stringify.valueAlloc(f, .{ .messages = .{.{ .role = "user", .content = .{.{ .type = "image_url", .image_url = .{ .url = url } }} }} }, .{});
+    var budget: @import("../sql/memory_budget.zig") = .{ .backing = a, .limit = 512 * 1024 };
+    var request = std.heap.ArenaAllocator.init(budget.allocator());
+    defer request.deinit();
+    _ = try request.allocator().alloc(u8, 4096);
+    const retained = budget.live;
+    for (0..32) |_| {
+        var encoded = try verifiedGenerateJson(request.allocator(), body, &.{.{ .url = url, .bytes = bytes, .mime_type = "image/png" }});
+        defer encoded.deinit();
+        try std.testing.expect(encoded.value.owned);
+        try std.testing.expect(std.mem.indexOf(u8, encoded.value.bytes, bytes) != null);
+        try std.testing.expect(budget.live > retained);
+        encoded.deinit();
+        try std.testing.expectEqual(retained, budget.live);
+    }
+    try std.testing.expect(!budget.exhausted);
 }

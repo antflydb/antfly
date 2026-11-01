@@ -131,8 +131,10 @@ fn BoundaryImpl(comptime VTable: type) type {
                 return error_abi.statusFromError(error.UnsupportedVersion);
             const info = @typeInfo(VTable).@"struct";
             inline for (info.field_names, info.field_types) |reflected_name, Field| {
-                if (contract.method_id == native_abi.stableId(reflected_name)) {
-                    if (comptime isCallbackField(Field)) {
+                // Capability data is not an RPC. Keep it out of every hot
+                // method dispatch; unknown IDs retain the same rejection.
+                if (comptime isCallbackField(Field)) {
+                    if (contract.method_id == native_abi.stableId(reflected_name)) {
                         const Callback = callbackType(Field);
                         const Function = functionType(Callback);
                         const Args = std.meta.ArgsTuple(Function);
@@ -142,7 +144,6 @@ fn BoundaryImpl(comptime VTable: type) type {
                             return error_abi.statusFromError(error.InvalidArgument);
                         return invoke(reflected_name, Field, callback, args, output);
                     }
-                    return error_abi.statusFromError(error.InvalidArgument);
                 }
             }
             return error_abi.statusFromError(error.InvalidArgument);
@@ -398,4 +399,30 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
         error.InvalidArgument,
         TestBoundary.call("value", &callbacks.rejectingDispatch, &callbacks.value, .{ &base, 2 }),
     );
+}
+
+test "boundary capability metadata cannot be invoked as a callback" {
+    const VTable = struct {
+        capability: bool = true,
+        value: *const fn (*u32) u32,
+    };
+    const TestBoundary = BoundaryImpl(VTable);
+    const Callback = struct {
+        fn value(state: *u32) u32 {
+            state.* += 1;
+            return state.*;
+        }
+    };
+    const callback: *const fn (*u32) u32 = Callback.value;
+    const Args = std.meta.ArgsTuple(@typeInfo(@TypeOf(callback)).pointer.child);
+    var state: u32 = 3;
+    var args: Args = .{&state};
+    var output: u32 = 99;
+    const denied = native_abi.CallContract.of("capability", @TypeOf(callback), Args, u32);
+    try std.testing.expectEqual(error_abi.statusFromError(error.InvalidArgument), TestBoundary.local_dispatch(&denied, @ptrCast(callback), @ptrCast(&args), @ptrCast(&output)));
+    try std.testing.expectEqual(@as(u32, 3), state);
+    try std.testing.expectEqual(@as(u32, 99), output);
+    const allowed = native_abi.CallContract.of("value", @TypeOf(callback), Args, u32);
+    try std.testing.expect(TestBoundary.local_dispatch(&allowed, @ptrCast(callback), @ptrCast(&args), @ptrCast(&output)).isOk());
+    try std.testing.expectEqual(@as(u32, 4), output);
 }

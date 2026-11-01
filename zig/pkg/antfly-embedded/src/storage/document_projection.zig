@@ -43,6 +43,7 @@ pub const Field = struct {
     index: u16 = 0,
     parent: u16 = no_parent,
     kind: Kind = .subtree,
+    covering_offset: u16 = 0,
     first_child: u16 = 0,
     child_count: u16 = 0,
 };
@@ -241,7 +242,7 @@ pub fn buildAuthority(a: A, bytes: []const u8, kind: u8, digest: [32]u8) !?[]u8 
 }
 pub fn buildAuthorityObserved(a: A, bytes: []const u8, kind: u8, digest: [32]u8, observer: ?LeafObserver) !?[]u8 {
     if (kind != @import("internal_keys.zig").primary_kind or bytes.len < minimum_bytes) return null;
-    if (try buildObserved(a, bytes, kind, digest, observer)) |encoded| return encoded;
+    if (try buildObserved(a, bytes, kind, digest, observer)) |encoded| return try addCovering(a, encoded, bytes, kind, digest);
     const output = try a.alloc(u8, header_size);
     @memcpy(output[0..4], "DPX1");
     std.mem.writeInt(u64, output[4..12], bytes.len, .little);
@@ -254,17 +255,63 @@ pub fn isCurrent(a: A, bytes: []const u8, proof: anytype) !bool {
     if (bytes.len == header_size and std.mem.eql(u8, bytes[0..4], "DPX1") and std.mem.readInt(u64, bytes[4..12], .little) == proof.bytes and bytes[44] == proof.kind and std.mem.eql(u8, bytes[12..44], &proof.digest) and std.mem.readInt(u16, bytes[45..47], .little) == 0) return true;
     const directory = (try Directory.open(a, bytes, proof)) orelse return false;
     a.free(directory.fields);
-    return directory.version == 2;
+    return directory.version >= 2;
+}
+
+/// Soft, revision-bound metadata only. DPD1/2 remain readable; older readers
+/// ignore DPD3 and use primary bytes. Covering adds at most 1/64 of source bytes
+/// (four KiB total, one KiB per subtree), within the existing directory ceiling.
+pub const covering_max_bytes = 4096;
+pub const covering_max_field_bytes = 1024;
+fn addCovering(a: A, encoded: []u8, source: []const u8, kind: u8, digest: [32]u8) ![]u8 {
+    errdefer a.free(encoded);
+    const limit = @min(maximum_bytes, source.len / 16);
+    const budget = @min(covering_max_bytes, source.len / 64, limit -| encoded.len);
+    if (budget < 7) return encoded;
+    const directory = (try Directory.open(a, encoded, .{ .bytes = @as(u64, source.len), .kind = kind, .digest = digest })) orelse return encoded;
+    defer a.free(directory.fields);
+    var chosen: [maximum_fields]bool = @splat(false);
+    var size: usize = 2;
+    var count: u16 = 0;
+    for (directory.fields) |field| {
+        if (field.length > covering_max_field_bytes or field.length + 4 > budget -| size) continue;
+        var parent = field.parent;
+        const covered = while (parent != no_parent) : (parent = directory.fields[parent].parent) {
+            if (chosen[parent]) break true;
+        } else false;
+        if (covered) continue;
+        chosen[field.index] = true;
+        size += @as(usize, @intCast(field.length)) + 4;
+        count += 1;
+    }
+    if (count == 0) return encoded;
+    const output = try a.alloc(u8, encoded.len + size);
+    @memcpy(output[0..encoded.len], encoded);
+    @memcpy(output[0..4], "DPD3");
+    var pos = encoded.len;
+    std.mem.writeInt(u16, output[pos..][0..2], count, .little);
+    pos += 2;
+    for (directory.fields) |field| if (chosen[field.index]) {
+        const len: usize = @intCast(field.length);
+        std.mem.writeInt(u16, output[pos..][0..2], field.index, .little);
+        std.mem.writeInt(u16, output[pos + 2 ..][0..2], @intCast(len), .little);
+        pos += 4;
+        @memcpy(output[pos..][0..len], source[@intCast(field.offset)..][0..len]);
+        pos += len;
+    };
+    a.free(encoded);
+    return output;
 }
 
 pub const Directory = struct {
     fields: []const Field,
     root_count: usize,
     version: u8,
+    encoded: []const u8 = &.{},
     pub fn open(a: A, bytes: []const u8, proof: anytype) !?Directory {
         if (bytes.len < header_size or bytes.len > maximum_bytes or bytes.len > proof.bytes / 16) return null;
-        const version: u8 = if (std.mem.eql(u8, bytes[0..4], "DPD2")) 2 else if (std.mem.eql(u8, bytes[0..4], "DPD1")) 1 else return null;
-        if (version == 2 and proof.bytes > offset_mask) return null;
+        const version: u8 = if (std.mem.eql(u8, bytes[0..4], "DPD3")) 3 else if (std.mem.eql(u8, bytes[0..4], "DPD2")) 2 else if (std.mem.eql(u8, bytes[0..4], "DPD1")) 1 else return null;
+        if (version >= 2 and proof.bytes > offset_mask) return null;
         if (std.mem.readInt(u64, bytes[4..12], .little) != proof.bytes or bytes[44] != proof.kind or !std.mem.eql(u8, bytes[12..44], &proof.digest)) return null;
         const count = std.mem.readInt(u16, bytes[45..47], .little);
         if (count > maximum_fields) return null;
@@ -275,13 +322,14 @@ pub const Directory = struct {
             pos += 2;
             if (bytes.len -| pos < @as(usize, len) + 48) return null;
             const descriptor = std.mem.readInt(u64, bytes[pos + len ..][0..8], .little);
-            const offset = if (version == 2) descriptor & offset_mask else descriptor;
+            const offset = if (version >= 2) descriptor & offset_mask else descriptor;
             const size = std.mem.readInt(u64, bytes[pos + len + 8 ..][0..8], .little);
             if (size == 0 or offset > proof.bytes or size > proof.bytes - offset) return null;
-            if (version == 2 and descriptor >> 62 == 3) return null;
+            if (version >= 2 and descriptor >> 62 == 3) return null;
             pos += @as(usize, len) + 48;
         }
-        if (pos != bytes.len) return null;
+        const trailer_start = pos;
+        if (version != 3 and pos != bytes.len) return null;
         const fields = try a.alloc(Field, count);
         var success = false;
         defer if (!success) a.free(fields);
@@ -293,7 +341,7 @@ pub const Directory = struct {
             const len = std.mem.readInt(u16, bytes[pos..][0..2], .little);
             pos += 2;
             const descriptor = std.mem.readInt(u64, bytes[pos + len ..][0..8], .little);
-            field.* = .{ .name = bytes[pos..][0..len], .offset = if (version == 2) descriptor & offset_mask else descriptor, .length = std.mem.readInt(u64, bytes[pos + len + 8 ..][0..8], .little), .digest = bytes[pos + len + 16 ..][0..32].*, .index = @intCast(i), .parent = if (version == 2) @intCast((descriptor >> 53) & 511) else no_parent, .kind = if (version == 2) @fromBackingInt(@intCast(@as(u2, @intCast(descriptor >> 62)))) else .subtree };
+            field.* = .{ .name = bytes[pos..][0..len], .offset = if (version >= 2) descriptor & offset_mask else descriptor, .length = std.mem.readInt(u64, bytes[pos + len + 8 ..][0..8], .little), .digest = bytes[pos + len + 16 ..][0..32].*, .index = @intCast(i), .parent = if (version >= 2) @intCast((descriptor >> 53) & 511) else no_parent, .kind = if (version >= 2) @fromBackingInt(@intCast(@as(u2, @intCast(descriptor >> 62)))) else .subtree };
             if (field.parent == no_parent) {
                 if (previous_parent != null or (i != 0 and !less({}, fields[i - 1], field.*))) return null;
                 roots += 1;
@@ -313,8 +361,50 @@ pub const Directory = struct {
             }
             pos += @as(usize, len) + 48;
         }
+        if (version == 3) {
+            pos = trailer_start;
+            if (bytes.len -| pos < 2) return null;
+            const inline_count = std.mem.readInt(u16, bytes[pos..][0..2], .little);
+            pos += 2;
+            if (inline_count == 0 or inline_count > count or bytes.len - trailer_start > @min(covering_max_bytes, proof.bytes / 64)) return null;
+            var previous: ?u16 = null;
+            for (0..inline_count) |_| {
+                if (bytes.len -| pos < 4) return null;
+                const index = std.mem.readInt(u16, bytes[pos..][0..2], .little);
+                const len = std.mem.readInt(u16, bytes[pos + 2 ..][0..2], .little);
+                pos += 4;
+                if (index >= count or (if (previous) |prior| index <= prior else false) or len == 0 or len > covering_max_field_bytes or bytes.len -| pos < len or fields[index].length != len) return null;
+                const value = bytes[pos..][0..len];
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(value, &hash, .{});
+                if (!std.mem.eql(u8, &hash, &fields[index].digest)) return null;
+                fields[index].covering_offset = @intCast(pos);
+                previous = index;
+                pos += len;
+            }
+            if (pos != bytes.len) return null;
+        }
         success = true;
-        return .{ .fields = fields, .root_count = roots, .version = version };
+        return .{ .fields = fields, .root_count = roots, .version = version, .encoded = bytes };
+    }
+    /// Borrow a complete authenticated field from a bounded covering ancestor.
+    pub fn covered(self: Directory, field: Field) ?[]const u8 {
+        var index = field.index;
+        while (true) {
+            const ancestor = self.fields[index];
+            if (ancestor.covering_offset != 0) {
+                const begin: usize = ancestor.covering_offset;
+                const length = std.math.cast(usize, ancestor.length) orelse return null;
+                if (begin > self.encoded.len or length > self.encoded.len - begin) return null;
+                const bytes = self.encoded[begin..][0..length];
+                const delta = std.math.cast(usize, field.offset - ancestor.offset) orelse return null;
+                const len = std.math.cast(usize, field.length) orelse return null;
+                if (delta > bytes.len or len > bytes.len - delta) return null;
+                return bytes[delta..][0..len];
+            }
+            if (ancestor.parent == no_parent) return null;
+            index = ancestor.parent;
+        }
     }
     fn within(self: Directory, first: usize, count: usize, name: []const u8) ?Field {
         var low = first;
@@ -438,4 +528,35 @@ test "logical value nested authority bounds depth width corruption and allocatio
     try Fixture.run(std.testing.allocator);
     var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try @import("antfly_platform").allocator.checkAllAllocationFailures(failing.allocator(), Fixture.run, .{});
+}
+
+test "api query contract covering metadata is bounded revision bound and corruption safe" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const payload = try a.alloc(u8, 64 * 1024);
+    @memset(payload, 'x');
+    const source = try std.fmt.allocPrint(a, "{{\"metadata\":{{\"revision\":\"r1\",\"owners\":[1,2,3]}},\"large\":\"{s}\"}}", .{payload});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
+    const kind = @import("internal_keys.zig").primary_kind;
+    const proof = .{ .bytes = @as(u64, source.len), .kind = kind, .digest = digest };
+    const legacy = (try build(a, source, kind, digest)).?;
+    const encoded = (try buildAuthority(a, source, kind, digest)).?;
+    try std.testing.expectEqualStrings("DPD2", legacy[0..4]);
+    try std.testing.expectEqualStrings("DPD3", encoded[0..4]);
+    try std.testing.expect(encoded.len - legacy.len <= @min(covering_max_bytes, source.len / 64));
+    const directory = (try Directory.open(a, encoded, proof)).?;
+    try std.testing.expectEqualStrings("\"r1\"", directory.covered(directory.resolveExact("metadata.revision").?).?);
+    try std.testing.expectEqualStrings("[1,2,3]", directory.covered(directory.resolveExact("metadata.owners").?).?);
+    try std.testing.expect(directory.covered(directory.resolveExact("large").?) == null);
+    try std.testing.expect(try isCurrent(a, legacy, proof));
+    try std.testing.expect(try isCurrent(a, encoded, proof));
+    var stale = proof;
+    stale.digest[0] ^= 1;
+    try std.testing.expect(try Directory.open(a, encoded, stale) == null);
+    for (legacy.len..encoded.len) |end| try std.testing.expect(try Directory.open(a, encoded[0..end], proof) == null);
+    const broken = try a.dupe(u8, encoded);
+    broken[broken.len - 1] ^= 1;
+    try std.testing.expect(try Directory.open(a, broken, proof) == null);
 }

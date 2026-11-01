@@ -230,6 +230,9 @@ pub const QueryResponse = struct {
     pub fn bytes(self: QueryResponse) []const u8 {
         return self.response.buffer.slice();
     }
+    pub fn hasNativeFieldViews(self: QueryResponse) bool {
+        return self.response.native_field_views >= 1 and self.response.native_field_views <= 2;
+    }
 
     pub fn identityReadGeneration(self: QueryResponse) ?u64 {
         return if (self.response.has_identity_read_generation != 0)
@@ -707,6 +710,7 @@ pub const Owner = struct {
 
     pub fn queryJsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !QueryResponse {
         var response: QueryResponse = .{};
+        errdefer response.deinit();
         var failure: abi.FailureIdentity = .{};
         const status = abi.antfly_storage_owner_query_json(
             self.handle,
@@ -739,6 +743,8 @@ pub const Owner = struct {
             }
             return err;
         };
+        if (response.response.buffer_c_allocated > 1 or response.response.native_field_views > 2 or
+            (response.response.native_field_views != 0 and (options.execution.enabled == 0 or options.execution.native_field_views < response.response.native_field_views))) return error.InvalidQueryResponse;
         return response;
     }
 

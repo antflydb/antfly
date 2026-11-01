@@ -532,6 +532,45 @@ Evidence:
 - Production HTTP server construction selects the process request allocator
   internally; request-allocator injection is test-only.
 
+### Selected Range Ownership
+
+Read scopes distinguish whole-value retention, selected copies from a complete
+point value, and native selected-range I/O. The native LSM reader and cursor
+adapter copy selected spans; Lite reads selected ranges. Range-shaped methods
+alone do not prove that physical reads or retained buffers are small.
+
+Selected LSM reads use a temporary point-result owner under storage working-set
+admission. Complete values and block pins retire after each document; returned
+spans use the caller's allocation budget and remain valid until scope reset or
+close. Ordinary full-value reads keep their ownership contract. Revision proofs,
+directories and primary bytes come from the same pinned transaction.
+
+The selected-copy point reader borrows pinned memtables and temporarily adopts
+one decoded block instead of copying its complete value. The transient namespace
+hint is excluded from namespace identity and cannot alter the caller's normal
+full-value API. An adopted local block keeps its existing cache or working-set
+reservation, including when it exceeds the cache's admission ceiling. A wide
+uncached owned result can transfer into a temporary shared owner after admission;
+if that optional reservation is denied, the compact-copy fallback remains valid.
+No second payload may join that transient pin owner. Each document copies its
+selected spans before retiring the loan; multi-range reads reuse metadata
+capacity while releasing payloads and pins between documents. Cache admission,
+snapshot/version checks and selected-span authentication remain unchanged.
+
+Projection windows share a bounded plan between admission and execution,
+including explicit selected-read and full-read decisions. Estimates include
+coalesced spans, reconstruction and setup; logical work still charges original
+source sizes. Whole-value readers check cancellation between documents. Native
+selected I/O keeps its bounded batch walk; other scanners retain their existing
+physical-work limits. Scope modes are immutable vtable metadata, not callbacks;
+read transactions expose known scope capabilities before a scope is allocated.
+Tables built from type-only helpers have explicit compile-time storage. Metadata
+fields are excluded from native method dispatch. Copy-backed projection windows admit at most 1 MiB of
+original values as well as bounding selected work; selected I/O can admit by
+selected work alone. Cached plans use pointers so ordinary fallback rows do not
+carry inline range arrays; temporary authority headers stay in a bounded stack
+array. These limits do not bound backend caches or process RSS.
+
 ## Write Contract
 
 `DB.batch()` is document-first.
@@ -1608,11 +1647,12 @@ routing metadata.
 
 ### Conditional source value certificates
 
-Source-only query delivery may use the optional `SVI1` canonical-value sidecar
+Source-only query delivery may use the optional `SVI2` canonical-value sidecar (with legacy SVI1 compatibility)
 in `storage/source_value_identity.zig`. It is installed in the same transaction
-as primary JSON bytes, the existing DPD2 projection directory, content proof and
-mutation revision. It does not change DPD2 coverage or admission limits; rows
-below the existing 16 KiB threshold do not receive certificates.
+as primary JSON bytes, the DPD2/DPD3 projection directory, content proof and
+mutation revision. Rows below the existing 16 KiB threshold do not receive
+certificates. DPD3 additionally carries bounded covering values as described
+below. The primary document representation remains unchanged.
 
 A certificate binds primary byte length/SHA-256, source kind, exact directory
 SHA-256 and semantic canonicalizer ABI. Up to 512 sorted directory-index/digest
@@ -1649,10 +1689,85 @@ storage owners. Source-dependent operators retain complete values. Unsupported
 layouts and missing/stale certificates retain reference projection and hashing;
 existing bounded authority backfill installs certificates without advancing the
 logical revision. ABI changes invalidate old certificates and trigger safe
-fallback/repair. This is an internal storage optimization of the existing public
-`source_projection` contract, not another caller-managed proof field.
+fallback/repair. This is an internal storage optimization of the public `fields`/`select`
+contract; it introduces no caller-managed proof field.
 
 Qualify native delivery with `e2e/antfly/bench_source_projection.py` using pinned
 baseline/candidate servers. Its certificate-hit counters establish proof reuse,
 not physical disk-read counts. Remaining metadata, frame layout and ordinary
 source fallback still determine physical I/O.
+
+Selected-copy scopes also expose optional cancellation-aware batching. One
+engine scratch owner serves a bounded sorted batch and polls before every
+whole-value read; per-key resets release payload pins and loans while retaining
+bounded metadata capacity. Erased adapters without this capability retain
+per-key polling. The C polling view is borrowed only for the call and carries
+fixed status codes. Failure leaves partial outputs that the caller must discard.
+
+The [batch and physical-read qualification](../docs/design/antfly-grep.md#batch-cancellation-and-structured-native-media-2026-10-30)
+records 32.3% fewer scratch allocations in its persisted-row fixture. Reopened
+storage probes confirm that uncovered ranges still read complete
+checksummed/compressed blocks. DPD3 can avoid primary fetches for covered small
+fields; selected ownership does not imply arbitrary sparse primary I/O.
+
+
+### Covering metadata and borrowed projection fields
+
+DPD3 is an extension of disposable, revision-bound projection metadata. New
+writes and explicit metadata rebuilds can persist small JSON subtrees within the
+existing metadata key. The total extension, including framing, is bounded by
+four KiB, 1/64 of primary bytes, and remaining directory capacity; each subtree
+is at most one KiB. Ancestors cover descendants without duplicating their bytes.
+The reader validates indices, lengths, parent extents and content hashes.
+
+DPD1/DPD2 remain readable, and existing DPD2 metadata stays valid. An older reader
+ignores DPD3 and falls back to primary values. No primary format rewrite or eager
+table migration is required. Mutation/replay, identity reuse, deletion,
+compaction and distributed snapshots use the existing atomic metadata path.
+Canonical value identities and ASCH25 are unchanged. Covering values are persisted
+copies; native output witnesses and codec caches remain request-local.
+
+A selected-field view borrows checked ranges or covering values. A logical
+projection window retains its read scope through consumption, closes it before
+arena reset and retires before the transaction. Full-value fallback also borrows
+the scope, while callers of the existing owned-row APIs keep their contract.
+Scalar operators consume direct tokens; containing JSON is reconstructed only
+when a source mask or another consumer needs it. Covered read sets consume zero
+primary-value work in batch admission. Uncovered copied ranges retain the
+original physical-size bounds.
+
+Synchronous native result delivery can carry completed output token offsets and
+storage-producer field witnesses. Exact owned copies clone descriptor ownership.
+The encoded compiled-owner adapter negotiates a version-one metadata prefix in
+previously reserved request/response ABI bytes, retaining layout and version 84.
+Only an acknowledged owner response can restore receipts; public/remote JSON and
+caller-provided identity claims cannot create witnesses. The prefix is bounded
+by one MiB and 1,024 rows and shares the existing response serialization pass.
+Restoration validates row/program identity, member boundaries and completion
+tails without rescanning payloads. Older owners retain ordinary verification.
+Media reuse requires an already verified codec and a matching trusted field
+witness. Each reference still checks membership, revision, permissions, identity,
+SHA/MIME/length and pixel claims. Unsupported producers use byte comparison and
+ordinary verification. The bounded witness table expires with the invocation.
+
+See the [design and qualification](../docs/design/antfly-grep.md#covering-metadata-and-native-field-views-2026-10-31)
+for ownership, compatibility and measured tradeoffs. Benchmark comparisons use
+balanced even AB/BA rounds and summarize independent server runs.
+
+### Native projection span delivery
+
+Synchronous compiled query owners may negotiate private output version two in
+the existing ABI 84 execution-options byte. The acknowledged response contains
+bounded JSON metadata and raw immutable completed outputs. Ordinary/public
+parsers cannot restore these spans or their field witnesses. Older owners
+retain version-zero/one fallback, and oversized/unsupported cohorts use the
+previous representation. See [restricted projection views and native span
+delivery](../docs/design/antfly-grep.md#restricted-projection-views-and-native-span-delivery-2026-11-01)
+for frame bounds, ownership and validation.
+
+Delayed projected document rows consume DPD3 covering values under their live
+directory lease. Primary reads contain only uncovered ranges; logical output
+bytes remain charged even when physical primary reads are eliminated. Public
+masks narrow prepared selections before materializing JSON. Full authenticated
+loans can resolve leaf operands directly, while structured operands preserve
+the shared-root fallback.

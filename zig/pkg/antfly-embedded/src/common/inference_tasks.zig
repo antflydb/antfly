@@ -221,7 +221,7 @@ pub const Executor = struct {
     }
 
     pub fn decideRequest(self: Executor, a: std.mem.Allocator, name: []const u8, request: Json) !Json {
-        const batch = try @import("../functions/decision_batch.zig").parse(a, request);
+        const batch = try @import("../functions/decision_batch.zig").parseWithMedia(a, request, self.context.verified_media);
         const source_questions = request.object.get("questions") orelse return error.InvalidDecisionSpecification;
         if (!batch.batched) return self.decide(a, name, batch.items[0].input, source_questions);
         const questions = if (source_questions == .array) try decisions.publicQuestions(a, source_questions) else source_questions;

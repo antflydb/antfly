@@ -24,7 +24,12 @@ pub const Item = struct { id: ?[]const u8 = null, input: d.Input };
 pub const Batch = struct { items: []Item, batched: bool };
 
 pub fn parse(a: std.mem.Allocator, request: Json) !Batch {
+    return parseWithMedia(a, request, @as([]const @import("antfly_decisions").evidence.Media, &.{}));
+}
+pub fn parseWithMedia(a: std.mem.Allocator, request: Json, verified: anytype) !Batch {
     if (request != .object) return error.InvalidDecisionSpecification;
+    // All inputs borrow one immutable descriptor table for the invocation.
+    const media = try d.Input.descriptors(a, verified);
     const root = request.object;
     for (root.keys()) |key| {
         for ([_][]const u8{ "model", "input", "inputs", "questions", "context_version", "contexts" }) |allowed| {
@@ -45,7 +50,7 @@ pub fn parse(a: std.mem.Allocator, request: Json) !Batch {
         break :blk &.{};
     };
     if (!batched) {
-        const input = try d.Input.fromJson(root.get("input").?);
+        const input = try d.Input.fromJsonWithDescriptors(root.get("input").?, media);
         try input.checkLimit(a, max_input_bytes);
         return .{ .items = try a.dupe(Item, &.{.{ .input = input }}), .batched = false };
     }
@@ -61,7 +66,7 @@ pub fn parse(a: std.mem.Allocator, request: Json) !Batch {
         }
         item.* = .{
             .id = if (entry.object.get("id")) |value| try d.text(value) else null,
-            .input = try d.Input.fromJson(entry.object.get("input") orelse return error.InvalidDecisionSpecification),
+            .input = try d.Input.fromJsonWithDescriptors(entry.object.get("input") orelse return error.InvalidDecisionSpecification, media),
         };
         if (entry.object.get("context_index")) |index| {
             if (!root.contains("context_version") or index != .integer or index.integer < 0 or index.integer >= contexts.len) return error.InvalidDecisionSpecification;
@@ -73,10 +78,10 @@ pub fn parse(a: std.mem.Allocator, request: Json) !Batch {
                 var message = d.jsonObject();
                 try d.put(a, &message, "role", .{ .string = "user" });
                 try d.put(a, &message, "content", .{ .string = context });
-                const messages = try a.alloc(Json, item.input.messages.len + 1);
+                const messages = try a.alloc(Json, item.input.messageItems().len + 1);
                 messages[0] = message;
-                @memcpy(messages[1..], item.input.messages);
-                item.input = .{ .messages = messages };
+                @memcpy(messages[1..], item.input.messageItems());
+                item.input = item.input.withMessages(messages);
             }
         }
         const bytes = try item.input.byteSize(a);

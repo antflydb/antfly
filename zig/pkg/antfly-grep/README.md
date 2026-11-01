@@ -5032,3 +5032,124 @@ CPU/latency gains vary by case, with increases retained in the report. These are
 warm synthetic whole-server comparisons against an older main revision on one
 shared host. They do not establish universal or zero-cost behavior. Document
 format and canonical ABI remain unchanged.
+
+
+The [query-read follow-up](../../../docs/design/antfly-grep.md#measured-query-read-optimizations-after-1263)
+qualifies required-ID owner routing and projection preparation against the merge
+of #1263. Five alternating 50-read trials on a shared M4 Max reduce eight-shard
+clustered-ID read CPU about 79–85% and spread-ID read CPU about 41–49%, with equal
+values, scores and counts. Initial short-run latency and other controls vary;
+these are warm synthetic measurements, not universal guarantees. Canonical
+fingerprinting avoids a payload-sized allocation using a fixed 4 KiB buffer.
+Earlier range-batch admission and direct parent media allocation experiments were left
+out after their CPU/memory gains failed to hold consistently. The design includes
+both experimental sets, final controls, hashes and reproduction commands. Raw
+JSON reports/logs stay ignored. Public query syntax and ASCH25 remain unchanged.
+
+
+The [selected-range ownership design](../../../docs/design/antfly-grep.md#selected-range-ownership-and-shared-window-plans)
+separates retained output from physical I/O cost. Native LSM range results retain
+selected copies while temporary whole-value results retire after each document.
+Projection windows reuse both selected-read and full-read plans. Gateway media
+jobs transfer request-local payload leases while releasing query scratch at
+completion; repeated references to one field can share the retained bytes.
+
+
+The [current ownership and transport qualification](../../../docs/design/antfly-grep.md#batch-cancellation-and-structured-native-media-2026-10-30)
+records the contracts, complete paired controls, independent repeats and artifact
+identities. Selected LSM reads borrow one admitted point until selected spans
+are copied. Controlled batches retain one bounded scratch owner while polling
+cancellation/deadlines between whole-value reads. Point batches retire payload
+pins per document; dense cursor batches can retain current block/index leases
+within resource quotas until the batch ends. The earlier persisted-row fixture
+uses 32.3% fewer scratch allocations.
+
+Gateway media jobs transfer request-local payload leases and release completed
+parsing scratch. Compatible native generators/deciders reuse verified codec
+bytes. Legacy hints supplementing a retained URL keep a 1 MiB soft cap;
+compact native payloads replace that URL and stay within the existing expanded
+request ceiling (at most 12 MiB of codecs). Structured generation adapts message
+headers before serialization and passes borrowed attachments through the shared
+native handler, preserving options, tool history, token budgets, usage,
+completion and request controls. Older linked runtimes keep the JSON fallback;
+worker protocol 8 requires a matching explicitly configured worker CLI.
+
+The isolated structured-transport tool allocates 9,913 bytes per invocation for a
+1 MiB synthetic payload versus 8,402,713 through JSON/framing (99.88% less). It excludes
+source verification, caller-retained inputs, fixed dispatch, process transfer
+and model work. The 44-control whole-query matrix remains mixed/mostly flat;
+the design records the repeated wide conditional-read regression alongside the
+gains. These results do not establish universal latency, RSS or provider-cost
+improvements.
+
+Physical-read probes still fetch complete checksummed/compressed blocks.
+Selected retention is not sparse storage I/O. Public HTTP/query syntax, the
+document schema and ASCH25 remain unchanged; this follow-up introduces no
+persistent-format migration. Earlier qualification runs and rejected experiments
+remain in the linked design history.
+
+
+The [source-codec and payload-sharing contract](../../../docs/design/antfly-grep.md#bounded-source-codecs-and-shared-worker-payloads-2026-10-30)
+keeps compatible native source images as verified codecs and small internal
+handles, rendering expanded URLs only for legacy/hosted consumers. Logical
+request, image and token limits remain unchanged. Workers transfer each shared
+immutable payload once and retain separate logical references. Copy-backed
+projection batches reject ineligible pairs before opening scopes or planning
+spans. These are request-local changes with no document-format migration.
+
+
+The same-main follow-up qualifies 35 whole-server controls and independent
+seven-round repeats, with response-equivalence checks. Attribution confirms 56
+ineligible pairs rejected before any Selection planning, while eligible batches
+still run. The isolated source-preparation fixture allocates 67–97% fewer bytes;
+eight shared 1 MiB worker payloads use about 87% fewer wire bytes. These scoped
+results exclude model work and do not establish universal query speed, RSS or
+billing improvements. Initial and repeated slower cases remain in the design.
+
+The final merge of main through `0ff73ed56f` rebuilds byte-identical macOS server
+and grep artifacts. Indexed HTTP integration passes 57 tests (7 optional
+profiling skips); native fixture, allocation/wire and Linux VM scopes are
+recorded in the linked design. Full PR CI and required review remain separate.
+
+
+The [sorted range and HTTP transport follow-up](../../../docs/design/antfly-grep.md#sorted-range-batches-and-segmented-http-2026-10-30)
+shares snapshot cursor/index work for dense sorted range batches and retains
+point lookup for sparse keys. The persisted-row fixture reduces batched scratch
+allocations a further 50.8%. Proofs of actual byte equality avoid repeated base64
+decoding, hashing and image inspection while preserving each reference's
+authorization and claims.
+Remote native HTTP requests borrow codec segments through synchronous invocation;
+local ABI targets retain contiguous-body compatibility.
+
+Repeated verification of a roughly 1 MiB source takes 757 → 412 µs in the isolated
+fixture, with no decoded-buffer allocation on the reuse path. Constructing eight
+1 MiB HTTP attachments allocates 8,402,726 → 14,863 bytes; tiny frames allocate
+118–403 additional bytes. Public wire occurrences and logical model budgets do
+not change. The design retains complete whole-query controls and independent
+repeats, including slower cases. These are scoped preparation/allocation gains,
+not universal query latency, RSS or provider-billing improvements. Public API,
+document format and ASCH25 remain unchanged.
+
+
+The [covering metadata and native field-view design](../../../docs/design/antfly-grep.md#covering-metadata-and-native-field-views-2026-10-31)
+avoids primary fetches for bounded small fields and lets projection operators
+consume authenticated spans directly. DPD3 stores at most four KiB of covering
+metadata, further limited to 1/64 of the source and existing directory capacity.
+New writes/rebuilds can use it; existing DPD2 remains valid and older binaries
+retain primary-read fallback. Primary document format and public APIs do not
+change.
+
+Native consumers can reuse producer field witnesses after the first codec was
+verified. Revision, identity, permission and per-reference claims still apply;
+wire/caller metadata cannot create these witnesses. Copies of small covering
+values persist on disk, while verification witnesses and codecs remain local to
+the request. Uncovered values still read complete storage blocks. The linked
+design records qualification, allocation/read costs and balanced benchmark
+methodology; these mechanisms do not establish universal latency or memory wins.
+
+Compiled storage owners negotiate native descriptors through previously reserved
+ABI bytes, preserving layout and version 84. A bounded private metadata prefix
+shares the existing response serialization pass. Only an acknowledged owner
+response can restore receipts; public/remote JSON cannot. Older owners retain
+ordinary verification. Large native media groups request scalar views, while
+small groups keep the existing source path.

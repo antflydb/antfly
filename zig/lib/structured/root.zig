@@ -54,17 +54,17 @@ pub const Limits = struct {
             (self.max_decoded_pixels_per_call == null or cost.decoded_pixels <= self.max_decoded_pixels_per_call.?);
     }
 };
-const EvidenceCost = struct {
+pub const EvidenceCost = struct {
     media_parts: usize = 0,
     encoded_media_bytes: usize = 0,
     decoded_pixels: u64 = 0,
     overflow: bool = false,
-    fn add(self: EvidenceCost, other: EvidenceCost) EvidenceCost {
+    pub fn add(self: EvidenceCost, other: EvidenceCost) EvidenceCost {
         const pixels = @addWithOverflow(self.decoded_pixels, other.decoded_pixels);
         return .{ .media_parts = self.media_parts +| other.media_parts, .encoded_media_bytes = self.encoded_media_bytes +| other.encoded_media_bytes, .decoded_pixels = pixels[0], .overflow = self.overflow or other.overflow or pixels[1] != 0 };
     }
 };
-fn evidenceCost(a: Allocator, input: Json, measure_pixels: bool) !EvidenceCost {
+pub fn evidenceCost(a: Allocator, input: Json, measure_pixels: bool) !EvidenceCost {
     var cost = EvidenceCost{};
     if (input == .string) return cost;
     if (input != .array) return error.UnsupportedInferenceFeature;
@@ -155,6 +155,9 @@ pub const Invocation = struct {
 /// Render typed user evidence as real provider content, keeping item identity
 /// stable during selective repair. Media never appears in the metadata JSON.
 pub fn evidenceMessages(a: Allocator, invocation: Invocation, system: []const u8, openai_images: bool) ![]const @import("antfly_generating").ChatMessage {
+    return evidenceMessagesWithBorrowed(a, invocation, system, openai_images, false);
+}
+pub fn evidenceMessagesWithBorrowed(a: Allocator, invocation: Invocation, system: []const u8, openai_images: bool, borrowed_images: bool) ![]const @import("antfly_generating").ChatMessage {
     const generation = @import("antfly_generating");
     const metadata = try a.dupe(Item, invocation.items);
     var messages: std.ArrayList(generation.ChatMessage) = .empty;
@@ -190,7 +193,7 @@ pub fn evidenceMessages(a: Allocator, invocation: Invocation, system: []const u8
                             }
                         } else {
                             // Native/Google transports have no shared public-URL fetch contract.
-                            if (!openai_images) return error.UnsupportedInferenceFeature;
+                            if (!openai_images and !(borrowed_images and std.mem.startsWith(u8, url, "antfly-verified:"))) return error.UnsupportedInferenceFeature;
                             part.* = .{ .image_url = .{ .url = url, .detail = detail } };
                         }
                     }
@@ -239,12 +242,15 @@ pub const Reply = struct {
     /// Trusted token evidence, populated by an adapter, never model JSON.
     token_evidence: ?TokenEvidence = null,
 };
+pub const EvidenceMeasurement = struct { cost: EvidenceCost, bytes: usize };
 pub const Executor = struct {
     limits: Limits = .{},
     ptr: *anyopaque,
     invoke: *const fn (*anyopaque, Allocator, Invocation) anyerror!Reply,
     checkpoint: ?*const fn (*anyopaque) anyerror!void = null,
     validate_item: ?*const fn (*anyopaque, Allocator, usize, Json, ?TokenEvidence) anyerror!void = null,
+    /// Trusted adapters account for borrowed codecs without expanding base64.
+    measure_evidence: ?*const fn (*anyopaque, Allocator, Json, bool) anyerror!EvidenceMeasurement = null,
 };
 pub const Report = struct { native_batches: usize = 0, native_items: usize = 0, serial_items: usize = 0, rejected_items: usize = 0 };
 pub const Result = struct {
@@ -370,22 +376,27 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
     const cost_failures = try a.alloc(?anyerror, inputs.len);
     defer a.free(cost_failures);
     @memset(cost_failures, null);
-    for (inputs, costs, cost_failures) |input, *cost, *failure| cost.* = evidenceCost(a, input, executor.limits.max_decoded_pixels_per_call != null) catch |err| blk: {
-        if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled) return err;
-        failure.* = err;
-        break :blk .{};
-    };
     const sizes = try a.alloc(usize, inputs.len);
     defer a.free(sizes);
-    for (inputs, sizes) |input, *size| {
-        if (input == .string) {
-            size.* = input.string.len;
-        } else {
-            var buffer: [1024]u8 = undefined;
-            var counter = std.Io.Writer.Discarding.init(&buffer);
+    for (inputs, costs, cost_failures, sizes) |input, *cost, *failure, *size| {
+        const measured: EvidenceMeasurement = measured: {
+            if (executor.measure_evidence) |measure| break :measured measure(executor.ptr, a, input, executor.limits.max_decoded_pixels_per_call != null) catch |err| {
+                if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled) return err;
+                failure.* = err;
+                break :measured .{ .cost = .{}, .bytes = 0 };
+            };
+            const value = evidenceCost(a, input, executor.limits.max_decoded_pixels_per_call != null) catch |err| {
+                if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled) return err;
+                failure.* = err;
+                break :measured .{ .cost = .{}, .bytes = 0 };
+            };
+            if (input == .string) break :measured .{ .cost = value, .bytes = input.string.len };
+            var counter = std.Io.Writer.Discarding.init(&.{});
             try std.json.Stringify.value(input, .{}, &counter.writer);
-            size.* = std.math.cast(usize, counter.fullCount()) orelse return error.ConstrainedInputTooLarge;
-        }
+            break :measured .{ .cost = value, .bytes = std.math.cast(usize, counter.fullCount()) orelse return error.ConstrainedInputTooLarge };
+        };
+        cost.* = measured.cost;
+        size.* = measured.bytes;
     }
     if (mode == .auto or value_schema != .object) return error.InvalidConstrainedGenerationConfig;
     var validator = try schema_validator.CompiledSchema.init(a, value_schema);

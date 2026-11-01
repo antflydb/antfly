@@ -140,7 +140,7 @@ const standalone_inference_function_table: standalone_inference_bridge.FunctionT
         standalone_inference_bridge.Capability.route_manifest |
         standalone_inference_bridge.Capability.resource_budget |
         standalone_inference_bridge.Capability.request_admission |
-        standalone_inference_bridge.Capability.model_pull | standalone_inference_bridge.Capability.memory_admission,
+        standalone_inference_bridge.Capability.model_pull | standalone_inference_bridge.Capability.memory_admission | standalone_inference_bridge.Capability.structured_attachments,
     .create = &standaloneInferenceCreate,
     .configure = &standaloneInferenceConfigure,
     .invoke_provider = &standaloneInferenceInvokeProvider,

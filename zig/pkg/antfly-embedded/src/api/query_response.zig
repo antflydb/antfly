@@ -42,9 +42,12 @@ pub const QueryResponse = struct {
 /// that hit and carries the same producer-validated public projection as wire
 /// delivery. Column/other typed producers retain `_source`. Both forms expire
 /// when the synchronous consumer returns; neither grants query authority.
+pub const ComputedView = @import("field_projection.zig").ComputedView;
+pub const ValueProof = @import("field_projection.zig").ValueProof;
 pub const ResultView = struct {
     result: @import("antfly_metadata_openapi").QueryResult,
     encoded_sources: []const ?@import("antfly-json").RawObject = &.{},
+    computed_views: []const ?@import("field_projection.zig").ComputedView = &.{},
 };
 
 /// Synchronous delivery: the producer retains query state until the final write

@@ -106,6 +106,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_engine_mod = options.antfly_imports.raft_engine;
     const httpx_mod = options.antfly_imports.httpx;
     const structlog_mod = options.antfly_imports.structlog;
+    const verified_messages_bench = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/inference/verified_messages.zig"), .target = target, .optimize = optimize });
+    verified_messages_bench.addImport("antfly_inference_types", options.antfly_imports.inference_types);
+    verified_messages_bench.addImport("antfly_inference_work", options.antfly_imports.inference_work);
+    verified_messages_bench.addImport("antfly_inference_execution_context", options.antfly_imports.inference_execution_context);
+    const media_bench_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_native_generation_media.zig"), .target = target, .optimize = optimize });
+    media_bench_mod.addImport("inference", options.antfly_imports.inference_types);
+    media_bench_mod.addImport("media", options.antfly_imports.inference_execution_context);
+    media_bench_mod.addImport("verified", verified_messages_bench);
+    media_bench_mod.addImport("httpx", httpx_mod);
+    const media_bench = b.addExecutable(.{ .name = "antfly-native-generation-media-bench", .root_module = media_bench_mod });
+    b.step("native-generation-media-bench", "Build the verified structured generation transport comparison").dependOn(&b.addInstallArtifact(media_bench, .{}).step);
+    b.step("bench-native-generation-media", "Measure framed and borrowed native generation metadata paths").dependOn(&b.addRunArtifact(media_bench).step);
+
     const openapi_root_check = options.openapi_root_check;
     const platform_mod = options.antfly_imports.platform;
     const bloom_mod = options.antfly_imports.bloom;
@@ -268,6 +281,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, api_http_runtime_test_mod, true, true);
     api_http_runtime_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+
+    const source_preparation_bench = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "verified source", "httpx inference gateway source codec preparation benchmark", "httpx inference gateway native receipt preparation benchmark" } });
+    const run_source_preparation_bench = b.addRunArtifact(source_preparation_bench);
+    run_source_preparation_bench.setEnvironmentVariable("ANTFLY_BENCH_SOURCE_MEDIA", "1");
+    const source_preparation_bench_step = b.step("bench-source-preparation", "Measure repeated source verification and segmented envelope construction (use ReleaseFast)");
+    source_preparation_bench_step.dependOn(&run_source_preparation_bench.step);
+    source_preparation_bench_step.dependOn(&b.addInstallArtifact(source_preparation_bench, .{ .dest_sub_path = "antfly-source-preparation-bench" }).step);
 
     const schema_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/schema_contract_test_root.zig"),
@@ -5355,6 +5375,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone raster embedding control",
             "encoded reader ABI enforces resolved model capabilities",
             "linked generator validates concrete MIME and decoded pixels",
+            "standalone structured borrowed generation",
             "standalone prompt cache detaches resource observer before owner teardown",
             "standalone inference keep alive parses compound durations and zero",
             "standalone preload bridge preserves A4B residency controls",
@@ -5364,6 +5385,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "document execution manifests retain raw duplex body mode",
             "native checkpoint route manifest preserves binary upload and export streaming",
             "native checkpoint worker upload honors cancellation counts and cumulative ceiling",
+            "provider attachment generation preserves explicit budgets and legacy defaults",
         },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });
@@ -5468,7 +5490,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // These sources became shared modules; imported modules do not contribute
     // tests to the facade root. Keep their contracts in the aggregate gate.
     const shared_inference_contract_step = b.step("antfly-inference-contract-test", "Run shared inference work and provider contracts");
-    inline for (.{ antfly_imports.cache_budget, antfly_imports.inference_types, antfly_imports.inference_work, antfly_imports.inference_local, antfly_imports.inference_vertex }) |mod| {
+    inline for (.{ antfly_imports.cache_budget, antfly_imports.inference_types, antfly_imports.inference_work, antfly_imports.inference_local, antfly_imports.inference_vertex, antfly_imports.inference_execution_context }) |mod| {
         const tests = b.addTest(.{ .root_module = mod });
         const run = b.addRunArtifact(tests);
         shared_inference_contract_step.dependOn(&run.step);

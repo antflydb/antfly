@@ -55,7 +55,9 @@ fn parseResponse(a: std.mem.Allocator, bytes: []const u8) !decisions.Json {
     return std.json.parseFromSliceLeaky(decisions.Json, a, bytes, .{ .allocate = .alloc_always }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidDecisionOutput;
 }
 
-fn requestPayload(a: std.mem.Allocator, io: std.Io, cfg: decisions.DeciderConfig, request: decisions.Request) !decisions.WirePayload {
+fn requestPayload(a: std.mem.Allocator, io: std.Io, cfg: decisions.DeciderConfig, original_request: decisions.Request) !decisions.WirePayload {
+    var request = original_request;
+    if (cfg.decision_method != .generated) request.input = try request.input.materialized(a);
     if (cfg.decision_method == .generated) {
         try constrained_runtime.validateEvidence(cfg.generator.?, request.input);
         return .{ .body = try std.json.Stringify.valueAlloc(a, .{ .input = request.input.jsonValue(a), .questions = request.questions, .instructions = cfg.instructions }, .{}), .image_bytes = request.input.inlineImageBytes() };

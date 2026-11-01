@@ -171,7 +171,7 @@ pub fn parseRequest(a: A, value: V) !Request {
         bytes += size;
         if (bytes > 16 * 1024 * 1024) return error.DecideRequestLimitExceeded;
         // Native generation consumes inline image content with automatic detail.
-        if (input == .messages) for (input.messages) |message| {
+        if (input != .text) for (input.messageItems()) |message| {
             const content = message.object.get("content").?;
             if (content == .array) for (content.array.items) |part| {
                 if (!std.mem.eql(u8, part.object.get("type").?.string, "input_image")) continue;

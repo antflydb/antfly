@@ -41707,7 +41707,7 @@ pub const DB = struct {
                     self.directories_loaded[index] = true;
                 }
             }
-            const Prepared = struct { fields: []projection.FieldValue, ranges: []ranges_mod.Range, values: [][]const u8, hashes: [][32]u8, duplicate: bool = false };
+            const Prepared = struct { fields: []projection.FieldValue, selection: @import("../logical_source.zig").Selection, directory: projection.Directory, values: [][]const u8, read_values: [][]const u8, duplicate: bool = false };
             var prepared: [64]Prepared = undefined;
             var requests: [64]ranges_mod.Request = undefined;
             var request_count: usize = 0;
@@ -41732,34 +41732,31 @@ pub const DB = struct {
                     if (!try projection.isCurrent(a, raw, proof)) self.requestRepair();
                     break;
                 };
-                var selected_bytes: u64 = 0;
+                var roots: [projection.maximum_fields]projection.Field = undefined;
                 var selected_count: usize = 0;
                 for (fields) |name| if (directory.find(name)) |field| {
-                    selected_bytes +|= field.length;
+                    if (selected_count == roots.len) return null;
+                    roots[selected_count] = field;
                     selected_count += 1;
                 };
-                if (selected_bytes >= proof.bytes / 2 or selected_count > ranges_mod.maximum_ranges) break;
-                const ranges = try a.alloc(ranges_mod.Range, selected_count);
-                var slot: usize = 0;
-                for (fields) |name| if (directory.find(name)) |field| {
-                    ranges[slot] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
-                    slot += 1;
-                };
-                const cost = if (scope.supportsRange()) try ranges_mod.retainedBytes(std.math.cast(usize, proof.bytes) orelse return error.InvalidDocumentContentAuthority, ranges) else if (selected_count == 0) 0 else proof.bytes;
+                const selection = (try @import("../logical_source.zig").Selection.initFields(a, directory, proof, roots[0..selected_count])) orelse break;
+                if (selection.fields.len > ranges_mod.maximum_ranges) break;
+                const ranges = selection.ranges;
+                var selected_bytes: usize = 0;
+                for (selection.fields) |field| selected_bytes +|= std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority;
+                const physical_cost = if (ranges.len == 0) 0 else if (scope.supportsSelectedRangeIo()) try ranges_mod.retainedBytes(std.math.cast(usize, proof.bytes) orelse return error.InvalidDocumentContentAuthority, ranges) else proof.bytes;
+                // Covered values avoid I/O, but still consume the caller's
+                // logical output window. Preserve single-value soft limits.
+                const cost = @max(selected_bytes, physical_cost);
                 if (count != 0 and cost > limit -| retained) break;
                 retained +|= std.math.cast(usize, cost) orelse return error.InvalidDocumentContentAuthority;
-                const output = try a.alloc(projection.FieldValue, selected_count);
-                const values = try a.alloc([]const u8, selected_count);
-                const hashes = try a.alloc([32]u8, selected_count);
-                slot = 0;
-                for (fields) |name| if (directory.find(name)) |field| {
-                    output[slot] = .{ .name = field.name, .value = undefined };
-                    hashes[slot] = field.digest;
-                    slot += 1;
-                };
-                prepared[count] = .{ .fields = output, .ranges = ranges, .values = values, .hashes = hashes };
-                if (selected_count != 0) {
-                    requests[request_count] = .{ .key = physical, .ranges = ranges, .output = values };
+                const output = try a.alloc(projection.FieldValue, selection.fields.len);
+                const values = try a.alloc([]const u8, selection.fields.len);
+                const read_values = if (ranges.len == values.len) values else try a.alloc([]const u8, ranges.len);
+                for (selection.fields, output) |field, *item| item.* = .{ .name = field.name, .value = undefined };
+                prepared[count] = .{ .fields = output, .selection = selection, .directory = directory, .values = values, .read_values = read_values };
+                if (ranges.len != 0) {
+                    requests[request_count] = .{ .key = physical, .ranges = ranges, .output = read_values };
                     request_count += 1;
                 }
             }
@@ -41771,12 +41768,19 @@ pub const DB = struct {
             }.less);
             scope.getRangesMany(requests[0..request_count]) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
             for (prepared[0..count], self.sources[0..count]) |item, *source| {
-                if (!item.duplicate) for (item.values, item.hashes, item.fields) |value, hash, *field| {
-                    var digest: [32]u8 = undefined;
-                    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
-                    if (!std.mem.eql(u8, &digest, &hash)) return error.InvalidDocumentContentAuthority;
-                    field.value = value;
-                };
+                if (!item.duplicate) {
+                    var read_slot: usize = 0;
+                    for (item.selection.fields, item.values, item.fields) |selected, *value, *field| {
+                        if (item.directory.covered(selected)) |covered| value.* = covered else {
+                            value.* = item.read_values[read_slot];
+                            read_slot += 1;
+                        }
+                        var digest: [32]u8 = undefined;
+                        std.crypto.hash.sha2.Sha256.hash(value.*, &digest, .{});
+                        if (!std.mem.eql(u8, &digest, &selected.digest)) return error.InvalidDocumentContentAuthority;
+                        field.value = value.*;
+                    }
+                }
                 source.* = .{ .fields = item.fields };
             }
             self.window.bytes = retained;
@@ -42118,6 +42122,8 @@ pub const DB = struct {
     /// Final scalar projection shares one pinned transaction per bounded window.
     fn hydrateFieldProjection(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {
         const protocol = @import("../../api/field_projection.zig");
+        var profile_native_views: @import("field_projection_source.zig").NativeViewProfile = .{ .enabled = platform.env.getenvBool("ANTFLY_BENCH_SOURCE_REUSE") };
+        defer profile_native_views.finish();
         var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer arena.deinit();
         const borrowed = if (req.field_projection_plan) |shared| shared.get(req.field_projection_json) else null;
@@ -42164,16 +42170,18 @@ pub const DB = struct {
                 defer row.deinit();
                 if (try source_batch.at(&txn, i, keys[0 .. end - start], ids[0 .. end - start], authorities.rows[0 .. end - start], req, &operands)) |prepared| row.attach(prepared);
                 const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
-                const encoded = try plan.evaluateEncoded(a, alloc, row.source(), previous, protocol.requestLimits(&req));
+                const evaluated = try plan.evaluateRetained(a, alloc, row.source(), previous, protocol.requestLimits(&req), req.field_projection_value_views);
+                profile_native_views.observe(row, evaluated.receipt);
+                const encoded = evaluated.bytes;
                 errdefer alloc.free(encoded);
-                const receipt = if (previous == null) try plan.ownValidatedReceipt(alloc, encoded) else null;
-                errdefer if (receipt) |owned| alloc.destroy(owned);
+                const receipt = evaluated.receipt;
+                errdefer if (receipt) |owned| owned.deinit(alloc);
                 const source = try row.base(alloc);
                 if (row.metadata_hits != 0) metadata_rows += 1 else fallback_rows += 1;
                 if (row.certificate_hits != 0) certificate_rows += 1;
                 hit.clearSource(alloc);
                 if (hit.computed_json) |bytes| alloc.free(bytes);
-                if (hit.computed_receipt) |owned| alloc.destroy(owned);
+                if (hit.computed_receipt) |owned| owned.deinit(alloc);
                 hit.computed_json = encoded;
                 hit.computed_receipt = receipt;
                 hit.stored_data = source;
@@ -42197,6 +42205,8 @@ pub const DB = struct {
         if (req.document_authority_mode == .none) return;
         if (req.document_output_allocator != null and req.document_authority_mode != .hydrate) return error.InvalidQueryRequest;
         const scalar = @import("../../api/field_projection.zig");
+        var profile_native_views: @import("field_projection_source.zig").NativeViewProfile = .{ .enabled = platform.env.getenvBool("ANTFLY_BENCH_SOURCE_REUSE") };
+        defer profile_native_views.finish();
         var scalar_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer scalar_arena.deinit();
         const native_json = if (schema_view) |view| view.tableSchema().storage_mode != .relational and view.tableSchema().external_base_source == null else true;
@@ -42209,8 +42219,6 @@ pub const DB = struct {
         defer if (scalar_public_plan) |*plan| plan.deinit();
         const scalar_operands = if (scalar_plan) |plan| try @import("field_projection_source.zig").OperandPlans.init(scalar_arena.allocator(), plan) else null;
         var scalar_authorities: @import("../conditional_source.zig").Window = .{};
-        var scalar_batch = @import("field_projection_source.zig").Batch.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
-        defer scalar_batch.deinit();
         var scalar_metadata_rows: usize = 0;
         var scalar_certificate_rows: usize = 0;
         var scalar_fallback_rows: usize = 0;
@@ -42225,6 +42233,10 @@ pub const DB = struct {
         defer projection_scratch.deinit();
         var primary_window = DocumentPrimaryReadWindow.init(alloc);
         defer primary_window.deinit();
+        // Borrowed scalar scopes must retire before their parent transaction
+        // and before either metadata or projection scratch is released.
+        var scalar_batch = @import("field_projection_source.zig").Batch.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer scalar_batch.deinit();
         var physical: [64][]const u8 = undefined;
         var ids: [64][]const u8 = undefined;
         var contents: [64]?@import("../document_mutation_revision.zig").Content = undefined;
@@ -42240,6 +42252,7 @@ pub const DB = struct {
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             // Apply-shared fences ordinary reads; captured dense reads fork
             // the original visibility cut. Retire page scratch every 64 hits.
+            if (index % 64 == 0) scalar_batch.reset();
             if (index != 0 and index % 64 == 0) {
                 primary_window.retire();
                 read.?.abort();
@@ -42247,7 +42260,6 @@ pub const DB = struct {
                 read = if (pinned) |captured_read| try captured_read.forkRead() else try self.core.store.beginReadTxn();
             }
             if (index % 64 == 0) {
-                scalar_batch.reset();
                 if (!metadata_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = metadata_scratch.reset(.free_all);
                 const m = metadata_scratch.allocator();
                 const count = @min(@as(usize, 64), result.hits.len - index);
@@ -42321,13 +42333,15 @@ pub const DB = struct {
                     if (try scalar_batch.at(&read.?, index % 64, physical[0..count], ids[0..count], scalar_authorities.rows[0..count], req, operands)) |prepared| row.attach(prepared);
                 };
                 const previous = if (hit.computed_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) else null;
-                const encoded = try plan.evaluateEncoded(a, alloc, row.source(), previous, scalar.requestLimits(&req));
+                const evaluated = try plan.evaluateRetained(a, alloc, row.source(), previous, scalar.requestLimits(&req), req.field_projection_value_views);
+                profile_native_views.observe(row, evaluated.receipt);
+                const encoded = evaluated.bytes;
                 errdefer alloc.free(encoded);
-                const receipt = if (previous == null) try plan.ownValidatedReceipt(alloc, encoded) else null;
-                errdefer if (receipt) |owned| alloc.destroy(owned);
+                const receipt = evaluated.receipt;
+                errdefer if (receipt) |owned| owned.deinit(alloc);
                 const source = try row.base(body_allocator);
                 if (hit.computed_json) |bytes| alloc.free(bytes);
-                if (hit.computed_receipt) |owned| alloc.destroy(owned);
+                if (hit.computed_receipt) |owned| owned.deinit(alloc);
                 hit.computed_json = encoded;
                 hit.computed_receipt = receipt;
                 if (row.metadata_hits != 0) scalar_metadata_rows += 1 else scalar_fallback_rows += 1;
