@@ -120,3 +120,16 @@ test('point dependency lifecycle and immutable reuse counters remain diagnostic 
  const value=sanitizeTailEvent({outcome:'ok',logs:[{message:[JSON.stringify({event:'antfly.point_dependency',point_dependency_gets:1,point_dependency_reserved_bytes:4096,io_draining:true,io_lifecycle_id:'01234567-0123-4567-89ab-0123456789ab'})]}]});
  assert.ok(JSON.stringify(value).includes('antfly.point_dependency'));assert.ok(JSON.stringify(value).includes('point_dependency_gets'));
 });
+
+test('cold phase diagnostics retain scoped timings and classify provider memory errors without secrets',()=>{
+ const value=sanitizeTailEvent({outcome:'exception',logs:[{message:[JSON.stringify({event:'antfly.trace',scope:'resident:lookup',spans:[{name:'bootstrap_decode',duration_ms:7},{name:'bootstrap_serving_import_native',duration_ms:5}]}),JSON.stringify({event:'antfly.durable_storage_error',phase:'put_intent',error_message:'SQLITE_NOMEM credential=secret',token:'secret'})]}]});
+ const logs=value.logs.map(l=>JSON.parse(l.message[0]));assert.equal(logs[0].scope,'resident:lookup');assert.equal(logs[0].spans[0].name,'bootstrap_decode');assert.equal(logs[1].phase,'put_intent');assert.equal(logs[1].error_message,'SQLITE_NOMEM');assert.ok(!JSON.stringify(value).includes('secret'));
+});
+
+test('cold cohort diagnostics preserve only bounded caller UUIDs',()=>{
+ const id='01234567-0123-4567-89ab-0123456789ab',safe=sanitizeTailEvent({logs:[{message:[JSON.stringify({event:'antfly.operation',trace_ids:[id,'secret'],resident_cohort_trace_ids:[id,'secret']})]}]});const value=JSON.parse(safe.logs[0].message[0]);assert.deepEqual(value.trace_ids,[id]);assert.deepEqual(value.resident_cohort_trace_ids,[id]);
+});
+
+test('sanitized phase traces preserve platform resource flags',()=>{
+ const safe=sanitizeTailEvent({logs:[{message:[JSON.stringify({event:'antfly.trace',scope:'resident:lookup',errors:[{phase:'resident',resource_limit:'memory',remote:true,retryable:false}]})]}]});const row=JSON.parse(safe.logs[0].message[0]);assert.equal(row.errors[0].resource_limit,'memory');assert.equal(row.errors[0].remote,true);
+});

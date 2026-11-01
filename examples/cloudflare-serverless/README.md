@@ -821,3 +821,24 @@ to `dist/qualification/shared-pipeline-lab/before/` before comparing. See
 login, per-user mailboxes, Email Worker ingestion, private R2 attachments, Antfly
 search and a durable Cloudflare Email Service outbox. Its configuration and
 local captured-mail tests do not alter these operator or qualification profiles.
+
+### Small cold-bootstrap diagnostic pilot
+
+The [cold serving design](../../docs/design/cold-serving-bootstrap.md) records
+phase attribution, the prepare-once bootstrap implementation, retained negative
+results and the distinction between actor reconstruction and physical cold starts.
+`qualification/cold-pilot.mjs` supports `prepare ACCOUNT_ID`, then `seal`, `deploy`,
+`upload-token`, `seed`, `restart`, `read`, `tail ROLE`, and `cleanup`, each taking
+the generated `run.json` path. Start bounded sanitized tails before seeding. It
+uses four disposable split Workers, three actor namespaces and one R2 bucket,
+with explicit publication and no queues or recurring maintenance. Keep the
+credential file private. Cleanup retains reports and removes the test token.
+
+This is a diagnostic tool, not the full gate: all response versions must match,
+all reconstructed actor identities must change, and bodies/fences must remain
+correct. Tail cannot establish exhaustive resource-error coverage. Run local
+latency comparisons without competing builds, deployments or test suites; retain
+failed/mixed-version populations instead of treating a later retry as a clean run.
+The `--control-report=PATH` local latency option reuses and hash-checks saved
+`serving-durable` bundles and exact bindings; it does not select or alter the
+approved hosted control.

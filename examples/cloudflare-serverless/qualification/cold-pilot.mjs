@@ -1,0 +1,79 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import{readFile,writeFile,mkdir,appendFile,readdir,unlink}from'node:fs/promises';
+import{resolve,join}from'node:path';import{createHash,randomBytes}from'node:crypto';
+import{spawn,execFileSync}from'node:child_process';import assert from'node:assert/strict';
+import{tailFrames}from'./metrics-tail.mjs';
+const[action,path]=process.argv.slice(2),root=process.cwd(),cli=resolve('node_modules/wrangler/bin/wrangler.js'),roles=['writer','reader','builder','app'];
+const save=run=>writeFile(join(run.dir,'run.json'),JSON.stringify(run,null,2));
+const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+async function command(run,args,input){
+ const result=await new Promise((ok,no)=>{const child=spawn(process.execPath,[cli,...args],{env:{...process.env,WRANGLER_SEND_METRICS:'false'},stdio:['pipe','pipe','pipe']});let output='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>output+=b);child.on('error',no);child.on('close',code=>ok({code,output}));child.stdin.end(input);});
+ await appendFile(join(run.dir,'lifecycle.log'),result.output);if(result.code)throw Error('PilotCommandFailed:'+args[0]+': see lifecycle.log');return result.output;
+}
+if(action==='prepare'){
+ if(!/^[a-f0-9]{32}$/.test(path??''))throw Error('AccountRequired');
+ const id='antfly-1278-cold-'+Date.now().toString(36)+'-'+randomBytes(2).toString('hex'),dir=resolve('dist/qualification',id);await mkdir(dir,{recursive:true});
+ const incarnation='qualification-'+id,names=Object.fromEntries(roles.map(role=>[role,id+(role==='app'?'':'-'+role)]));
+ const vars={ANTFLY_INCARNATION:incarnation,ANTFLY_TENANTS:JSON.stringify(Object.fromEntries(['a','b','c','d'].map(t=>[t,{incarnation:incarnation+'-'+t,storage_id:incarnation+'-'+t}]))),COORDINATOR_BACKEND:'r2',SPLIT_RUNTIME:'true',AUTO_GC:'false',READERS_PER_TENANT:'2',PAGED_TEXT:'true',PAGED_PROJECTIONS:'true',PUBLICATION_RECORDS:'64',LOG_METRICS:'true',METADATA_ROOT_BACKEND:'bounded-journal',NATIVE_READ_AFFINITY:'false',DETACHED_METADATA_PROOFS:'false',WAL_DOCUMENT_INDEX:'false'};
+ for(const key of['DIRECT_READS','LOCAL_METADATA_READS','INLINE_METADATA_ROOTS','WAL_INLINE_TAIL','FENCED_READ_LEASES','NATIVE_WRITE_PLAN','NATIVE_READ_PLAN','NATIVE_READ_DETACHED','FUSED_READ_ADMISSION','NATIVE_READ_STATE','FOREGROUND_CACHE_POLICY','OPPORTUNISTIC_READ_PREPARE','PUBLICATION_CONTINUATIONS','PUBLICATION_PREPARED_SLICES','PUBLICATION_ADAPTIVE_SLICES','CANONICAL_POINT_BODIES','POINT_READ_BLOCKS','WAL_PACKED_PAGES','WAL_DEFERRED_INDEXES','RESIDENT_COLD_PIPELINE','RESIDENT_DURABLE_BOOTSTRAP','RESIDENT_SERVING','RESIDENT_READ_STATE','RESIDENT_MVCC','RESIDENT_SHARED_KERNELS','RESIDENT_BOOTSTRAP','RESIDENT_READ_COHORTS','RESIDENT_FETCH_COALESCE','NATIVE_METADATA_CONTINUATIONS','NATIVE_POINT_CONTINUATIONS'])vars[key]='true';
+ const appSource=`import app from ${JSON.stringify(resolve('qualification/worker.mjs'))};import{configureKernels}from ${JSON.stringify(resolve('kernels.mjs'))};import{tenantEnv}from ${JSON.stringify(resolve('tenants.mjs'))};configureKernels('app');export default{...app,async fetch(request,env,ctx){if(new URL(request.url).pathname!=='/_qualification/cold-state')return app.fetch(request,env,ctx);if(request.method!=='POST'||!env.API_TOKEN||request.headers.get('Authorization')!=='Bearer '+env.API_TOKEN)return new Response('unauthorized',{status:401});const input=await request.json(),states=[];for(const t of['a','b','c','d']){const e=tenantEnv(env,t);states.push({tenant:t,...await e.COMMITS.getByName(e.ANTFLY_INCARNATION).pilotState(input.checkpoint===true)});}return Response.json({version:env.WORKER_VERSION?.id,states});}};`;
+ const writerSource=`import{R2CommitCoordinator as Base}from ${JSON.stringify(resolve('r2-coordinator.mjs'))};import{configureKernels,kernelMetrics}from ${JSON.stringify(resolve('kernels.mjs'))};configureKernels('writer');export class R2CommitCoordinator extends Base{constructor(ctx,env){super(ctx,env);this.pilotInstance=crypto.randomUUID();}async pilotState(checkpoint){const result=checkpoint?await this.checkpointDurableServing():null;return{instance:this.pilotInstance,version:this.env.WORKER_VERSION?.id,checkpoint:result,clean:this.store.durableBootstrap?.entry?.dirty===false,active:this.store.ioDrain===true,checkpoint_pending:!!this.store.durableCheckpoint?.pending,kernels:kernelMetrics()};}}export default{fetch(){return new Response('private',{status:404});}};`;
+ const services=[];
+ for(const role of roles){
+  const config=JSON.parse(await readFile('wrangler.split-'+role+'.jsonc'));Object.assign(config,{name:names[role],account_id:path,vars,observability:{enabled:true,head_sampling_rate:1}});delete config.queues;delete config.triggers;delete config.ai;delete config.assets;config.r2_buckets[0].bucket_name=id;
+  for(const b of config.durable_objects.bindings)if(b.script_name)b.script_name=names[{COMMITS:'writer',READERS:'reader',BUILDERS:'builder'}[b.name]];
+  const entry=join(dir,role+'.mjs');await writeFile(entry,role==='app'?appSource:role==='writer'?writerSource:`export{default,${role==='reader'?'R2ReadRuntime':'R2BuildRuntime'}}from ${JSON.stringify(resolve(role+'-worker.mjs'))};`);
+  config.main=entry;const configPath=join(dir,role+'.json');await writeFile(configPath,JSON.stringify(config,null,2));services.push({role,name:names[role],entry,config:configPath});
+ }
+ const run={schema:1,kind:'cold-pilot-not-gate',qualification:false,id,account:path,dir,bucket:id,services,token_file:join(dir,'api-token'),source:{revision:execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),dirty:!!execFileSync('git',['status','--porcelain'],{encoding:'utf8'}).trim()},limits:['4 tenants, 64 documents each, 3 points per tenant per restart','manual publication; no queue, recurring maintenance or full mixed-load qualification','redeployment proves actor reconstruction, not independent physical cold isolates','Tail is diagnostic and may be dropped or sampled; no full gate coverage claim']};
+ await writeFile(run.token_file,randomBytes(32).toString('hex'),{mode:0o600});await save(run);console.log(join(dir,'run.json'));process.exit(0);
+}
+const run=JSON.parse(await readFile(resolve(path)));if(run.schema!==1||run.kind!=='cold-pilot-not-gate'||!/^antfly-1278-cold-[a-z0-9]+-[a-f0-9]{4}$/.test(run.id)||run.bucket!==run.id||resolve(run.dir)!==resolve('dist/qualification',run.id)||!/^[a-f0-9]{32}$/.test(run.account))throw Error('PilotScopeMismatch');
+assert.equal(run.token_file,join(run.dir,'api-token'));assert.deepEqual(run.services.map(s=>s.role),roles);if(run.deleted&&action!=='cleanup')throw Error('PilotAlreadyDeleted');
+for(const s of run.services){assert.equal(s.name,run.id+(s.role==='app'?'':'-'+s.role));assert.equal(s.config,join(run.dir,s.role+'.json'));const config=JSON.parse(await readFile(s.config));assert.equal(config.name,s.name);assert.equal(config.account_id,run.account);assert.equal(config.r2_buckets[0].bucket_name,run.id);assert.equal(config.queues,undefined);assert.equal(config.triggers,undefined);}
+const app=run.services.find(s=>s.role==='app');
+async function verify(){for(const s of run.services){assert.equal(hash(await readFile(s.config)),run.seal[s.role].config,'PilotConfigChanged');for(const[name,expected]of Object.entries(run.seal[s.role].files))assert.equal(hash(await readFile(join(run.dir,'bundle-'+s.role,name))),expected,'PilotBundleChanged');}}
+async function deploy(s){const output=await command(run,['deploy','--no-bundle','--config',s.config]),version=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];if(!version)throw Error('PilotVersionMissing');run.versions??={};run.versions[s.role]=version;if(s.role==='app'){run.origin=/https:\/\/[^\s]+\.workers\.dev/.exec(output)?.[0];if(!run.origin||!new URL(run.origin).hostname.startsWith(run.id+'.'))throw Error('PilotOriginMismatch');}await save(run);}
+async function call(input,pathname='/api',tenant='a'){
+ const token=(await readFile(run.token_file,'utf8')).trim(),started=performance.now();let response;try{response=await fetch(new URL(pathname,run.origin),{method:'POST',headers:{Authorization:'Bearer '+token,'X-Antfly-Tenant':tenant},body:JSON.stringify(input),signal:AbortSignal.timeout(60000)});}catch(error){await appendFile(join(run.dir,'requests.jsonl'),JSON.stringify({at:new Date().toISOString(),tenant,op:input.op??pathname,status:null,ms:performance.now()-started,error:error.name??'Error'})+'\n');throw error;}const value=await response.json();const sample={status:response.status,ms:performance.now()-started,trace_id:response.headers.get('X-Antfly-Trace-Id'),version:response.headers.get('X-Antfly-Version'),value};
+ await appendFile(join(run.dir,'requests.jsonl'),JSON.stringify({at:new Date().toISOString(),tenant,op:input.op??pathname,...sample})+'\n');assert.equal(response.status,200,JSON.stringify(value));return sample;
+}
+if(action==='seal'){
+ run.seal={};for(const s of run.services){const out=join(run.dir,'bundle-'+s.role);await command(run,['deploy','--dry-run','--config',s.config,'--outdir',out]);const files={};for(const name of await readdir(out))if(/\.(js|wasm)$/.test(name))files[name]=hash(await readFile(join(out,name)));const entries=Object.keys(files).filter(n=>n.endsWith('.js'));assert.equal(entries.length,1);const c=JSON.parse(await readFile(s.config));c.main=join(out,entries[0]);await writeFile(s.config,JSON.stringify(c,null,2));const configBytes=await readFile(s.config);await writeFile(join(run.dir,'sealed-config-'+s.role+'.json'),configBytes);run.seal[s.role]={config:hash(configBytes),files};}await save(run);
+}else if(action==='deploy'){
+ await verify();await command(run,['r2','bucket','create',run.id,'--config',app.config]);run.bucket_created=true;await save(run);for(const s of run.services)await deploy(s);run.deployed=true;await save(run);
+}else if(action==='upload-token'){
+ await verify();assert.ok(run.deployed);const token=(await readFile(run.token_file,'utf8')).trim();assert.match(token,/^[a-f0-9]{64}$/);await command(run,['secret','put','API_TOKEN','--config',app.config],token);run.token_installed=true;await save(run);
+}else if(action==='seed'){
+ await verify();assert.ok(!run.seeded);const receipts={};for(const tenant of['a','b','c','d']){const value=await call({op:'mutate',operation_id:'seed',mutations:Array.from({length:64},(_,i)=>({kind:'upsert',doc_id:'doc/'+i,body:JSON.stringify({tenant,i,payload:'x'.repeat(1024)})}))},'/api',tenant);receipts[tenant]=value.value.visibility;for(let step=0;;step++){assert.ok(step<128);if(!(await call({op:'publish'},'/api',tenant)).value.has_more)break;}}run.receipts=receipts;run.seeded=true;await save(run);console.log(JSON.stringify((await call({checkpoint:true},'/_qualification/cold-state')).value));
+}else if(action==='restart'){
+ await verify();const before=(await call({checkpoint:true},'/_qualification/cold-state')).value;assert.ok(before.states.every(s=>s.clean&&!s.checkpoint_pending),'PilotCheckpointNotClean');run.before=before;await save(run);await deploy(run.services.find(s=>s.role==='writer'));await deploy(app);console.log('Redeployed app and writer; next reads are timed without a state warmup.');
+}else if(action==='read'){
+ await verify();const samples=await Promise.all(['a','b','c','d'].flatMap(tenant=>[1,2,3].map(async id=>{const s=await call({op:'lookup',doc_id:'doc/'+id,required_visibility:run.receipts[tenant],fresh:true},'/api',tenant);assert.equal(s.value.body,JSON.stringify({tenant,i:id,payload:'x'.repeat(1024)}));assert.ok(BigInt('0x'+s.value.visibility.slice(-16))>=BigInt('0x'+run.receipts[tenant].slice(-16)));return{tenant,id,ms:s.ms,trace_id:s.trace_id,version:s.version};})));const after=(await call({},'/_qualification/cold-state')).value;
+ const expected_reconstruction=!!run.before,reconstructed=expected_reconstruction&&after.states.every(s=>s.instance!==run.before.states.find(b=>b.tenant===s.tenant).instance),versions_match=samples.every(s=>s.version===run.versions.app)&&after.version===run.versions.app&&after.states.every(s=>s.version===run.versions.writer);run.reads??=[];run.reads.push({at:new Date().toISOString(),reconstruction_requested:expected_reconstruction,reconstructed,versions_match,expected_versions:{...run.versions},samples,after});delete run.before;await save(run);console.log(JSON.stringify({qualification:false,reconstructed,versions_match,samples}));assert.ok(!expected_reconstruction||reconstructed,'PilotActorDidNotRestart');assert.ok(versions_match,'PilotRolloutVersionMismatch');
+}else if(action==='tail'){
+ const role=process.argv[4],s=run.services.find(s=>s.role===role);assert.ok(s);const file=join(run.dir,'tail-'+role+'.jsonl'),child=spawn(process.execPath,[cli,'tail',s.name,'--config',s.config,'--format','json'],{env:{...process.env,WRANGLER_SEND_METRICS:'false'},stdio:['ignore','pipe','ignore']});
+ let queue=Promise.resolve(),bytes=0;const parse=tailFrames(safe=>{const line=JSON.stringify({received_at:new Date().toISOString(),...safe})+'\n';bytes+=Buffer.byteLength(line);if(bytes>32*1024*1024){child.kill('SIGTERM');return;}queue=queue.then(()=>appendFile(file,line));});child.stdout.setEncoding('utf8');child.stdout.on('data',parse);await appendFile(file,JSON.stringify({connection_started:new Date().toISOString()})+'\n');for(const signal of['SIGINT','SIGTERM'])process.on(signal,()=>child.kill(signal));const exit_code=await new Promise((ok,no)=>{child.on('error',no);child.on('close',ok);});await queue;await appendFile(file,JSON.stringify({connection_ended:new Date().toISOString(),exit_code,bounded_diagnostic_only:true})+'\n');
+}else if(action==='cleanup'){
+ // Only this manifest's disposable stack. Stop private actors before draining.
+ run.cleanup??={};const step=async(name,fn)=>{if(run.cleanup[name])return;await fn();run.cleanup[name]=true;await save(run);};
+ await step('detach',async()=>{const c=JSON.parse(await readFile(app.config));c.main=resolve('qualification/drain-worker.mjs');c.durable_objects.bindings=[];await writeFile(app.config,JSON.stringify(c,null,2));await command(run,['deploy','--no-bundle','--config',app.config]);});
+ for(const role of['builder','reader','writer'])await step('delete-'+role,()=>command(run,['delete','--force','--config',run.services.find(s=>s.role===role).config]));
+ await step('quiescence',()=>new Promise(ok=>setTimeout(ok,31000)));
+ await step('drain',async()=>{for(let page=0;page<1000;page++)if((await call({},'/_qualification/drain')).value.done)return;throw Error('PilotDrainExceeded');});
+ await step('delete-app',()=>command(run,['delete','--force','--config',app.config]));await step('delete-bucket',()=>command(run,['r2','bucket','delete',run.id,'--config',app.config]));await unlink(run.token_file).catch(e=>{if(e.code!=='ENOENT')throw e;});run.deleted=true;await save(run);
+}else throw Error('UnknownPilotAction');

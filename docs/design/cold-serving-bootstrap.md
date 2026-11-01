@@ -348,3 +348,123 @@ python3 -B qualification/prune-local-artifacts.py
 python3 -B qualification/prune-local-artifacts.py --apply
 python3 -B test/prune-local-artifacts.test.py
 ```
+
+## Cold-path phase attribution and hosted diagnostic pilot
+
+The follow-up instruments authority lookup, provider-local storage loading,
+bootstrap import/queue/instantiation, owner admission, cut hashing and bootstrap
+preparation. Spans share trace IDs across services and retain local durations;
+never subtract clock offsets across isolates or sum nested spans. With metrics
+enabled, API responses include `X-Antfly-Trace-Id`. The local experiment correlates
+this with the HTTP trace and records `client_outside_http_trace_ms`: this includes
+client/runtime dispatch, transport, startup and response handling, **not solely
+platform startup**.
+
+Instrumented baseline `09c259f11c` identified repeated gzip decoding and validation
+of the same committed headers on continuation frontiers: twelve decodes for four
+cold cohorts. Runtime change `8737fa541e` adds shared object-store
+`CommittedHeaders.prepare`, returning a factory containing owned immutable bytes.
+Each captured read prepares once, then creates context-local transports from that
+factory. It retains no request handles or shared decode promises. Every returned
+body remains an independent copy; namespace/version/ETag/range/size validation and
+original compressed/plaintext bounds remain enforced. The compatibility `wrap`
+API retains its lazy compressed path and synchronous envelope/plaintext checks.
+No authority, publication format, resource budget, freshness rule or gate target
+changes. This is usable by other JavaScript object-store adapters as well.
+
+A new local control mode uses the **original saved role bundles**, verifies their
+module/bundle hashes and exact bindings, and records their original source
+provenance. It is not the approved hosted control and does not replace its bytes.
+Modules now reside once in an immutable SHA-addressed local store with hard links
+for case-local evidence. Mutable build output is copied, never hard-linked into
+that store. Repeated qualification no longer creates a full WASM copy per case.
+
+Sixteen local paired cases, both orders, retain **3,328 reads, 832 writes and 96
+additional reconstruction reads**. Independent auditing verifies 112 case-local
+module/bundle hashes and successful body/fence/resource/settlement checks. Decoding
+falls from twelve to four per cold population. These runs are **exploratory**:
+the machine was also running other worktrees' Zig/Go builds and tests, and hosted
+deployment work overlapped part of the matrix. A captured load average was about
+92. Preserve the negative warm result; do not claim a passed latency guard.
+
+| Exploratory p95 in ms, both orders | Instrumented control | Prepare once |
+| --- | ---: | ---: |
+| Cold, 64 documents/tenant | 504–691 | 436–745 |
+| Cold, 512 documents/tenant | 706–758 | 530–685 |
+| Mixed after cold, 64 read / write | 166–168 / 397–406 | 162–165 / 411–412 |
+| Mixed after cold, 512 read / write | 223–227 / 360–367 | 217 / 354–356 |
+| Warm 512, 32 rounds, read / write | 167–168 / 199–219 | 178–584 / 213–597 |
+| Offered 32 reads/s, read / write | 70–78 / 136–144 | 78 / 147–166 |
+
+Local import's first native invocation is about 21–25 ms and WASM instantiation
+is at most 2 ms in the initial baseline. The smaller headers change cannot
+explain hundreds of milliseconds of startup variation. Module compilation before
+handler execution is outside those instantiation spans. The hosted deployments'
+Wrangler-reported Worker Startup Time is 2–5 ms for the measured application
+versions; this is another platform metric, not end-to-end cold latency. There is
+no measured justification here for introducing another specialized native module.
+First resolve transport/owner placement, startup attribution and reproducible
+latency guards; keep the existing 8 MiB point lane and precise capacity promotion.
+
+### Small live pilot, not qualification
+
+`qualification/cold-pilot.mjs` prepares and seals four split Workers and a single
+R2 bucket. It enables the same durable native-bootstrap profile without queues,
+cron jobs or automatic GC; publication is explicit. Scope validation fixes the
+account, disposable names, token path and service roles. Sealed configuration
+snapshots and bundles are hash-checked before actions. It captures sanitized Tail
+journals, request outcomes, version headers, caller/cohort UUIDs, actor identities
+and pool diagnostics. Tokens and request headers are excluded from telemetry.
+
+The pilot `antfly-1278-cold-mvx4qaij-9563` seeds four tenants with 64 documents each
+and checks bodies plus fresh visibility fences on **60 point reads**: twelve
+initial reads and four batches of twelve after app/writer redeployment. One
+reconstruction batch returned **mixed old/new app versions**; it remains recorded
+and is rejected as a qualifying cold population. The driver now requires all
+response/state versions to match the expected deployment. Redeployment proves
+observed actor reconstruction, not independent physical cold Worker isolates.
+
+The three version-consistent reconstructed batches have client p95 **1,283–1,304
+ms**. The final strict batch correlates all twelve client trace IDs with both
+HTTP and owner/cohort telemetry and the expected app/writer versions. Its HTTP
+trace durations are 410–969 ms, versus client durations 947–1,302 ms. Differences
+include connection setup, edge routing, dispatch and response handling; these
+are not measurements of R2 or native CPU alone. Available journals contain no
+non-OK outcomes, truncated events, resource failures or durable-storage/checkpoint
+errors. Maximum observed WASM pool linear memory is **19,660,800 bytes**, excluding
+JavaScript/platform/SQLite memory. Tail remains diagnostic and may be dropped or
+sampled; the original whole-window independent-coverage gate is not satisfied.
+
+Cloudflare [documents](https://developers.cloudflare.com/workers/runtime-apis/performance/)
+that its timers only advance after I/O. CPU-only spans can therefore report zero;
+use Tail invocation CPU time as an
+invocation-wide measurement; a zero native-import duration does not mean zero
+CPU. New telemetry preserves the existing platform memory/CPU flags and bounded
+caller UUID arrays while redacting arbitrary messages and credentials.
+
+After capture, the cleanup driver detaches the app, stops private actors, waits
+for quiescence and drains R2 through the standalone cleanup Worker until an empty
+invocation. All four Workers and the bucket were deleted; the disposable token
+was removed. Read-only follow-up checks receive explicit missing-Worker errors
+for each name. No queues or observability destinations were created. This is a
+scoped cleanup receipt, not an account-wide billing audit.
+
+Local evidence is under `dist/qualification/cold-v5-phase/`, with per-case bundles
+and reports under `cold-v5-paired-*`. Live reports, sanitized journals, original
+sealed configurations, hash records and absence checks remain under
+`dist/qualification/antfly-1278-cold-mvx4qaij-9563/`. Older retention receipts and
+approved-control modules are untouched.
+
+The bootstrap implementation and diagnostic pilot are complete. **Isolated warm,
+burst and cold latency guards remain pending a quiet benchmark host.** Do not
+claim a twofold/tenfold improvement, a resolved historical `SQLITE_NOMEM`, or the
+full hosted gate. The next qualification must pin/reconcile every serving version,
+separate client and owner transit from native/storage work, and collect the
+original complete resource-error windows before expanding the workload.
+
+Validation for this follow-up: **587 Node tests and five targeted actual-workerd
+checks pass**, including v4/durable publication/reconstruction/freeze lifecycles,
+immutable-flight caller ownership, RPC-owned data and native point continuations.
+The WASM modules remain unchanged from the integrated native build above. Guarded
+`make gc` skips cleanup because other native builds are active; no caches used by
+those builds are forcibly removed.
