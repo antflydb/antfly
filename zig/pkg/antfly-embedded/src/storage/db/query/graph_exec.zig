@@ -2755,11 +2755,13 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
 pub const PreparedPatternFilter = struct {
     arena: std.heap.ArenaAllocator,
     compiled: CompiledPatternFilter,
+    selector: ?*const @import("json_projection_plan.zig").Selector,
 
     pub fn init(backing_alloc: Allocator, filter_query_json: []const u8) !PreparedPatternFilter {
         var out = PreparedPatternFilter{
             .arena = std.heap.ArenaAllocator.init(backing_alloc),
             .compiled = undefined,
+            .selector = null,
         };
         errdefer out.arena.deinit();
         const arena_alloc = out.arena.allocator();
@@ -2770,6 +2772,7 @@ pub const PreparedPatternFilter = struct {
             .{ .allocate = .alloc_always },
         );
         out.compiled = try compilePatternFilter(arena_alloc, filter_query);
+        out.selector = try out.compiled.selector(arena_alloc);
         return out;
     }
 
@@ -2777,6 +2780,7 @@ pub const PreparedPatternFilter = struct {
         var out = PreparedPatternFilter{
             .arena = std.heap.ArenaAllocator.init(backing_alloc),
             .compiled = undefined,
+            .selector = null,
         };
         errdefer out.arena.deinit();
         const arena_alloc = out.arena.allocator();
@@ -2784,6 +2788,7 @@ pub const PreparedPatternFilter = struct {
         // Compiled predicates must outlive the caller's JSON parser.
         const owned_filter_query = try owned_json.clone(arena_alloc, filter_query);
         out.compiled = try compilePatternFilter(arena_alloc, owned_filter_query);
+        out.selector = try out.compiled.selector(arena_alloc);
         return out;
     }
 
@@ -2798,6 +2803,15 @@ pub const PreparedPatternFilter = struct {
         key: []const u8,
         stored: []const u8,
     ) !bool {
+        const raw = std.mem.trim(u8, stored, " \r\n\t");
+        if (self.selector) |selector| if (raw.len != 0 and (raw[0] == '{' or raw[0] == '[')) {
+            var arena = std.heap.ArenaAllocator.init(scratch_alloc);
+            defer arena.deinit();
+            var view = JsonView.init(arena.allocator(), stored);
+            view.parse_numbers = true;
+            try view.prepareProjectionWithOptions(selector, .all, .any_container, .{ .defer_fanout = true });
+            return self.compiled.matchesWith(arena.allocator(), key, &view);
+        };
         var parsed = try std.json.parseFromSlice(std.json.Value, scratch_alloc, stored, .{});
         defer parsed.deinit();
         return try self.compiled.matches(scratch_alloc, key, parsed.value);
@@ -3443,7 +3457,40 @@ pub const CompiledPatternFilter = union(enum) {
         };
     }
 
+    fn selector(self: CompiledPatternFilter, a: Allocator) !?*const @import("json_projection_plan.zig").Selector {
+        var paths: std.ArrayListUnmanaged(@import("json_projection_plan.zig").Path) = .empty;
+        try self.collectPaths(a, &paths);
+        return @import("json_projection_plan.zig").compile(a, paths.items) catch |err| switch (err) {
+            error.InvalidQueryRequest => null,
+            else => return err,
+        };
+    }
+    fn collectPaths(self: CompiledPatternFilter, a: Allocator, paths: *std.ArrayListUnmanaged(@import("json_projection_plan.zig").Path)) anyerror!void {
+        switch (self) {
+            .match_all, .match_none, .doc_id => {},
+            .conjuncts, .disjuncts => |items| for (items) |item| try item.collectPaths(a, paths),
+            .bool_query => |query| {
+                for (query.must) |item| try item.collectPaths(a, paths);
+                for (query.should) |item| try item.collectPaths(a, paths);
+                for (query.must_not) |item| try item.collectPaths(a, paths);
+            },
+            .field_matcher => |matcher| {
+                const parts = switch (matcher.path) {
+                    .single => |name| parts: {
+                        const names = try a.alloc([]const u8, 1);
+                        names[0] = name;
+                        break :parts names;
+                    },
+                    .dotted, .json_pointer => |parts| parts,
+                };
+                try paths.append(a, .{ .parts = parts });
+            },
+        }
+    }
     pub fn matches(self: CompiledPatternFilter, alloc: Allocator, key: []const u8, doc: std.json.Value) !bool {
+        return self.matchesWith(alloc, key, doc);
+    }
+    fn matchesWith(self: CompiledPatternFilter, alloc: Allocator, key: []const u8, doc: anytype) anyerror!bool {
         return switch (self) {
             .match_all => true,
             .match_none => false,
@@ -3453,24 +3500,24 @@ pub const CompiledPatternFilter = union(enum) {
             },
             .conjuncts => |items| blk: {
                 for (items) |item| {
-                    if (!(try item.matches(alloc, key, doc))) break :blk false;
+                    if (!(try item.matchesWith(alloc, key, doc))) break :blk false;
                 }
                 break :blk true;
             },
             .disjuncts => |items| blk: {
                 for (items) |item| {
-                    if (try item.matches(alloc, key, doc)) break :blk true;
+                    if (try item.matchesWith(alloc, key, doc)) break :blk true;
                 }
                 break :blk false;
             },
             .bool_query => |bool_query| blk: {
                 for (bool_query.must) |item| {
-                    if (!(try item.matches(alloc, key, doc))) break :blk false;
+                    if (!(try item.matchesWith(alloc, key, doc))) break :blk false;
                 }
                 if (bool_query.min_should > 0) {
                     var matched: usize = 0;
                     for (bool_query.should) |item| {
-                        if (try item.matches(alloc, key, doc)) {
+                        if (try item.matchesWith(alloc, key, doc)) {
                             matched += 1;
                             if (matched >= bool_query.min_should) break;
                         }
@@ -3478,14 +3525,22 @@ pub const CompiledPatternFilter = union(enum) {
                     if (matched < bool_query.min_should) break :blk false;
                 }
                 for (bool_query.must_not) |item| {
-                    if (try item.matches(alloc, key, doc)) break :blk false;
+                    if (try item.matchesWith(alloc, key, doc)) break :blk false;
                 }
                 break :blk true;
             },
             .field_matcher => |matcher| blk: {
                 var values = std.ArrayListUnmanaged(std.json.Value).empty;
                 defer values.deinit(alloc);
-                try matcher.path.collectValues(alloc, doc, &values);
+                if (comptime @TypeOf(doc) == *JsonView) {
+                    const pointer = matcher.path == .json_pointer;
+                    const parts: []const []const u8 = switch (matcher.path) {
+                        .single => |name| &.{name},
+                        .dotted, .json_pointer => |parts| parts,
+                    };
+                    if (matcher.predicate == .exists) break :blk try doc.hasPath(parts, pointer);
+                    try doc.collect(parts, pointer, &values);
+                } else try matcher.path.collectValues(alloc, doc, &values);
                 break :blk try matcher.predicate.matches(alloc, values.items);
             },
         };
@@ -8037,4 +8092,82 @@ test "external lake temporal numeric ranges preserve timestamps beyond i64" {
     try std.testing.expect(try jsonValueMatchesStandardRange(.{ .integer = 0 }, lower, upper));
     try std.testing.expect(!try jsonValueMatchesStandardRange(.{ .number_string = "9223372036854775809" }, lower, upper));
     try std.testing.expect(!try jsonValueMatchesStandardRange(.{ .number_string = "-9223372036854775809" }, lower, upper));
+}
+
+test "prepared pattern filters borrow validated document spans with unchanged semantics" {
+    const a = std.testing.allocator;
+    const wide = try a.alloc(u8, 2 << 20);
+    defer a.free(wide);
+    @memset(wide, 'x');
+    const raw = try std.json.Stringify.valueAlloc(a, .{
+        .tenant = "acme",
+        .body = wide,
+        .payload = .{ .name = "gold", .body = wide, .number = @as(i64, 9007199254740993) },
+        .items = .{ .{ .name = "alpha", .body = wide }, .{ .name = "beta", .body = wide } },
+        .nil = @as(?u8, null),
+    }, .{});
+    defer a.free(raw);
+    var ordinary = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer ordinary.deinit();
+    for ([_][]const u8{
+        "{\"term\":{\"tenant\":\"acme\"}}",
+        "{\"term\":{\"payload.name\":\"gold\"}}",
+        "{\"term\":{\"/payload/number\":9007199254740993}}",
+        "{\"prefix\":{\"items.name\":\"al\"}}",
+        "{\"term\":{\"/items/1/name\":\"beta\"}}",
+        "{\"term\":{\"/items/01/name\":\"beta\"}}",
+        "{\"exists\":{\"field\":\"body\"}}",
+        "{\"exists\":{\"field\":\"nil\"}}",
+        "{\"exists\":{\"field\":\"missing\"}}",
+        "{\"bool\":{\"must\":[{\"term\":{\"tenant\":\"acme\"}}],\"should\":[{\"term\":{\"payload.name\":\"gold\"}}],\"minimum_should_match\":1,\"must_not\":[{\"term\":{\"tenant\":\"other\"}}]}}",
+    }) |query| {
+        var filter = try PreparedPatternFilter.init(a, query);
+        defer filter.deinit();
+        const expected = try filter.matchesJson(a, "a", ordinary.value);
+        var quota: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 128 << 10 };
+        try std.testing.expectEqual(expected, try filter.matchesStored(quota.allocator(), "a", raw));
+        try std.testing.expectEqual(@as(usize, 0), quota.live);
+        try std.testing.expect(quota.peak < 128 << 10);
+    }
+}
+
+test "prepared pattern filters borrow spans without hiding invalid documents" {
+    const a = std.testing.allocator;
+    var filter = try PreparedPatternFilter.init(a, "{\"term\":{\"tenant\":\"acme\"}}");
+    defer filter.deinit();
+    for ([_][]const u8{
+        "{\"tenant\":\"acme\",\"body\":{\"x\":1,\"x\":2}}",
+        "{\"tenant\":\"acme\",\"body\":1,\"body\":2}",
+    }) |raw| try std.testing.expectError(error.DuplicateField, filter.matchesStored(a, "a", raw));
+    try std.testing.expectError(error.SyntaxError, filter.matchesStored(a, "a", "{\"tenant\":\"acme\",\"body\":[}"));
+    var all = try PreparedPatternFilter.init(a, "{\"match_all\":{}}");
+    defer all.deinit();
+    try std.testing.expect(try all.matchesStored(a, "a", "42"));
+}
+
+test "prepared pattern filters borrow spans preserving parser failures and allocation cleanup" {
+    const a = std.testing.allocator;
+    var filter = try PreparedPatternFilter.init(a, "{\"term\":{\"tenant\":\"acme\"}}");
+    defer filter.deinit();
+    for ([_][]const u8{
+        "{\"tenant\":\"acme\",\"body\":\"\\uD800\"}",
+        "{\"tenant\":\"acme\",\"body\":\"\\uZZZZ\"}",
+        "{\"tenant\":\"acme\",\"body\":\"\xff\"}",
+        "{\"tenant\":\"acme\",\"body\":1e99999}",
+        "{\"tenant\":\"acme\",\"body\":18446744073709551616}",
+    }) |raw| {
+        var parsed = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch |expected| {
+            try std.testing.expectError(expected, filter.matchesStored(a, "a", raw));
+            continue;
+        };
+        defer parsed.deinit();
+        try std.testing.expectEqual(try filter.matchesJson(a, "a", parsed.value), try filter.matchesStored(a, "a", raw));
+    }
+    try std.testing.checkAllAllocationFailures(a, struct {
+        fn run(alloc: Allocator) !void {
+            var prepared = try PreparedPatternFilter.init(alloc, "{\"term\":{\"nested.tenant\":\"acme\"}}");
+            defer prepared.deinit();
+            try std.testing.expect(try prepared.matchesStored(alloc, "a", "{\"nested\":{\"tenant\":\"acme\",\"ignored\":[1,2,3]}}"));
+        }
+    }.run, .{});
 }

@@ -75,6 +75,24 @@ pub fn admits(graph: catalog.Graph, input: b.CountInput, node: *const @import("v
     for (input.node.labels) |name| if (!try graph.admits(node, name, work)) return false;
     return true;
 }
+/// A private count node exposes neither the full entity nor labels(). Keep
+/// catalog authorization separate from the membership actually observed here.
+pub fn membershipGraph(a: std.mem.Allocator, graph: catalog.Graph, input: b.CountInput, table: []const u8) !catalog.Graph {
+    if (!permitsTable(graph, input, table)) return error.Forbidden;
+    var local = graph;
+    var labels: std.ArrayList(catalog.Label) = .empty;
+    if (input.node.labels.len == 0) {
+        // One unconditional label certifies the entire physical-table union.
+        for (graph.labels) |label| if (std.mem.eql(u8, label.table, table) and label.predicate.len == 0) {
+            try labels.append(a, label);
+            local.labels = labels.items;
+            return local;
+        };
+        for (graph.labels) |label| if (std.mem.eql(u8, label.table, table)) try labels.append(a, label);
+    } else for (input.node.labels) |name| try labels.append(a, graph.label(name).?);
+    local.labels = labels.items;
+    return local;
+}
 fn alreadyBound(_: *anyopaque, _: std.mem.Allocator, _: catalog.Graph) !void {}
 pub fn run(a: std.mem.Allocator, backend: b.Backend, graph: catalog.Graph, table: []const u8, input: b.CountInput, work: ?b.Work) !?b.CountResult {
     if (!eligible(input)) return null;

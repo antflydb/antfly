@@ -5148,3 +5148,74 @@ The merge includes `origin/main` at `ef13a4ae03`. Its retained-cut test conflict
 keeps cold-cache admission pressure and pinned-cut validity checks without an
 allocator-dependent peak assertion. The focused retained-cut regression passes
 with no leaks (56/56 build steps).
+
+### Reusable count evaluation and borrowed document predicates
+
+Native owner COUNT keeps one scalar evaluator for its complete invocation.
+Invocation specialization gives immutable expressions stable identities, so
+parameter and literal membership domains are built lazily once and shared
+across records. Existing evaluation scopes still retire borrowed row metadata
+after each record; invariant byte pools use the invocation's budgeted backing
+allocator. Access planning and scalar evaluation share this state without
+evaluating failing expressions before visibility admits a record.
+
+Certified storage-authorized counts use a private membership graph containing
+only the labels observed by that reduction. Explicit labels retain conjunction
+semantics. An unconditional label certifies a table's complete unlabeled union;
+otherwise all same-table alternatives remain. The retained adapter authenticates
+and keeps the original catalog. Opaque projection authorities retain their full
+membership inputs. Adding an unused label with a wide-value predicate therefore
+does not widen a certified count's property demand.
+
+Prepared document filters compile their field paths into a borrowed JSON
+selector. They validate the complete record and materialize only terminal values
+observed by the existing matcher. Existence uses path presence without decoding
+the payload. Dotted array fanout, strict JSON pointers, boolean evaluation,
+numeric semantics, malformed JSON and duplicate-field rejection retain the
+ordinary matcher contract. Primitive documents and unsupported selector paths
+use the original parser. This shared implementation benefits retained visibility
+and ordinary query consumers without changing physical scan accounting.
+Ordinary document scans also borrow their callback-pinned input through filtering
+and projection, then own only the resulting output. This removes a full-record
+copy even for metadata-only scans. A hosted-storage regression projects 2 MiB
+records, with and without a row filter, inside 256 KiB and checks that a second
+read cannot invalidate the first result.
+
+The regression suite covers recycled record arenas, lazy scalar failures,
+4,096-value invariant domains, unrelated wide labels, bounded document filters,
+parser compatibility, and allocation-failure cleanup. The full Cypher core suite
+passes all 539 tests in ReleaseFast; the 16 focused owner-count tests also pass
+in Debug. Borrowed filters evaluate an 8 MiB document within a 128 KiB scratch
+ceiling in both Debug and ReleaseFast, with zero leaks.
+
+Final qualification uses the complete CPU Debug executable (69/69 build steps,
+Metal disabled). All four authenticated performance campaigns pass, including
+SQL/property plans, producer visibility, and both storage-mode count campaigns.
+The focused ReleaseFast boundary build passes all 39 steps: eight prepared-filter
+cases, three portable-host campaigns, borrowed count projections, and independent
+scan callback error domains. The new hosted scan-ownership case has zero leaks.
+
+On the same 32-row wide-record fixture, parameter membership uses the following
+work units. Each query examines 32 physical anchors; parameter cases use a
+64 MiB statement ceiling and a 200,000-unit work ceiling.
+
+| Parameter IDs | Document work | Relational work |
+| ---: | ---: | ---: |
+| 512 | 2,181 | 4,230 |
+| 2,048 | 6,789 | 14,982 |
+| 4,096 | 12,933 | 29,318 |
+
+The previous 512-ID relational COUNT used 52,677 units; the larger domains
+previously exhausted a one-million-unit ceiling. The current 512-ID literal
+cases also pass, using 2,663/4,721 units in document/relational storage.
+
+The unrelated wide-label queries, explicit and unlabeled COUNT forms, all row
+filters, hidden scalar failures, and ordinary `SUM(1)` now pass a 1 MiB ceiling.
+This supersedes the earlier document-policy qualification at 8 MiB. Document
+`SUM(1)` peaks at 417,326 bytes for the administrator and 413,478 bytes for the
+filtered reader, with 32 physical anchors in both cases. The earlier unfiltered
+document peak was 1,267,718 bytes. These measurements establish allocation and
+work bounds; they do not claim latency improvements from Debug builds.
+
+This change includes `origin/main` at `97945ad58e`, merged as `e94a10b854` before
+implementation.

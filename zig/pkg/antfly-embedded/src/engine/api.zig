@@ -1533,6 +1533,42 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
     }
 }
 
+test "embedded api Cypher document scans project wide inputs before owning output" {
+    const a = std.testing.allocator;
+    var storage = support.lsm_storage.MemoryStorage.init(a);
+    defer storage.deinit();
+    var api = try Api.openHosted(a, "/portable-document-projection", .{ .db = .{ .storage = storage.storage(), .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } } } });
+    defer api.close();
+    const body = try a.alloc(u8, 2 << 20);
+    defer a.free(body);
+    @memset(body, 'x');
+    const payload = try std.json.Stringify.valueAlloc(a, .{ .inserts = .{
+        .a = .{ .id = "a", .tenant = "keep", .body = body },
+        .b = .{ .id = "b", .tenant = "skip", .body = body },
+    }, .sync_level = "full_index" }, .{});
+    defer a.free(payload);
+    const seeded = try api.batchJson(a, payload);
+    defer a.free(seeded);
+    for ([_][]const u8{ "", "{\"term\":{\"tenant\":\"keep\"}}" }, [_]usize{ 2, 1 }) |filter, expected| {
+        const buffer = try a.alloc(u8, 256 << 10);
+        defer a.free(buffer);
+        var fixed = std.heap.FixedBufferAllocator.init(buffer);
+        const scratch = fixed.allocator();
+        var result = try api.db.inner.scan(scratch, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"id"}, .filter_query_json = filter });
+        defer result.deinit(scratch);
+        try std.testing.expectEqual(expected, result.documents.len);
+        // Another read cannot invalidate the first result's owned JSON.
+        var next = try api.db.inner.scan(scratch, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{} });
+        defer next.deinit(scratch);
+        for (result.documents) |document| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, document.json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+            try std.testing.expectEqualStrings(document.id, parsed.value.object.get("id").?.string);
+        }
+    }
+}
+
 test "embedded api Cypher relational counts account for rejected storage candidates" {
     const a = std.testing.allocator;
     var storage = support.lsm_storage.MemoryStorage.init(a);

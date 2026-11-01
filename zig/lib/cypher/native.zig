@@ -103,6 +103,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             project: *const fn (*anyopaque, A, *const v.Node) anyerror!?*const v.Node,
             /// Opt in only when the retained reader has enforced the complete
             /// read authorization above. Does not license point-read bypasses.
+            /// Private count inputs may carry nullness and membership views;
+            /// policies cannot be derived from their projected payloads.
             project_stored: ?*const fn (*anyopaque, A, *const v.Node) anyerror!?*const v.Node = null,
             project_relationship: *const fn (*anyopaque, A, *const v.Relationship) anyerror!?*const v.Relationship,
             search: ?*const fn (*anyopaque, A, []const u8, b.SearchInput) anyerror!b.SearchPage = null,
@@ -144,6 +146,9 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         }
         const ScanOptions = if (@hasDecl(DB, "cypherDocumentScanOptions")) @typeInfo(@typeInfo(@TypeOf(DB.cypherDocumentScanOptions)).@"fn".return_type.?).error_union.payload else void;
         fn scanOptions(self: *Self, a: A, db: *DB, input: ScanOptions) !ScanOptions {
+            return self.scanOptionsInGraph(a, db, input, self.graph.?);
+        }
+        fn scanOptionsInGraph(self: *Self, a: A, db: *DB, input: ScanOptions, graph: root.catalog.Graph) !ScanOptions {
             var opts = try db.cypherDocumentScanOptions(a, input);
             if (self.read_fields) |required| if (opts.relational_query) |*query| {
                 var fields: std.ArrayList([]const u8) = .empty;
@@ -157,7 +162,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             } else if (self.authority.storage_projection) {
                 var fields: std.StringHashMapUnmanaged(void) = .empty;
                 for (required) |field| try fields.put(a, field, {});
-                for (self.graph.?.labels) |label| for (label.predicate) |entry| try fields.put(a, entry.name, {});
+                for (graph.labels) |label| for (label.predicate) |entry| try fields.put(a, entry.name, {});
                 // Native document selectors interpret path syntax. Preserve
                 // literal Cypher property names by falling back to full reads
                 // whenever a name could be interpreted as a selector.
@@ -278,13 +283,16 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             return self.projectNodeValue(a, table, key, input, false);
         }
         fn projectNodeValue(self: *Self, a: A, table: []const u8, key: []const u8, input: std.json.Value, stored: bool) !?*const v.Node {
+            return self.projectNodeValueInGraph(a, table, key, input, stored, self.graph.?);
+        }
+        fn projectNodeValueInGraph(self: *Self, a: A, table: []const u8, key: []const u8, input: std.json.Value, stored: bool, graph: root.catalog.Graph) !?*const v.Node {
             const value = try v.Value.fromJson(a, input);
             if (value != .map) return error.CypherInvalidDocument;
             const result = try a.create(v.Node);
             result.* = .{ .identity = .{ .table = try a.dupe(u8, table), .key = try a.dupe(u8, key) }, .properties = try v.entityProperties(a, value.map) };
             var membership = self.valueWork(a);
             var labels: std.ArrayList([]const u8) = .empty;
-            for (self.graph.?.labels) |label| if (try self.graph.?.admits(result, label.name, &membership)) try labels.append(a, label.name);
+            for (graph.labels) |label| if (try graph.admits(result, label.name, &membership)) try labels.append(a, label.name);
             result.labels = try labels.toOwnedSlice(a);
             if (stored) if (self.authority.project_stored) |project| return project(self.authority.ptr, a, result);
             return self.authority.project(self.authority.ptr, a, result);
@@ -366,7 +374,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             var arena = std.heap.ArenaAllocator.init(quota.allocator());
             defer arena.deinit();
             const temporary = arena.allocator();
-            const projection = (try @import("owner_count.zig").Projection.init(temporary, graph, input)) orelse return null;
+            const membership_graph = if (self.authority.project_stored != null) try @import("owner_count.zig").membershipGraph(temporary, graph, input, table) else graph;
+            const projection = (try @import("owner_count.zig").Projection.init(temporary, membership_graph, input)) orelse return null;
             if (!@import("owner_count.zig").permitsTable(graph, input, table)) return error.Forbidden;
             const Visitor = @typeInfo(@TypeOf(DB.visitCypherDocuments)).@"fn".param_types[5].?;
             const Entry = @typeInfo(@FieldType(Visitor, "visit")).pointer.child;
@@ -375,6 +384,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 adapter: *Self,
                 projection: @import("owner_count.zig").Projection,
                 input: b.CountInput,
+                graph: root.catalog.Graph,
+                evaluator: ?*@import("runtime.zig").OwnerCountEvaluator = null,
                 table: []const u8,
                 quota: *@import("budget.zig"),
                 parent: ?b.Work,
@@ -422,7 +433,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     const scratch = row.allocator();
                     const counted_node = candidate: {
                         if (entry.document_stream) |document| if (try document.countProjection(scratch, fold.projection.presence)) |projected|
-                            break :candidate try fold.adapter.projectNodeValue(scratch, fold.table, entry.id, projected, fold.stored);
+                            break :candidate try fold.adapter.projectNodeValueInGraph(scratch, fold.table, entry.id, projected, fold.stored, fold.graph);
                         // Providers without the optional borrowed projection
                         // retain ordinary JSON validation and scalar semantics.
                         if (entry.document_json) |json| break :candidate try fold.adapter.fullNode(scratch, fold.table, entry.id, json);
@@ -436,8 +447,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         return error.CypherInvalidDocument;
                     } orelse return;
                     var membership = fold.adapter.valueWork(scratch);
-                    if (!try @import("owner_count.zig").admits(fold.adapter.graph.?, fold.input, counted_node, &membership)) return;
-                    if (!try @import("runtime.zig").ownerCountMatches(scratch, fold.adapter.backend(), fold.adapter.graph.?, fold.input, counted_node, fold.adapter.work)) return;
+                    if (!try @import("owner_count.zig").admits(fold.graph, fold.input, counted_node, &membership)) return;
+                    if (!try fold.evaluator.?.matches(scratch, counted_node)) return;
                     try charge(fold, fold.projection.arguments.len);
                     fold.count += 1;
                     for (fold.projection.arguments, fold.counts) |argument_value, *count| {
@@ -452,7 +463,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             };
             const counts = try temporary.alloc(usize, input.arguments.len);
             @memset(counts, 0);
-            var fold: Fold = .{ .adapter = self, .projection = projection, .input = input, .table = table, .quota = quota, .parent = self.work, .meter = .{ .a = quota.allocator(), .backend = self.backend(), .limit = input.max_work }, .counts = counts };
+            var fold: Fold = .{ .adapter = self, .projection = projection, .input = input, .graph = membership_graph, .table = table, .quota = quota, .parent = self.work, .meter = .{ .a = quota.allocator(), .backend = self.backend(), .limit = input.max_work }, .counts = counts };
             const previous_work = self.work;
             const previous_fields = self.read_fields;
             defer {
@@ -461,14 +472,16 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             }
             self.work = .{ .ptr = &fold, .charge = Fold.charge, .value = Fold.value };
             self.read_fields = projection.fields;
+            fold.evaluator = try @import("runtime.zig").OwnerCountEvaluator.create(temporary, quota.allocator(), self.backend(), membership_graph, input, self.work);
+            defer fold.evaluator.?.deinit();
             const db = try self.selected(table);
             const authorization = try self.readAuthorization(temporary, table);
             // Only certified owner projections may consume visibility at the
             // original scan. Opaque providers retain their per-node callback.
             fold.stored = self.authority.project_stored != null;
-            var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .filter_query_json = if (fold.stored) authorization.filter_query_json else "", .include_documents = true, .limit = @intCast(input.max_examined + 1) });
+            var opts = try self.scanOptionsInGraph(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .filter_query_json = if (fold.stored) authorization.filter_query_json else "", .include_documents = true, .limit = @intCast(input.max_examined + 1) }, membership_graph);
             if (opts.relational_query) |*query| {
-                const filters = try @import("runtime.zig").ownerCountFilters(temporary, self.backend(), graph, input, self.work);
+                const filters = try fold.evaluator.?.filters();
                 // Share the complete sparse/composite candidate planner, but
                 // consume its admitted domains without materializing pages.
                 const sparse = for (filters) |filter| {

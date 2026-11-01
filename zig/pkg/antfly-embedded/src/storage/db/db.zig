@@ -42158,10 +42158,12 @@ pub const DB = struct {
                 const needs_logical_value = !relational or semantic_hash == null or
                     (state.filter != null and ordinal_filter_match == null) or
                     (state.opts.include_documents and state.direct_projection_fields == null and !stream_whole_row);
-                // Scan callbacks pin their borrowed storage slices until they
-                // return. A synchronous plain-document producer can keep that
-                // borrow instead of copying the entire input before projection.
-                const borrow_plain = !relational and state.visitor.borrow_documents and state.stream_plan != null;
+                // Storage pins this input until scanEntry returns, including
+                // ordinary visitors. Filters and projection finish inside that
+                // lifetime; projected output owns its bytes independently.
+                // Copying here makes even an empty projection retain the full
+                // unused payload and defeats the borrowed predicate path.
+                const borrow_plain = !relational;
                 const logical_value: ?[]const u8 = if (needs_logical_value)
                     if (ordinal_row) |row|
                         try row.reconstructValueAlloc(state.alloc)

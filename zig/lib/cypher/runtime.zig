@@ -1894,21 +1894,49 @@ pub fn ownerCountFilters(a: A, backend: backend_mod.Backend, graph: catalog.Grap
     defer if (engine.invariants) |state_value| state_value.deinit();
     return engine.nodeFilters(input.node, input.predicate, &.{});
 }
-pub fn ownerCountMatches(a: A, backend: backend_mod.Backend, graph: catalog.Graph, input: backend_mod.CountInput, node: *const v.Node, work: ?backend_mod.Work) !bool {
-    if (input.node.properties.len == 0 and input.predicate == null) return true;
-    var engine = countEngine(a, backend, graph, input, work);
-    engine.values = .{ .a = a, .ptr = &engine, .charge = Engine.chargeWork };
-    engine.strings = engine.newStringWork(a);
-    defer engine.regex.deinit();
-    defer if (engine.invariants) |state_value| state_value.deinit();
-    const binding = [_]v.Entry{.{ .name = input.node.alias orelse "", .value = .{ .node = node } }};
-    const row: Row = if (input.node.alias != null) &binding else &.{};
-    for (input.node.properties) |property| {
-        const actual = try engine.values.property(.{ .node = node }, property.name);
-        if ((try engine.values.equal(actual, try engine.eval(property.value, row, null))) != true) return false;
+/// One owner-fold invocation. Only proven immutable expressions survive rows;
+/// metadata for borrowed nodes and row values belongs to each record arena.
+pub const OwnerCountEvaluator = struct {
+    engine: Engine,
+    input: backend_mod.CountInput,
+    pub fn create(a: A, backing: A, backend: backend_mod.Backend, graph: catalog.Graph, input: backend_mod.CountInput, work: ?backend_mod.Work) !*OwnerCountEvaluator {
+        const scope = try reduction_plan.specializeInvocation(a, .{ .node = input.node, .predicate = input.predicate }, input.parameters);
+        const self = try a.create(OwnerCountEvaluator);
+        self.* = .{ .engine = countEngine(a, backend, graph, input, work), .input = input };
+        self.input.node = scope.node;
+        self.input.predicate = scope.predicate;
+        // Byte pools owned by invocation caches must never use a row arena.
+        self.engine.scratch_allocator = backing;
+        self.engine.values = .{ .a = a, .ptr = &self.engine, .charge = Engine.chargeWork };
+        self.engine.strings = self.engine.newStringWork(a);
+        return self;
     }
-    if (input.predicate) |predicate| return (try (try engine.eval(predicate, row, null)).truth()) == true;
-    return true;
+    pub fn deinit(self: *OwnerCountEvaluator) void {
+        self.engine.regex.deinit();
+        if (self.engine.invariants) |state_value| state_value.deinit();
+    }
+    pub fn filters(self: *OwnerCountEvaluator) ![]const backend_mod.PropertyFilter {
+        return self.engine.nodeFilters(self.input.node, self.input.predicate, &.{});
+    }
+    pub fn matches(self: *OwnerCountEvaluator, a: A, node: *const v.Node) !bool {
+        if (self.input.node.properties.len == 0 and self.input.predicate == null) return true;
+        const engine = &self.engine;
+        const frame = Engine.EvalScope.enter(engine, a);
+        defer frame.leave(engine);
+        const binding = [_]v.Entry{.{ .name = self.input.node.alias orelse "", .value = .{ .node = node } }};
+        const row: Row = if (self.input.node.alias != null) &binding else &.{};
+        for (self.input.node.properties) |property| {
+            const actual = try engine.values.property(.{ .node = node }, property.name);
+            if ((try engine.values.equal(actual, try engine.eval(property.value, row, null))) != true) return false;
+        }
+        if (self.input.predicate) |predicate| return (try (try engine.eval(predicate, row, null)).truth()) == true;
+        return true;
+    }
+};
+pub fn ownerCountMatches(a: A, backend: backend_mod.Backend, graph: catalog.Graph, input: backend_mod.CountInput, node: *const v.Node, work: ?backend_mod.Work) !bool {
+    const evaluator = try OwnerCountEvaluator.create(a, backend_mod.reclaimingAllocator(a), backend, graph, input, work);
+    defer evaluator.deinit();
+    return evaluator.matches(a, node);
 }
 
 const Engine = struct {

@@ -1249,7 +1249,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
     const portable_cypher_tests = b.addTest(.{
         .root_module = embedded_api_mod,
-        .filters = &.{ "embedded api Cypher catalog and writes", "embedded api Cypher relational counts" },
+        .filters = &.{ "embedded api Cypher catalog and writes", "embedded api Cypher relational counts", "embedded api Cypher document scans" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("embedded-cypher-test", "Qualify the portable single-source graph host")
@@ -1266,6 +1266,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("cypher-count-projection-test", "Verify borrowed COUNT projections and bounded validation scratch")
         .dependOn(&addFilteredTestRunArtifact(b, count_projection_tests).step);
+    const document_predicate_mod = @import("../../../build_support/embedded/source_owner.zig").cloneModule(b, embedded_support_mod);
+    document_predicate_mod.root_source_file = b.path("pkg/antfly-embedded/src/cypher_document_predicate_test_root.zig");
+    document_predicate_mod.addImport("antfly_source_root", document_predicate_mod);
+    if (document_predicate_mod.import_table.contains("antfly_storage_root")) document_predicate_mod.addImport("antfly_storage_root", document_predicate_mod);
+    const document_predicate_tests = b.addTest(.{
+        .root_module = document_predicate_mod,
+        .filters = &.{"prepared pattern filters"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-document-predicate-test", "Verify borrowed document predicate semantics, validation and allocation bounds")
+        .dependOn(&addFilteredTestRunArtifact(b, document_predicate_tests).step);
     embedded_test_step.dependOn(&run_embedded_api_tests.step);
     // db.zig is also its own module (embedded_db_mod) rather than a file
     // reachable from embedded_mod's root, so its tests need the same

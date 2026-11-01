@@ -1559,7 +1559,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                 "query": f"MATCH (n:{label}) RETURN count(*),count(n),count(n.body),"
                 "count(n.missing),count($p),count(n.body)+count(*)",
                 "parameters": {"p": False},
-                "limits": {"memory_bytes": 8 << 20},
+                "limits": {"memory_bytes": 1 << 20},
             },
             session=session,
         )
@@ -1571,7 +1571,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                 for value in (rows, rows, bodies, 0, rows, bodies + rows)
             ]
         ], result
-        assert result["stats"]["memory_bytes"] < 8 << 20, result
+        assert result["stats"]["memory_bytes"] < 1 << 20, result
         return result
 
     try:
@@ -1670,6 +1670,75 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                 sort_keys=True,
             )
         )
+        # A predicate on an unrelated label must not turn a count's private
+        # membership projection into a full wide-value observation.
+        wide_graph = prefix + "_wide_label"
+        call(
+            f"/graphs/{wide_graph}",
+            {
+                "labels": [
+                    {"name": "D", "table": prefix},
+                    {"name": "Wide", "table": prefix, "where": {"body": "unmatched"}},
+                ],
+                "relationships": [],
+            },
+        )
+        for pattern, aggregate, expected in (
+            ("n:D", "count(*)", 32),
+            ("n:D", "count(n.body)", 16),
+            ("n", "count(n.body)", 16),
+        ):
+            bounded = call(
+                f"/graphs/{wide_graph}/query",
+                {
+                    "query": f"MATCH({pattern}) RETURN {aggregate}",
+                    "limits": {"memory_bytes": 1 << 20, "scanned_anchors": 32},
+                },
+            )
+            assert bounded["rows"] == [[{"type": "integer", "value": str(expected)}]], (
+                bounded
+            )
+            assert bounded["stats"]["memory_bytes"] < 1 << 20, bounded
+            assert bounded["stats"]["scanned_anchors"] == 32, bounded
+        # Repeated parameter/literal probes share one lazy invariant domain.
+        for size in (512, 2048, 4096):
+            ids = [f"n{i}" for i in range(size)]
+            for literal in (False, True) if size == 512 else (False,):
+                domain = (
+                    "[" + ",".join("'" + key + "'" for key in ids) + "]"
+                    if literal
+                    else "$ids"
+                )
+                bounded = call(
+                    f"/graphs/{prefix}/query",
+                    {
+                        "query": f"MATCH(n:D) WHERE n.id IN {domain} RETURN count(*)",
+                        "parameters": {} if literal else {"ids": ids},
+                        "limits": {
+                            "memory_bytes": 64 << 20,
+                            "scanned_anchors": 32,
+                            "intermediate_states": 200000,
+                        },
+                    },
+                )
+                assert bounded["rows"] == [[{"type": "integer", "value": "32"}]], (
+                    bounded
+                )
+                assert bounded["stats"]["scanned_anchors"] == 32, bounded
+                assert bounded["stats"]["intermediate_states"] < 200000, bounded
+                print(
+                    json.dumps(
+                        {
+                            "invariant_storage": "relational"
+                            if relational
+                            else "document",
+                            "ids": size,
+                            "literal": literal,
+                            "stats": bounded["stats"],
+                        },
+                        sort_keys=True,
+                    )
+                )
         for label, limits, code in (
             ("D", {"scanned_anchors": 31}, "CypherAnchorBudgetExceeded"),
             ("A", {"scanned_anchors": 31}, "CypherAnchorBudgetExceeded"),
@@ -1701,6 +1770,30 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
             method="PUT",
         )
         count("D", reader, (16, 8))
+        for session, expected in ((admin, 32), (reader, 16)):
+            ordinary = call(
+                f"/graphs/{prefix}/query",
+                {
+                    "query": "MATCH(n:D) RETURN sum(1)",
+                    "limits": {"memory_bytes": 1 << 20, "scanned_anchors": 32},
+                },
+                session=session,
+            )
+            assert ordinary["rows"] == [
+                [{"type": "integer", "value": str(expected)}]
+            ], ordinary
+            assert ordinary["stats"]["memory_bytes"] < 1 << 20, ordinary
+            assert ordinary["stats"]["scanned_anchors"] == 32, ordinary
+            print(
+                json.dumps(
+                    {
+                        "ordinary_storage": "relational" if relational else "document",
+                        "filtered": session is reader,
+                        "stats": ordinary["stats"],
+                    },
+                    sort_keys=True,
+                )
+            )
         # The retained scan applies effective row filters once. Rejected rows
         # still consume physical progress before policy evaluation.
         denied_budget = reader.post(
@@ -1767,7 +1860,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                 f"/graphs/{prefix}/query",
                 {
                     "query": "MATCH (n:D) WHERE n.enabled=false RETURN count(n.enabled)",
-                    "limits": {"memory_bytes": 8 << 20},
+                    "limits": {"memory_bytes": 1 << 20},
                 },
                 session=session,
             )
@@ -1797,9 +1890,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
         ):
             for session in (admin, reader):
                 visible = expected if session is admin else min(expected, 1)
-                # Document policies retain their existing per-record filter
-                # workspace. Typed relational policies also fit at one MiB.
-                memory = 8 << 20 if session is reader and not relational else 1 << 20
+                memory = 1 << 20
                 result = call(
                     f"/graphs/{prefix}/query",
                     {
@@ -1860,7 +1951,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
             f"/graphs/{prefix}/query",
             {
                 "query": "MATCH (n:D) WHERE 1/0=0 RETURN count(n.body)",
-                "limits": {"memory_bytes": 8 << 20},
+                "limits": {"memory_bytes": 1 << 20},
             },
             session=reader,
         )
@@ -1870,7 +1961,7 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
             f"/graphs/{prefix}/query",
             {
                 "query": "MATCH(n:D) WHERE n.id IN ['n1','n3'] AND 1/0=0 RETURN count(n.body)",
-                "limits": {"memory_bytes": (1 if relational else 8) << 20},
+                "limits": {"memory_bytes": 1 << 20},
             },
             session=reader,
         )

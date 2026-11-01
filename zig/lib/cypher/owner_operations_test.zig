@@ -697,3 +697,70 @@ test "unlabeled owner COUNT reduces unique tables under one anchor budget" {
     }
     try std.testing.expectError(error.CypherAnchorBudgetExceeded, root.runtime.execute(a, set.backend(), graph, &compiled, &.{}, .{ .scanned_anchors = 31 }));
 }
+
+test "owner COUNT prepares lazy invariants once across recycled row arenas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: Fixture = .{};
+    try fixture.init(a);
+    for (&fixture.properties, &fixture.nodes) |*properties, node| properties[1].value = .{ .string = node.identity.key };
+    const ids = try a.alloc(v.Value, 4096);
+    for (ids, 0..) |*id, i| id.* = .{ .string = try std.fmt.allocPrint(a, "n{d}", .{i}) };
+    const parameters = [_]v.Entry{.{ .name = "ids", .value = .{ .list = ids } }};
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(a, "MATCH(n:D) WHERE n.value IN $ids AND n.value IN ['n0','n1','n2'] RETURN count(*)", .{}, &diagnostic);
+    defer compiled.deinit();
+    const operation = compiled.query.clauses[0].operation.match;
+    var meter: b.Meter = .{ .a = a, .backend = fixture.backend(), .limit = 100000 };
+    const evaluator = try root.runtime.OwnerCountEvaluator.create(a, std.testing.allocator, fixture.backend(), definition, .{ .node = operation.paths[0].nodes[0], .predicate = operation.predicate, .parameters = &parameters }, meter.work());
+    defer evaluator.deinit();
+    _ = try evaluator.filters();
+    var count: usize = 0;
+    for (0..3) |_| for (&fixture.nodes) |*node| {
+        var row = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer row.deinit();
+        if (try evaluator.matches(row.allocator(), node)) count += 1;
+    };
+    // Planning is still safe after every borrowed record arena has died.
+    _ = try evaluator.filters();
+    try std.testing.expectEqual(@as(usize, 9), count);
+    try std.testing.expect(meter.units < 50000);
+}
+
+test "owner COUNT specialization never hoists hidden scalar failures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: Fixture = .{};
+    try fixture.init(a);
+    for ([_][]const u8{ "false", "1/0=0" }, 0..) |predicate, i| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, try std.fmt.allocPrint(a, "MATCH(n:D) WHERE {s} RETURN count(*)", .{predicate}), .{}, &diagnostic);
+        defer compiled.deinit();
+        const operation = compiled.query.clauses[0].operation.match;
+        const evaluator = try root.runtime.OwnerCountEvaluator.create(a, std.testing.allocator, fixture.backend(), definition, .{ .node = operation.paths[0].nodes[0], .predicate = operation.predicate }, null);
+        defer evaluator.deinit();
+        _ = try evaluator.filters();
+        if (i == 0) try std.testing.expect(!try evaluator.matches(a, &fixture.nodes[0])) else try std.testing.expectError(error.CypherDivisionByZero, evaluator.matches(a, &fixture.nodes[0]));
+    }
+}
+
+test "owner COUNT membership demand excludes unrelated predicates and covered unions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const graph: root.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{
+        .{ .name = "D", .table = "docs" },
+        .{ .name = "Wide", .table = "docs", .predicate = &.{.{ .name = "body", .value = .{ .string = "unmatched" } }} },
+        .{ .name = "Other", .table = "elsewhere", .predicate = &.{.{ .name = "elsewhere", .value = .{ .boolean = true } }} },
+    }, .relationships = &.{} };
+    for ([_][]const []const u8{ &.{"D"}, &.{} }) |labels| {
+        const input: b.CountInput = .{ .node = .{ .span = .{}, .alias = "n", .labels = labels, .properties = &.{} } };
+        const scope = try @import("owner_count.zig").membershipGraph(a, graph, input, "docs");
+        try std.testing.expectEqual(@as(usize, 1), scope.labels.len);
+        const projection = (try @import("owner_count.zig").Projection.init(a, scope, input)).?;
+        try std.testing.expectEqual(@as(usize, 0), projection.fields.len);
+    }
+    try std.testing.expectEqual(@as(usize, 3), graph.labels.len);
+}
