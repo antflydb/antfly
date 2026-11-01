@@ -128,6 +128,7 @@ def checked_receipt(report, *, native, concurrency):
         "seconds": elapsed,
         "pages_per_second": len(shape) / elapsed,
         "rounds": len(rounds),
+        "warmup_rounds": len(warmup),
     }
 
 
@@ -146,7 +147,7 @@ def compare(native_serial, native_batch, reference_serial, reference_batch):
     rs = checked_receipt(reference_serial, native=False, concurrency=1)
     rb = checked_receipt(reference_batch, native=False, concurrency=concurrency)
     captures = (ns, nb, rs, rb)
-    for key in ("revision", "script", "max_tokens", "rounds"):
+    for key in ("revision", "script", "max_tokens", "rounds", "warmup_rounds"):
         if len({c[key] for c in captures}) != 1:
             raise ValueError(f"captures disagree on {key}")
     if ns["shape"] != rs["shape"] or nb["shape"] != rb["shape"]:

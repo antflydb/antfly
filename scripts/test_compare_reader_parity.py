@@ -93,6 +93,12 @@ class ReaderParityTests(unittest.TestCase):
         self.assertFalse(self.result()["correctness"]["concurrent_exact"])
         self.assertFalse(self.result()["passed"])
 
+    def test_mismatched_warmup_work_is_rejected(self):
+        self.captures[1]["warmup_rounds"] = 2
+        self.captures[1]["warmup_observations"] *= 2
+        with self.assertRaisesRegex(ValueError, "warmup_rounds"):
+            self.result()
+
     def test_speed_alone_cannot_qualify(self):
         for observation in self.captures[1]["observations"]:
             observation["requests"][0]["text_sha256"] = "a" * 64
