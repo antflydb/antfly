@@ -16,6 +16,7 @@
 //! Leased native row-index consumption. Seek candidates in bounded windows,
 //! hydrate physical vectors, then apply deletes and residuals before delivery.
 const std = @import("std");
+const cover_columns = @import("lake_index_cover_columns.zig");
 const local = @import("antfly_local_sources");
 const catalog = local.sql_catalog;
 const operation = local.api_operation;
@@ -38,6 +39,7 @@ const Owner = struct {
     reader: ordered.Reader = undefined,
     reader_open: bool = false,
     public_order: ?@import("lake_index_public_order.zig").Cursor = null,
+    primary_order: ?PrimaryOrder = null,
     predicate_lower: []const u8 = "",
     predicate_upper: ?[]const u8 = null,
     predicate_count: u64 = 0,
@@ -72,6 +74,7 @@ const Owner = struct {
     probe_done: bool = true,
     probe_cache: ?tree.Cache = null,
     covered: bool = false,
+    cover_columns_lease: ?cover_columns.Loaded = null,
     covered_entries: []const ordered.Reader.Entry = &.{},
     covered_blocks: []const struct { block: local.sql_spill.ColumnarBlock, row: u16 } = &.{},
     covered_selection: []const usize = &.{},
@@ -90,6 +93,7 @@ const Owner = struct {
         if (self.lease) |lease| lease.deinit();
         if (self.ordered_store) |*store| store.deinit();
         self.window.deinit();
+        if (self.cover_columns_lease) |*loaded| loaded.deinit();
         if (self.cover_lease) |owned| owned.release();
         self.cover_arena.deinit();
         self.arena.deinit();
@@ -341,6 +345,8 @@ const Owner = struct {
                 self.cover_candidate_offset = 0;
                 if (self.cover_candidates.len == 0) return .{ .selection = &.{} };
             }
+            if (self.cover_columns_lease) |*loaded| loaded.deinit();
+            self.cover_columns_lease = null;
             if (self.cover_lease) |owned| owned.release();
             self.cover_lease = null;
             _ = self.cover_arena.reset(.retain_capacity);
@@ -354,22 +360,22 @@ const Owner = struct {
             }
             self.covered_entries = self.cover_candidates[begin..end];
             self.cover_candidate_offset = end;
-            try @import("../serverless/artifacts/store.zig").chargeReadBudget(&self.reader.remaining_reads, cover.block.byte_len);
-            const block = if (self.reader.cached) |cached| cached_block: {
-                const owned = try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(cached, self.artifacts, cover.block, self.reader.pages.cancellation);
-                self.cover_lease = owned;
-                break :cached_block owned.value.*;
-            } else uncached: {
-                const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, self.artifacts, cover.block, self.reader.pages.cancellation, null);
-                break :uncached try local.sql_spill.decodeColumnarBlockInArena(a, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
-            };
-            if (block.values.len != self.reader.root.cover.len or block.keys.len != 1) return error.InvalidNativeLakeRowIndex;
+            var projected_columns: std.ArrayList(usize) = .empty;
+            for (self.reader.root.cover, 0..) |name, i| {
+                const required = covers(self.request.fields, name) or for (self.request.conditions) |condition| {
+                    if (std.mem.eql(u8, condition.column, name)) break true;
+                } else false;
+                if (required) try projected_columns.append(a, i);
+            }
+            self.cover_columns_lease = try cover_columns.load(a, self.artifacts, cover.block, cover.striped, projected_columns.items, self.reader.root.cover.len, self.reader.pages.cancellation, self.reader.cached, 64 * 1024 * 1024, &self.reader.remaining_reads, null);
+            const block = self.cover_columns_lease.?.block;
+            if (block.values.len != self.reader.root.cover.len) return error.InvalidNativeLakeRowIndex;
             const covered = try a.alloc(@typeInfo(@TypeOf(self.covered_blocks)).pointer.child, self.covered_entries.len);
             for (self.covered_entries, covered) |entry, *position| {
                 const candidate = entry.cover.?;
                 if (candidate.block.byte_len != cover.block.byte_len or candidate.row >= block.count()) return error.InvalidNativeLakeRowIndex;
-                const key = try block.keyCell(candidate.row, 0);
-                if (key.sql_null or key.value != .string or !std.mem.eql(u8, key.value.string, entry.key)) return error.InvalidNativeLakeRowIndex;
+                if (candidate.striped != cover.striped) return error.InvalidNativeLakeRowIndex;
+                try self.cover_columns_lease.?.verify(self.reader.root.domain, candidate.row, entry.key[entry.key.len - 16 ..][0..16].*, cover_columns.witness(self.reader.root.domain, entry.key));
                 position.* = .{ .block = block, .row = candidate.row };
             }
             self.covered_blocks = covered;
@@ -718,6 +724,28 @@ pub const Predicate = struct {
         }
         return owner.mapRefs(a, try owner.reader.next(a, count));
     }
+    /// A page's last authenticated index key bounds every later primary tuple,
+    /// whether or not any of its rows match the text query. References may be
+    /// relocated; the key remains in the cursor's immutable publication domain.
+    pub const OrderedPage = struct {
+        rows: []const local.storage_rowsource_types.RowRef,
+        exhausted: bool = false,
+        boundary: ?struct {
+            order: *const PrimaryOrder,
+            key: []const u8,
+            pub fn compare(self: @This(), a: A, values: []const std.json.Value) !std.math.Order {
+                return self.order.compare(a, self.key, values);
+            }
+        } = null,
+    };
+    pub fn nextOrdered(self: *Predicate, a: A, count: usize) !OrderedPage {
+        if (self.scan or self.complete_order) return .{ .rows = try self.next(a, count) };
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        const primary = if (owner.primary_order) |*value| value else return .{ .rows = try self.next(a, count) };
+        try owner.read_context.ensureActive();
+        const page = try owner.reader.nextBoundaryPage(a, count);
+        return .{ .rows = try owner.mapRefs(a, page.refs), .exhausted = page.exhausted, .boundary = if (page.key) |key| .{ .order = primary, .key = key } else null };
+    }
 };
 /// Borrowed only for the lifetime of the outer query's publication lease.
 /// Reusing this authorization avoids reopening a client/lease for every conjunct.
@@ -764,35 +792,76 @@ pub fn tryOpenPredicateWithContext(a: A, server: *server_api.ApiHttpServer, tabl
 /// Decoded leases remain admitted until the caller consumes this wave. Each
 /// 16 MiB lane fits the default 32 MiB I/O allowance; saturation runs inline.
 const CoveringWave = struct {
-    const lane_bytes = 16 * 1024 * 1024;
-    const Metadata = @import("lake_index_decoded_metadata.zig");
-    const Block = Metadata.Owned(local.sql_spill.ColumnarBlock);
     const Job = struct {
+        a: A,
         cached: @import("lake_index_aggregate_artifact.zig").CachedRead,
         store: @import("../serverless/artifacts/store.zig").ArtifactStore,
-        ref: @import("lake_index_aggregate_artifact.zig").ChunkRef,
+        cover: ordered.Reader.Cover,
+        columns: []const usize,
+        width: usize,
         token: @import("antfly_cancellation").CancellationToken,
-        block: ?Block = null,
+        prepared: ?cover_columns.Prepared = null,
+        limit: usize = 0,
+        block: ?cover_columns.Loaded = null,
+        fn prepare(self: *@This()) anyerror!void {
+            var reads: u64 = self.cover.block.byte_len + @import("lake_index_aggregate_artifact.zig").max_block_bytes;
+            self.prepared = try cover_columns.prepare(self.a, self.store, self.cover.block, self.cover.striped, self.columns, self.width, self.token, self.cached, &reads);
+        }
         fn run(self: *@This()) anyerror!void {
-            self.block = try Metadata.acquireColumnBlockBounded(self.cached, self.store, self.ref, self.token, lane_bytes);
+            var reads = self.prepared.?.bytes;
+            self.block = try cover_columns.load(self.a, self.store, self.cover.block, self.cover.striped, self.columns, self.width, self.token, self.cached, self.limit, &reads, self.prepared);
         }
     };
+    scheduler: *local.sql_parallel_scheduler.Scheduler = local.sql_parallel_scheduler.global(),
     jobs: [4]Job = undefined,
     count: usize = 0,
     retained: usize = 0,
     fn deinit(self: *CoveringWave) void {
-        for (self.jobs[0..self.count]) |job| if (job.block) |block| block.release();
-        if (self.retained != 0) local.sql_parallel_scheduler.global().releasePull(0, self.retained);
+        for (self.jobs[0..self.count]) |*job| {
+            if (job.block) |*block| block.deinit();
+            if (job.prepared) |*prepared| prepared.deinit();
+        }
+        if (self.retained != 0) self.scheduler.releasePull(0, self.retained);
         self.* = .{};
     }
-    fn read(self: *CoveringWave, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, store: @import("../serverless/artifacts/store.zig").ArtifactStore, refs: []const @import("lake_index_aggregate_artifact.zig").ChunkRef, token: @import("antfly_cancellation").CancellationToken) !void {
+    fn read(self: *CoveringWave, a: A, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, store: @import("../serverless/artifacts/store.zig").ArtifactStore, refs: []const ordered.Reader.Cover, columns: []const usize, width: usize, token: @import("antfly_cancellation").CancellationToken, reads: *u64) !void {
         if (refs.len > self.jobs.len or self.count != 0) return error.InvalidNativeLakeRowIndex;
         const scheduler = local.sql_parallel_scheduler;
-        const retained = lane_bytes * refs.len;
-        if (!scheduler.global().reservePull(0, retained)) return error.SqlMemoryLimitExceeded;
-        self.retained = retained;
-        for (refs, self.jobs[0..refs.len]) |ref, *job| job.* = .{ .cached = cached, .store = store, .ref = ref, .token = token };
+        // A is shared between jobs only through this locked owner. All jobs
+        // join before it leaves scope; loaded arenas keep the backing A below.
+        var allocations: scheduler.LockedAllocator = .{ .backing = a };
+        // Admit directory wire bytes before any work; exact stripe wire bytes
+        // are charged on the caller after all preparation jobs have joined.
+        for (refs) |ref| try @import("../serverless/artifacts/store.zig").chargeReadBudget(reads, ref.block.byte_len);
+        for (refs, self.jobs[0..refs.len]) |ref, *job| job.* = .{ .a = allocations.allocator(), .cached = cached, .store = store, .cover = ref, .columns = columns, .width = width, .token = token };
         self.count = refs.len;
+        {
+            const reservation = refs.len * cover_columns.directory_limit;
+            if (!self.scheduler.reservePull(0, reservation)) return error.SqlMemoryLimitExceeded;
+            defer self.scheduler.releasePull(0, reservation);
+            try self.runJobs(cached, Job.prepare);
+        }
+        var reservation: usize = 0;
+        for (self.jobs[0..self.count]) |*job| {
+            const prepared = job.prepared.?;
+            try @import("../serverless/artifacts/store.zig").chargeReadBudget(reads, prepared.bytes - job.cover.block.byte_len);
+            job.limit = @intCast(@min(16 * 1024 * 1024, prepared.bytes *| 4 +| 256 * 1024));
+            reservation += job.limit;
+        }
+        if (!self.scheduler.reservePull(0, reservation)) return error.SqlMemoryLimitExceeded;
+        self.retained = reservation;
+        defer for (self.jobs[0..self.count]) |*job| if (job.block) |*block| if (block.scratch_owner) |arena| {
+            _ = arena;
+            block.budget.?.backing = a;
+            block.backing = a;
+        };
+        try self.runJobs(cached, Job.run);
+        try token.check();
+        try cached.context.ensureActive();
+    }
+    fn runJobs(self: *CoveringWave, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, comptime run: fn (*Job) anyerror!void) !void {
+        const scheduler = local.sql_parallel_scheduler;
+        var ready: std.Io.Event = .unset;
         var tasks: [4]?scheduler.Task(anyerror!void) = @splat(null);
         defer if (cached.context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
             held.cancel(io) catch {};
@@ -801,21 +870,17 @@ const CoveringWave = struct {
         for (self.jobs[0..self.count], 0..) |*job, i| {
             if (failure != null) break;
             if (cached.context.io) |io| if (self.count > 1) {
-                tasks[i] = scheduler.global().submitIo(io, lane_bytes, Job.run, .{job});
+                tasks[i] = self.scheduler.submitIoNotified(io, if (run == Job.prepare) cover_columns.directory_limit else job.limit, &ready, run, .{job});
             };
-            if (tasks[i] == null) job.run() catch |err| {
+            if (tasks[i] == null) run(job) catch |err| {
                 failure = err;
             };
         }
-        if (cached.context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
-            held.await(io) catch |err| {
-                if (failure == null) failure = err;
-            };
-            task.* = null;
-        };
         if (failure) |err| return err;
-        try token.check();
-        try cached.context.ensureActive();
+        if (cached.context.io) |io| scheduler.joinNotified(io, &ready, &tasks) catch |err| {
+            try cached.context.ensureActive();
+            return err;
+        };
     }
 };
 
@@ -858,21 +923,20 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
             for (result) |value| if (value) |row| row.deinit();
             out.free(result);
         };
-        const Pending = struct { entry: ordered.Reader.Entry, position: usize };
+        const Pending = struct { entry: ordered.Reader.CoverEntry, position: usize };
         const pending = try scratch.allocator().alloc(Pending, refs_.len);
         // Sort the bounded gather by block identity: one lease, decode and
         // read-budget charge per block, while preserving ranked output order.
         const index_refs = try owner.mapToIndex(scratch.allocator(), refs_);
-        const entries = try owner.reader.entriesAtPhysical(scratch.allocator(), index_refs);
+        const entries = try owner.reader.coversAtPhysical(scratch.allocator(), index_refs);
         for (entries, pending, 0..) |found, *item, position| {
             try owner.read_context.ensureActive();
             const entry = found orelse return null;
-            if (entry.cover == null) return null;
             item.* = .{ .entry = entry, .position = position };
         }
         std.mem.sort(Pending, pending, {}, struct {
             fn less(_: void, left: Pending, right: Pending) bool {
-                return std.mem.order(u8, left.entry.cover.?.block.artifact_id, right.entry.cover.?.block.artifact_id) == .lt;
+                return std.mem.order(u8, left.entry.cover.block.artifact_id, right.entry.cover.block.artifact_id) == .lt;
             }
         }.less);
         var row_arena = std.heap.ArenaAllocator.init(a);
@@ -881,34 +945,42 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
         while (begin < pending.len) {
             var wave: CoveringWave = .{};
             defer wave.deinit();
-            var block_refs: [4]@import("lake_index_aggregate_artifact.zig").ChunkRef = undefined;
+            var block_refs: [4]ordered.Reader.Cover = undefined;
             var groups: [4]struct { begin: usize, end: usize } = undefined;
             var count: usize = 0;
             while (count < block_refs.len and begin < pending.len) {
-                const reference = pending[begin].entry.cover.?;
+                const reference = pending[begin].entry.cover;
                 var end = begin + 1;
-                while (end < pending.len and std.mem.eql(u8, pending[end].entry.cover.?.block.artifact_id, reference.block.artifact_id)) : (end += 1) {
-                    const same = pending[end].entry.cover.?.block;
-                    if (same.byte_len != reference.block.byte_len or !std.mem.eql(u8, same.checksum, reference.block.checksum)) return error.InvalidNativeLakeRowIndex;
+                while (end < pending.len and std.mem.eql(u8, pending[end].entry.cover.block.artifact_id, reference.block.artifact_id)) : (end += 1) {
+                    const same = pending[end].entry.cover.block;
+                    if (pending[end].entry.cover.striped != reference.striped or same.byte_len != reference.block.byte_len or !std.mem.eql(u8, same.checksum, reference.block.checksum)) return error.InvalidNativeLakeRowIndex;
                 }
-                try @import("../serverless/artifacts/store.zig").chargeReadBudget(&owner.reader.remaining_reads, reference.block.byte_len);
-                block_refs[count] = reference.block;
+                block_refs[count] = reference;
                 groups[count] = .{ .begin = begin, .end = end };
                 count += 1;
                 begin = end;
             }
-            try wave.read(.{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context }, owner.artifacts, block_refs[0..count], owner.reader.pages.cancellation);
+            var selected: std.ArrayList(usize) = .empty;
+            defer selected.deinit(a);
+            for (root.cover, 0..) |name, i| if (covers(fields, name)) try selected.append(a, i);
+            try wave.read(a, .{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context }, owner.artifacts, block_refs[0..count], selected.items, root.cover.len, owner.reader.pages.cancellation, &owner.reader.remaining_reads);
             for (wave.jobs[0..count], groups[0..count]) |job, group| {
-                const block = job.block.?;
-                for (pending[group.begin..group.end]) |item| {
+                const loaded = job.block.?;
+                const block = loaded.block;
+                _ = row_arena.reset(.retain_capacity);
+                const sa = row_arena.allocator();
+                const selected_rows = try sa.alloc(u16, group.end - group.begin);
+                const selected_refs = try sa.alloc(local.storage_rowsource_types.RowRef, selected_rows.len);
+                for (pending[group.begin..group.end], selected_rows, selected_refs) |item, *row, *ref| {
                     try owner.read_context.ensureActive();
-                    _ = row_arena.reset(.retain_capacity);
-                    const row = item.entry.cover.?.row;
-                    if (block.value.keys.len != 1 or row >= block.value.count()) return error.InvalidNativeLakeRowIndex;
-                    const key = try block.value.keyCell(row, 0);
-                    if (key.sql_null or key.value != .string or !std.mem.eql(u8, key.value.string, item.entry.key)) return error.InvalidNativeLakeRowIndex;
-                    result[item.position] = try coveringSource(out, row_arena.allocator(), table, root, block.value.*, row, refs_[item.position], fields);
+                    row.* = item.entry.cover.row;
+                    ref.* = refs_[item.position];
+                    if (row.* >= block.count()) return error.InvalidNativeLakeRowIndex;
+                    try loaded.verify(root.domain, row.*, item.entry.physical, item.entry.witness);
                 }
+                const page = try coveringPage(out, sa, table, block, selected_rows, selected_refs, root.cover, fields);
+                defer page.release();
+                for (pending[group.begin..group.end], 0..) |item, row| result[item.position] = page.row(row);
             }
         }
         transferred = true;
@@ -917,70 +989,51 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
     return null;
 }
 
-fn coveringSource(a: A, scratch: A, table: catalog.Table, root: ordered.Root, block: local.sql_spill.ColumnarBlock, row: u16, ref: local.storage_rowsource_types.RowRef, fields: []const []const u8) !local.storage_db_types.ColumnSource {
-    const rows_ = local.storage_rowsource_types;
-    if (row >= block.count() or block.values.len != root.cover.len) return error.InvalidNativeLakeRowIndex;
-    var columns: std.ArrayList(rows_.ColumnVector) = .empty;
+/// One typed result page per decoded covering group. Payloads are copied into
+/// its arena once; no reader, request, or block lease escapes the gather wave.
+fn coveringPage(a: A, scratch: A, table: catalog.Table, block: local.sql_spill.ColumnarBlock, selected: []const u16, refs_: []const local.storage_rowsource_types.RowRef, cover: []const []const u8, fields: []const []const u8) !*local.storage_db_types.ColumnSourcePage {
+    if (selected.len != refs_.len or block.values.len != cover.len) return error.InvalidNativeLakeRowIndex;
+    var names: std.ArrayList([]const u8) = .empty;
     for (fields) |field| {
-        if (generatedCoveringField(table, field)) continue;
-        // Projection and hidden highlight dependencies can request the same
-        // field. Preserve one physical column, including a declared _type.
-        if (for (columns.items) |column| {
-            if (std.mem.eql(u8, column.name, field)) break true;
-        } else false) continue;
-        const index = for (root.cover, 0..) |name, i| {
+        if (covers(names.items, field)) continue;
+        if (!generatedCoveringField(table, field) and !covers(cover, field)) return error.InvalidNativeLakeRowIndex;
+        try names.append(scratch, field);
+    }
+    // Identity is carried by refs and witnesses, independently of source
+    // columns. Generate virtual metadata only when the caller requested it;
+    // changing the physical hydration path must not change wildcard _source.
+    const page = try local.storage_db_types.ColumnSourcePage.native(a, names.items, selected.len);
+    errdefer page.release();
+    const pa = page.arena.allocator();
+    // Resolve fields once for the group, then write each final scalar vector.
+    for (names.items, 0..) |field, column| {
+        const index: ?usize = if (generatedCoveringField(table, field)) null else for (cover, 0..) |name, i| {
             if (std.mem.eql(u8, name, field)) break i;
         } else return error.InvalidNativeLakeRowIndex;
-        const cell = try block.cell(row, index);
-        const nulls = try scratch.alloc(u8, 1);
-        nulls[0] = @intFromBool(cell.sql_null);
-        var column: rows_.ColumnVector = .{ .name = field, .nulls = .{ .bytes = nulls }, .values = undefined };
-        const wire: std.json.Value = if (cell.sql_null) .null else if (cell.numeric != null or cell.array != null)
-            try local.sql_runtime.encodeStorageDatum(scratch, cell, try table.column(field), @import("lake_index_aggregate_artifact.zig").max_block_bytes)
-        else
-            cell.value;
-        switch (wire) {
-            .integer => |value| {
-                const values = try scratch.alloc(i64, 1);
-                values[0] = value;
-                column.values = .{ .i64 = values };
-            },
-            .float => |value| {
-                const values = try scratch.alloc(f64, 1);
-                values[0] = value;
-                column.values = .{ .f64 = values };
-            },
-            .bool => |value| {
-                const values = try scratch.alloc(bool, 1);
-                values[0] = value;
-                column.values = .{ .bool = values };
-            },
-            .string => |value| {
-                const values = try scratch.alloc([]const u8, 1);
-                values[0] = value;
-                column.values = .{ .bytes = values };
-            },
-            else => {
-                const values = try scratch.alloc([]const u8, 1);
-                values[0] = try std.json.Stringify.valueAlloc(scratch, wire, .{});
-                column.values = .{ .json = values };
-            },
+        for (selected, refs_, 0..) |physical, ref, row| {
+            if (physical >= block.count()) return error.InvalidNativeLakeRowIndex;
+            var sql_null = false;
+            const wire: std.json.Value = if (index) |i| value: {
+                const cell = try block.cell(physical, i);
+                sql_null = cell.sql_null;
+                if (cell.sql_null) break :value .null;
+                if (cell.numeric != null or cell.array != null) break :value try local.sql_runtime.encodeStorageDatum(pa, cell, try table.column(field), @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+                break :value try local.api_json_helpers.cloneJsonValue(pa, cell.value);
+            } else .{ .string = try local.storage_rowsource_identity.allocId(pa, ref) };
+            try page.setNativeCell(row, column, wire, sql_null);
         }
-        try columns.append(scratch, column);
     }
-    const identity = try local.storage_rowsource_identity.allocId(scratch, ref);
-    try columns.append(scratch, .{ .name = "_id", .values = .{ .bytes = try scratch.dupe([]const u8, &.{identity}) } });
-    if (generatedCoveringField(table, "_type")) try columns.append(scratch, .{ .name = "_type", .values = .{ .bytes = try scratch.dupe([]const u8, &.{"row"}) } });
-    const page = try local.storage_db_types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = root.source, .snapshot_id = root.snapshot }, .row_refs = &.{ref}, .columns = columns.items }, &.{0});
+    try page.finishNative();
+    return page;
+}
+fn coveringSource(a: A, scratch: A, table: catalog.Table, root: ordered.Root, block: local.sql_spill.ColumnarBlock, row: u16, ref: local.storage_rowsource_types.RowRef, fields: []const []const u8) !local.storage_db_types.ColumnSource {
+    const page = try coveringPage(a, scratch, table, block, &.{row}, &.{ref}, root.cover, fields);
     defer page.release();
     return page.row(0);
 }
 
-fn generatedCoveringField(table: catalog.Table, field: []const u8) bool {
-    if (std.mem.eql(u8, field, "_id")) return true;
-    if (!std.mem.eql(u8, field, "_type")) return false;
-    for (table.columns) |column| if (std.mem.eql(u8, column.name, field)) return false;
-    return true;
+fn generatedCoveringField(_: catalog.Table, field: []const u8) bool {
+    return std.mem.eql(u8, field, "_id");
 }
 
 /// Relative work for vectorized projected decoding/evaluation. Inventory bytes
@@ -1203,6 +1256,10 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
             best_cost = cost;
             best_complete = complete;
             best_reverse = physical_reverse;
+            if (!complete) {
+                const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+                owner.primary_order = try PrimaryOrder.init(owner.arena.allocator(), table, parsed, index, indexed.scan, indexed.reversed);
+            }
             best_filter_proof = orderedFilterProof(a, table, search_order.filter_query_json, indexed.scan.conditions) catch |err| switch (err) {
                 error.OutOfMemory, error.InvalidArgument => null,
                 else => return err,
@@ -1301,6 +1358,50 @@ pub fn hasOrderedPredicatePlan(a: A, table: catalog.Table, request: catalog.Scan
 }
 
 const OrderedCandidate = struct { scan: catalog.Scan, reversed: bool };
+
+/// Operation-owned comparison capability. It uses the exact write-side tuple
+/// codec, including equality prefixes, per-key directions, SQL types and NULL
+/// placement. Extra physical keys and private row identities cannot break ties.
+const PrimaryOrder = struct {
+    tuple: local.storage_db_relational_index_keys.TuplePlan,
+    constants: []const std.json.Value,
+    columns: []const catalog.Column,
+    reversed: bool,
+    fn init(a: A, table: catalog.Table, parsed: anytype, index: local.storage_relational_index.RelationalIndexDefinition, request: catalog.Scan, reversed: bool) !PrimaryOrder {
+        var equal: usize = 0;
+        for (index.keys) |key| {
+            const constant = for (request.conditions) |condition| {
+                if (condition.op == .eq and condition.value != .null and std.mem.eql(u8, key.column, condition.column)) break true;
+            } else false;
+            if (!constant) break;
+            equal += 1;
+        }
+        const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+        const layout = try a.create(local.storage_db_algebraic_relational_row_codec.PhysicalLayout);
+        layout.* = try local.storage_db_algebraic_relational_row_codec.PhysicalLayout.init(a, runtime);
+        const prefix = index.keys[0 .. equal + request.order.len];
+        const constants = try a.alloc(std.json.Value, equal);
+        for (prefix[0..equal], constants) |key, *value| {
+            value.* = for (request.conditions) |condition| {
+                if (condition.op == .eq and std.mem.eql(u8, key.column, condition.column)) break try local.api_json_helpers.cloneJsonValue(a, condition.value);
+            } else unreachable;
+        }
+        const columns = try a.alloc(catalog.Column, request.order.len);
+        for (columns, request.order) |*column, field| column.* = try table.column(field.column);
+        return .{ .tuple = try local.storage_db_relational_index_keys.TuplePlan.init(a, runtime, layout, prefix), .constants = constants, .columns = columns, .reversed = reversed };
+    }
+    fn compare(self: PrimaryOrder, a: A, key: []const u8, values: []const std.json.Value) !std.math.Order {
+        if (values.len != self.columns.len) return error.InvalidRelationalIndexBound;
+        const normalized = try a.alloc(std.json.Value, self.constants.len + values.len);
+        @memcpy(normalized[0..self.constants.len], self.constants);
+        for (normalized[self.constants.len..], values, self.columns) |*value, wire, column| value.* = try local.sql_lake_values.conditionValue(a, wire, column);
+        const prefix = try boundKey(a, self.tuple, normalized);
+        // A key extends the encoded prefix with additional keys and row ID.
+        // Lexical length is not evidence that this primary tuple is worse.
+        const order = if (std.mem.startsWith(u8, key, prefix)) std.math.Order.eq else std.mem.order(u8, key, prefix);
+        return if (self.reversed) order.invert() else order;
+    }
+};
 
 /// Search NULL order differs from SQL defaults. A required scalar comparison
 /// can prove NULLs absent; otherwise physical placement must match, including
@@ -2520,8 +2621,14 @@ test "external lake covering result gathers retain typed values independently of
             var scratch = std.heap.ArenaAllocator.init(alloc);
             var scratch_live = true;
             defer if (scratch_live) scratch.deinit();
-            const row = try coveringSource(alloc, scratch.allocator(), table_, root_, block_, 0, ref_, root_.cover);
+            const page = try coveringPage(alloc, scratch.allocator(), table_, block_, &.{ 0, 0, 0, 0 }, &.{ ref_, ref_, ref_, ref_ }, root_.cover, root_.cover);
+            const row = page.row(3);
+            const first = page.row(0);
             defer row.deinit();
+            defer first.deinit();
+            try std.testing.expect(row.page == first.page);
+            try std.testing.expectEqual(@as(usize, 4), page.len);
+            page.release();
             scratch.deinit();
             scratch_live = false;
             var output = std.heap.ArenaAllocator.init(alloc);
@@ -2531,7 +2638,8 @@ test "external lake covering result gathers retain typed values independently of
             try std.testing.expectEqualStrings("covered title", json.object.get("title").?.string);
             try std.testing.expect(json.object.get("missing").? == .null);
             try std.testing.expectEqualStrings("12345678901234567890.0123456789", json.object.get("number").?.string);
-            try std.testing.expectEqualStrings("row", json.object.get("_type").?.string);
+            try std.testing.expect(!json.object.contains("_id"));
+            try std.testing.expect(!json.object.contains("_type"));
             try std.testing.expect(row.page.columns[0].values == .i64);
             try std.testing.expect(row.page.columns[1].values == .bytes);
         }
@@ -2558,7 +2666,7 @@ test "external lake covering results preserve declared type values and nulls wit
         const json = try source.value(&arena);
         const actual = json.object.get("_type").?;
         if (value.sql_null) try std.testing.expect(actual == .null) else try std.testing.expectEqualStrings("story", actual.string);
-        try std.testing.expectEqual(@as(usize, 2), source.page.columns.len);
+        try std.testing.expectEqual(@as(usize, 1), source.page.columns.len);
     }
 }
 
@@ -2691,13 +2799,17 @@ test "external lake covering waves overlap cold blocks retain admission and join
         var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
         defer cache.deinit();
         var wave: CoveringWave = .{};
-        const read = wave.read(.{ .cache = &cache, .scope = @splat(7), .context = .{ .io = std.testing.io } }, backend, &refs, .{ .ptr = &probe, .is_cancelled_fn = Probe.canceled });
+        var covers_: [4]ordered.Reader.Cover = undefined;
+        for (refs, &covers_) |ref, *cover| cover.* = .{ .block = ref, .row = 0 };
+        var reads: u64 = 4 * artifacts.max_block_bytes;
+        const read = wave.read(a, .{ .cache = &cache, .scope = @splat(7), .context = .{ .io = std.testing.io } }, backend, &covers_, &.{0}, 1, .{ .ptr = &probe, .is_cancelled_fn = Probe.canceled }, &reads);
         defer wave.deinit();
         if (mode == 0) {
             try read;
             try std.testing.expect(probe.peak.load(.monotonic) > 1);
-            try std.testing.expectEqual(before + 4 * CoveringWave.lane_bytes, scheduler.pull_bytes);
-            for (wave.jobs, 0..) |job, i| try std.testing.expectEqual(@as(i64, @intCast(i)), (try job.block.?.value.cell(0, 0)).value.integer);
+            try std.testing.expect(wave.retained != 0);
+            try std.testing.expectEqual(before + wave.retained, scheduler.pull_bytes);
+            for (wave.jobs, 0..) |job, i| try std.testing.expectEqual(@as(i64, @intCast(i)), (try job.block.?.block.cell(0, 0)).value.integer);
         } else if (mode == 1) try std.testing.expectError(error.InjectedCoveringReadFailure, read) else try std.testing.expectError(error.Canceled, read);
         try std.testing.expectEqual(@as(usize, 0), probe.current.load(.acquire));
         wave.deinit();
@@ -2769,4 +2881,176 @@ test "external lake metadata materialization costs count blocks and coordinate c
     owner.predicate_blocks = 0;
     try std.testing.expectEqual(@as(u64, 2312), value.materializationWork(null));
     try std.testing.expectEqual(std.math.maxInt(u64), value.scanMaterializationWork(std.math.maxInt(u64)));
+}
+
+test "external lake dynamic exact keys primary boundary ignores suffixes and preserves equality prefixes reverse and NULLs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"rank":{"type":"integer"},"suffix":{"type":"integer"}}}}}}
+    );
+    defer parsed.deinit(a);
+    const table: catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{ .{ .name = "tenant", .path = "tenant", .type = .integer }, .{ .name = "rank", .path = "rank", .type = .integer } } };
+    for ([_]bool{ false, true }) |reverse| {
+        const index: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "rank", .owner_kind = .table, .owner_name = "rank", .access_method = .ordered_tuple, .keys = &.{ .{ .column = "tenant" }, .{ .column = "rank", .direction = .desc, .nulls = .first }, .{ .column = "suffix" } } };
+        const request: catalog.Scan = .{ .fields = &.{}, .limit = 20, .conditions = &.{.{ .column = "tenant", .op = .eq, .value = .{ .integer = 7 } }}, .order = &.{.{ .column = "rank", .descending = !reverse, .nulls_first = !reverse }} };
+        const order = try PrimaryOrder.init(a, table, parsed, index, request, reverse);
+        const full = try boundKey(a, order.tuple, &.{ .{ .integer = 7 }, .{ .integer = -9007199254740993 } });
+        const key = try std.mem.concat(a, u8, &.{ full, "suffix-and-private-id" });
+        try std.testing.expectEqual(std.math.Order.eq, try order.compare(a, key, &.{.{ .integer = -9007199254740993 }}));
+        try std.testing.expectEqual(if (reverse) std.math.Order.lt else .gt, try order.compare(a, key, &.{.{ .integer = -9007199254740992 }}));
+        const null_key = try boundKey(a, order.tuple, &.{ .{ .integer = 7 }, .null });
+        try std.testing.expectEqual(if (reverse) std.math.Order.gt else .lt, try order.compare(a, null_key, &.{.{ .integer = 0 }}));
+    }
+}
+
+test "external lake bounded window profiles covering directory waves overlap reuse decoded leases and join failures" {
+    const stores = @import("../serverless/artifacts/store.zig");
+    const artifacts = @import("lake_index_aggregate_artifact.zig");
+    const Token = @import("antfly_cancellation").CancellationToken;
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("cover-directory-wave");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const scope: stores.UploadScope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    store.upload_scope = scope;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var refs: [4]ordered.Reader.Cover = undefined;
+    var directory_bytes: u64 = 0;
+    for (&refs, 0..) |*ref, i| {
+        const key = try std.fmt.allocPrint(arena.allocator(), "row-{d:0>16}", .{i});
+        const keys = [_]local.sql_scalar.Datum{local.sql_scalar.Datum.fromJson(.{ .string = key })};
+        const values = [_]local.sql_scalar.Datum{ local.sql_scalar.Datum.fromJson(.{ .integer = @intCast(i) }), local.sql_scalar.Datum.fromJson(.{ .integer = 9007199254740993 }) };
+        ref.* = .{ .block = try cover_columns.publish(arena.allocator(), store, scope, &.{.{ .keys = &keys, .values = &values, .ordinal = i }}, .none, &directory_bytes), .row = 0, .striped = true };
+    }
+    const Probe = struct {
+        var active: *@This() = undefined;
+        original: *const stores.ArtifactStore.VTable,
+        refs: []const ordered.Reader.Cover,
+        live: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        calls: std.atomic.Value(usize) = .init(0),
+        directories: std.atomic.Value(usize) = .init(0),
+        fail: bool = false,
+        fn get(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Token) ![]u8 {
+            const probe = active;
+            _ = probe.calls.fetchAdd(1, .monotonic);
+            for (probe.refs, 0..) |ref, i| if (std.mem.eql(u8, ref.block.artifact_id, id)) {
+                const live = probe.live.fetchAdd(1, .acq_rel) + 1;
+                defer _ = probe.live.fetchSub(1, .release);
+                _ = probe.peak.fetchMax(live, .monotonic);
+                _ = probe.directories.fetchAdd(1, .monotonic);
+                try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+                if (probe.fail and i == 1) return error.InjectedDirectoryFailure;
+                break;
+            };
+            return if (probe.original.get_range_alloc_with_cancellation) |read| read(raw, alloc, id, offset, length, token) else probe.original.get_range_alloc(raw, alloc, id, offset, length);
+        }
+    };
+    var traced = store.vtable.*;
+    traced.get_range_alloc_with_cancellation = Probe.get;
+    const original = store.vtable;
+    store.vtable = &traced;
+    for ([_]usize{ 0, 4 }) |lanes| {
+        var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_io_workers = lanes };
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        cache.max_entries = 0;
+        cache.physical.max_entries = 0;
+        const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(9), .context = .{ .io = std.testing.io } };
+        var probe: Probe = .{ .original = original, .refs = &refs };
+        Probe.active = &probe;
+        for (0..2) |iteration| {
+            const before = probe.calls.load(.acquire);
+            var wave: CoveringWave = .{ .scheduler = &scheduler };
+            defer wave.deinit();
+            var reads: u64 = 1024 * 1024;
+            try wave.read(a, cached, store, &refs, &.{0}, 2, .none, &reads);
+            for (wave.jobs[0..wave.count], 0..) |job, i| {
+                try std.testing.expect(job.prepared.?.lease != null);
+                try std.testing.expectEqual(@as(i64, @intCast(i)), (try job.block.?.block.cell(0, 0)).value.integer);
+                try std.testing.expect((try job.block.?.block.cell(0, 1)).sql_null);
+            }
+            if (iteration == 1) try std.testing.expectEqual(before, probe.calls.load(.acquire));
+        }
+        try std.testing.expectEqual(@as(usize, 4), probe.directories.load(.acquire));
+        if (lanes == 0) try std.testing.expectEqual(@as(usize, 1), probe.peak.load(.acquire)) else try std.testing.expect(probe.peak.load(.acquire) > 1);
+        try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+        try std.testing.expectEqual(@as(usize, 0), cache.physical.entries.count());
+        {
+            var wave: CoveringWave = .{ .scheduler = &scheduler };
+            defer wave.deinit();
+            var reads: u64 = 0;
+            const before = probe.calls.load(.acquire);
+            try std.testing.expectError(error.ArtifactReadBudgetExceeded, wave.read(a, cached, store, &refs, &.{0}, 2, .none, &reads));
+            try std.testing.expectEqual(before, probe.calls.load(.acquire));
+        }
+        // Rejected payload allowance and canceled warm readers must unwind
+        // already-resident directory leases without starting payload reads.
+        for ([_]bool{ false, true }) |canceled| {
+            var wave: CoveringWave = .{ .scheduler = &scheduler };
+            defer wave.deinit();
+            var signal: std.atomic.Value(bool) = .init(canceled);
+            var reads: u64 = 0;
+            for (refs) |ref| reads += ref.block.byte_len;
+            const before = probe.calls.load(.acquire);
+            try std.testing.expectError(if (canceled) error.Canceled else error.ArtifactReadBudgetExceeded, wave.read(a, cached, store, &refs, &.{0}, 2, Token.fromAtomic(&signal), &reads));
+            try std.testing.expectEqual(before, probe.calls.load(.acquire));
+        }
+        // A distinct cache scope forces fresh preparation and a provider error.
+        {
+            var failed_cache = cached;
+            failed_cache.scope = @splat(8);
+            probe.fail = true;
+            var wave: CoveringWave = .{ .scheduler = &scheduler };
+            defer wave.deinit();
+            var reads: u64 = 1024 * 1024;
+            try std.testing.expectError(error.InjectedDirectoryFailure, wave.read(a, failed_cache, store, &refs, &.{0}, 2, .none, &reads));
+        }
+        try std.testing.expectEqual(@as(usize, 0), probe.live.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+        std.debug.print("COVER_DIRECTORY_WAVE lanes={d} peak={d} warm_raw_empty_gets=0\n", .{ lanes, probe.peak.load(.acquire) });
+    }
+}
+
+test "external lake bounded window profiles covering wave observes later failure before parked sibling" {
+    const Probe = struct {
+        var active: *@This() = undefined;
+        entered: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        live: std.atomic.Value(usize) = .init(0),
+        fn run(job: *CoveringWave.Job) anyerror!void {
+            const self = active;
+            _ = self.live.fetchAdd(1, .acq_rel);
+            defer _ = self.live.fetchSub(1, .acq_rel);
+            if (job.width == 0) {
+                self.entered.set(std.testing.io);
+                try self.gate.waitTimeout(std.testing.io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
+                return error.UnexpectedGateRelease;
+            }
+            try self.entered.wait(std.testing.io);
+            return error.InjectedLaterCoverFailure;
+        }
+    };
+    var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_io_workers = 2 };
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &cache, .scope = @splat(9), .context = .{ .io = std.testing.io } };
+    var state: Probe = .{};
+    Probe.active = &state;
+    var wave: CoveringWave = .{ .scheduler = &scheduler, .count = 2 };
+    defer wave.deinit();
+    for (wave.jobs[0..2], 0..) |*job, index| job.* = .{ .a = std.testing.allocator, .cached = cached, .store = undefined, .cover = undefined, .columns = &.{}, .width = index, .token = .none, .limit = 64 * 1024 };
+    const start = @import("antfly_platform").time.monotonicNs();
+    const outcome = wave.runJobs(cached, Probe.run);
+    const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+    if (outcome) |_| return error.ExpectedInjectedFailure else |err| std.debug.print("COVER_FAILURE error={} elapsed_ms={} providers_live={}\n", .{ err, elapsed / 1000000, state.live.load(.acquire) });
+    try std.testing.expectEqual(@as(usize, 0), state.live.load(.acquire));
+    try std.testing.expectError(error.InjectedLaterCoverFailure, outcome);
 }

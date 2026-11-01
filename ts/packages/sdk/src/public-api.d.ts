@@ -23675,8 +23675,9 @@ export interface components {
              */
             prompt?: string;
             /**
-             * @description Maximum tokens to generate
-             * @default 256
+             * @description Maximum output tokens per page. When omitted, the selected reader
+             *     model supplies its default, bounded by deployment limits. Explicit
+             *     values override the model default and must fit model and server limits.
              * @example 256
              */
             max_tokens?: number;

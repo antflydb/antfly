@@ -51,6 +51,7 @@ test "reader classifies retryable HTTP statuses" {
 
 pub const Provider = config.Provider;
 pub const Config = config.Config;
+pub const max_output_tokens = config.max_output_tokens;
 pub const apple = @import("apple.zig");
 
 /// Validated, borrowed MIME essence shared by transport and source adapters.

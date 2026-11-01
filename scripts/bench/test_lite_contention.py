@@ -158,7 +158,9 @@ class ContentionReportTests(unittest.TestCase):
                     or (zero if phases.count("snapshot") == 1 else final)
                 ),
             ),
-            patch.object(bench.time, "monotonic", side_effect=[0, 1, 1.1, 2.1, 2.2, 3]),
+            patch.object(
+                bench.time, "monotonic", side_effect=[0, 1, 1.1, 1.2, 2.1, 2.2, 3]
+            ),
             patch.object(bench.time, "perf_counter_ns", side_effect=[100, 150]),
         ):
             bench.native_worker(
@@ -206,7 +208,9 @@ class ContentionReportTests(unittest.TestCase):
         with (
             patch.object(bench, "sdk", return_value=api),
             patch.object(bench, "measurement_stats", side_effect=[stats, stats]),
-            patch.object(bench.time, "monotonic", side_effect=[0, 1, 1.1, 2.1, 2.2, 3]),
+            patch.object(
+                bench.time, "monotonic", side_effect=[0, 1, 1.1, 1.2, 2.1, 2.2, 3]
+            ),
             patch.object(bench.time, "perf_counter_ns", side_effect=[100, 150]),
         ):
             bench.native_worker(
@@ -274,6 +278,14 @@ class ContentionReportTests(unittest.TestCase):
         self.assertEqual(partial["status"], "starved_workers")
         self.assertEqual(partial["workers_without_success"], 1)
         self.assertEqual(partial["successful_calls_per_second"], 1)
+        # Initial progress cannot conceal a worker that stalls for the rest
+        # of a soak while its peers keep succeeding.
+        late_stall = {**progressing, "success_windows": [1, 0]}
+        sustained = {**progressing, "success_windows": [1, 1]}
+        late = bench.aggregate([late_stall, sustained])
+        self.assertEqual(late["status"], "stalled_workers")
+        self.assertEqual(late["workers_with_stalled_windows"], 1)
+        self.assertEqual(late["workers_without_success"], 0)
 
     def test_unsampled_admission_has_no_latency_even_with_successful_calls(self):
         worker = {

@@ -1,0 +1,558 @@
+{
+  "schema_version": 1,
+  "status": "partial_qualification",
+  "issues": [
+    1362,
+    1431
+  ],
+  "base_revision": "f91c9c0e4682a3ff20e39fce9a44d67b658a7b55",
+  "code_revision": "4d90e0b25da06fc7a560897c3c17301cd08de022",
+  "debug": {
+    "provenance": {
+      "commit": "4d90e0b25da06fc7a560897c3c17301cd08de022",
+      "profile": "debug",
+      "library_sha256": "dd57419504d21e639072bba4d89071212dc75c97f1fd26651b26693f3df1c589",
+      "source_sha256": {
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "2f7ede41258f9d11aba9fc2369179f9fe2dc5819bfa618952727caf4eeb20de8",
+        "zig/pkg/antfly-embedded/src/capi/types.zig": "17f16baba66c63d94216579affde2624afa8cb72c336f37fb62e16d47d803ad1",
+        "zig/pkg/antfly-embedded/src/storage/lite/backend.zig": "3b70fd92b909605397a9ad1177f5a97afc63e6ff834e5a7c171b1a5d2d0f6079",
+        "zig/pkg/antfly-embedded/src/storage/lite/docstore.zig": "819a57f5b36b0266e7515e4b2fb96031c77e11f93cce0d1c57cae0d69a55a27d",
+        "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "74c3f72e4549d69c962c49c908b7fde028d662597a508e9599c9cf4b048bf0d6",
+        "zig/pkg/antfly-embedded/src/storage/lite/reader_coordinator.zig": "e9f1fe63a6b578c002800c0fcd25a3185ecc7dc1086e1611914b741f8ec58165",
+        "zig/pkg/antfly-embedded/src/storage/db/db.zig": "f2beea29dedb8ec9fcd279fc456e6d087006a96251b14e99c01159cc78607ef3",
+        "zig/pkg/antfly-embedded/src/storage/db/maintenance/text_merge_runtime.zig": "01ec8de30dbdc814e4c310e1b84a11f18d66c5bf1c30786612f403b87b219a37",
+        "zig/pkg/antfly-embedded/src/storage/lite/allocator_v4.zig": "0f7342109185be28f5306174f3c1239391c5d32d7a645bd25cfa7cf29a8ac5b0"
+      }
+    },
+    "storage_tests_passed": 514,
+    "allocator_tests_passed": 19,
+    "churn_negative_control_failed_as_expected": true,
+    "sdk_tests_passed": 75,
+    "capi_consumer_smoke": "passed",
+    "public_exports": 134,
+    "earlier_manual_merge_contracts_passed": 8,
+    "earlier_proof_admission_contracts_passed": 23,
+    "critical_append_replay": {
+      "status": "ok",
+      "revision": "4d90e0b25da06fc7a560897c3c17301cd08de022",
+      "library_sha256": "dd57419504d21e639072bba4d89071212dc75c97f1fd26651b26693f3df1c589",
+      "optimization": "debug",
+      "before": {
+        "file_bytes": 4933730304,
+        "reusable_bytes": 1121112064
+      },
+      "after": {
+        "file_bytes": 4933730304,
+        "reusable_bytes": 183083008
+      },
+      "growth_bytes": 0,
+      "seconds": 662.4447174170054,
+      "exit_code": 0,
+      "all_expected_threads_present": true,
+      "integrity_valid": true,
+      "busy_errors": 0,
+      "capacity_errors": 0
+    }
+  },
+  "optimized_matrix": {
+    "revision": "14d57ca1caf6f8cdb9c12363c3078180d98adfc6",
+    "library_sha256": "4e6cfc759bb5b014b681f80d12883760160b74dbca03f053e576af6de786df42",
+    "note": "Predates retirement tombstone fix. Includes bounded Busy outcomes; passing means all workers progressed and validation completed.",
+    "results": {
+      "exits": {
+        "post-load-indexed-p8-r2": 0,
+        "indexed": 0,
+        "sdk": 0,
+        "beads": 0,
+        "warm-candidate-r0": 0,
+        "soak": 0,
+        "warm-candidate-r1": 0,
+        "large-certified": 0,
+        "warm-guard-r0": 0,
+        "large-foreign": 0,
+        "unindexed": 0,
+        "warm-guard-r1": 0,
+        "live-index": 0,
+        "post-load-indexed-p16-r2": 0,
+        "post-load-soak-p8-r0": 0,
+        "post-load-indexed-p32-r2": 1,
+        "unindexed-32": 0
+      },
+      "measurements": {
+        "indexed.jsonl": [
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 1,
+            "successful_calls": 6223,
+            "busy_calls": 0,
+            "success_p50_ns": 801292,
+            "success_p99_ns": 10662166,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 1,
+            "successful_calls": 5309,
+            "busy_calls": 0,
+            "success_p50_ns": 833417,
+            "success_p99_ns": 16694958,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 1,
+            "successful_calls": 4818,
+            "busy_calls": 0,
+            "success_p50_ns": 824167,
+            "success_p99_ns": 47614125,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 8,
+            "successful_calls": 1437,
+            "busy_calls": 0,
+            "success_p50_ns": 43521291,
+            "success_p99_ns": 354152584,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 8,
+            "successful_calls": 1679,
+            "busy_calls": 0,
+            "success_p50_ns": 43727125,
+            "success_p99_ns": 131688958,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 8,
+            "successful_calls": 1234,
+            "busy_calls": 0,
+            "success_p50_ns": 40641875,
+            "success_p99_ns": 367957500,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 16,
+            "successful_calls": 1739,
+            "busy_calls": 0,
+            "success_p50_ns": 86751417,
+            "success_p99_ns": 207610458,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 16,
+            "successful_calls": 1151,
+            "busy_calls": 0,
+            "success_p50_ns": 91347791,
+            "success_p99_ns": 544069083,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 16,
+            "successful_calls": 1645,
+            "busy_calls": 0,
+            "success_p50_ns": 83423750,
+            "success_p99_ns": 456063750,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 32,
+            "successful_calls": 1722,
+            "busy_calls": 0,
+            "success_p50_ns": 188306250,
+            "success_p99_ns": 320128333,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 32,
+            "successful_calls": 1710,
+            "busy_calls": 0,
+            "success_p50_ns": 192568125,
+            "success_p99_ns": 331657833,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 32,
+            "successful_calls": 1708,
+            "busy_calls": 0,
+            "success_p50_ns": 185835250,
+            "success_p99_ns": 314104666,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          }
+        ],
+        "unindexed.jsonl": [
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 8,
+            "successful_calls": 3155,
+            "busy_calls": 0,
+            "success_p50_ns": 13429541,
+            "success_p99_ns": 159630334,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 1
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 8,
+            "successful_calls": 4940,
+            "busy_calls": 0,
+            "success_p50_ns": 12513791,
+            "success_p99_ns": 104145667,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 1
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 16,
+            "successful_calls": 3188,
+            "busy_calls": 0,
+            "success_p50_ns": 30988125,
+            "success_p99_ns": 344094084,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 0
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 16,
+            "successful_calls": 3517,
+            "busy_calls": 0,
+            "success_p50_ns": 30204709,
+            "success_p99_ns": 341103209,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 1
+          }
+        ],
+        "unindexed-32.jsonl": [
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 32,
+            "successful_calls": 3213,
+            "busy_calls": 0,
+            "success_p50_ns": 76265083,
+            "success_p99_ns": 605826125,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 1
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 32,
+            "successful_calls": 3123,
+            "busy_calls": 2,
+            "success_p50_ns": 77809125,
+            "success_p99_ns": 680089833,
+            "busy_max_ns": 1144159125,
+            "allocator_proof_walks": 1
+          },
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 32,
+            "successful_calls": 3255,
+            "busy_calls": 0,
+            "success_p50_ns": 76347292,
+            "success_p99_ns": 727743042,
+            "busy_max_ns": null,
+            "allocator_proof_walks": 2
+          }
+        ],
+        "soak.jsonl": [
+          {
+            "kind": "native",
+            "status": "ok",
+            "concurrency": 8,
+            "successful_calls": 9713,
+            "busy_calls": 7,
+            "success_p50_ns": 240007500,
+            "success_p99_ns": 3081894750,
+            "busy_max_ns": 5144584333,
+            "allocator_proof_walks": 0
+          }
+        ],
+        "warm-guard-r0.log": [
+          {
+            "kind": "seeded"
+          },
+          {
+            "kind": "foreign_setup",
+            "status": "ok"
+          },
+          {
+            "kind": "operation",
+            "status": "ok",
+            "operation": "read"
+          },
+          {
+            "kind": "warm_operation",
+            "status": "ok",
+            "operation": "batch",
+            "p50_ns": 633792,
+            "p95_ns": 746208
+          },
+          {
+            "kind": "warm_operation",
+            "status": "ok",
+            "operation": "sql",
+            "p50_ns": 591041,
+            "p95_ns": 769417
+          },
+          {
+            "kind": "integrity",
+            "status": "ok"
+          },
+          {
+            "kind": "complete",
+            "status": "ok"
+          }
+        ],
+        "warm-guard-r1.log": [
+          {
+            "kind": "seeded"
+          },
+          {
+            "kind": "foreign_setup",
+            "status": "ok"
+          },
+          {
+            "kind": "operation",
+            "status": "ok",
+            "operation": "read"
+          },
+          {
+            "kind": "warm_operation",
+            "status": "ok",
+            "operation": "batch",
+            "p50_ns": 600375,
+            "p95_ns": 809833
+          },
+          {
+            "kind": "warm_operation",
+            "status": "ok",
+            "operation": "sql",
+            "p50_ns": 601875,
+            "p95_ns": 768500
+          },
+          {
+            "kind": "integrity",
+            "status": "ok"
+          },
+          {
+            "kind": "complete",
+            "status": "ok"
+          }
+        ],
+        "warm-candidate-r0.log": [
+          {
+            "kind": "seeded"
+          },
+          {
+            "kind": "foreign_setup",
+            "status": "ok"
+          },
+          {
+            "kind": "operation",
+            "status": "ok",
+            "operation": "read"
+          },
+          {
+            "kind": "warm_operation",
+            "status": "ok",
+            "operation": "batch",
+            "p50_ns": 810750,
+            "p95_ns": 899083
+          },
+          {
+            "kind": "warm_operation",
+            "status": "ok",
+            "operation": "sql",
+            "p50_ns": 773708,
+            "p95_ns": 936459
+          },
+          {
+            "kind": "integrity",
+            "status": "ok"
+          },
+          {
+            "kind": "complete",
+            "status": "ok"
+          }
+        ],
+        "warm-candidate-r1.log": [
+          {
+            "kind": "seeded"
+          },
+          {
+            "kind": "foreign_setup",
+            "status": "ok"
+          },
+          {
+            "kind": "operation",
+            "status": "ok",
+            "operation": "read"
+          },
+          {
+            "kind": "warm_operation",
+            "status": "ok",
+            "operation": "batch",
+            "p50_ns": 823417,
+            "p95_ns": 1021625
+          },
+          {
+            "kind": "warm_operation",
+            "status": "ok",
+            "operation": "sql",
+            "p50_ns": 783750,
+            "p95_ns": 925333
+          },
+          {
+            "kind": "integrity",
+            "status": "ok"
+          },
+          {
+            "kind": "complete",
+            "status": "ok"
+          }
+        ]
+      },
+      "post_load_32_rerun_exit": 0
+    },
+    "host": "wolfspider",
+    "profile": "fast"
+  },
+  "original_frozen_imports": {
+    "revision": "14d57ca1caf6f8cdb9c12363c3078180d98adfc6",
+    "library_sha256": "4e6cfc759bb5b014b681f80d12883760160b74dbca03f053e576af6de786df42",
+    "importer_sha256": "f8c48e309c207f6d550805eef8929bffb3c4ce5ad5bc098659160b30224ef1f3",
+    "fixture_hashes": {
+      "source_sqlite_sha256": "1481d396d225a2fac52920aed53ece5280c1535f2abbb546365469c15406e013",
+      "copied_sqlite_sha256": "c9c9ec70fd6ea23e3107e93bb205d47b6d27d7ffaf504ca77628f8dc87ff8eba",
+      "rebased_rollout_paths": 15,
+      "thread_count": 15,
+      "source_unmodified": true
+    },
+    "physical_validation": {
+      "status": "ok",
+      "failures": [],
+      "threads": 15,
+      "all_expected_threads_present": true,
+      "integrity_valid": true,
+      "file_bytes": 4933730304,
+      "live_bytes": 2507653637,
+      "file_live_ratio": 1.9674688047837445,
+      "library_sha256": "4e6cfc759bb5b014b681f80d12883760160b74dbca03f053e576af6de786df42"
+    },
+    "critical_append": {
+      "growth_bytes": 0,
+      "reusable_bytes_before": 1121112064,
+      "seconds": 64.69983654102543
+    },
+    "full_semantic_drain": {
+      "status": "failed",
+      "diagnostic": "EnrichmentWorkerFailed",
+      "underlying_error": "GlinerBoundaryPaddedSequenceLimitExceeded",
+      "metal_device_selected": true,
+      "qualification_bounds_unchanged": true
+    }
+  },
+  "concurrent_real_imports": {
+    "writers": 3,
+    "busy_timeout_seconds": 5,
+    "successful_importers": 1,
+    "busy_failures": 2,
+    "status_reads": 47,
+    "status_reader_errors": 0,
+    "integrity_valid": true,
+    "all_expected_threads_present": false
+  },
+  "retirement_churn_microbenchmark": {
+    "optimization": "ReleaseFast",
+    "before_revision": "14d57ca1caf6f8cdb9c12363c3078180d98adfc6",
+    "after_revision": "4d90e0b25da06fc7a560897c3c17301cd08de022",
+    "method": "Three alternating-order runs; medians. One protected retirement survives monotonic insert/collect cycles, then absent-key probes. Synthetic allocator measurement, not database throughput.",
+    "measurements": [
+      {
+        "hash_capacity": 512,
+        "live_retirements": 1,
+        "churn_cycles": 8192,
+        "missing_lookups": 20000,
+        "before": {
+          "churn_ns": 1694958,
+          "missing_20000_ns": 5657792
+        },
+        "after": {
+          "churn_ns": 222583,
+          "missing_20000_ns": 21417
+        }
+      },
+      {
+        "hash_capacity": 8192,
+        "live_retirements": 1,
+        "churn_cycles": 131072,
+        "missing_lookups": 20000,
+        "before": {
+          "churn_ns": 295553542,
+          "missing_20000_ns": 85829125
+        },
+        "after": {
+          "churn_ns": 3942292,
+          "missing_20000_ns": 20625
+        }
+      }
+    ],
+    "system": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "zig_version": "0.17.0"
+  },
+  "limitations": [
+    "The optimized matrix and full fifteen-import run predate the retirement-map change; current code has Debug verification.",
+    "The original 32-worker post-load check refused capacity below the default 16 GiB disk safety floor; same preserved case passed after cleanup restored about 21 GiB free. Original failed receipt retained.",
+    "Whole-file physical validation passes; full semantic draining still fails the qualified GLiNER padded-sequence bound.",
+    "Real parallel importers can exceed a five-second Busy budget. Blanket SQL retries can duplicate a commit if strong synchronization fails afterward.",
+    "No healthy final-candidate factory soak.",
+    "Earlier merged-candidate aggregate unit run failed inference/OCR and compiler memory limits, then stopped early; this is not a completed full unit gate."
+  ],
+  "sdk_compatibility": {
+    "abi_change": false,
+    "schema_change": false,
+    "required_sdk_changes": false,
+    "note": "Text merge timeout uses existing Busy code; application retry policy must respect operation idempotency."
+  }
+}
