@@ -80,3 +80,35 @@ zig build check-kernel-ownership test-tile-kernels
 Enable the backend under test for physical device coverage. Qualify numerical
 changes with independent references, retained native resource/schedule checks,
 and controlled baseline/candidate timing before retiring a fast path.
+
+## Remaining migration boundaries
+
+Issue [#1166](https://github.com/antflydb/antfly/issues/1166) also requests a
+complete migration of execution policy. Shared kernel ownership and the common
+preparation API do not by themselves complete these remaining requirements:
+
+- Imported ONNX retains its own four-entry specialization LRU alongside the
+  architecture runtime cache. Shared preparation and initializer leases are in
+  place; specialization policy and eviction ownership are not fully unified.
+- Assigned outputs/workspace cover admitted native/CUDA descriptors, while Metal
+  consumes its existing physical allocation plan. Compatibility allocation paths
+  remain, and CUDA decode capture still uses its learned allocation arena.
+  A universal authoritative allocation/capture plan is unfinished.
+- `model_definition.zig`, `compute_context.zig`, prepared executables and model
+  candidates separate important responsibilities. The session factory, model
+  manager and generation pipeline still contain model-specific loading and
+  physical execution decisions. Optional model-specific hooks also remain in
+  the generic compute vtable; their migration to extension interfaces is open.
+- Resident stage contracts, exact typed transfers and strict readback auditing
+  are implemented. Migrating every task to resident stage chaining and moving
+  all KV/recurrent execution choices behind runtime owners remains incremental.
+- Existing format and backend tests do not constitute one equivalent-model
+  ONNX/safetensors/GGUF comparison with explicit quantization accounting.
+  Execution/provider diagnostics also remain separate; one uniform report of
+  every backend's launches, synchronization, peak memory and cache decisions is
+  not complete.
+
+The issue checklist records implementation and evidence separately from remaining
+migration. Compatibility paths stay until their replacements satisfy correctness,
+residency, lifetime and performance checks. Physical L4/A100 qualification remains
+deferred; CPU, local Metal and Glowworm GB10 provide the available hardware tests.

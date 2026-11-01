@@ -92,7 +92,7 @@ pub fn prepareAnalyzedGraph(allocator: std.mem.Allocator, graph: *const @import(
         try runtime_module.Runtime.initWithOptions(allocator, graph, backend, strategy, .{ .tensor_descs = tensor_descs, .analysis = analysis, .region_costs = options.region_costs }) };
 }
 
-test "prepared executable reuses CPU and Metal plans with resident outputs" {
+test "prepared executable reuses CPU Metal and CUDA plans with resident outputs" {
     if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
     const ml = @import("ml");
     const a = std.testing.allocator;
@@ -106,7 +106,10 @@ test "prepared executable reuses CPU and Metal plans with resident outputs" {
     var program = try ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "out", .node_id = out, .kind = .output } });
     defer program.deinit();
     const BackendType = @import("../backends/backends.zig").BackendType;
-    for ([_]BackendType{ .native, .metal }) |kind| {
+    for ([_]BackendType{ .native, .metal, .cuda }) |kind| {
+        if (kind == .cuda) {
+            if (comptime !@import("build_options").enable_cuda) continue;
+        }
         if (kind == .metal) {
             if (comptime !@import("build_options").enable_metal) continue;
             if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) continue;
@@ -151,7 +154,7 @@ test "prepared executable reuses CPU and Metal plans with resident outputs" {
     }
 }
 
-test "prepared BERT program matches CPU reference on CPU and Metal" {
+test "prepared BERT program matches CPU reference on CPU Metal and CUDA" {
     if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
     const ml = @import("ml");
     const bert_graph = @import("../architectures/bert_graph.zig");
@@ -173,7 +176,10 @@ test "prepared BERT program matches CPU reference on CPU and Metal" {
     defer program.deinit();
     var expected: ?[]f32 = null;
     defer if (expected) |values| a.free(values);
-    for ([_]BackendType{ .native, .metal }) |kind| {
+    for ([_]BackendType{ .native, .metal, .cuda }) |kind| {
+        if (kind == .cuda) {
+            if (comptime !@import("build_options").enable_cuda) continue;
+        }
         if (kind == .metal) {
             if (comptime !@import("build_options").enable_metal) continue;
             if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) continue;
@@ -241,6 +247,9 @@ test "prepared BERT program matches CPU reference on CPU and Metal" {
         defer executable.deinit();
         var result = try executable.run(a, .{ .runtime_inputs = bound, .output_placement = .producer });
         defer result.deinit(&executable.runtime);
+        // This fixture is admitted on each device; a CPU-only fallback must
+        // not masquerade as cross-backend prepared execution parity.
+        try std.testing.expectEqual(cb.kind(), result.backendFor(&executable.runtime, 0).kind());
         const values = try result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], a);
         defer a.free(values);
         try std.testing.expectEqual(expected.?.len, values.len);

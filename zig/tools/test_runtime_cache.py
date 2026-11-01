@@ -1739,6 +1739,10 @@ class RuntimeCacheTest(unittest.TestCase):
                 )
                 if backend == "cuda":
                     native_templates.append(self.own("zig/pkg/inference/src/ops/cuda/embedding_gemma2.zig"))
+                    native_templates.extend(self.own("zig/pkg/inference/" + name) for name in (
+                        "src/graph/cuda_execution_contract.zig",
+                        "src/ops/cuda/lighton_device_policy.zig",
+                    ))
                 native_templates.append(self.own("zig/pkg/inference/src/tile/whisper_logits.zig"))
                 native_templates.append(self.own("zig/lib/tile/src/native_math.zig"))
                 if backend == "metal":
@@ -1814,6 +1818,8 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/gpu/masked_pool_program.h",
                     "src/graph/cuda_kernel_fold.zig",
                     "src/tile/source_inputs.zig",
+                    "src/graph/cuda_execution_contract.zig",
+                    "src/ops/cuda/lighton_device_policy.zig",
                     "src/ops/cuda/driver_contract.zig", "src/ops/cuda/artifact.zig", "src/ops/cuda/context.zig", "src/ops/cuda/embedded_module.zig",
                     "src/ops/cuda/gated_delta.zig",
                     "src/ops/cuda/paged_attention_bf16.zig",
