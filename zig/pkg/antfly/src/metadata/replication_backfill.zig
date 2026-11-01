@@ -59,7 +59,7 @@ const cdc_apply_sync_level = db_mod.types.SyncLevel.full_index;
 // it does for any other `.write`-level write.
 const cdc_snapshot_window_sync_level = db_mod.types.SyncLevel.write;
 const default_prepared_snapshot_timeout_ns: u64 = 30 * std.time.ns_per_s;
-const default_runtime_quantum_ns: u64 = 5 * std.time.ns_per_s;
+pub const default_runtime_quantum_ns: u64 = 5 * std.time.ns_per_s;
 const snapshot_keyset_checkpoint_prefix = "snapshot_keyset:";
 const max_snapshot_keyset_json_len: usize = 16 * 1024;
 const cutover_mode_exported_snapshot = "exported_snapshot";
@@ -1960,6 +1960,51 @@ pub const StreamingReplicationCoordinator = struct {
         return summary;
     }
 };
+
+/// Runs one snapshot round, resuming from `cursor` and writing the round's
+/// new resume point back to it before returning (on both the success and
+/// the expected-error path through `runRound`; see `SourceRoundCursor`).
+/// Every CDC owner (standalone's scheduler, cluster metadata's leader) must
+/// hold one `SourceRoundCursor` per coordinator kind on its own long-lived
+/// state and pass the *same* pointer to this function every round. Passing
+/// a fresh, default cursor each round instead -- the bug this type and
+/// function exist to prevent -- restarts every round at the top of the
+/// table/source list, so a source stuck past its round's quantum starves
+/// every source after it in the list, indefinitely.
+pub fn runSnapshotRound(
+    alloc: Allocator,
+    service: anytype,
+    runner: SnapshotBackfillRunner,
+    runtime_quantum_ns: u64,
+    cursor: *SourceRoundCursor,
+) !BackfillRoundSummary {
+    var snapshot = SnapshotBackfillCoordinator{
+        .alloc = alloc,
+        .runner = runner,
+        .runtime_quantum_ns = runtime_quantum_ns,
+        .cursor = cursor.*,
+    };
+    defer cursor.* = snapshot.cursor;
+    return try snapshot.runRound(service);
+}
+
+/// The streaming counterpart of `runSnapshotRound`; see its doc comment.
+pub fn runStreamingRound(
+    alloc: Allocator,
+    service: anytype,
+    runner: StreamingReplicationRunner,
+    runtime_quantum_ns: u64,
+    cursor: *SourceRoundCursor,
+) !StreamingRoundSummary {
+    var streaming = StreamingReplicationCoordinator{
+        .alloc = alloc,
+        .runner = runner,
+        .runtime_quantum_ns = runtime_quantum_ns,
+        .cursor = cursor.*,
+    };
+    defer cursor.* = streaming.cursor;
+    return try streaming.runRound(service);
+}
 
 const ParsedReplicationSourceConfig = struct {
     type_name: []u8,
@@ -5362,7 +5407,7 @@ test "metadata replication backfill coordinator continues past one source's retr
     try std.testing.expect(saw_failure and saw_completion);
 }
 
-test "metadata replication backfill coordinator rotates past a source stuck until its own timeout" {
+test "metadata replication backfill production round entry point persists the cursor so a source stuck until its own timeout cannot starve later sources" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-replication-backfill-fairness";
 
@@ -5549,38 +5594,36 @@ test "metadata replication backfill coordinator rotates past a source stuck unti
         });
     }
 
-    var coordinator = SnapshotBackfillCoordinator{
+    // Exercise the production entry point, `runSnapshotRound`, rather than
+    // hand-wiring a second coordinator's cursor from the first: standalone's
+    // CDC scheduler and cluster metadata's leader both call this exact
+    // function once per round, each holding one `SourceRoundCursor` on their
+    // own long-lived state and passing the same pointer in every round. A
+    // single local `cursor` here plays that role; no test code copies it
+    // between rounds, `runSnapshotRound` does, the same way it does in
+    // production.
+    var cursor: SourceRoundCursor = .{};
+    const runner_config = SnapshotBackfillRunner{
         .alloc = alloc,
-        .runner = .{
-            .alloc = alloc,
-            .registry = &registry,
-            .write_source = write_source.source(),
-        },
-        // Tiny relative to the slow source's call (2s, always overruns it)
-        // so without a rotating cursor every round restarts at ordinal 0
-        // and the other two sources never run.
-        .runtime_quantum_ns = 500 * std.time.ns_per_ms,
+        .registry = &registry,
+        .write_source = write_source.source(),
     };
-    const round1 = try coordinator.runRound(&service);
+    // Tiny relative to the slow source's call (2s, always overruns it) so
+    // without a persisted cursor every round restarts at ordinal 0 and the
+    // other two sources never run.
+    const quantum_ns: u64 = 500 * std.time.ns_per_ms;
+
+    const round1 = try runSnapshotRound(alloc, &service, runner_config, quantum_ns, &cursor);
     try std.testing.expectEqual(@as(usize, 1), round1.sources_considered);
     try std.testing.expectEqual(@as(usize, 1), round1.sources_failed);
-    try std.testing.expect(coordinator.cursor.valid);
-    try std.testing.expectEqual(@as(u64, 22), coordinator.cursor.table_id);
-    try std.testing.expectEqual(@as(u32, 1), coordinator.cursor.source_ordinal);
+    try std.testing.expect(cursor.valid);
+    try std.testing.expectEqual(@as(u64, 22), cursor.table_id);
+    try std.testing.expectEqual(@as(u32, 1), cursor.source_ordinal);
 
-    // A fresh coordinator (a new round, same as every real round) carrying
-    // only the cursor forward resumes at source 1, not source 0 again.
-    var coordinator2 = SnapshotBackfillCoordinator{
-        .alloc = alloc,
-        .runner = .{
-            .alloc = alloc,
-            .registry = &registry,
-            .write_source = write_source.source(),
-        },
-        .runtime_quantum_ns = 500 * std.time.ns_per_ms,
-        .cursor = coordinator.cursor,
-    };
-    const round2 = try coordinator2.runRound(&service);
+    // The second round reads whatever `runSnapshotRound` wrote into
+    // `cursor` above -- exactly what a real owner's next round does -- and
+    // resumes at source 1, not source 0 again.
+    const round2 = try runSnapshotRound(alloc, &service, runner_config, quantum_ns, &cursor);
     try std.testing.expect(round2.sources_considered >= 2);
     try std.testing.expectEqual(@as(usize, 2), round2.sources_completed);
 

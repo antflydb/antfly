@@ -3777,7 +3777,15 @@ const LocalStandaloneMetadata = struct {
     }
 
     /// One snapshot round then one streaming round, the same sequence and
-    /// coordinators cluster metadata runs from its leader.
+    /// coordinators cluster metadata runs from its leader. The snapshot and
+    /// streaming resume cursors live on `self.cdc` (the scheduler), not on
+    /// a coordinator that only lives for this one call: a fresh coordinator
+    /// per round previously meant a fresh default cursor every round, so a
+    /// source stuck past its own round's quantum could starve every source
+    /// after it in the table/source list indefinitely. Loading and storing
+    /// them around the round (rather than holding the scheduler's mutex for
+    /// the whole round) matches how every other field on `self.cdc` is
+    /// guarded.
     fn runCdcRoundJob(self: *LocalStandaloneMetadata) anyerror!void {
         try cdcPermitCheckpoint(self, .snapshot_step);
         const server = self.data_server orelse return;
@@ -3785,19 +3793,18 @@ const LocalStandaloneMetadata = struct {
         const service = CdcService{ .metadata = self };
         const io = self.backend_runtime.io() orelse std.Options.debug_io;
         const write_source = server.write_source.source();
-        var snapshot = backfill.SnapshotBackfillCoordinator{
+        var cursors = self.cdc.loadCursors();
+        defer self.cdc.storeCursors(cursors.snapshot, cursors.streaming);
+
+        const summary = backfill.runSnapshotRound(self.alloc, service, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = io,
-                .registry = &self.cdc.registry,
-                .write_source = write_source,
-                .secret_store = server.write_source.secret_store,
-                .work_permit = self.cdcWorkPermit(),
-                .destination_authorizer = server.write_source.destination_authorizer,
-            },
-        };
-        const summary = snapshot.runRound(service) catch |err| {
+            .io = io,
+            .registry = &self.cdc.registry,
+            .write_source = write_source,
+            .secret_store = server.write_source.secret_store,
+            .work_permit = self.cdcWorkPermit(),
+            .destination_authorizer = server.write_source.destination_authorizer,
+        }, backfill.default_runtime_quantum_ns, &cursors.snapshot) catch |err| {
             if (!antfly.metadata_service.isExpectedCdcRoundError(err)) return err;
             std.log.warn("standalone cdc snapshot round skipped: {s}", .{@errorName(err)});
             return;
@@ -3806,19 +3813,15 @@ const LocalStandaloneMetadata = struct {
             "standalone cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d} yielded={d} failed={d}",
             .{ summary.tables_considered, summary.sources_considered, summary.sources_started, summary.sources_resumed, summary.sources_completed, summary.sources_yielded, summary.sources_failed },
         );
-        var streaming = backfill.StreamingReplicationCoordinator{
+        const stream_summary = backfill.runStreamingRound(self.alloc, service, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = io,
-                .registry = &self.cdc.registry,
-                .write_source = write_source,
-                .secret_store = server.write_source.secret_store,
-                .work_permit = self.cdcWorkPermit(),
-                .destination_authorizer = server.write_source.destination_authorizer,
-            },
-        };
-        const stream_summary = streaming.runRound(service) catch |err| {
+            .io = io,
+            .registry = &self.cdc.registry,
+            .write_source = write_source,
+            .secret_store = server.write_source.secret_store,
+            .work_permit = self.cdcWorkPermit(),
+            .destination_authorizer = server.write_source.destination_authorizer,
+        }, backfill.default_runtime_quantum_ns, &cursors.streaming) catch |err| {
             if (!antfly.metadata_service.isExpectedCdcRoundError(err)) return err;
             std.log.warn("standalone cdc streaming round skipped: {s}", .{@errorName(err)});
             return;

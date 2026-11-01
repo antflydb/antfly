@@ -26,6 +26,7 @@ const std = @import("std");
 const platform_time = @import("antfly_platform").time;
 const foreign_mod = @import("../foreign/mod.zig");
 const background_runtime = @import("antfly_local_sources").storage_db_selected_root.db.background_runtime;
+const replication_backfill = @import("../metadata/replication_backfill.zig");
 
 /// Matches the cluster metadata cadence.
 pub const round_interval_ms: u64 = 1_000;
@@ -39,6 +40,17 @@ pub const Scheduler = struct {
     owner_id: u64 = 0,
     next_round_at_ms: u64 = 0,
     runtime: ?*background_runtime.BackendRuntime = null,
+    // Resume points for the snapshot and streaming coordinators, carried
+    // across rounds by this long-lived scheduler so a source stuck past its
+    // round's quantum does not starve sources later in the table/source
+    // list on every subsequent round (see SourceRoundCursor). In-memory
+    // scheduling state only: it resets to the top of the list on restart or
+    // on a leadership change that recreates this scheduler, which is fine —
+    // the worst case is one extra round of the old ordering, not lost work.
+    // Guarded by `mutex`, the same lock that already serializes this
+    // scheduler's other round state.
+    snapshot_cursor: replication_backfill.SourceRoundCursor = .{},
+    streaming_cursor: replication_backfill.SourceRoundCursor = .{},
 
     /// Submit one round unless a round is in flight, the cadence has not
     /// elapsed, or shutdown started. `run` executes on a maintenance worker.
@@ -118,4 +130,69 @@ pub const Scheduler = struct {
     pub fn deinit(self: *Scheduler, alloc: std.mem.Allocator) void {
         self.registry.deinit(alloc);
     }
+
+    /// Read both round cursors under the same lock that guards the rest of
+    /// this scheduler's round state. A round job is single-flight
+    /// (`in_flight`), but this keeps cursor access consistent with every
+    /// other field here rather than relying on that alone.
+    pub fn loadCursors(self: *Scheduler) struct {
+        snapshot: replication_backfill.SourceRoundCursor,
+        streaming: replication_backfill.SourceRoundCursor,
+    } {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        return .{ .snapshot = self.snapshot_cursor, .streaming = self.streaming_cursor };
+    }
+
+    /// Persist both round cursors after a round, under the same lock.
+    pub fn storeCursors(
+        self: *Scheduler,
+        snapshot: replication_backfill.SourceRoundCursor,
+        streaming: replication_backfill.SourceRoundCursor,
+    ) void {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        self.snapshot_cursor = snapshot;
+        self.streaming_cursor = streaming;
+    }
 };
+
+test "standalone cdc scheduler persists independent snapshot and streaming cursors across rounds" {
+    var scheduler = Scheduler{};
+    defer scheduler.deinit(std.testing.allocator);
+
+    // A fresh scheduler, like a fresh process, starts every coordinator at
+    // the top of its table/source list.
+    const initial = scheduler.loadCursors();
+    try std.testing.expect(!initial.snapshot.valid);
+    try std.testing.expect(!initial.streaming.valid);
+
+    // runCdcRoundJob (standalone) and runReplicationBackfillWorker (cluster)
+    // both load the pair, hand each half to its own coordinator for one
+    // round, and store the pair back -- this is that load/mutate/store
+    // cycle, repeated across rounds, without a data server or registry.
+    var cursors = scheduler.loadCursors();
+    cursors.snapshot = .{ .valid = true, .table_id = 7, .source_ordinal = 2 };
+    scheduler.storeCursors(cursors.snapshot, cursors.streaming);
+
+    const after_snapshot_round = scheduler.loadCursors();
+    try std.testing.expect(after_snapshot_round.snapshot.valid);
+    try std.testing.expectEqual(@as(u64, 7), after_snapshot_round.snapshot.table_id);
+    try std.testing.expectEqual(@as(u32, 2), after_snapshot_round.snapshot.source_ordinal);
+    // The streaming cursor is a separate resume point: storing a new
+    // snapshot cursor must not disturb it.
+    try std.testing.expect(!after_snapshot_round.streaming.valid);
+
+    var cursors2 = scheduler.loadCursors();
+    cursors2.streaming = .{ .valid = true, .table_id = 9, .source_ordinal = 1 };
+    scheduler.storeCursors(cursors2.snapshot, cursors2.streaming);
+
+    const after_streaming_round = scheduler.loadCursors();
+    // The snapshot cursor from the earlier round survives this round that
+    // only touched streaming -- the persistence this scheduler exists for.
+    try std.testing.expect(after_streaming_round.snapshot.valid);
+    try std.testing.expectEqual(@as(u64, 7), after_streaming_round.snapshot.table_id);
+    try std.testing.expect(after_streaming_round.streaming.valid);
+    try std.testing.expectEqual(@as(u64, 9), after_streaming_round.streaming.table_id);
+    try std.testing.expectEqual(@as(u32, 1), after_streaming_round.streaming.source_ordinal);
+}
