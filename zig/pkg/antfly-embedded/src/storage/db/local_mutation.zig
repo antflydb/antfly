@@ -278,12 +278,9 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const projectedBatchLsmAdmissionBytes = preparation.projectedBatchLsmAdmissionBytes;
         pub const rememberBulkIngestAllNewIdentityUpserts = commit.rememberBulkIngestAllNewIdentityUpserts;
         pub const replicationMutationBarrier = commit.replicationMutationBarrier;
-        pub const resetCoalescedEntryToDelete = preparation.resetCoalescedEntryToDelete;
         pub const resolveTransactionIntentsInternal = commit.resolveTransactionIntentsInternal;
         pub const resolveTransactionIntentsPrepared = commit.resolveTransactionIntentsPrepared;
         pub const restoreStagingStatus = commit.restoreStagingStatus;
-        pub const setCoalescedEntryToBorrowedWrite = preparation.setCoalescedEntryToBorrowedWrite;
-        pub const setCoalescedEntryToOwnedWrite = preparation.setCoalescedEntryToOwnedWrite;
         pub const shouldApplySplitReplicationLocked = commit.shouldApplySplitReplicationLocked;
         pub const splitMarkerMatches = commit.splitMarkerMatches;
         pub const storedDocumentValuesEqual = preparation.storedDocumentValuesEqual;

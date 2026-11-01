@@ -19,10 +19,13 @@ const Imports = @import("antfly/imports.zig").AntflyRootImports;
 
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, imports: Imports, linalg: *std.Build.Module) void {
     const aggregate = b.step("architecture-probe-test", "Test pure mutation plans and independent production-operation owners");
-    const plan = b.addTest(.{ .name = "mutation-plan-tests", .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/transform_read_plan.zig"), .target = target, .optimize = optimize }) });
-    const plan_run = b.addRunArtifact(plan);
-    b.step("mutation-plan-test", "Test request-only transform planning without storage").dependOn(&plan_run.step);
-    aggregate.dependOn(&plan_run.step);
+    const plan_step = b.step("mutation-plan-test", "Test concrete mutation and transform read planning without storage");
+    inline for (.{ "transform_read_plan", "mutation_plan" }) |name| {
+        const plan = b.addTest(.{ .name = name ++ "-tests", .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/" ++ name ++ ".zig"), .target = target, .optimize = optimize }) });
+        const plan_run = b.addRunArtifact(plan);
+        plan_step.dependOn(&plan_run.step);
+        aggregate.dependOn(&plan_run.step);
+    }
 
     const abi = b.createModule(.{ .root_source_file = b.path("build_support/architecture_probe_abi.zig"), .target = target, .optimize = optimize });
     abi.addImport("runtime_failure_abi", imports.storage_boundary.failure);

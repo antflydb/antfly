@@ -9837,12 +9837,6 @@ pub const DB = struct {
 
     pub const appendGraphTransformDelete = local_mutation.appendGraphTransformDelete;
 
-    pub const resetCoalescedEntryToDelete = local_mutation.resetCoalescedEntryToDelete;
-
-    pub const setCoalescedEntryToBorrowedWrite = local_mutation.setCoalescedEntryToBorrowedWrite;
-
-    pub const setCoalescedEntryToOwnedWrite = local_mutation.setCoalescedEntryToOwnedWrite;
-
     pub const coalesceKeyValueRequest = local_mutation.coalesceKeyValueRequest;
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
