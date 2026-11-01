@@ -6383,7 +6383,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lite_merge_publication_runtime_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions", "db manual text producers merge capacity without optional workers" },
+        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions", "db manual text producers merge capacity without optional workers", "db bulk ingest keeps full text merge maintenance live", "db text merge stop does not deadlock against a producer's assisted fallback", "text merge publication handoff releases index lease before global contention", "db delete full text index drains active merge before closing generation", "db close stops text admission before joining derived publishers", "db structural mutation autonomously retries transient maintenance restart failures" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-merge-publication-runtime-test", "Verify incremental merge publication handoff and shutdown")
