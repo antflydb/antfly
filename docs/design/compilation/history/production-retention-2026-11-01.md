@@ -89,6 +89,12 @@ products keep embedded inference and the existing runtime composition.
 | Physical inference archive | 50,925,464 | 47,953,232 | 2,972,232 (5.84%) |
 | Inference attributed text, estimated | 33,640,776 | 31,901,492 | 1,739,284 (5.17%) |
 
+These reductions compare with the immediately preceding work-avoidance build.
+Against the [pre-query-owner executable](query-owner-redesign-2026-11-01.md)
+of 225,639,896 bytes with the same flags, the current server remains 3,981,856
+bytes larger (1.76%). This increment recovers part of that split's size cost;
+it does not establish a cumulative executable size reduction across the redesign.
+
 The new audit rejects the preceding archive with 518 CUDA-compute text
 symbols and accepts the candidate with zero. Across the entire `ops.cuda`
 namespace, estimated text falls from 1,324,972 to 7,184 bytes; the remaining
