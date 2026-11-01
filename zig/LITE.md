@@ -1157,16 +1157,45 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-6 files (`AFLITE\x06P`) with packed records and
+Native owners create revision-7 files (`AFLITE\x07P`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
 owners migrate revision 3 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-6 signature before checkpoint selection.
-Unreleased revision-4/5 prototypes are rejected rather than mixing their reader
-coordination protocols; revision-3 migration creates a bound revision-6 image.
+and older binaries reject the revision-7 signature before checkpoint selection.
+Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-7 image.
+
+Revision 7 records separate opaque identities for primary data, runtime metadata,
+and index inputs in each recovery slot. Allocator-only checkpoints and scoped
+reader leases preserve those identities, so admission can retain an unchanged
+serving runtime after both physical slots advance. Allocator caches independently
+validate journal ancestry and the current seal; a repeated physical root ID does
+not establish a cache hit.
+
+Schema and SQL recovery-state writes atomically mark their namespace in a durable
+recovery agenda. Admission checks pending namespaces instead of opening every
+table and index. Recovery acknowledges only terminal work under the path lease,
+and rotates bounded pages so one namespace cannot monopolize a turn. Revision-3
+conversion bootstraps this agenda before publishing the replacement generation.
+
+Detached replay uses per-index-kind feedback retained by the namespace scheduling
+owner. Cheap full windows can grow up to 2,048 records and 16 MiB; slow or failed
+windows shrink, and observed blocked reuse lowers retention limits. The 25 ms
+quantum is a sizing target, not preemption of an individual record/provider call.
+Background and foreground retirement work remains capped per publication. Pending
+work diagnostics report replay budgets and the current retirement-work limit.
+Explicit integrity reports split logical bytes among documents, control documents,
+metadata catalogs, and index artifacts; allocator checks independently load disk
+state rather than using a writer's transient traversal inventory.
+
+Database-wide compact preparation drains and merges named-table indexes as well
+as the default namespace. The C API also settles cross-table promotion before
+merging. An unavailable namespace fails explicit compaction rather than silently
+reporting a partially settled database. Logical-byte comparisons must use the
+same inputs and equivalent index catch-up/merge state.
 
 The indexed layout removes historical record chains. Ordered indexes identify live
 records; journaled ownership counters and a hierarchical bitmap replenish free
@@ -1178,7 +1207,7 @@ compact generation independently of routine reuse. See the
 storage admission, format encoding, memory costs, and qualification.
 
 Background shrink assessments and generation copies use coordinated snapshots.
-Their fences retain both data and allocator metadata. Revision-6 cooperating
+Their fences retain both data and allocator metadata. Revision-7 cooperating
 processes publish locked reader epochs in a bounded `.aflite-readers-<path-hash>`
 directory. The header binds a persistent random identity and directory inode;
 the pathname only locates that namespace. Missing or replaced namespaces cannot

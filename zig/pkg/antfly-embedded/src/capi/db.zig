@@ -3547,11 +3547,15 @@ pub const LiteCompactReport = struct {
 };
 
 pub fn prepareLiteCompact(handle: *Handle) !void {
-    try handle.database().*.runUntilIdle();
-    try handle.database().*.forceCompactTextIndexes();
-    try handle.database().*.drainScheduledTextMerges();
-    try handle.database().*.sync(true);
-    try handle.database().*.syncIndexes(true);
+    const root = handle.parent_handle orelse handle;
+    // Compaction is database-wide. Fail on an unavailable namespace rather
+    // than reporting a partially settled artifact as fully compacted.
+    try @import("tables.zig").load(root);
+    try @import("entity_sink.zig").runUntilIdle(root);
+    try @import("../storage/lite/connection.zig").prepareDatabaseCompact(&root.db);
+    var iterator = root.embedded_tables.valueIterator();
+    while (iterator.next()) |table|
+        try @import("../storage/lite/connection.zig").prepareDatabaseCompact(&table.*.db);
 }
 
 pub fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {

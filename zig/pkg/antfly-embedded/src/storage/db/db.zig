@@ -55486,6 +55486,19 @@ fn replayPendingDerivedBatches(
             .index_name = index_ref.name,
             .last_log_ns = monotonicTimeNs(),
         };
+        const replay_state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
+        const replay_lane: usize = switch (index_ref.kind) {
+            .full_text => 0,
+            .dense_vector => 1,
+            .sparse_vector => 2,
+            .graph => 3,
+            .algebraic => 4,
+        };
+        const adaptive_budget = replay_state.replay_budget.budget(replay_lane);
+        const replay_started = monotonicTimeNs();
+        var replay_completed = false;
+        defer if (options.bounded_replay and !replay_completed)
+            replay_state.replay_budget.observe(replay_lane, adaptive_budget, monotonicTimeNs() - replay_started, 0, true);
         const stats = try derived_worker.catchUpIndexWithOptions(
             self.alloc,
             resources.replay_source,
@@ -55504,11 +55517,11 @@ fn replayPendingDerivedBatches(
                 .persist_progress_fn = PersistReplayProgress.run,
                 .max_records_per_window = @min(
                     if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxRecords() else derived_worker.catch_up_max_records_per_window_default,
-                    if (options.bounded_replay) derived_worker.catch_up_background_max_records else std.math.maxInt(usize),
+                    if (options.bounded_replay) adaptive_budget.records else std.math.maxInt(usize),
                 ),
                 .max_chunk_bytes = @min(
                     if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxChunkBytes() else derived_worker.catch_up_max_chunk_bytes_default,
-                    if (options.bounded_replay) derived_worker.catch_up_background_max_chunk_bytes else std.math.maxInt(u64),
+                    if (options.bounded_replay) adaptive_budget.bytes else std.math.maxInt(u64),
                 ),
                 .max_windows_per_call = options.max_windows_per_index,
                 .deadline_ns = options.deadline_ns,
@@ -55542,6 +55555,9 @@ fn replayPendingDerivedBatches(
             try finishReplayCapture(&replay_ctx, index_ref, target_sequence);
             try self.core.saveAppliedSequence(index_ref.name, target_sequence);
         } else try abortReplayCapture(&replay_ctx, index_ref);
+        if (options.bounded_replay)
+            replay_state.replay_budget.observe(replay_lane, adaptive_budget, monotonicTimeNs() - replay_started, stats.scanned_entries, false);
+        replay_completed = true;
     }
     if (options.truncate_replay) try truncateReplayJournalIfSafe(self);
 }

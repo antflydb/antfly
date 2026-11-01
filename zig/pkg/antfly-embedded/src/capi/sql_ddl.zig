@@ -182,8 +182,20 @@ pub fn invalidate(handle: *h.Handle) void {
 }
 
 pub fn recover(handle: *h.Handle) !void {
-    if (!handle.sql_ddl_recovery_needed) return;
+    if (!handle.sql_ddl_recovery_needed) {
+        if (handle.owned_lite_backend) |*backend| {
+            if (backend.native_docstore) |storage| {
+                if (!storage.file.header.indexed_reclamation or std.mem.eql(u8, &handle.sql_ddl_recovery_generation, &storage.file.activeCheckpoint().logical.metadata)) return;
+            } else return;
+        } else return;
+    }
     if (h.builtin.is_test) handle.sql_ddl_recovery_scans +%= 1;
+    if (handle.owned_lite_backend) |*backend| {
+        if (backend.native_docstore) |storage| if (storage.file.header.indexed_reclamation) {
+            try recoverAgenda(handle, storage);
+            return;
+        };
+    }
     try @import("tables.zig").loadAvailable(handle);
     try @import("sql_fk.zig").recover(handle);
     var complete = try recoverTable(handle, &handle.db, "default");
@@ -192,6 +204,104 @@ pub fn recover(handle: *h.Handle) !void {
         if (!try recoverTable(handle, &table.*.db, table.*.name)) complete = false;
     }
     handle.sql_ddl_recovery_needed = !complete or handle.embedded_table_errors.count() != 0;
+}
+
+/// Read only the compact agenda before opening any namespace/index runtime.
+/// The path lease encloses recovery and acknowledgement. A crash leaves a
+/// conservative marker; a peer's later mutation atomically recreates it.
+fn recoverAgenda(handle: *h.Handle, storage: anytype) !void {
+    const agenda = @import("../storage/lite/recovery_agenda.zig");
+    const native = @import("../storage/lite/native.zig");
+    // This coordinator affects every table. It must settle even when this
+    // agenda page wraps past a root marker earlier than the cursor.
+    try @import("sql_fk.zig").recover(handle);
+    const began_at_start = handle.sql_ddl_agenda_after_len == 0;
+    var cursor = try storage.file.metadataCatalogCursor(storage.file.activeCheckpoint(), agenda.prefix);
+    defer cursor.deinit();
+    if (handle.sql_ddl_agenda_after_len != 0)
+        cursor.start_after = handle.sql_ddl_agenda_after[0..handle.sql_ddl_agenda_after_len];
+    var keys: std.ArrayList([]u8) = .empty;
+    defer {
+        for (keys.items) |key_bytes| handle.alloc.free(key_bytes);
+        keys.deinit(handle.alloc);
+    }
+    // Capture keys before recovery writes can retire their catalog pages.
+    const max_namespaces_per_turn = 8;
+    while (keys.items.len < max_namespaces_per_turn) {
+        const entry = (try cursor.next()) orelse break;
+        defer storage.file.allocator.free(entry.key);
+        const owned = try handle.alloc.dupe(u8, entry.key);
+        errdefer handle.alloc.free(owned);
+        try keys.append(handle.alloc, owned);
+    }
+    const more = keys.items.len == max_namespaces_per_turn;
+    if (keys.items.len == 0) {
+        // Wrap on the next admission; a failed earlier namespace must not
+        // starve siblings, and a completed sweep cannot hide earlier debt.
+        const wrapped = handle.sql_ddl_agenda_after_len != 0;
+        handle.sql_ddl_agenda_after_len = 0;
+        handle.sql_ddl_recovery_needed = wrapped;
+        if (!wrapped) handle.sql_ddl_recovery_generation = storage.file.activeCheckpoint().logical.metadata;
+        return;
+    }
+    var complete = !more;
+    for (keys.items) |marker| {
+        if (marker.len > handle.sql_ddl_agenda_after.len) return error.InvalidRecoveryAgenda;
+        @memcpy(handle.sql_ddl_agenda_after[0..marker.len], marker);
+        handle.sql_ddl_agenda_after_len = @intCast(marker.len);
+        const id = try agenda.tableId(marker[agenda.prefix.len..]);
+        var database = &handle.db;
+        var name: []const u8 = "default";
+        if (id) |table_id| {
+            try @import("tables.zig").loadCatalog(handle);
+            var records = handle.embedded_table_records.iterator();
+            const found = while (records.next()) |record| {
+                if (record.value_ptr.* == table_id) {
+                    name = record.key_ptr.*;
+                    break true;
+                }
+            } else false;
+            if (found) {
+                database = try @import("tables.zig").get(handle, name);
+            } else {
+                // IDs never repeat. Dropping a table retires its recovery work.
+                if (h.liteOpenModeCanWrite(handle.open_mode)) try acknowledgeAgenda(storage, marker, native);
+                continue;
+            }
+        } else {
+            try @import("sql_fk.zig").recover(handle);
+        }
+        if (!try recoverTable(handle, database, name)) {
+            complete = false;
+            continue;
+        }
+        if (h.liteOpenModeCanWrite(handle.open_mode)) try acknowledgeAgenda(storage, marker, native);
+    }
+    // Check the current queue after acknowledgements: recovery itself can
+    // create work in a sibling namespace. An empty durable queue is the clean
+    // witness; a rotated page alone never proves earlier work completed.
+    var remaining = try storage.file.metadataCatalogCursor(storage.file.activeCheckpoint(), agenda.prefix);
+    defer remaining.deinit();
+    const first = try remaining.next();
+    defer if (first) |entry| storage.file.allocator.free(entry.key);
+    const read_only_clean = !h.liteOpenModeCanWrite(handle.open_mode) and began_at_start and complete and !more;
+    handle.sql_ddl_recovery_needed = first != null and !read_only_clean;
+    if (!handle.sql_ddl_recovery_needed) {
+        handle.sql_ddl_agenda_after_len = 0;
+        handle.sql_ddl_recovery_generation = storage.file.activeCheckpoint().logical.metadata;
+    }
+}
+
+fn acknowledgeAgenda(storage: anytype, marker: []const u8, comptime native: type) !void {
+    const Ack = struct {
+        key_bytes: []const u8,
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try file.deleteCatalogRecord(self.key_bytes);
+        }
+    };
+    var ack = Ack{ .key_bytes = marker };
+    try storage.submitIndexMutation(&ack, Ack.apply, true);
 }
 
 /// Native schema publication creates durable activation progress. Reuse the
