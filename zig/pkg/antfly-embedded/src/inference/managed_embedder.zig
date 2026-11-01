@@ -5187,10 +5187,19 @@ fn resolveEmbeddingDimensionsForEntryWithValidation(
     return probe_dims;
 }
 
+/// Below this much remaining time, another provider attempt would almost
+/// certainly be cut off before a real response could arrive. Stop and
+/// surface `error.EmbeddingProbeUnavailable` instead of spending the last
+/// sliver of the deadline on an attempt that cannot succeed.
+const min_probe_attempt_remaining_ns: u64 = 250 * std.time.ns_per_ms;
+
 /// Probe the provider for its embedding dimension, retrying a transient
 /// failure with the operator-repair backoff schedule
-/// (`repair_failure.repairTransientBackoffNs`) bounded by
-/// `probe_retry_budget_ns` (`default_probe_retry_budget_ns` when null).
+/// (`repair_failure.repairTransientBackoffNs`) bounded by one absolute
+/// deadline computed once at the start of the probe: `now + budget_ns`
+/// (`probe_retry_budget_ns`, or `default_probe_retry_budget_ns` when null),
+/// clipped to the caller's own request deadline (`entry.deadline_ns`) when
+/// that is earlier.
 ///
 /// A dimension probe fails transiently when the local `antfly` provider
 /// refuses admission because memory is tight, or the model is still loading
@@ -5198,7 +5207,25 @@ fn resolveEmbeddingDimensionsForEntryWithValidation(
 /// at exactly that moment. Giving up on the first such failure turns an
 /// ordinary startup race into a 503 that nothing retries, so loop here
 /// instead and only surface `error.EmbeddingProbeUnavailable` once the
-/// budget is spent.
+/// deadline is spent.
+///
+/// Every attempt shares that one deadline (via a request overlay's
+/// `deadline_ns`, the same mechanism `embeddingOperationDeadline` already
+/// uses to size a provider timeout) instead of each computing its own fresh
+/// `max_embedding_request_timeout_ns` window: without this, a provider that
+/// always times out could let each retry restart a full fresh timeout,
+/// turning one bounded budget into several minutes of real wall-clock
+/// waiting. A timed-out attempt (`error.Timeout`) is itself transient and
+/// retries while time remains, via `isOperationalEmbeddingProbeError`.
+///
+/// `EmbeddingProbeUnavailable` means "this is transient, ask again later" —
+/// true only when the probe's *own* retry budget ran out while the caller
+/// still had time. An already-expired (or mid-retry-expired) caller deadline
+/// or cancellation is the caller's own signal, not a condition retrying
+/// could ever fix, so it is never folded into that retryable error: it
+/// surfaces as `error.Timeout`/`error.Cancelled` instead, whatever the
+/// create-table/add-index path already maps a request deadline or
+/// cancellation to.
 ///
 /// Returns `null` only when `validation == .defer_probe` meets a transient
 /// failure: deferring the probe already means the caller does not want to
@@ -5211,10 +5238,35 @@ fn probeEmbeddingDimensionsRetryingTransient(
     validation: DimensionProbeValidation,
     probe_retry_budget_ns: ?u64,
 ) !?u32 {
-    var remaining_budget_ns: u64 = probe_retry_budget_ns orelse default_probe_retry_budget_ns;
+    // An already-expired caller deadline or cancellation can't be fixed by
+    // retrying at all; surface it before spending a single attempt on it.
+    try ensureEntryDeadline(entry);
+
+    const budget_ns = probe_retry_budget_ns orelse default_probe_retry_budget_ns;
+    const budget_deadline_ns = monotonicNowNs() +| budget_ns;
+    // Decided once, from the two fixed deadlines: whichever is earlier is
+    // "binding", and that alone decides what running out of time means below
+    // — the caller's own deadline maps to their timeout, never to
+    // EmbeddingProbeUnavailable, regardless of which specific check (a stale
+    // "now", or too little time left for another attempt) trips first.
+    const caller_binds = if (entry.deadline_ns) |caller_deadline| caller_deadline <= budget_deadline_ns else false;
+    const deadline_ns = if (entry.deadline_ns) |caller_deadline|
+        @min(caller_deadline, budget_deadline_ns)
+    else
+        budget_deadline_ns;
+    const out_of_time_err: anyerror = if (caller_binds) error.Timeout else error.EmbeddingProbeUnavailable;
+
+    // Every attempt reuses this overlay so `embeddingOperationDeadline` sizes
+    // each provider timeout from the same fixed `deadline_ns`, shrinking as
+    // the probe spends it, rather than each attempt getting a fresh default
+    // timeout from `entry.deadline_ns == null`.
+    var probing = entry.requestOverlay(alloc);
+    probing.deadline_ns = deadline_ns;
+    defer probing.auth_header_cache.deinit(alloc);
+
     var attempt: u32 = 1;
     while (true) {
-        if (inferEmbeddingDimensionsFromEntry(alloc, entry, declared orelse 0)) |dims| return dims else |err| {
+        if (inferEmbeddingDimensionsFromEntry(alloc, &probing, declared orelse 0)) |dims| return dims else |err| {
             const transient = switch (err) {
                 error.InvalidEmbeddingDimensions,
                 error.EmptyEmbeddingResponse,
@@ -5227,10 +5279,16 @@ fn probeEmbeddingDimensionsRetryingTransient(
             };
             if (!transient) return err;
             if (validation == .defer_probe) return null;
-            if (entry.cancellation) |token| if (token.isCancelled()) return error.EmbeddingProbeUnavailable;
-            const delay_ns = repair_failure.repairTransientBackoffNs(attempt);
-            if (delay_ns > remaining_budget_ns) return error.EmbeddingProbeUnavailable;
-            remaining_budget_ns -= delay_ns;
+            // Cancellation is always the caller's own signal; it never maps
+            // to the probe's own retryable unavailability.
+            if (entry.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+            const now_ns = monotonicNowNs();
+            if (now_ns >= deadline_ns) return out_of_time_err;
+            const remaining_ns = deadline_ns - now_ns;
+            if (remaining_ns < min_probe_attempt_remaining_ns) return out_of_time_err;
+            // Never sleep past the point where the next attempt would no
+            // longer have a meaningful amount of the deadline left.
+            const delay_ns = @min(repair_failure.repairTransientBackoffNs(attempt), remaining_ns -| min_probe_attempt_remaining_ns);
             platform_time.sleepNs(delay_ns);
             attempt += 1;
         }
@@ -10061,6 +10119,183 @@ test "managed embedder gives up with EmbeddingProbeUnavailable once the retry bu
     try std.testing.expect(monotonicNowNs() - started_ns < 400 * std.time.ns_per_ms);
 }
 
+test "managed embedder dimension probe treats a timed-out attempt as transient and keeps retrying" {
+    // error.Timeout (what a spent deadline produces) must not be surfaced as
+    // a permanent failure: it is exactly the condition one absolute deadline
+    // is meant to retry while time remains.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = 1, .failure = error.Timeout };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 5 * std.time.ns_per_s,
+    })).?;
+    defer std.testing.allocator.free(normalized);
+
+    try std.testing.expectEqual(@as(usize, 2), local.calls);
+}
+
+test "managed embedder dimension probe rejects an already-expired caller deadline without attempting" {
+    // A deadline that is already in the past when the probe starts can never
+    // be fixed by retrying. This must surface as the caller's own timeout
+    // (whatever the create-table/add-index path already maps a request
+    // deadline to), never as the retryable EmbeddingProbeUnavailable, and
+    // without spending a single provider call on an attempt that cannot
+    // possibly land before the deadline.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = std.math.maxInt(usize) };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.Timeout, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        // A generous budget: if this is reached at all, something ignored
+        // the already-expired deadline below.
+        .probe_retry_budget_ns = 10 * std.time.ns_per_s,
+        .deadline_ns = monotonicNowNs() -| std.time.ns_per_s,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
+}
+
+test "managed embedder dimension probe reports the caller's timeout when its deadline expires mid-retry" {
+    // The caller's deadline is fine at the start (unlike the test above) but
+    // runs out after one retry, well before the much larger retry budget
+    // would. Running out of *our own* budget while the caller still has
+    // time returns EmbeddingProbeUnavailable (see the "once the retry
+    // budget is spent" test above); running out of the *caller's* own time
+    // must not — it has to surface as their timeout instead, exactly like
+    // the already-expired case.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = std.math.maxInt(usize) };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    const started_ns = monotonicNowNs();
+    try std.testing.expectError(error.Timeout, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        // A retry budget this large would, by itself, keep retrying for
+        // seconds; the much shorter caller deadline below must win instead.
+        .probe_retry_budget_ns = 10 * std.time.ns_per_s,
+        // Long enough to survive the first attempt and its 500ms backoff
+        // step, short enough to be spent by the second attempt's check.
+        .deadline_ns = monotonicNowNs() + 600 * std.time.ns_per_ms,
+    }));
+    // Two attempts: the first failure's backoff (capped short of the
+    // deadline) still leaves a meaningful window, but the second failure
+    // finds the caller's deadline already behind it.
+    try std.testing.expectEqual(@as(usize, 2), local.calls);
+    try std.testing.expect(monotonicNowNs() - started_ns < 1 * std.time.ns_per_s);
+}
+
+test "managed embedder dimension probe rejects already-cancelled caller without attempting" {
+    // Mirrors the already-expired-deadline test: cancellation set before the
+    // probe starts must surface as error.Cancelled with no attempt spent.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = std.math.maxInt(usize) };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 10 * std.time.ns_per_s,
+        .cancellation = CancellationToken.fromAtomic(&canceled),
+    }));
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
+}
+
+test "managed embedder dimension probe surfaces caller cancellation mid-retry instead of EmbeddingProbeUnavailable" {
+    // Cancellation is always the caller's own signal, exactly like their
+    // deadline: it must never be folded into the probe's retryable
+    // unavailability, whether it is set before the probe starts (the test
+    // above) or, as here, flips true only once the first attempt fails.
+    const CancelingLocal = struct {
+        calls: usize = 0,
+        cancel_flag: *std.atomic.Value(bool),
+
+        fn dense(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.cancel_flag.store(true, .monotonic);
+            return error.ResourceTemporarilyUnavailable;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+    var canceled = std.atomic.Value(bool).init(false);
+    var local = CancelingLocal{ .cancel_flag = &canceled };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.Cancelled, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = CancelingLocal.dense, .embed_sparse_texts = CancelingLocal.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 10 * std.time.ns_per_s,
+        .cancellation = CancellationToken.fromAtomic(&canceled),
+    }));
+    // One attempt only: cancellation is checked (and wins) right after it
+    // fails, before any backoff sleep is considered.
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+}
+
+test "managed embedder dimension probe spends slow provider attempts against the same deadline" {
+    // Reproduces the regression this fix targets: a provider that always
+    // eventually answers transient-failure, but takes real time to do so,
+    // must not get a fresh timeout window on every retry. Advancing the
+    // logical clock inside the fake response simulates that provider time
+    // without paying for it in real test wall-clock.
+    TestClock.offset_ns.store(0, .monotonic);
+    defer TestClock.offset_ns.store(0, .monotonic);
+
+    const FakeApp = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            // Each "attempt" costs 2s of logical time before the provider
+            // answers 429 (rate limited, transient).
+            _ = TestClock.offset_ns.fetchAdd(2 * std.time.ns_per_s, .monotonic);
+            return .{
+                .status = 429,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, "{}"),
+            };
+        }
+    };
+    var app = FakeApp{};
+
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, app.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    const index_json = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"text-embedding-3-small","url":"{s}"}}}}
+    , .{base_uri});
+    defer std.testing.allocator.free(index_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, index_json, .{});
+    defer parsed.deinit();
+
+    // The first attempt alone (2s simulated execution) plus its backoff
+    // sleep (500ms) already spends nearly all of the 3s budget. The second
+    // attempt never reaches the network at all: `checkEntryDispatchDeadline`
+    // finds the one shared deadline already passed and fails it with
+    // `error.Timeout` before dispatch. With the old budget-minus-sleeps
+    // accounting (no shared deadline, a fresh per-attempt timeout instead),
+    // this provider's execution time would never count against the budget,
+    // and it would keep hitting the network for several retries instead.
+    try std.testing.expectError(error.EmbeddingProbeUnavailable, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .probe_retry_budget_ns = 3 * std.time.ns_per_s,
+    }));
+    try std.testing.expectEqual(@as(u32, 1), app.calls.load(.monotonic));
+}
+
 test "managed embedder routes antfly model to local provider" {
     const Local = struct {
         calls: usize = 0,
@@ -11297,7 +11532,11 @@ test "managed embedder cold activation precedes default probe and query inferenc
             defer parsed.deinit();
             const result = normalizeEmbeddingsIndexDimensionJsonWithOptions(a, "semantic", parsed.value, options);
             if (case.bounded) {
-                try std.testing.expectError(error.EmbeddingProbeUnavailable, result);
+                // The caller's own 20ms deadline is what ran out here, not the
+                // probe's much larger retry budget, so this must match the
+                // query path above: error.Timeout, never the retryable
+                // EmbeddingProbeUnavailable.
+                try std.testing.expectError(error.Timeout, result);
             } else {
                 const normalized = try result;
                 defer if (normalized) |value| a.free(value);
