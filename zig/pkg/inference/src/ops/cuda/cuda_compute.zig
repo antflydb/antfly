@@ -3169,7 +3169,7 @@ pub const CudaCompute = struct {
     pub fn lightOnVisionMlp(cb: *const ops.ComputeBackend, input_ct: CT, weights: [6]CT, rows: usize, dim: usize, hidden: usize, eps: f32) !?CT {
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (self.capability_profile != .lightonocr3 or !self.lighton_fused_vision_mlp_enabled or self.ctx.info.compute_major < 8 or
+        if (self.capability_profile != .lightonocr3 or !self.lighton_fused_vision_mlp_enabled or !lightOnDevice(self).portableKernels() or
             self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or rows == 0 or rows > 65536 or
             !((dim == 768 and hidden == 3072) or (dim == 1024 and hidden == 4096)) or
             !cudaCublasLtEnabled() or self.cublaslt == null or self.cublaslt_bf16_tuning_profile != .off) return null;
@@ -5152,13 +5152,12 @@ pub const CudaCompute = struct {
             // The pair-only E2B route uses checked-in, shape-specific AOT
             // artifacts rather than a production JIT route. Keep its explicit
             // candidate gate available in JIT mode, but retain the same target
-            // qualification and master-disable contract as bundled dispatch.
+            // execution-capability and master-disable contract as bundled dispatch.
             gates.e2b_pair_only = (GeneratedQ4_0Gates{
                 .e2b_pair_only = cudaQ4_0GeneratedE2BFfnPairOnlyEnabled(),
-            }).restrictToPromotedTarget(
+            }).restrictToExecutionSupport(
                 ctx.info.compute_major,
                 ctx.info.compute_minor,
-                platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_ALLOW_UNPROMOTED_GENERATED_KERNELS", false),
             ).e2b_pair_only;
             break :blk gates.withExplicitDisables();
         } else GeneratedQ4_0Gates.resolveForTarget(ctx.info.compute_major, ctx.info.compute_minor);
@@ -5199,8 +5198,8 @@ pub const CudaCompute = struct {
             .florence_grouped_channel_tc_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_GROUPED_CHANNEL_TC"),
             .lighton_wide_microbatches = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES"),
 
-            .ocr_pinned_metadata_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_OCR_PINNED_METADATA"),
-            .ocr_pinned_inputs_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_OCR_PINNED_INPUTS"),
+            .ocr_pinned_metadata_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_OCR_PINNED_METADATA", profile == .lightonocr3),
+            .ocr_pinned_inputs_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_OCR_PINNED_INPUTS", profile == .lightonocr3),
             .lighton_cached_mrope_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_CACHED_MROPE_POSITIONS", lighton_auto),
             .lighton_fused_batch_recurrent = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_BATCH_RECURRENT"),
             .lighton_prefix_batch_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_PREFIX"),
@@ -5217,9 +5216,9 @@ pub const CudaCompute = struct {
             .florence_fused_bias_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_BIAS"),
             .florence_fused_depthwise_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_DEPTHWISE"),
             .lighton_precision = try @import("lighton_vision_bf16.zig").Precision.resolveWithAttention(platform.env.getenv("ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE"), platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN", true)),
-            .lighton_fused_vision_mlp_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_MLP"),
-            .lighton_fused_vision_qkv_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_QKV"),
-            .lighton_norm_weight_cache_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE"),
+            .lighton_fused_vision_mlp_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_MLP", lighton_auto),
+            .lighton_fused_vision_qkv_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_QKV", lighton_auto),
+            .lighton_norm_weight_cache_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE", profile == .lightonocr3),
 
             .florence_bart_ffn_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_BART_FFN"),
             .florence_fused_append_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_KV_APPEND"),
@@ -5242,6 +5241,7 @@ pub const CudaCompute = struct {
             .dispatch_stats = .{ .enabled = cudaDispatchStatsEnabled() },
             .runtime_jit_shape_gating = jit_config.mode.activates(),
         };
+        std.log.info("cuda_generated_q4_policy compute={d}.{d} portable_matmul_capable={} evidence_target=sm_89 mmv={} mm={} pair={}", .{ ctx.info.compute_major, ctx.info.compute_minor, quant_kernel_catalog.portableCudaDeviceSupported(ctx.info.compute_major, ctx.info.compute_minor), generated_q4_0_gates.mmv, generated_q4_0_gates.mm, generated_q4_0_gates.pair });
         if (profile == .lightonocr3) std.log.info("lighton_cuda_policy compute={d}.{d} driver={d} automatic={} graph={s} specialized_kernels={}", .{ ctx.info.compute_major, ctx.info.compute_minor, ctx.info.driver_version, lighton_auto, @tagName(result.lightOnGraphDecision()), lighton_device.specializedKernels() });
         return result;
     }
@@ -9284,10 +9284,9 @@ pub const CudaTunedRouteGates = struct {
     q6_k_lm_head_q8_1: bool = false,
     lm_head_q8_1_argmax: bool = false,
     async_i32_download_staging: bool = false,
-    // Opt-in (default off, never auto-promoted): route Q4_0 prefill projections
-    // through the W4A16 tensor-core (tc_hmma) kernel, and fuse gate+up into a
-    // single concatenated cuBLASLt GEMM. Kept out of promotedDefaultsForTarget
-    // so they can be A/B'd against the cuBLASLt-BF16 mirror before promotion.
+    // W4A16 prefill follows compiled tensor-core capability and preserves
+    // BF16 mirror precedence. The separate bounded expansion and paired-GEMM
+    // experiments remain explicit choices.
     q4_0_tc_hmma_prefill: bool = false,
     /// Opt-in bounded, per-projection BF16 expansion. Reuses the temporary
     /// pool rather than retaining a dense copy of every model weight.
@@ -9643,10 +9642,9 @@ pub const GeneratedQ4_0Gates = struct {
             .exact_ffn_candidates = cudaQ4_0GeneratedExactFfnCandidatesEnabled(),
             .e2b_pair_only = cudaQ4_0GeneratedE2BFfnPairOnlyEnabled(),
         };
-        return requested.restrictToPromotedTarget(
+        return requested.restrictToExecutionSupport(
             compute_major,
             compute_minor,
-            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_ALLOW_UNPROMOTED_GENERATED_KERNELS", false),
         ).withMasterDisable(platform.env.getenvBoolDefault(
             "ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0",
             false,
@@ -9698,13 +9696,12 @@ pub const GeneratedQ4_0Gates = struct {
         };
     }
 
-    fn restrictToPromotedTarget(
+    fn restrictToExecutionSupport(
         self: GeneratedQ4_0Gates,
         compute_major: i32,
         compute_minor: i32,
-        allow_unpromoted: bool,
     ) GeneratedQ4_0Gates {
-        if (allow_unpromoted or quant_kernel_catalog.targetForComputeCapability(compute_major, compute_minor) != null) {
+        if (quant_kernel_catalog.portableCudaDeviceSupported(compute_major, compute_minor)) {
             return self;
         }
         return allDisabled();
@@ -9750,7 +9747,7 @@ fn runtimeJitShapeAllowsForCompute(
     );
 }
 
-test "generated Q4 routes require promoted CUDA target evidence" {
+test "generated CUDA Q4 routes follow execution capability without a benchmark target bypass" {
     const requested = GeneratedQ4_0Gates{
         .mmv = true,
         .mm = true,
@@ -9761,9 +9758,9 @@ test "generated Q4 routes require promoted CUDA target evidence" {
         .exact_ffn_candidates = true,
         .e2b_pair_only = true,
     };
-    try std.testing.expect(std.meta.eql(requested, requested.restrictToPromotedTarget(8, 9, false)));
+    for ([_][2]i32{ .{ 7, 5 }, .{ 8, 0 }, .{ 8, 9 }, .{ 9, 0 }, .{ 12, 1 } }) |cc| try std.testing.expect(std.meta.eql(requested, requested.restrictToExecutionSupport(cc[0], cc[1])));
 
-    const blocked = requested.restrictToPromotedTarget(8, 0, false);
+    const blocked = requested.restrictToExecutionSupport(7, 0);
     try std.testing.expect(!blocked.mmv);
     try std.testing.expect(!blocked.mm);
     try std.testing.expect(!blocked.pair);
@@ -9773,7 +9770,7 @@ test "generated Q4 routes require promoted CUDA target evidence" {
     try std.testing.expect(!blocked.exact_ffn_candidates);
     try std.testing.expect(!blocked.e2b_pair_only);
 
-    try std.testing.expect(std.meta.eql(requested, requested.restrictToPromotedTarget(9, 0, true)));
+    try std.testing.expect(std.meta.eql(requested, requested.restrictToExecutionSupport(9, 0)));
 }
 
 test "generated Q4 routes are opt in and master disable wins" {
@@ -9994,7 +9991,7 @@ test "generated CUDA FFN catalog resolves by shape and target" {
     try std.testing.expect(wrong_rows.route == null);
     try std.testing.expectEqual(@as(usize, 1), wrong_rows.attempts);
     try std.testing.expectEqual(@as(usize, 1), wrong_rows.misses);
-    try std.testing.expect(generatedQ4_0CatalogFfnRoute(true, true, true, 1, 1536, 6144, .gelu_new, 8, 0).route == null);
+    try std.testing.expect(generatedQ4_0CatalogFfnRoute(true, true, true, 1, 1536, 6144, .gelu_new, 8, 0).route != null);
     try std.testing.expect(generatedQ4_0CatalogFfnRoute(false, true, true, 1, 2560, 10240, .gelu_new, 8, 9).route != null);
     const disabled_pair = generatedQ4_0CatalogFfnRoute(true, false, true, 1, 1536, 6144, .gelu_new, 8, 9);
     try std.testing.expect(disabled_pair.route == null);
@@ -11272,16 +11269,15 @@ fn embeddingGemma2Attention(
             shape.head_dim == 256 and shape.seq <= 8192 and shape.batch >= 1 and
             (shape.seq == 512 or @as(usize, shape.batch) * shape.seq >= 1024) and
             try embeddingGemma2TextCudnn(self, module, out, q, k, v, shape, sequence_lengths)) return;
-        // WMMA fragment element ownership used for in-register alpha scaling
-        // is qualified on SM89. Other SM80+ devices retain the exact warp
-        // route until hardware differential evidence establishes their map.
-        if (self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
+        // The online output accumulator uses the documented PTX MMA layout,
+        // so eligibility follows the bundled BF16 instructions, not GPU names.
+        if (self.ctx.info.compute_major >= 8 and
             cuda_artifact.hasBf16WmmaCodeFor(self.ctx.info.compute_major, self.ctx.info.compute_minor))
             return module.launchLocalFlashAttention(&self.ctx, out, q, k, v, mask, shape);
         module.noteAttentionFallback();
         return module.launchAttention(&self.ctx, out, q, k, v, mask, shape);
     }
-    // The resident SM89 kernel implements the global layers' exact MQA
+    // The resident BF16 kernel implements the global layers' exact MQA
     // geometry as well as the sliding layers' GQA geometry. At 512 tokens its
     // radius-zero mode covers the full sequence without materializing scores.
     if (embeddingGemma2GlobalFlashEligible(
@@ -11298,7 +11294,7 @@ fn embeddingGemma2Attention(
 }
 
 fn embeddingGemma2GlobalFlashEligible(compute_major: i32, compute_minor: i32, has_wmma_artifact: bool, shape: embedding_gemma2_cuda.Attention) bool {
-    return compute_major == 8 and compute_minor == 9 and has_wmma_artifact and
+    return compute_major >= 8 and compute_minor >= 0 and has_wmma_artifact and
         shape.seq == 512 and shape.q_heads == 4 and shape.kv_heads == 1 and
         shape.head_dim == 512 and shape.local_radius == 0;
 }
@@ -31487,11 +31483,15 @@ test "attention match CUDA authoritative snapshot batches large half and float r
     }
 }
 
-test "EmbeddingGemma 2 global flash route is exact SM89 document geometry" {
+test "EmbeddingGemma 2 global flash route uses compiled BF16 support and exact document geometry" {
     const global = embedding_gemma2_cuda.Attention{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 0 };
     try std.testing.expect(embeddingGemma2GlobalFlashEligible(8, 9, true, global));
     try std.testing.expect(!embeddingGemma2GlobalFlashEligible(8, 9, false, global));
-    try std.testing.expect(!embeddingGemma2GlobalFlashEligible(8, 0, true, global));
+    for ([_][2]i32{ .{ 8, 0 }, .{ 8, 6 }, .{ 8, 9 }, .{ 9, 0 }, .{ 12, 1 } }) |cc| {
+        try std.testing.expect(embeddingGemma2GlobalFlashEligible(cc[0], cc[1], true, global));
+        try std.testing.expect(!embeddingGemma2GlobalFlashEligible(cc[0], cc[1], false, global));
+    }
+    try std.testing.expect(!embeddingGemma2GlobalFlashEligible(7, 5, true, global));
     try std.testing.expect(!embeddingGemma2GlobalFlashEligible(8, 9, true, .{ .batch = 32, .seq = 128, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 0 }));
     try std.testing.expect(!embeddingGemma2GlobalFlashEligible(8, 9, true, .{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 0 }));
 }

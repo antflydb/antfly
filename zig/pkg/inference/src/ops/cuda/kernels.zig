@@ -407,7 +407,7 @@ fn generatedGqaScorePreworkTiled64Eligible(
     compute_major: i32,
     compute_minor: i32,
 ) bool {
-    if (compute_major != 8 or compute_minor != 9 or
+    if (!@import("../../graph/quant_kernel_catalog.zig").portableCudaDeviceSupported(compute_major, compute_minor) or
         request.num_heads != 8 or request.num_kv_heads != 1 or
         request.format != 2 or request.value_format != 2)
     {
@@ -479,11 +479,10 @@ fn generatedGqaScorePreworkSelectionFor(
             null;
         if (selection) |selected| {
             if (mode == .explicit) return selected;
-            // The default is intentionally architecture- and evidence-bound:
-            // the exact route was qualified on sm_89 and only wins once the
-            // long-context crossover is reached. Explicit mode remains the
-            // controlled path for qualifying other supported architectures.
-            if (compute_major == 8 and compute_minor == 9 and request.kv_seq_len >= 512) return selected;
+            // The same portable kernel already serves explicit mode on these
+            // devices. Keep the bounded long-context crossover, independently
+            // of the machine used to collect benchmark evidence.
+            if (request.kv_seq_len >= 512) return selected;
         }
         return null;
     }
@@ -956,8 +955,10 @@ fn qwen3VlAutomaticM32GqaPrefillEligible(
     mask_len: usize,
     bias_mode: u32,
 ) bool {
-    return compute_major == 8 and
-        compute_minor == 9 and
+    _ = compute_minor;
+    // M32 uses the SM80+ dynamic shared-memory envelope; opaque WMMA
+    // fragment elements are not indexed (rescaling uses shared matrices).
+    return compute_major >= 8 and
         batch == 1 and
         num_heads == 16 and
         num_kv_heads == 8 and
@@ -1101,7 +1102,7 @@ pub fn gqaSplitkOnlineDecodeReplayScalarsEligible(
 fn gqaSplitkOnlineDecodeEligibility(
     request: GqaSplitkOnlineDecodeRequest,
 ) GqaSplitkOnlineDecodeEligibility {
-    if (request.compute_major != 8 or request.compute_minor != 9) {
+    if (!@import("../../graph/quant_kernel_catalog.zig").portableCudaDeviceSupported(request.compute_major, request.compute_minor)) {
         return .compute_capability_ineligible;
     }
     if (request.batch != 1 or request.q_seq_len != 1 or
@@ -4119,7 +4120,7 @@ pub const KernelModule = struct {
             .gqa_score_prework_consumer_mode = gqa_score_prework_consumer_mode,
             .gqa_attention_decode_turboquant_split_stage1_f32 = gqa_attention_decode_turboquant_split_stage1_f32,
             .gqa_attention_decode_f16_warp_stage1_f32 = gqa_attention_decode_f16_warp_stage1_f32,
-            .e4b_f16_warp_split_enabled = ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT", false),
+            .e4b_f16_warp_split_enabled = gqa_attention_decode_f16_warp_stage1_f32 != null and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT", false),
             .gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32,
             .gqa_attention_decode_turboquant_split_stage2_f32 = gqa_attention_decode_turboquant_split_stage2_f32,
             .gqa_attention_decode_turboquant_f32 = gqa_attention_decode_turboquant_f32,
@@ -4180,8 +4181,7 @@ pub const KernelModule = struct {
             .linear_q8_0_bias_add_f32_tc_hmma = linear_q8_0_bias_add_f32_tc_hmma,
             .linear_q4_0_f32_tc_hmma = linear_q4_0_f32_tc_hmma,
             .linear_q4_0_f32_tc_hmma_bf16 = linear_q4_0_f32_tc_hmma_bf16,
-            .linear_q4_0_bf16_staged = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and
-                bundledQ4_0TcHmmaBf16Supported(ctx.info.compute_major, ctx.info.compute_minor))
+            .linear_q4_0_bf16_staged = if (bundledQ4_0TcHmmaBf16Supported(ctx.info.compute_major, ctx.info.compute_minor))
                 loadOptionalFunction(ctx, module, "antfly_linear_q4_0_bf16_staged")
             else
                 null,
@@ -24290,7 +24290,7 @@ test "CUDA SM89 split-K online decode selector enforces locked replay capacity" 
 
     request.compute_minor = 0;
     try std.testing.expectEqual(
-        GqaSplitkOnlineDecodeEligibility.compute_capability_ineligible,
+        GqaSplitkOnlineDecodeEligibility.eligible,
         gqaSplitkOnlineDecodeEligibility(request),
     );
     request.compute_minor = 9;
@@ -24381,8 +24381,8 @@ test "CUDA GQA prefill profile is canonical and legacy resolution is unambiguous
     try std.testing.expectEqual(GqaPrefillProfile.automatic, defaults.profile);
     try std.testing.expectEqual(GqaPrefillProfileSource.default, defaults.source);
     // The promoted automatic default attempts paged-F16 Flash first, uses
-    // cooperative dense prefill for F32 attention, and selects the qualified
-    // SM89 Qwen3-VL-2B M32 tensor-core route. It never fails closed; explicit
+    // cooperative dense prefill for F32 attention, and selects the supported
+    // SM80+ Qwen3-VL-2B M32 tensor-core route. It never fails closed; explicit
     // `off` remains the rollback with neither selection.
     try std.testing.expect(defaults.profile.selectsFlashF16Sm89());
     try std.testing.expect(!defaults.profile.failClosed());
@@ -24393,7 +24393,7 @@ test "CUDA GQA prefill profile is canonical and legacy resolution is unambiguous
     try std.testing.expect(!fastGqaPrefillEligible(.automatic, 0, 511, 16, 8, 128, 0, 0));
     try std.testing.expect(!fastGqaPrefillEligible(.automatic, 4, 511, 16, 8, 128, 1, 0));
     try std.testing.expect(qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 159, 16, 8, 128, 0, 0));
-    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 0, 1, 159, 16, 8, 128, 0, 0));
+    try std.testing.expect(qwen3VlAutomaticM32GqaPrefillEligible(8, 0, 1, 159, 16, 8, 128, 0, 0));
     try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 2, 159, 16, 8, 128, 0, 0));
     try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 159, 8, 1, 256, 0, 0));
     try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 1, 16, 8, 128, 0, 0));
@@ -24821,7 +24821,7 @@ test "generated CUDA paged score prework selects exact Gemma 4 F16 boundaries" {
     try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) == null);
 
     request.block_count = 16;
-    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 0) == null);
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 0) != null);
     try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .disabled, 8, 9) == null);
 
     request.head_dim = 512;
@@ -24872,7 +24872,7 @@ test "generated CUDA paged score prework selects exact Gemma 4 one-KV-head bound
     try std.testing.expectEqual(GeneratedGqaScorePreworkRoute.gemma4_f16_local, local.route);
     try std.testing.expectEqual(@as(u16, 512), local.score_capacity);
     try std.testing.expectEqual(@as(?usize, 16 * 1024), local.workspaceBytes(8));
-    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 0) == null);
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 0) != null);
 
     // The benchmark's 2,051 prompt tokens plus 299 subsequent decode
     // positions remain eligible with logical page coverage independent of a
@@ -24952,12 +24952,10 @@ test "generated CUDA score prework tiled64 consumer is typed and fail closed" {
     try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, required.consumer);
     try std.testing.expect(required.tiled64_required);
 
-    // Explicit score prework can run on other architectures, but the tiled
-    // candidate remains SM89-only. Required mode carries the unsatisfied
-    // requirement to launch-time so it errors instead of silently falling
-    // back to serial.
+    // Portable tiled score consumers select on A100 too. Required mode still
+    // rejects unsupported shapes instead of silently falling back to serial.
     try std.testing.expectEqual(
-        std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected,
+        std.meta.Tag(GeneratedGqaScorePreworkDecision).selected,
         std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .explicit, .required_tiled64, 8, 0)),
     );
 
@@ -25566,4 +25564,13 @@ test "E4B Flash warp decode selection preserves compressed and E2B routes" {
     module.gqa_attention_decode_turboquant_split_stage2_f32 = @ptrFromInt(1);
     module.gqa_attention_decode_f16_warp_stage1_f32 = null;
     try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
+}
+
+test "CUDA A4B baseline primitives execute on the loaded device without a GPU allowlist" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    try smokeGemma4A4BResidentQ4_0(std.testing.allocator, &ctx, &module);
 }

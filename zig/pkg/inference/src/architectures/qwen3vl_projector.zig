@@ -3275,7 +3275,7 @@ test "LightOnOCR3 CUDA learned positions preserve host interpolation merge order
     for ([_]usize{ 768, 1024 }) |dim| for ([_]bool{ false, true }) |bf16| {
         var compute = try CudaCompute.init(a);
         defer compute.deinit();
-        if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+        if (!@import("../ops/cuda/lighton_attention.zig").packetSupported(compute.ctx.info.compute_major, compute.ctx.info.driver_version)) return error.SkipZigTest;
         compute.capability_profile = .lightonocr3;
         const cb = compute.computeBackend();
         const values = try a.alloc(f32, 48 * 48 * dim);

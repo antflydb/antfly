@@ -469,7 +469,7 @@ test "LightOnOCR3 CUDA prefill fairness limit preserves selected defaults and op
     try std.testing.expectEqualDeep(fallback, fallback.withDecodeStreakOverride("8"));
 }
 
-test "LightOnOCR3 CUDA token chaining opt in shares bounded admission configuration" {
+test "LightOnOCR3 CUDA automatic token chaining preserves explicit disable and bounded admission" {
     const F = Features(struct {});
     const selected = F.forProfile(.cuda_lighton4b, .{}, 128);
     const disabled = selected.withCudaTokenBurstOverride(false, null);

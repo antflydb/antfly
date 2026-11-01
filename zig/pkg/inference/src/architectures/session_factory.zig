@@ -1970,10 +1970,8 @@ fn createCudaSessionWithRequiredProfile(
         platform.env.getenvBoolDefault("ANTFLY_CUDA_GLINER_1B_Q8_F16_ATTENTION", true);
     cuda_compute.laya_optimizations = (cuda_profile == .laya or cuda_profile == .gliner25_modern_bert) and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true);
     cuda_compute.laya_fusion = cuda_compute.laya_optimizations and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_FUSION", true);
-    if (a4b_inference != null and
-        (cuda_compute.ctx.info.compute_major != 8 or cuda_compute.ctx.info.compute_minor != 9))
-    {
-        return error.A4bCudaUnsupportedDevice;
+    if (a4b_inference != null and !cuda_compute.kernels.hasGemma4A4BResidentQ4_0Primitives()) {
+        return error.A4bCudaKernelUnavailable;
     }
     cuda_compute.a4b_inference = a4b_inference;
     var resident_uploads: std.ArrayListUnmanaged(CudaResidentUpload) = .empty;

@@ -28,6 +28,14 @@ pinned model explicitly and verify discovery and the selected route agree.
 Gemma 4 generation is a separate capability; enabling it is not a prerequisite
 for the initial full-text, embedding, and GLiNER graph pipeline.
 
+For focused Zig checks, use one compile-time substring (for example
+`zig build test-bin -Dcuda=true -Dcuda-artifacts=fatbin -Dtest-filter=LightOn`),
+then run the installed binary with `--test-filter LightOn`. Multiple Zig
+compile-time filters intersect; the runtime runner combines its filters as a
+union. `-Druntime-test-filter=true` deliberately compiles the full suite and is
+expensive. Require named cases and nonzero runtime matches; declaration-wrapper
+checks alone do not establish numerical or policy coverage.
+
 ## Reader execution and completeness
 
 1. Run the placement, recurrent numerical oracle, ownership, and admission
@@ -203,14 +211,99 @@ so its timings are excluded from performance qualification. The final main-merge
 binary separately passes serial and mixed-page requests, exact 0.8B reference
 checks, model switching, readiness after each phase, and explicit unloading.
 
-Decoder graphs remain opt-in. Projection-rounding modes whose arithmetic is not
-capture-compatible retain eager CUDA execution. Immutable fusion copies consume
+Decoder graphs now select automatically from compiled/runtime capabilities,
+with explicit operator disables preserved. Projection-rounding modes whose
+arithmetic is not capture-compatible retain eager CUDA execution. Immutable fusion copies consume
 the device weight budget independently of scratch; device/combined admission and
 release on model retirement remain mandatory. All measured native runs retain
 the 20 GiB host, 34 GiB device, 4 GiB KV and 8 GiB scratch limits. The DGX uses
 its reference environment's CUDA 13 libraries, not the deployment image's pinned
 CUDA 12 libraries. No result here qualifies the A100 pool, full container image,
 new-node artifact download, or production rollout.
+
+## Capability-based defaults
+
+Hardware selection and benchmark evidence are separate. LightOn graph capture,
+FFN fusion, input projection packing, recurrent state pooling and device token
+bursts must not depend on the GPU used for testing. Portable PTX 9.0 operations
+require SM80+ and CUDA driver API 13.0; ordinary tensor-core and device-ID
+operations use their own compiled kernel/library checks. Older drivers retain
+ordinary CUDA instead of attempting unsupported PTX.
+
+The runtime selects graph prerequisites automatically for resident LightOn CUDA
+sessions and preserves each explicit environment disable. Startup logs include
+`lighton_cuda_policy`, compute capability, driver, and a named graph decision:
+unsupported compute/driver, disabled dependency, unavailable cuBLASLt, insufficient
+plan cache, noncapturable arithmetic/execution, or enabled. Epoch ownership,
+immutable weights, greedy eligibility, admission and cancellation still gate
+individual claims. A bounded request can use eager CUDA even when the session
+supports graphs.
+
+Encoder BF16 mirrors, bounded DeBERTa attention, portable quantized routes and
+generic graph replay support select from compiled tensor-core capability rather
+than an L4 allowlist. Laya warp attention uses its loaded symbol and shape
+contract instead of a GPU-model check. Per-operation symbols, shapes, numerical recipe and memory
+checks remain authoritative. Explicit overrides continue to work.
+
+Retained architecture restrictions correspond to actual compiled artifacts:
+`sm_121a` fused vision/head kernels, the external SM12.1 recurrent-prefill
+library, and layout-dependent attention kernels. Generated portable matmul
+execution uses its multi-target build contract and common resource envelope;
+the catalog retains the original SM89 evidence fingerprint. No benchmark record
+is relabeled as an A100 measurement. SM121-specific cuBLASLt
+heuristic tables also remain local to that architecture; other GPUs use native
+cuBLASLt heuristics. Generated Flash-prefill kernels that still index opaque
+WMMA fragments retain their implementation-specific layout restriction. Typed,
+exhaustive renderer contracts declare portable SIMT versus layout-dependent
+execution; command strings and benchmark labels are not execution contracts.
+Arithmetic-changing precision profiles and experimental
+algorithms retain their independent explicit settings. Resource capacities stay
+bounded; no DGX benchmark memory or 128-row preset becomes a serving default.
+
+Benchmark results above describe the earlier runtime and diagnostic controls.
+After changing automatic selection, rerun the default-policy workload and report
+its own binary and timings. Use `scripts/check_cuda_generated_matmul.py --output REPORT` from the inference
+package to check bundled portable Q4 kernels against a CPU FP64 reference,
+including output guards and readonly inputs. A100 test coverage is an evidence
+gap, not an additional software allowlist or a requirement for manually enabling compatible
+paths.
+
+## Portable EmbeddingGemma attention
+
+EmbeddingGemma 2's online BF16 attention now uses the documented PTX
+`mma.sync.m16n8k16` register layout for P×V accumulation and rescaling. It does
+not index implementation-defined WMMA fragments. Q×K continues through public
+WMMA load/store APIs, which preserve the logical matrix layout. Accumulators
+stay in registers, and output normalization stores directly from those
+registers. Two value tiles share one `ldmatrix.x4.trans` load. Launch bounds
+prevent a small register increase from halving 512-thread block occupancy.
+The default local/global routing follows bundled BF16 kernel support and the
+existing geometry bounds, including the scalar route for partial query tiles.
+
+A DGX GB10 comparison of standalone old/new kernels passed six cases bitwise,
+covering local/global attention, batches, masks, fully masked input, and
+64–2,048 tokens. Independent CPU FP64 SDPA checks passed (maximum absolute
+error 0.00185, including the kernel's existing BF16 probability boundary).
+The final bundled image additionally passed eight cases bitwise, including
+65/129-token scalar query tails; output guards and readonly inputs passed.
+Compiled SM80 through SM120 images each use 64 registers per thread.
+Seven alternating-order rounds of
+100 CUDA-event-timed launches per kernel measured:
+
+| Batch / tokens / head dimension | Old ms | Portable ms |
+| --- | ---: | ---: |
+| 1 / 512 / 256 | 0.319 | 0.320 |
+| 4 / 512 / 256 | 0.952 | 0.950 |
+| 1 / 2,048 / 256 | 1.313 | 1.332 |
+| 1 / 512 / 512 | 0.557 | 0.572 |
+| 4 / 512 / 512 | 3.072 | 3.045 |
+
+This preserves kernel performance within approximately 3% on this GPU. It
+is not an A100 timing result or an end-to-end embedding/retrieval result. Run
+`scripts/check_cuda_embeddinggemma_attention.py --artifact FATBIN --output REPORT`
+on each target GPU; add `--baseline OLD_FATBIN --benchmark` for bitwise and
+latency comparison. Use the existing encoder/retrieval qualification below
+before changing an index's serving recipe.
 
 ## Embeddings and extraction
 
