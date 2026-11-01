@@ -386,6 +386,22 @@
         "valid": true,
         "valid_prefix_size": 45158400
       }
+    },
+    "latest_churn_values_after_catch_up_canary_and_reopen": {
+      "status": "ok",
+      "checked_latest_acknowledged_keys_after_catch_up_canary_and_reopen": 1024,
+      "integrity": {
+        "valid": true,
+        "file_size": 45158400,
+        "valid_prefix_size": 45158400,
+        "tail_bytes": 0,
+        "record_count": 16471,
+        "live_file_count": 16439,
+        "live_bytes": 3933789,
+        "compact_size": 7581696,
+        "reclaimable_bytes": 37576704,
+        "issue": null
+      }
     }
   },
   "indexed_churn": {
