@@ -79,7 +79,11 @@ to warm the evictable cache rather than permanently reserving the model slot;
 the default remains `true` for intentionally resident preloads. Explicit
 per-model backend, GLiNER CUDA precision, and A4B load settings survive eviction
 and apply to subsequent automatic cold loads. Pinning only controls residency;
-explicit request placement remains separate.
+explicit request placement overrides only placement. Specifying the same
+backend on `/generate` preserves the configured residency, memory, loading and
+precision settings on both warm and cold paths. Explicit load-policy APIs can
+override the corresponding policy, and those variants retain distinct cache and
+in-flight identities.
 
 Reader performance qualification must distinguish native executor attribution
 from observed batching. `execution.max_native_step_items` reports the largest

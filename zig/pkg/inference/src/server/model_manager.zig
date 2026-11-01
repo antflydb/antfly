@@ -7707,23 +7707,36 @@ pub const ModelManager = struct {
         return self.startupBackends(self.startupLoadPolicy(model_dir));
     }
 
-    const DefaultModelLoadPolicy = struct {
+    /// Overrides describe only fields the caller selected. Placement is
+    /// independent of the model's persistent load contract.
+    const ModelLoadOverrides = struct {
+        preferred_backends: ?[]const backends.BackendType = null,
+        a4b_request: ?backend_contracts.A4bInferenceRequest = null,
+        gliner_cuda_precision: ?session_factory.GlinerCudaPrecision = null,
+    };
+
+    const ResolvedModelLoadPolicy = struct {
         preferred_backends: []const backends.BackendType,
         cache_policy: ModelLoadCachePolicy,
     };
 
-    fn defaultModelLoadPolicy(self: *ModelManager, model_dir: []const u8) DefaultModelLoadPolicy {
+    fn resolveModelLoadPolicy(self: *ModelManager, model_dir: []const u8, overrides: ModelLoadOverrides) ResolvedModelLoadPolicy {
         const startup = self.startupLoadPolicy(model_dir);
-        const a4b_request = startup.a4b_request orelse self.session_manager.a4b_inference_request;
-        var policy = inheritedA4bCachePolicy(a4b_request, startup.backend != null);
-        policy.gliner_cuda_precision = startup.gliner_cuda_precision;
-        if (startup.gliner_cuda_precision != null) policy.accept_default_alias = false;
-        return .{ .preferred_backends = self.startupBackends(startup), .cache_policy = policy };
+        const a4b_request = overrides.a4b_request orelse startup.a4b_request orelse self.session_manager.a4b_inference_request;
+        const precision = overrides.gliner_cuda_precision orelse startup.gliner_cuda_precision;
+        var policy = inheritedA4bCachePolicy(a4b_request, overrides.preferred_backends != null or startup.backend != null);
+        policy.gliner_cuda_precision = precision;
+        if (precision != null) policy.accept_default_alias = false;
+        return .{ .preferred_backends = overrides.preferred_backends orelse self.startupBackends(startup), .cache_policy = policy };
     }
 
-    fn defaultModelLoad(self: *ModelManager, model_dir: []const u8, control: ?InferenceExecutionControl) !ModelHandle {
-        const defaults = self.defaultModelLoadPolicy(model_dir);
-        return self.loadFromDirCoordinated(model_dir, defaults.preferred_backends, true, defaults.cache_policy, control);
+    fn defaultModelLoadPolicy(self: *ModelManager, model_dir: []const u8) ResolvedModelLoadPolicy {
+        return self.resolveModelLoadPolicy(model_dir, .{});
+    }
+
+    fn acquireResolvedModel(self: *ModelManager, model_dir: []const u8, overrides: ModelLoadOverrides, cache_default_alias: bool, control: ?InferenceExecutionControl) !ModelHandle {
+        const resolved = self.resolveModelLoadPolicy(model_dir, overrides);
+        return self.loadFromDirCoordinated(model_dir, resolved.preferred_backends, cache_default_alias, resolved.cache_policy, control);
     }
 
     /// Lazy, single-flight component runtime. The handle pins both sessions,
@@ -7888,7 +7901,7 @@ pub const ModelManager = struct {
     /// Acquire a model for the duration of one operation. The returned handle
     /// prevents eviction until release.
     pub fn acquireFromDir(self: *ModelManager, model_dir: []const u8) !ModelHandle {
-        return self.defaultModelLoad(model_dir, null);
+        return self.acquireResolvedModel(model_dir, .{}, true, null);
     }
 
     pub fn acquireFromDirWithControl(
@@ -7896,7 +7909,7 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         control: InferenceExecutionControl,
     ) !ModelHandle {
-        return self.defaultModelLoad(model_dir, control);
+        return self.acquireResolvedModel(model_dir, .{}, true, control);
     }
 
     pub fn acquireFromDirWithPreferredBackends(
@@ -7905,13 +7918,7 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            preferred_backends,
-            cache_default_alias,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
-            null,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = preferred_backends }, cache_default_alias, null);
     }
 
     pub fn acquireFromDirWithPreferredBackendsAndControl(
@@ -7921,20 +7928,14 @@ pub const ModelManager = struct {
         cache_default_alias: bool,
         control: InferenceExecutionControl,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            preferred_backends,
-            cache_default_alias,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
-            control,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = preferred_backends }, cache_default_alias, control);
     }
 
     /// Explicit GLiNER precision is immutable and part of both the resident
     /// variant and in-flight load identity. Later ordinary requests may reuse
     /// the default alias published by this startup preload.
     pub fn acquireFromDirWithGlinerCudaPrecision(self: *ModelManager, model_dir: []const u8, precision: session_factory.GlinerCudaPrecision) !ModelHandle {
-        return self.loadFromDirCoordinated(model_dir, &.{.cuda}, true, .{ .gliner_cuda_precision = precision, .accept_default_alias = false }, null);
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = &.{.cuda}, .gliner_cuda_precision = precision }, true, null);
     }
 
     /// Acquire a model using an immutable A4B policy for this load. Explicit
@@ -7948,13 +7949,7 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         a4b_request: backend_contracts.A4bInferenceRequest,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            self.defaultModelBackends(model_dir),
-            true,
-            .{ .a4b_request = a4b_request, .accept_default_alias = false },
-            null,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .a4b_request = a4b_request }, true, null);
     }
 
     pub fn acquireFromDirWithA4bRequestAndControl(
@@ -7963,13 +7958,7 @@ pub const ModelManager = struct {
         a4b_request: backend_contracts.A4bInferenceRequest,
         control: InferenceExecutionControl,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            self.defaultModelBackends(model_dir),
-            true,
-            .{ .a4b_request = a4b_request, .accept_default_alias = false },
-            control,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .a4b_request = a4b_request }, true, control);
     }
 
     pub fn acquireFromDirWithPreferredBackendsAndA4bRequest(
@@ -7979,13 +7968,7 @@ pub const ModelManager = struct {
         cache_default_alias: bool,
         a4b_request: backend_contracts.A4bInferenceRequest,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            preferred_backends,
-            cache_default_alias,
-            .{ .a4b_request = a4b_request, .accept_default_alias = false },
-            null,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = preferred_backends, .a4b_request = a4b_request }, cache_default_alias, null);
     }
 
     pub fn acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(
@@ -7996,13 +7979,7 @@ pub const ModelManager = struct {
         a4b_request: backend_contracts.A4bInferenceRequest,
         control: InferenceExecutionControl,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            preferred_backends,
-            cache_default_alias,
-            .{ .a4b_request = a4b_request, .accept_default_alias = false },
-            control,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = preferred_backends, .a4b_request = a4b_request }, cache_default_alias, control);
     }
 
     /// Compatibility API for offline tools that keep a raw model pointer. Such
@@ -15457,4 +15434,110 @@ test "startup load policy owns directory keys and preserves precision and A4B se
     try std.testing.expectEqual(backend_contracts.A4bResidencyMode.streamed, updated.a4b_request.?.residency_mode);
     try std.testing.expectEqual(@as(u32, 4096), updated.a4b_request.?.memory_budget_mb);
     try std.testing.expectEqualDeep(updated.a4b_request, manager.defaultModelLoadPolicy("model").cache_policy.a4b_request);
+}
+
+fn loadPolicySelectionTestModel(runtime_id: RuntimeId) LoadedModel {
+    const Stub = struct {
+        var probe: TeardownTestProbe = .{};
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .cuda;
+        }
+        const vtable = blk: {
+            var table = TeardownTestProbe.vtable;
+            table.backend = backend;
+            break :blk table;
+        };
+    };
+    var model = admissionEvictionTestModel(0);
+    model.session = .{ .ptr = &Stub.probe, .vtable = &Stub.vtable };
+    model.runtime_id = runtime_id;
+    return model;
+}
+
+fn deinitLoadPolicySelectionTestManager(manager: *ModelManager) void {
+    // These are borrowed metadata-only models. No driver/session is entered.
+    var loaded = manager.loaded.keyIterator();
+    while (loaded.next()) |key| manager.allocator.free(key.*);
+    manager.loaded.deinit(manager.allocator);
+    var aliases = manager.loaded_aliases.keyIterator();
+    while (aliases.next()) |key| manager.allocator.free(key.*);
+    manager.loaded_aliases.deinit(manager.allocator);
+    var policies = manager.startup_load_policies.keyIterator();
+    while (policies.next()) |key| manager.allocator.free(key.*);
+    manager.startup_load_policies.deinit(manager.allocator);
+    manager.in_flight_loads.deinit(manager.allocator);
+}
+
+fn expectLoadPolicySelection(handle: ModelHandle, expected: RuntimeId) !void {
+    var owned = handle;
+    defer owned.release();
+    try std.testing.expectEqual(expected, owned.get().runtime_id);
+}
+
+test "explicit load policy placement preserves configured A4B variants with and without aliases" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.cuda} });
+    defer deinitLoadPolicySelectionTestManager(&manager);
+    const configured_request = backend_contracts.A4bInferenceRequest{ .residency_mode = .resident, .memory_budget_mb = 20480, .load_workers = 8, .load_staging_mb = 512 };
+    const override_request = backend_contracts.A4bInferenceRequest{ .residency_mode = .resident, .memory_budget_mb = 24576, .load_workers = 4 };
+    try manager.setStartupLoadPolicy("model", .{ .backend = .cuda, .a4b_request = configured_request });
+    var configured = loadPolicySelectionTestModel(1);
+    var unqualified = loadPolicySelectionTestModel(2);
+    var overridden = loadPolicySelectionTestModel(3);
+    try manager.loaded.put(a, try backendVariantCacheKey(a, "model", .cuda, configured_request), &configured);
+    try manager.loaded.put(a, try backendVariantCacheKey(a, "model", .cuda, null), &unqualified);
+    try manager.loaded.put(a, try backendVariantCacheKey(a, "model", .cuda, override_request), &overridden);
+    try manager.loaded_aliases.put(a, try a.dupe(u8, "model"), &configured);
+    for (0..2) |phase| {
+        if (phase == 1) {
+            const alias = manager.loaded_aliases.fetchRemove("model").?;
+            a.free(alias.key);
+        }
+        try expectLoadPolicySelection(try manager.acquireFromDir("model"), 1);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithControl("model", .{}), 1);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackends("model", &.{.cuda}, false), 1);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackendsAndControl("model", &.{.cuda}, false, .{}), 1);
+        try expectLoadPolicySelection((try manager.acquireCachedFromDir("model")).?, 1);
+        // A real policy override remains exact, regardless of the default alias.
+        try expectLoadPolicySelection(try manager.acquireFromDirWithA4bRequest("model", override_request), 3);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithA4bRequestAndControl("model", override_request, .{}), 3);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackendsAndA4bRequest("model", &.{.cuda}, false, override_request), 3);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackendsAndA4bRequestAndControl("model", &.{.cuda}, false, override_request, .{}), 3);
+    }
+    const automatic = manager.resolveModelLoadPolicy("model", .{});
+    const explicit = manager.resolveModelLoadPolicy("model", .{ .preferred_backends = &.{.cuda} });
+    try std.testing.expectEqualDeep(automatic.cache_policy, explicit.cache_policy);
+    const auto_flight = try manager.loadFlightKey("model", automatic.preferred_backends, false, automatic.cache_policy);
+    defer a.free(auto_flight);
+    const explicit_flight = try manager.loadFlightKey("model", explicit.preferred_backends, false, explicit.cache_policy);
+    defer a.free(explicit_flight);
+    try std.testing.expectEqualStrings(auto_flight, explicit_flight);
+}
+
+test "explicit load policy placement retains configured GLiNER precision and honors an explicit precision override" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.cuda} });
+    defer deinitLoadPolicySelectionTestManager(&manager);
+    try manager.setStartupLoadPolicy("model", .{ .backend = .cuda, .gliner_cuda_precision = .bf16 });
+    var configured = loadPolicySelectionTestModel(1);
+    var unqualified = loadPolicySelectionTestModel(2);
+    var overridden = loadPolicySelectionTestModel(3);
+    try manager.loaded.put(a, try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, .bf16), &configured);
+    try manager.loaded.put(a, try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, null), &unqualified);
+    try manager.loaded.put(a, try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, .fp32), &overridden);
+    try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackends("model", &.{.cuda}, false), 1);
+    try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackendsAndControl("model", &.{.cuda}, false, .{}), 1);
+    try expectLoadPolicySelection(try manager.acquireFromDirWithGlinerCudaPrecision("model", .fp32), 3);
+}
+
+test "explicit load policy resolves global model and call precedence before any model is resident" {
+    var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{ .native, .cuda }, .a4b_inference_request = .{ .memory_budget_mb = 16384 } });
+    defer manager.deinit();
+    try manager.setStartupLoadPolicy("model", .{ .backend = .cuda, .a4b_request = .{ .memory_budget_mb = 20480 } });
+    try std.testing.expectEqual(@as(u32, 16384), manager.resolveModelLoadPolicy("other", .{}).cache_policy.a4b_request.?.memory_budget_mb);
+    const explicit = manager.resolveModelLoadPolicy("model", .{ .preferred_backends = &.{.metal} });
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.metal}, explicit.preferred_backends);
+    try std.testing.expectEqual(@as(u32, 20480), explicit.cache_policy.a4b_request.?.memory_budget_mb);
+    const override = manager.resolveModelLoadPolicy("model", .{ .a4b_request = .{ .memory_budget_mb = 24576 } });
+    try std.testing.expectEqual(@as(u32, 24576), override.cache_policy.a4b_request.?.memory_budget_mb);
 }
