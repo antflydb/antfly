@@ -5314,3 +5314,47 @@ record to cross the soft quantum. This avoids charging a winner's scan in one
 page and emitting it without scan credit in the next. Owned-byte and physical
 scan limits remain independent. Continuation regressions force one wide input
 per page and require scan accounting to cover every returned edge.
+
+The authenticated demand fixture contains four positive records, including one
+with both a 2 MiB root body and a 2 MiB body inside `payload`. It also declares
+an unused body-dependent label and a separate category table. Narrow queries
+must fit both a 1 MiB statement ceiling and a 1,000-unit work ceiling.
+
+| Query / principal | Document peak bytes | Relational peak bytes | Work |
+| --- | ---: | ---: | ---: |
+| `SUM(d.payload.rank)`, administrator | 87,180 | 79,736 | 52 |
+| `SUM(d.payload.rank)`, filtered reader | 113,792 | 111,292 | 28 |
+| Return complete `c` with `SUM(d.score)`, administrator | 85,946 | 76,100 | 119 |
+| Return complete `c` with `SUM(d.score)`, filtered reader | 111,464 | 106,562 | 59 |
+
+The original one-row review reproductions needed 22,875,418 bytes for the nested
+sum and 19,681,118 bytes for the cross-table entity return; both rejected a
+1 MiB ceiling. The expanded fixture now meets that ceiling with aliases, nested
+nullness, complete category membership, and filtered readers. Separate controls
+verify complete ancestor values, shared-table identities, null/missing values,
+and the original type errors for scalar/list ancestors. Complete-value controls
+use larger budgets because their actual 2 MiB payload must be returned. These
+are CPU Debug allocation/work qualifications, without latency claims.
+
+The relationship campaign additionally covers nested fields in both native and
+Cypher-written metadata under 1 MiB, retains complete relationship values, and
+checks exact 16/17-edge budget accounting across the selected-input quantum.
+
+This update merges `origin/main` at `a3b0410c9f` as `ffc1818f08`. The resolution
+retains Cypher's immutable query/catalog pins alongside main's reader-epoch and
+document-guard checks, releases both capture pins before physical maintenance,
+and keeps both sets of regressions. Bounded allocator service is exempt from the
+detached-publication requirement because it computes no document/index output;
+primary, index, and artifact writes still require that proof. The combined
+failure ABI is version 86;
+published status numbers and Cypher's appended 848–911 range are unchanged.
+
+Final qualification passes 548 Cypher core tests, all seven authenticated
+campaigns after the main merge, and all three new campaigns again on the final
+binary. The merged portable/projection/adjacency/count/scan-sink gate passes all
+42 build steps, the failure-ABI tests retain all published identifiers, and the
+final native build passes all 69 steps. The C API allocator/publication proof
+and retained-read tests pass 21 cases; the independently compiled retained-read
+fork test also passes. Publication-less primary/index/artifact writes remain
+rejected while bounded allocator service can safely rebase under its writer
+fence.

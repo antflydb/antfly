@@ -1171,7 +1171,10 @@ pub const Owner = struct {
         if (self.stopping.load(.acquire)) return error.Canceled;
         self.publication_stats.attempts +|= 1;
         errdefer self.publication_stats.refused +|= 1;
-        if (scope != .reclamation and root.maintenance_publication == null) return error.Canceled;
+        // Bounded allocator service runs after detached publication/catalog
+        // pins have been released and computes no document/index output.
+        const requires_publication = scope != .reclamation and scope != .allocator_service;
+        if (requires_publication and root.maintenance_publication == null) return error.Canceled;
         // A resolver publication can change index inputs before its replay
         // watermark is saved. Fence subsequent immutable index work, while
         // allowing primary transactions to read the rebased checkpoint and
@@ -1225,7 +1228,7 @@ pub const Owner = struct {
             if (self.current) |current| try file.inheritAllocatorVerification(&current.owned_lite_backend.?.native_docstore.?.file);
             self.publication_stats.rebased +|= 1;
         }
-        if (scope != .reclamation) {
+        if (requires_publication) {
             const publication = root.maintenance_publication orelse return error.Canceled;
             publication.requireCurrentCatalog() catch |err| {
                 publication.index_inputs_changed = true;
@@ -4428,6 +4431,12 @@ test "capi native allocator proof issue1431 bounded allocator service rebases a 
     // A prepared vacuum must still refuse this stale capture.
     try std.testing.expectError(error.EnrichmentWaitCanceled, Owner.enterMaintenanceWriter(detached, .reclamation));
     try std.testing.expectEqual(captured, file.header);
+    // The exemption is metadata-only: detached document/index writes still
+    // require their publication and catalog proof before they can rebase.
+    for ([_]PublicationScope{ .primary, .index, .artifact_lease }) |scope| {
+        try std.testing.expectError(error.Canceled, Owner.enterMaintenanceWriter(detached, scope));
+        try std.testing.expectEqual(captured, file.header);
+    }
     const admitted = owner.publication_stats.allocator_service_admissions;
     try Owner.enterMaintenanceWriter(detached, .allocator_service);
     var held = true;
