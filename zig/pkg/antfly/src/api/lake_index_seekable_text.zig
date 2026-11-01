@@ -1110,6 +1110,90 @@ const Owner = struct {
                 self.lengths[slot] = offset - piece.offset;
             }
         }
+        fn releaseDecoded(owner: *anyopaque, item: *anyopaque) void {
+            const lease: Decoded.Lease = .{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) };
+            lease.release();
+        }
+        fn decodedKey(self: *Query, request: local.segment_source.DecodeKey) ?[32]u8 {
+            const cached = self.capability.cache orelse return null;
+            const reference = self.owner.directory_ref orelse return null;
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update("native-source-interpretation-v1");
+            hash.update(&cached.scope);
+            hash.update(reference.artifact_id);
+            hash.update(reference.checksum);
+            var bounds: [16]u8 = undefined;
+            std.mem.writeInt(u64, bounds[0..8], request.offset, .little);
+            std.mem.writeInt(u64, bounds[8..16], request.length, .little);
+            hash.update(&bounds);
+            hash.update(&request.interpretation);
+            hash.update(&.{@backingInt(request.class)});
+            var key: [32]u8 = undefined;
+            hash.final(&key);
+            return key;
+        }
+        fn lookupDecoded(raw: *anyopaque, request: local.segment_source.DecodeKey) !?local.segment_source.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checkContext(self);
+            const cached = self.capability.cache orelse return null;
+            try cached.context.ensureActive();
+            const key = self.decodedKey(request) orelse return null;
+            const lane = switch (request.class) {
+                .navigation => &cached.cache.decoded,
+                .text_page => &cached.cache.text_pages,
+            };
+            const held = lane.lookup(key) orelse return null;
+            errdefer held.release();
+            try checkContext(self);
+            try cached.context.ensureActive();
+            return .{ .value = held.item.payload.extension, .owner = held.cache, .item = held.item, .release_fn = releaseDecoded, .retained_bytes = held.item.budget.live };
+        }
+        fn acquireDecoded(raw: *anyopaque, request: local.segment_source.DecodeRequest) !?local.segment_source.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checkContext(self);
+            const cached = self.capability.cache orelse return null;
+            const key = self.decodedKey(request.key()) orelse return null;
+            const Loader = struct {
+                request: local.segment_source.DecodeRequest,
+                fn load(context: *anyopaque, item: *Decoded.Item) !void {
+                    const loader: *@This() = @ptrCast(@alignCast(context));
+                    item.payload = .{ .extension = @constCast(loader.request.invoke(item.arena.allocator()) catch |err| {
+                        if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
+                        return err;
+                    }) };
+                }
+            };
+            var loader: Loader = .{ .request = request };
+            const Guard = struct {
+                query: *Query,
+                parent: local.serverless_query_lake_read_context.Context,
+                fn check(raw_: *anyopaque) !void {
+                    const guard: *@This() = @ptrCast(@alignCast(raw_));
+                    try checkContext(guard.query);
+                    try guard.parent.ensureActive();
+                }
+            };
+            var guard: Guard = .{ .query = self, .parent = cached.context };
+            var context = cached.context;
+            context.checkpoint = .{ .ptr = &guard, .check = Guard.check };
+            context.additional_checkpoint = null;
+            const lane = switch (request.class) {
+                .navigation => &cached.cache.decoded,
+                .text_page => &cached.cache.text_pages,
+            };
+            const limit: usize = switch (request.class) {
+                .navigation => 1024 * 1024,
+                .text_page => 256 * 1024,
+            };
+            const held = lane.acquire(key, limit, context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
+                try checkContext(self);
+                if (err == error.SqlMemoryLimitExceeded) return null;
+                return err;
+            };
+            errdefer held.release();
+            try checkContext(self);
+            return .{ .value = held.item.payload.extension, .owner = held.cache, .item = held.item, .release_fn = releaseDecoded, .retained_bytes = held.item.budget.live };
+        }
         fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.cancelled.load(.acquire)) return error.Canceled;
@@ -1154,7 +1238,7 @@ const Owner = struct {
         try capability.check();
         const query = try a.create(Query);
         query.* = .{ .a = a, .owner = owner, .capability = capability, .io = capability.context.io };
-        return .{ .ranges = .{ .ptr = query, .length = owner.directory_bytes, .read_into = Query.read, .close = Query.close, .prefetch = Query.prefetch, .quiesce_read_context = Query.quiesce, .resource_manager = capability.resource_manager orelse owner.resource_manager, .read_io = capability.context.io, .check_read_context = Query.checkContext } };
+        return .{ .ranges = .{ .ptr = query, .length = owner.directory_bytes, .read_into = Query.read, .close = Query.close, .prefetch = Query.prefetch, .quiesce_read_context = Query.quiesce, .resource_manager = capability.resource_manager orelse owner.resource_manager, .read_io = capability.context.io, .check_read_context = Query.checkContext, .acquire_decoded = Query.acquireDecoded, .lookup_decoded = Query.lookupDecoded } };
     }
     fn containing(pieces: []const Piece, offset: usize) ?usize {
         var low: usize = 0;
@@ -2261,7 +2345,7 @@ test "external lake required pack reads overlap and return every scheduler reser
             try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
         }
         try std.testing.expectEqual(@as(usize, 0), memory.live);
-        try std.testing.expectEqual(@as(usize, 0), build.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), build.liveBytes());
     }
 }
 
@@ -2281,15 +2365,14 @@ test "external lake admitted directories evict independently of the corpus heap 
     var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer cache.deinit();
     cache.decoded.max_entries = 1;
-    // Twelve live Owner shells (plus their duplicated artifact/checksum
-    // strings) now cost ~1.4KB each; keep enough headroom above that fixed
-    // per-source cost that the loop admits all twelve while still proving
-    // the directory payload itself is excluded from this budget.
-    var memory: local.sql_memory_budget = .{ .backing = a, .limit = 20 * 1024 };
+    const descriptor_count = 12;
+    // The corpus pays for fixed reader capabilities and small owned reference
+    // strings. Decoded directories must remain outside this per-owner bound.
+    var memory: local.sql_memory_budget = .{ .backing = a, .limit = descriptor_count * (@sizeOf(Owner) + 1024) };
     const capability: Read = .{ .store = store, .cache = .{ .cache = &cache, .scope = @splat(3), .context = .{ .io = std.testing.io } }, .context = .{ .io = std.testing.io }, .cancellation = .none };
     var first: ?Owner.DirectoryPin = null;
     defer if (first) |*pin| pin.release();
-    var sources: [12]?local.index.SegmentSource = @splat(null);
+    var sources: [descriptor_count]?local.index.SegmentSource = @splat(null);
     defer for (&sources) |*source| if (source.*) |*owned| owned.close();
     for (&sources, 0..) |*source, i| {
         store.upload_scope = try stores.UploadScope.forPublication(@splat(@intCast(i + 1)), 1, std.testing.io);

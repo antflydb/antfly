@@ -3486,9 +3486,11 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             )
             assert (
                 skewed["profile"]["sort"]["candidate_source"]
-                == "ordered_lake_index_then_text_postings"
+                == "ordered_lake_index_then_text_windows"
             ), skewed
-            assert skewed["profile"]["sort"]["ordered_scanned_count"] <= 1024, skewed
+            assert 0 < skewed["profile"]["sort"]["ordered_scanned_count"] <= 1024, (
+                skewed
+            )
         tied = query(
             {"match_all": {}}, order_by=[{"field": "sort_rank"}], limit=1, profile=True
         )
@@ -3906,10 +3908,12 @@ def test_remote_ordered_scan_budget_counts_rows_without_text_ordinals(tmp_path):
             2,
         ], result
         profile = result["profile"]["sort"]
-        assert profile["candidate_source"] == "ordered_lake_index_then_text_postings", (
+        assert profile["candidate_source"] == "ordered_lake_index_then_text_windows", (
             result
         )
-        assert profile["ordered_scanned_count"] <= 1024, result
+        # The abandoned ordered attempt reports physical probes, including rows
+        # without text ordinals, before the bounded text-window fallback.
+        assert 0 < profile["ordered_scanned_count"] <= 1024, result
         failed = False
     finally:
         server.stop(test_failed=failed)
@@ -6894,18 +6898,24 @@ def test_prefix_compressed_repeated_predicates_without_statistics_survive_restar
                 # Both ranges are valid together; every row fails only after
                 # its column has been traversed by the first predicate.
                 (
-                    "SELECT COUNT(*) FROM prefix_predicates "
-                    "WHERE label >= 'a' AND label < 'ab'",
+                    (
+                        "SELECT COUNT(*) FROM prefix_predicates "
+                        "WHERE label >= 'a' AND label < 'ab'"
+                    ),
                     [["0"]],
                 ),
                 (
-                    "SELECT COUNT(*) FROM prefix_predicates "
-                    "WHERE label >= 'a' AND label < 'b'",
+                    (
+                        "SELECT COUNT(*) FROM prefix_predicates "
+                        "WHERE label >= 'a' AND label < 'b'"
+                    ),
                     [[str(count)]],
                 ),
                 (
-                    "SELECT label FROM prefix_predicates "
-                    "WHERE label >= 'a' AND label < 'b' LIMIT 3",
+                    (
+                        "SELECT label FROM prefix_predicates "
+                        "WHERE label >= 'a' AND label < 'b' LIMIT 3"
+                    ),
                     [["abcdefg"]] * 3,
                 ),
             ):

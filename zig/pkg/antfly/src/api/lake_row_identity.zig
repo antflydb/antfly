@@ -440,7 +440,7 @@ pub fn validateRoots(backing: A, store: *stores.ArtifactStore, root: Root, token
         // generation repair hint. Health polling never performs an archive walk.
         if (value.bytes > reads) return;
         _ = scratch.reset(.retain_capacity);
-        var page = tree.readPage(scratch.allocator(), pages.store(), value) catch |err| return derivedReadFailure(err);
+        var page = tree.readNavigationPage(scratch.allocator(), pages.store(), value) catch |err| return derivedReadFailure(err);
         page.deinit(scratch.allocator());
     }
     var navigation_seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -953,7 +953,10 @@ const TestRows = struct {
 };
 
 test "external lake logical row maps spill verify value equivalence and flatten arbitrary rewrites" {
-    const a = std.testing.allocator;
+    // Preserve checked ownership without unwinding every successful allocation.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const a = fixture_allocator.allocator();
     var memory: local.sql_memory_budget = .{ .backing = a, .limit = 4 * 1024 * 1024 };
     const ma = memory.allocator();
     var marker: u8 = 0;
