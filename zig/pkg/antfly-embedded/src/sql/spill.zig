@@ -956,16 +956,63 @@ fn jsonNumber(bytes: []const u8) bool {
     }
     return at == bytes.len;
 }
+// Stable subscriptions only publish atomic byte deltas. They never allocate,
+// acquire cache/allocator locks, or borrow a movable hash-map entry.
+const RetainedSubscription = struct {
+    next: ?*RetainedSubscription = null,
+    pending: *std.atomic.Value(usize),
+    initial: usize = 0,
+};
 const JsonOwner = struct {
+    retention_mutex: std.atomic.Mutex = .unlocked,
+    retained_capacity: std.atomic.Value(usize) = .init(0),
+    subscribers: ?*RetainedSubscription = null,
     arena: std.heap.ArenaAllocator,
     mutex: std.atomic.Mutex = .unlocked,
-    // Only consumers crossing a scalar/text boundary allocate cache records.
-    // Keys borrow validated, immutable ranges owned by the enclosing block.
     cached: std.AutoHashMapUnmanaged(usize, *FrozenJson) = .empty,
+    fn retentionLock(self: *JsonOwner) void {
+        @import("antfly_platform").sync.lockYielding(&self.retention_mutex);
+    }
+    // Called while the JSON mutation mutex is held, including failed partial
+    // allocations. The separate lifetime lock never encloses allocation/free.
+    fn publishCapacity(self: *JsonOwner) void {
+        const capacity = self.arena.queryCapacity();
+        if (capacity == self.retained_capacity.load(.acquire)) return;
+        self.retentionLock();
+        defer self.retention_mutex.unlock();
+        const previous = self.retained_capacity.swap(capacity, .acq_rel);
+        std.debug.assert(capacity >= previous);
+        var link = self.subscribers;
+        while (link) |current| : (link = current.next) {
+            _ = current.pending.fetchAdd(capacity - previous, .release);
+        }
+    }
+    fn subscribe(self: *JsonOwner, link: *RetainedSubscription) usize {
+        self.retentionLock();
+        defer self.retention_mutex.unlock();
+        link.initial = self.retained_capacity.load(.acquire);
+        link.next = self.subscribers;
+        self.subscribers = link;
+        return link.initial;
+    }
+    fn unsubscribe(self: *JsonOwner, link: *RetainedSubscription) usize {
+        self.retentionLock();
+        defer self.retention_mutex.unlock();
+        var cursor = &self.subscribers;
+        while (cursor.*) |current| {
+            if (current == link) {
+                cursor.* = current.next;
+                return self.retained_capacity.load(.acquire) - link.initial;
+            }
+            cursor = &current.next;
+        }
+        unreachable;
+    }
     fn get(self: *JsonOwner, bytes: []const u8, lossless: bool) !*FrozenJson {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         if (self.cached.get(@intFromPtr(bytes.ptr))) |entry| return entry;
+        defer self.publishCapacity();
         const a = self.arena.allocator();
         const entry = try a.create(FrozenJson);
         entry.* = .{ .owner = self, .bytes = bytes, .lossless = lossless };
@@ -973,6 +1020,7 @@ const JsonOwner = struct {
         return entry;
     }
     fn deinit(self: *JsonOwner) void {
+        std.debug.assert(self.subscribers == null);
         self.arena.deinit();
     }
 };
@@ -998,6 +1046,7 @@ const FrozenJson = struct {
         self.lock();
         defer self.owner.mutex.unlock();
         if (self.value == null) {
+            defer self.owner.publishCapacity();
             var decoder: Decoder = .{ .validated_json = true, .a = self.owner.arena.allocator(), .bytes = self.bytes };
             self.value = try decoder.json(0);
         }
@@ -1010,6 +1059,7 @@ const FrozenJson = struct {
         self.lock();
         defer self.owner.mutex.unlock();
         if (self.text == null) {
+            defer self.owner.publishCapacity();
             const work = @import("memory_budget.zig").reclaimingAllocator(self.owner.arena.allocator());
             var output: std.Io.Writer.Allocating = .init(work);
             defer output.deinit();
@@ -1462,6 +1512,7 @@ fn decodeColumnarBlockManaged(a: Allocator, cache_backing: ?Allocator, bytes: []
     for (values) |*column| column.* = try Sequential.EncodedColumn.decode(&decoder, count);
     for (keys) |*column| column.* = try Sequential.EncodedColumn.decode(&decoder, count);
     if (decoder.position != bytes.len) return error.InvalidSqlSpill;
+    if (decoder.json_owner) |owner| owner.publishCapacity();
     return .{ .values = values, .keys = keys, .ordinals = ordinals, .json_owner = decoder.json_owner };
 }
 
@@ -3318,14 +3369,14 @@ pub const Sequential = struct {
         /// Include separately owned lazy DOM/text caches in retention policy.
         /// The page's immutable metadata arena has one owner; cache publication
         /// synchronizes through JsonOwner just as scalar/text access does.
+        fn immutableRetainedBytes(self: *const OwnedBlock) usize {
+            return @sizeOf(OwnedBlock) +| self.arena.queryCapacity() +| self.dependencies.capacity *| @sizeOf(*OwnedBlock);
+        }
         fn ownRetainedBytes(self: *const OwnedBlock) usize {
-            var bytes = @sizeOf(OwnedBlock) +| self.arena.queryCapacity();
-            if (self.encoded) |encoded| if (encoded.json_owner) |owner| {
-                while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
-                defer owner.mutex.unlock();
-                bytes +|= owner.arena.queryCapacity();
-            };
-            return bytes +| self.dependencies.capacity *| @sizeOf(*OwnedBlock);
+            return self.immutableRetainedBytes() +| if (self.encoded) |encoded|
+                (if (encoded.json_owner) |owner| owner.retained_capacity.load(.acquire) else 0)
+            else
+                0;
         }
         pub fn retainedBytes(self: *const OwnedBlock) usize {
             var bytes = self.ownRetainedBytes();
@@ -3724,6 +3775,7 @@ pub const Sequential = struct {
             decoder.json_consumption = .scalar;
             for (keys) |*column| column.* = try EncodedColumn.decode(&decoder, count_rows);
             if (decoder.position != payload.len) return error.InvalidSqlSpill;
+            if (decoder.json_owner) |json_owner| json_owner.publishCapacity();
             owner.encoded = .{ .values = values, .keys = keys, .ordinals = ordinals, .json_owner = decoder.json_owner };
             physical.* += header.len + len;
         }
@@ -3957,7 +4009,7 @@ fn nativeRowsEqual(a: Allocator, batch: @import("execution_batch.zig").Batch, le
 const PayloadCache = struct {
     const Block = Sequential.OwnedBlock;
     const Entry = struct { offset: u64, block: *Block, previous: ?*Entry = null, next: ?*Entry = null };
-    const Owner = struct { block: *Block, references: usize = 1, bytes: usize, previous_same: ?*Block = null, next_same: ?*Block = null };
+    const Owner = struct { block: *Block, references: usize = 1, bytes: usize, subscription: ?*RetainedSubscription = null, previous_same: ?*Block = null, next_same: ?*Block = null };
     // Allocated only for sustained cache thrashing. A fixed-size, aging
     // frequency sketch admits a newcomer only when it is more useful than the
     // LRU victim. Ties keep resident roots, making cyclic scans scan-resistant.
@@ -4016,6 +4068,7 @@ const PayloadCache = struct {
     oldest: ?*Entry = null,
     newest: ?*Entry = null,
     bytes: usize = 0,
+    pending_growth: std.atomic.Value(usize) = .init(0),
     metadata_bytes: usize = 0,
     // Recognized refundable owners bound residency by live byte admission.
     // Explicit caps remain useful for controls; opaque owners stay conservative.
@@ -4077,7 +4130,7 @@ const PayloadCache = struct {
     }
     fn target(self: *const PayloadCache) usize {
         if (!self.registered) return @min(self.max_bytes, 64 * 1024);
-        const owned = self.bytes +| self.metadata_bytes;
+        const owned = self.bytes +| self.pending_growth.load(.acquire) +| self.metadata_bytes;
         const available = @import("memory_budget.zig").headroom(self.manager.?.alloc) orelse return @min(self.max_bytes, 64 * 1024);
         // Equal-pressure readers converge on a fair share while leaving a
         // comparable amount for required operators and output descriptors.
@@ -4100,22 +4153,8 @@ const PayloadCache = struct {
         self.consecutive_misses = 0;
         self.consecutive_hits = 0;
     }
-    fn refresh(self: *PayloadCache) void {
-        var bytes: usize = 0;
-        var owners = self.owners.valueIterator();
-        while (owners.next()) |owner| {
-            owner.bytes = owner.block.ownRetainedBytes();
-            bytes +|= owner.bytes;
-        }
-        self.bytes = bytes;
-    }
-    fn refreshBlock(self: *PayloadCache, block: *Block) void {
-        if (self.owners.getPtr(block)) |owner| {
-            const current = block.ownRetainedBytes();
-            self.bytes = (self.bytes - owner.bytes) +| current;
-            owner.bytes = current;
-        }
-        for (block.dependencies.items) |body| self.refreshBlock(body);
+    fn applyGrowth(self: *PayloadCache) void {
+        self.bytes +|= self.pending_growth.swap(0, .acq_rel);
     }
     fn addOwner(self: *PayloadCache, block: *Block) anyerror!void {
         const offset = block.physical_offset orelse return error.InvalidSqlSpill;
@@ -4124,7 +4163,15 @@ const PayloadCache = struct {
             return;
         }
         if (self.owners.count() >= self.ownerLimit()) return error.SqlPayloadCacheFull;
-        const own_bytes = block.ownRetainedBytes();
+        // Cached block descriptors/dependencies are immutable. Only their
+        // separately synchronized JSON owner can grow after adoption.
+        const own_bytes = block.immutableRetainedBytes();
+        var subscription: ?*RetainedSubscription = null;
+        if (block.encoded) |encoded| if (encoded.json_owner != null) {
+            subscription = try self.allocator().create(RetainedSubscription);
+            subscription.?.* = .{ .pending = &self.pending_growth };
+        };
+        errdefer if (subscription) |link| self.allocator().destroy(link);
         const previous = self.addresses.get(offset);
         try self.owners.put(self.allocator(), block, .{ .block = block, .bytes = own_bytes, .next_same = previous });
         self.addresses.put(self.allocator(), offset, block) catch |err| {
@@ -4133,6 +4180,14 @@ const PayloadCache = struct {
         };
         if (previous) |prior| self.owners.getPtr(prior).?.previous_same = block;
         self.bytes +|= own_bytes;
+        if (subscription) |link| {
+            const capacity = block.encoded.?.json_owner.?.subscribe(link);
+            const record = self.owners.getPtr(block).?;
+            record.bytes += capacity;
+            record.subscription = link;
+            self.bytes += capacity;
+            subscription = null;
+        }
         var added: usize = 0;
         errdefer {
             for (block.dependencies.items[0..added]) |body| self.removeOwner(body);
@@ -4145,9 +4200,12 @@ const PayloadCache = struct {
     }
     fn removeRecord(self: *PayloadCache, block: *Block) void {
         const owner = self.owners.get(block).?;
+        const growth = if (owner.subscription) |link| block.encoded.?.json_owner.?.unsubscribe(link) else 0;
+        self.applyGrowth();
+        if (owner.subscription) |link| self.allocator().destroy(link);
         if (owner.previous_same) |prior| self.owners.getPtr(prior).?.next_same = owner.next_same else if (owner.next_same) |next| self.addresses.getPtr(block.physical_offset.?).?.* = next else _ = self.addresses.remove(block.physical_offset.?);
         if (owner.next_same) |next| self.owners.getPtr(next).?.previous_same = owner.previous_same;
-        self.bytes -= owner.bytes;
+        self.bytes -= owner.bytes + growth;
         _ = self.owners.remove(block);
     }
     fn removeOwner(self: *PayloadCache, block: *Block) void {
@@ -4286,7 +4344,7 @@ const PayloadCache = struct {
             self.consecutive_hits = 0;
             self.consecutive_misses = @min(self.modeThreshold(), self.consecutive_misses +| 1);
             if (self.accesses % 64 == 0) {
-                self.refresh();
+                self.applyGrowth();
                 self.trim();
             }
             return null;
@@ -4300,7 +4358,7 @@ const PayloadCache = struct {
         }
         block.retain();
         if (self.entries.get(offset)) |entry| self.touch(entry);
-        if (self.accesses % 64 == 0) self.refresh() else self.refreshBlock(block);
+        self.applyGrowth();
         self.trim();
         return block;
     }
@@ -4308,7 +4366,7 @@ const PayloadCache = struct {
         self.lock();
         defer self.mutex.unlock();
         const block = self.addresses.get(offset) orelse return null;
-        self.refreshBlock(block);
+        self.applyGrowth();
         return block.retainedBytes();
     }
     fn insert(self: *PayloadCache, block: *Block, reserve: usize) !void {
@@ -4342,9 +4400,9 @@ const PayloadCache = struct {
                 return;
             }
         }
-        // Refresh before admitted growth. Rejected misses use the periodic
-        // refresh in get instead of walking every retained owner on every row.
-        self.refresh();
+        // Drain published growth in constant time. Immutable primitive owners
+        // need no revisits, regardless of residency or row count.
+        self.applyGrowth();
         self.trim();
         while (self.entries.count() >= self.entryLimit(self.target())) _ = self.evictLocked();
         self.adopt(block) catch |err| {
@@ -10493,4 +10551,105 @@ test "SQL adaptive payload cache grows beyond legacy ceilings and refunds requir
     defer budget.allocator().free(required);
     try std.testing.expect(reader.cache.entries.count() < offsets_.len);
     try std.testing.expect(budget.live <= budget.limit);
+}
+
+test "SQL adaptive payload cache publishes shared lazy growth and unlinks every owner under faults" {
+    const Check = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(a: Allocator) !void {
+            var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 4 << 20 };
+            defer std.debug.assert(budget.live == 0);
+            var marker: u8 = 0;
+            var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = checkpoint, .async_writes = false };
+            defer manager.deinit();
+            var pages = try JoinPayloads.init(&manager);
+            defer pages.close();
+            var values: [128]std.json.Value = undefined;
+            for (&values, 0..) |*value, i| value.* = .{ .integer = @intCast(i) };
+            const cells = [_]Datum{Datum.json(.{ .array = std.json.Array.fromOwnedSlice(a, &values) })};
+            const offset = try pages.appendBatch(.{ .rows = &.{ &cells, &cells } });
+            try pages.file.seal();
+            const block = try pages.read(offset);
+            defer block.release();
+            try std.testing.expect(block.encoded.?.json_owner != null);
+            const alias = try manager.allocator().create(Sequential.OwnedBlock);
+            alias.* = .{ .a = manager.allocator(), .arena = .init(manager.allocator()), .physical_offset = offset + 1 };
+            defer alias.release();
+            try alias.dependencies.append(manager.allocator(), block);
+            block.retain();
+            var left: PayloadCache = .{};
+            left.bind(&manager);
+            defer left.deinit();
+            var right: PayloadCache = .{};
+            right.bind(&manager);
+            defer right.deinit();
+            try left.insert(block, 0);
+            try left.insert(alias, 0);
+            try right.insert(block, 0);
+            const before = block.ownRetainedBytes();
+            _ = try block.cell(0, 0);
+            try std.testing.expect(block.ownRetainedBytes() > before);
+            left.applyGrowth();
+            right.applyGrowth();
+            try std.testing.expectEqual(block.ownRetainedBytes() + alias.ownRetainedBytes(), left.bytes);
+            try std.testing.expectEqual(block.ownRetainedBytes(), right.bytes);
+            try std.testing.expect(left.evict());
+            try std.testing.expectEqual(block.ownRetainedBytes() + alias.ownRetainedBytes(), left.bytes);
+            try std.testing.expect(left.evict());
+            try std.testing.expectEqual(@as(usize, 0), left.bytes);
+            _ = try block.cell(1, 0);
+            right.applyGrowth();
+            try std.testing.expectEqual(block.ownRetainedBytes(), right.bytes);
+            try std.testing.expectEqual(@as(usize, 0), left.pending_growth.load(.acquire));
+        }
+    };
+    try Check.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Check.run, .{});
+}
+
+test "SQL adaptive payload cache lazy growth publication retires concurrent subscribers before return" {
+    const State = struct {
+        owner: JsonOwner = .{ .arena = .init(std.testing.allocator) },
+        entered: std.Io.Event = .unset,
+        fn run(self: *@This()) !void {
+            self.entered.set(std.testing.io);
+            for (0..128) |_| {
+                while (!self.owner.mutex.tryLock()) std.atomic.spinLoopHint();
+                {
+                    defer self.owner.mutex.unlock();
+                    _ = try self.owner.arena.allocator().alloc(u8, 512);
+                    self.owner.publishCapacity();
+                }
+                try std.testing.io.sleep(.fromNanoseconds(1), .awake);
+            }
+        }
+    };
+    var state: State = .{};
+    defer state.owner.deinit();
+    var permanent: std.atomic.Value(usize) = .init(0);
+    var link: RetainedSubscription = .{ .pending = &permanent };
+    _ = state.owner.subscribe(&link);
+    var linked = true;
+    defer {
+        if (linked) _ = state.owner.unsubscribe(&link);
+    }
+    var task = try std.testing.io.concurrent(State.run, .{&state});
+    defer _ = task.cancel(std.testing.io) catch {};
+    try state.entered.wait(std.testing.io);
+    for (0..512) |_| {
+        var pending: std.atomic.Value(usize) = .init(0);
+        var temporary: RetainedSubscription = .{ .pending = &pending };
+        _ = state.owner.subscribe(&temporary);
+        const growth = state.owner.unsubscribe(&temporary);
+        // Unsubscribe is a lifetime fence, not just removal from a snapshot.
+        // This stack counter can immediately be reused by the next subscriber.
+        try std.testing.expectEqual(growth, pending.load(.acquire));
+    }
+    try task.await(std.testing.io);
+    const capacity = state.owner.retained_capacity.load(.acquire);
+    try std.testing.expect(capacity > 0);
+    try std.testing.expectEqual(capacity, permanent.load(.acquire));
+    try std.testing.expectEqual(capacity, state.owner.unsubscribe(&link));
+    linked = false;
 }

@@ -1883,18 +1883,21 @@ fn addSingleTextFieldToBuilders(
     const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
     const analyzer_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     const capture = try source_capture.wants(doc_idx, field.source_field orelse field.field_name, field.text, source_root, analyzer);
-    var streaming = if (capture != null and field.text.len >= SourceCapture.stream_min_bytes and !reuse.repeated(.{ .field = field.source_field orelse field.field_name, .text = field.text, .signature = capture.?.signature })) analyzer.sourceStream(alloc, field.text) else null;
+    const reuse_key: AnalysisReuse.Key = .{ .field = field.source_field orelse field.field_name, .text = field.text, .signature = if (capture) |request| request.signature else if (field.text.len >= SourceCapture.stream_min_bytes and reuse.entries.count() != 0) try source_capture.signatureFor(analyzer) else @splat(0) };
+    const replay = if (field.text.len >= SourceCapture.stream_min_bytes and (capture != null or reuse.hasReplay(reuse_key))) try reuse.acquireReplay(reuse_key, analyzer, source_capture.io, source_capture.directory, source_capture.resources) else null;
+    defer if (replay) |held| held.release();
+    var streaming = if (replay == null and capture != null and field.text.len >= SourceCapture.stream_min_bytes and !reuse.repeated(.{ .field = field.source_field orelse field.field_name, .text = field.text, .signature = capture.?.signature })) analyzer.sourceStream(alloc, field.text) else null;
     defer if (streaming) |*stream| stream.deinit();
     const producer = if (capture == null and field.text.len >= 128) analyzer.tokenStream(field.text) else null;
     var shared: ?AnalysisReuse.Lease = null;
-    if (streaming == null and producer == null and reuse.entries.count() != 0) shared = try reuse.acquire(.{ .field = field.source_field orelse field.field_name, .text = field.text, .signature = try source_capture.signatureFor(analyzer) }, analyzer, capture != null);
+    if (replay == null and streaming == null and producer == null and reuse.entries.count() != 0) shared = try reuse.acquire(.{ .field = field.source_field orelse field.field_name, .text = field.text, .signature = try source_capture.signatureFor(analyzer) }, analyzer, capture != null);
     defer if (shared) |held| held.release();
     var field_acc = FieldAcc.init(alloc);
     defer field_acc.deinit();
     // Compiled contributions contain positions, but not original source spans.
     // Source capture and document-local token leases must finish before this
     // optional cross-document acceleration can replace analysis.
-    if (streaming) |*stream| {
+    if (replay != null or streaming != null) {
         const Consumer = struct {
             a: Allocator,
             field: *FieldAcc,
@@ -1904,7 +1907,11 @@ fn addSingleTextFieldToBuilders(
             }
         };
         var consumer: Consumer = .{ .a = doc_alloc, .field = &field_acc };
-        const count = try source_capture.recordStream(capture.?, stream, .{ .ptr = &consumer, .accept = Consumer.accept });
+        const count: u32 = if (replay) |held| replayed: {
+            const input = try held.visit(SourceCapture.TokenConsumer{ .ptr = &consumer, .accept = Consumer.accept });
+            if (capture) |request| try source_capture.recordReplay(request, input);
+            break :replayed @intCast(input.count);
+        } else try source_capture.recordStream(capture.?, &streaming.?, .{ .ptr = &consumer, .accept = Consumer.accept });
         field_acc.token_offset = count;
         if (profile) |p| {
             p.token_count +|= count;
@@ -2012,9 +2019,12 @@ fn accumulateTokenStream(a: Allocator, field: *FieldAcc, input: analysis_mod.Tok
 fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool, source_capture: *SourceCapture, doc: u32, source_field: []const u8, source_root: ?std.json.Value, reuse: *AnalysisReuse, contribution_cache: ?*AnalyzedContributionCache, known_reuse: bool) !void {
     const analysis_started = if (timings) platform_time.monotonicNs() else 0;
     const capture = try source_capture.wants(doc, source_field, text, source_root, analyzer);
+    const reuse_key: AnalysisReuse.Key = .{ .field = source_field, .text = text, .signature = if (capture) |request| request.signature else if (text.len >= SourceCapture.stream_min_bytes and reuse.entries.count() != 0) try source_capture.signatureFor(analyzer) else @splat(0) };
+    const replay = if (text.len >= SourceCapture.stream_min_bytes and (capture != null or reuse.hasReplay(reuse_key))) try reuse.acquireReplay(reuse_key, analyzer, source_capture.io, source_capture.directory, source_capture.resources) else null;
+    defer if (replay) |held| held.release();
     var streaming = if (capture != null and text.len >= SourceCapture.stream_min_bytes and !reuse.repeated(.{ .field = source_field, .text = text, .signature = capture.?.signature })) analyzer.sourceStream(scratch, text) else null;
     defer if (streaming) |*stream| stream.deinit();
-    if (streaming) |*stream| {
+    if (replay != null or streaming != null) {
         const Consumer = struct {
             a: Allocator,
             scratch: Allocator,
@@ -2037,7 +2047,11 @@ fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.String
             }
         };
         var consumer: Consumer = .{ .a = a, .scratch = scratch, .fields = fields, .name = name };
-        const count = try source_capture.recordStream(capture.?, stream, .{ .ptr = &consumer, .accept = Consumer.accept });
+        const count: u32 = if (replay) |held| replayed: {
+            const input = try held.visit(SourceCapture.TokenConsumer{ .ptr = &consumer, .accept = Consumer.accept });
+            if (capture) |request| try source_capture.recordReplay(request, input);
+            break :replayed @intCast(input.count);
+        } else try source_capture.recordStream(capture.?, &streaming.?, .{ .ptr = &consumer, .accept = Consumer.accept });
         if (consumer.field) |field| field.token_offset = try std.math.add(u32, consumer.base, count);
         if (profile) |p| {
             p.token_count +|= count;
@@ -5590,9 +5604,10 @@ test "highlight streaming indexing preserves native postings source positions an
     const expected = try analysis_mod.default_analyzer.analyzeWithSourceOffsets(reference.allocator(), text);
     const fields = [_]TextField{
         .{ .field_name = "body", .source_field = "body", .text = text },
-        .{ .field_name = "tail", .source_field = "tail", .text = "extra" },
+        .{ .field_name = "_all", .source_field = "body", .text = text },
+        .{ .field_name = "_all", .source_field = "tail", .text = "extra" },
     };
-    for ([_]bool{ false, true }) |disk| for ([_]usize{ 1, 2 }) |field_count| {
+    for ([_]bool{ false, true }) |disk| for ([_]usize{ 1, 2, 3 }) |field_count| {
         var profile: BuildTextProfile = .{};
         const bytes = try buildSegmentFromTextWithAnalysisOptions(a, &.{.{
             .id = "row",
@@ -5601,7 +5616,9 @@ test "highlight streaming indexing preserves native postings source positions an
             .text_fields = fields[0..field_count],
         }}, &analysis_mod.default_analyzer, .{}, .{ .store_source_columns = true, .profile = &profile, .postings_run_io = if (disk) std.testing.io else null });
         defer a.free(bytes);
-        try std.testing.expectEqual(expected.len + field_count - 1, profile.token_count);
+        try std.testing.expectEqual(expected.len * (if (field_count > 1) @as(usize, 2) else 1) + @intFromBool(field_count == 3), profile.token_count);
+        try std.testing.expectEqual(@as(u64, @intFromBool(field_count > 1)), profile.shared_analysis_runs);
+        try std.testing.expectEqual(@as(u64, @intFromBool(field_count > 1)), profile.shared_analysis_reuses);
         try std.testing.expectEqual(@as(u64, 1), profile.source_vectors_captured);
         var reader = try segment_mod.SegmentReader.init(a, bytes);
         defer reader.deinit();

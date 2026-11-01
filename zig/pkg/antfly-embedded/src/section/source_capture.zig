@@ -89,6 +89,9 @@ pub const Capture = struct {
         try self.recordInput(request, try spool.input(), null);
         return @intCast(spool.count);
     }
+    pub fn recordReplay(self: *Capture, request: Request, input: anytype) !void {
+        return self.recordInput(request, input, null);
+    }
     pub fn record(self: *Capture, request: Request, tokens: []const analysis.Token) !void {
         return self.recordInput(request, offsets.TokenSlice.init(tokens), tokens);
     }

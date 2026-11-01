@@ -1923,6 +1923,7 @@ pub const SourceStream = struct {
     cursor: u32 = 0,
     position: u32 = 0,
     checkpoint: usize = 0,
+    scratch_tokens: u8 = 0,
     control: Control = .none,
     pub fn deinit(self: *SourceStream) void {
         self.arena.deinit();
@@ -1930,7 +1931,14 @@ pub const SourceStream = struct {
     pub fn next(self: *SourceStream) !?Token {
         try self.control.check();
         while (self.cursor < self.text.len) {
-            if (!self.arena.reset(.{ .retain_with_limit = 64 * 1024 })) return error.OutOfMemory;
+            // Returned terms expire at next(), but retaining a bounded microbatch
+            // avoids arena-reset machinery on every short token. Oversized
+            // tokens retire before the next one, under the same allocator quota.
+            if (self.scratch_tokens == 64 or self.arena.queryCapacity() >= 64 * 1024) {
+                if (!self.arena.reset(.{ .retain_with_limit = 64 * 1024 })) return error.OutOfMemory;
+                self.scratch_tokens = 0;
+            }
+            self.scratch_tokens += 1;
             const a = self.arena.allocator();
             const whitespace = self.analyzer.tokenizer == .whitespace;
             self.cursor = try advanceRun(self.text, self.cursor, whitespace, whitespace, self.control, &self.checkpoint);

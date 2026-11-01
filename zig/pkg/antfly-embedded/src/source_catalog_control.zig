@@ -166,6 +166,7 @@ pub const search_stopwords = @import("search/stopwords.zig");
 pub const search_wildcard = @import("search/wildcard.zig");
 pub const section_source_column = @import("section/source_column.zig");
 pub const section_source_capture = @import("section/source_capture.zig");
+pub const section_analysis_reuse = @import("section/analysis_reuse.zig");
 pub const section_source_offsets = @import("section/source_offsets.zig");
 pub const section_doc_values = @import("section/doc_values.zig");
 pub const section_inverted = @import("section/inverted.zig");

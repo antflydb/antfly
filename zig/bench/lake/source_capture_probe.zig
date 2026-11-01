@@ -26,9 +26,17 @@ test "lake streaming source capture probe" {
     const repeats: usize = if (std.c.getenv("ANTFLY_CAPTURE_REPEATS")) |s| try std.fmt.parseInt(usize, std.mem.span(s), 10) else 65536;
     if (repeats == 0) return error.InvalidBenchmarkShape;
     const pattern = "Needle repeated token café ";
-    const input = try std.heap.page_allocator.alloc(u8, try std.math.mul(usize, repeats, pattern.len));
-    defer std.heap.page_allocator.free(input);
-    for (0..repeats) |i| @memcpy(input[i * pattern.len ..][0..pattern.len], pattern);
+    const bindings: usize = if (std.c.getenv("ANTFLY_CAPTURE_BINDINGS")) |value| try std.fmt.parseInt(usize, std.mem.span(value), 10) else 1;
+    if (bindings == 0 or bindings > 4) return error.InvalidBenchmarkShape;
+    const diverse = std.c.getenv("ANTFLY_CAPTURE_DIVERSE") != null;
+    var generated: std.ArrayList(u8) = .empty;
+    defer generated.deinit(std.heap.page_allocator);
+    for (0..repeats) |i| {
+        var buffer: [128]u8 = undefined;
+        const bytes = if (diverse) try std.fmt.bufPrint(&buffer, "Needle{0d:0>6} repeated{0d:0>6} token{0d:0>6} café{0d:0>6} ", .{i % 1024}) else pattern;
+        try generated.appendSlice(std.heap.page_allocator, bytes);
+    }
+    const input = generated.items;
     const legacy = std.c.getenv("ANTFLY_MATERIALIZED_CAPTURE") != null;
     var budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 256 << 20 };
     defer std.debug.assert(budget.live == 0);
@@ -49,7 +57,7 @@ test "lake streaming source capture probe" {
             self.count += 1;
         }
     };
-    var observed: Observer = .{};
+    var observers: [4]Observer = @splat(.{});
     const cpu = now(.THREAD_CPUTIME_ID);
     const wall = now(.MONOTONIC);
     var capture = Capture.init(budget.allocator(), true, std.testing.io, ".", null);
@@ -59,26 +67,47 @@ test "lake streaming source capture probe" {
         var owner = std.heap.ArenaAllocator.init(budget.allocator());
         defer owner.deinit();
         const tokens = try analyzer.analyzeWithSourceOffsets(owner.allocator(), input);
-        for (tokens) |token| try Observer.accept(&observed, token);
-        try capture.record(request, tokens);
-    } else {
+        for (0..bindings) |binding| {
+            for (tokens) |token| try Observer.accept(&observers[binding], token);
+            if (binding == 0) try capture.record(request, tokens);
+        }
+    } else if (bindings == 1) {
         var stream = analyzer.sourceStream(budget.allocator(), input).?;
         defer stream.deinit();
-        try std.testing.expectEqual(observed.count, @as(u32, 0));
-        const count = try capture.recordStream(request, &stream, .{ .ptr = &observed, .accept = Observer.accept });
-        try std.testing.expectEqual(observed.count, count);
+        const count = try capture.recordStream(request, &stream, .{ .ptr = &observers[0], .accept = Observer.accept });
+        try std.testing.expectEqual(observers[0].count, count);
+    } else {
+        const Cache = local.section_analysis_reuse.Cache;
+        var cache = Cache.init(budget.allocator());
+        defer cache.deinit();
+        const key: Cache.Key = .{ .field = "body", .text = input, .signature = signature };
+        for (0..bindings) |_| try cache.note(key);
+        for (0..bindings) |binding| {
+            const lease = (try cache.acquireReplay(key, analyzer, std.testing.io, ".", null)).?;
+            defer lease.release();
+            const tokens = try lease.visit(Capture.TokenConsumer{ .ptr = &observers[binding], .accept = Observer.accept });
+            if (binding == 0) try capture.recordReplay(request, tokens);
+        }
+        try std.testing.expectEqual(@as(usize, 1), cache.analyses);
+        try std.testing.expectEqual(bindings - 1, cache.reuses);
     }
     const elapsed = now(.THREAD_CPUTIME_ID) - cpu;
     const elapsed_wall = now(.MONOTONIC) - wall;
     const peak = budget.peak;
-    try std.testing.expectEqual(repeats * 4, observed.count);
+    const observed = &observers[0];
+    for (observers[0..bindings]) |*observer| {
+        try std.testing.expectEqual(repeats * 4, observer.count);
+        try std.testing.expectEqual(observed.hash.final(), observer.hash.final());
+    }
     const variants = try capture.variants(0, "body");
     try std.testing.expectEqual(@as(usize, 1), variants.items.len);
     const entry = variants.items[0];
     const encoded = try std.heap.page_allocator.alloc(u8, entry.bytes);
     defer std.heap.page_allocator.free(encoded);
     try variants.view.readInto(entry.offset, encoded);
+    var input_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(input, &input_digest, .{});
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
-    std.debug.print("CAPTURE legacy={} input={d} tokens={d} cpu_ns={d} wall_ns={d} peak={d} quota={d} token_hash={x} encoded_sha256={s}\n", .{ legacy, input.len, observed.count, elapsed, elapsed_wall, peak, budget.limit, observed.hash.final(), std.fmt.bytesToHex(digest, .lower) });
+    std.debug.print("CAPTURE legacy={} bindings={d} diverse={} input={d} tokens={d} cpu_ns={d} wall_ns={d} peak={d} quota={d} token_hash={x} encoded_sha256={s} input_sha256={s}\n", .{ legacy, bindings, diverse, input.len, observed.count, elapsed, elapsed_wall, peak, budget.limit, observed.hash.final(), std.fmt.bytesToHex(digest, .lower), std.fmt.bytesToHex(input_digest, .lower) });
 }

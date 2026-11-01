@@ -94,8 +94,12 @@ pub const Spool = struct {
     }
     fn read(self: *Spool, index: usize) !analysis.Token {
         if (index >= self.count) return error.InvalidData;
-        var record: [16]u8 = undefined;
-        try self.view.?.readInto(try std.math.mul(usize, index, 16), &record);
+        const offset = try std.math.mul(usize, index, 16);
+        var buffer: [16]u8 = undefined;
+        const record = if (self.run == null) self.memory.out.items[offset..][0..16] else read: {
+            try self.view.?.readInto(offset, &buffer);
+            break :read @as(*const [16]u8, &buffer);
+        };
         const id = std.mem.readInt(u32, record[0..4], .little);
         if (id >= self.terms.items.len) return error.InvalidData;
         return .{ .term = self.terms.items[id], .start_byte = std.mem.readInt(u32, record[4..8], .little), .end_byte = std.mem.readInt(u32, record[8..12], .little), .position = std.mem.readInt(u32, record[12..16], .little) };
