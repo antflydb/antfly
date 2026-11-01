@@ -20,13 +20,16 @@
 //!       [--metric l2|cosine|ip] [--m 30] [--efc 128] [--quantizer pq|rabitq|both] \
 //!       [--unpruned 1] [--cost FILE]
 //!       [--churn ROUNDS] [--churn-frac 0.05] [--rebuild-at 0.2]
+//!       [--churn-set maintenance|rebuild]
 //!
 //! --churn switches to the mixed-workload benchmark: after the initial build,
 //! each round deletes `churn-frac * n` random live vectors and inserts as many
 //! new ones (rows after the first n of the training set), then measures
 //! recall and recomputations against exact ground truth over the live set.
 //! It compares tombstones with rebuilds at `rebuild-at` deleted, delete
-//! consolidation, and both with stored upper-layer vectors.
+//! consolidation, and both with stored upper-layer vectors. With
+//! `--churn-set rebuild` it compares where rebuilds get their vectors from:
+//! exact embeddings, the RaBitQ codes alone, or an int8 copy.
 //!
 //! --cost names a measured embedder cost curve: one "batch_size milliseconds"
 //! pair per line (see scripts/leann_embed_cost.py). When given, the bench
@@ -55,7 +58,10 @@ const Args = struct {
     churn: usize = 0,
     churn_frac: f64 = 0.05,
     rebuild_at: f64 = 0.2,
+    churn_set: ChurnSet = .maintenance,
 };
+
+const ChurnSet = enum { maintenance, rebuild };
 
 /// Embedder cost curve: milliseconds per call at measured batch sizes,
 /// linearly interpolated (and extrapolated from the last two points).
@@ -140,6 +146,8 @@ pub fn main(init: std.process.Init) !void {
             args.churn = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--churn-frac")) {
             args.churn_frac = try std.fmt.parseFloat(f64, value);
+        } else if (std.mem.eql(u8, flag, "--churn-set")) {
+            args.churn_set = std.meta.stringToEnum(ChurnSet, value) orelse return error.UnknownChurnSet;
         } else if (std.mem.eql(u8, flag, "--rebuild-at")) {
             args.rebuild_at = try std.fmt.parseFloat(f64, value);
         } else if (std.mem.eql(u8, flag, "--cost")) {
@@ -478,12 +486,49 @@ fn truthOver(alloc: Allocator, rows: Matrix, queries: Matrix, metric: leann.Metr
     return truth;
 }
 
+/// Where a rebuild gets the vectors it builds the graph from.
+const RebuildSource = enum {
+    /// Exact embeddings: re-embedding every live document.
+    exact,
+    /// Reconstructions of the RaBitQ codes already in the index.
+    codes,
+    /// A per-dimension int8 copy (dims bytes per vector of extra storage).
+    int8,
+};
+
 const ChurnVariant = struct {
     name: []const u8,
     store_upper: bool,
     consolidate: bool,
     rebuild: bool,
+    source: RebuildSource = .exact,
 };
+
+/// Round-trips rows through per-dimension int8 scalar quantization.
+fn int8RoundTrip(alloc: Allocator, rows: []const f32, dims: usize, metric: leann.Metric) ![]f32 {
+    const out = try alloc.dupe(f32, rows);
+    errdefer alloc.free(out);
+    const n = rows.len / dims;
+    if (metric == .cosine) {
+        for (0..n) |i| normalize(out[i * dims ..][0..dims]);
+    }
+    const lo = try alloc.alloc(f32, dims);
+    defer alloc.free(lo);
+    const hi = try alloc.alloc(f32, dims);
+    defer alloc.free(hi);
+    @memset(lo, std.math.inf(f32));
+    @memset(hi, -std.math.inf(f32));
+    for (0..n) |i| for (out[i * dims ..][0..dims], lo, hi) |x, *l, *h| {
+        l.* = @min(l.*, x);
+        h.* = @max(h.*, x);
+    };
+    for (0..n) |i| for (out[i * dims ..][0..dims], lo, hi) |*x, l, h| {
+        const step = (h - l) / 255;
+        if (step == 0) continue;
+        x.* = l + @round((x.* - l) / step) * step;
+    };
+    return out;
+}
 
 /// One variant's index plus the node id <-> dataset row mapping.
 const ChurnState = struct {
@@ -511,6 +556,27 @@ const ChurnState = struct {
             st.row_node[r] = @intCast(i);
         }
         st.index = try leann.Index.build(alloc, cfg, st.vecs.items);
+        return st;
+    }
+
+    /// Rebuilds over `live_rows` (dataset rows, all live) from the existing
+    /// codes, optionally guided by an int8 copy of their vectors.
+    fn rebuildFromCodes(self: *const ChurnState, alloc: Allocator, rows: Matrix, live_rows: []const u32, total_rows: usize, source: RebuildSource) !ChurnState {
+        const nodes = try alloc.alloc(u32, live_rows.len);
+        defer alloc.free(nodes);
+        var st = ChurnState{ .index = undefined, .row_node = try alloc.alloc(u32, total_rows) };
+        errdefer alloc.free(st.row_node);
+        @memset(st.row_node, std.math.maxInt(u32));
+        for (live_rows, 0..) |r, i| {
+            nodes[i] = self.row_node[r];
+            try st.vecs.appendSlice(alloc, rows.row(r));
+            try st.node_row.append(alloc, r);
+            st.row_node[r] = @intCast(i);
+        }
+        var guide: ?[]f32 = null;
+        defer if (guide) |g| alloc.free(g);
+        if (source == .int8) guide = try int8RoundTrip(alloc, st.vecs.items, rows.dims, self.index.config.metric);
+        st.index = try self.index.rebuildFromCodes(alloc, nodes, guide);
         return st;
     }
 
@@ -572,11 +638,21 @@ fn runChurn(alloc: Allocator, io: std.Io, out: *std.Io.Writer, args: Args) !void
     defer w.deinit(alloc);
     try out.print("ground truth for {d} states in {d:.1}s\n", .{ args.churn + 1, msSince(io, t_truth) / 1000 });
 
-    const variants = [_]ChurnVariant{
+    const maintenance_set = [_]ChurnVariant{
         .{ .name = "tombstones + rebuild", .store_upper = false, .consolidate = false, .rebuild = true },
         .{ .name = "stored upper + rebuild", .store_upper = true, .consolidate = false, .rebuild = true },
         .{ .name = "consolidate", .store_upper = false, .consolidate = true, .rebuild = false },
         .{ .name = "stored upper + consolidate", .store_upper = true, .consolidate = true, .rebuild = false },
+    };
+    const rebuild_set = [_]ChurnVariant{
+        .{ .name = "tombstones + rebuild from exact", .store_upper = false, .consolidate = false, .rebuild = true, .source = .exact },
+        .{ .name = "tombstones + rebuild from codes", .store_upper = false, .consolidate = false, .rebuild = true, .source = .codes },
+        .{ .name = "tombstones + rebuild from int8", .store_upper = false, .consolidate = false, .rebuild = true, .source = .int8 },
+        .{ .name = "consolidate + rebuild from codes", .store_upper = false, .consolidate = true, .rebuild = true, .source = .codes },
+    };
+    const variants: []const ChurnVariant = switch (args.churn_set) {
+        .maintenance => &maintenance_set,
+        .rebuild => &rebuild_set,
     };
     const initial = try alloc.alloc(u32, args.n);
     defer alloc.free(initial);
@@ -620,11 +696,14 @@ fn runChurn(alloc: Allocator, io: std.Io, out: *std.Io.Writer, args: Args) !void
                 if (variant.rebuild and st.index.deletedFraction() >= args.rebuild_at) {
                     const live = try st.liveRows(alloc);
                     defer alloc.free(live);
-                    var fresh = try ChurnState.build(alloc, cfg, rows, live, total);
+                    var fresh = switch (variant.source) {
+                        .exact => try ChurnState.build(alloc, cfg, rows, live, total),
+                        .codes, .int8 => try st.rebuildFromCodes(alloc, rows, live, total, variant.source),
+                    };
                     st.deinit(alloc);
                     st = fresh;
                     fresh = undefined;
-                    rebuild_embeds += live.len;
+                    if (variant.source == .exact) rebuild_embeds += live.len;
                     rebuilds += 1;
                     rebuilt = true;
                 }
@@ -647,7 +726,7 @@ fn runChurn(alloc: Allocator, io: std.Io, out: *std.Io.Writer, args: Args) !void
             });
             try out.flush();
         }
-        try out.print("rebuilds {d}, embeddings for rebuilds {d}\n", .{ rebuilds, rebuild_embeds });
+        try out.print("rebuilds {d} (from {s}), embeddings for rebuilds {d}\n", .{ rebuilds, @tagName(variant.source), rebuild_embeds });
         try out.flush();
     }
 }

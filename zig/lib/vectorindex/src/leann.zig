@@ -336,6 +336,60 @@ pub const Index = struct {
                 try index.rabitq.?.encodeAll(alloc, work, n_usize);
             },
         }
+        try index.buildGraph(work, n);
+        return index;
+    }
+
+    /// Rebuilds the graph over the live nodes `live` without exact
+    /// embeddings, keeping their codes unchanged: new node i is old node
+    /// `live[i]`. The graph is built from `graph_vectors` (row i for
+    /// `live[i]`, original space) when given, otherwise from each code's own
+    /// reconstruction. RaBitQ only.
+    pub fn rebuildFromCodes(self: *const Index, alloc: Allocator, live: []const u32, graph_vectors: ?[]const f32) !Index {
+        const cfg = self.config;
+        if (cfg.store_upper or self.rabitq == null) return error.Unsupported;
+        const dims: usize = cfg.dims;
+        if (live.len == 0 or live.len > std.math.maxInt(u32) - 1) return error.InvalidInput;
+        const n: u32 = @intCast(live.len);
+        const old = &self.rabitq.?;
+        const work = try alloc.alloc(f32, live.len * dims);
+        defer alloc.free(work);
+        if (graph_vectors) |gv| {
+            if (gv.len != work.len) return error.InvalidInput;
+            @memcpy(work, gv);
+            if (cfg.metric == .cosine) {
+                for (0..live.len) |i| normalize(work[i * dims ..][0..dims]);
+            }
+            try old.rotateInPlace(alloc, work);
+        } else {
+            for (live, 0..) |id, i| {
+                if (id >= self.node_count) return error.InvalidInput;
+                old.decode(id, work[i * dims ..][0..dims]);
+            }
+        }
+
+        var index = Index{ .alloc = alloc, .config = cfg };
+        errdefer index.deinit();
+        index.rabitq = try RaBitQCodes.init(alloc, cfg);
+        const r = &index.rabitq.?;
+        r.centroid = try alloc.dupe(f32, old.centroid);
+        r.centroid_norm = old.centroid_norm;
+        try r.reserve(alloc, live.len);
+        for (live) |id| {
+            if (id >= self.node_count) return error.InvalidInput;
+            r.appendRowFromAssumeCapacity(old, id);
+        }
+        try index.buildGraph(work, n);
+        return index;
+    }
+
+    /// HNSW construction, pruning and connectivity repair over `work` (in the
+    /// space `decodeApprox` uses), after the codes are in place.
+    fn buildGraph(index: *Index, work: []const f32, n: u32) !void {
+        const alloc = index.alloc;
+        const cfg = index.config;
+        const dims: usize = cfg.dims;
+        const n_usize: usize = n;
         try index.flags.appendNTimes(alloc, 0, n_usize);
 
         try index.upper.ensureTotalCapacity(alloc, n_usize);
@@ -404,7 +458,6 @@ pub const Index = struct {
         }
         index.node_count = n;
         try index.rebuildIndegree();
-        return index;
     }
 
     fn rebuildIndegree(self: *Index) !void {
@@ -1938,6 +1991,16 @@ pub const RaBitQCodes = struct {
         if (self.metric != .l2_squared) self.centroid_dot_products.appendAssumeCapacity(@bitCast(std.mem.readInt(u32, bytes[pos + 12 ..][0..4], .little)));
     }
 
+    /// Appends a copy of `other`'s row `id`. Both must share a centroid.
+    fn appendRowFromAssumeCapacity(self: *RaBitQCodes, other: *const RaBitQCodes, id: u32) void {
+        const i: usize = id;
+        self.codes.appendSliceAssumeCapacity(other.codes.items[i * self.width ..][0..self.width]);
+        self.code_counts.appendAssumeCapacity(other.code_counts.items[i]);
+        self.centroid_distances.appendAssumeCapacity(other.centroid_distances.items[i]);
+        self.quantized_dot_products.appendAssumeCapacity(other.quantized_dot_products.items[i]);
+        if (self.metric != .l2_squared) self.centroid_dot_products.appendAssumeCapacity(other.centroid_dot_products.items[i]);
+    }
+
     fn popRow(self: *RaBitQCodes) void {
         self.codes.items.len -= self.width;
         self.code_counts.items.len -= 1;
@@ -2976,6 +3039,44 @@ test "leann: stored upper vectors avoid recomputing upper nodes" {
     const undo = try index.applyDeltaUndoable(delta);
     index.revertDelta(delta, undo);
     try testing.expectEqual(before, index.upper_vectors.count());
+}
+
+test "leann: rebuild from codes keeps codes and live nodes" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2000, 20, 32, 24, 41);
+    defer fx.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = 32, .max_degree = 24, .quantizer = .rabitq }, fx.data);
+    defer index.deinit();
+    var live = std.ArrayListUnmanaged(u32).empty;
+    defer live.deinit(alloc);
+    var live_vectors = std.ArrayListUnmanaged(f32).empty;
+    defer live_vectors.deinit(alloc);
+    for (0..2000) |i| {
+        if (i % 4 == 0) {
+            try index.markDeleted(@intCast(i));
+            continue;
+        }
+        try live.append(alloc, @intCast(i));
+        try live_vectors.appendSlice(alloc, fx.data[i * 32 ..][0..32]);
+    }
+    for ([_]?[]const f32{ null, live_vectors.items }) |graph_vectors| {
+        var rebuilt = try index.rebuildFromCodes(alloc, live.items, graph_vectors);
+        defer rebuilt.deinit();
+        try testing.expectEqual(@as(u32, @intCast(live.items.len)), rebuilt.node_count);
+        try testing.expectEqual(@as(u32, 0), rebuilt.deleted_count);
+        const width = index.rabitq.?.width;
+        for (live.items, 0..) |old, new| {
+            try testing.expectEqualSlices(u64, index.rabitq.?.codes.items[old * width ..][0..width], rebuilt.rabitq.?.codes.items[new * width ..][0..width]);
+        }
+        var src = SliceEmbeddingSource{ .vectors = live_vectors.items, .dims = 32 };
+        // Each live vector finds itself through the rebuilt graph.
+        for ([_]usize{ 0, 700, 1499 }) |new| {
+            var resp = try rebuilt.search(alloc, src.source(), live_vectors.items[new * 32 ..][0..32], .{ .k = 1, .ef = 256 });
+            defer resp.deinit(alloc);
+            try testing.expectEqual(@as(u32, @intCast(new)), resp.results[0].id);
+        }
+    }
+    try testing.expectError(error.InvalidInput, index.rebuildFromCodes(alloc, &.{}, null));
 }
 
 test "leann: recompute failures propagate" {
