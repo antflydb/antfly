@@ -6782,7 +6782,9 @@ pub const IndexManager = struct {
             .use_quantization = dense_cfg.use_quantization,
             .rerank_policy = dense_cfg.rerank_policy,
             .quantizer_seed = dense_cfg.quantizer_seed,
-            .use_random_ortho_trans = dense_cfg.use_random_ortho_trans,
+            .use_random_ortho_trans = dense_cfg.use_random_ortho_trans or dense_cfg.quantization_bits > 1,
+            .quantization_bits = dense_cfg.quantization_bits,
+            .quantization_refine = dense_cfg.quantization_refine,
             .max_cached_nodes = cache_limits.max_cached_nodes,
             .max_cached_vectors = cache_limits.max_cached_vectors,
             .max_cached_metadata = cache_limits.max_cached_metadata,
@@ -22890,7 +22892,9 @@ pub const IndexManager = struct {
                     .use_quantization = dense_cfg.use_quantization,
                     .rerank_policy = dense_cfg.rerank_policy,
                     .quantizer_seed = dense_cfg.quantizer_seed,
-                    .use_random_ortho_trans = dense_cfg.use_random_ortho_trans,
+                    .use_random_ortho_trans = dense_cfg.use_random_ortho_trans or dense_cfg.quantization_bits > 1,
+                    .quantization_bits = dense_cfg.quantization_bits,
+                    .quantization_refine = dense_cfg.quantization_refine,
                     .max_cached_nodes = cache_limits.max_cached_nodes,
                     .max_cached_vectors = cache_limits.max_cached_vectors,
                     .max_cached_metadata = cache_limits.max_cached_metadata,
@@ -33567,6 +33571,10 @@ const DenseConfig = struct {
     rerank_policy: hbc_mod.HBCConfig.RerankPolicy = .boundary,
     quantizer_seed: u64 = 42,
     use_random_ortho_trans: bool = false,
+    /// `quantization_bits` in the index config (1 to 8). Above 1 also turns
+    /// on `use_random_ortho_trans`, which extended RaBitQ codes assume.
+    quantization_bits: u8 = 1,
+    quantization_refine: @FieldType(hbc_mod.HBCConfig, "quantization_refine") = .near_cutoff,
     lazy_posting_maintenance: bool = false,
     auto_posting_maintenance_max_postings: usize = 0,
     centroid_directory_mode: hbc_mod.HBCConfig.CentroidDirectoryMode = .auto,
@@ -34404,6 +34412,14 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
             value.bool
         else
             false,
+        .quantization_bits = if (root.object.get("quantization_bits")) |value| blk: {
+            if (value != .integer or value.integer < 1 or value.integer > 8) return error.InvalidIndexConfig;
+            break :blk @intCast(value.integer);
+        } else 1,
+        .quantization_refine = if (root.object.get("quantization_refine")) |value| blk: {
+            if (value != .string) return error.InvalidIndexConfig;
+            break :blk std.meta.stringToEnum(@FieldType(hbc_mod.HBCConfig, "quantization_refine"), value.string) orelse return error.InvalidIndexConfig;
+        } else .near_cutoff,
         .lazy_posting_maintenance = if (root.object.get("lazy_posting_maintenance")) |value|
             value.bool
         else
@@ -38945,6 +38961,8 @@ test "parseDenseConfig accepts HBC algorithm tuning" {
         \\  "rerank_policy": "never",
         \\  "quantizer_seed": 99,
         \\  "use_random_ortho_trans": true,
+        \\  "quantization_bits": 4,
+        \\  "quantization_refine": "all",
         \\  "lazy_posting_maintenance": true,
         \\  "auto_posting_maintenance_max_postings": 17,
         \\  "centroid_directory_mode": "flat_rabitq",
@@ -38972,6 +38990,8 @@ test "parseDenseConfig accepts HBC algorithm tuning" {
     try std.testing.expectEqual(hbc_mod.HBCConfig.RerankPolicy.never, cfg.rerank_policy);
     try std.testing.expectEqual(@as(u64, 99), cfg.quantizer_seed);
     try std.testing.expectEqual(true, cfg.use_random_ortho_trans);
+    try std.testing.expectEqual(@as(u8, 4), cfg.quantization_bits);
+    try std.testing.expectEqual(.all, cfg.quantization_refine);
     try std.testing.expectEqual(true, cfg.lazy_posting_maintenance);
     try std.testing.expectEqual(@as(usize, 17), cfg.auto_posting_maintenance_max_postings);
     try std.testing.expectEqual(hbc_mod.HBCConfig.CentroidDirectoryMode.flat_rabitq, cfg.centroid_directory_mode);

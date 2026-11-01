@@ -6431,6 +6431,7 @@ pub const HBCIndex = struct {
                             .use_quantization = config.use_quantization,
                             .quantizer_seed = config.quantizer_seed,
                             .metric = @as(u8, @intCast(@backingInt(config.metric))),
+                            .quantization_bits = config.quantization_bits,
                         };
 
                         var meta_buf: [IndexMetadata.encoded_size]u8 = undefined;
@@ -6477,6 +6478,12 @@ pub const HBCIndex = struct {
         effective_config.leaf_size = metadata.leaf_size;
         effective_config.use_quantization = metadata.use_quantization;
         effective_config.quantizer_seed = metadata.quantizer_seed;
+        // The stored bit count wins, like the other quantizer settings.
+        effective_config.quantization_bits = metadata.quantization_bits;
+        if (effective_config.quantization_bits == 0 or effective_config.quantization_bits > 8) return error.Corrupted;
+        // Extended codes assume randomly rotated vectors.
+        if (effective_config.quantization_bits > 1 and !effective_config.use_random_ortho_trans)
+            return error.QuantizationBitsRequireRotation;
 
         const env_owner: EnvOwner = opened;
 
@@ -9266,7 +9273,7 @@ pub const HBCIndex = struct {
     }
 
     fn decodeExperimentalPostingMetadataForConfig(expected: IndexMetadata, encoded: []const u8) !IndexMetadata {
-        if (encoded.len != IndexMetadata.encoded_size and encoded.len != IndexMetadata.legacy_encoded_size)
+        if (encoded.len != IndexMetadata.encoded_size and encoded.len != IndexMetadata.topology_encoded_size and encoded.len != IndexMetadata.legacy_encoded_size)
             return error.CorruptedPostingMetadata;
         const metadata = IndexMetadata.decode(encoded);
         // The bootstrap metadata may itself have come from the same native
@@ -9278,7 +9285,8 @@ pub const HBCIndex = struct {
             metadata.leaf_size != expected.leaf_size or
             metadata.use_quantization != expected.use_quantization or
             metadata.quantizer_seed != expected.quantizer_seed or
-            metadata.metric != expected.metric)
+            metadata.metric != expected.metric or
+            metadata.quantization_bits != expected.quantization_bits)
         {
             return error.PostingCheckpointMetadataMismatch;
         }
@@ -35570,6 +35578,20 @@ test "hbc multi-bit codes refine leaf admission and survive reopen" {
             const again = try multiBitRecall(alloc, &reopened, data, queries, dims, &refined);
             try std.testing.expect(refined > 0);
             try std.testing.expectApproxEqAbs(recalls[vi], again, 0.02);
+        }
+        if (bits > 1) {
+            // The stored bit count wins over a reopen config's.
+            var one_bit_cfg = cfg;
+            one_bit_cfg.quantization_bits = 1;
+            {
+                var reopened = try HBCIndex.open(alloc, path, one_bit_cfg);
+                defer reopened.close();
+                try std.testing.expectEqual(@as(u8, bits), reopened.config.quantization_bits);
+            }
+            // Extended codes need rotated vectors.
+            var unrotated = cfg;
+            unrotated.use_random_ortho_trans = false;
+            try std.testing.expectError(error.QuantizationBitsRequireRotation, HBCIndex.open(alloc, path, unrotated));
         }
     }
     std.testing.expect(recalls[1] >= recalls[0]) catch |err| {
