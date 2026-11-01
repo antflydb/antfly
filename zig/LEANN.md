@@ -335,9 +335,37 @@ recomputations per query at ef 1024:
   better-than-1-bit vectors, because pruning and neighbor selection compare
   many close pairs.
 
-Options in between, not yet measured: a 4-bit copy (half of int8), or
-multi-bit RaBitQ codes as the index's codes, which would also tighten the
-search-time bounds.
+### Multi-bit RaBitQ codes
+
+`Config.rabitq_bits` (1 to 8) switches the codes to extended RaBitQ
+(`antfly_vector.rabitq_ex`): B bits per dimension, full-precision query,
+error bounds sized like the 1-bit kernel's. NYTimes-256, 100k, cosine,
+bounds ×1, 200 queries:
+
+| Bits | Index (% of raw f32) | Recall@10, ef 512 | Recomputed/q | Recall@10, ef 1024 | Recomputed/q | CPU ms/q (ef 1024) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 9.5% | 0.851 | 157 | 0.892 | 207 | 2.8 |
+| 2 | 12.6% | 0.880 | 34 | 0.920 | 36 | 8.7 |
+| 3 | 15.7% | 0.890 | 19 | 0.933 | 19 | 8.3 |
+| 4 | 18.9% | 0.898 | 14 | 0.934 | 14 | 8.6 |
+
+- Recomputations fall 6x at 2 bits and 15x at 4 bits, to barely more than
+  k, while recall rises (better estimates also steer the walk). Modeled
+  CPU embedding time per query (4-way fan-out curve above) drops from
+  ~16 s to ~1.1 s at 4 bits.
+- The estimator is scalar today (bit extraction per dimension), so the
+  walk costs ~3x more CPU; a nibble lookup table or SIMD kernel would close
+  most of that.
+- Rebuilding from the codes alone now matches exact rebuilds: with 4-bit
+  codes, recall after the two rebuilds is 0.938 and 0.934 from codes vs.
+  0.938 and 0.936 from exact embeddings (2-bit: 0.914 and 0.919 vs. 0.926
+  and 0.930). So multi-bit codes remove the embedding cost of rebuilds too.
+- A separate 4-bit scalar copy guiding 1-bit rebuilds did worse (0.883
+  after a rebuild) and costs more bytes than 4-bit codes, so it is not
+  worth keeping.
+
+Recommendation: 4 bits for LEANN (3 when index bytes matter more). It is
+not yet exposed in the public `leann` config.
 
 ## Table integration
 
