@@ -17697,6 +17697,13 @@ pub fn runNativePdfOcrGroundingIntegration(
         .ocr_executor = .reader,
         .ocr_model = "multistage-integration",
         .ocr_config_json = "{\"provider\":\"antfly\",\"model\":\"multistage-integration\"}",
+        // Constructed directly rather than through parseConfig, so the
+        // reader's normal .plain policy (empty prompt; real readers run
+        // their own default OCR task) never gets resolved here. The
+        // synthetic multistage-integration fake reader this target exercises
+        // requires the literal "<OCR>" text, matching every other reader
+        // request this file builds by hand.
+        .ocr_prompt = document_extraction_mod.florence_ocr_prompt,
         .ocr_render_dpi = 72,
         .pdf_render_max_parallel_pages = 1,
         .pdf_decode_limits = .{
