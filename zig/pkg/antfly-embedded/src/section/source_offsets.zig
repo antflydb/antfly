@@ -133,17 +133,22 @@ pub fn write(a: A, sink: *Sink, tokens: []const analysis.Token) !Encoded {
     return writeInput(a, sink, TokenSlice.init(tokens));
 }
 pub fn writeInput(a: A, sink: *Sink, input: anytype) !Encoded {
-    const count = std.math.cast(u32, input.count) orelse return error.InvalidData;
-    const base = sink.len();
-    try sink.appendNTimes(0, header_size);
+    _ = std.math.cast(u32, input.count) orelse return error.InvalidData;
+    if (comptime @hasDecl(@TypeOf(input), "prepareOffsets")) {
+        var prepared = try input.prepareOffsets(a);
+        defer prepared.deinit();
+        return writePrepared(a, sink, &prepared);
+    } else return writeSliceInput(a, sink, input);
+}
+fn writeSliceInput(a: A, sink: *Sink, input: anytype) !Encoded {
     const Group = struct { term: []const u8, first: u32, last: u32, count: u32 = 1 };
     var groups: std.ArrayList(Group) = .empty;
     defer groups.deinit(a);
     var by_term: std.StringHashMapUnmanaged(u32) = .empty;
     defer by_term.deinit(a);
-    const next = try a.alloc(u32, input.count);
-    defer a.free(next);
-    @memset(next, std.math.maxInt(u32));
+    const links = try a.alloc(u32, input.count);
+    defer a.free(links);
+    @memset(links, std.math.maxInt(u32));
     var ordered = true;
     var disjoint = true;
     var previous_input: ?analysis.Token = null;
@@ -161,7 +166,7 @@ pub fn writeInput(a: A, sink: *Sink, input: anytype) !Encoded {
             try groups.append(a, .{ .term = token.term, .first = @intCast(i), .last = @intCast(i) });
         } else {
             const group = &groups.items[entry.value_ptr.*];
-            next[group.last] = @intCast(i);
+            links[group.last] = @intCast(i);
             group.last = @intCast(i);
             group.count += 1;
         }
@@ -173,6 +178,68 @@ pub fn writeInput(a: A, sink: *Sink, input: anytype) !Encoded {
             return std.mem.lessThan(u8, l.term, r.term);
         }
     }.less);
+    const Prepared = struct {
+        input: @TypeOf(input),
+        groups: []Group,
+        links: []u32,
+        count: usize,
+        ordered: bool,
+        disjoint: bool,
+        const Self = @This();
+        const GroupCursor = struct {
+            input: @TypeOf(input),
+            links: []const u32,
+            at: u32,
+            remaining: u32,
+            pub fn deinit(_: *@This()) void {}
+            pub fn next(self: *@This()) !?analysis.Token {
+                if (self.remaining == 0) return null;
+                self.remaining -= 1;
+                const token = try self.input.at(self.at);
+                self.at = self.links[self.at];
+                return token;
+            }
+        };
+        pub fn groupCursor(self: *Self, _: A, group: Group) !GroupCursor {
+            return .{ .input = self.input, .links = self.links, .at = group.first, .remaining = group.count };
+        }
+        pub fn prepareSource(self: *Self) void {
+            for (self.groups, 0..) |group, ordinal| {
+                var at = group.first;
+                for (0..group.count) |_| {
+                    const following = self.links[at];
+                    self.links[at] = @intCast(ordinal);
+                    at = following;
+                }
+            }
+        }
+        const SourceCursor = struct {
+            input: @TypeOf(input),
+            ordinals: []const u32,
+            at: usize = 0,
+            pub fn deinit(_: *@This()) void {}
+            pub fn next(self: *@This()) !?struct { token: analysis.Token, ordinal: u32 } {
+                if (self.at == self.input.count) return null;
+                defer self.at += 1;
+                return .{ .token = try self.input.at(self.at), .ordinal = self.ordinals[self.at] };
+            }
+        };
+        pub fn sourceCursor(self: *Self, _: A) !SourceCursor {
+            return .{ .input = self.input, .ordinals = self.links };
+        }
+    };
+    var prepared: Prepared = .{ .input = input, .groups = groups.items, .links = links, .count = input.count, .ordered = ordered, .disjoint = disjoint };
+    return writePrepared(a, sink, &prepared);
+}
+/// One encoder defines persisted bytes for materialized and normalized input.
+/// Preparation changes only occurrence access and term grouping ownership.
+fn writePrepared(a: A, sink: *Sink, input: anytype) !Encoded {
+    const count = std.math.cast(u32, input.count) orelse return error.InvalidData;
+    const base = sink.len();
+    try sink.appendNTimes(0, header_size);
+    const groups = input.groups;
+    const ordered = input.ordered;
+    const disjoint = input.disjoint;
     var pending: std.ArrayList(u8) = .empty;
     defer pending.deinit(a);
     var root: std.ArrayList(u8) = .empty;
@@ -185,21 +252,23 @@ pub fn writeInput(a: A, sink: *Sink, input: anytype) !Encoded {
     defer raw.deinit(a);
     var refs: std.ArrayList(Ref) = .empty;
     defer refs.deinit(a);
-    for (groups.items) |group| {
+    for (groups) |group| {
         if (terms != 0 and (terms == page_terms or pending.items.len >= page_bytes)) {
             try dictionary(a, sink, base, &pending, terms, previous, &root);
             pages += 1;
             terms = 0;
         }
         refs.clearRetainingCapacity();
-        var at = group.first;
+        var cursor = try input.groupCursor(a, group);
+        defer cursor.deinit();
         var remaining = group.count;
+        var consumed: u32 = 0;
         var prior: ?analysis.Token = null;
         var minimum_start: u32 = std.math.maxInt(u32);
         var minimum_gap: u32 = std.math.maxInt(u32);
         var through_end: u32 = 0;
         var regular = true;
-        const first_token = try input.at(group.first);
+        const first_token = (try cursor.next()) orelse return error.InvalidData;
         var stride: ?u32 = null;
         while (remaining != 0) {
             const n = @min(remaining, block_tokens);
@@ -208,7 +277,8 @@ pub fn writeInput(a: A, sink: *Sink, input: anytype) !Encoded {
             var block_start: u32 = std.math.maxInt(u32);
             var block_gap: u32 = std.math.maxInt(u32);
             for (0..n) |_| {
-                const token = try input.at(at);
+                const token = if (consumed == 0) first_token else (try cursor.next()) orelse return error.InvalidData;
+                consumed += 1;
                 through_end = @max(through_end, token.end_byte);
                 if (prior) |previous_token| {
                     const step = token.start_byte -| previous_token.start_byte;
@@ -227,7 +297,6 @@ pub fn writeInput(a: A, sink: *Sink, input: anytype) !Encoded {
                 try variable(a, &raw, token.end_byte - token.start_byte);
                 try variable(a, &raw, token.position);
                 start = token.start_byte;
-                at = next[at];
             }
             var ref = try chunk(a, sink, base, raw.items, n);
             ref.through_end = through_end;
@@ -253,15 +322,10 @@ pub fn writeInput(a: A, sink: *Sink, input: anytype) !Encoded {
     // Dense, diverse queries use a bounded source-order lane instead of one
     // decoded head block per term. Reuse the build links as compact term IDs.
     refs.clearRetainingCapacity();
-    if (ordered and groups.items.len >= 64) {
-        for (groups.items, 0..) |group, ordinal| {
-            var at = group.first;
-            for (0..group.count) |_| {
-                const following = next[at];
-                next[at] = @intCast(ordinal);
-                at = following;
-            }
-        }
+    if (ordered and groups.len >= 64) {
+        input.prepareSource();
+        var source = try input.sourceCursor(a);
+        defer source.deinit();
         var begin: usize = 0;
         var through: u32 = 0;
         var previous_source: ?analysis.Token = null;
@@ -271,8 +335,10 @@ pub fn writeInput(a: A, sink: *Sink, input: anytype) !Encoded {
             var start: i64 = 0;
             var minimum_start: u32 = std.math.maxInt(u32);
             var minimum_gap: u32 = std.math.maxInt(u32);
-            for (next[begin..end], begin..end) |ordinal, index| {
-                const token = try input.at(index);
+            for (begin..end) |_| {
+                const occurrence = (try source.next()) orelse return error.InvalidData;
+                const token = occurrence.token;
+                const ordinal = occurrence.ordinal;
                 if (previous_source) |prior| {
                     minimum_start = @min(minimum_start, token.start_byte -| prior.start_byte);
                     minimum_gap = @min(minimum_gap, token.start_byte -| prior.end_byte);
@@ -304,8 +370,8 @@ pub fn writeInput(a: A, sink: *Sink, input: anytype) !Encoded {
     std.mem.writeInt(u32, header[16..20], root_ref.wire, .little);
     std.mem.writeInt(u32, header[20..24], root_ref.raw, .little);
     std.mem.writeInt(u32, header[24..28], count, .little);
-    if (groups.items.len > 0x3fffffff) return error.InvalidData;
-    std.mem.writeInt(u32, header[28..32], @as(u32, @intCast(groups.items.len)) | (if (ordered) @as(u32, 0x80000000) else 0) | (if (ordered and disjoint) @as(u32, 0x40000000) else 0), .little);
+    if (groups.len > 0x3fffffff) return error.InvalidData;
+    std.mem.writeInt(u32, header[28..32], @as(u32, @intCast(groups.len)) | (if (ordered) @as(u32, 0x80000000) else 0) | (if (ordered and disjoint) @as(u32, 0x40000000) else 0), .little);
     try sink.writeAt(base, &header);
     return .{ .bytes = sink.len() - base, .root_raw = root_ref.raw, .count = count };
 }

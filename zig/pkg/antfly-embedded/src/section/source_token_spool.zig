@@ -22,6 +22,7 @@ const Run = @import("../postings_run.zig").Run;
 const View = @import("../segment_source.zig").View;
 const A = std.mem.Allocator;
 pub const Spool = struct {
+    const Term = struct { text: []const u8, count: u32 = 0 };
     a: A,
     io: ?std.Io,
     directory: []const u8,
@@ -30,7 +31,12 @@ pub const Spool = struct {
     run: ?*Run = null,
     memory: segment.MemorySegmentSink,
     ids: std.StringHashMapUnmanaged(u32) = .empty,
-    terms: std.ArrayList([]const u8) = .empty,
+    terms: std.ArrayList(Term) = .empty,
+    ordered: bool = true,
+    disjoint: bool = true,
+    previous: ?struct { start: u32, end: u32 } = null,
+    group_memory_records: usize = 16 * 1024,
+    grouping_read_calls: usize = 0,
     count: usize = 0,
     view: ?View = null,
     pub fn init(a: A, io: ?std.Io, directory: []const u8, resources: ?*@import("../storage/resource_manager.zig").ResourceManager) Spool {
@@ -40,7 +46,7 @@ pub const Spool = struct {
     }
     pub fn deinit(self: *Spool) void {
         self.ids.deinit(self.a);
-        for (self.terms.items) |term| self.a.free(term);
+        for (self.terms.items) |term| self.a.free(term.text);
         self.terms.deinit(self.a);
         if (self.run) |run| run.deinit();
         self.memory.deinit();
@@ -50,7 +56,7 @@ pub const Spool = struct {
         const id = self.ids.get(token.term) orelse intern: {
             const owned = try self.a.dupe(u8, token.term);
             errdefer self.a.free(owned);
-            try self.terms.append(self.a, owned);
+            try self.terms.append(self.a, .{ .text = owned });
             errdefer _ = self.terms.pop();
             const value: u32 = @intCast(self.terms.items.len - 1);
             try self.ids.put(self.a, owned, value);
@@ -75,12 +81,24 @@ pub const Spool = struct {
         var sink = if (self.run) |run| run.sink() else self.memory.sink();
         try sink.appendSlice(&record);
         self.count += 1;
+        self.terms.items[id].count += 1;
+        if (self.previous) |prior| {
+            if (token.start_byte < prior.start or (token.start_byte == prior.start and token.end_byte > prior.end)) self.ordered = false;
+            if (token.start_byte <= prior.end) self.disjoint = false;
+        }
+        self.previous = .{ .start = token.start_byte, .end = token.end_byte };
     }
     pub const Input = struct {
         spool: *Spool,
         count: usize,
         pub fn at(self: Input, index: usize) !analysis.Token {
             return self.spool.read(index);
+        }
+        pub fn cursor(self: Input, a: A) Cursor {
+            return .{ .spool = self.spool, .raw = RawCursor.init(a, .{ .view = self.spool.view.?, .count = self.count }) };
+        }
+        pub fn prepareOffsets(self: Input, a: A) !Prepared {
+            return Prepared.init(self.spool, a);
         }
     };
     pub fn input(self: *Spool) !Input {
@@ -100,10 +118,283 @@ pub const Spool = struct {
             try self.view.?.readInto(offset, &buffer);
             break :read @as(*const [16]u8, &buffer);
         };
+        return self.decodeRecord(record);
+    }
+    fn decodeRecord(self: *Spool, record: *const [16]u8) !analysis.Token {
         const id = std.mem.readInt(u32, record[0..4], .little);
         if (id >= self.terms.items.len) return error.InvalidData;
-        return .{ .term = self.terms.items[id], .start_byte = std.mem.readInt(u32, record[4..8], .little), .end_byte = std.mem.readInt(u32, record[8..12], .little), .position = std.mem.readInt(u32, record[12..16], .little) };
+        return .{ .term = self.terms.items[id].text, .start_byte = std.mem.readInt(u32, record[4..8], .little), .end_byte = std.mem.readInt(u32, record[8..12], .little), .position = std.mem.readInt(u32, record[12..16], .little) };
     }
+    const Range = struct { offset: usize, bytes: usize };
+    const RecordSource = struct {
+        view: View,
+        count: usize,
+        begin: usize = 0,
+        ranges: []const Range = &.{},
+    };
+    /// Fixed records are read in bounded blocks. Memory sources are borrowed;
+    /// file sources own only the current block, never one read per occurrence.
+    const RawCursor = struct {
+        a: A,
+        source: RecordSource,
+        range_index: usize = 0,
+        range_position: usize = 0,
+        block: []const u8 = &.{},
+        at: usize = 0,
+        buffer: []u8 = &.{},
+        fn init(a: A, source: RecordSource) RawCursor {
+            return .{ .a = @import("../sql/memory_budget.zig").reclaimingAllocator(a), .source = source };
+        }
+        fn deinit(self: *RawCursor) void {
+            self.a.free(self.buffer);
+        }
+        fn nextBlock(self: *RawCursor) !?[]const u8 {
+            while (true) {
+                const range = if (self.source.ranges.len != 0) blk: {
+                    if (self.range_index == self.source.ranges.len) return null;
+                    break :blk self.source.ranges[self.range_index];
+                } else if (self.range_index == 0) Range{ .offset = self.source.begin, .bytes = self.source.count * 16 } else return null;
+                if (self.range_position == range.bytes) {
+                    self.range_index += 1;
+                    self.range_position = 0;
+                    continue;
+                }
+                const n = @min(64 * 1024, range.bytes - self.range_position);
+                if (n % 16 != 0) return error.InvalidData;
+                const offset = range.offset + self.range_position;
+                self.range_position += n;
+                if (self.source.view.source == .contiguous) {
+                    const start: usize = @intCast(self.source.view.offset + offset);
+                    return self.source.view.source.contiguous[start..][0..n];
+                }
+                if (self.buffer.len < n) {
+                    self.a.free(self.buffer);
+                    self.buffer = &.{};
+                    self.buffer = try self.a.alloc(u8, n);
+                }
+                try self.source.view.readInto(offset, self.buffer[0..n]);
+                return self.buffer[0..n];
+            }
+        }
+        fn next(self: *RawCursor) !?*const [16]u8 {
+            if (self.at == self.block.len) {
+                self.block = (try self.nextBlock()) orelse return null;
+                self.at = 0;
+            }
+            const record = self.block[self.at..][0..16];
+            self.at += 16;
+            return record;
+        }
+    };
+    pub const Cursor = struct {
+        spool: *Spool,
+        raw: RawCursor,
+        term_id: u32 = 0,
+        pub fn deinit(self: *Cursor) void {
+            self.raw.deinit();
+        }
+        pub fn next(self: *Cursor) !?analysis.Token {
+            const record = (try self.raw.next()) orelse return null;
+            self.term_id = std.mem.readInt(u32, record[0..4], .little);
+            return try self.spool.decodeRecord(record);
+        }
+    };
+    /// The encoder consumes the same term order and bytes as TokenSlice. Only
+    /// the private occurrence access changes: linked memory or sorted runs.
+    pub const Prepared = struct {
+        pub const Group = struct { term: []const u8, id: u32, first: u32, last: u32 = 0, count: u32 };
+        a: A,
+        spool: *Spool,
+        count: usize,
+        groups: []Group,
+        ranks: []u32,
+        links: []u32 = &.{},
+        ordered: bool,
+        disjoint: bool,
+        grouped: ?*Run = null,
+        view: ?View = null,
+        fn init(spool: *Spool, allocator: A) !Prepared {
+            const a = @import("../sql/memory_budget.zig").reclaimingAllocator(allocator);
+            const groups = try a.alloc(Group, spool.terms.items.len);
+            errdefer a.free(groups);
+            const ranks = try a.alloc(u32, groups.len);
+            errdefer a.free(ranks);
+            for (groups, spool.terms.items, 0..) |*group, term, id| {
+                if (term.count == 0) return error.InvalidData;
+                group.* = .{ .term = term.text, .id = @intCast(id), .first = 0, .count = term.count };
+            }
+            std.mem.sort(Group, groups, {}, struct {
+                fn less(_: void, l: Group, r: Group) bool {
+                    return std.mem.lessThan(u8, l.term, r.term);
+                }
+            }.less);
+            var count: u32 = 0;
+            for (groups, 0..) |*group, rank| {
+                ranks[group.id] = @intCast(rank);
+                group.first = count;
+                count = try std.math.add(u32, count, group.count);
+            }
+            if (count != spool.count) return error.InvalidData;
+            var self: Prepared = .{ .a = a, .spool = spool, .count = spool.count, .groups = groups, .ranks = ranks, .ordered = spool.ordered, .disjoint = spool.disjoint };
+            // groups/ranks are covered by the outer error defers until success.
+            errdefer {
+                a.free(self.links);
+                if (self.grouped) |run| run.deinit();
+            }
+            if (spool.run == null) {
+                self.links = try a.alloc(u32, spool.count);
+                @memset(self.links, std.math.maxInt(u32));
+                for (groups) |*group| group.first = std.math.maxInt(u32);
+                var cursor = (try spool.input()).cursor(a);
+                defer cursor.deinit();
+                var at: u32 = 0;
+                while (try cursor.next()) |_| : (at += 1) {
+                    const group = &groups[ranks[cursor.term_id]];
+                    if (group.first == std.math.maxInt(u32)) group.first = at else self.links[group.last] = at;
+                    group.last = at;
+                }
+            } else {
+                const run = try Run.createWithResources(a, spool.io.?, spool.directory, spool.resources);
+                self.grouped = run;
+                run.preferSequentialReads();
+                const bits: u6 = if (groups.len < 2) 0 else @intCast(@bitSizeOf(u32) - @clz(@as(u32, @intCast(groups.len - 1))));
+                const shift: u5 = if (bits == 0) 0 else @intCast((bits - 1) / 4 * 4);
+                try self.partition(.{ .view = spool.view.?, .count = spool.count }, run, 0, groups.len, shift);
+                try run.seal(0);
+                self.view = try run.sealedView();
+            }
+            return self;
+        }
+        pub fn deinit(self: *Prepared) void {
+            if (self.grouped) |run| {
+                self.spool.grouping_read_calls += run.read_calls;
+                run.deinit();
+            }
+            self.a.free(self.links);
+            self.a.free(self.ranks);
+            self.a.free(self.groups);
+        }
+        pub const GroupCursor = struct {
+            spool: *Spool,
+            remaining: u32,
+            at: u32,
+            links: []const u32,
+            raw: ?RawCursor = null,
+            pub fn deinit(self: *GroupCursor) void {
+                if (self.raw) |*raw| raw.deinit();
+            }
+            pub fn next(self: *GroupCursor) !?analysis.Token {
+                if (self.remaining == 0) return null;
+                self.remaining -= 1;
+                if (self.raw) |*raw| return try self.spool.decodeRecord((try raw.next()) orelse return error.InvalidData);
+                const token = try self.spool.read(self.at);
+                self.at = self.links[self.at];
+                return token;
+            }
+        };
+        pub fn groupCursor(self: *Prepared, a: A, group: Group) !GroupCursor {
+            return .{ .spool = self.spool, .remaining = group.count, .at = group.first, .links = self.links, .raw = if (self.view) |view| RawCursor.init(a, .{ .view = view, .count = group.count, .begin = @as(usize, group.first) * 16 }) else null };
+        }
+        pub fn prepareSource(_: *Prepared) void {}
+        pub const SourceCursor = struct {
+            cursor: Cursor,
+            ranks: []const u32,
+            pub fn deinit(self: *SourceCursor) void {
+                self.cursor.deinit();
+            }
+            pub fn next(self: *SourceCursor) !?struct { token: analysis.Token, ordinal: u32 } {
+                const token = (try self.cursor.next()) orelse return null;
+                return .{ .token = token, .ordinal = self.ranks[self.cursor.term_id] };
+            }
+        };
+        pub fn sourceCursor(self: *Prepared, a: A) !SourceCursor {
+            return .{ .cursor = (try self.spool.input()).cursor(a), .ranks = self.ranks };
+        }
+        /// Stable MSD partitioning on lexical term ranks. Each pass scans
+        /// bounded blocks into sixteen small buffers in one private run. Leaves
+        /// use counting scatter within a fixed workspace; a single huge term
+        /// streams directly. No occurrence-count-sized payload allocation and
+        /// no one-file-per-term fanout are needed.
+        fn partition(self: *Prepared, source: RecordSource, output: *Run, first: usize, end: usize, shift: u5) anyerror!void {
+            if (source.count == 0) return;
+            if (end <= first or end > self.groups.len) return error.InvalidData;
+            var cursor = RawCursor.init(self.a, source);
+            defer cursor.deinit();
+            if (end - first == 1) {
+                while (try cursor.nextBlock()) |bytes| try output.appendSlice(bytes);
+                return;
+            }
+            const headroom = @import("../sql/memory_budget.zig").headroom(self.a) orelse std.math.maxInt(usize);
+            const leaf_records = @min(self.spool.group_memory_records, headroom / 64);
+            if (source.count <= leaf_records) {
+                const records = try self.a.alloc(u8, source.count * 16);
+                defer self.a.free(records);
+                const positions = try self.a.alloc(u32, end - first);
+                defer self.a.free(positions);
+                var total: u32 = 0;
+                for (positions, self.groups[first..end]) |*position, group| {
+                    position.* = total;
+                    total = try std.math.add(u32, total, group.count);
+                }
+                if (total != source.count) return error.InvalidData;
+                while (try cursor.next()) |record| {
+                    const id = std.mem.readInt(u32, record[0..4], .little);
+                    if (id >= self.ranks.len) return error.InvalidData;
+                    const rank = self.ranks[id];
+                    if (rank < first or rank >= end) return error.InvalidData;
+                    const position = &positions[rank - first];
+                    @memcpy(records[@as(usize, position.*) * 16 ..][0..16], record);
+                    position.* += 1;
+                }
+                try output.appendSlice(records);
+                return;
+            }
+            const temporary = try Run.createWithResources(self.a, self.spool.io.?, self.spool.directory, self.spool.resources);
+            defer {
+                self.spool.grouping_read_calls += temporary.read_calls;
+                temporary.deinit();
+            }
+            temporary.preferSequentialReads();
+            var ranges: [16]std.ArrayList(Range) = @splat(.empty);
+            defer for (&ranges) |*list| list.deinit(self.a);
+            var counts: [16]usize = @splat(0);
+            {
+                const buffer_bytes = @min(16 * 1024, @max(16, (headroom / 64) / 16 * 16));
+                const buffers = try self.a.alloc(u8, 16 * buffer_bytes);
+                defer self.a.free(buffers);
+                var used: [16]usize = @splat(0);
+                while (try cursor.next()) |record| {
+                    const id = std.mem.readInt(u32, record[0..4], .little);
+                    if (id >= self.ranks.len) return error.InvalidData;
+                    const rank = self.ranks[id];
+                    if (rank < first or rank >= end) return error.InvalidData;
+                    const bucket = (rank >> shift) & 15;
+                    const buffer = buffers[bucket * buffer_bytes ..][0..buffer_bytes];
+                    @memcpy(buffer[used[bucket]..][0..16], record);
+                    used[bucket] += 16;
+                    counts[bucket] += 1;
+                    if (used[bucket] == buffer_bytes) {
+                        try ranges[bucket].append(self.a, .{ .offset = temporary.length, .bytes = buffer_bytes });
+                        try temporary.appendSlice(buffer);
+                        used[bucket] = 0;
+                    }
+                }
+                for (used, 0..) |length, bucket| if (length != 0) {
+                    try ranges[bucket].append(self.a, .{ .offset = temporary.length, .bytes = length });
+                    try temporary.appendSlice(buffers[bucket * buffer_bytes ..][0..length]);
+                };
+            }
+            try temporary.seal(0);
+            const view = try temporary.sealedView();
+            const span = @as(usize, 1) << shift;
+            const base = first & ~((span - 1) * 16 + 15);
+            for (counts, 0..) |count, bucket| if (count != 0) {
+                const lower = @max(first, base + bucket * span);
+                const upper = @min(end, base + (bucket + 1) * span);
+                try self.partition(.{ .view = view, .count = count, .ranges = ranges[bucket].items }, output, lower, upper, shift -| 4);
+            };
+        }
+    };
 };
 
 test "highlight source token spool crosses its memory bound and refunds failures" {
@@ -134,4 +425,93 @@ test "highlight source token spool crosses its memory bound and refunds failures
         try Check.run(std.testing.allocator, disk);
         try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{disk});
     }
+}
+
+test "highlight normalized grouping preserves exact offsets and stable source order across skew partitions and faults" {
+    const offsets = @import("source_offsets.zig");
+    const Check = struct {
+        fn run(a: A, disk: bool, skew: bool) !void {
+            var spool = Spool.init(a, if (disk) std.testing.io else null, ".", null);
+            defer spool.deinit();
+            spool.max_memory_bytes = 16;
+            spool.group_memory_records = 4;
+            var reference = std.heap.ArenaAllocator.init(a);
+            defer reference.deinit();
+            const ra = reference.allocator();
+            const tokens = try ra.alloc(analysis.Token, 132);
+            for (tokens, 0..) |*token, i| {
+                // Lexical order differs from discovery. Positions deliberately
+                // repeat; stable grouping must not sort equal terms by position.
+                const id = if (skew and i > 64) 0 else i % 65;
+                const word = try std.fmt.allocPrint(ra, "word{d}", .{id});
+                const start = if (skew and i % 7 == 0) 0 else i * 8;
+                token.* = .{ .term = word, .start_byte = @intCast(start), .end_byte = @intCast(start + 4), .position = @intCast(i % 7) };
+                try spool.append(token.*);
+            }
+            var expected = segment.MemorySegmentSink.init(a);
+            defer expected.deinit();
+            var expected_sink = expected.sink();
+            const encoded_expected = try offsets.write(a, &expected_sink, tokens);
+            var actual = segment.MemorySegmentSink.init(a);
+            defer actual.deinit();
+            var actual_sink = actual.sink();
+            const encoded_actual = try offsets.writeInput(a, &actual_sink, try spool.input());
+            try std.testing.expectEqual(encoded_expected, encoded_actual);
+            try std.testing.expectEqualSlices(u8, expected.out.items, actual.out.items);
+            var cursor = (try spool.input()).cursor(a);
+            defer cursor.deinit();
+            for (tokens) |token| {
+                const replayed = (try cursor.next()).?;
+                try std.testing.expectEqualStrings(token.term, replayed.term);
+                try std.testing.expectEqual(token.position, replayed.position);
+                try std.testing.expectEqual(token.start_byte, replayed.start_byte);
+                try std.testing.expectEqual(token.end_byte, replayed.end_byte);
+            }
+            try std.testing.expect((try cursor.next()) == null);
+            if (disk) try std.testing.expect(spool.grouping_read_calls != 0);
+        }
+    };
+    for ([_]bool{ false, true }) |disk| for ([_]bool{ false, true }) |skew| {
+        try Check.run(std.testing.allocator, disk, skew);
+        var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(stable.allocator(), Check.run, .{ disk, skew });
+    };
+}
+
+test "highlight normalized disk grouping bounds workspace and physical reads for diverse source order" {
+    var budget: @import("../sql/memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 8 << 20 };
+    defer std.debug.assert(budget.live == 0);
+    const a = budget.allocator();
+    var spool = Spool.init(a, std.testing.io, ".", null);
+    defer spool.deinit();
+    spool.max_memory_bytes = 128;
+    const total = 32769;
+    for (0..total) |i| {
+        var word: [32]u8 = undefined;
+        const term = try std.fmt.bufPrint(&word, "word{d}", .{i % 4096});
+        try spool.append(.{ .term = term, .start_byte = @intCast(i * 10), .end_byte = @intCast(i * 10 + 4), .position = @intCast(i) });
+    }
+    var prepared = try (try spool.input()).prepareOffsets(a);
+    defer prepared.deinit();
+    for (prepared.groups) |group| {
+        var cursor = try prepared.groupCursor(a, group);
+        defer cursor.deinit();
+        var previous: ?u32 = null;
+        while (try cursor.next()) |token| {
+            try std.testing.expectEqualStrings(group.term, token.term);
+            if (previous) |position| try std.testing.expect(token.position > position);
+            previous = token.position;
+        }
+    }
+    var source = (try spool.input()).cursor(a);
+    defer source.deinit();
+    var count: usize = 0;
+    while (try source.next()) |token| : (count += 1) try std.testing.expectEqual(count, token.position);
+    try std.testing.expectEqual(@as(usize, total), count);
+    // Each source/group/partition lane reads blocks, rather than one page per
+    // occurrence. Include the still-open final sorted run in this assertion.
+    const reads = spool.run.?.read_calls + spool.grouping_read_calls + prepared.grouped.?.read_calls;
+    try std.testing.expect(reads < total / 8);
+    try std.testing.expect(budget.peak < budget.limit);
+    std.debug.print("PARTITIONED_REPLAY records={d} reads={d} peak={d} quota={d}\n", .{ total, reads, budget.peak, budget.limit });
 }

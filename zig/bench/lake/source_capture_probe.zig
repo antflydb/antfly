@@ -58,6 +58,7 @@ test "lake streaming source capture probe" {
         }
     };
     var observers: [4]Observer = @splat(.{});
+    var replay_reads: ?usize = null;
     const cpu = now(.THREAD_CPUTIME_ID);
     const wall = now(.MONOTONIC);
     var capture = Capture.init(budget.allocator(), true, std.testing.io, ".", null);
@@ -87,6 +88,8 @@ test "lake streaming source capture probe" {
             defer lease.release();
             const tokens = try lease.visit(Capture.TokenConsumer{ .ptr = &observers[binding], .accept = Observer.accept });
             if (binding == 0) try capture.recordReplay(request, tokens);
+            const spool = lease.entry.replay.?;
+            replay_reads = spool.grouping_read_calls + if (spool.run) |run| run.read_calls else @as(usize, 0);
         }
         try std.testing.expectEqual(@as(usize, 1), cache.analyses);
         try std.testing.expectEqual(bindings - 1, cache.reuses);
@@ -109,5 +112,5 @@ test "lake streaming source capture probe" {
     std.crypto.hash.sha2.Sha256.hash(input, &input_digest, .{});
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
-    std.debug.print("CAPTURE legacy={} bindings={d} diverse={} input={d} tokens={d} cpu_ns={d} wall_ns={d} peak={d} quota={d} token_hash={x} encoded_sha256={s} input_sha256={s}\n", .{ legacy, bindings, diverse, input.len, observed.count, elapsed, elapsed_wall, peak, budget.limit, observed.hash.final(), std.fmt.bytesToHex(digest, .lower), std.fmt.bytesToHex(input_digest, .lower) });
+    std.debug.print("CAPTURE legacy={} bindings={d} diverse={} input={d} tokens={d} cpu_ns={d} wall_ns={d} peak={d} quota={d} replay_reads={?d} token_hash={x} encoded_sha256={s} input_sha256={s}\n", .{ legacy, bindings, diverse, input.len, observed.count, elapsed, elapsed_wall, peak, budget.limit, replay_reads, observed.hash.final(), std.fmt.bytesToHex(digest, .lower), std.fmt.bytesToHex(input_digest, .lower) });
 }

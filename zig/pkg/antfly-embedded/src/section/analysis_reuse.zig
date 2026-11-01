@@ -58,7 +58,9 @@ pub const Cache = struct {
                 }
             } else {
                 const input = try spool.input();
-                for (0..input.count) |i| try consumer.accept(consumer.ptr, try input.at(i));
+                var cursor = input.cursor(self.a);
+                defer cursor.deinit();
+                while (try cursor.next()) |token| try consumer.accept(consumer.ptr, token);
             }
             return spool.input();
         }
