@@ -565,12 +565,13 @@ pub const InitOptions = struct {
     /// Bound on retrying a transient strict dimension probe (local-provider
     /// admission refusal, a model still loading, a remote rate limit)
     /// before giving up with `error.EmbeddingProbeUnavailable`. Null uses
-    /// `default_probe_retry_budget_ns`. This bounds only *retries*: the
-    /// first attempt always keeps its own normal deadline (the caller's
+    /// `default_probe_retry_budget_ns`. `0` disables retrying, not the
+    /// probe: the single attempt keeps its normal deadline (the caller's
     /// deadline if set, otherwise the provider's default request timeout),
-    /// so `0` disables retrying, not the first attempt -- a healthy
-    /// provider still answers it, and only a transient failure on that one
-    /// attempt fails immediately, as before retrying existed.
+    /// and a transient failure on it fails immediately. A nonzero budget is
+    /// one absolute deadline for the whole probe, first attempt included,
+    /// intersected with the caller's deadline; keep it at least as long as
+    /// one provider request.
     probe_retry_budget_ns: ?u64 = null,
 };
 
