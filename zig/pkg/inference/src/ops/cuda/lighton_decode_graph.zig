@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Epoch-local owner for a bounded two-token decoder graph. The caller holds
+//! Epoch-local owner for a bounded multi-token decoder graph. The caller holds
 //! mutex across preflight, real execution, and the final ID read. No borrowed
 //! host page or tensor descriptor is retained by this owner.
 const std = @import("std");
@@ -64,6 +64,49 @@ test "LightOnOCR3 CUDA graph canonical cohorts restore both token columns after 
     try std.testing.expectError(error.InvalidPagedKvBatch, canonicalOrder(&.{ 7, 29, 7, 43 }, &order));
     try std.testing.expectError(error.InvalidPagedKvBatch, canonicalOrder(&.{ 7, 0, 29, 43 }, &order));
 }
+pub const max_steps: usize = 8;
+// Bank + positions, with two possible 256-byte alignment gaps and progress.
+pub const max_metadata_read_words = (max_steps + 3) * max_rows + 128;
+
+/// Graph depth shares the existing bounded continuation policy. Never reserve
+/// or execute more tokens than the smallest remaining request allowance.
+pub fn boundedSteps(requested: usize, remaining: usize) ?usize {
+    if (remaining < 2) return null;
+    return @min(std.math.clamp(requested, 2, max_steps), remaining);
+}
+
+/// Restore every token column after canonical scheduler-row ordering.
+pub fn restoreTokenColumns(tokens: []u32, order: []const usize) !void {
+    if (order.len == 0 or order.len > max_rows or tokens.len == 0 or tokens.len % order.len != 0 or tokens.len / order.len > max_steps) return error.InvalidPagedKvBatch;
+    var seen = std.StaticBitSet(max_rows).empty;
+    for (order) |original| {
+        if (original >= order.len or seen.isSet(original)) return error.InvalidPagedKvBatch;
+        seen.set(original);
+    }
+    var restored: [max_rows]u32 = undefined;
+    var offset: usize = 0;
+    while (offset < tokens.len) : (offset += order.len) {
+        for (order, 0..) |original, row| restored[original] = tokens[offset + row];
+        @memcpy(tokens[offset..][0..order.len], restored[0..order.len]);
+    }
+}
+
+pub const MetadataLayout = struct {
+    bank_offset: usize,
+    positions_offset: usize,
+    progress_offset: usize,
+    bytes: usize,
+
+    pub fn init(rows: usize, hidden: usize, steps: usize) !MetadataLayout {
+        if (rows < 2 or rows > max_rows or (hidden != 1024 and hidden != 2560) or steps < 2 or steps > max_steps) return error.InvalidShape;
+        const input_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, hidden), 4);
+        const bank_offset = std.mem.alignForward(usize, input_bytes, 256);
+        const positions_offset = bank_offset + std.mem.alignForward(usize, rows * steps * 4, 256);
+        const progress_offset = std.mem.alignForward(usize, positions_offset + rows * 3 * 4, 256);
+        return .{ .bank_offset = bank_offset, .positions_offset = positions_offset, .progress_offset = progress_offset, .bytes = progress_offset + 256 };
+    }
+};
+
 pub const Phase = enum { warm, learn, capture, replay, disabled };
 pub const Module = struct {
     mutex: std.atomic.Mutex = .unlocked,
@@ -80,7 +123,8 @@ pub const Module = struct {
     rows: usize = 0,
     hidden: usize = 0,
     vocab: usize = 0,
-    // Wide logits live outside the bounded temporary arena. Both dependent
+    steps: usize = 2,
+    // Wide logits live outside the bounded temporary arena. All dependent
     // steps reuse this independently admitted output after their argmax.
     head: buffer.DeviceBuffer = .{},
     head_admission: ?memory.AdmissionLease = null,
@@ -143,15 +187,12 @@ pub const Module = struct {
             host_positions.len == 3 * self.rows and
             std.mem.eql(u32, self.next_positions[0..host_positions.len], host_positions);
     }
-    pub fn reset(self: *Module, ctx: *context.CudaContext, key: []const u64, host_positions: []const u32, rows: usize, hidden: usize, vocab: usize) !void {
+    pub fn reset(self: *Module, ctx: *context.CudaContext, key: []const u64, host_positions: []const u32, rows: usize, hidden: usize, vocab: usize, steps: usize) !void {
         try self.clear(ctx);
         if (rows < 2 or rows > max_rows or host_positions.len != rows * 3 or key.len == 0 or vocab == 0)
             return error.InvalidShape;
-        const input_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, hidden), 4);
-        const bank_offset = std.mem.alignForward(usize, input_bytes, 256);
-        const positions_offset = bank_offset + std.mem.alignForward(usize, rows * 2 * 4, 256);
-        const progress_offset = std.mem.alignForward(usize, positions_offset + host_positions.len * 4, 256);
-        const bytes = progress_offset + 256;
+        const layout = try MetadataLayout.init(rows, hidden, steps);
+        const bytes = layout.bytes;
         var lease: ?memory.AdmissionLease = null;
         if (ctx.video_cache_budget.admission) |policy|
             lease = try policy.controller.tryAcquire(.gpu, policy.limits, .{
@@ -187,9 +228,10 @@ pub const Module = struct {
         self.rows = rows;
         self.hidden = hidden;
         self.vocab = vocab;
-        self.bank_offset = bank_offset;
-        self.positions_offset = positions_offset;
-        self.progress_offset = progress_offset;
+        self.steps = steps;
+        self.bank_offset = layout.bank_offset;
+        self.positions_offset = layout.positions_offset;
+        self.progress_offset = layout.progress_offset;
         @memcpy(self.base_positions[0..host_positions.len], host_positions);
         @memcpy(self.next_positions[0..host_positions.len], host_positions);
         self.phase = .warm;
@@ -212,7 +254,7 @@ pub const Module = struct {
         return .{ .ptr = self.metadata.ptr, .len = self.rows * self.hidden * 4, .borrowed = true };
     }
     pub fn bank(self: *const Module) buffer.DeviceBuffer {
-        return .{ .ptr = self.metadata.ptr + self.bank_offset, .len = self.rows * 2 * 4, .borrowed = true };
+        return .{ .ptr = self.metadata.ptr + self.bank_offset, .len = self.rows * self.steps * 4, .borrowed = true };
     }
     pub fn positions(self: *const Module) buffer.DeviceBuffer {
         return .{ .ptr = self.metadata.ptr + self.positions_offset, .len = self.rows * 3 * 4, .borrowed = true };
@@ -220,10 +262,37 @@ pub const Module = struct {
     pub fn counter(self: *const Module) buffer.DeviceBuffer {
         return .{ .ptr = self.metadata.ptr + self.progress_offset, .len = 4, .borrowed = true };
     }
-    pub fn notePair(self: *Module) !void {
-        const next = try std.math.add(u32, self.progress, 2);
+    pub fn noteSteps(self: *Module) !void {
+        const next = try std.math.add(u32, self.progress, @intCast(self.steps));
         for (self.next_positions[0 .. self.rows * 3]) |*position|
-            position.* = try std.math.add(u32, position.*, 2);
+            position.* = try std.math.add(u32, position.*, @intCast(self.steps));
         self.progress = next;
     }
 };
+
+test "LightOn CUDA graph depth bounds every token bank and scheduler column" {
+    try std.testing.expect(boundedSteps(4, 1) == null);
+    try std.testing.expectEqual(@as(?usize, 3), boundedSteps(4, 3));
+    try std.testing.expectEqual(@as(?usize, 8), boundedSteps(100, 100));
+    for ([_]usize{ 2, 3, 4, 8 }) |steps| {
+        const layout = try MetadataLayout.init(128, 2560, steps);
+        try std.testing.expect(layout.bank_offset + 128 * steps * 4 <= layout.positions_offset);
+        try std.testing.expect((layout.progress_offset + 4 - layout.bank_offset) / 4 <= max_metadata_read_words);
+        try std.testing.expect(layout.positions_offset + 128 * 3 * 4 <= layout.progress_offset);
+        try std.testing.expectEqual(@as(usize, 0), layout.bytes % 256);
+        var module = Module{ .rows = 4, .steps = steps };
+        try module.noteSteps();
+        try module.noteSteps();
+        try std.testing.expectEqual(@as(u32, @intCast(2 * steps)), module.progress);
+        try std.testing.expectEqual(@as(u32, @intCast(2 * steps)), module.next_positions[11]);
+        var tokens: [max_steps * 4]u32 = undefined;
+        for (0..steps) |step| for (0..4) |row| {
+            tokens[step * 4 + row] = @intCast(step * 10 + row);
+        };
+        try restoreTokenColumns(tokens[0 .. steps * 4], &.{ 2, 0, 3, 1 });
+        for (0..steps) |step| try std.testing.expectEqualSlices(u32, &.{ @intCast(step * 10 + 1), @intCast(step * 10 + 3), @intCast(step * 10), @intCast(step * 10 + 2) }, tokens[step * 4 ..][0..4]);
+    }
+    try std.testing.expectError(error.InvalidShape, MetadataLayout.init(4, 2560, 9));
+    var tokens = [_]u32{ 0, 1, 2, 3 };
+    try std.testing.expectError(error.InvalidPagedKvBatch, restoreTokenColumns(&tokens, &.{ 0, 1, 1, 3 }));
+}

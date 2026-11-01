@@ -2656,11 +2656,11 @@ pub const CudaCompute = struct {
         pub fn burst(self: *@This(), embedding: CT, vocab: usize) !LightOnTokenBurst {
             const owner = &self.compute.lighton_decode_graph;
             if (vocab != owner.vocab) return error.InvalidShape;
-            const shape = try allocShape2(self.compute.allocator, 2, owner.rows);
+            const shape = try allocShape2(self.compute.allocator, owner.steps, owner.rows);
             errdefer self.compute.allocator.free(shape);
-            const bank = try createTensorWithDType(self.compute, owner.bank(), shape, 2 * owner.rows, .i32);
+            const bank = try createTensorWithDType(self.compute, owner.bank(), shape, owner.steps * owner.rows, .i32);
             tensorFromCt(bank).owns_buffer = false;
-            return .{ .owner = self.compute, .bank = bank, .embedding_weight = embedding, .suppress = .{}, .suppress_count = 0, .rows = owner.rows, .steps = 2, .hidden = owner.hidden, .vocab = vocab };
+            return .{ .owner = self.compute, .bank = bank, .embedding_weight = embedding, .suppress = .{}, .suppress_count = 0, .rows = owner.rows, .steps = owner.steps, .hidden = owner.hidden, .vocab = vocab };
         }
         pub fn projectHead(self: *@This(), cb: *const ops.ComputeBackend, input_ct: CT, weight: CT) !CT {
             const owner = &self.compute.lighton_decode_graph;
@@ -2710,8 +2710,8 @@ pub const CudaCompute = struct {
                 owner.replays += 1;
                 owner.wide_replays += @intFromBool(owner.rows > 64);
                 owner.max_replay_rows = @max(owner.max_replay_rows, owner.rows);
-                if (owner.progress == 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
-                    std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d}\n", .{ owner.rows, owner.captures });
+                if (owner.progress == owner.steps and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                    std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d} steps={d} allocations={d} events={d}\n", .{ owner.rows, owner.captures, owner.steps, owner.plan.?.count, owner.plan.?.event_count });
                 return;
             }
             const phase = owner.phase;
@@ -2769,19 +2769,20 @@ pub const CudaCompute = struct {
         }
         pub fn read(self: *@This(), burst_value: *LightOnTokenBurst, tokens: []u32) !void {
             const owner = &self.compute.lighton_decode_graph;
-            if (tokens.len != 2 * owner.rows) return error.InvalidShape;
-            var host: [768]u32 = undefined;
+            if (tokens.len != owner.steps * owner.rows) return error.InvalidShape;
+            var host: [@import("lighton_decode_graph.zig").max_metadata_read_words]u32 = undefined;
             const bytes = owner.progress_offset + 4 - owner.bank_offset;
+            if (bytes % 4 != 0 or bytes / 4 > host.len) return error.InvalidShape;
             const source = buffer_mod.DeviceBuffer{ .ptr = owner.bank().ptr, .len = bytes, .borrowed = true };
             try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(host[0 .. bytes / 4]));
             burst_value.drained = true;
-            const expected = try std.math.add(u32, owner.progress, 2);
+            const expected = try std.math.add(u32, owner.progress, @intCast(owner.steps));
             if (host[(owner.progress_offset - owner.bank_offset) / 4] != expected) return error.InvalidExecutionPlan;
             const position_offset = (owner.positions_offset - owner.bank_offset) / 4;
             for (owner.next_positions[0 .. owner.rows * 3], 0..) |position, i|
-                if (host[position_offset + i] != try std.math.add(u32, position, 2)) return error.InvalidExecutionPlan;
+                if (host[position_offset + i] != try std.math.add(u32, position, @intCast(owner.steps))) return error.InvalidExecutionPlan;
             @memcpy(tokens, host[0..tokens.len]);
-            try owner.notePair();
+            try owner.noteSteps();
         }
         pub fn noteKvTokens(self: *@This(), storage: *kv_storage_runtime.KvStorageRuntime, max_tokens: usize) void {
             const hook = storage.device_write_hook orelse return;
@@ -2792,8 +2793,8 @@ pub const CudaCompute = struct {
             while (it.next()) |entry| entry.value_ptr.token_count = @max(entry.value_ptr.token_count, max_tokens);
         }
     };
-    pub fn beginLightOnDecodeGraph(cb: *const ops.ComputeBackend, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, vocab: usize, future_tokens: usize, attention_layers: usize, recurrent_layers: usize) !?LightOnGraphClaim {
-        if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or vocab == 0 or future_tokens == 0 or future_tokens > @import("lighton_attention.zig").max_native_context_tokens or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
+    pub fn beginLightOnDecodeGraph(cb: *const ops.ComputeBackend, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, vocab: usize, steps: usize, future_tokens: usize, attention_layers: usize, recurrent_layers: usize) !?LightOnGraphClaim {
+        if (steps < 2 or steps > @import("lighton_decode_graph.zig").max_steps or !lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or vocab == 0 or future_tokens == 0 or future_tokens > @import("lighton_attention.zig").max_native_context_tokens or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
         if (rows > 64 and rows % 64 == 1) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (rows > 64 and !self.lighton_ragged_recurrent_enabled) return null;
@@ -2803,7 +2804,7 @@ pub const CudaCompute = struct {
         var claimed = false;
         defer if (!claimed) owner.mutex.unlock();
         if (owner.disabled_epoch == epoch) return null;
-        if (owner.epoch_id != epoch or !owner.matches(key, positions)) {
+        if (owner.epoch_id != epoch or owner.steps != steps or !owner.matches(key, positions)) {
             if (owner.resets_logged < 12 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
                 var mismatch: usize = 0;
                 while (mismatch < @min(owner.key.len, key.len) and owner.key[mismatch] == key[mismatch]) : (mismatch += 1) {}
@@ -2813,7 +2814,7 @@ pub const CudaCompute = struct {
                 });
                 owner.resets_logged += 1;
             }
-            owner.reset(&self.ctx, key, positions, rows, hidden, vocab) catch |err| switch (err) {
+            owner.reset(&self.ctx, key, positions, rows, hidden, vocab, steps) catch |err| switch (err) {
                 error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded => {
                     owner.admission_denials += 1;
                     return null;
@@ -2846,8 +2847,8 @@ pub const CudaCompute = struct {
             _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
         };
         owner.future_tokens = future_tokens;
-        owner.expected_attention_calls = try checkedMul(try checkedMul(2, attention_layers), (rows + 63) / 64);
-        owner.expected_ragged_packets = if (rows > 64) try checkedMul(try checkedMul(2, recurrent_layers), (rows + 63) / 64) else 0;
+        owner.expected_attention_calls = try checkedMul(try checkedMul(steps, attention_layers), (rows + 63) / 64);
+        owner.expected_ragged_packets = if (rows > 64) try checkedMul(try checkedMul(steps, recurrent_layers), (rows + 63) / 64) else 0;
         claimed = true;
         return .{ .compute = self, .future_tokens = future_tokens };
     }
@@ -35552,12 +35553,12 @@ test "LightOnOCR3 CUDA decoder graph arena admission rejects partial allocations
         .scratch_limit_bytes = 16 * 1024 * 1024,
     }, .check_live_memory = false };
     const baseline = compute.ctx.device_allocations.snapshot().live;
-    try std.testing.expectError(error.ResourceLimitExceeded, owner.reset(&compute.ctx, &key, &positions, 2, 1024, 8));
+    try std.testing.expectError(error.ResourceLimitExceeded, owner.reset(&compute.ctx, &key, &positions, 2, 1024, 8, 2));
     try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = bytes;
-    try owner.reset(&compute.ctx, &key, &positions, 2, 1024, 8);
+    try owner.reset(&compute.ctx, &key, &positions, 2, 1024, 8, 2);
     try std.testing.expectEqual(@as(usize, bytes), controller.snapshot().backend_scratch_bytes);
     try std.testing.expect(owner.matches(&key, &positions));
     owner.plan.?.allocate(1024, 0x1000);
@@ -35575,7 +35576,7 @@ test "LightOnOCR3 CUDA decoder graph arena admission rejects partial allocations
     try owner.reserveArena(&compute.ctx);
     try std.testing.expectEqual(arena_pointer, owner.arena.ptr);
     try std.testing.expectEqual(@as(usize, bytes + 1024), controller.snapshot().backend_scratch_bytes);
-    try owner.notePair();
+    try owner.noteSteps();
     try std.testing.expect(!owner.matches(&key, &positions));
     try owner.clear(&compute.ctx);
     try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
@@ -35605,13 +35606,13 @@ test "LightOnOCR3 CUDA wide graph head has independent admission and never enter
     const baseline = compute.ctx.device_allocations.snapshot().live;
     // The second lease is denied; the preceding metadata allocation and both
     // host reservations must be rolled back before conservative execution.
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, owner.reset(&compute.ctx, &key, &positions, 128, 1024, 8));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, owner.reset(&compute.ctx, &key, &positions, 128, 1024, 8, 2));
     try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), owner.head.ptr);
     compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = total;
-    try owner.reset(&compute.ctx, &key, &positions, 128, 1024, 8);
+    try owner.reset(&compute.ctx, &key, &positions, 128, 1024, 8, 2);
     try std.testing.expectEqual(@as(usize, head_bytes), owner.head.len);
     try std.testing.expectEqual(@as(usize, metadata_bytes), owner.metadata.len);
     try std.testing.expectEqual(@as(usize, total), controller.snapshot().backend_scratch_bytes);
