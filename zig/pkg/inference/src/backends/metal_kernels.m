@@ -22485,7 +22485,7 @@ static int termite_metal_encode_quant_matmul_none_on_encoder_family(
     } else if (descriptor->rows == 3u && runtime->q8_0_small_batch_r3_pipeline != nil) {
         small_batch_pipeline = runtime->q8_0_small_batch_r3_pipeline;
         small_batch_rows_per_tg = 3u;
-    } else if (descriptor->rows == 4u && runtime->q8_0_small_batch_r4_pipeline != nil) {
+    } else if (descriptor->rows >= 4u && descriptor->rows <= 8u && runtime->q8_0_small_batch_r4_pipeline != nil) {
         small_batch_pipeline = runtime->q8_0_small_batch_r4_pipeline;
         small_batch_rows_per_tg = 4u;
     }
@@ -22801,7 +22801,7 @@ static int termite_metal_encode_quant_matmul_pair_activation_mul_on_encoder(
     } else if (descriptor->rows == 3u && runtime->q8_0_pair_activation_small_batch_r3_pipeline != nil) {
         small_batch_pipeline = runtime->q8_0_pair_activation_small_batch_r3_pipeline;
         small_batch_rows_per_tg = 3u;
-    } else if (descriptor->rows == 4u && runtime->q8_0_pair_activation_small_batch_r4_pipeline != nil) {
+    } else if (descriptor->rows >= 4u && descriptor->rows <= 8u && runtime->q8_0_pair_activation_small_batch_r4_pipeline != nil) {
         small_batch_pipeline = runtime->q8_0_pair_activation_small_batch_r4_pipeline;
         small_batch_rows_per_tg = 4u;
     }
@@ -23097,7 +23097,7 @@ static int termite_metal_encode_quant_matmul_pair_on_encoder(
     } else if (descriptor->rows == 3u && runtime->q8_0_pair_small_batch_r3_pipeline != nil) {
         small_batch_pipeline = runtime->q8_0_pair_small_batch_r3_pipeline;
         small_batch_rows_per_tg = 3u;
-    } else if (descriptor->rows == 4u && runtime->q8_0_pair_small_batch_r4_pipeline != nil) {
+    } else if (descriptor->rows >= 4u && descriptor->rows <= 8u && runtime->q8_0_pair_small_batch_r4_pipeline != nil) {
         small_batch_pipeline = runtime->q8_0_pair_small_batch_r4_pipeline;
         small_batch_rows_per_tg = 4u;
     }

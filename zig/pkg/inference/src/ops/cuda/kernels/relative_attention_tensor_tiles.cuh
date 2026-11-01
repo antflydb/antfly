@@ -174,14 +174,9 @@
             if (warp < 4u) {
                 wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
                 wmma::load_matrix_sync(acc, output + warp * 16u, kHeadDim, wmma::mem_row_major);
-                #pragma unroll
-                for (unsigned int key_chunk = 0u; key_chunk < 2u; ++key_chunk) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
-                    wmma::load_matrix_sync(p_frag, probabilities + key_chunk * 16u, kKeyTile);
-                    wmma::load_matrix_sync(v_frag, v_tile + (key_chunk * 16u) * kHeadDim + warp * 16u, kHeadDim);
-                    wmma::mma_sync(acc, p_frag, v_frag, acc);
-                }
+                ANTFLY_CUDA_WMMA_PV16_F32(
+                    unsigned int key_chunk = 0u; key_chunk < 2u; ++key_chunk,
+                    half, acc, probabilities + key_chunk * 16u, kKeyTile, v_tile + (key_chunk * 16u) * kHeadDim + warp * 16u, kHeadDim)
                 wmma::store_matrix_sync(output + warp * 16u, acc, kHeadDim, wmma::mem_row_major);
             }
             __syncthreads();
@@ -263,11 +258,8 @@
             const unsigned int output_d_chunk = warp & 3u;
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
             wmma::load_matrix_sync(acc, output + output_query_chunk * 16u * kHeadDim + output_d_chunk * 16u, kHeadDim, wmma::mem_row_major);
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
-            wmma::load_matrix_sync(p_frag, probabilities + output_query_chunk * 16u * kKeyTile, kKeyTile);
-            wmma::load_matrix_sync(v_frag, v_tile + output_d_chunk * 16u, kHeadDim);
-            wmma::mma_sync(acc, p_frag, v_frag, acc);
+            ANTFLY_CUDA_WMMA_ACCUMULATE16_F32(
+                half, acc, probabilities + output_query_chunk * 16u * kKeyTile, kKeyTile, v_tile + output_d_chunk * 16u, kHeadDim)
             wmma::store_matrix_sync(output + output_query_chunk * 16u * kHeadDim + output_d_chunk * 16u, acc, kHeadDim, wmma::mem_row_major);
             __syncthreads();
         }

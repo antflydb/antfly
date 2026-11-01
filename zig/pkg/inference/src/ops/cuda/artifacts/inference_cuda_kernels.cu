@@ -2659,14 +2659,9 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_mma(ANTF
             const unsigned int column_chunk = warp;
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> output_acc;
             wmma::load_matrix_sync(output_acc, output + column_chunk * 16u, dim, wmma::mem_row_major);
-            #pragma unroll
-            for (unsigned int kb = 0u; kb < 4u; ++kb) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
-                wmma::load_matrix_sync(p_frag, probabilities_hi + kb * 16u, score_pitch);
-                wmma::load_matrix_sync(v_frag, kv_tile + (kb * 16u) * kv_pitch + column_chunk * 16u, kv_pitch);
-                wmma::mma_sync(output_acc, p_frag, v_frag, output_acc);
-            }
+            ANTFLY_CUDA_WMMA_PV16_F32(
+                unsigned int kb = 0u; kb < 4u; ++kb,
+                half, output_acc, probabilities_hi + kb * 16u, score_pitch, kv_tile + (kb * 16u) * kv_pitch + column_chunk * 16u, kv_pitch)
             wmma::store_matrix_sync(output + column_chunk * 16u, output_acc, dim, wmma::mem_row_major);
         }
         __syncthreads();
@@ -15200,38 +15195,16 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
                 values[j] = valid ? scores[row * N + n] * 0.125f : -INFINITY;
                 next_max = fmaxf(next_max, values[j]);
             }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
-            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
-            const float a = isfinite(maximum[row]) ? __expf(maximum[row] - next_max) : 0.0f;
-            float sum = 0.0f;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j) {
-                const float p = isfinite(next_max) ? __expf(values[j] - next_max) : 0.0f;
-                probabilities[row * N + lane + j * 32u] = __float2half_rn(p);
-                sum += p;
-            }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                sum += __shfl_down_sync(0xffffffffu, sum, shift);
-            if (lane == 0u) {
-                alpha[row] = a;
-                denominator[row] = denominator[row] * a + sum;
-                maximum[row] = next_max;
-            }
+            ANTFLY_CUDA_ATTENTION_ONLINE_ROW64(__expf, probabilities[row * N + lane + j * 32u] = __float2half_rn(p);)
         }
         __syncthreads();
         for (unsigned int i = tid; i < M * D; i += T) output[i] *= alpha[i / D];
         __syncthreads();
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
         wmma::load_matrix_sync(acc, output + qr * 16u * D + kc * 16u, D, wmma::mem_row_major);
-        #pragma unroll
-        for (unsigned int n = 0u; n < N; n += 16u) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
-            wmma::load_matrix_sync(pf, probabilities + qr * 16u * N + n, N);
-            wmma::load_matrix_sync(vf, vt + n * P + kc * 16u, P);
-            wmma::mma_sync(acc, pf, vf, acc);
-        }
+        ANTFLY_CUDA_WMMA_PV16_F32(
+            unsigned int n = 0u; n < N; n += 16u,
+            half, acc, probabilities + qr * 16u * N + n, N, vt + n * P + kc * 16u, P)
         wmma::store_matrix_sync(output + qr * 16u * D + kc * 16u, acc, D, wmma::mem_row_major);
         __syncthreads();
     }
@@ -15509,14 +15482,9 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
         if (warp < 4u) {
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
             wmma::load_matrix_sync(acc, output + warp * 16u, kHeadDim, wmma::mem_row_major);
-            #pragma unroll
-            for (unsigned int key_chunk = 0u; key_chunk < 2u; ++key_chunk) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
-                wmma::load_matrix_sync(p_frag, probabilities + key_chunk * 16u, kKeyTile);
-                wmma::load_matrix_sync(v_frag, v_tile + (key_chunk * 16u) * kPitch + warp * 16u, kPitch);
-                wmma::mma_sync(acc, p_frag, v_frag, acc);
-            }
+            ANTFLY_CUDA_WMMA_PV16_F32(
+                unsigned int key_chunk = 0u; key_chunk < 2u; ++key_chunk,
+                half, acc, probabilities + key_chunk * 16u, kKeyTile, v_tile + (key_chunk * 16u) * kPitch + warp * 16u, kPitch)
             wmma::store_matrix_sync(output + warp * 16u, acc, kHeadDim, wmma::mem_row_major);
         }
         __syncthreads();
@@ -15603,56 +15571,10 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
                 values[j] = valid ? shared_scores[row * S + n] * 0.125f : -INFINITY;
                 next_max = fmaxf(next_max, values[j]);
             }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
-            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
-            const float a = isfinite(maximum[row]) ? __expf(maximum[row] - next_max) : 0.0f;
-            float sum = 0.0f;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j) {
-                const float p = isfinite(next_max) ? __expf(values[j] - next_max) : 0.0f;
-                staged_probabilities[g][j] = p;
-                sum += p;
-            }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                sum += __shfl_down_sync(0xffffffffu, sum, shift);
-            if (lane == 0u) {
-                alpha[row] = a;
-                denominator[row] = denominator[row] * a + sum;
-                maximum[row] = next_max;
-            }
+            ANTFLY_CUDA_ATTENTION_ONLINE_ROW64(__expf, staged_probabilities[g][j] = p;)
         }
-        // Half probabilities alias the lower half of shared score storage.
-        // No writer may reuse it before every warp has read all of its rows.
-        __syncthreads();
-        #pragma unroll
-        for (unsigned int g = 0u; g < 8u; ++g) {
-            const unsigned int row = warp * 8u + g;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j)
-                probabilities[row * P + lane + j * 32u] = __float2half_rn(staged_probabilities[g][j]);
-        }
-        __syncthreads();
-        #pragma unroll
-        for (unsigned int g = 0u; g < 2u; ++g) {
-            const unsigned int qr = warp / 4u, dc = warp % 4u;
-            // WMMA's fragment layout is opaque. Store, rescale by row, and
-            // reload through the public API instead of assuming lane mapping.
-            wmma::store_matrix_sync(scratch + qr * 16u * S + dc * 16u, output[g], S, wmma::mem_row_major);
-            __syncthreads();
-            for (unsigned int i = tid; i < 32u * D; i += T) scratch[(i / D) * S + i % D] *= alpha[g * 32u + i / D];
-            __syncthreads();
-            wmma::load_matrix_sync(output[g], scratch + qr * 16u * S + dc * 16u, S, wmma::mem_row_major);
-            #pragma unroll
-            for (unsigned int n = 0u; n < N; n += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
-                wmma::load_matrix_sync(pf, probabilities + (g * 32u + qr * 16u) * P + n, P);
-                wmma::load_matrix_sync(vf, vt + n * P + dc * 16u, P);
-                wmma::mma_sync(output[g], pf, vf, output[g]);
-            }
-            __syncthreads();
-        }
+        ANTFLY_CUDA_ATTENTION_PUBLISH_HALF_ROWS64()
+        ANTFLY_CUDA_ATTENTION_PV_ROWS64(vt)
     }
     #pragma unroll
     for (unsigned int g = 0u; g < 2u; ++g) {

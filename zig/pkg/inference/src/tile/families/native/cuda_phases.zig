@@ -56,8 +56,8 @@ pub const attention = .{
     \\        if (physical_token == 0xffffffffu) valid = false;
     \\        const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
     ,
-    .online_softmax_shared_half = program.render(online_softmax, .{ .probability_store = "                probabilities[row * N + lane + j * 32u] = __float2half_rn(p);" }),
-    .online_softmax_register_f32 = program.render(online_softmax, .{ .probability_store = "                staged_probabilities[g][j] = p;" }),
+    .online_softmax_shared_half = "            ANTFLY_CUDA_ATTENTION_ONLINE_ROW64(__expf, probabilities[row * N + lane + j * 32u] = __float2half_rn(p);)",
+    .online_softmax_register_f32 = "            ANTFLY_CUDA_ATTENTION_ONLINE_ROW64(__expf, staged_probabilities[g][j] = p;)",
     .dense_gqa_parameters =
     \\    float* dst,
     \\    const float* q,
@@ -267,26 +267,6 @@ pub const projection = .{
 };
 
 // Publication precision and storage remain properties of the static schedule.
-const online_softmax =
-    \\            for (unsigned int shift = 16u; shift; shift >>= 1u)
-    \\                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
-    \\            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
-    \\            const float a = isfinite(maximum[row]) ? __expf(maximum[row] - next_max) : 0.0f;
-    \\            float sum = 0.0f;
-    \\            #pragma unroll
-    \\            for (unsigned int j = 0u; j < 2u; ++j) {
-    \\                const float p = isfinite(next_max) ? __expf(values[j] - next_max) : 0.0f;
-    \\{{probability_store}}
-    \\                sum += p;
-    \\            }
-    \\            for (unsigned int shift = 16u; shift; shift >>= 1u)
-    \\                sum += __shfl_down_sync(0xffffffffu, sum, shift);
-    \\            if (lane == 0u) {
-    \\                alpha[row] = a;
-    \\                denominator[row] = denominator[row] * a + sum;
-    \\                maximum[row] = next_max;
-    \\            }
-;
 
 const q4q8_pair_dot =
     \\{{indent}}const unsigned char* gate_bp = weight_gate + ({{index_cast}}col * row_blocks + block) * 18u;

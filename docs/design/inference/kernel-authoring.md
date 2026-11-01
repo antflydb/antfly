@@ -13,7 +13,7 @@ The agent-facing rules are in `zig/pkg/inference/src/ops/AGENTS.md`.
 | Masked token-major pooling | `src/ops/gpu/masked_pool_program.h` | Mask optionality, independent coordinate/address widths, count ownership and per-term versus post-sum division; callers retain row normalization |
 | Prefix L2 normalization and accumulated VJP | `cuda/prefix_normalization.zig`, `kernels/prefix_normalization_program.cuh` | Explicit input stride, dense output, untouched gradient suffix, four-accumulator reduction, clamp and division boundaries; static 768-stride compatibility schedule |
 | Spatial depthwise residual | `src/ops/cuda/prototypes/vision_f16_programs.cu` | Native 3x3 traversal and explicit FMA/add boundaries |
-| Native CUDA WMMA score products | `src/ops/cuda/kernels/wmma_tile_program.cuh` | F16/BF16 storage, B layout, depth, pitches, caller-owned scope and preloaded left-fragment reuse |
+| Native CUDA WMMA attention tiles | `src/ops/cuda/kernels/wmma_tile_program.cuh` | F16/BF16 score/P×V storage, layout, pitches, live accumulators, grouped rescale/publication and fixed-order online softmax |
 | Row statistics and normalization | `src/ops/cuda/kernels/row_program.cuh` | Warp/block, shared tree, four-accumulator training fold and fixed-256 warp-finish reductions; publication dtype |
 | Rotary products and axes | `src/ops/cuda/kernels/rotary_program.cuh` and Metal rotary helpers | Axis-local versus head-wide halves, product rounding, frequency evaluation and upper-product order |
 | MPP projection | `antfly_mpp_affine`, `antfly_mpp_split_projection`, `TERMITE_MSL_MPP_GATE_PROGRAM` in `metal_kernels.m` | Rows/columns, SIMD groups, split-K, projection planes, F32/BF16 storage and finite-gate epilogue |
@@ -98,7 +98,14 @@ F32/F16/BF16 scalar/reduction exports share `metal_phases.dense_rows`; keep the
 weight storage type explicit so the original precision overload is retained.
 CUDA's online-softmax family retains distinct shared-half and register-F32
 probability publication. Sharing a template does not permit merging those
-rounding or scratch-lifetime contracts.
+rounding or scratch-lifetime contracts. The native WMMA owner also retains
+`expf` versus `__expf` as a static policy; shared numerical code must not
+substitute one for the other.
+
+Metal Q8 small-row dispatch retains R2/R3 for two/three rows, uses R4 for
+four through eight rows, and keeps R5 for larger fallback shapes. R4 was slower
+than R2/R3 on some small shapes and slower than R5 on a larger fallback shape
+in qualification. Check fallback coverage before retiring a row schedule.
 
 Q4/Q8 paired-activation and fixed-row projection helper definitions belong to
 their generated specialization families. Their shared dual-dot phases retain

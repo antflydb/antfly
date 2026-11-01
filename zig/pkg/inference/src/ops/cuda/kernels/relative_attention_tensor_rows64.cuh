@@ -155,62 +155,16 @@
                 values[j] = score;
                 next_max = fmaxf(next_max, values[j]);
             }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
-            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
-            const float a = isfinite(maximum[row]) ? expf(maximum[row] - next_max) : 0.0f;
-            float sum = 0.0f;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j) {
-                const float p = isfinite(next_max) ? expf(values[j] - next_max) : 0.0f;
-                staged_probabilities[g][j] = p;
-                sum += p;
-            }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                sum += __shfl_down_sync(0xffffffffu, sum, shift);
-            if (lane == 0u) {
-                alpha[row] = a;
-                denominator[row] = denominator[row] * a + sum;
-                maximum[row] = next_max;
-            }
+            ANTFLY_CUDA_ATTENTION_ONLINE_ROW64(expf, staged_probabilities[g][j] = p;)
         }
-        // Half probabilities alias the lower half of shared score storage.
-        // No writer may reuse it before every warp has read all of its rows.
-        __syncthreads();
-        #pragma unroll
-        for (unsigned int g = 0u; g < 8u; ++g) {
-            const unsigned int row = warp * 8u + g;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j)
-                probabilities[row * P + lane + j * 32u] = __float2half_rn(staged_probabilities[g][j]);
-        }
-        __syncthreads();
+        ANTFLY_CUDA_ATTENTION_PUBLISH_HALF_ROWS64()
         for (unsigned int i=tid;i<N*D;i+=T) {
             const unsigned int row=i/D,d=i%D,key=key_start+row;
             const bool valid=key<seq && (!mask||mask[b*seq+key]!=0);
             kv[row*P+d]=__float2half_rn(valid?v[(b*seq+key)*hidden+head_off+d]:0.0f);
         }
         __syncthreads();
-        #pragma unroll
-        for (unsigned int g = 0u; g < 2u; ++g) {
-            const unsigned int qr = warp / 4u, dc = warp % 4u;
-            // WMMA's fragment layout is opaque. Store, rescale by row, and
-            // reload through the public API instead of assuming lane mapping.
-            wmma::store_matrix_sync(scratch + qr * 16u * S + dc * 16u, output[g], S, wmma::mem_row_major);
-            __syncthreads();
-            for (unsigned int i = tid; i < 32u * D; i += T) scratch[(i / D) * S + i % D] *= alpha[g * 32u + i / D];
-            __syncthreads();
-            wmma::load_matrix_sync(output[g], scratch + qr * 16u * S + dc * 16u, S, wmma::mem_row_major);
-            #pragma unroll
-            for (unsigned int n = 0u; n < N; n += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
-                wmma::load_matrix_sync(pf, probabilities + (g * 32u + qr * 16u) * P + n, P);
-                wmma::load_matrix_sync(vf, kv + n * P + dc * 16u, P);
-                wmma::mma_sync(output[g], pf, vf, output[g]);
-            }
-            __syncthreads();
-        }
+        ANTFLY_CUDA_ATTENTION_PV_ROWS64(kv)
     }
     #pragma unroll
     for (unsigned int g = 0u; g < 2u; ++g) {
