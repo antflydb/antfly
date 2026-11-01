@@ -1178,8 +1178,13 @@ not establish a cache hit.
 Schema and SQL recovery-state writes atomically mark their namespace in a durable
 recovery agenda. Admission checks pending namespaces instead of opening every
 table and index. Recovery acknowledges only terminal work under the path lease,
-and rotates bounded pages so one namespace cannot monopolize a turn. Revision-3
-conversion bootstraps this agenda before publishing the replacement generation.
+and rotates bounded pages so one namespace cannot monopolize a turn. The page
+cursor schedules discovery; it never authorizes access. Every operation checks
+its affected namespaces, and catalog-dependent operations check their schema
+participants, before admission. Read-only handles carry a clean-sweep witness
+across pages for the same logical metadata generation; data-only commits preserve
+it and new DDL invalidates it. Revision-3 conversion bootstraps this agenda before
+publishing the replacement generation.
 
 Detached replay uses per-index-kind feedback retained by the namespace scheduling
 owner. Cheap full windows can grow up to 2,048 records and 16 MiB; slow or failed
@@ -1189,7 +1194,12 @@ Background and foreground retirement work remains capped per publication. Pendin
 work diagnostics report replay budgets and the current retirement-work limit.
 Explicit integrity reports split logical bytes among documents, control documents,
 metadata catalogs, and index artifacts; allocator checks independently load disk
-state rather than using a writer's transient traversal inventory.
+state rather than using a writer's transient traversal inventory. Document bytes
+cover authored primary/relational rows and unreserved raw records. Control bytes
+include transaction receipts, replay/identity metadata, columnar controls and
+other reserved internal rows, including derived records. Namespace wrappers are
+removed structurally before classification; document IDs containing reserved
+text remain documents.
 
 Database-wide compact preparation drains and merges named-table indexes as well
 as the default namespace. The C API also settles cross-table promotion before

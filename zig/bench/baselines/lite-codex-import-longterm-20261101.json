@@ -1,5 +1,5 @@
 {
-  "status": "Implementation pushed as draft; combined performance qualification in progress",
+  "status": "Review fixes implemented; final correctness gates and combined performance qualification in progress",
   "source_parent_commit": "dff38d144c45c36cd90391d949c5b5f722ed5cfa",
   "importer": {
     "sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -7,12 +7,12 @@
   },
   "implementation": [
     "Revision-7 checksummed logical checkpoint identities retain unchanged runtime metadata beyond physical recovery slots.",
-    "Native schema/activation/DDL/FK writes atomically project per-namespace durable recovery markers; admission rotates at most eight namespaces per turn. Ordinary SQL decisions retain their existing dedicated root journal and recovery guard.",
+    "Native schema/activation/DDL/FK writes atomically project per-namespace durable recovery markers. Discovery rotates at most eight namespaces per turn; independent admission fences check affected namespaces and dependency catalogs. Read-only clean sweeps persist across pages for one logical metadata generation. Ordinary SQL decisions retain their dedicated root journal and recovery guard.",
     "Per-kind replay feedback survives runtime replacement, targets a 25 ms quantum and responds to blocked reuse; retirement work stays bounded at 128..512 pages.",
     "Allocator cache adoption cannot match by reused physical root ID; unretained ancestry requires the current seal/digest or an independent load.",
     "Explicit integrity checks load on-disk allocator state independently of transient cached traversal inventories.",
     "Database-wide compaction drains named-table indexes as well as the default namespace.",
-    "Integrity reports account separately for document, control, metadata and index logical payload; typed SDKs expose optional fields."
+    "Integrity accounting classifies physical namespace wrappers structurally, then uses shared internal-key families for receipts, replay/identity state, columnar controls and other internal records. Authored primary/relational rows and unreserved raw records remain documents; typed SDKs expose optional fields."
   ],
   "compatibility": {
     "indexed_format": 7,
@@ -55,7 +55,7 @@
     "rust": "7 pure tests passed; typed binding compiled",
     "typescript": "embedded typecheck passed",
     "abi": "C smoke and 134-export consumer executable/shared-library linkage passed",
-    "full_capi_contract_gate": "Local suite: 200 passed, 3 skipped, zero failures/leaks. Main suite found three warm-cache regressions, now fixed with three passing focused tests; complete gate rerunning.",
+    "full_capi_contract_gate": "At 451063f8b4: 284 passed, 3 skipped, zero failures/leaks. Rerunning after operation-specific recovery fences.",
     "warm_recovery_regressions": {
       "passed": 3,
       "failed": 0,
@@ -65,6 +65,20 @@
         "Ordinary row writes do not queue DDL work",
         "Plain lease/shadow bookkeeping retains the serving runtime; changed inputs fence it"
       ]
+    },
+    "review_regressions": {
+      "recovery_passed": 5,
+      "accounting_passed": 1,
+      "failed": 0,
+      "leaks": 0,
+      "covers": [
+        "Affected namespaces beyond the bounded discovery page remain fenced over 20 attempts",
+        "Root C API admission consistently refuses unfinished DDL",
+        "Read-only sweeps become clean with exactly eight and nine markers",
+        "Foreign data-only commits preserve the clean witness; new DDL invalidates it",
+        "Transaction receipts, columnar controls, binary replay/identity state and derived rows classify as controls in root and named namespaces; authored rows remain documents"
+      ],
+      "full_gates": "C API/native/SDK rerun in progress"
     }
   },
   "descriptor_limit_control": {
@@ -84,7 +98,7 @@
     "Original importer three-writer/one-reader contention with original timeout/retry behavior",
     "Ten-minute eight-writer indexed churn: active-write plateau, acknowledged values, integrity, catch-up, canary search and reopen",
     "Matched optimized native measurements",
-    "Full C API gate completion"
+    "Full C API/native/SDK gates after review fixes"
   ],
   "measurement_rules": [
     "Keep original importer and frozen inputs identical.",

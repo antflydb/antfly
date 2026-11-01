@@ -1067,6 +1067,13 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             store.file.read_only = true;
         }
         guard.entry_sequence = root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        if (!pinned) @import("sql_commit.zig").recover(root) catch |err| {
+            guard.entry_error = capi.mapError(err);
+        };
+        if (!pinned and guard.entry_error == null) @import("sql_ddl.zig").recover(root) catch |err| {
+            guard.entry_error = capi.mapError(err);
+        };
+        if (guard.entry_error != null) return guard;
         if (handle.parent_id != null) {
             const database = @import("tables.zig").get(root, handle.selected_table_name orelse "default") catch |err| {
                 guard.entry_error = capi.mapError(err);
@@ -1084,10 +1091,7 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             guard.entry_error = catalogOwnershipError(err);
             return guard;
         };
-        if (!pinned) @import("sql_commit.zig").recover(root) catch |err| {
-            guard.entry_error = capi.mapError(err);
-        };
-        if (!pinned and guard.entry_error == null) @import("sql_ddl.zig").recover(root) catch |err| {
+        if (!pinned and guard.entry_error == null) @import("sql_ddl.zig").requireRecovered(root, guard.handle.database(), guard.handle.selected_table_name orelse "default") catch |err| {
             guard.entry_error = capi.mapError(err);
         };
         return guard;
@@ -1117,6 +1121,10 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             return guard;
         };
         @import("sql_ddl.zig").recover(lock_handle) catch |err| {
+            guard.entry_error = capi.mapError(err);
+            return guard;
+        };
+        @import("sql_ddl.zig").requireRecovered(lock_handle, handle.database(), handle.selected_table_name orelse "default") catch |err| {
             guard.entry_error = capi.mapError(err);
             return guard;
         };

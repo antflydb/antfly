@@ -3650,6 +3650,17 @@ pub const InspectReport = struct {
     issue: ?[]const u8 = null,
 };
 
+fn isControlDocumentPhysicalKey(key: []const u8) bool {
+    var logical = key;
+    // Namespace wrappers are not replay records. Classify only the contained
+    // logical key, never a reserved-looking substring in an authored document ID.
+    if (std.mem.startsWith(u8, logical, "\x02db/")) {
+        const end = std.mem.indexOfScalar(u8, logical, 0) orelse return true;
+        logical = logical[end + 1 ..];
+    }
+    return @import("../internal_keys.zig").isControlRecordKey(logical);
+}
+
 pub const LiveByteAccounting = struct {
     pub const Category = struct { records: u64 = 0, key_bytes: u64 = 0, value_bytes: u64 = 0 };
     metadata_catalog: Category = .{},
@@ -11120,7 +11131,7 @@ pub const NativeFile = struct {
                 live_bytes +|= record.key.len + len;
                 const category = switch (source) {
                     .catalog => |root| if (root == .metadata) &accounting.metadata_catalog else &accounting.index_catalog,
-                    .documents => if (std.mem.indexOf(u8, record.key, "\x00\x00__metadata__:") != null or std.mem.indexOf(u8, record.key, "\x00antfly/embedded/") != null) &accounting.control_documents else &accounting.documents,
+                    .documents => if (isControlDocumentPhysicalKey(record.key)) &accounting.control_documents else &accounting.documents,
                 };
                 category.records +|= 1;
                 category.key_bytes +|= record.key.len;
@@ -21317,4 +21328,57 @@ test "lite logical generations authenticate allocator adoption after root page r
     var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
     defer reopened.close();
     try std.testing.expect((try reopened.check()).valid);
+}
+
+test "lite logical byte accounting distinguishes control families and namespace wrappers" {
+    const a = std.testing.allocator;
+    const keys = @import("../internal_keys.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "accounting-families.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    const primary = try keys.documentKeyAlloc(a, "doc\x00\x00__metadata__:authored-id");
+    defer a.free(primary);
+    const relational = try keys.relationalRowKeyAlloc(a, "row");
+    defer a.free(relational);
+    const derived = try a.dupe(u8, primary);
+    defer a.free(derived);
+    derived[derived.len - 1] = keys.artifact_kind;
+    const namespace = "\x02db/embedded/tables/2\x00";
+    try writer.putDocument(primary, "d");
+    try writer.putDocument(relational, "r");
+    try writer.putDocument("plain\x00\x00__txn_records__:authored-id", "p");
+    const named_primary = try std.mem.concat(a, u8, &.{ namespace, primary });
+    defer a.free(named_primary);
+    try writer.putDocument(named_primary, "n");
+    for ([_][]const u8{
+        "\x00\x00__txn_records__:receipt",
+        keys.relational_columnar_manifest_key,
+        &keys.range_document_count_key,
+        &keys.identity_namespace_key,
+        derived,
+    }) |control| {
+        try writer.putDocument(control, "c");
+        const named = try std.mem.concat(a, u8, &.{ namespace, control });
+        defer a.free(named);
+        try writer.putDocument(named, "c");
+    }
+    const report = try writer.check();
+    try std.testing.expect(report.valid);
+    const accounting = report.live_accounting.?;
+    try std.testing.expectEqual(@as(u64, 4), accounting.documents.records);
+    try std.testing.expectEqual(@as(u64, 10), accounting.control_documents.records);
+    try std.testing.expectEqual(@as(u64, 4), accounting.documents.value_bytes);
+    try std.testing.expectEqual(@as(u64, 10), accounting.control_documents.value_bytes);
+    var bytes: u64 = 0;
+    var records: u64 = 0;
+    inline for (@typeInfo(LiveByteAccounting).@"struct".field_names) |field| {
+        const category = @field(accounting, field);
+        bytes += category.key_bytes + category.value_bytes;
+        records += category.records;
+    }
+    try std.testing.expectEqual(report.live_bytes, bytes);
+    try std.testing.expectEqual(report.live_file_count, records);
 }

@@ -661,3 +661,18 @@ physical-page reader. It verifies each loaded bundle and each requested record
 without reconstructing a synthetic checksummed page per inline record. The
 reachable-root and ownership-count checks remain unchanged, including both
 recovery checkpoints and the cancellation fence.
+
+Recovery agenda discovery is capped at eight namespaces per turn. Admission
+independently checks each affected namespace, including schema participants of
+catalog-dependent operations; cursor progress cannot bypass unfinished DDL.
+Read-only clean sweeps accumulate across pages of one logical metadata generation,
+including across foreign data-only checkpoints. New metadata invalidates that
+witness. Snapshot recovery only inspects its captured cut and cannot publish
+repairs.
+
+Logical-byte accounting strips the physical namespace wrapper before applying
+the shared internal-key classifier. Authored primary/relational rows and
+unreserved raw records count as documents; receipts, replay/identity state,
+columnar controls and other reserved internal records count as control documents.
+These categories describe payload ownership, not an estimate of removable
+overhead.
