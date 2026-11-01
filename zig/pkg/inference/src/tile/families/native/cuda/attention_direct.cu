@@ -696,25 +696,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_tiled_f16_exact_f32(ANT
         num_kv_heads != 1u ||
         (head_dim != 256u && head_dim != 512u) ||
         blockDim.x != head_dim ||
-        mask_len != 0u ||
-        bias_mode != 0u ||
-        format != 2u ||
-        value_format != 2u ||
-        key_row_bytes != expected_row_bytes ||
-        base_key_row_bytes != expected_row_bytes ||
-        value_row_bytes != expected_row_bytes ||
-        !termite_tq_f16_prefill_page_layout_valid(
-            kv_seq_len,
-            block_table,
-            block_count,
-            page_size_tokens,
-            physical_token_capacity
-        ) ||
-        decode_scalars != 0) return;
-
-    const unsigned int head = blockIdx.x;
-    const unsigned int tile_row_start = blockIdx.y * tile_m;
-    if (head >= num_heads || tile_row_start >= q_seq_len) return;
+{{f16_page_admission}}
 
     const unsigned int tid = threadIdx.x;
     if (tid < tile_m) {
@@ -840,25 +822,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_tiled_f16_warp_f32(ANTF
         num_kv_heads != 1u ||
         (head_dim != 256u && head_dim != 512u) ||
         blockDim.x != 256u ||
-        mask_len != 0u ||
-        bias_mode != 0u ||
-        format != 2u ||
-        value_format != 2u ||
-        key_row_bytes != expected_row_bytes ||
-        base_key_row_bytes != expected_row_bytes ||
-        value_row_bytes != expected_row_bytes ||
-        !termite_tq_f16_prefill_page_layout_valid(
-            kv_seq_len,
-            block_table,
-            block_count,
-            page_size_tokens,
-            physical_token_capacity
-        ) ||
-        decode_scalars != 0) return;
-
-    const unsigned int head = blockIdx.x;
-    const unsigned int tile_row_start = blockIdx.y * tile_m;
-    if (head >= num_heads || tile_row_start >= q_seq_len) return;
+{{f16_page_admission}}
 
     const unsigned int tid = threadIdx.x;
     const unsigned int warp = tid >> 5;
@@ -1369,31 +1333,8 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(ANTFLY_CU
     __syncthreads();
 
     for (unsigned int ki = 0u; ki < kv_seq_len; ++ki) {
-        unsigned int key_pos = kv_position_offset + ki;
-        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
-        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
-        bool future_blocked = key_pos > query_pos && !future_allowed;
-        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
-        bool valid = !(future_blocked || past_blocked);
-        unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
-        if (physical_token == 0xffffffffu) valid = false;
-        const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
-        float partial = 0.0f;
-        if (valid && lane < head_dim) {
-            unsigned int value_index = kv_head * head_dim + lane;
-            float key_value = format == 0u
-                ? termite_tq_decode_polar4_at(k_row, value_index)
-                : (format == 1u
-                    ? termite_tq_decode_turbo3_at(k_row, value_index)
-                    : termite_tq_f16_value(k_row, value_index));
-            partial = q[q_base + lane] * key_value;
-        }
-        reduce[lane] = partial;
-        __syncthreads();
-        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
-            if (lane < stride) reduce[lane] += reduce[lane + stride];
-            __syncthreads();
-        }
+{{paged_key_visibility}}
+{{paged_key_dot_cached}}
         if (lane == 0u) {
             float score = neg_inf;
             if (valid) {
@@ -1415,35 +1356,12 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(ANTFLY_CU
     __syncthreads();
     float acc = 0.0f;
     for (unsigned int ki = 0u; ki < kv_seq_len; ++ki) {
-        unsigned int key_pos = kv_position_offset + ki;
-        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
-        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
-        bool future_blocked = key_pos > query_pos && !future_allowed;
-        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
-        bool valid = !(future_blocked || past_blocked);
-        unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
-        if (physical_token == 0xffffffffu) valid = false;
-        const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
+{{paged_key_visibility}}
         if (cache_scores) {
             if (lane == 0u) shared_score = shared_scores[ki];
             __syncthreads();
         } else {
-            float partial = 0.0f;
-            if (valid && lane < head_dim) {
-                unsigned int value_index = kv_head * head_dim + lane;
-                float key_value = format == 0u
-                    ? termite_tq_decode_polar4_at(k_row, value_index)
-                    : (format == 1u
-                        ? termite_tq_decode_turbo3_at(k_row, value_index)
-                        : termite_tq_f16_value(k_row, value_index));
-                partial = q[q_base + lane] * key_value;
-            }
-            reduce[lane] = partial;
-            __syncthreads();
-            for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
-                if (lane < stride) reduce[lane] += reduce[lane + stride];
-                __syncthreads();
-            }
+{{paged_key_dot_replayed}}
             if (lane == 0u) {
                 if (valid) {
                     float score = reduce[0];
@@ -1489,47 +1407,7 @@ extern "C" __global__ void termite_deberta_attention_f32(ANTFLY_CUDA_DEBERTA_ATT
     float* reduction = scores + seq_len;
     unsigned int tid = threadIdx.x;
 
-    float local_max = -3.402823466e+38f;
-    for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
-            float score = termite_deberta_attention_score_f32(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
-            scores[ki] = score;
-            local_max = fmaxf(local_max, score);
-        } else {
-            scores[ki] = -3.402823466e+38f;
-        }
-    }
-    reduction[tid] = local_max;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reduction[tid] = fmaxf(reduction[tid], reduction[tid + stride]);
-        __syncthreads();
-    }
-    float row_max = reduction[0];
-    // Every warp must consume reduction[0] before thread 0 can reuse that
-    // shared-memory location for the denominator reduction below. Without
-    // this barrier, long attention rows race after the first reduction and
-    // produce nondeterministic forward activations.
-    __syncthreads();
-
-    float local_sum = 0.0f;
-    for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
-            float e = expf(scores[ki] - row_max);
-            scores[ki] = e;
-            local_sum += e;
-        } else {
-            scores[ki] = 0.0f;
-        }
-    }
-    reduction[tid] = local_sum;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reduction[tid] += reduction[tid + stride];
-        __syncthreads();
-    }
-    float denom = reduction[0];
-    __syncthreads();
+{{relative_softmax}}
 
     unsigned int hidden = num_heads * head_dim;
     unsigned int head_off = head * head_dim;
@@ -1732,16 +1610,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
         }
         __syncthreads();
         const unsigned int qr = warp / 4u, kc = warp % 4u;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
-        wmma::fill_fragment(dot, 0.0f);
-        #pragma unroll
-        for (unsigned int d = 0u; d < D; d += 16u) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
-            wmma::load_matrix_sync(qf, qt + qr * 16u * P + d, P);
-            wmma::load_matrix_sync(kf, kt + kc * 16u * P + d, P);
-            wmma::mma_sync(dot, qf, kf, dot);
-        }
+{{qk_mma_dot_single}}
         wmma::store_matrix_sync(scores + qr * 16u * N + kc * 16u, dot, N, wmma::mem_row_major);
         __syncthreads();
         #pragma unroll
@@ -2099,16 +1968,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
         #pragma unroll
         for (unsigned int g = 0u; g < 2u; ++g) {
             const unsigned int qr = warp / 4u + g * 2u, kc = warp % 4u;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
-            wmma::fill_fragment(dot, 0.0f);
-            #pragma unroll
-            for (unsigned int d = 0u; d < D; d += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
-                wmma::load_matrix_sync(qf, qt + qr * 16u * P + d, P);
-                wmma::load_matrix_sync(kf, kt + kc * 16u * P + d, P);
-                wmma::mma_sync(dot, qf, kf, dot);
-            }
+{{qk_mma_dot_grouped}}
             wmma::store_matrix_sync(shared_scores + qr * 16u * S + kc * 16u, dot, S, wmma::mem_row_major);
         }
         __syncthreads();

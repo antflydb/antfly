@@ -159,43 +159,7 @@ extern "C" __global__ void termite_deberta_attention_backward_scores_f32(ANTFLY_
     float* reduction = d_probability + seq_len;
     unsigned int tid = threadIdx.x;
 
-    float local_max = -3.402823466e+38f;
-    for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
-            float score = termite_deberta_training_score(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
-            scores[ki] = score;
-            d_probability[ki] = termite_deberta_training_dp(v, d_out, b, qi, ki, head, seq_len, num_heads, head_dim);
-            local_max = fmaxf(local_max, score);
-        } else {
-            scores[ki] = -3.402823466e+38f;
-            d_probability[ki] = 0.0f;
-        }
-    }
-    reduction[tid] = local_max;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reduction[tid] = fmaxf(reduction[tid], reduction[tid + stride]);
-        __syncthreads();
-    }
-    float row_max = reduction[0];
-    __syncthreads();
-
-    float local_sum = 0.0f;
-    for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
-            float e = expf(scores[ki] - row_max);
-            scores[ki] = e;
-            local_sum += e;
-        }
-    }
-    reduction[tid] = local_sum;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reduction[tid] += reduction[tid + stride];
-        __syncthreads();
-    }
-    float denominator = reduction[0];
-    __syncthreads();
+{{relative_softmax}}
 
     float local_weighted_dp = 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {

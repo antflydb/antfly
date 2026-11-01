@@ -192,3 +192,13 @@ pub const InterleavedRows = struct {
         return text;
     }
 };
+
+/// Four packed axes, innermost first. The batch axis is the final quotient.
+/// Native schedules supply names/types and retain their existing integer width.
+pub const DenseIndex4 = struct {
+    axes: [4][]const u8,
+    extents: [3][]const u8,
+    pub fn native(comptime d: DenseIndex4, comptime integer: []const u8) []const u8 {
+        return std.fmt.comptimePrint("    {s} {s} = idx % {s};\n    {s} tmp = idx / {s};\n    {s} {s} = tmp % {s};\n    tmp /= {s};\n    {s} {s} = tmp % {s};\n    {s} {s} = tmp / {s};", .{ integer, d.axes[0], d.extents[0], integer, d.extents[0], integer, d.axes[1], d.extents[1], d.extents[1], integer, d.axes[2], d.extents[2], integer, d.axes[3], d.extents[2] });
+    }
+};

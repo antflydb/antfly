@@ -167,7 +167,7 @@ test {
 
 test "normalization profiles preserve affine association, explicit FMA and algorithm ownership" {
     const f = core.fexpr;
-    const input: f.Inputs(f32) = .{ .value = 1e20, .gate = 1e20, .bias = 1e-20, .residual = 0 };
+    const input = .{ .value = @as(f32, 1e20), .inverse = @as(f32, 1e20), .weight = @as(f32, 1e-20) };
     try std.testing.expect(std.math.isInf((comptime core.native_math.rms(.scale_then_weight)).evaluate(struct {}, input)));
     try std.testing.expect(std.math.isFinite((comptime core.native_math.rms(.weighted_inverse)).evaluate(struct {}, input)));
     const fused = comptime f.acc.mulAdd(.bias, .residual);
@@ -199,4 +199,19 @@ test "default vector math evaluates primitive tanh" {
     const e = comptime core.fexpr.acc.tanhOf();
     const result = e.evalVec(4, input, @splat(0), @splat(0));
     inline for (0..4) |i| try std.testing.expectEqual(@as(u32, @bitCast(std.math.tanh(input[i]))), @as(u32, @bitCast(result[i])));
+}
+
+test "named adjoints preserve the original ordered activation formula and subtraction" {
+    const f = core.fexpr;
+    for (0..4097) |i| {
+        const x: f32 = (@as(f32, @floatFromInt(i)) - 2048) / 256;
+        const x2 = x * x;
+        const t = std.math.tanh(@as(f32, 0.7978845608028654) * (x + @as(f32, 0.044715) * x * x2));
+        const sech2 = 1 - t * t;
+        const expected = @as(f32, 0.5) * (1 + t) + @as(f32, 0.5) * x * sech2 * @as(f32, 0.7978845608028654) * (1 + @as(f32, 0.134145) * x2);
+        const actual = (comptime core.native_math.geluDerivative(f.operand("sech2"))).evaluate(struct {}, .{ .value = x, .t = t, .x2 = x2, .sech2 = sech2 });
+        try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(actual)));
+    }
+    const e = comptime f.operand("left").minus(f.operand("right").minus(f.operand("tail")));
+    try std.testing.expectEqualStrings("a - (b - c)", comptime e.renderNative(.{}, .{ .left = "a", .right = "b", .tail = "c" }, null));
 }

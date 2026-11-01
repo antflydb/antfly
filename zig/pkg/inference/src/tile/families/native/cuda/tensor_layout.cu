@@ -203,12 +203,7 @@ extern "C" __global__ void termite_token_to_nchw_f32(ANTFLY_CUDA_TOKEN_TO_NCHW_F
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = batch * height * width * channels;
     if (idx >= total) return;
-    unsigned int c = idx % channels;
-    unsigned int tmp = idx / channels;
-    unsigned int x = tmp % width;
-    tmp /= width;
-    unsigned int y = tmp % height;
-    unsigned int b = tmp / height;
+{{channel_coordinates}}
     unsigned int dst_idx = ((b * channels + c) * height + y) * width + x;
     dst[dst_idx] = src[idx];
 }
@@ -217,12 +212,7 @@ extern "C" __global__ void termite_nchw_to_token_f32(ANTFLY_CUDA_TOKEN_TO_NCHW_F
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = batch * height * width * channels;
     if (idx >= total) return;
-    unsigned int c = idx % channels;
-    unsigned int tmp = idx / channels;
-    unsigned int x = tmp % width;
-    tmp /= width;
-    unsigned int y = tmp % height;
-    unsigned int b = tmp / height;
+{{channel_coordinates}}
     unsigned int src_idx = ((b * channels + c) * height + y) * width + x;
     dst[idx] = src[src_idx];
 }
@@ -260,12 +250,7 @@ extern "C" __global__ void termite_unpad_windows_f32(ANTFLY_CUDA_PACK_WINDOWS_F3
     unsigned int total = batch * height * width * dim;
     if (idx >= total) return;
 
-    unsigned int feature = idx % dim;
-    unsigned int tmp = idx / dim;
-    unsigned int x = tmp % width;
-    tmp /= width;
-    unsigned int y = tmp % height;
-    unsigned int b = tmp / height;
+{{window_coordinates}}
     unsigned int windows_w = padded_w / window_size;
     unsigned int wh = y / window_size;
     unsigned int ww = x / window_size;

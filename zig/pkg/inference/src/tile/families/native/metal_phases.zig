@@ -128,6 +128,7 @@ fn encoded(comptime text: []const u8) []const u8 {
     return lines[0 .. lines.len - 1]; // The template supplies the final source newline.
 }
 
+const tile = @import("antfly_tile");
 pub const boundary = .{
     .self_attention_scores = encoded(phases.self_attention_scores),
     .relative_attention_scores = encoded(phases.relative_attention_scores),
@@ -160,3 +161,26 @@ pub const dense_row =
     \\}
     \\
 ;
+
+// Shared standalone/fused adjoint; lazy upstream reads and guards stay native.
+pub const source_0 = program.metal(program.render(
+    \\template<typename Upstream> inline float termite_gelu_backward_scalar(float x, Upstream upstream, uint gid, uint kind) {
+    \\    if (!isfinite(x)) return 0.0f;
+    \\    float x2 = x * x;
+    \\    float derivative = 0.0f;
+    \\    if (kind == 1u) {
+    \\        float cdf = 0.5f * (1.0f + termite_erf_approx(x * 0.7071067811865476f));
+    \\        float pdf = exp(-0.5f * x2) * 0.3989422804014327f;
+    \\        derivative = cdf + x * pdf;
+    \\    } else {
+    \\        float inner = 0.7978845608028654f * (x + 0.044715f * x * x2);
+    \\        if (inner > 10.0f) return termite_gelu_upstream(upstream, gid);
+    \\        if (inner < -10.0f) return 0.0f;
+    \\        float t = tanh(inner);
+    \\        float sech2 = 1.0f - t * t;
+    \\        derivative = {{derivative}};
+    \\    }
+    \\    return isfinite(derivative) ? termite_gelu_upstream(upstream, gid) * derivative : 0.0f;
+    \\}
+    \\
+, .{ .derivative = tile.fexpr.binding(tile.native_math.geluDerivative(tile.fexpr.operand("sech2")), tile.native_math.metal, .{ .value = "x", .t = "t", .x2 = "x2", .sech2 = "sech2" }) }));

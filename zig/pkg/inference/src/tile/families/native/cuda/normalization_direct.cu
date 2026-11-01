@@ -23,18 +23,8 @@ extern "C" __global__ void termite_rms_norm_add_weighted_embedding_i32_q6_k_f32(
     unsigned int group = group_row - token_row * num_groups;
     unsigned int base = token_row * embedding_dim + group * group_dim;
     __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < group_dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float norm_scale = rsqrtf(partial[0] / (float)group_dim + eps);
+    float norm_scale = antfly_row_rms_tree_inverse(group_dim, eps, partial,
+        [&](unsigned i) { return input[base + i]; });
     unsigned long long src_row = (unsigned long long)((unsigned int)ids[token_row]);
     unsigned int row_blocks = embedding_dim / 256u;
     for (unsigned int i = tid; i < group_dim; i += blockDim.x) {

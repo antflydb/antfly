@@ -34,8 +34,10 @@ pub const FExpr = union(enum) {
     /// Elementwise gate/up-projection input, independent of the skip residual.
     gate,
     residual,
+    named: []const u8,
     lit: f32,
     add: [2]*const FExpr,
+    sub: [2]*const FExpr,
     mul: [2]*const FExpr,
     div: [2]*const FExpr,
     maximum: [2]*const FExpr,
@@ -56,6 +58,9 @@ pub const FExpr = union(enum) {
 
     pub fn plus(comptime a: FExpr, comptime b: FExpr) FExpr {
         return .{ .add = .{ box(a), box(b) } };
+    }
+    pub fn minus(comptime a: FExpr, comptime b: FExpr) FExpr {
+        return .{ .sub = .{ box(a), box(b) } };
     }
     pub fn times(comptime a: FExpr, comptime b: FExpr) FExpr {
         return .{ .mul = .{ box(a), box(b) } };
@@ -105,8 +110,8 @@ pub const FExpr = union(enum) {
 
     pub fn uses(comptime e: FExpr, comptime tag: std.meta.Tag(FExpr)) bool {
         return switch (e) {
-            .acc, .bias, .gate, .residual, .lit => e == tag,
-            .add, .mul, .div, .maximum => |xs| e == tag or xs[0].uses(tag) or xs[1].uses(tag),
+            .acc, .bias, .gate, .residual, .named, .lit => e == tag,
+            .add, .sub, .mul, .div, .maximum => |xs| e == tag or xs[0].uses(tag) or xs[1].uses(tag),
             .fma => |x| e == tag or x[0].uses(tag) or x[1].uses(tag) or x[2].uses(tag),
             .gelu, .silu, .round_f16, .round_bf16, .neg, .exp, .tanh => |x| e == tag or x.uses(tag),
         };
@@ -151,12 +156,14 @@ pub const FExpr = union(enum) {
     pub inline fn evaluate(comptime e: FExpr, comptime Math: type, inputs: anytype) @TypeOf(inputs.value) {
         const T = @TypeOf(inputs.value);
         return switch (e) {
+            .named => |name| @field(inputs, name),
             .acc => inputs.value,
             .bias => inputs.bias,
             .gate => inputs.gate,
             .residual => inputs.residual,
             .lit => |v| if (@typeInfo(T) == .vector) @splat(v) else v,
             .add => |x| x[0].evaluate(Math, inputs) + x[1].evaluate(Math, inputs),
+            .sub => |x| x[0].evaluate(Math, inputs) - x[1].evaluate(Math, inputs),
             .mul => |x| x[0].evaluate(Math, inputs) * x[1].evaluate(Math, inputs),
             .div => |x| x[0].evaluate(Math, inputs) / x[1].evaluate(Math, inputs),
             .fma => |x| @mulAdd(T, x[0].evaluate(Math, inputs), x[1].evaluate(Math, inputs), x[2].evaluate(Math, inputs)),
@@ -208,31 +215,32 @@ pub const FExpr = union(enum) {
         return e.renderAt(source, inputs, null, false, null);
     }
     pub const Substitute = struct { expr: FExpr, text: []const u8 };
-    pub fn renderNative(comptime e: FExpr, comptime source: Source, comptime inputs: Inputs([]const u8), comptime substitute: ?Substitute) []const u8 {
+    pub fn renderNative(comptime e: FExpr, comptime source: Source, comptime inputs: anytype, comptime substitute: ?Substitute) []const u8 {
         var native = source;
         native.native_syntax = true;
         return e.renderAt(native, inputs, null, false, substitute);
     }
     fn precedence(comptime e: FExpr) u8 {
         return switch (e) {
-            .add => 1,
+            .add, .sub => 1,
             .mul, .div => 2,
             .neg => 3,
             else => 4,
         };
     }
-    fn renderAt(comptime e: FExpr, comptime source: Source, comptime inputs: Inputs([]const u8), comptime parent: ?FExpr, comptime right: bool, comptime sub: ?Substitute) []const u8 {
+    fn renderAt(comptime e: FExpr, comptime source: Source, comptime inputs: anytype, comptime parent: ?FExpr, comptime right: bool, comptime sub: ?Substitute) []const u8 {
         @setEvalBranchQuota(100_000);
         if (sub) |replacement| if (std.meta.eql(e, replacement.expr)) return replacement.text;
         if (source.native_syntax and source.expand_silu and e == .silu) return e.expanded().renderAt(source, inputs, parent, right, sub);
         const text = switch (e) {
+            .named => |name| @field(inputs, name),
             .acc => inputs.value,
             .bias => inputs.bias,
             .gate => inputs.gate,
             .residual => inputs.residual,
             .lit => |v| if (source.native_syntax) nativeLiteral(v) else std.fmt.comptimePrint("{e}f", .{v}),
-            .add, .mul, .div => |x| blk: {
-                const body = x[0].renderAt(source, inputs, e, false, sub) ++ (if (source.compact) (if (e == .add) "+" else if (e == .mul) "*" else "/") else (if (e == .add) " + " else if (e == .mul) " * " else " / ")) ++ x[1].renderAt(source, inputs, e, true, sub);
+            .add, .sub, .mul, .div => |x| blk: {
+                const body = x[0].renderAt(source, inputs, e, false, sub) ++ (if (source.compact) (if (e == .add) "+" else if (e == .sub) "-" else if (e == .mul) "*" else "/") else (if (e == .add) " + " else if (e == .sub) " - " else if (e == .mul) " * " else " / ")) ++ x[1].renderAt(source, inputs, e, true, sub);
                 break :blk if (source.native_syntax) body else "(" ++ body ++ ")";
             },
             .fma => |x| source.fma ++ "(" ++ x[0].renderAt(source, inputs, null, false, sub) ++ ", " ++ x[1].renderAt(source, inputs, null, false, sub) ++ ", " ++ x[2].renderAt(source, inputs, null, false, sub) ++ ")",
@@ -253,6 +261,22 @@ pub const FExpr = union(enum) {
 };
 
 pub const acc: FExpr = .acc;
+/// Operation-local operands are resolved at comptime; missing bindings are
+/// compile errors. Legacy GEMM slots remain available for existing programs.
+pub fn operand(comptime name: []const u8) FExpr {
+    return .{ .named = name };
+}
+pub fn Binding(comptime expr: FExpr, comptime source: FExpr.Source, comptime inputs: anytype) type {
+    return struct {
+        pub fn render(comptime _: @This()) []const u8 {
+            return expr.renderNative(source, inputs, null);
+        }
+    };
+}
+pub fn binding(comptime expr: FExpr, comptime source: FExpr.Source, comptime inputs: anytype) Binding(expr, source, inputs) {
+    return .{};
+}
+
 pub fn lit(comptime v: f32) FExpr {
     return .{ .lit = v };
 }
@@ -284,7 +308,7 @@ const ReferenceMath = struct {
     }
 };
 fn nativeLiteral(comptime v: f32) []const u8 {
-    return if (@as(u32, @bitCast(v)) == 0x80000000) "-0.0f" else if (v == 0) "0.0f" else if (v == 1) "1.0f" else if (v == 0.5) "0.5f" else if (v == 0.044715) "0.044715f" else if (v == 0.7978845608028654) "0.7978845608028654f" else if (v == -1.702) "-1.702f" else std.fmt.comptimePrint("{e}f", .{v});
+    return if (@as(u32, @bitCast(v)) == 0x80000000) "-0.0f" else if (v == 0) "0.0f" else if (v == 1) "1.0f" else if (v == 0.5) "0.5f" else if (v == 0.044715) "0.044715f" else if (v == 0.7978845608028654) "0.7978845608028654f" else if (v == 0.134145) "0.134145f" else if (v == -1.702) "-1.702f" else std.fmt.comptimePrint("{e}f", .{v});
 }
 
 /// A source-template binding. Native schedules retain temporaries and barriers;

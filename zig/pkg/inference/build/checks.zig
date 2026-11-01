@@ -27,8 +27,9 @@ pub fn createCodegen(ctx: Context) CreateCodegenResult {
     const b = ctx.b;
     const quant_kernel_codegen_exe = b.addExecutable(.{
         .name = "antfly-quant-kernel-codegen",
-        // Native geometry owners currently peak near 1.2 GiB when compiled.
-        .max_rss = 2 * 1024 * 1024 * 1024,
+        // Linux/aarch64 peaked at 2,252,902,400 bytes. Retain 10% headroom,
+        // rounded up to 128 MiB; this bounds compiler scheduling only.
+        .max_rss = @as(usize, if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64) 2432 else 2048) * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/quant_kernel_codegen_main.zig"),
             .target = b.graph.host,

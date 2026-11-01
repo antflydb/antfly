@@ -2,6 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Native compile-time Q4_0/Q8_1 FFN schedules. Keep packed-sum precision,
 // reduction order and output rounding distinct through the Ggml policy.
+// Preserve each caller's address width and Decode input-sum precision.
+#ifndef ANTFLY_Q8_1_NATIVE_INPUT
+#define ANTFLY_Q8_1_NATIVE_INPUT(Address) \
+    const unsigned char *q8_bp = Address; \
+    const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]); \
+    const float q8_sum = Decode::input_sum(q8_bp); \
+    const signed char *q8_values = (const signed char *)(q8_bp + 4u); \
+    const unsigned int q8_base0 = iqs * 4u; \
+    const unsigned int q8_base1 = q8_base0 + 4u; \
+    const int q8_low0 = *(const int *)(q8_values + q8_base0); \
+    const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u); \
+    const int q8_low1 = *(const int *)(q8_values + q8_base1); \
+    const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u)
+#endif
+
 #define ANTFLY_Q4_Q8_PAIR_PARAMS unsigned char* dst_q8, const unsigned char* q8_input, const unsigned char* weight_gate, const unsigned char* weight_up, unsigned int activation, unsigned int rows, unsigned int in_dim, unsigned int out_dim
 #define ANTFLY_Q4_Q8_PAIR_ARGS dst_q8, q8_input, weight_gate, weight_up, activation, rows, in_dim, out_dim
 #define ANTFLY_Q4_Q8_DOWN_PARAMS float* dst, const unsigned char* q8_input, const unsigned char* weight, unsigned int rows, unsigned int in_dim, unsigned int out_dim
@@ -44,16 +59,7 @@ __device__ __forceinline__ void antfly_q4_q8_pair(ANTFLY_Q4_Q8_PAIR_PARAMS) {
 
             const unsigned int iqs = (local_tid & 1u) * 2u;
             for (unsigned int block = local_tid >> 1u; block < row_blocks; block += Warps * 16u) {
-                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
-                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-                const float q8_sum = Decode::input_sum(q8_bp);
-                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-                const unsigned int q8_base0 = iqs * 4u;
-                const unsigned int q8_base1 = q8_base0 + 4u;
-                const int q8_low0 = *(const int *)(q8_values + q8_base0);
-                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-                const int q8_low1 = *(const int *)(q8_values + q8_base1);
-                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+                ANTFLY_Q8_1_NATIVE_INPUT(q8_input + (row * row_blocks + block) * 36u);
 
                 #pragma unroll
                 for (unsigned int c = 0u; c < group_cols; ++c) {
@@ -131,16 +137,7 @@ __device__ __forceinline__ void antfly_q4_q8_down(ANTFLY_Q4_Q8_DOWN_PARAMS) {
 
     const unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += Threads / 2u) {
-        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
-        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-                const float q8_sum = Decode::input_sum(q8_bp);
-        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-        const unsigned int q8_base0 = iqs * 4u;
-        const unsigned int q8_base1 = q8_base0 + 4u;
-        const int q8_low0 = *(const int *)(q8_values + q8_base0);
-        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-        const int q8_low1 = *(const int *)(q8_values + q8_base1);
-        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+        ANTFLY_Q8_1_NATIVE_INPUT(q8_input + ((size_t)row * row_blocks + block) * 36u);
 
         #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {

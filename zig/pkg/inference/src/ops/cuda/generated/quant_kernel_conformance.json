@@ -5666,7 +5666,7 @@
       "cuda_production_kernel_id": "termite_linear_q4_0_q8_1_f32_tile4+termite_argmax_last_row_f32",
       "cuda_candidate_kernel_id": "antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1",
       "cuda_candidate_source_path": "src/ops/cuda/generated/quant_kernel_q4_0_q8_1_argmax_e2b_tile8.cu",
-      "cuda_candidate_source_fingerprint": 11390706158512684799,
+      "cuda_candidate_source_fingerprint": 17768050047743598715,
       "cuda_fallback_reason": "generated_runtime_not_wired",
       "metal_route": "unsupported",
       "metal_candidate_route": "unsupported",

@@ -11518,6 +11518,7 @@ static NSString *termite_metal_shader_source(void) {
            "// loads in the standalone kernel's nonfinite and saturated-negative paths.\n"
            "inline float termite_gelu_upstream(float upstream, uint) { return upstream; }\n"
            "inline float termite_gelu_upstream(device const float *upstream, uint gid) { return upstream[gid]; }\n"
+           // tile-codegen:begin training.math family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "template<typename Upstream> inline float termite_gelu_backward_scalar(float x, Upstream upstream, uint gid, uint kind) {\n"
            "    if (!isfinite(x)) return 0.0f;\n"
            "    float x2 = x * x;\n"
@@ -11536,6 +11537,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "    return isfinite(derivative) ? termite_gelu_upstream(upstream, gid) * derivative : 0.0f;\n"
            "}\n"
+           // tile-codegen:end training.math family
            "template<bool PrecomputedSecond, bool SaveSecond, bool SaveUpstream>\n"
            "inline void termite_ffn_gelu_backward_rank1_impl(\n"
            "    device const float *first_lhs, device const float *first_rhs,\n"
@@ -15008,24 +15010,13 @@ static NSString *termite_metal_shader_source(void) {
            // tile-codegen:end reduce.embedding_lookup.1 family
            // tile-codegen:begin reduce.rope.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_rope(device const float *input [[buffer(0)]], device const uint *positions [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_rope_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    uint total = p.total_chunks * p.head_dim;\n"
-           "    if (gid >= total) return;\n"
-           "    uint chunk = gid / p.head_dim;\n"
-           "    uint d = gid - chunk * p.head_dim;\n"
-           "    uint base = chunk * p.head_dim;\n"
+           "    uint total = p.total_chunks * p.head_dim; if (gid >= total) return; uint chunk = gid / p.head_dim; uint d = gid - chunk * p.head_dim; uint base = chunk * p.head_dim;\n"
            "    if (p.rope_dim < 2u) { output[gid] = input[gid]; return; }\n"
            "    uint idx0 = 0u; uint idx1 = 0u; uint j = 0u;\n"
            "    if (!termite_rope_pair_indices(d, p.head_dim, p.rope_dim, p.consecutive_pairs, idx0, idx1, j)) { output[gid] = input[gid]; return; }\n"
-           "    float pos = float(positions[chunk]);\n"
-           "    float freq = 1.0f / pow(p.theta, float(2u * j) / float(p.rope_dim));\n"
-           "    float angle = pos * p.freq_scale * freq;\n"
-           "    float cos_val = cos(angle);\n"
-           "    float sin_val = sin(angle);\n"
-           "    float x0 = input[base + idx0];\n"
-           "    float x1 = input[base + idx1];\n"
-           "    if (d == idx0) output[gid] = x0 * cos_val - x1 * sin_val;\n"
-           "    else if (d == idx1) output[gid] = x0 * sin_val + x1 * cos_val;\n"
-           "    else output[gid] = input[gid];\n"
+           "    float pos = float(positions[chunk]); float freq = 1.0f / pow(p.theta, float(2u * j) / float(p.rope_dim)); float angle = pos * p.freq_scale * freq; float cos_val = cos(angle); float sin_val = sin(angle);\n"
+           "    float x0 = input[base + idx0]; float x1 = input[base + idx1];\n"
+           "    if (d == idx0) { output[gid] = x0 * cos_val - x1 * sin_val; } else if (d == idx1) { output[gid] = x0 * sin_val + x1 * cos_val; } else { output[gid] = input[gid]; }\n"
            "}\n"
            // tile-codegen:end reduce.rope.0 family
            ANTFLY_MSL_GDN_SOURCE
@@ -15277,10 +15268,9 @@ static NSString *termite_metal_shader_source(void) {
            "    uint idx0 = 0u; uint idx1 = 0u; uint j = 0u;\n"
            "    if (!termite_rope_pair_indices(d, p.head_dim, p.rope_dim, p.consecutive_pairs, idx0, idx1, j)) { first_output[gid] = first_input[gid]; second_output[gid] = second_input[gid]; return; }\n"
            "    float pos = float(positions[chunk]); float freq = 1.0f / pow(p.theta, float(2u * j) / float(p.rope_dim)); float angle = pos * p.freq_scale * freq; float cos_val = cos(angle); float sin_val = sin(angle);\n"
-           "    float first_x0 = first_input[base + idx0]; float first_x1 = first_input[base + idx1]; float second_x0 = second_input[base + idx0]; float second_x1 = second_input[base + idx1];\n"
-           "    if (d == idx0) { first_output[gid] = first_x0 * cos_val - first_x1 * sin_val; second_output[gid] = second_x0 * cos_val - second_x1 * sin_val; }\n"
-           "    else if (d == idx1) { first_output[gid] = first_x0 * sin_val + first_x1 * cos_val; second_output[gid] = second_x0 * sin_val + second_x1 * cos_val; }\n"
-           "    else { first_output[gid] = first_input[gid]; second_output[gid] = second_input[gid]; }\n"
+           "    float first_x0 = first_input[base + idx0]; float first_x1 = first_input[base + idx1];\n"
+           "    float second_x0 = second_input[base + idx0]; float second_x1 = second_input[base + idx1];\n"
+           "    if (d == idx0) { first_output[gid] = first_x0 * cos_val - first_x1 * sin_val; second_output[gid] = second_x0 * cos_val - second_x1 * sin_val; } else if (d == idx1) { first_output[gid] = first_x0 * sin_val + first_x1 * cos_val; second_output[gid] = second_x0 * sin_val + second_x1 * cos_val; } else { first_output[gid] = first_input[gid]; second_output[gid] = second_input[gid]; }\n"
            "}\n"
            // tile-codegen:end reduce.rope.1 family
            // tile-codegen:begin attention.direct.21 family (do not edit; run: zig build tile-kernel-codegen -- --write)

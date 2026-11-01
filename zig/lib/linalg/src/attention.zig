@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const kernel_math = @import("antfly_tile").native_math;
 const primitives = @import("primitives.zig");
 const gemm = @import("gemm_dispatch.zig");
 const pool = @import("pool.zig");
@@ -171,8 +172,9 @@ pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_d
             const idx1 = if (consecutive_pairs) 2 * j + 1 else j + head_half;
             const x0 = output[base + idx0];
             const x1 = output[base + idx1];
-            output[base + idx0] = x0 * cos_val - x1 * sin_val;
-            output[base + idx1] = x0 * sin_val + x1 * cos_val;
+            const operands = .{ .value = x0, .other = x1, .cosine = cos_val, .sine = sin_val };
+            output[base + idx0] = (comptime kernel_math.rotary(false)).evaluate(struct {}, operands);
+            output[base + idx1] = (comptime kernel_math.rotary(true)).evaluate(struct {}, operands);
         }
     }
 }

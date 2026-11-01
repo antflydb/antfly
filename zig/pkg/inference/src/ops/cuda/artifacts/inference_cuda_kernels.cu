@@ -1688,13 +1688,13 @@ extern "C" __global__ void termite_elementwise_f32(
     } else if (op == 1u) {
         out = x * y;
     } else if (op == 2u) {
-        out = x / (1.0f + expf(-x));
+        out = termite_decoder_activation_f32(x, 2u);
     } else if (op == 3u) {
-        out = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+        out = termite_decoder_activation_f32(x, 0u);
     } else if (op == 4u) {
         out = fmaxf(x, 0.0f);
     } else if (op == 5u) {
-        out = x / (1.0f + expf(-1.702f * x));
+        out = termite_decoder_activation_f32(x, 4u);
     } else if (op == 6u) {
         out = 1.0f / (1.0f + expf(-x));
     } else if (op == 7u) {
@@ -1861,7 +1861,7 @@ extern "C" __global__ void termite_silu_multiply_f32(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     float x = gate[i];
-    dst[i] = (x / (1.0f + expf(-x))) * up[i];
+    dst[i] = (termite_decoder_activation_f32(x, 2u)) * up[i];
 }
 // tile-codegen:end elementwise.direct.11 family
 
@@ -1876,21 +1876,7 @@ extern "C" __global__ void termite_activation_multiply_f32(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     float x = gate[i];
-    float act;
-    if (activation == 0u) {
-        act = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    } else if (activation == 1u) {
-        act = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    } else if (activation == 2u) {
-        act = x / (1.0f + expf(-x));
-    } else if (activation == 3u) {
-        act = fmaxf(x, 0.0f);
-    } else if (activation == 4u) {
-        act = x / (1.0f + expf(-1.702f * x));
-    } else {
-        float r = fmaxf(x, 0.0f);
-        act = r * r;
-    }
+    float act = termite_decoder_activation_f32(x, activation);
     dst[i] = act * up[i];
 }
 // tile-codegen:end elementwise.direct.12 family
@@ -12700,18 +12686,8 @@ extern "C" __global__ void termite_rms_norm_add_weighted_embedding_i32_q6_k_f32(
     unsigned int group = group_row - token_row * num_groups;
     unsigned int base = token_row * embedding_dim + group * group_dim;
     __shared__ float partial[256];
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < group_dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    partial[tid] = sumsq;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float norm_scale = rsqrtf(partial[0] / (float)group_dim + eps);
+    float norm_scale = antfly_row_rms_tree_inverse(group_dim, eps, partial,
+        [&](unsigned i) { return input[base + i]; });
     unsigned long long src_row = (unsigned long long)((unsigned int)ids[token_row]);
     unsigned int row_blocks = embedding_dim / 256u;
     for (unsigned int i = tid; i < group_dim; i += blockDim.x) {
@@ -12804,9 +12780,11 @@ extern "C" __global__ void termite_deberta_attention_f32(ANTFLY_CUDA_DEBERTA_ATT
         if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
             float score = termite_deberta_attention_score_f32(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
             scores[ki] = score;
+
             local_max = fmaxf(local_max, score);
         } else {
             scores[ki] = -3.402823466e+38f;
+
         }
     }
     reduction[tid] = local_max;
@@ -13460,10 +13438,12 @@ extern "C" __global__ void termite_deberta_attention_backward_scores_f32(ANTFLY_
             float score = termite_deberta_training_score(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
             scores[ki] = score;
             d_probability[ki] = termite_deberta_training_dp(v, d_out, b, qi, ki, head, seq_len, num_heads, head_dim);
+
             local_max = fmaxf(local_max, score);
         } else {
             scores[ki] = -3.402823466e+38f;
             d_probability[ki] = 0.0f;
+
         }
     }
     reduction[tid] = local_max;
@@ -13473,6 +13453,10 @@ extern "C" __global__ void termite_deberta_attention_backward_scores_f32(ANTFLY_
         __syncthreads();
     }
     float row_max = reduction[0];
+    // Every warp must consume reduction[0] before thread 0 can reuse that
+    // shared-memory location for the denominator reduction below. Without
+    // this barrier, long attention rows race after the first reduction and
+    // produce nondeterministic forward activations.
     __syncthreads();
 
     float local_sum = 0.0f;
@@ -13988,6 +13972,21 @@ struct antfly_q8_ggml {
 // SPDX-License-Identifier: Apache-2.0
 // Native compile-time Q4_0/Q8_1 FFN schedules. Keep packed-sum precision,
 // reduction order and output rounding distinct through the Ggml policy.
+// Preserve each caller's address width and Decode input-sum precision.
+#ifndef ANTFLY_Q8_1_NATIVE_INPUT
+#define ANTFLY_Q8_1_NATIVE_INPUT(Address) \
+    const unsigned char *q8_bp = Address; \
+    const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]); \
+    const float q8_sum = Decode::input_sum(q8_bp); \
+    const signed char *q8_values = (const signed char *)(q8_bp + 4u); \
+    const unsigned int q8_base0 = iqs * 4u; \
+    const unsigned int q8_base1 = q8_base0 + 4u; \
+    const int q8_low0 = *(const int *)(q8_values + q8_base0); \
+    const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u); \
+    const int q8_low1 = *(const int *)(q8_values + q8_base1); \
+    const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u)
+#endif
+
 #define ANTFLY_Q4_Q8_PAIR_PARAMS unsigned char* dst_q8, const unsigned char* q8_input, const unsigned char* weight_gate, const unsigned char* weight_up, unsigned int activation, unsigned int rows, unsigned int in_dim, unsigned int out_dim
 #define ANTFLY_Q4_Q8_PAIR_ARGS dst_q8, q8_input, weight_gate, weight_up, activation, rows, in_dim, out_dim
 #define ANTFLY_Q4_Q8_DOWN_PARAMS float* dst, const unsigned char* q8_input, const unsigned char* weight, unsigned int rows, unsigned int in_dim, unsigned int out_dim
@@ -14030,16 +14029,7 @@ __device__ __forceinline__ void antfly_q4_q8_pair(ANTFLY_Q4_Q8_PAIR_PARAMS) {
 
             const unsigned int iqs = (local_tid & 1u) * 2u;
             for (unsigned int block = local_tid >> 1u; block < row_blocks; block += Warps * 16u) {
-                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
-                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-                const float q8_sum = Decode::input_sum(q8_bp);
-                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-                const unsigned int q8_base0 = iqs * 4u;
-                const unsigned int q8_base1 = q8_base0 + 4u;
-                const int q8_low0 = *(const int *)(q8_values + q8_base0);
-                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-                const int q8_low1 = *(const int *)(q8_values + q8_base1);
-                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+                ANTFLY_Q8_1_NATIVE_INPUT(q8_input + (row * row_blocks + block) * 36u);
 
                 #pragma unroll
                 for (unsigned int c = 0u; c < group_cols; ++c) {
@@ -14117,16 +14107,7 @@ __device__ __forceinline__ void antfly_q4_q8_down(ANTFLY_Q4_Q8_DOWN_PARAMS) {
 
     const unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += Threads / 2u) {
-        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
-        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-                const float q8_sum = Decode::input_sum(q8_bp);
-        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-        const unsigned int q8_base0 = iqs * 4u;
-        const unsigned int q8_base1 = q8_base0 + 4u;
-        const int q8_low0 = *(const int *)(q8_values + q8_base0);
-        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-        const int q8_low1 = *(const int *)(q8_values + q8_base1);
-        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+        ANTFLY_Q8_1_NATIVE_INPUT(q8_input + ((size_t)row * row_blocks + block) * 36u);
 
         #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {

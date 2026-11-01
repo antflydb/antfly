@@ -19,6 +19,43 @@ const program = @import("../../native_program.zig");
 const row_schedules = @import("../../q4_q8_schedule.zig");
 
 pub const attention = .{
+    .relative_softmax = relativeSoftmax(false),
+    .qk_mma_dot_single = program.render(qk_mma_dot, .{ .indent = "        " }),
+    .qk_mma_dot_grouped = program.render(qk_mma_dot, .{ .indent = "            " }),
+    .paged_key_dot_cached = program.render(paged_key_dot, .{ .indent = "        " }),
+    .paged_key_dot_replayed = program.render(paged_key_dot, .{ .indent = "            " }),
+    .f16_page_admission =
+    \\        mask_len != 0u ||
+    \\        bias_mode != 0u ||
+    \\        format != 2u ||
+    \\        value_format != 2u ||
+    \\        key_row_bytes != expected_row_bytes ||
+    \\        base_key_row_bytes != expected_row_bytes ||
+    \\        value_row_bytes != expected_row_bytes ||
+    \\        !termite_tq_f16_prefill_page_layout_valid(
+    \\            kv_seq_len,
+    \\            block_table,
+    \\            block_count,
+    \\            page_size_tokens,
+    \\            physical_token_capacity
+    \\        ) ||
+    \\        decode_scalars != 0) return;
+    \\
+    \\    const unsigned int head = blockIdx.x;
+    \\    const unsigned int tile_row_start = blockIdx.y * tile_m;
+    \\    if (head >= num_heads || tile_row_start >= q_seq_len) return;
+    ,
+    .paged_key_visibility =
+    \\        unsigned int key_pos = kv_position_offset + ki;
+    \\        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
+    \\        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
+    \\        bool future_blocked = key_pos > query_pos && !future_allowed;
+    \\        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
+    \\        bool valid = !(future_blocked || past_blocked);
+    \\        unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
+    \\        if (physical_token == 0xffffffffu) valid = false;
+    \\        const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
+    ,
     .online_softmax_shared_half = program.render(online_softmax, .{ .probability_store = "                probabilities[row * N + lane + j * 32u] = __float2half_rn(p);" }),
     .online_softmax_register_f32 = program.render(online_softmax, .{ .probability_store = "                staged_probabilities[g][j] = p;" }),
     .dense_gqa_parameters =
@@ -365,3 +402,95 @@ const q4q8_rows =
     \\        }
     \\    }
 ;
+
+const tile = @import("antfly_tile");
+pub const elementwise = .{
+    .gelu_derivative_x = tile.native_math.geluDerivative(tile.fexpr.lit(1).minus(tile.fexpr.operand("t").times(tile.fexpr.operand("t")))).renderNative(tile.native_math.cuda, .{ .value = "x", .t = "t", .x2 = "x2" }, null),
+};
+pub const training = .{
+    .relative_softmax = relativeSoftmax(true),
+};
+
+const paged_key_dot =
+    \\{{indent}}float partial = 0.0f;
+    \\{{indent}}if (valid && lane < head_dim) {
+    \\{{indent}}    unsigned int value_index = kv_head * head_dim + lane;
+    \\{{indent}}    float key_value = format == 0u
+    \\{{indent}}        ? termite_tq_decode_polar4_at(k_row, value_index)
+    \\{{indent}}        : (format == 1u
+    \\{{indent}}            ? termite_tq_decode_turbo3_at(k_row, value_index)
+    \\{{indent}}            : termite_tq_f16_value(k_row, value_index));
+    \\{{indent}}    partial = q[q_base + lane] * key_value;
+    \\{{indent}}}
+    \\{{indent}}reduce[lane] = partial;
+    \\{{indent}}__syncthreads();
+    \\{{indent}}for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+    \\{{indent}}    if (lane < stride) reduce[lane] += reduce[lane + stride];
+    \\{{indent}}    __syncthreads();
+    \\{{indent}}}
+;
+
+const qk_mma_dot =
+    \\{{indent}}wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
+    \\{{indent}}wmma::fill_fragment(dot, 0.0f);
+    \\{{indent}}#pragma unroll
+    \\{{indent}}for (unsigned int d = 0u; d < D; d += 16u) {
+    \\{{indent}}    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf;
+    \\{{indent}}    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
+    \\{{indent}}    wmma::load_matrix_sync(qf, qt + qr * 16u * P + d, P);
+    \\{{indent}}    wmma::load_matrix_sync(kf, kt + kc * 16u * P + d, P);
+    \\{{indent}}    wmma::mma_sync(dot, qf, kf, dot);
+    \\{{indent}}}
+;
+
+const relative_softmax =
+    \\    float local_max = -3.402823466e+38f;
+    \\    for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
+    \\        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
+    \\            float score = {{score_function}}(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
+    \\            scores[ki] = score;
+    \\{{#training}}            d_probability[ki] = termite_deberta_training_dp(v, d_out, b, qi, ki, head, seq_len, num_heads, head_dim);
+    \\{{/training}}
+    \\            local_max = fmaxf(local_max, score);
+    \\        } else {
+    \\            scores[ki] = -3.402823466e+38f;
+    \\{{#training}}            d_probability[ki] = 0.0f;
+    \\{{/training}}
+    \\        }
+    \\    }
+    \\    reduction[tid] = local_max;
+    \\    __syncthreads();
+    \\    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+    \\        if (tid < stride) reduction[tid] = fmaxf(reduction[tid], reduction[tid + stride]);
+    \\        __syncthreads();
+    \\    }
+    \\    float row_max = reduction[0];
+    \\    // Every warp must consume reduction[0] before thread 0 can reuse that
+    \\    // shared-memory location for the denominator reduction below. Without
+    \\    // this barrier, long attention rows race after the first reduction and
+    \\    // produce nondeterministic forward activations.
+    \\    __syncthreads();
+    \\
+    \\    float local_sum = 0.0f;
+    \\    for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
+    \\        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
+    \\            float e = expf(scores[ki] - row_max);
+    \\            scores[ki] = e;
+    \\            local_sum += e;
+    \\        }{{^training}} else {
+    \\            scores[ki] = 0.0f;
+    \\        }{{/training}}
+    \\    }
+    \\    reduction[tid] = local_sum;
+    \\    __syncthreads();
+    \\    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+    \\        if (tid < stride) reduction[tid] += reduction[tid + stride];
+    \\        __syncthreads();
+    \\    }
+    \\    float {{denominator}} = reduction[0];
+    \\    __syncthreads();
+;
+
+fn relativeSoftmax(comptime training_mode: bool) []const u8 {
+    return program.render(relative_softmax, .{ .training = training_mode, .score_function = if (training_mode) "termite_deberta_training_score" else "termite_deberta_attention_score_f32", .denominator = if (training_mode) "denominator" else "denom" });
+}

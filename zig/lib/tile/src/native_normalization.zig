@@ -45,7 +45,7 @@ pub fn cudaRms(comptime e: RmsExport, comptime family: []const u8) []const u8 {
 /// adapters differ only in addressing; neither selects a parallel tree.
 pub fn metalSerialRms(comptime name: []const u8, comptime rows: bool, comptime params_type: []const u8) []const u8 {
     const base = if (rows) "row_base + i" else "i";
-    const normalized = math.rms(.scale_then_weight).renderNative(math.metal, .{ .value = "input[" ++ base ++ "]", .bias = "weight[i]", .gate = "inv_rms", .residual = "" }, null);
+    const normalized = math.rms(.scale_then_weight).renderNative(math.metal, .{ .value = "input[" ++ base ++ "]", .weight = "weight[i]", .inverse = "inv_rms" }, null);
     const body = (if (rows) "    if (gid >= p.rows) return;\n" else "    if (gid != 0) return;\n") ++ "    if (p.hidden_size == 0) return;\n" ++ (if (rows) "    uint row_base = gid * p.hidden_size;\n" else "") ++
         "    float mean_square = 0.0f;\n    for (uint i = 0; i < p.hidden_size; ++i) { float x = input[" ++ base ++ "]; mean_square += x * x; }\n    mean_square /= float(p.hidden_size);\n    float inv_rms = rsqrt(mean_square + p.eps);\n    for (uint i = 0; i < p.hidden_size; ++i) output[" ++ base ++ "] = " ++ normalized ++ ";\n";
     return gpu.nativeMetalExport(name, &.{ .{ .name = "input" }, .{ .name = "weight" }, .{ .name = "output", .writable = true } }, params_type, &.{"uint gid [[thread_position_in_grid]]"}, body);

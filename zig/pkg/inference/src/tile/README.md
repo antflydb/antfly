@@ -49,8 +49,22 @@ GEMMs are not switched to it by these contracts.
 scalar/SIMD evaluator and source renderer preserve tree association, explicit
 FMA and storage rounding. `native_math` supplies the existing target math
 profiles, including the two cubic GELU orders and guarded projection GELU.
+`fexpr.operand("weight")` and other operation-local names bind through
+`evaluate`/`renderNative`; scalar/SIMD evaluation uses the `value` field to
+establish its type. RMS binds `inverse` and `weight` directly. Native templates
+also accept `fexpr.binding` for arbitrary named operands.
+
 Typed `fexpr.Emission` template bindings insert those expressions into tuned
 CUDA/Metal epilogues without moving barriers, scratch publication or rounding.
+
+Whole-body sharing includes the native single/paired rotary program, packed
+coordinate decoding, paged-key reconstruction, QK MMA, F16 page admission and
+relative-attention forward/backward softmax phases. Forward activations reuse
+the qualified native activation helper; CPU/CUDA/Metal standard tanh-GELU adjoints share
+the ordered derivative tree while native guards and saved values remain local.
+Small arithmetic expressions need not acquire a separate binding record when
+the record is larger than the expression. Count every profile and replacement
+owner before promoting another abstraction.
 
 Normalization exports select their statistics algorithm explicitly: centered
 two-pass, raw-moment tree, uncentered RMS and Welford are distinct contracts.

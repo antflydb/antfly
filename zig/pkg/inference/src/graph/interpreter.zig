@@ -1954,7 +1954,7 @@ fn executeGeluBackwardFallback(
         }
         const t = std.math.tanh(inner);
         const sech2 = 1.0 - t * t;
-        const derivative = 0.5 * (1.0 + t) + 0.5 * x * sech2 * 0.7978845608028654 * (1.0 + 0.134145 * x2);
+        const derivative = (comptime @import("antfly_tile").native_math.geluDerivative(@import("antfly_tile").fexpr.operand("sech2"))).evaluate(struct {}, .{ .value = x, .t = t, .x2 = x2, .sech2 = sech2 });
         dst.* = if (std.math.isFinite(derivative)) upstream * derivative else 0.0;
     }
 

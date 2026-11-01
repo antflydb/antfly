@@ -117,14 +117,14 @@ pub fn runRms(comptime width: comptime_int, comptime residual_scaled: bool, a: R
         while (c + width <= a.dim) : (c += width) {
             const v: Vec = x[c..][0..width].*;
             const w: Vec = a.gamma[c..][0..width].*;
-            const normalized = (comptime native_math.rms(.scale_then_weight)).evaluate(struct {}, fexpr.Inputs(Vec){ .value = v, .gate = @splat(inv), .bias = w, .residual = @splat(0) });
+            const normalized = (comptime native_math.rms(.scale_then_weight)).evaluate(struct {}, .{ .value = v, .inverse = @as(Vec, @splat(inv)), .weight = w });
             out[c..][0..width].* = if (residual_scaled)
                 (@as(Vec, a.residual.?[r * a.dim + c ..][0..width].*) + normalized * @as(Vec, @splat(a.norm_scale))) * @as(Vec, @splat(a.output_scale))
             else
                 normalized;
         }
         while (c < a.dim) : (c += 1) {
-            const normalized = (comptime native_math.rms(.scale_then_weight)).evaluate(struct {}, fexpr.Inputs(f32){ .value = x[c], .gate = inv, .bias = a.gamma[c], .residual = 0 });
+            const normalized = (comptime native_math.rms(.scale_then_weight)).evaluate(struct {}, .{ .value = x[c], .inverse = inv, .weight = a.gamma[c] });
             out[c] = if (residual_scaled) (a.residual.?[r * a.dim + c] + normalized * a.norm_scale) * a.output_scale else normalized;
         }
     }

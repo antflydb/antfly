@@ -64,7 +64,7 @@ pub const source_1 = program.metal(program.render(
     \\}
     \\
 , .{
-    .normalized = emit(tile.native_math.rms(.scale_then_weight), "float(input[base + i])", "weight[i]", "inv_rms", ""),
+    .normalized = f.binding(tile.native_math.rms(.scale_then_weight), tile.native_math.metal, .{ .value = "float(input[base + i])", .weight = "weight[i]", .inverse = "inv_rms" }),
 }));
 pub const source_2 = program.metal(program.render(
     \\template<bool Clamp> inline void termite_rms_norm_simd4_impl(
@@ -87,5 +87,5 @@ pub const source_2 = program.metal(program.render(
     \\}
     \\
 , .{
-    .normalized = emit(tile.native_math.rms(.weighted_inverse), "x", "w", "inv_rms", ""),
+    .normalized = f.binding(tile.native_math.rms(.weighted_inverse), tile.native_math.metal, .{ .value = "x", .weight = "w", .inverse = "inv_rms" }),
 }));

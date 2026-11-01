@@ -21,6 +21,7 @@ const cuda_phases = @import("native/cuda_phases.zig");
 const metal_phases = @import("native/metal_phases.zig");
 
 pub const regions = r.regions(&.{
+    r.metalFamily("training.math", metal_phases),
     r.metalFamily("normalization.epilogue", @import("native/metal_normalization_epilogue.zig")),
     r.metalFamily("projection.epilogue", @import("native/metal_projection_epilogue.zig")),
     r.cudaFamily("projection.epilogue", @import("native/cuda_projection_epilogue.zig")),
@@ -116,7 +117,7 @@ pub const regions = r.regions(&.{
     r.metalFamily("projection.dot_small_m", @import("native/metal_projection_dot_small_m.zig")),
     r.cudaSourceFamily("attention.direct", program.render(@embedFile("native/cuda/attention_direct.cu"), cuda_phases.attention)),
     r.cudaSourceFamily("convolution.direct", @embedFile("native/cuda/convolution.cu")),
-    r.cudaSourceFamily("elementwise.direct", @embedFile("native/cuda/elementwise_direct.cu")),
+    r.cudaSourceFamily("elementwise.direct", program.render(@embedFile("native/cuda/elementwise_direct.cu"), cuda_phases.elementwise)),
     r.cudaSourceFamily("expert.projection.direct", program.render(@embedFile("native/cuda/expert_projection.cu"), cuda_phases.projection)),
     r.cudaSourceFamily("kv.storage.direct", @embedFile("native/cuda/kv_storage.cu")),
     r.cudaSourceFamily("normalization.direct", @embedFile("native/cuda/normalization_direct.cu")),
@@ -124,8 +125,8 @@ pub const regions = r.regions(&.{
     r.cudaSourceFamily("projection.direct", program.render(@embedFile("native/cuda/projection_direct.cu"), cuda_phases.projection)),
     r.cudaSourceFamily("selection.direct", @embedFile("native/cuda/selection.cu")),
     r.cudaSourceFamily("sequence.transforms.direct", @embedFile("native/cuda/sequence_transforms.cu")),
-    r.cudaSourceFamily("tensor.layout.direct", program.render(@embedFile("native/cuda/tensor_layout.cu"), .{ .interleaved_three_stores = (@import("antfly_tile").layout.InterleavedRows{ .parts = 3 }).nativeStores(&.{ "first", "second", "third" }, "input", "idx", "src", "dim") })),
-    r.cudaSourceFamily("training.direct", @embedFile("native/cuda/training.cu")),
+    r.cudaSourceFamily("tensor.layout.direct", program.render(@embedFile("native/cuda/tensor_layout.cu"), .{ .channel_coordinates = (@import("antfly_tile").layout.DenseIndex4{ .axes = .{ "c", "x", "y", "b" }, .extents = .{ "channels", "width", "height" } }).native("unsigned int"), .window_coordinates = (@import("antfly_tile").layout.DenseIndex4{ .axes = .{ "feature", "x", "y", "b" }, .extents = .{ "dim", "width", "height" } }).native("unsigned int"), .interleaved_three_stores = (@import("antfly_tile").layout.InterleavedRows{ .parts = 3 }).nativeStores(&.{ "first", "second", "third" }, "input", "idx", "src", "dim") })),
+    r.cudaSourceFamily("training.direct", program.render(@embedFile("native/cuda/training.cu"), cuda_phases.training)),
     r.encodedMetalSourceFamily("attention.direct", program.render(@embedFile("native/metal/attention_direct.m"), metal_phases.boundary)),
     r.encodedMetalSourceFamily("audio.direct", @embedFile("native/metal/audio.m")),
     r.metalSourceFamily("convolution.direct", @embedFile("native/metal/convolution.metal")),

@@ -137,10 +137,19 @@ pub fn decoderActivationSource(comptime source: Source, comptime qualifier: []co
 pub const Statistics = enum { rms_uncentered, centered_two_pass, raw_moments_tree, welford };
 pub const RmsOrder = enum { scale_then_weight, weighted_inverse };
 pub fn rms(comptime order: RmsOrder) f.FExpr {
-    return if (order == .scale_then_weight) f.acc.times(.gate).times(.bias) else f.acc.times((@as(f.FExpr, .gate)).times(.bias));
+    return if (order == .scale_then_weight) f.acc.times(f.operand("inverse")).times(f.operand("weight")) else f.acc.times(f.operand("inverse").times(f.operand("weight")));
 }
 pub const layer_affine = f.acc.times(.gate).times(.bias).plus(.residual);
 
 pub fn cudaExpression(comptime expr: f.FExpr, comptime value: []const u8, comptime bias: []const u8, comptime gate: []const u8, comptime residual: []const u8) f.Emission {
     return .{ .expr = expr, .source = cuda, .inputs = .{ .value = value, .bias = bias, .gate = gate, .residual = residual } };
+}
+
+/// These are forward/adjoint recipes, not symbolic differentiation: callers
+/// retain saved intermediates, finite guards and storage rounding schedules.
+pub fn geluDerivative(comptime sech2: f.FExpr) f.FExpr {
+    return f.lit(0.5).times(f.lit(1).plus(f.operand("t"))).plus(f.lit(0.5).times(f.acc).times(sech2).times(f.lit(0.7978845608028654)).times(f.lit(1).plus(f.lit(0.134145).times(f.operand("x2")))));
+}
+pub fn rotary(comptime upper: bool) f.FExpr {
+    return if (upper) f.acc.times(f.operand("sine")).plus(f.operand("other").times(f.operand("cosine"))) else f.acc.times(f.operand("cosine")).minus(f.operand("other").times(f.operand("sine")));
 }

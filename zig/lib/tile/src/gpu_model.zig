@@ -530,3 +530,31 @@ pub fn nativeMetalExport(comptime name: []const u8, comptime buffers: []const Na
     args = args ++ .{l.params(params_type, buffers.len)};
     return l.kernel(name, 0, args, attributes) ++ body ++ "}\n";
 }
+
+pub const RotaryPlane = struct { input: []const u8, output: []const u8, prefix: []const u8 = "" };
+pub fn nativeMetalRotary(comptime name: []const u8, comptime planes: []const RotaryPlane) []const u8 {
+    if (planes.len == 0) @compileError("rotary program requires an output plane");
+    var buffers: []const NativeBuffer = &.{};
+    var copies: []const u8 = "";
+    var loads: []const u8 = "";
+    var lower: []const u8 = "";
+    var upper: []const u8 = "";
+    for (planes) |p| {
+        buffers = buffers ++ [_]NativeBuffer{.{ .name = p.input }};
+        copies = copies ++ p.output ++ "[gid] = " ++ p.input ++ "[gid]; ";
+        const x0 = p.prefix ++ "x0";
+        const x1 = p.prefix ++ "x1";
+        loads = loads ++ "    float " ++ x0 ++ " = " ++ p.input ++ "[base + idx0]; float " ++ x1 ++ " = " ++ p.input ++ "[base + idx1];\n";
+        const bindings = .{ .value = x0, .other = x1, .cosine = "cos_val", .sine = "sin_val" };
+        lower = lower ++ p.output ++ "[gid] = " ++ @import("native_math.zig").rotary(false).renderNative(.{}, bindings, null) ++ "; ";
+        upper = upper ++ p.output ++ "[gid] = " ++ @import("native_math.zig").rotary(true).renderNative(.{}, bindings, null) ++ "; ";
+    }
+    buffers = buffers ++ [_]NativeBuffer{.{ .name = "positions", .element = "uint" }};
+    for (planes) |p| buffers = buffers ++ [_]NativeBuffer{.{ .name = p.output, .writable = true }};
+    const body = "    uint total = p.total_chunks * p.head_dim; if (gid >= total) return; uint chunk = gid / p.head_dim; uint d = gid - chunk * p.head_dim; uint base = chunk * p.head_dim;\n" ++
+        "    if (p.rope_dim < 2u) { " ++ copies ++ "return; }\n    uint idx0 = 0u; uint idx1 = 0u; uint j = 0u;\n" ++
+        "    if (!termite_rope_pair_indices(d, p.head_dim, p.rope_dim, p.consecutive_pairs, idx0, idx1, j)) { " ++ copies ++ "return; }\n" ++
+        "    float pos = float(positions[chunk]); float freq = 1.0f / pow(p.theta, float(2u * j) / float(p.rope_dim)); float angle = pos * p.freq_scale * freq; float cos_val = cos(angle); float sin_val = sin(angle);\n" ++ loads ++
+        "    if (d == idx0) { " ++ lower ++ "} else if (d == idx1) { " ++ upper ++ "} else { " ++ copies ++ "}\n";
+    return nativeMetalExport(name, buffers, "termite_metal_rope_params", &.{"uint gid [[thread_position_in_grid]]"}, body);
+}

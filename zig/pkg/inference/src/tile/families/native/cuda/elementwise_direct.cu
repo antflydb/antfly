@@ -193,13 +193,13 @@ extern "C" __global__ void termite_elementwise_f32(
     } else if (op == 1u) {
         out = x * y;
     } else if (op == 2u) {
-        out = x / (1.0f + expf(-x));
+        out = termite_decoder_activation_f32(x, 2u);
     } else if (op == 3u) {
-        out = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+        out = termite_decoder_activation_f32(x, 0u);
     } else if (op == 4u) {
         out = fmaxf(x, 0.0f);
     } else if (op == 5u) {
-        out = x / (1.0f + expf(-1.702f * x));
+        out = termite_decoder_activation_f32(x, 4u);
     } else if (op == 6u) {
         out = 1.0f / (1.0f + expf(-x));
     } else if (op == 7u) {
@@ -249,7 +249,7 @@ extern "C" __global__ void termite_elementwise_f32(
             derivative = 0.0f;
         } else {
             float t = tanhf(inner);
-            derivative = 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * 0.7978845608028654f * (1.0f + 0.134145f * x2);
+            derivative = {{gelu_derivative_x}};
         }
         out = isfinite(derivative) ? y * derivative : 0.0f;
     }
@@ -265,7 +265,7 @@ extern "C" __global__ void termite_silu_multiply_f32(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     float x = gate[i];
-    dst[i] = (x / (1.0f + expf(-x))) * up[i];
+    dst[i] = (termite_decoder_activation_f32(x, 2u)) * up[i];
 }
 // native-program:entry termite_activation_multiply_f32
 extern "C" __global__ void termite_activation_multiply_f32(
@@ -278,21 +278,7 @@ extern "C" __global__ void termite_activation_multiply_f32(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     float x = gate[i];
-    float act;
-    if (activation == 0u) {
-        act = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    } else if (activation == 1u) {
-        act = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    } else if (activation == 2u) {
-        act = x / (1.0f + expf(-x));
-    } else if (activation == 3u) {
-        act = fmaxf(x, 0.0f);
-    } else if (activation == 4u) {
-        act = x / (1.0f + expf(-1.702f * x));
-    } else {
-        float r = fmaxf(x, 0.0f);
-        act = r * r;
-    }
+    float act = termite_decoder_activation_f32(x, activation);
     dst[i] = act * up[i];
 }
 // native-program:entry termite_florence_vision_tail_sources_f32
