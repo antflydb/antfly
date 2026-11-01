@@ -46,6 +46,7 @@ const rq = antfly_vector.quantizer;
 const vproto = antfly_vector.proto;
 const vmath = antfly_vector.vector;
 const vrabitq = antfly_vector.rabitq;
+const rqx = antfly_vector.rabitq_ex;
 
 /// Distance metric. Values match `antfly_vector.vector.DistanceMetric`.
 pub const Metric = enum(u8) {
@@ -91,6 +92,10 @@ pub const Config = struct {
     /// Not serialized or replicated yet: `serialize` and `Delta.encode`
     /// refuse indexes and deltas that use it.
     store_upper: bool = false,
+    /// RaBitQ bits per dimension, 1 to 8. One uses the repo's 1-bit kernel;
+    /// more use extended RaBitQ (`antfly_vector.rabitq_ex`), whose tighter
+    /// estimates and bounds trade index bytes for fewer recomputations.
+    rabitq_bits: u8 = 1,
 
     pub fn resolved(self: Config) !Config {
         if (self.dims == 0) return error.InvalidConfig;
@@ -98,6 +103,8 @@ pub const Config = struct {
         if (self.ef_construction == 0) return error.InvalidConfig;
         if (self.quantizer == .rabitq and self.dims < 2) return error.InvalidConfig;
         if (!(self.hub_fraction >= 0 and self.hub_fraction <= 1)) return error.InvalidConfig;
+        if (self.rabitq_bits == 0 or self.rabitq_bits > rqx.max_bits) return error.InvalidConfig;
+        if (self.quantizer != .rabitq and self.rabitq_bits != 1) return error.InvalidConfig;
         var out = self;
         if (out.low_degree == 0) out.low_degree = @max(2, out.max_degree / 5);
         if (out.low_degree > out.max_degree) return error.InvalidConfig;
@@ -1476,7 +1483,7 @@ pub const Index = struct {
     // ---------------------------------------------------------------------
 
     const magic = "LEANNIDX";
-    pub const format_version: u32 = 4;
+    pub const format_version: u32 = 5;
 
     /// Serializes the graph layers, quantizer state, codes, and flags. No
     /// embeddings are written. Layout after the header: quantizer section,
@@ -1499,6 +1506,7 @@ pub const Index = struct {
         try wr.writeInt(u32, @bitCast(cfg.hub_fraction), .little);
         try wr.writeInt(u32, cfg.pq_subspaces, .little);
         try wr.writeInt(u64, cfg.seed, .little);
+        try wr.writeByte(cfg.rabitq_bits);
         try wr.writeInt(u32, self.node_count, .little);
         try wr.writeInt(u32, self.entry, .little);
         try wr.writeByte(self.max_level);
@@ -1541,7 +1549,8 @@ pub const Index = struct {
         var r: std.Io.Reader = .fixed(body);
         const head = r.take(magic.len) catch return error.InvalidFormat;
         if (!std.mem.eql(u8, head, magic)) return error.InvalidFormat;
-        if ((try readU32(&r)) != format_version) return error.UnsupportedVersion;
+        const file_version = try readU32(&r);
+        if (file_version != format_version and file_version != 4) return error.UnsupportedVersion;
         var cfg = Config{ .dims = try readU32(&r) };
         cfg.metric = std.enums.fromInt(Metric, r.takeByte() catch return error.InvalidFormat) orelse return error.InvalidFormat;
         cfg.quantizer = std.enums.fromInt(Quantizer, r.takeByte() catch return error.InvalidFormat) orelse return error.InvalidFormat;
@@ -1551,6 +1560,8 @@ pub const Index = struct {
         cfg.hub_fraction = @bitCast(try readU32(&r));
         cfg.pq_subspaces = try readU32(&r);
         cfg.seed = r.takeInt(u64, .little) catch return error.InvalidFormat;
+        // Version 4 predates multi-bit RaBitQ.
+        if (file_version >= 5) cfg.rabitq_bits = r.takeByte() catch return error.InvalidFormat;
         cfg = cfg.resolved() catch return error.InvalidFormat;
         const n = try readU32(&r);
         const entry = try readU32(&r);
@@ -1765,6 +1776,8 @@ const Approx = struct {
     out: std.ArrayListUnmanaged(Est) = .empty,
     /// Query in the space of `Index.upper_vectors`, when the index has any.
     exact_q: []f32 = &.{},
+    /// Multi-bit RaBitQ only.
+    ex_query: ?rqx.Codec.Query = null,
 
     const Pair = struct { id: u32, slot: u32 };
 
@@ -1783,6 +1796,10 @@ const Approx = struct {
         const rotated = try alloc.alloc(f32, q.len);
         defer alloc.free(rotated);
         _ = r.rotation.transform(q, rotated);
+        if (r.ex) |ex| {
+            self.ex_query = try ex.prepare(alloc, r.centroid, rotated);
+            return self;
+        }
         const scratch = try alloc.create(rq.RaBitQuantizer.EstimateScratch);
         errdefer alloc.destroy(scratch);
         scratch.* = try rq.RaBitQuantizer.EstimateScratch.init(alloc, q.len);
@@ -1795,6 +1812,7 @@ const Approx = struct {
     fn deinit(self: *Approx) void {
         if (self.table.len > 0) self.alloc.free(self.table);
         if (self.exact_q.len > 0) self.alloc.free(self.exact_q);
+        if (self.ex_query) |*eq| eq.deinit(self.alloc);
         if (self.scratch) |s| {
             s.deinit(self.alloc);
             self.alloc.destroy(s);
@@ -1820,6 +1838,15 @@ const Approx = struct {
         if (ids.len == 0) return out;
         if (self.index.pq) |*pq| {
             for (ids, out) |id, *o| o.* = .{ .dist = pq.adc(self.table, self.index.code(id)), .bound = 0 };
+            return out;
+        }
+        if (self.ex_query) |*eq| {
+            const r = &self.index.rabitq.?;
+            const ex = r.ex.?;
+            for (ids, out) |id, *o| {
+                const e = ex.estimate(eq, r.exRow(id));
+                o.* = .{ .dist = e.distance, .bound = e.bound };
+            }
             return out;
         }
         // The RaBitQ kernel scores sorted, non-overlapping ranges.
@@ -1884,13 +1911,18 @@ pub const RaBitQCodes = struct {
     quantized_dot_products: std.ArrayListUnmanaged(f32) = .empty,
     /// Empty for l2_squared.
     centroid_dot_products: std.ArrayListUnmanaged(f32) = .empty,
+    /// Multi-bit codes (`Config.rabitq_bits > 1`): one self-contained row of
+    /// `ex.rowBytes()` bytes per node, replacing the 1-bit arrays above.
+    ex: ?rqx.Codec = null,
+    ex_rows: std.ArrayListUnmanaged(u8) = .empty,
 
     fn init(alloc: Allocator, cfg: Config) !RaBitQCodes {
         const metric: vmath.DistanceMetric = @fromBackingInt(@intCast(@backingInt(cfg.metric)));
         var quantizer = try rq.RaBitQuantizer.init(alloc, cfg.dims, cfg.seed, metric);
         errdefer quantizer.deinit();
         const rotation = try vmath.RandomOrthogonalTransformer.init(alloc, .givens, cfg.dims, cfg.seed);
-        return .{ .quantizer = quantizer, .rotation = rotation, .metric = metric, .dims = cfg.dims, .width = vrabitq.codeWidth(cfg.dims) };
+        const ex: ?rqx.Codec = if (cfg.rabitq_bits > 1) try rqx.Codec.init(cfg.dims, cfg.rabitq_bits, metric) else null;
+        return .{ .quantizer = quantizer, .rotation = rotation, .metric = metric, .dims = cfg.dims, .width = vrabitq.codeWidth(cfg.dims), .ex = ex };
     }
 
     fn deinit(self: *RaBitQCodes, alloc: Allocator) void {
@@ -1902,10 +1934,17 @@ pub const RaBitQCodes = struct {
         self.centroid_distances.deinit(alloc);
         self.quantized_dot_products.deinit(alloc);
         self.centroid_dot_products.deinit(alloc);
+        self.ex_rows.deinit(alloc);
     }
 
     fn count(self: *const RaBitQCodes) usize {
+        if (self.ex) |ex| return self.ex_rows.items.len / ex.rowBytes();
         return self.code_counts.items.len;
+    }
+
+    fn exRow(self: *const RaBitQCodes, id: u32) []const u8 {
+        const len = self.ex.?.rowBytes();
+        return self.ex_rows.items[@as(usize, id) * len ..][0..len];
     }
 
     fn rotateInPlace(self: *const RaBitQCodes, alloc: Allocator, rows: []f32) !void {
@@ -1931,6 +1970,12 @@ pub const RaBitQCodes = struct {
         for (self.centroid, sum) |*c, s| c.* = @floatCast(s / @as(f64, @floatFromInt(n)));
         self.centroid_norm = if (self.metric == .l2_squared) 0 else @sqrt(dot(self.centroid, self.centroid));
 
+        if (self.ex) |ex| {
+            const len = ex.rowBytes();
+            try self.ex_rows.resize(alloc, n * len);
+            for (0..n) |i| try ex.encodeAlloc(alloc, self.centroid, rotated[i * self.dims ..][0..self.dims], self.ex_rows.items[i * len ..][0..len]);
+            return;
+        }
         var set = try self.quantizer.quantize(self.centroid, rotated, n);
         defer set.deinit(alloc);
         try self.codes.appendSlice(alloc, set.codes.data);
@@ -1960,10 +2005,20 @@ pub const RaBitQCodes = struct {
     /// distance, f32 quantized dot product, then f32 centroid dot product
     /// for inner product and cosine.
     fn rowByteLen(self: *const RaBitQCodes) usize {
+        if (self.ex) |ex| return ex.rowBytes();
         return self.width * 8 + 12 + (if (self.metric != .l2_squared) @as(usize, 4) else 0);
     }
 
     fn encodeRowBytes(self: *const RaBitQCodes, alloc: Allocator, v: []const f32) ![]u8 {
+        if (self.ex) |ex| {
+            const rotated = try alloc.alloc(f32, self.dims);
+            defer alloc.free(rotated);
+            _ = self.rotation.transform(v, rotated);
+            const out = try alloc.alloc(u8, ex.rowBytes());
+            errdefer alloc.free(out);
+            try ex.encodeAlloc(alloc, self.centroid, rotated, out);
+            return out;
+        }
         var row = try self.encodeRow(alloc, v);
         defer row.deinit(alloc);
         const out = try alloc.alloc(u8, self.rowByteLen());
@@ -1980,6 +2035,7 @@ pub const RaBitQCodes = struct {
     }
 
     fn appendRowBytesAssumeCapacity(self: *RaBitQCodes, bytes: []const u8) void {
+        if (self.ex != null) return self.ex_rows.appendSliceAssumeCapacity(bytes);
         var pos: usize = 0;
         for (0..self.width) |_| {
             self.codes.appendAssumeCapacity(std.mem.readInt(u64, bytes[pos..][0..8], .little));
@@ -1993,6 +2049,7 @@ pub const RaBitQCodes = struct {
 
     /// Appends a copy of `other`'s row `id`. Both must share a centroid.
     fn appendRowFromAssumeCapacity(self: *RaBitQCodes, other: *const RaBitQCodes, id: u32) void {
+        if (self.ex != null) return self.ex_rows.appendSliceAssumeCapacity(other.exRow(id));
         const i: usize = id;
         self.codes.appendSliceAssumeCapacity(other.codes.items[i * self.width ..][0..self.width]);
         self.code_counts.appendAssumeCapacity(other.code_counts.items[i]);
@@ -2002,6 +2059,10 @@ pub const RaBitQCodes = struct {
     }
 
     fn popRow(self: *RaBitQCodes) void {
+        if (self.ex) |ex| {
+            self.ex_rows.items.len -= ex.rowBytes();
+            return;
+        }
         self.codes.items.len -= self.width;
         self.code_counts.items.len -= 1;
         self.centroid_distances.items.len -= 1;
@@ -2010,6 +2071,7 @@ pub const RaBitQCodes = struct {
     }
 
     fn decodeRowBytes(self: *const RaBitQCodes, bytes: []const u8, out: []f32) void {
+        if (self.ex) |ex| return ex.decode(self.centroid, bytes, out);
         const cd: f32 = @bitCast(std.mem.readInt(u32, bytes[self.width * 8 + 4 ..][0..4], .little));
         const scale = cd / @sqrt(@as(f32, @floatFromInt(self.dims)));
         for (out, 0..) |*o, j| {
@@ -2020,6 +2082,7 @@ pub const RaBitQCodes = struct {
     }
 
     fn reserve(self: *RaBitQCodes, alloc: Allocator, extra: usize) !void {
+        if (self.ex) |ex| return self.ex_rows.ensureUnusedCapacity(alloc, extra * ex.rowBytes());
         try self.codes.ensureUnusedCapacity(alloc, extra * self.width);
         try self.code_counts.ensureUnusedCapacity(alloc, extra);
         try self.centroid_distances.ensureUnusedCapacity(alloc, extra);
@@ -2051,6 +2114,7 @@ pub const RaBitQCodes = struct {
 
     /// Reconstruction in rotated space: centroid + |r| * sign(code) / sqrt(D).
     fn decode(self: *const RaBitQCodes, id: u32, out: []f32) void {
+        if (self.ex) |ex| return ex.decode(self.centroid, self.exRow(id), out);
         const words = self.codes.items[@as(usize, id) * self.width ..][0..self.width];
         const scale = self.centroid_distances.items[id] / @sqrt(@as(f32, @floatFromInt(self.dims)));
         for (out, 0..) |*o, j| {
@@ -2062,6 +2126,7 @@ pub const RaBitQCodes = struct {
     fn write(self: *const RaBitQCodes, wr: *std.Io.Writer) !void {
         for (self.centroid) |f| try wr.writeInt(u32, @bitCast(f), .little);
         try wr.writeInt(u32, @bitCast(self.centroid_norm), .little);
+        if (self.ex != null) return wr.writeAll(self.ex_rows.items);
         for (self.codes.items) |c| try wr.writeInt(u64, c, .little);
         for (self.code_counts.items) |c| try wr.writeInt(u32, c, .little);
         for (self.centroid_distances.items) |f| try wr.writeInt(u32, @bitCast(f), .little);
@@ -2070,6 +2135,15 @@ pub const RaBitQCodes = struct {
     }
 
     fn read(self: *RaBitQCodes, alloc: Allocator, r: *std.Io.Reader, n: u32) !void {
+        if (self.ex) |ex| {
+            const total = @as(usize, n) * ex.rowBytes();
+            if (r.bufferedLen() < self.dims * 4 + 4 + total) return error.InvalidFormat;
+            self.centroid = try alloc.alloc(f32, self.dims);
+            for (self.centroid) |*f| f.* = @bitCast(readU32(r) catch unreachable);
+            self.centroid_norm = @bitCast(readU32(r) catch unreachable);
+            try self.ex_rows.appendSlice(alloc, r.take(total) catch unreachable);
+            return;
+        }
         const per_node: usize = self.width * 8 + 4 * 3 + (if (self.metric != .l2_squared) @as(usize, 4) else 0);
         if (r.bufferedLen() < self.dims * 4 + 4 + per_node * n) return error.InvalidFormat;
         self.centroid = try alloc.alloc(f32, self.dims);
@@ -3148,6 +3222,49 @@ test "leann: rabitq serialization and inserts without recomputation" {
         bad[bad.len / 3] ^= 0x10;
         try testing.expectError(error.InvalidFormat, Index.deserialize(alloc, bad));
     }
+}
+
+test "leann: multi-bit rabitq recomputes less and round-trips" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 2400, 20, 64, 16, 47);
+    defer fx.deinit(alloc);
+    var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 64 };
+    var one_bit = try Index.build(alloc, .{ .dims = 64, .metric = .cosine, .quantizer = .rabitq, .max_degree = 16 }, fx.data[0 .. 2000 * 64]);
+    defer one_bit.deinit();
+    var four_bit = try Index.build(alloc, .{ .dims = 64, .metric = .cosine, .quantizer = .rabitq, .rabitq_bits = 4, .max_degree = 16 }, fx.data[0 .. 2000 * 64]);
+    defer four_bit.deinit();
+    try testing.expectError(error.InvalidConfig, Index.build(alloc, .{ .dims = 64, .quantizer = .pq, .rabitq_bits = 4 }, fx.data[0 .. 100 * 64]));
+
+    // A replica fed the leader's encoded deltas ends up byte-identical.
+    var replica = try Index.build(alloc, .{ .dims = 64, .metric = .cosine, .quantizer = .rabitq, .rabitq_bits = 4, .max_degree = 16 }, fx.data[0 .. 2000 * 64]);
+    defer replica.deinit();
+    for (2000..2400) |i| {
+        var delta = try four_bit.planInsert(alloc, src.source(), fx.data[i * 64 ..][0..64]);
+        defer delta.deinit(alloc);
+        const wire = try delta.encode(alloc);
+        defer alloc.free(wire);
+        var decoded = try Delta.decode(alloc, wire);
+        defer decoded.deinit(alloc);
+        try four_bit.applyDelta(delta);
+        try replica.applyDelta(decoded);
+    }
+    try testing.expectEqual(@as(u64, 0), src.recomputed);
+    const a_bytes = try four_bit.serialize(alloc);
+    defer alloc.free(a_bytes);
+    const b_bytes = try replica.serialize(alloc);
+    defer alloc.free(b_bytes);
+    try testing.expectEqualSlices(u8, a_bytes, b_bytes);
+    var copy = try Index.deserialize(alloc, a_bytes);
+    defer copy.deinit();
+    try testing.expectEqual(@as(u8, 4), copy.config.rabitq_bits);
+
+    const opts = SearchOptions{ .k = 10, .ef = 128, .rerank = .bounds };
+    const r1 = try recallAt(alloc, &one_bit, &fx, src.source(), opts, 20, 2000);
+    const r4 = try recallAt(alloc, &copy, &fx, src.source(), opts, 20, 2400);
+    testing.expect(r4.recomputed < r1.recomputed and r4.recall >= r1.recall - 0.03) catch |err| {
+        std.debug.print("1-bit recall={d:.3} rec={d:.1} | 4-bit recall={d:.3} rec={d:.1}\n", .{ r1.recall, r1.recomputed, r4.recall, r4.recomputed });
+        return err;
+    };
 }
 
 test "leann: replicas applying the leader's deltas stay byte-identical" {

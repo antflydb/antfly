@@ -20,7 +20,7 @@
 //!       [--metric l2|cosine|ip] [--m 30] [--efc 128] [--quantizer pq|rabitq|both] \
 //!       [--unpruned 1] [--cost FILE]
 //!       [--churn ROUNDS] [--churn-frac 0.05] [--rebuild-at 0.2]
-//!       [--churn-set maintenance|rebuild]
+//!       [--churn-set maintenance|rebuild|codes|int4] [--bits 1..8]
 //!
 //! --churn switches to the mixed-workload benchmark: after the initial build,
 //! each round deletes `churn-frac * n` random live vectors and inserts as many
@@ -59,9 +59,11 @@ const Args = struct {
     churn_frac: f64 = 0.05,
     rebuild_at: f64 = 0.2,
     churn_set: ChurnSet = .maintenance,
+    /// RaBitQ bits per dimension.
+    bits: u8 = 1,
 };
 
-const ChurnSet = enum { maintenance, rebuild };
+const ChurnSet = enum { maintenance, rebuild, codes, int4 };
 
 /// Embedder cost curve: milliseconds per call at measured batch sizes,
 /// linearly interpolated (and extrapolated from the last two points).
@@ -146,6 +148,8 @@ pub fn main(init: std.process.Init) !void {
             args.churn = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--churn-frac")) {
             args.churn_frac = try std.fmt.parseFloat(f64, value);
+        } else if (std.mem.eql(u8, flag, "--bits")) {
+            args.bits = try std.fmt.parseInt(u8, value, 10);
         } else if (std.mem.eql(u8, flag, "--churn-set")) {
             args.churn_set = std.meta.stringToEnum(ChurnSet, value) orelse return error.UnknownChurnSet;
         } else if (std.mem.eql(u8, flag, "--rebuild-at")) {
@@ -208,14 +212,15 @@ pub fn main(init: std.process.Init) !void {
 
     for (variants[0..nv]) |variant| {
         const t0 = std.Io.Timestamp.now(io, .awake);
-        var index = try leann.Index.build(alloc, .{ .dims = @intCast(dims), .metric = args.metric, .quantizer = variant.quantizer, .max_degree = args.m, .ef_construction = args.efc, .prune = variant.prune }, train.data);
+        var index = try leann.Index.build(alloc, .{ .dims = @intCast(dims), .metric = args.metric, .quantizer = variant.quantizer, .max_degree = args.m, .ef_construction = args.efc, .prune = variant.prune, .rabitq_bits = if (variant.quantizer == .rabitq) args.bits else 1 }, train.data);
         defer index.deinit();
         const build_ms = @as(f64, @floatFromInt(t0.untilNow(io, .awake).nanoseconds)) / 1e6;
         const bytes = try index.serialize(alloc);
         defer alloc.free(bytes);
         const gs = index.graphStats();
-        try out.print("\n== {s} {s} graph: build {d:.1}s, avg degree {d:.2}, max {d}, hubs {d}, levels {d}, upper nodes {d}, repaired {d}, index {d:.2} MiB = {d:.1}% of raw f32 ({d:.2} MiB)\n", .{
+        try out.print("\n== {s} (bits {d}) {s} graph: build {d:.1}s, avg degree {d:.2}, max {d}, hubs {d}, levels {d}, upper nodes {d}, repaired {d}, index {d:.2} MiB = {d:.1}% of raw f32 ({d:.2} MiB)\n", .{
             @tagName(variant.quantizer),
+            if (variant.quantizer == .rabitq) args.bits else 0,
             if (variant.prune) "pruned" else "unpruned",
             build_ms / 1000,
             gs.avg_degree,
@@ -494,6 +499,8 @@ const RebuildSource = enum {
     codes,
     /// A per-dimension int8 copy (dims bytes per vector of extra storage).
     int8,
+    /// A per-dimension 4-bit copy (dims / 2 bytes per vector).
+    int4,
 };
 
 const ChurnVariant = struct {
@@ -504,8 +511,9 @@ const ChurnVariant = struct {
     source: RebuildSource = .exact,
 };
 
-/// Round-trips rows through per-dimension int8 scalar quantization.
-fn int8RoundTrip(alloc: Allocator, rows: []const f32, dims: usize, metric: leann.Metric) ![]f32 {
+/// Round-trips rows through per-dimension scalar quantization to `levels`
+/// values (256 for int8, 16 for 4 bits).
+fn scalarRoundTrip(alloc: Allocator, rows: []const f32, dims: usize, metric: leann.Metric, levels: f32) ![]f32 {
     const out = try alloc.dupe(f32, rows);
     errdefer alloc.free(out);
     const n = rows.len / dims;
@@ -523,7 +531,7 @@ fn int8RoundTrip(alloc: Allocator, rows: []const f32, dims: usize, metric: leann
         h.* = @max(h.*, x);
     };
     for (0..n) |i| for (out[i * dims ..][0..dims], lo, hi) |*x, l, h| {
-        const step = (h - l) / 255;
+        const step = (h - l) / (levels - 1);
         if (step == 0) continue;
         x.* = l + @round((x.* - l) / step) * step;
     };
@@ -575,7 +583,7 @@ const ChurnState = struct {
         }
         var guide: ?[]f32 = null;
         defer if (guide) |g| alloc.free(g);
-        if (source == .int8) guide = try int8RoundTrip(alloc, st.vecs.items, rows.dims, self.index.config.metric);
+        if (source == .int8 or source == .int4) guide = try scalarRoundTrip(alloc, st.vecs.items, rows.dims, self.index.config.metric, if (source == .int8) 256 else 16);
         st.index = try self.index.rebuildFromCodes(alloc, nodes, guide);
         return st;
     }
@@ -631,7 +639,7 @@ fn runChurn(alloc: Allocator, io: std.Io, out: *std.Io.Writer, args: Args) !void
     const quantizer = args.quantizer orelse .rabitq;
     if (quantizer != .rabitq) return error.ChurnNeedsRaBitQ;
 
-    try out.print("churn: n={d} dims={d} queries={d} rounds={d} per round: {d} deletes + {d} inserts, rebuild at {d:.0}% deleted, M={d} efC={d}\n", .{ args.n, rows.dims, queries.rows, args.churn, per_round, per_round, args.rebuild_at * 100, args.m, args.efc });
+    try out.print("churn: n={d} dims={d} queries={d} rounds={d} per round: {d} deletes + {d} inserts, rebuild at {d:.0}% deleted, M={d} efC={d}, rabitq bits {d}\n", .{ args.n, rows.dims, queries.rows, args.churn, per_round, per_round, args.rebuild_at * 100, args.m, args.efc, args.bits });
     try out.flush();
     const t_truth = std.Io.Timestamp.now(io, .awake);
     var w = try makeWorkload(alloc, rows, queries, args.metric, args.n, args.churn, per_round, k);
@@ -650,16 +658,25 @@ fn runChurn(alloc: Allocator, io: std.Io, out: *std.Io.Writer, args: Args) !void
         .{ .name = "tombstones + rebuild from int8", .store_upper = false, .consolidate = false, .rebuild = true, .source = .int8 },
         .{ .name = "consolidate + rebuild from codes", .store_upper = false, .consolidate = true, .rebuild = true, .source = .codes },
     };
+    const codes_set = [_]ChurnVariant{
+        .{ .name = "tombstones + rebuild from exact", .store_upper = false, .consolidate = false, .rebuild = true, .source = .exact },
+        .{ .name = "tombstones + rebuild from codes", .store_upper = false, .consolidate = false, .rebuild = true, .source = .codes },
+    };
+    const int4_set = [_]ChurnVariant{
+        .{ .name = "tombstones + rebuild from int4", .store_upper = false, .consolidate = false, .rebuild = true, .source = .int4 },
+    };
     const variants: []const ChurnVariant = switch (args.churn_set) {
         .maintenance => &maintenance_set,
         .rebuild => &rebuild_set,
+        .codes => &codes_set,
+        .int4 => &int4_set,
     };
     const initial = try alloc.alloc(u32, args.n);
     defer alloc.free(initial);
     for (initial, 0..) |*r, i| r.* = @intCast(i);
 
     for (variants) |variant| {
-        const cfg = leann.Config{ .dims = @intCast(rows.dims), .metric = args.metric, .quantizer = .rabitq, .max_degree = args.m, .ef_construction = args.efc, .store_upper = variant.store_upper };
+        const cfg = leann.Config{ .dims = @intCast(rows.dims), .metric = args.metric, .quantizer = .rabitq, .max_degree = args.m, .ef_construction = args.efc, .store_upper = variant.store_upper, .rabitq_bits = args.bits };
         const tb = std.Io.Timestamp.now(io, .awake);
         var st = try ChurnState.build(alloc, cfg, rows, initial, total);
         defer st.deinit(alloc);
@@ -698,7 +715,7 @@ fn runChurn(alloc: Allocator, io: std.Io, out: *std.Io.Writer, args: Args) !void
                     defer alloc.free(live);
                     var fresh = switch (variant.source) {
                         .exact => try ChurnState.build(alloc, cfg, rows, live, total),
-                        .codes, .int8 => try st.rebuildFromCodes(alloc, rows, live, total, variant.source),
+                        .codes, .int8, .int4 => try st.rebuildFromCodes(alloc, rows, live, total, variant.source),
                     };
                     st.deinit(alloc);
                     st = fresh;
