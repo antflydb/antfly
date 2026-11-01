@@ -299,8 +299,11 @@ max_rss_mb="$(rss_mb_from_kb "${max_rss_kb}")"
 # Large compilations use @response files. Retain them before another packaging
 # invocation replaces its cache, and resolve unit attribution while readable.
 memory_report_status=0
-python3 "${repo_root}/scripts/summarize_zig_compile_memory.py" "${timeline}" \
-    --output "${memory_report}" --capture-response-dir "${response_dir}" || memory_report_status=$?
+(
+    cd "${zig_dir}"
+    python3 "${repo_root}/scripts/summarize_zig_compile_memory.py" "${timeline}" \
+        --output "${memory_report}" --capture-response-dir "${response_dir}"
+) || memory_report_status=$?
 
 {
     echo "label=${label}"
@@ -342,4 +345,7 @@ python3 "${repo_root}/scripts/summarize_zig_compile_memory.py" "${timeline}" \
 printf '%s\n' "${max_cmd}" > "${max_command_file}"
 
 cat "${summary}"
-exit "${build_status}"
+if [ "${build_status}" -ne 0 ]; then
+    exit "${build_status}"
+fi
+exit "${memory_report_status}"

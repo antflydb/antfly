@@ -27,7 +27,10 @@ class DiagnosticTests(unittest.TestCase):
         script = Path(__file__).with_name("diagnose-zig-build-memory.sh")
         with tempfile.TemporaryDirectory(prefix="antfly-command-test-") as tmp:
             root = Path(tmp)
-            response = root / "compiler-args"
+            build_dir = root / "build"
+            build_dir.mkdir()
+            (build_dir / "build.zig").write_text("")
+            response = build_dir / "compiler-args"
             response.write_text("--name antfly-storage-kernel -Ofast")
             zig = root / "zig"
             zig.write_text(
@@ -46,6 +49,8 @@ class DiagnosticTests(unittest.TestCase):
                 [
                     str(script),
                     "--command",
+                    "--zig-dir",
+                    str(build_dir),
                     "--out-dir",
                     str(root / "logs"),
                     "--prefix",
@@ -63,7 +68,7 @@ class DiagnosticTests(unittest.TestCase):
                 env=dict(
                     os.environ,
                     ARGUMENT_FILE=str(root / "argument"),
-                    RESPONSE_FILE=str(response),
+                    RESPONSE_FILE="compiler-args",
                 ),
                 capture_output=True,
                 text=True,
@@ -82,7 +87,10 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertEqual(len(fields), 5)
                 self.assertTrue(fields[2])
                 self.assertTrue(fields[3])
-            report = summarize((root / "logs/command.rss.tsv").read_text())
+            report = summarize(
+                (root / "logs/command.rss.tsv").read_text(),
+                response_dir=root / "logs/command.response-files",
+            )
             self.assertGreater(report["units"]["storage_kernel"]["peak_rss_bytes"], 0)
             self.assertEqual(report["compilations"][0]["kind"], "test")
             response.unlink()
@@ -93,6 +101,47 @@ class DiagnosticTests(unittest.TestCase):
                 ),
                 report,
             )
+
+    def test_successful_build_fails_when_compiler_arguments_cannot_be_attributed(self):
+        script = Path(__file__).with_name("diagnose-zig-build-memory.sh")
+        with tempfile.TemporaryDirectory(prefix="antfly-attribution-test-") as tmp:
+            root = Path(tmp)
+            (root / "build.zig").write_text("")
+            zig = root / "zig"
+            zig.write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = build ]; then\n'
+                '  "$0" build-lib @missing-response\n'
+                "else\n"
+                "  sleep 1\n"
+                "fi\n"
+            )
+            zig.chmod(0o700)
+            result = subprocess.run(
+                [
+                    str(script),
+                    "--command",
+                    "--zig-dir",
+                    str(root),
+                    "--out-dir",
+                    str(root / "logs"),
+                    "--label",
+                    "missing",
+                    "--interval",
+                    "0.05",
+                    "--no-stack-sample",
+                    "--",
+                    str(zig),
+                    "build",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            summary = (root / "logs/missing.summary.txt").read_text()
+            self.assertIn("status=0\n", summary)
+            self.assertIn("memory_report_status=1\n", summary)
 
     def test_live_build_produces_complete_seven_column_samples_and_summary(self):
         script = Path(__file__).with_name("diagnose-zig-build-memory.sh")
