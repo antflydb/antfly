@@ -935,13 +935,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_reranking_runtime_test_step = b.step("antfly-reranking-test", "Run reranking backend adapter tests");
     lib_reranking_runtime_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
 
+    // One fixed artifact owns the common/provider/CLI-parser domains. Public
+    // steps keep their existing runtime selections and environment policies.
+    const common_config_filters = &.{"common.config.test."};
+    const preload_filters = &.{
+        "preload model spec parser categorizes registry variants and backends",
+        "inference runtime preload parser preserves registry variants and explicit backends",
+        "inference run config",
+        "structured extraction request selects the JSON interface",
+        "inference list accepts models directory before or after flags",
+        "kernel JIT mode precedence is CLI then environment then config then default",
+    };
+    const provider_default_filters = &.{ "audio runtime", "bearer auth header cache provider defaults" };
+    const common_secrets_filters = &.{ "file secret store", "bearer auth header cache", "remote content runtime", "secret contract", "secret record" };
     const lib_common_default_filters = [_][]const u8{ "provider registry", "std http listener", "std http executor", "threaded connector", "health server", "runtime lifecycle" };
     const lib_common_runtime_filters = selectTestFilters(b, &lib_common_default_filters);
     const lib_common_tests = b.addTest(.{
+        .name = "common-runtime-tests",
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(
             b,
-            &.{"common."},
+            std.mem.concat(b.allocator, []const u8, &.{ &.{"common."}, common_config_filters, preload_filters, provider_default_filters, common_secrets_filters }) catch @panic("OOM"),
             lib_common_runtime_filters,
         ),
     });
@@ -953,55 +967,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_common_test_step = b.step("antfly-common-test", "Run common/provider registry tests");
     lib_common_test_step.dependOn(&run_lib_common_tests.step);
 
-    const lib_common_config_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
-        .filters = &.{"common.config.test."},
-        .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_common_config_tests = addFilteredTestRunArtifact(b, lib_common_config_tests);
+    const lib_common_config_tests = lib_common_tests;
+    const run_lib_common_config_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, lib_common_config_tests, common_config_filters);
     run_lib_common_config_tests.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
     const lib_common_config_test_step = b.step("antfly-common-config-test", "Run common/config tests");
     lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
 
-    const lib_preload_model_spec_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
-        .filters = &.{
-            "preload model spec parser categorizes registry variants and backends",
-            "inference runtime preload parser preserves registry variants and explicit backends",
-            "inference run config",
-            "structured extraction request selects the JSON interface",
-            "inference list accepts models directory before or after flags",
-            "kernel JIT mode precedence is CLI then environment then config then default",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_preload_model_spec_tests = addFilteredTestRunArtifact(b, lib_preload_model_spec_tests);
+    const lib_preload_model_spec_tests = lib_common_tests;
+    const run_lib_preload_model_spec_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, lib_preload_model_spec_tests, preload_filters);
     const lib_preload_model_spec_test_step = b.step("antfly-common-preload-model-spec-test", "Run preload model CLI parser tests");
     lib_preload_model_spec_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
 
-    const provider_default_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
-        .filters = &.{ "audio runtime", "bearer auth header cache provider defaults" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
-    });
-    const run_provider_default_tests = addFilteredTestRunArtifact(b, provider_default_tests);
+    const provider_default_tests = lib_common_tests;
+    const run_provider_default_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, provider_default_tests, provider_default_filters);
     b.step("antfly-provider-defaults-test", "Verify provider endpoint and credential defaults").dependOn(&run_provider_default_tests.step);
 
-    const lib_common_secrets_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
-        .filters = &.{ "file secret store", "bearer auth header cache", "remote content runtime", "secret contract", "secret record" },
-        .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_common_secrets_tests = addFilteredTestRunArtifact(b, lib_common_secrets_tests);
+    const lib_common_secrets_tests = lib_common_tests;
+    const run_lib_common_secrets_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, lib_common_secrets_tests, common_secrets_filters);
     const lib_common_secrets_test_step = b.step("antfly-common-secrets-test", "Run common secret and remote-content reload tests");
     lib_common_secrets_test_step.dependOn(&run_lib_common_secrets_tests.step);
 

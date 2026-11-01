@@ -84,6 +84,7 @@ pub const Artifacts = struct {
 /// artifacts used by public targets without maintaining a second build graph.
 pub fn create(b: *std.Build) ?Artifacts {
     defer @import("antfly_platform").finalizeMacosSdk(b);
+    defer @import("build_support/test_build_graph.zig").add(b);
     defer @import("build_support/embedded/source_owner.zig").finalize(b);
     const shared = @import("build_support/antfly/dependencies.zig").create(b, @This()) orelse return null;
     @import("build_support/antfly/test_partitions.zig").setMemoryProfile(b, .{
