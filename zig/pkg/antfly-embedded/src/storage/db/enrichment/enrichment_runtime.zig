@@ -2369,6 +2369,19 @@ test "transient refusals do not spend the enrichment attempt budget" {
     try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
 }
 
+test "normalized local admission refusal is exempt but normalized provider transient failure is not" {
+    // managed_embedder.normalizeLocalEmbeddingError reports a local
+    // provider's admission refusal as error.EmbedAdmissionRefused, distinct
+    // from error.EmbedTransientFailure (a real provider failure: 5xx,
+    // timeout, connection error). Dense, sparse, and media embedding all
+    // share that one normalization function, so this exemption must hold for
+    // all three without re-deriving it per call site.
+    try std.testing.expect(enrichmentFailureSparesAttemptBudget(error.EmbedAdmissionRefused));
+    try std.testing.expect(!enrichmentFailureSparesAttemptBudget(error.EmbedTransientFailure));
+    try std.testing.expect(isRetryableEnrichmentError(error.EmbedAdmissionRefused));
+    try std.testing.expect(isRetryableEnrichmentError(error.EmbedTransientFailure));
+}
+
 pub fn isRetryableEnrichmentError(err: anyerror) bool {
     return enrichmentErrorDisposition(err) == .retryable_request;
 }
@@ -3122,6 +3135,79 @@ test "admission refusal on the final allowed attempt still yields" {
     // parking the document.
     try std.testing.expect(shouldYieldRequestError(&runtime, error.ResourceTemporarilyUnavailable));
     try std.testing.expect(runtime.retry_error_has_request_identity);
+}
+
+test "a dense or media embedder refusing admission after adapter normalization never spends the document retry budget" {
+    // managed_embedder.normalizeLocalEmbeddingError reports the local
+    // provider's admission refusal as error.EmbedAdmissionRefused, not the
+    // raw error.ResourceTemporarilyUnavailable. Dense and media document
+    // embedding read that normalized error directly (they never retry
+    // through managed_embedder's query-only retry wrapper), so the
+    // document's attempt budget must stay untouched across many repeated
+    // refusals, exactly like the pre-normalization identity does.
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 55;
+    // A plain attempt-budget check (prior_attempts=0, max_attempts=1) would
+    // already deny this: 0 + 1 < 1 is false. The admission exemption must
+    // still let the very first refusal yield.
+    try std.testing.expect(shouldYieldRequestError(&runtime, error.EmbedAdmissionRefused));
+    try std.testing.expect(runtime.retry_error_has_request_identity);
+
+    runtime.retry_failure_fingerprint = runtime.active_failure_fingerprint;
+    var refusal: u32 = 0;
+    while (refusal < 10) : (refusal += 1) {
+        runtime.transient_retry_count = refusal;
+        try std.testing.expect(shouldYieldRequestError(&runtime, error.EmbedAdmissionRefused));
+        // Admission refusals never spend retry_failure_count, so once
+        // admission frees up the request still has its full attempt budget.
+        try std.testing.expectEqual(@as(u32, 0), runtime.retry_failure_count);
+    }
+}
+
+test "a real embedding provider transient failure still spends the document retry budget" {
+    // Contrast with the admission-refusal test above: error.EmbedTransientFailure
+    // is the managed embedding adapters' identity for a real provider
+    // failure (5xx, timeout, connection error). It must not share the
+    // admission exemption, or a genuinely failing provider would retry past
+    // the document's attempt budget instead of eventually parking as repair
+    // debt.
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 77;
+    runtime.retry_failure_fingerprint = 77;
+    // The document's ordinary attempt budget is already exhausted.
+    try std.testing.expect(!retryBudgetAllowsYield(runtime.retry_failure_count, runtime.config.worker_retry_max_attempts));
+    try std.testing.expect(!shouldYieldRequestError(&runtime, error.EmbedTransientFailure));
+    try std.testing.expect(!runtime.retry_error_has_request_identity);
 }
 
 test "shouldYieldRequestErrorFor applies the same admission exemption as the active identity check" {
@@ -4203,7 +4289,8 @@ fn parallelDenseBatchWithCapacityFallback(alloc: Allocator, io: Io, provider: em
 }
 
 fn denseBatchCapacityFailure(err: anyerror) bool {
-    return err == error.EmbedTransientFailure or err == error.ResourceTemporarilyUnavailable;
+    return err == error.EmbedTransientFailure or err == error.ResourceTemporarilyUnavailable or
+        err == error.EmbedAdmissionRefused;
 }
 
 fn noteDenseBatchFailure(failure: *?anyerror, err: anyerror) void {
