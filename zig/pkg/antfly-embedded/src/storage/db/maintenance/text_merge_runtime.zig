@@ -495,8 +495,21 @@ const PlatformTextMergeRuntime = struct {
 
     pub fn runOnce(self: *TextMergeRuntime) !bool {
         const io = self.io orelse return false;
+        // `pause()` shares `stopLocked()` with `stop()` and so also sets
+        // `shutdown`, but — unlike `stop()` — it leaves `desired_running`
+        // untouched: it exists to keep the automatic worker off an index
+        // during a structural mutation while the caller still intends to
+        // resume it shortly via `resumeAfterPause()`. A deliberate, explicit
+        // turn (for example to keep text merge maintenance live through a
+        // bulk-ingest window) must still be serviceable while merely paused;
+        // only a genuine stop() — which also clears `desired_running` — may
+        // refuse it here. `active_manual_turns` still makes this turn visible
+        // to a concurrent stop()/pause() drain regardless of this check.
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        const terminated = !self.desired_running;
+        self.lifecycle_mutex.unlock();
         self.mutex.lockUncancelable(io);
-        if (self.shutdown) {
+        if (self.shutdown and terminated) {
             self.mutex.unlock(io);
             return false;
         }
