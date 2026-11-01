@@ -176,6 +176,9 @@ Native capsules do not manufacture those guarantees for another provider.
 
 ## Final local measurements
 
+This full matrix predates the main integration described below; the merged
+binaries have their own validation and smoke evidence.
+
 Production JavaScript: `eced42c73e`; native source: `72bc259849`; measurement
 harness: `eeedd57e3a`. The final 36 cases are independently audited: **7,680
 measured reads, 2,304 writes and 144 separate reconstruction reads**, with exact
@@ -280,3 +283,35 @@ large cold corpus use `--documents=512 --cold-ids=1,137,273`. Replace the cold
 flags with `--resident-warmup` for a warm burst; use 8 and 32 rounds to retain
 both short and long write-tail profiles. Offered-load profiles add
 `--offered-reads=512 --offered-rps=32 --offered-write-every=4`.
+
+## Integration with current main
+
+After the full latency seal, main advanced. Integrated `origin/main` at
+`97945ad58e` in merge `2eee524615`. The only conflict was the retained-cut
+cache-pressure test: preserve main's deterministic residency/reservation pressure
+and the branch's retained-value assertions. Cloudflare JavaScript and shared
+object-store files merged unchanged; main's provider/schema dependencies changed
+the rebuilt WASM modules, so the full 36-case numbers above remain explicitly
+**pre-integration results**.
+
+The merged build passes **581 Node tests, all 58 actual-workerd checks, the mail
+integration, 49 focused native checks and two resolved retained-cut tests**.
+Three live-provider native checks still skip. A separate, independently audited
+four-case startup-inclusive smoke comparison uses both execution orders and the
+64-document corpus: **384 measured reads, 128 writes and 48 reconstruction
+reads**, with bodies/fences, hashes, owner attribution, limits, resource histories
+and settlement checked again. This smaller integration run does not replace the
+full matrix or establish a hosted/performance gate pass.
+
+| Merged-build smoke, p95 in ms | Existing resident | Durable bootstrap |
+| --- | ---: | ---: |
+| Startup-inclusive cold | 681–704 | 407–504 |
+| Mixed read / write | 629–632 / 785–798 | 161–162 / 396–398 |
+
+Merged full WASM SHA-256:
+`bfce41574f5e44b546636d9670c40bae08c37eeb493babed89c44c5e695fc3e4`.
+Integration evidence: `dist/qualification/cold-v4-main-1445-sealed-1793491742482/evidence.json`, **69 artifacts / 791,720,602 bytes**,
+SHA-256 `d8836e685e8a670505e43c8ab5145fafdda5a0210eb85ee5584896fc6f62c6e9`. The prior 1,772-artifact seal independently
+reverifies unchanged; no old results or seals were rewritten. Live Cloudflare
+qualification and historical `SQLITE_NOMEM` remain open. No cloud resources or
+credentials were created by the integration checks.
