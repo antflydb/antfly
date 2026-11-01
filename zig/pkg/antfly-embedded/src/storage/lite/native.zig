@@ -7343,10 +7343,14 @@ pub const NativeFile = struct {
     pub fn runtimeMetadataUnchanged(self: *NativeFile, latest: *NativeFile) !bool {
         const before = self.activeCheckpoint();
         const after = latest.activeCheckpoint();
-        if (self.header.indexed_reclamation and latest.header.indexed_reclamation)
-            return self.header.page_size == latest.header.page_size and
-                std.mem.eql(u8, &before.logical.primary, &after.logical.primary) and
-                std.mem.eql(u8, &before.logical.metadata, &after.logical.metadata);
+        if (self.header.indexed_reclamation and latest.header.indexed_reclamation) {
+            if (self.header.page_size != latest.header.page_size or
+                !std.mem.eql(u8, &before.logical.primary, &after.logical.primary)) return false;
+            if (std.mem.eql(u8, &before.logical.metadata, &after.logical.metadata)) return true;
+            // Raw catalog callers can publish lease keys without the dedicated
+            // lease transaction. Retain the fenced exact comparison for that
+            // conservative identity change; never traverse an unretained cut.
+        }
         // An idle runtime has no inode reader fence. Its old page IDs are
         // comparable only while the allocator still retains that checkpoint;
         // a retired slot could already have been reused for unrelated bytes.

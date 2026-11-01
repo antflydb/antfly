@@ -830,6 +830,10 @@ pub const Owner = struct {
         errdefer h.closeHandle(replacement);
         try self.bindGroupSourceState(replacement);
         if (self.current) |previous| {
+            // A clean memo is meaningful only at its logical metadata cut.
+            // Copy the witness; recover() compares it with the replacement's
+            // current identity before skipping work.
+            replacement.sql_ddl_recovery_generation = previous.sql_ddl_recovery_generation;
             replacement.sql_ddl_agenda_after = previous.sql_ddl_agenda_after;
             replacement.sql_ddl_agenda_after_len = previous.sql_ddl_agenda_after_len;
             if (known_maintenance) |snapshot| {
@@ -1299,6 +1303,7 @@ pub const Owner = struct {
         snapshot.lease_snapshot = true;
         snapshot.sql_commit_recovery_needed = foreground.sql_commit_recovery_needed;
         snapshot.sql_ddl_recovery_needed = foreground.sql_ddl_recovery_needed;
+        snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
         const store = snapshot.owned_lite_backend.?.native_docstore.?;
         store.file.reader_coordinator = self.reader_coordinator;
         try store.file.inheritAllocatorVerification(file);

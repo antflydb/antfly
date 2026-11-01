@@ -14,7 +14,8 @@
 // limitations under the License.
 
 //! Conservative recovery work projection, maintained by the native writer.
-//! A marker is added atomically with every schema/job-state change. Only the
+//! A marker is added atomically with every schema/DDL-state change. SQL commit
+//! decisions use their existing dedicated journal and recovery guard. Only the
 //! admitted recovery owner removes it after checking durable terminal state.
 const std = @import("std");
 pub const prefix = "\x00AFRECOVERY/";
@@ -33,7 +34,6 @@ pub fn namespace(key: []const u8) ?[]const u8 {
         "\x00\x00__metadata__:relational_integrity_activation",
         "\x00antfly/embedded/sql-ddl",
         "\x00antfly/embedded/sql-fk-publication",
-        "\x00antfly/embedded/sql-commit/v1",
     }) |tracked| if (std.mem.eql(u8, logical, tracked)) return scope;
     return null;
 }

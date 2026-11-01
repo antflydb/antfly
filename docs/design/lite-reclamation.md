@@ -104,8 +104,10 @@ retained checkpoint require a matching current checked seal and canonical digest
 failed ancestry falls back to an independent load. Explicit integrity checks also
 load the on-disk ledger independently of cached traversal inventories.
 
-The native writer projects schema, activation, SQL DDL, FK publication and SQL
-commit-state changes into a per-namespace recovery agenda in the same transaction.
+The native writer projects schema, activation, SQL DDL and FK publication changes
+into a per-namespace recovery agenda in the same transaction. Ordinary SQL commit
+decisions retain their separate root journal and recovery guard; row commits do
+not create DDL agenda work.
 Recovery reads at most eight namespace keys per turn and opens only those runtimes.
 A database-wide FK coordinator settles before any rotated page can return. Under
 the path lease, recovery acknowledges only completed work, then checks the current
