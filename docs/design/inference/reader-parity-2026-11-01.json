@@ -161,5 +161,211 @@
         128
       ]
     }
+  },
+  "attention_candidate": {
+    "build": {
+      "source_commit": "8203cf3c44e5ace4867b1c5a2df7dbc03f6450af",
+      "baseline_upstream_commit": "1004ca0325a83047e141c13b058a3bb537a13084",
+      "source_files": {
+        "inference.zig": "e43d3807811f5311dc4a671c5467317cd02485b3f82e0f467712f8c639b4e998",
+        "ops/cuda/cuda_compute.zig": "d11311313debb36f12cf857650ecb59b11f6cf70d5a732eb85cb2d85cce5e984",
+        "ops/cuda/lighton_attention.zig": "cc0053af860eb8b4688f05acbfebc1c81ec1965a220f9e940d5789632d43140f",
+        "ops/cuda/lighton_decode_graph.zig": "22440b75a8cf9214978d3b1bc67f248927ce94c36f5135835e2bfe37b399582f",
+        "pipelines/generation.zig": "b3797d6afd876aa4dc012238d13ea328f9f4ef25647b8db6ebd48aa9ad38667a"
+      },
+      "status": "passed",
+      "exit": 0,
+      "seconds": 664.744
+    },
+    "qualification_passed": false,
+    "qualification_error": "qualification isolation changed: GPU ownership changed",
+    "isolation": {
+      "quiet_seconds": 20,
+      "sample_interval_seconds": 1,
+      "samples": 335,
+      "errors": [
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed",
+        "GPU ownership changed"
+      ]
+    },
+    "binary_sha256": "9980b372c7ce50a1dcaa174d24d833d7fa3fb6c5f1e2fa9cb16ce4e2422194b2",
+    "config_sha256": "43bebd78fc0e8dc95ec8323b249a62327216ed210e2cd1871aa858dc722d0f14",
+    "checks": [
+      {
+        "phase": "serial",
+        "exit": 0
+      },
+      {
+        "phase": "batch",
+        "exit": 0
+      }
+    ],
+    "deadline_isolation": {
+      "deadline_ms": 8000,
+      "short": {
+        "status": 504,
+        "error": "INFERENCE_TIMEOUT"
+      },
+      "peer": {
+        "status": 200,
+        "statuses": [
+          "completed"
+        ],
+        "text_sha256": "3cae0440aafc509ffdac2df223b7adf2efe3066a1f188ddb1706c6153de19877"
+      },
+      "readiness_samples": 36,
+      "all_ready": true
+    },
+    "recovery": {
+      "status": 200,
+      "statuses": [
+        "completed"
+      ],
+      "text_sha256": "d247c69a9adca06eb893f73ee08e3f27f4b6761e60db05fb662a4e8d518d7422"
+    },
+    "reload": {
+      "status": 200,
+      "statuses": [
+        "completed"
+      ],
+      "text_sha256": "d247c69a9adca06eb893f73ee08e3f27f4b6761e60db05fb662a4e8d518d7422"
+    },
+    "unloaded": true,
+    "stopped": true,
+    "attention_dispatch": [
+      {
+        "chunk128_calls": 512,
+        "grouped_calls": 256,
+        "multiprocessors": 48
+      },
+      {
+        "chunk128_calls": 0,
+        "grouped_calls": 0,
+        "multiprocessors": 0
+      }
+    ],
+    "timing_status": "Rejected: GPU ownership changed during capture; no full-model performance gain is claimed",
+    "final_08_status": "Not run after 4B isolation rejection"
+  },
+  "graph_experiment": {
+    "4b": {
+      "schema": "antfly.reader-parity/v1",
+      "model_revision": "b71010f095dc3735de7ee6b9969bff8f8f50b39a",
+      "concurrency": 4,
+      "max_tokens": 2048,
+      "correctness": {
+        "serial_exact": false,
+        "concurrent_exact": false,
+        "native_batch_stable": true,
+        "reference_batch_stable": true
+      },
+      "timings": {
+        "serial": {
+          "native_median_seconds": 51.7625,
+          "reference_median_seconds": 57.158500000000004,
+          "native_pages_per_second": 0.03863801014247766,
+          "reference_pages_per_second": 0.034990421372149375,
+          "native_over_reference_latency": 0.905595843137941,
+          "parity": true
+        },
+        "concurrent": {
+          "native_median_seconds": 41.0135,
+          "reference_median_seconds": 32.846000000000004,
+          "native_pages_per_second": 0.09752886244773062,
+          "reference_pages_per_second": 0.12178042988491748,
+          "native_over_reference_latency": 1.2486604152712657,
+          "parity": false
+        }
+      },
+      "passed": false,
+      "capture_sha256": {
+        "native_serial": "cafffe0a62e2a261bfc1acc6a50e063937c0ec43b395d5bb4aa9055839427c25",
+        "native_batch": "e2af54c3ad9748b3c949a74d7cd993065e4474db085f52c7e528a7479f15dec9",
+        "reference_serial": "9fedb3c931d2cf0d5a85a4042a2e1761b7910f6186b166751568cb790b716881",
+        "reference_batch": "4c1912f81a43ac06bde1834a7d80198599dfd04f2754df70250d67b70a208e2a"
+      }
+    },
+    "08": {
+      "schema": "antfly.reader-parity/v1",
+      "model_revision": "36d8636925327c671bd8e479c517a004f7566bd9",
+      "concurrency": 4,
+      "max_tokens": 2048,
+      "correctness": {
+        "serial_exact": true,
+        "concurrent_exact": true,
+        "native_batch_stable": true,
+        "reference_batch_stable": true
+      },
+      "timings": {
+        "serial": {
+          "native_median_seconds": 12.564499999999999,
+          "reference_median_seconds": 10.571000000000002,
+          "native_pages_per_second": 0.15917863822675,
+          "reference_pages_per_second": 0.18919685933213506,
+          "native_over_reference_latency": 1.1885819695393054,
+          "parity": false
+        },
+        "concurrent": {
+          "native_median_seconds": 10.0955,
+          "reference_median_seconds": 6.994,
+          "native_pages_per_second": 0.3962161359021346,
+          "reference_pages_per_second": 0.5719187875321704,
+          "native_over_reference_latency": 1.4434515298827566,
+          "parity": false
+        }
+      },
+      "passed": false,
+      "capture_sha256": {
+        "native_serial": "001c90035103c8356a48aad0937d7a399ce356ed1847bf198ff35ff147546a41",
+        "native_batch": "638038cb7fe6aea04af669901e84db6bda9b9a3606d1ecca860bc4ab45c4de71",
+        "reference_serial": "42591f267719d86ae0e6bdf0c1582e6da2e0a635dd504080d0b9b14c3c1fdbb7",
+        "reference_batch": "410e17a29f00c87813611cba98850734edf9446c2d7b20533ac377b15ce8a019"
+      }
+    }
+  },
+  "diagnostics": {
+    "4b": {
+      "scope": "Existing BF16-vision diagnostic; concurrent only, serial unmeasured",
+      "controls": {
+        "ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE": "bf16_vision",
+        "ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS": "1024"
+      },
+      "concurrent_exact": false,
+      "native_median_seconds": 51.223,
+      "reference_median_seconds": 32.846000000000004,
+      "native_over_reference_latency": 1.559489739998782
+    },
+    "08": {
+      "scope": "Existing BF16-vision diagnostic; concurrent only, serial unmeasured",
+      "controls": {
+        "ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE": "bf16_vision"
+      },
+      "concurrent_exact": true,
+      "native_median_seconds": 8.214,
+      "reference_median_seconds": 6.994,
+      "native_over_reference_latency": 1.174435230197312
+    }
   }
 }

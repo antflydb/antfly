@@ -16,7 +16,7 @@
 
 """Compare existing grouped and per-head attention on synthetic reader geometry.
 
-Requires an otherwise idle GPU 0. CUDA graph replay and events share one
+Requires an otherwise idle GPU host; uses CUDA device 0. CUDA graph replay and events share one
 explicit stream; each trial executes 100 complete attention/combine operations.
 Five warm device-time trials exclude Python dispatch and CPU oracle work.
 Every path uses shuffled physical pages and NaN-filled holes, checked against
@@ -29,9 +29,11 @@ import ctypes as c
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import subprocess
+import threading
 
 import torch
 from check_cuda_attention import Params, Page
@@ -41,6 +43,11 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--artifact", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
 cli = parser.parse_args()
+if cli.output.resolve() in (cli.artifact.resolve(), Path(__file__).resolve()):
+    parser.error("--output must differ from the artifact and benchmark source")
+cli.output.parent.mkdir(parents=True, exist_ok=True)
+# A failed or interrupted rerun must not leave an older passing receipt.
+cli.output.write_text(json.dumps({"status": "running", "passed": False}) + "\n")
 if subprocess.check_output(
     ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True
 ).strip():
@@ -82,6 +89,45 @@ def launch(name, grid, args):
         args,
         c.c_void_p(),
     )
+
+
+monitor_stop = threading.Event()
+monitor_errors = []
+monitor_samples = []
+
+
+def observe_isolation():
+    active = subprocess.check_output(
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True
+    ).split()
+    for value in active:
+        pid = int(value)
+        if pid == os.getpid():
+            continue
+        try:
+            status = Path("/proc", value, "status").read_text()
+            tgid = next(
+                int(line.split()[1])
+                for line in status.splitlines()
+                if line.startswith("Tgid:")
+            )
+        except (FileNotFoundError, StopIteration) as error:
+            raise RuntimeError("GPU process ownership could not be verified") from error
+        if tgid != os.getpid():
+            raise RuntimeError("another GPU process overlapped the benchmark")
+    monitor_samples.append(True)
+
+
+def monitor_isolation():
+    while not monitor_stop.wait(1):
+        try:
+            observe_isolation()
+        except Exception as error:
+            monitor_errors.append(str(error))
+
+
+monitor = threading.Thread(target=monitor_isolation, daemon=True)
+monitor.start()
 
 
 try:
@@ -141,6 +187,14 @@ try:
                 measurements = {}
                 outputs = {}
                 for grouped in [False, True]:
+                    if monitor_errors:
+                        raise RuntimeError(monitor_errors[0])
+                    # Each implementation must produce its own values, even
+                    # if a future artifact accidentally becomes a no-op here.
+                    with torch.cuda.stream(stream):
+                        for tensor in (output, partial, stats):
+                            tensor[:-16].fill_(float("nan"))
+                    torch.cuda.synchronize()
                     selected = (
                         ("lighton_attention_grouped_chunks" + str(chunk))
                         if grouped
@@ -187,6 +241,8 @@ try:
                     measurements["grouped" if grouped else "ungrouped"] = (
                         statistics.median(times)
                     )
+                    if monitor_errors:
+                        raise RuntimeError(monitor_errors[0])
                     outputs[grouped] = (
                         output[:-16].cpu().clone().reshape(rows, kh, heads // kh, 256)
                     )
@@ -234,9 +290,25 @@ try:
                 }
                 results.append(result)
                 print(json.dumps(result), flush=True)
+    observe_isolation()
+    if monitor_errors:
+        raise RuntimeError(monitor_errors[0])
 finally:
+    monitor_stop.set()
+    monitor.join(timeout=5)
     driver.close()
+if monitor.is_alive() or monitor_errors:
+    raise RuntimeError(
+        monitor_errors[0] if monitor_errors else "isolation monitor did not finish"
+    )
 report = {
+    "status": "passed",
+    "passed": True,
+    "isolation": {
+        "sample_interval_seconds": 1,
+        "samples": len(monitor_samples),
+        "errors": monitor_errors,
+    },
     "gpu": torch.cuda.get_device_name(0),
     "sms": torch.cuda.get_device_properties(0).multi_processor_count,
     "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),

@@ -193,13 +193,16 @@ requirements. Precision, graph depth and resource ceilings are unchanged.
 
 The [synthetic timing receipt](attention-dispatch-2026-11-01.json) covers 42
 cases across one to 32 rows, both model geometries and 256–8,192-token contexts.
-All outputs pass an independent FP64 oracle (maximum absolute error `3.57e-7`),
-read-only input checks and output/scratch canaries. CUDA graph replay and timing
+All outputs pass an independent FP64 oracle (maximum absolute error `4.79e-7`),
+read-only input checks, shuffled physical page tables, NaN-masked unused slots,
+and output/scratch canaries. CUDA graph replay and timing
 events share one explicit stream. Each trial executes 100 complete
 attention/combine operations; five device-time trials exclude Python dispatch
 and CPU oracle work. All 27 cases selected by the new heuristic were faster in
-this matrix; the smallest measured reduction was approximately 14%. This is a
-kernel result, not a full-model throughput claim or A100 qualification.
+this exploratory matrix; the smallest measured reduction was approximately 16%.
+The GPU was checked idle before the run, but that benchmark revision did not
+continuously monitor ownership. These timings require a rerun with the hardened
+benchmark and do not establish a qualified full-model gain or A100 performance.
 
 Reproduce using the CUDA qualification Python environment:
 
@@ -209,8 +212,24 @@ python zig/pkg/inference/scripts/lightonocr3/benchmark_cuda_attention_dispatch.p
   --output attention-dispatch.json
 ```
 
-Full-model candidate measurements and lifecycle checks are pending. The existing
-BF16-vision diagnostic remains separate: 0.8B takes 8.214 seconds for four
+The final CUDA ReleaseFast candidate builds successfully, and all five frozen
+runtime file hashes match the reviewed source at `8203cf3c44`. Its 4B completion,
+timeout isolation, peer completion, all 36 readiness probes, recovery and
+unload/reload checks pass. Counters observe 256 grouped host submissions on 48
+SMs. However, the continuous monitor detects another GPU process during capture
+and rejects the timing receipt. No full-model performance gain is claimed, and
+the final 0.8B run remains pending. The PR stays draft until an exclusive GPU
+window permits rerunning both models and the baseline control. This session's
+qualification servers and queued waiter were stopped; other sessions were left
+untouched.
+
+The synthetic benchmark now continuously monitors GPU ownership, poisons each
+implementation's output/scratch before execution, and replaces a stale output
+receipt with an incomplete marker before a rerun. Its stronger checks are
+awaiting GPU revalidation in that exclusive window. Local syntax/lint and
+26 Python qualification tests pass.
+
+The existing BF16-vision diagnostic remains separate: 0.8B takes 8.214 seconds for four
 requests and still matches exactly. The 4B diagnostic with a 1,024-row prefill
 chunk starts at 36.356 seconds but its two measured cohorts take
 51.133/51.313 seconds. Admission logs show `domain_scratch` pressure near the
