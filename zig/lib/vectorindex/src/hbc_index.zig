@@ -3960,6 +3960,39 @@ const SubgroupScoreSink = struct {
     }
 };
 
+/// Rescores 1-bit candidates with a set's extended (multi-bit) codes:
+/// all of them, or only those whose 1-bit lower bound could still enter the
+/// candidate heap (`types.QuantizationRefine`).
+const ExRefine = struct {
+    est: quantizer_mod.ExEstimator,
+    set: *const proto.RaBitQuantizedVectorSet,
+    all: bool,
+    refined: u64 = 0,
+
+    /// Returns null when the index is 1-bit or the set has no extended codes
+    /// (older payloads keep scoring 1-bit).
+    fn init(self: anytype, set: *const proto.RaBitQuantizedVectorSet, approx_query: []const f32) !?ExRefine {
+        if (self.config.quantization_bits <= 1 or !set.hasEx()) return null;
+        return .{
+            .est = try quantizer_mod.ExEstimator.init(self.alloc, set, approx_query),
+            .set = set,
+            .all = self.config.quantization_refine == .all,
+        };
+    }
+
+    fn deinit(self: *ExRefine, alloc: Allocator) void {
+        self.est.deinit(alloc);
+    }
+
+    fn apply(self: *ExRefine, results: *const search_results.ApproxSearchResults, index: usize, distance: *f32, bound: *f32) void {
+        if (!self.all and distance.* - bound.* > results.admissionCutoff()) return;
+        const e = self.est.estimate(self.set, index);
+        distance.* = e.distance;
+        bound.* = e.bound;
+        self.refined += 1;
+    }
+};
+
 fn CandidateScoreSink(comptime with_projection: bool) type {
     return struct {
         results: *search_results.ApproxSearchResults,
@@ -3970,9 +4003,13 @@ fn CandidateScoreSink(comptime with_projection: bool) type {
         count: usize = 0,
         distances: [8]f32 = undefined,
         errors: [8]f32 = undefined,
+        refine: ?*ExRefine = null,
 
-        pub fn write(self: *@This(), index: usize, distance: f32, bound: f32) void {
+        pub fn write(self: *@This(), index: usize, distance_in: f32, bound_in: f32) void {
             std.debug.assert(index == self.first_row + self.count);
+            var distance = distance_in;
+            var bound = bound_in;
+            if (self.refine) |r| r.apply(self.results, index, &distance, &bound);
             self.distances[self.count] = distance;
             self.errors[self.count] = bound;
             self.count += 1;
@@ -4352,7 +4389,12 @@ fn scoreLeafMemberIds(
     const original_positions: []const usize = if (direct_native_scoring) &.{} else scratch.positions[0..filtered_count];
     if (direct_no_copy) {
         try validateQuantizedSet(self, native_quantized.?, member_ids.len);
-        var sink = NoCopyCandidateScoreSink{ .results = results, .ids = member_ids };
+        var refine = try ExRefine.init(self, &native_quantized.?.rabit, approx_query);
+        defer if (refine) |*r| {
+            profile.ex_refined_vectors += r.refined;
+            r.deinit(self.alloc);
+        };
+        var sink = NoCopyCandidateScoreSink{ .results = results, .ids = member_ids, .refine = if (refine) |*r| r else null };
         try self.quantizer.estimateDistancesTo(
             &native_quantized.?.rabit,
             approx_query,
@@ -4385,7 +4427,12 @@ fn scoreLeafMemberIds(
             if (direct_native_scoring) {
                 const count = member_ids.len;
                 try validateQuantizedSet(self, native_quantized.?, count);
-                var sink = NativeCandidateScoreSink{ .results = results, .ids = member_ids, .plane = projection_plane, .dims = dims };
+                var refine = try ExRefine.init(self, &native_quantized.?.rabit, approx_query);
+                defer if (refine) |*r| {
+                    profile.ex_refined_vectors += r.refined;
+                    r.deinit(self.alloc);
+                };
+                var sink = NativeCandidateScoreSink{ .results = results, .ids = member_ids, .plane = projection_plane, .dims = dims, .refine = if (refine) |*r| r else null };
                 try self.quantizer.estimateDistancesTo(
                     &native_quantized.?.rabit,
                     approx_query,
@@ -4492,6 +4539,21 @@ fn scoreLeafMemberIds(
             const distances = scratch.distances[0..count];
             const error_bounds = scratch.error_bounds[0..count];
             try self.estimateQuantizedDistances(quantized_set, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
+            if (std.meta.activeTag(quantized_set.*) == .rabit) {
+                if (try ExRefine.init(self, &quantized_set.rabit, approx_query)) |refine_init| {
+                    // The heap does not change during this pass, so the cutoff
+                    // is conservative: it can only refine more, never less.
+                    var refine = refine_init;
+                    defer refine.deinit(self.alloc);
+                    if (direct_native_scoring) {
+                        for (0..count) |i| refine.apply(results, i, &distances[i], &error_bounds[i]);
+                    } else {
+                        // Filtered members score at their original positions.
+                        for (original_positions) |pos| refine.apply(results, pos, &distances[pos], &error_bounds[pos]);
+                    }
+                    profile.ex_refined_vectors += refine.refined;
+                }
+            }
             if (!has_extra_filters and !filters_active) {
                 var cancellation_index: usize = 0;
                 while (cancellation_index < scoring_member_ids.len) : (cancellation_index += 256) {

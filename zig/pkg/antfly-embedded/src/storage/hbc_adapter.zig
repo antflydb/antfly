@@ -6488,6 +6488,8 @@ pub const HBCIndex = struct {
         );
         errdefer quantizer.deinit();
         quantizer.query_packing = .reduce;
+        // Every quantized set this index writes carries extended codes too.
+        quantizer.ex_bits = if (effective_config.quantization_bits > 1) effective_config.quantization_bits else 0;
         if (platform.env.getenv("ANTFLY_EXPERIMENT_QUERY_PACKING")) |mode| {
             if (std.mem.eql(u8, mode, "lanes")) quantizer.query_packing = .lanes;
             if (std.mem.eql(u8, mode, "reduce")) quantizer.query_packing = .reduce;
@@ -35475,4 +35477,103 @@ test "detached posting metadata batch survives mutations tombstones and index de
     try next.getManySorted(&.{ 1, 2, 3 }, &values);
     try std.testing.expectEqualStrings("replacement-a", values[0].?);
     try std.testing.expect(values[1] == null and values[2] == null);
+}
+
+fn multiBitTestVectors(alloc: Allocator, n: usize, dims: usize, seed: u64) ![]f32 {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rand = prng.random();
+    const centers = try alloc.alloc(f32, 24 * dims);
+    defer alloc.free(centers);
+    for (centers) |*c| c.* = rand.floatNorm(f32) * 2;
+    const out = try alloc.alloc(f32, n * dims);
+    for (0..n) |i| {
+        const c = rand.uintLessThan(usize, 24);
+        for (0..dims) |j| out[i * dims + j] = centers[c * dims + j] + rand.floatNorm(f32);
+    }
+    return out;
+}
+
+fn multiBitRecall(alloc: Allocator, idx: *HBCIndex, data: []const f32, queries: []const f32, dims: usize, refined: *u64) !f64 {
+    const k = 10;
+    var hits: usize = 0;
+    const nq = queries.len / dims;
+    for (0..nq) |qi| {
+        const q = queries[qi * dims ..][0..dims];
+        var best: [k]u64 = undefined;
+        var best_d: [k]f32 = @splat(std.math.inf(f32));
+        for (0..data.len / dims) |i| {
+            var d: f32 = 0;
+            for (data[i * dims ..][0..dims], q) |a, b| d += (a - b) * (a - b);
+            if (d >= best_d[k - 1]) continue;
+            var pos: usize = k - 1;
+            while (pos > 0 and best_d[pos - 1] > d) : (pos -= 1) {
+                best_d[pos] = best_d[pos - 1];
+                best[pos] = best[pos - 1];
+            }
+            best_d[pos] = d;
+            best[pos] = i + 1;
+        }
+        // A small candidate heap makes admission quality matter.
+        var profiled = try idx.searchProfiledRequest(.{ .query = q, .k = k, .rerank_factor = 2, .load_metadata = false });
+        defer profiled.results.deinit();
+        refined.* += profiled.profile.ex_refined_vectors;
+        for (profiled.results.getHits()) |h| {
+            if (std.mem.indexOfScalar(u64, &best, h.vector_id) != null) hits += 1;
+        }
+    }
+    _ = alloc;
+    return @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(nq * k));
+}
+
+test "hbc multi-bit codes refine leaf admission and survive reopen" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const dims = 64;
+    const n = 2400;
+    const data = try multiBitTestVectors(alloc, n, dims, 5);
+    defer alloc.free(data);
+    const queries = try multiBitTestVectors(alloc, 40, dims, 6);
+    defer alloc.free(queries);
+    const items = try alloc.alloc(BatchInsertItem, n);
+    defer alloc.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .vector_id = i + 1, .vector = data[i * dims ..][0..dims], .metadata = "" };
+
+    var recalls: [2]f64 = undefined;
+    for ([_]u8{ 1, 4 }, 0..) |bits, vi| {
+        var tp: TestPath = .{};
+        const path = tp.init();
+        defer tp.cleanup();
+        const cfg = HBCConfig{
+            .dims = dims,
+            .leaf_size = 64,
+            .branching_factor = 16,
+            .search_width = 48,
+            .use_quantization = true,
+            .rerank_policy = .boundary,
+            .use_random_ortho_trans = true,
+            .quantization_bits = bits,
+        };
+        {
+            var idx = try HBCIndex.open(alloc, path, cfg);
+            defer idx.close();
+            try idx.bulkBuildWithMetadata(items);
+            var refined: u64 = 0;
+            recalls[vi] = try multiBitRecall(alloc, &idx, data, queries, dims, &refined);
+            if (bits == 1) try std.testing.expectEqual(@as(u64, 0), refined) else try std.testing.expect(refined > 0);
+        }
+        if (bits > 1) {
+            // Persisted payloads carry the extended codes across reopen.
+            var reopened = try HBCIndex.open(alloc, path, cfg);
+            defer reopened.close();
+            var refined: u64 = 0;
+            const again = try multiBitRecall(alloc, &reopened, data, queries, dims, &refined);
+            try std.testing.expect(refined > 0);
+            try std.testing.expectApproxEqAbs(recalls[vi], again, 0.02);
+        }
+    }
+    std.testing.expect(recalls[1] >= recalls[0]) catch |err| {
+        std.debug.print("1-bit recall={d:.3} 4-bit recall={d:.3}\n", .{ recalls[0], recalls[1] });
+        return err;
+    };
 }

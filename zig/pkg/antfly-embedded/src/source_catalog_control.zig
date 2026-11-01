@@ -559,6 +559,7 @@ pub const storage_lite_paths = @import("storage/lite/paths.zig");
 pub const storage_lite_portable_restore = @import("storage/lite/portable_restore.zig");
 pub const storage_lite_result_scratch = @import("storage/lite/result_scratch.zig");
 pub const storage_lite_read_workspace = @import("storage/lite/read_workspace.zig");
+pub const storage_lite_reader_epochs = @import("storage/lite/reader_epochs.zig");
 pub const storage_lite_metadata_pool = @import("storage/lite/metadata_pool.zig");
 pub const storage_prepared_score_plan = @import("storage/prepared_score_plan.zig");
 pub const storage_prepared_score_request = @import("storage/prepared_score_request.zig");
