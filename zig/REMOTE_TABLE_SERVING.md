@@ -2881,3 +2881,53 @@ with 6,565,096 tracked peak bytes under a 64-MiB quota, one analysis and one
 reuse. All 600 native checks and 50 real Parquet/Iceberg E2E cases pass. These
 kernel and correctness results do not establish optimized-server throughput,
 cloud retention, archive-scale or RSS improvements.
+
+
+### Sequential normalized replay and bounded term grouping
+
+Compact original-offset records keep their normalized term IDs through encoding.
+The producer records term counts and conservative source-order/disjointness flags
+once. Materialized token slices retain the reference preparation path; both
+preparations feed one offset encoder, so dictionary order, source lanes, geometry
+bounds, compression and persisted bytes remain identical.
+
+Memory-backed occurrences use compact index links without hashing their terms
+again. Disk-backed occurrences use stable MSD partitioning by lexical term rank.
+Each pass reads sequential blocks into sixteen small buffers in one admitted
+private run. Leaves use counting scatter within a bounded workspace, adapting to
+live quota headroom; an oversized single term streams directly. Equal-term
+occurrences preserve input order, including repeated positions and overlapping
+spans. Private partition runs share the existing capacity reservations and are
+closed on success, allocation failure or provider failure. The maximum radix
+depth is bounded by the 32-bit term-ID width, rather than the occurrence count.
+
+The grouped output is consumed in lexical order. Aliases and the dense
+source-order lane read the original spool through block cursors. Memory sources
+borrow immutable bytes directly; disk cursors retain only their current block.
+This removes the term-by-term scattered disk access at the memory-to-file
+threshold without lifting that threshold or changing source-offset formats.
+Temporary cursor and partition buffers use refundable scratch allocators while
+preserving enclosing statement/host quotas. The final alias still closes the
+original spool and interned terms. Runtime ABI 84 fences the new state; reader
+protocol 97 and persisted encodings are unchanged.
+
+
+The [partitioned normalized replay observation](bench/lake/partitioned-normalized-replay-v1-observation.json)
+qualifies runtime `3efae3aac45cdf8a8aa2783a04381ca08bbfbe7a` against the frozen
+pre-fix probe on the same main. Three alternating pairs show 75.7–78.8% lower
+CPU for diverse disk-backed capture across simple/English analysis and one/two
+bindings, with about 11% lower CPU for the memory-fitting cohorts. Every tested
+pair is faster and complete token/span/input/encoded-byte hashes match. The
+English two-binding threshold case drops from 242.113 to 58.949 ms and performs
+775 physical private-run reads for 262,148 tokens. The larger case drops from
+471.839 to 104.286 ms, with 1,920 reads for 524,288 tokens.
+
+Tracked compact capture peak is 8,647,856 bytes in these diverse cohorts, about
+94% below the owning-token control. The compact path still takes 28.3–76.6% more
+CPU than owning tokens on the measured diverse fixtures; repeated-term English
+capture takes 5.1–15.1% more CPU. This fixes the disk amplification while retaining
+the deliberate bounded-memory tradeoff. Both 64-MiB owning-token controls exhaust
+their quota while normalized capture completes with identical output. The larger
+native postings/search fixture uses 9,506,567 tracked peak bytes under that same
+64-MiB quota. All 602 native checks and 50 real Parquet/Iceberg E2E cases pass.
+These kernel observations do not establish whole-ingestion or cloud speedups.

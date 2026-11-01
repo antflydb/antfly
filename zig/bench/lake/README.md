@@ -3149,3 +3149,83 @@ ABI 83 fences new state; reader protocol 97 and persisted encodings are unchange
 No task-owned builds, tests or cleanup overlap final measurements. Other host
 activity and OS caches remain uncontrolled. These results establish no current
 optimized-server, cloud, archive-scale, cold-cache or RSS gain.
+
+
+### Partitioned normalized replay
+
+The supported capture probe accepts workloads immediately around the compact
+spool's 4-MiB record threshold. At four tokens per repeated unit, 65,536 repeats
+fit exactly and 65,537 repeats spill. The 131,072-repeat cohort exercises a
+larger spilled run. Retain all three cohorts: a smaller memory-only fixture
+cannot qualify disk replay.
+
+```sh
+# From zig/, after: zig build lake-native-bench-build -Doptimize=fast
+ANTFLY_CAPTURE_REPEATS=65537 ANTFLY_CAPTURE_BINDINGS=2 \
+  ANTFLY_CAPTURE_ENGLISH=1 ANTFLY_CAPTURE_DIVERSE=1 \
+  ANTFLY_CAPTURE_QUOTA=536870912 zig-out/bin/lake-source-capture-bench
+```
+
+The diverse fixture has 4,096 distinct terms. Set `ANTFLY_MATERIALIZED_CAPTURE=1`
+for the owning-token control. The compact path preserves normalized IDs into
+preparation, partitions disk occurrences into stable lexical term runs and
+replays aliases in blocks. It uses the same offset encoder and must match every
+token/span digest plus complete input and encoded-output SHA-256.
+
+`replay_reads` counts physical private-run reads for the two-binding compact
+path, including retired grouping partitions and the original replay spool.
+It is `null` for controls that do not expose this counter; it does not measure
+network requests or total storage traffic. Timing and tracked-memory boundaries
+remain those of the capture kernel above. Expected quota-denial controls stay
+separate from passing correctness tests. Full native indexing additionally
+exercises both a memory-fitting field and a larger spilled field under the
+same 64-MiB quota, preserving postings, one analysis and one alias reuse.
+
+
+[partitioned-normalized-replay-v1-observation.json](partitioned-normalized-replay-v1-observation.json)
+records runtime `3efae3aac45cdf8a8aa2783a04381ca08bbfbe7a`, frozen before/after
+probe identities, the frozen server, exact commands, excluded warmups and three
+alternating measured pairs per cohort. Both versions include main
+`97945ad58e8194815ad377a0ba853a4583d83ec4`. The harness adds only the read counter;
+fixtures, timing boundaries, hard quotas and equivalence checks remain comparable.
+The before probe is qualification `ebd79013e3c088d3639a8f1acb21f18db68fae6a`,
+production runtime `3d058bc003189c73b49f190fdf17ecea423d67ac`.
+
+English analysis, 4,096 distinct terms, two bindings and a 512-MiB hard quota:
+
+| Tokens / compact placement | Before median CPU | Partitioned median CPU | CPU change | New physical private reads |
+| --- | ---: | ---: | ---: | ---: |
+| 262,144 / memory | 51.052 ms | 45.346 ms | 11.2% lower | 0 |
+| 262,148 / disk | 242.113 ms | 58.949 ms | 75.7% lower | 775 |
+| 524,288 / disk | 471.839 ms | 104.286 ms | 77.9% lower | 1,920 |
+
+Every measured before/after compact pair is faster across all 12 cohorts
+(36 pairs). Diverse spilled capture falls 75.7–78.8% across simple/English
+analysis and one/two bindings; its memory-fitting cohorts fall about 11%.
+Repeated four-term English alias capture falls 5.3–13.6%. The diverse compact
+peak is 8,647,856 bytes at every size, versus 142.5–143.6 MB for owning tokens.
+That is 93.9–94.0% less tracked memory. Compact CPU remains 28.3–76.6% above
+owning tokens on diverse inputs and 5.1–15.1% above on repeated inputs; no
+unconditional ingestion-speedup claim follows. Both owning-token 64-MiB controls
+fail with expected OutOfMemory, while compact capture completes and matches all
+output digests. Negative capacity controls are separate from product tests.
+
+The native read-bound regression checks 32,769 diverse records using 83 physical
+reads and 1,516,557 tracked peak bytes under an 8-MiB quota. Stable grouping
+matches the reference codec byte for byte under allocation faults, overlapping
+spans, repeated positions, skew and recursive partitioning. Actual native
+postings/search additionally covers 1,245,184- and 2,490,387-byte fields with
+`body`/`_all` aliases under a 64-MiB budget: peaks are 6,565,128 and 9,506,567
+bytes, with one analysis and one reuse in each case.
+
+Final qualification passes **415 shared + 187 API native checks (602 total)**,
+with zero failures, skips or leaks, and **50 real Parquet/Iceberg E2E cases in
+397.26 seconds** against the frozen Debug server. Full Debug testing caught
+narrow integer inference in the adaptive buffer multiplication; explicit usize
+arithmetic corrects it before this complete passing rerun. Runtime ABI 84 fences
+new state; reader protocol 97 and persisted bytes are unchanged. All supported
+native probe builds/runs, Apache boundary, license, formatting, whole-branch
+whitespace and artifact checks pass. Final timing overlaps no task-owned builds,
+tests or cleanup. Other host activity and OS caches remain uncontrolled. These
+kernel results qualify no whole-ingestion, optimized-server, cloud, archive-scale,
+cold-storage or RSS gain. Earlier observations retain their own identities.
