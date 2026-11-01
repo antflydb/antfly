@@ -64,6 +64,50 @@ def reference_expectations(path):
     return result
 
 
+def image_request_payload(api_shape, model, max_tokens, image_url):
+    if api_shape == "openai-chat":
+        return {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "top_p": 1,
+            "repetition_penalty": 1,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": image_url}}],
+                }
+            ],
+        }
+    if api_shape != "antfly-reader":
+        raise ValueError("unsupported API shape")
+    return {"model": model, "max_tokens": max_tokens, "images": [{"url": image_url}]}
+
+
+def response_texts_and_statuses(api_shape, data):
+    if api_shape == "openai-chat":
+        items = data.get("choices", [])
+        texts = [item["message"]["content"] for item in items]
+        statuses = [
+            "completed"
+            if item.get("finish_reason") == "stop"
+            else "truncated"
+            if item.get("finish_reason") == "length"
+            else "unresolved"
+            for item in items
+        ]
+    elif api_shape == "antfly-reader":
+        items = data.get("data", [])
+        texts = [item.get("text", "") for item in items]
+        statuses = [item.get("status") for item in items]
+    else:
+        raise ValueError("unsupported API shape")
+    if any(not isinstance(text, str) for text in texts):
+        raise ValueError("inference response must contain text")
+    return texts, statuses
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--url", required=True)
@@ -73,6 +117,9 @@ def main():
     p.add_argument("--rounds", type=int, default=2)
     p.add_argument("--concurrency", type=int, default=1)
     p.add_argument("--max-tokens", type=int, default=2048)
+    p.add_argument(
+        "--api-shape", choices=("antfly-reader", "openai-chat"), default="antfly-reader"
+    )
     p.add_argument("--require-native-batch", action="store_true")
     p.add_argument(
         "--reference-report",
@@ -92,12 +139,17 @@ def main():
         p.error("qualification is bounded to 1–64 pages per round")
     if args.require_reference_parity and args.reference_report is None:
         p.error("--require-reference-parity requires --reference-report")
+    if args.require_native_batch and args.api_shape != "antfly-reader":
+        p.error("--require-native-batch requires the Antfly reader API")
     references = (
         reference_expectations(args.reference_report) if args.reference_report else None
     )
     manifest = json.loads((args.fixtures / "manifest.json").read_text())
     expected = json.loads((args.fixtures / "expectations.json").read_text())["cases"]
-    norm = lambda s: re.sub("[^a-z0-9]", "", s.casefold())
+
+    def norm(value):
+        return re.sub("[^a-z0-9]", "", value.casefold())
+
     payloads = []
     for page in args.pages:
         item = next(x for x in manifest if x["id"] == page)
@@ -113,16 +165,12 @@ def main():
                 page,
                 item["image_sha256"],
                 json.dumps(
-                    {
-                        "model": args.model,
-                        "max_tokens": args.max_tokens,
-                        "images": [
-                            {
-                                "url": "data:image/png;base64,"
-                                + base64.b64encode(image).decode()
-                            }
-                        ],
-                    }
+                    image_request_payload(
+                        args.api_shape,
+                        args.model,
+                        args.max_tokens,
+                        "data:image/png;base64," + base64.b64encode(image).decode(),
+                    )
                 ).encode(),
             )
         )
@@ -130,6 +178,10 @@ def main():
         "model": args.model,
         "max_tokens": args.max_tokens,
         "concurrency": args.concurrency,
+        "api_shape": args.api_shape,
+        "benchmark_script_sha256": hashlib.sha256(
+            pathlib.Path(__file__).read_bytes()
+        ).hexdigest(),
         "observations": [],
     }
     if args.reference_report:
@@ -149,7 +201,7 @@ def main():
                 row["http_status"] = response.status
                 data = json.load(response)
             row["seconds"] = round(time.monotonic() - start, 3)
-            texts = [x.get("text", "") for x in data.get("data", [])]
+            texts, statuses = response_texts_and_statuses(args.api_shape, data)
             text = "\n".join(texts)
             row.update(
                 items=len(texts),
@@ -158,7 +210,7 @@ def main():
                 tail_pass=all(norm(x) in norm(text) for x in expected[page]),
                 usage=data.get("usage"),
                 execution=data.get("execution"),
-                statuses=[x.get("status") for x in data.get("data", [])],
+                statuses=statuses,
             )
             if references is not None:
                 exact, whitespace, normalized = references[digest]
@@ -175,11 +227,18 @@ def main():
             row["http_status"] = e.code
             try:
                 error = json.load(e)
-                row["error_code"] = error.get("error", error.get("code"))
+                code = error.get("error", error.get("code"))
+                row["error_code"] = (
+                    code.get("code") or code.get("type")
+                    if isinstance(code, dict)
+                    else code
+                )
             except (ValueError, AttributeError):
                 row["error_code"] = "unparseable_error"
         except (urllib.error.URLError, TimeoutError):
             row["error_code"] = "CLIENT_TRANSPORT_ERROR"
+        except (ValueError, TypeError, KeyError, AttributeError):
+            row["error_code"] = "INVALID_INFERENCE_RESPONSE"
         if "seconds" not in row:
             row["seconds"] = round(time.monotonic() - start, 3)
         print(json.dumps(row), flush=True)

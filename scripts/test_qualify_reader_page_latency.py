@@ -21,7 +21,87 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from qualify_reader_page_latency import normalized_text, reference_expectations
+from qualify_reader_page_latency import (
+    image_request_payload,
+    normalized_text,
+    reference_expectations,
+    response_texts_and_statuses,
+)
+
+
+class ReaderWireTests(unittest.TestCase):
+    def test_chat_reference_uses_the_same_image_only_greedy_workload(self):
+        body = image_request_payload(
+            "openai-chat", "reader", 2048, "data:image/png;base64,fixture"
+        )
+        self.assertEqual(body["max_tokens"], 2048)
+        self.assertEqual(body["temperature"], 0)
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(
+            body["messages"],
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,fixture"},
+                        }
+                    ],
+                }
+            ],
+        )
+        native = image_request_payload(
+            "antfly-reader", "reader", 2048, "data:image/png;base64,fixture"
+        )
+        self.assertEqual(
+            native,
+            {
+                "model": "reader",
+                "max_tokens": 2048,
+                "images": [{"url": "data:image/png;base64,fixture"}],
+            },
+        )
+
+    def test_both_wire_shapes_preserve_the_complete_text(self):
+        text = "Café 123!\n\n---"
+        native = response_texts_and_statuses(
+            "antfly-reader", {"data": [{"text": text, "status": "completed"}]}
+        )
+        chat = response_texts_and_statuses(
+            "openai-chat",
+            {"choices": [{"message": {"content": text}, "finish_reason": "stop"}]},
+        )
+        self.assertEqual(native, ([text], ["completed"]))
+        self.assertEqual(chat, native)
+
+    def test_chat_length_and_unknown_finish_reasons_cannot_qualify(self):
+        for reason, status in [
+            ("length", "truncated"),
+            (None, "unresolved"),
+            ("content_filter", "unresolved"),
+        ]:
+            with self.subTest(reason=reason):
+                texts, statuses = response_texts_and_statuses(
+                    "openai-chat",
+                    {
+                        "choices": [
+                            {
+                                "message": {"content": "complete tail words"},
+                                "finish_reason": reason,
+                            }
+                        ]
+                    },
+                )
+                self.assertEqual(texts, ["complete tail words"])
+                self.assertEqual(statuses, [status])
+
+    def test_nontext_chat_result_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "contain text"):
+            response_texts_and_statuses(
+                "openai-chat",
+                {"choices": [{"message": {"content": None}, "finish_reason": "stop"}]},
+            )
 
 
 class ReaderReferenceTests(unittest.TestCase):

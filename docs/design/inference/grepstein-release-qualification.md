@@ -127,62 +127,90 @@ changing the live shared reader pool.
 
 ### Current large-page investigation
 
-The DGX Spark investigation has not yet met the concurrent throughput target.
-With the original LightOn 4B checkpoint, the same two full-page images, greedy
-decoding and a 2,048-token output allowance, the ordinary CUDA defaults before
-enabling owned greedy continuations
-take about 53 seconds for the two pages serially, versus about 57 seconds for
-vLLM. A four-request cohort containing two copies of each page takes about
-47 seconds after extending the batched attention packet beyond its former
-1,024-token context bound. The preceding defaults took about 51 seconds.
-The vLLM four-request diagnostic took about 33 seconds. These are HTTP native
-versus in-process vLLM measurements on an isolated GB10, not Cloud A100 results.
+The concurrent throughput target is not met yet. The isolated DGX Spark tests
+use original BF16 checkpoints, identical hashes for a deposition page and a
+longer dense page, image-only greedy decoding, and a 2,048-token output allowance.
+Each four-request cohort contains two copies of each image. The same HTTP client
+can now compare `/ai/v1/read` with an OpenAI-compatible reference using
+`--api-shape openai-chat --url http://127.0.0.1:PORT/v1/chat/completions`.
+Payload construction is outside timing in both modes; unknown or truncated chat
+finish reasons cannot qualify, even if expected tail words appear.
 
-Native outputs are byte-identical to the corresponding vLLM batched outputs.
-The dense page's vLLM serial output differs from its batched output in line
-breaks and a trailing Markdown separator; the strict serial-reference parity
-assertion therefore fails for that batched reference. Reviewing those edits
-does not turn the failed assertion into an automatic correctness pass. Keep
-both reference outputs and the source-image review as qualification evidence.
+| Four-page policy | LightOn 4B seconds | LightOn 0.8B seconds |
+| --- | ---: | ---: |
+| vLLM in-process, two fresh rounds | 33.01–33.05 | 7.08–7.12 |
+| vLLM HTTP, same client and prompts | 32.93–33.02 | Not measured |
+| Native canonical defaults, main-merged runtime | 44.70–44.84 | 12.24–12.31 |
+| Best measured diagnostic profile | 35.24–35.44 | 8.18–8.21 |
+| Two-image vision diagnostic, after geometry fix | Not measured | 11.58–11.75 |
 
-The long-context attention change passes 64 independent GPU numerical and
-graph-replay oracle cases, including sparse/permuted physical page tables and
-contexts through 8,192 tokens. Full-page throughput remains a separate gate.
-Observed decoder cohorts are nearly full for the available live pages; the
-remaining profile is dominated by matrix operations. Increasing public
-concurrency or temporary-memory ceilings alone is not a demonstrated remedy.
-Experimental precision and fusion profiles remain separate from defaults
-until their complete-page correctness and throughput are qualified.
-With derived immutable fusion weights charged to the device weight budget
-rather than temporary scratch, the experimental fused-projection profile
-completes the four-page cohort in 37.4–37.9 seconds over two rounds. Output
-hashes and complete-tail checks are unchanged. A projection-output BF16 profile
-alone takes 39.6–39.9 seconds. Neither measurement establishes default-policy,
-0.8B, A100, or sustained-service qualification.
+The best 4B diagnostic uses recurrent-input packing, BF16 vision, an owned greedy
+continuation, and optional decoder graphs. It captures four graphs and replays
+766 times without graph admission denials over two rounds. Bounded 1,024-row
+prefill chunks reduce its four-page time from 35.46–35.52 to 35.24–35.44 seconds.
+The 0.8B diagnostic uses its independently selected eager profile and a four-token
+executor burst; the burst improves 8.28–8.36 to 8.18–8.21 seconds. These are not runtime defaults.
+Paired feed-forward weight copies add little improvement over recurrent-input
+packing; projection-output BF16, bounded matrix tuning, and a simple batched
+matrix-vector prototype did not improve on the selected path. They were not
+promoted. Wider vision batching is correct on the tested pages but slower;
+keep the single-image vision default.
 
-Owning the greedy continuation independently of multi-token bursts reduces the
-fused candidate to 35.9–36.0 seconds. Enabling its optional decoder graph gives
-35.5 seconds, with four captures, 766 replays, and no graph admission denials.
-Both rounds preserve all four output hashes. These remain diagnostic candidates,
-not a declaration that the throughput target has been met. Bounded matrix tuning
-and a simple batched matrix-vector prototype did not improve on the selected
-library path and were not promoted.
+The native 4B outputs are byte-identical to vLLM's batched outputs. The dense
+page's vLLM serial output differs from its own batched output in line breaks and
+a trailing Markdown separator. Its strict in-process serial-reference assertion
+therefore still fails. The HTTP comparison passes functional completion checks,
+with that exact-reference difference recorded separately; it is not an automatic
+serial-reference correctness pass. Do not strip production output to hide the
+difference. Native 0.8B outputs match both serial and batched references exactly,
+including the new two-image vision path and the optional token burst. Every
+successful run listed above retains complete tails; failed experiments are
+excluded from those timing ranges. This is bounded same-page coverage, not a corpus-wide accuracy
+qualification.
 
-Canonical reader profiles now authorize the executor-owned continuation without
-requiring a diagnostic environment switch. Its existing pure-greedy, callback,
-progress, cancellation and scheduler-ownership checks remain mandatory. A live
-functional check timed out one request with `504 INFERENCE_TIMEOUT` while its
-peer completed with the expected full output hash; all 38 readiness probes
-succeeded. The same check passed four-page 0.8B batching and 4B eviction/reload.
-Compilation ran concurrently with this functional check, so its timings are
-deliberately excluded from performance qualification.
+With canonical defaults, the two 4B pages take 52.96–52.97 seconds serially,
+compared with the earlier clean 57.22–57.23-second vLLM serial control. Four-page
+native decoding improved from approximately 51 seconds before the packet changes
+to 44.7 seconds with the current defaults. The stronger diagnostic profiles must
+remain distinct from these default-policy measurements.
 
-The long-context packet artifact requires a CUDA 13 driver API. Older drivers
-keep ordinary CUDA attention. Decoder graphs remain opt-in, and graph capture
-declines projection-rounding modes whose arithmetic is not capture-compatible;
-their eager CUDA execution retains the requested precision. Cached immutable
-fusion copies consume the device weight budget, independently of scratch, and
-still require device/combined admission and release on model retirement.
+Clean software-timestamp profiles attribute 34.52 seconds of GPU busy time to
+the native graph/input-packing profile versus 32.86 seconds to vLLM. Matrix
+kernels consume approximately 29.7 seconds in each. Native paged-attention
+chunk kernels take 1.33 seconds versus 0.70 seconds for the reference decode
+attention, and native also spends more time in prefill and vocabulary reduction.
+The profile is diagnostic evidence, not a replacement for uninstrumented timing.
+Attention variants measured at actual page contexts pass independent numerical,
+canary and input-immutability checks, but kernel microbenchmarks alone do not
+authorize changing a serving default. Throughput parity remains an open gate.
+
+The long-context packet passes 64 independent GPU numerical and graph-replay
+oracle cases, including sparse/permuted tables and contexts through 8,192 tokens.
+It requires a CUDA 13 driver API; older drivers retain ordinary CUDA attention.
+The projector now applies backend-specific per-image and aggregate vision bounds:
+CUDA accepts up to 16,384 patches per image and 65,536 packed rows, while Metal
+retains its 4,096-patch batching envelope. Brokers cap their work to that geometry.
+A prepared page outside the batching envelope retains its serial encoder instead
+of failing only because batching was enabled.
+
+Canonical reader profiles authorize the executor-owned continuation independently
+of multi-token bursts. Pure-greedy, callback, progress, cancellation and scheduler
+ownership checks remain mandatory. A live functional check timed out one request
+with `504 INFERENCE_TIMEOUT` while a peer completed with the expected full output
+hash; all 38 readiness probes succeeded. The same check passed four-page 0.8B
+batching and 4B eviction/reload. Compilation ran during this functional check,
+so its timings are excluded from performance qualification. The final main-merged
+binary separately passes serial and mixed-page requests, exact 0.8B reference
+checks, model switching, readiness after each phase, and explicit unloading.
+
+Decoder graphs remain opt-in. Projection-rounding modes whose arithmetic is not
+capture-compatible retain eager CUDA execution. Immutable fusion copies consume
+the device weight budget independently of scratch; device/combined admission and
+release on model retirement remain mandatory. All measured native runs retain
+the 20 GiB host, 34 GiB device, 4 GiB KV and 8 GiB scratch limits. The DGX uses
+its reference environment's CUDA 13 libraries, not the deployment image's pinned
+CUDA 12 libraries. No result here qualifies the A100 pool, full container image,
+new-node artifact download, or production rollout.
 
 ## Embeddings and extraction
 
