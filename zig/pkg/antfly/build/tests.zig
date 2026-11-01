@@ -2899,6 +2899,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&b.top_level_steps.get("embedded-package-test").?.step);
     unit_test_step.dependOn(&run_secret_backend_tests.step);
 
+    // Keep the Cloudflare host fixture on the same source-owner/import graph
+    // as production consumers; hand-written CLI module lists miss SQL quota
+    // recognition and allocator-reclamation dependencies after refactors.
+    const cloudflare_host_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/serverless_host_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, cloudflare_host_mod, true, true);
+    const cloudflare_host_tests = b.addTest(.{
+        .root_module = cloudflare_host_mod,
+        .filters = &.{ "serverless live", "serverless indexed", "serverless visibility", "serverless query cursors", "serverless mutation decoder", "serverless embedding checkpoints" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-cloudflare-host-test", "Run native Cloudflare host WAL, visibility and checkpoint contracts")
+        .dependOn(&addFilteredTestRunArtifact(b, cloudflare_host_tests).step);
+
     const serverless_default_filters = [_][]const u8{"serverless"};
     const serverless_tests = b.addTest(.{
         // macOS ReleaseFast measured 10.74 GB for this root. Reserve realistic
@@ -3075,9 +3092,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const text_frontier_tests = b.addTest(.{
         .root_module = text_frontier_mod,
         .filters = selectTestFilters(b, &.{ "external lake global frontier", "external lake metadata navigation", "external lake bounded window profiles", "external lake exact segment admission", "external lake bounded transforms", "external lake bounded window lookahead", "external lake bounded WAL", "constant score" }),
-        // The combined real-file/cloud owner peaks near 10 GB under optimized
-        // codegen; declare headroom instead of compiling twice on RSS retry.
-        .max_rss = @as(usize, if (optimize == .debug) 8 else 12) * 1024 * 1024 * 1024,
+        // The full external-lake Debug selection measured 12.92 GB on macOS;
+        // optimized codegen peaks near 10 GB. Reserve compiler headroom so a
+        // broader test filter can run without a failed RSS admission/recompile.
+        .max_rss = @as(usize, if (optimize == .debug) (if (target.result.os.tag == .macos) 16 else 8) else 12) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-text-frontier-test", "Verify metadata-only global admission, score bounds, ties and bounded profile aggregation")
@@ -6423,7 +6441,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lite_merge_publication_runtime_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions" },
+        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions", "db manual text producers merge capacity without optional workers" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-merge-publication-runtime-test", "Verify incremental merge publication handoff and shutdown")

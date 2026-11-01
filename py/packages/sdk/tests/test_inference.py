@@ -17,6 +17,7 @@ from antfly.client_generated.models import (
     InferenceContextPrepareRequest,
     InferenceGenerateChatTemplateKwargs,
     InferenceGenerateRequest,
+    InferenceReadRequest,
     InferenceRole,
     InferenceTextRegion,
     InferenceToolChoiceType0,
@@ -742,3 +743,28 @@ def test_anthropic_config_and_signed_assistant_history_roundtrip() -> None:
     }
     assert InferenceGenerateMessage.from_dict(payload).to_dict() == payload
     assert InferenceChatMessage.from_dict(payload).to_dict() == payload
+
+
+@pytest.mark.parametrize("model", ["lightonai/LightOnOCR-3-0.8B", "another-reader"])
+@pytest.mark.parametrize("max_tokens", [None, 4096, 8192])
+def test_read_preserves_model_default_and_explicit_output_budget(model: str, max_tokens: int | None) -> None:
+    captured: list[dict[str, object]] = []
+
+    def handle(incoming: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(incoming.read()))
+        return httpx.Response(
+            200,
+            json={"object": "list", "model": model, "data": [{"object": "read", "index": 0, "text": "page complete"}]},
+        )
+
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(handle))
+    request = InferenceReadRequest(model=model)
+    if max_tokens is not None:
+        request.max_tokens = max_tokens
+    assert client.read(request).data[0].text == "page complete"
+    assert captured[0]["model"] == model
+    if max_tokens is None:
+        assert "max_tokens" not in captured[0]
+    else:
+        assert captured[0]["max_tokens"] == max_tokens

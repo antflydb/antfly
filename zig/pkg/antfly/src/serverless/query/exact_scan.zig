@@ -355,7 +355,7 @@ const Meter = struct {
         count.* += 1;
         return self.backing.get(self.backing.ptr, a, ref);
     }
-    fn many(ptr: *anyopaque, a: A, refs_: []const tree.Ref, output: []tree.Page) !void {
+    fn many(ptr: *anyopaque, a: A, refs_: []const tree.Ref, output: []tree.NavigationPage) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const count = self.counter orelse &self.reads;
         if (refs_.len > self.limit -| count.*) return error.ExactScanYield;

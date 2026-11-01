@@ -591,7 +591,7 @@ pub const SparseEnricher = struct {
         worker.media_page_limit = @max(cfg.media_pages_per_document, 1);
         worker.media_checkpoint_interval_ms = @max(cfg.media_checkpoint_interval_ms, 1);
         return worker.processAdmittedDocument(namespace, cfg, pin, pages, fact, key, head, expected_lsn, stats, source_read_bytes) catch |err| {
-            if (err == error.OutOfMemory and working.limit_exceeded) return error.EnrichmentDocumentBudgetExceeded;
+            if (err == error.OutOfMemory and working.limitExceeded()) return error.EnrichmentDocumentBudgetExceeded;
             return err;
         };
     }

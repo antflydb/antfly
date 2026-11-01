@@ -70,6 +70,24 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_ha_compat_tests = options.run_lib_ha_compat_tests;
     const compiled_recall_tests = options.compiled_recall_tests;
+    // Native lake probes use the product source graph so generated options,
+    // SDK inputs and platform dependencies are rebuilt after cache collection.
+    const lake_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
+    const lake_build = b.step("lake-native-bench-build", "Build and install the native lake performance probes");
+    inline for (.{
+        .{ "typed_spill_merge_probe", "lake-typed-merge-bench", "typed spill merge full sort probe" },
+        .{ "spill_residency_probe", "lake-spill-residency-bench", "lake budget governed spill residency probe" },
+        .{ "source_capture_probe", "lake-source-capture-bench", "lake streaming source capture probe" },
+    }) |probe| {
+        const module = b.createModule(.{ .root_source_file = b.path("bench/lake/" ++ probe[0] ++ ".zig"), .target = target, .optimize = optimize });
+        lake_imports.configure(b, module, true, true);
+        module.addImport("local", module.import_table.get("antfly_local_sources").?);
+        const binary = b.addTest(.{ .name = probe[1], .root_module = module, .filters = &.{probe[2]}, .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result) });
+        const install = b.addInstallArtifact(binary, .{});
+        lake_build.dependOn(&install.step);
+        b.step(probe[1] ++ "-build", "Build and install " ++ probe[1]).dependOn(&install.step);
+        b.step(probe[1], "Run " ++ probe[1]).dependOn(&b.addRunArtifact(binary).step);
+    }
     const system_catalog_bench = b.addExecutable(.{
         .name = "antfly-system-catalog-bench",
         .root_module = b.createModule(.{

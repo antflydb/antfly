@@ -1144,7 +1144,7 @@ pub const IndexedObjectStore = struct {
             try check(raw);
             return result.body;
         }
-        fn readPages(raw: *anyopaque, a: A, refs: []const tree.Ref, output: []tree.Page) !void {
+        fn readPages(raw: *anyopaque, a: A, refs: []const tree.Ref, output: []tree.NavigationPage) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (refs.len != output.len or refs.len > @import("objectstore").ordered_tree.max_read_batch) return error.InvalidGraphPage;
             var initialized: usize = 0;
@@ -1155,7 +1155,7 @@ pub const IndexedObjectStore = struct {
                 // A packed page may already share the request's physical block.
                 if (refs[begin].pack != null or refs[begin].bytes > 256 * 1024) {
                     const encoded = try getPage(raw, a, refs[begin]);
-                    output[begin] = try tree.decodePage(a, self.domain, refs[begin], encoded);
+                    output[begin] = try tree.decodeNavigationPage(a, self.domain, refs[begin], encoded);
                     initialized += 1;
                     begin += 1;
                     continue;
@@ -1182,7 +1182,7 @@ pub const IndexedObjectStore = struct {
                 for (results, 0..) |*result, i| {
                     const body = (result.* orelse return error.FileNotFound).body;
                     result.*.?.body = &.{};
-                    output[begin + i] = try tree.decodePage(a, self.domain, refs[begin + i], body);
+                    output[begin + i] = try tree.decodeNavigationPage(a, self.domain, refs[begin + i], body);
                     initialized += 1;
                 }
                 begin += count;

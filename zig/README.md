@@ -132,6 +132,19 @@ zig build test -Dshared-lib-root=../..
 
 ## Tests
 
+Large allocation-heavy lake fixtures use `CheckedTestAllocator`: ownership,
+poisoning, write-after-free and leak checks stay enabled without capturing a
+stack for each successful allocation. Set `ANTFLY_TEST_ALLOCATOR_TRACES=1` to
+rerun with full allocation traces, and `ANTFLY_TEST_TIMINGS=1` to print per-test
+setup, body and cleanup times. For example, from `zig/`:
+
+```sh
+ANTFLY_TEST_ALLOCATOR_TRACES=1 ZIG_GLOBAL_CACHE_DIR=.zig-cache/global \
+  ~/bin/zig build lake-integration-test \
+  -Dtest-filter='external lake native ordered indexes spill real Parquet' -j1
+```
+
+
 The default Zig test target runs unit, simulation, chaos, and checked recall
 coverage:
 

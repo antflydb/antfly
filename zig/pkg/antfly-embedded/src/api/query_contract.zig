@@ -4220,6 +4220,7 @@ fn ColumnWireResult(comptime T: type) type {
         req: db_mod.types.SearchRequest,
         projection: ?*const field_projection.Plan,
         scratch: *std.heap.ArenaAllocator,
+        column_projection: *@import("../storage/db/column_source.zig").ProjectionCache,
         alloc: std.mem.Allocator,
         failure: *?anyerror,
         plan: ?*ColumnWirePlan = null,
@@ -4284,7 +4285,8 @@ fn ColumnWireResult(comptime T: type) type {
                                         if (self.plan) |plan| {
                                             // Prepared descriptors live only until source() either
                                             // clones them into residency or writes them to the spool.
-                                            const prepared = source.prepare(self.scratch.allocator(), self.scratch, options) catch |err| {
+                                            // A single hit cannot amortize a schema-plan build.
+                                            const prepared = (if (self.hits.len > 1) self.column_projection.prepare(source, self.scratch.allocator(), self.scratch, options) else source.prepare(self.scratch.allocator(), self.scratch, options)) catch |err| {
                                                 self.failure.* = err;
                                                 return error.WriteFailed;
                                             };
@@ -4294,7 +4296,7 @@ fn ColumnWireResult(comptime T: type) type {
                                                 return error.WriteFailed;
                                             };
                                             w.endWriteRaw();
-                                        } else source.write(self.scratch, options, w) catch |err| {
+                                        } else (if (self.hits.len > 1) self.column_projection.write(source, self.scratch, options, w) else source.write(self.scratch, options, w)) catch |err| {
                                             if (err != error.WriteFailed) self.failure.* = err;
                                             return error.WriteFailed;
                                         };
@@ -4332,6 +4334,8 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
     var failure: ?anyerror = null;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
+    var column_projection = @import("../storage/db/column_source.zig").ProjectionCache.init(alloc);
+    defer column_projection.deinit();
     const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
     if (delivery) |sink| {
         var plan: ColumnWirePlan = undefined;
@@ -4356,7 +4360,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
                 }
             };
         }
-        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan };
+        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .column_projection = &column_projection, .alloc = alloc, .failure = &failure, .plan = &plan };
         std.json.Stringify.value(.{ .responses = &.{wrapped} }, options, &plan.writer) catch |err| return failure orelse (plan.failure orelse err);
         plan.writer.flush() catch |err| return plan.failure orelse err;
         // Every prepared fragment now belongs to residency or the spool.
@@ -4384,7 +4388,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, graph_wire: ?BorrowedGraphMap, req
         delivered.* = plan.length;
         return empty;
     }
-    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .alloc = alloc, .failure = &failure };
+    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .graph_wire = graph_wire, .hits = hits, .req = req, .projection = projection, .scratch = &scratch, .column_projection = &column_projection, .alloc = alloc, .failure = &failure };
     return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, options) catch |err| return failure orelse err;
 }
 

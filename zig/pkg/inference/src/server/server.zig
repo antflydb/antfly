@@ -1616,8 +1616,9 @@ pub const max_ordered_embedding_media_parts_per_item: usize = 32;
 const max_chunk_results = lib_chunker.max_chunk_results;
 const max_chunk_target_tokens = lib_chunker.max_chunk_target_tokens;
 const max_chunk_audio_window_ms = lib_chunker.max_chunk_audio_window_ms;
-const default_read_admission_max_tokens: usize = 256;
-const max_read_tokens: usize = 8192;
+// Admission accounting quantum, independent of model-specific completion defaults.
+const read_admission_tokens_per_unit: usize = 256;
+const max_read_tokens: usize = readers_api.max_output_tokens;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 const default_max_request_media_bytes: usize = 100 * 1024 * 1024;
 const read_admission_bytes_per_unit: usize = 16 * 1024 * 1024;
@@ -9107,8 +9108,10 @@ pub const Node = struct {
         allow_incomplete: bool,
     ) ![]Qwen3VlReadResult {
         try control.update(.loading_model, 0, 1);
-        const contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "read");
-        const max_tokens: i32 = @intCast(boundedReadOutputTokens(requested_max_tokens, default_read_admission_max_tokens, contract.batch.max_output_tokens_per_item));
+        var manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer manifest.deinit();
+        const contract = try resolvedInferenceExecutorContract(self, "read", &manifest);
+        const max_tokens: i32 = @intCast(resolveGenerativeReadMaxTokens(&manifest, requested_max_tokens, contract.batch.max_output_tokens_per_item));
         try validateInferenceExecutorInvocation(contract, .{ .item_count = image_datas.len, .output_tokens_per_item = @intCast(max_tokens), .has_image = true });
         // Keep one handle alive across the serial batch so another request
         // cannot evict the resident decoder/projector between page images.
@@ -9239,7 +9242,7 @@ pub const Node = struct {
 
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
-        const max_tokens = try validateReadMaxTokens(request.max_tokens);
+        var max_tokens = try validateReadMaxTokens(request.max_tokens);
         const inline_source_cap = readInlineSourceByteCap(self);
         var inline_source_bytes: usize = 0;
         for (request.images) |url| {
@@ -9263,12 +9266,15 @@ pub const Node = struct {
         const is_qwen3vl = isGenerativeReadModel(&admission_manifest);
 
         if (is_qwen3vl) {
+            const contract = try resolvedInferenceExecutorContract(self, "read", &admission_manifest);
+            max_tokens = resolveGenerativeReadMaxTokens(&admission_manifest, max_tokens, contract.batch.max_output_tokens_per_item);
+            try validateInferenceExecutorInvocation(contract, .{ .item_count = request.images.len, .output_tokens_per_item = max_tokens.?, .has_image = true });
             const generation_units = estimateGenerateAdmissionUnitsFromShape(
                 (try resolveGenerativeReadPrompt(&admission_manifest, request.prompt)).len,
                 1,
-                @intCast(max_tokens orelse default_read_admission_max_tokens),
+                @intCast(max_tokens.?),
             );
-            const required_units = @max(reserved_units, generation_units);
+            const required_units = @max(reserved_units, @max(generation_units, estimateReadAdmissionUnits(request.images.len, max_tokens)));
             try self.growAdmissionUnits(reserved_units, required_units);
             reserved_units = required_units;
         }
@@ -9493,7 +9499,7 @@ pub const Node = struct {
             if (isGenerativeReadModel(&manifest)) {
                 const prompt = try resolveGenerativeReadPrompt(&manifest, request.prompt);
                 const contract = try resolvedInferenceExecutorContract(self, "read", &manifest);
-                const output_tokens = boundedReadOutputTokens(max_tokens, default_read_admission_max_tokens, contract.batch.max_output_tokens_per_item);
+                const output_tokens = resolveGenerativeReadMaxTokens(&manifest, max_tokens, contract.batch.max_output_tokens_per_item);
                 const image_datas = try allocator.alloc([]const u8, request.images.len);
                 defer allocator.free(image_datas);
                 for (request.images, 0..) |image, index| {
@@ -9509,11 +9515,11 @@ pub const Node = struct {
                     .media_parts_per_item = 1,
                     .has_image = true,
                 });
-                var reserved_units = @max(required_units, estimateGenerateAdmissionUnitsFromShape(
+                var reserved_units = @max(required_units, @max(estimateReadAdmissionUnits(request.images.len, output_tokens), estimateGenerateAdmissionUnitsFromShape(
                     prompt.len,
                     1,
                     @intCast(output_tokens),
-                ));
+                )));
                 try self.acquireAdmissionUnits(reserved_units);
                 defer self.releaseAdmissionUnits(reserved_units);
                 const results = try self.readQwen3VlImagesWithAdmission(
@@ -20877,20 +20883,23 @@ pub const Node = struct {
         defer admission_manifest.deinit();
         const is_qwen3vl = isGenerativeReadModel(&admission_manifest);
 
+        const executor_contract = resolvedInferenceExecutorContract(self, "read", &admission_manifest) catch |err|
+            return inferenceExecutorContractFailureResponse(ctx, err);
         if (is_qwen3vl) {
+            max_tokens = resolveGenerativeReadMaxTokens(&admission_manifest, max_tokens, executor_contract.batch.max_output_tokens_per_item);
+            validateInferenceExecutorInvocation(executor_contract, .{ .item_count = (body.images orelse @as([]const api.ImageURL, &.{})).len, .output_tokens_per_item = max_tokens.?, .has_image = true }) catch |err|
+                return inferenceExecutorContractFailureResponse(ctx, err);
             const prompt = resolveGenerativeReadPrompt(&admission_manifest, body.prompt) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "LightOnOCR-3 prompt must be empty or grounding" });
             const generation_units = estimateGenerateAdmissionUnitsFromShape(
                 prompt.len,
                 1,
-                @intCast(max_tokens orelse default_read_admission_max_tokens),
+                @intCast(max_tokens.?),
             );
-            const required_units = @max(reserved_units, generation_units);
+            const required_units = @max(reserved_units, @max(generation_units, estimateReadAdmissionUnits((body.images orelse @as([]const api.ImageURL, &.{})).len, max_tokens)));
             if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
             reserved_units = required_units;
         }
-        const executor_contract = resolvedInferenceExecutorContract(self, "read", &admission_manifest) catch |err|
-            return inferenceExecutorContractFailureResponse(ctx, err);
         const read_prompt_bytes = if (is_qwen3vl)
             (try resolveGenerativeReadPrompt(&admission_manifest, body.prompt)).len
         else if (body.prompt) |prompt|
@@ -33155,7 +33164,7 @@ test "/read recognizes a Qwen3-VL generator bundle before reader model loading" 
     const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
-    var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 8 });
+    var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 8, .max_work_units = 64 });
     defer node.deinit();
     resetRequestWorkTestCounters();
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
@@ -33179,14 +33188,32 @@ test "/read recognizes a Qwen3-VL generator bundle before reader model loading" 
     defer image.deinit(allocator);
     const encoded = readers_api.EncodedRequest{ .images = &.{.{ .bytes = image.data, .mime_type = "image/png" }} };
     {
-        try node.acquireAdmissionUnits(4);
-        defer node.releaseAdmissionUnits(4);
+        try node.acquireAdmissionUnits(60);
+        defer node.releaseAdmissionUnits(60);
         try std.testing.expectError(error.QueueFull, node.readEncodedImagesReportedDirect(allocator, "owner/qwen", encoded));
-        try std.testing.expectEqual(@as(usize, 4), node.inference_admission.inFlightUnits());
+        try std.testing.expectEqual(@as(usize, 60), node.inference_admission.inFlightUnits());
     }
     try std.testing.expectError(error.IncompatibleModel, node.readEncodedImagesReportedDirect(allocator, "owner/qwen", encoded));
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     try std.testing.expectError(error.Timeout, node.readEncodedImagesReportedDirectWithContext(allocator, "owner/qwen", encoded, 0, .{}));
+
+    // A model's omitted page budget must expand consistently through HTTP,
+    // URL and encoded routes. A request may occupy the entire work capacity,
+    // but expansion must not overbook a competing request's existing units.
+    var constrained = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 8, .max_work_units = 16 });
+    defer constrained.deinit();
+    try constrained.acquireAdmissionUnits(1);
+    defer constrained.releaseAdmissionUnits(1);
+    var constrained_ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer constrained_ctx.deinit();
+    var constrained_response = try constrained.readImages(&constrained_ctx);
+    defer constrained_response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), constrained_response.status.code);
+    try std.testing.expectEqual(@as(usize, 1), constrained.inference_admission.inFlightUnits());
+    try std.testing.expectError(error.QueueFull, constrained.readImagesDirect(allocator, "owner/qwen", .{ .images = &.{"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"} }));
+    try std.testing.expectEqual(@as(usize, 1), constrained.inference_admission.inFlightUnits());
+    try std.testing.expectError(error.QueueFull, constrained.readEncodedImagesReportedDirect(allocator, "owner/qwen", encoded));
+    try std.testing.expectEqual(@as(usize, 1), constrained.inference_admission.inFlightUnits());
 }
 
 test "Qwen3-VL encoded read results own page identities and report serial execution" {
@@ -33235,7 +33262,7 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
 test "read admission units scale with image batch and decode length" {
     try std.testing.expectEqual(@as(usize, 1), estimateReadAdmissionUnits(1, null));
     try std.testing.expectEqual(@as(usize, 4), estimateReadAdmissionUnits(4, null));
-    try std.testing.expectEqual(@as(usize, 8), estimateReadAdmissionUnits(4, default_read_admission_max_tokens + 1));
+    try std.testing.expectEqual(@as(usize, 8), estimateReadAdmissionUnits(4, read_admission_tokens_per_unit + 1));
     try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(4, 1024));
     try std.testing.expectEqual(@as(usize, 128), estimateReadAdmissionUnits(4, 8192));
 }
@@ -33244,7 +33271,7 @@ test "Qwen3-VL read admission includes one serial multimodal generation" {
     const generation_units = Node.estimateGenerateAdmissionUnitsFromShape(
         qwen3vl_reader_mod.DefaultPrompt.len,
         1,
-        @intCast(default_read_admission_max_tokens),
+        @intCast(read_admission_tokens_per_unit),
     );
     try std.testing.expectEqual(@as(usize, 5), generation_units);
     try std.testing.expect(generation_units > estimateReadAdmissionUnits(1, null));
@@ -41159,8 +41186,8 @@ fn optionalBytesEql(a: ?[]const u8, b: ?[]const u8) bool {
 }
 
 fn estimateReadAdmissionUnits(image_count: usize, max_tokens: ?usize) usize {
-    const estimated_max_tokens = max_tokens orelse default_read_admission_max_tokens;
-    const token_units = 1 + ((@max(estimated_max_tokens, 1) - 1) / default_read_admission_max_tokens);
+    const estimated_max_tokens = max_tokens orelse read_admission_tokens_per_unit;
+    const token_units = 1 + ((@max(estimated_max_tokens, 1) - 1) / read_admission_tokens_per_unit);
     return std.math.mul(usize, @max(image_count, 1), token_units) catch std.math.maxInt(usize);
 }
 
@@ -47288,17 +47315,18 @@ test "reader media budget admits a full scan independently of single request con
     try std.testing.expectError(error.QueueFull, node.inference_admission.acquireRequestSlot());
 }
 
-/// Only omitted output lengths are narrowed automatically; explicit requests
-/// retain their value so invocation validation can report a policy violation.
-fn boundedReadOutputTokens(requested: ?usize, model_default: usize, ceiling: ?usize) usize {
-    return requested orelse if (ceiling) |limit| @min(model_default, limit) else model_default;
+/// The model family owns OCR defaults; deployment policy bounds omitted values.
+/// Explicit requests survive resolution for authoritative invocation validation.
+fn resolveGenerativeReadMaxTokens(manifest: *const manifest_mod.ModelManifest, requested: ?usize, ceiling: ?usize) usize {
+    const model_default = if (manifest.isLightOnOcr3()) lightonocr3_reader_mod.default_max_tokens else qwen3vl_reader_mod.default_max_tokens;
+    return readers_mod.resolveOutputTokens(requested, model_default, ceiling).?;
 }
 
 test "omitted reader output tokens resolve before execution and explicit excess is rejected" {
-    try std.testing.expectEqual(@as(usize, 64), boundedReadOutputTokens(null, 256, 64));
-    try std.testing.expectEqual(@as(usize, 64), boundedReadOutputTokens(null, 4096, 64));
-    try std.testing.expectEqual(@as(usize, 256), boundedReadOutputTokens(null, 256, 1024));
-    try std.testing.expectEqual(@as(usize, 65), boundedReadOutputTokens(65, 256, 64));
+    try std.testing.expectEqual(@as(?usize, 64), readers_mod.resolveOutputTokens(null, 256, 64));
+    try std.testing.expectEqual(@as(?usize, 64), readers_mod.resolveOutputTokens(null, 4096, 64));
+    try std.testing.expectEqual(@as(?usize, 256), readers_mod.resolveOutputTokens(null, 256, 1024));
+    try std.testing.expectEqual(@as(?usize, 65), readers_mod.resolveOutputTokens(65, 256, 64));
     const contract: ResolvedInferenceExecutorContract = .{
         .task = "read",
         .max_items_per_request = 1,
@@ -47308,10 +47336,10 @@ test "omitted reader output tokens resolve before execution and explicit excess 
         .accepts_audio = false,
         .accepts_document = false,
     };
-    try validateInferenceExecutorInvocation(contract, .{ .output_tokens_per_item = boundedReadOutputTokens(null, 4096, 64) });
+    try validateInferenceExecutorInvocation(contract, .{ .output_tokens_per_item = readers_mod.resolveOutputTokens(null, 4096, 64).? });
     try std.testing.expectError(error.InferenceBatchTooLarge, validateInferenceExecutorInvocation(contract, .{ .item_count = 2 }));
     try validateInferenceExecutorInvocation(contract, .{ .item_count = 2, .internal_microbatch = true });
-    try std.testing.expectError(error.InferenceOutputTokensExceeded, validateInferenceExecutorInvocation(contract, .{ .output_tokens_per_item = boundedReadOutputTokens(65, 4096, 64) }));
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, validateInferenceExecutorInvocation(contract, .{ .output_tokens_per_item = readers_mod.resolveOutputTokens(65, 4096, 64).? }));
 }
 
 fn validateMeasuredReadPrompt(contract: ResolvedInferenceExecutorContract, actual_input_tokens: usize, output_tokens: usize) !void {
@@ -47437,4 +47465,21 @@ test "LightOnOCR3 serial and cohort CUDA admission charge persistent recurrent s
     try std.testing.expectEqual(first.backend_scratch_bytes * 2, cohort.amounts.backend_scratch_bytes);
     try std.testing.expectEqual(first.backend_kv_bytes * 2, cohort.amounts.backend_kv_bytes);
     try std.testing.expectEqual(peak, cohort.decoder_backend_peak);
+}
+
+test "OCR generative profiles resolve page budgets without changing admission units" {
+    const a = std.testing.allocator;
+    var lighton_capabilities = [_][]const u8{"lightonocr3"};
+    const lighton = manifest_mod.ModelManifest{ .allocator = a, .model_type = .generator, .config_model_arch = "qwen3_5", .capabilities = &lighton_capabilities };
+    const qwen = manifest_mod.ModelManifest{ .allocator = a, .model_type = .generator, .inference_bundle_family = "qwen3_vl_gguf_bundle/v1" };
+    for ([_]*const manifest_mod.ModelManifest{ &lighton, &qwen }) |manifest| {
+        try std.testing.expectEqual(@as(usize, 4096), resolveGenerativeReadMaxTokens(manifest, null, null));
+        try std.testing.expectEqual(@as(usize, 1024), resolveGenerativeReadMaxTokens(manifest, null, 1024));
+        try std.testing.expectEqual(@as(usize, 8192), resolveGenerativeReadMaxTokens(manifest, 8192, 4096));
+        const tokens = resolveGenerativeReadMaxTokens(manifest, null, 8192);
+        try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(1, tokens));
+        try std.testing.expectEqual(@as(usize, 32), estimateReadAdmissionUnits(2, tokens));
+        try std.testing.expectEqual(@as(usize, 20), Node.estimateGenerateAdmissionUnitsFromShape(0, 1, @intCast(tokens)));
+    }
+    try std.testing.expectEqual(@as(usize, 1), estimateReadAdmissionUnits(1, 256));
 }

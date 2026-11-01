@@ -178,17 +178,18 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
     const maximum = envelope.value.working_set_bytes;
     if (maximum < 4096 or maximum > 20 * 1024 * 1024) return error.InvalidHostedWorkingSetBudget;
     var working = try @import("serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(wasm_allocator, .{ .max_working_set_bytes = maximum });
+    defer working.deinit();
     working_set_peak = 0;
     rejected_growth = 0;
     backing_failure = 0;
     defer {
-        working_set_peak = working.peak_live_bytes;
-        rejected_growth = working.largest_rejected_growth;
-        backing_failure = working.largest_backing_failure;
+        working_set_peak = working.peakBytes();
+        rejected_growth = working.largestRejectedGrowth();
+        backing_failure = working.largestBackingFailure();
     }
     const result = executeAdditional(working.allocator(), raw) catch |err| {
         if (err == error.ImmutableReadDependency and envelope.value.native_read_yield) return wasm_allocator.dupe(u8, "{\"__read_dependency\":true}");
-        if (err == error.OutOfMemory and working.limit_exceeded) return error.HostedWorkingSetBudgetExceeded;
+        if (err == error.OutOfMemory and working.limitExceeded()) return error.HostedWorkingSetBudgetExceeded;
         return err;
     };
     defer working.allocator().free(result);

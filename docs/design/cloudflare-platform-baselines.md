@@ -295,3 +295,42 @@ reading them for cleanup verification. Reports, failed samples, source hashes,
 sanitized logs and the audit remain local. No queues, scheduled jobs or export
 destinations were created. The historical memory error and full hosted gate
 remain open.
+
+## Latest main integration
+
+After the measurements above, merged `origin/main` at `a3b0410c9f` (215 incoming
+commits relative to this branch's prior integration). The three direct conflicts
+were the ordered-page facade, batched page storage and working-set allocator.
+Main's lazy `KeyView`/`NavigationPage` implementation now lives in the shared
+object-store engine, preserving this branch's batched read-ahead, dictionary
+values, relative pack validation and physical value provenance. Long compressed
+keys stay lazy; value dictionaries retain a separately owned bounded expansion.
+The compatibility facade exports the shared API rather than creating a second
+page engine. A combined long-key/dictionary/provenance regression passes.
+
+Main's reclaimer-aware quota is retained with advisory request-cache headroom
+and the native host's peak/rejected-growth/backing-failure diagnostics. The
+focused native host runner now uses the standard Zig build/source-owner graph;
+its old hand-written module list omitted the new allocator dependencies.
+The packed-page allocation-failure test uses the platform's existing stable
+failure-enumeration wrapper while retaining leak and ownership checks.
+
+All three WASM variants were rebuilt with the original maxima:
+
+- Full: `a5622fe8f6fc2565943b8fe8f2c9f77db5d5c3be8701a73ce136b27de47ba9dd`
+- Compact: `b8602aace3749f706c9074e1b789bea609add3d5914e40f901f9c0680eff3e0f`
+- Observe: `8d144f61f0e26ea4c402f54cf1c753144182809599905e045e51d7882e5d8cbd`
+
+Merged validation passes **623 Node tests**, **209 shared object-store tests
+(two live-provider tests skip)**, **96 graph/page contracts**, **16 native
+read-state and 14 publication/read-write-plan contracts**, and **27 focused
+native host contracts**. Six actual-workerd checks pass against the rebuilt
+modules: metadata/point continuations plus v1/v2/v4/durable resident lifecycles,
+including updates, deletion, publication, expiry, reconstruction and retirement.
+The Apache source boundary check passes.
+
+The paired local latency table and hosted primitive results above remain pinned
+to their original source/bundles. No post-merge full latency matrix or new hosted
+Antfly qualification is inferred from functional validation. Old module payloads
+remain immutable and their recorded hashes still verify. The approved original
+control and all gate thresholds remain unchanged; batching remains opt-in.

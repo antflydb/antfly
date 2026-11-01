@@ -273,18 +273,16 @@ pub const Capture = struct {
         self.cluster = Cluster.init(ca, &self.manager, columns.len);
         self.route_store = try PrivatePages.beginRun(&self.routes);
         self.edits = Mutations.init(ca, &self.manager, self.route_store);
-        self.edits.?.private_pages.phase = store.io_phase;
     }
     /// Produce navigation tuples while the verified typed batch is live. The
     /// private tree shares the payload spill quota and has no serving authority.
-    pub fn configureOrdering(self: *Capture, schema: local.storage_schema.TableSchema, store: *stores.ArtifactStore) !void {
+    pub fn configureOrdering(self: *Capture, schema: local.storage_schema.TableSchema) !void {
         if (schema.index_sort.len < 2) return;
         const a = self.arena.allocator();
         const encoded = try local.storage_schema.serializeSchema(a, schema);
         self.ordering_schema = try local.storage_schema.deserializeSchema(a, encoded);
         self.ordering_fields = try local.storage_db_document_mapper.indexSortFieldsForSchemaAlloc(a, self.ordering_schema);
         self.ordering_edits = Mutations.init(self.budget.allocator(), &self.manager, self.route_store);
-        self.ordering_edits.?.private_pages.phase = store.io_phase;
     }
     fn check(raw: *anyopaque) !void {
         try @as(*Capture, @ptrCast(@alignCast(raw))).context.ensureActive();

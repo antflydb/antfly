@@ -24,8 +24,8 @@ const refs = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 
 pub const ReadCache = struct {
     ptr: *anyopaque,
-    decoded_read: ?*const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, [32]u8, tree.Ref, CancellationToken, *u64) anyerror!tree.Page = null,
-    decoded_many: ?*const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, [32]u8, []const tree.Ref, []tree.Page, CancellationToken, *u64) anyerror!void = null,
+    decoded_read: ?*const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, [32]u8, tree.Ref, CancellationToken, *u64) anyerror!tree.NavigationPage = null,
+    decoded_many: ?*const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, [32]u8, []const tree.Ref, []tree.NavigationPage, CancellationToken, *u64) anyerror!void = null,
     /// Own every output on success; release every partial output on failure.
     read_many: ?*const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, [32]u8, []const tree.Ref, [][]u8, CancellationToken, *u64) anyerror!void = null,
     read: *const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, refs.ArtifactRef, u64, usize, [32]u8, CancellationToken, *u64) anyerror![]u8,
@@ -213,18 +213,18 @@ pub const PageStore = struct {
         return self.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, id, ref.offset(), ref.bytes, self.cancellation);
     }
 
-    fn readDecoded(raw: *anyopaque, a: std.mem.Allocator, ref: tree.Ref) !tree.Page {
+    fn readDecoded(raw: *anyopaque, a: std.mem.Allocator, ref: tree.Ref) !tree.NavigationPage {
         const self: *PageStore = @ptrCast(@alignCast(raw));
         if ((ref.pack != null and self.pack_cache != null) or (if (self.inline_page) |page| page.ref.eql(ref) else false)) {
             var plain = self.store();
             plain.decoded_page = null;
-            return tree.readPage(a, plain, ref);
+            return tree.readNavigationPage(a, plain, ref);
         }
         const cache = self.read_cache.?;
         return cache.decoded_read.?(cache.ptr, a, self.artifacts, self.domain, ref, self.cancellation, self.remaining_read_bytes);
     }
 
-    fn readMany(raw: *anyopaque, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.Page) !void {
+    fn readMany(raw: *anyopaque, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.NavigationPage) !void {
         const self: *PageStore = @ptrCast(@alignCast(raw));
         if (refs_.len != output.len or refs_.len > tree.max_read_batch) return error.InvalidGraphPage;
         if (self.read_phase != null) return self.readCoalesced(a, refs_, output);
@@ -247,7 +247,7 @@ pub const PageStore = struct {
                 errdefer for (output[0..initialized]) |*page| page.deinit(a);
                 for (refs_, encoded[0..refs_.len], output) |ref, data, *page| {
                     consumed += 1;
-                    page.* = try tree.decodePage(a, self.domain, ref, data);
+                    page.* = try tree.decodeNavigationPage(a, self.domain, ref, data);
                     initialized += 1;
                 }
                 return;
@@ -274,13 +274,13 @@ pub const PageStore = struct {
 
     /// The coordinator owns phase transitions and counters. Workers receive
     /// immutable ranges and a locked allocator, never the mutable phase/cache.
-    fn readCoalesced(self: *PageStore, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.Page) !void {
+    fn readCoalesced(self: *PageStore, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.NavigationPage) !void {
         try self.cancellation.check();
         if (self.read_cache != null and self.read_phase != null) {
             var initialized: usize = 0;
             errdefer for (output[0..initialized]) |*page| page.deinit(a);
             for (refs_, output) |ref, *page| {
-                page.* = try tree.readPage(a, .{ .domain = self.domain, .ptr = self, .get = get, .put = put, .check = check }, ref);
+                page.* = try tree.readNavigationPage(a, .{ .domain = self.domain, .ptr = self, .get = get, .put = put, .check = check }, ref);
                 initialized += 1;
             }
             return;
@@ -380,7 +380,7 @@ pub const PageStore = struct {
         for (refs_, owners[0..refs_.len], output) |ref, owner, *page| {
             const job = jobs[owner];
             const offset = ref.offset() - job.begin;
-            page.* = try tree.decodePage(a, self.domain, ref, try a.dupe(u8, job.bytes.?[offset..][0..ref.bytes]));
+            page.* = try tree.decodeNavigationPage(a, self.domain, ref, try a.dupe(u8, job.bytes.?[offset..][0..ref.bytes]));
             initialized += 1;
         }
     }
@@ -483,16 +483,16 @@ pub const PageStore = struct {
 /// Query-owned authenticated reads. Allocator forwarding is locked only while
 /// workers run; all tasks join before output or an error escapes the caller.
 /// Each store capability must have independent counters or synchronized owners.
-pub fn readBatch(io: std.Io, a: std.mem.Allocator, sources: []const tree.Store, refs_: []const tree.Ref, output: []tree.Page) !void {
+pub fn readBatch(io: std.Io, a: std.mem.Allocator, sources: []const tree.Store, refs_: []const tree.Ref, output: []tree.NavigationPage) !void {
     const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
     if (sources.len != refs_.len or refs_.len != output.len or refs_.len > tree.max_read_batch) return error.InvalidGraphPage;
     const Job = struct {
         source: tree.Store,
         a: std.mem.Allocator,
         ref: tree.Ref,
-        result: ?tree.Page = null,
+        result: ?tree.NavigationPage = null,
         fn run(self: *@This()) anyerror!void {
-            self.result = try tree.readPage(self.a, self.source, self.ref);
+            self.result = try tree.readNavigationPage(self.a, self.source, self.ref);
         }
     };
     var allocations: scheduler.LockedAllocator = .{ .backing = a };
@@ -1507,7 +1507,7 @@ test "serverless graph query page waves overlap reads and drain failures cancell
         ref.* = entry.child.?.*;
         source.* = store;
     }
-    var output: [tree.max_read_batch]tree.Page = undefined;
+    var output: [tree.max_read_batch]tree.NavigationPage = undefined;
     try readBatch(std.testing.io, a, sources[0..count], refs_[0..count], output[0..count]);
     for (output[0..count]) |*owned| owned.deinit(a);
     try std.testing.expect(measured.peak.load(.acquire) > 1 and measured.peak.load(.acquire) <= count);
@@ -1655,7 +1655,7 @@ test "serverless navigation packed builders release every failed allocation" {
             try std.testing.expectEqual(@as(u64, 80), count);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "external lake publication miss waves coalesce packs bound fanout and drain failures" {
@@ -1731,7 +1731,7 @@ test "external lake publication miss waves coalesce packs bound fanout and drain
     var cache: tree.Cache = .{ .alloc = a, .decoded = true, .underlying = pages.store() };
     defer cache.deinit();
     const storage = cache.store();
-    var output: [6]tree.Page = undefined;
+    var output: [6]tree.NavigationPage = undefined;
     const before = fixture.memory.reads;
     // Reverse the request order to exercise scatter after packed range sorting.
     std.mem.reverse(tree.Ref, &roots);
@@ -1787,7 +1787,7 @@ test "serverless serial query ranges coalesce packed pages and reject corruption
             var none: u64 = 0;
             var store_ = PageStore{ .domain = @splat(9), .artifacts = source, .remaining_read_bytes = &remaining, .remaining_write_bytes = &none, .coalesce_reads = true };
             const capability = store_.store().read_many.?;
-            var output: [5]tree.Page = undefined;
+            var output: [5]tree.NavigationPage = undefined;
             try capability.read(capability.ptr, alloc, refs_, &output);
             defer for (&output) |*page| page.deinit(alloc);
             for (refs_, output) |ref, page| try std.testing.expect(page.ref.eql(ref));

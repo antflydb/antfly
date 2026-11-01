@@ -45,114 +45,52 @@ pub const Limits = struct {
 /// a configured-limit denial from an actual backing-allocator OOM through
 /// `limit_exceeded` and preserve a stable user-facing budget error.
 pub const WorkingSetAllocator = struct {
-    backing: std.mem.Allocator,
-    live_bytes: usize = 0,
-    peak_live_bytes: usize = 0,
-    max_live_bytes: usize,
-    limit_exceeded: bool = false,
-    largest_rejected_growth: usize = 0,
-    largest_backing_failure: usize = 0,
-    mutex: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *WorkingSetAllocator) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-    }
+    quota: @import("antfly_platform").allocator.reclamation.Quota,
 
     pub fn init(backing: std.mem.Allocator, limits: Limits) !WorkingSetAllocator {
         try limits.validate();
-        return .{ .backing = backing, .max_live_bytes = limits.max_working_set_bytes };
+        return .{ .quota = .init(backing, limits.max_working_set_bytes) };
     }
-
+    pub fn deinit(self: *WorkingSetAllocator) void {
+        self.quota.deinit();
+    }
     pub fn allocator(self: *WorkingSetAllocator) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &vtable };
+        return self.quota.allocator();
     }
-
+    pub fn limitExceeded(self: *const WorkingSetAllocator) bool {
+        return self.quota.limit_exceeded;
+    }
+    pub fn liveBytes(self: *const WorkingSetAllocator) usize {
+        return self.quota.live_bytes;
+    }
+    pub fn maxBytes(self: *const WorkingSetAllocator) usize {
+        return self.quota.max_live_bytes;
+    }
     pub fn headroom(a: std.mem.Allocator) ?usize {
-        if (a.vtable == &vtable) {
-            const self: *WorkingSetAllocator = @ptrCast(@alignCast(a.ptr));
-            self.lock();
-            const available = self.max_live_bytes -| self.live_bytes;
-            const backing = self.backing;
-            self.mutex.unlock();
-            return @min(available, headroom(backing) orelse return null);
-        }
+        if (@import("antfly_platform").allocator.reclamation.Quota.owner(a)) |owner| return @min(owner.available(), headroom(owner.backing) orelse return null);
         if (@import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
         if (comptime @import("builtin").is_test) if (a.vtable == std.testing.allocator.vtable) return std.math.maxInt(usize);
         if (@import("antfly_local_sources").sql_memory_budget.optionalLocalHeadroom(a)) |layer| return @min(layer.available, headroom(layer.backing) orelse return null);
         return @import("antfly_local_sources").sql_memory_budget.optionalHeadroom(a);
     }
-    /// Optional retention may use a known request cap even when the backing
-    /// allocator exposes no headroom. This is not a guarantee that backing
-    /// allocation succeeds and does not change admission's stricter headroom.
+    /// Optional cache retention may use a known quota above opaque backing.
+    /// Admission still uses strict headroom and actual allocation may fail.
     pub fn cacheHeadroom(a: std.mem.Allocator) ?usize {
-        if (a.vtable != &vtable) return headroom(a);
-        const self: *WorkingSetAllocator = @ptrCast(@alignCast(a.ptr));
-        self.lock();
-        const available = self.max_live_bytes -| self.live_bytes;
-        const backing = self.backing;
-        self.mutex.unlock();
-        return @min(available, headroom(backing) orelse available);
+        if (@import("antfly_platform").allocator.reclamation.Quota.owner(a)) |owner| {
+            const available = owner.available();
+            return @min(available, headroom(owner.backing) orelse available);
+        }
+        return headroom(a);
     }
-
-    fn permitsGrowth(self: *WorkingSetAllocator, additional_bytes: usize) bool {
-        if (additional_bytes <= self.max_live_bytes -| self.live_bytes) return true;
-        self.limit_exceeded = true;
-        self.largest_rejected_growth = @max(self.largest_rejected_growth, additional_bytes);
-        return false;
+    pub fn peakBytes(self: *const WorkingSetAllocator) usize {
+        return self.quota.peak_bytes;
     }
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
-        self.lock();
-        defer self.mutex.unlock();
-        if (!self.permitsGrowth(len)) return null;
-        const memory = self.backing.rawAlloc(len, alignment, ret_addr) orelse {
-            self.largest_backing_failure = @max(self.largest_backing_failure, len);
-            return null;
-        };
-        self.live_bytes += len;
-        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
-        return memory;
+    pub fn largestRejectedGrowth(self: *const WorkingSetAllocator) usize {
+        return self.quota.largest_rejected_growth;
     }
-
-    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
-        self.lock();
-        defer self.mutex.unlock();
-        const growth = new_len -| memory.len;
-        if (growth > 0 and !self.permitsGrowth(growth)) return false;
-        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
-        self.live_bytes = self.live_bytes -| memory.len +| new_len;
-        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
-        return true;
+    pub fn largestBackingFailure(self: *const WorkingSetAllocator) usize {
+        return self.quota.largest_backing_failure;
     }
-
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
-        self.lock();
-        defer self.mutex.unlock();
-        const growth = new_len -| memory.len;
-        if (growth > 0 and !self.permitsGrowth(growth)) return null;
-        const remapped = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
-        self.live_bytes = self.live_bytes -| memory.len +| new_len;
-        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
-        return remapped;
-    }
-
-    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
-        self.lock();
-        defer self.mutex.unlock();
-        self.backing.rawFree(memory, alignment, ret_addr);
-        self.live_bytes -|= memory.len;
-    }
-
-    const vtable = std.mem.Allocator.VTable{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
 };
 
 pub const Budget = struct {
@@ -264,10 +202,10 @@ test "lake build working-set allocator rejects growth before allocation" {
     const first = try bounded_alloc.alloc(u8, 8);
     defer bounded_alloc.free(first);
     try std.testing.expectError(error.OutOfMemory, bounded_alloc.alloc(u8, 1));
-    try std.testing.expect(bounded.limit_exceeded);
-    try std.testing.expect(bounded.largest_rejected_growth > 0);
-    try std.testing.expectEqual(@as(usize, 8), bounded.live_bytes);
-    try std.testing.expectEqual(@as(usize, 8), bounded.peak_live_bytes);
+    try std.testing.expect(bounded.limitExceeded());
+    try std.testing.expect(bounded.largestRejectedGrowth() > 0);
+    try std.testing.expectEqual(@as(usize, 8), bounded.peakBytes());
+    try std.testing.expectEqual(@as(usize, 8), bounded.liveBytes());
 }
 
 test "lake build working-set allocator shares exact accounting across upload workers" {
@@ -290,8 +228,8 @@ test "lake build working-set allocator shares exact accounting across upload wor
     }
     for (threads) |thread| thread.join();
     started = 0;
-    try std.testing.expectEqual(@as(usize, 0), bounded.live_bytes);
-    try std.testing.expect(!bounded.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 0), bounded.liveBytes());
+    try std.testing.expect(!bounded.limitExceeded());
 }
 
 test "lake build working-set headroom composes SQL budgets without bypassing opaque quotas" {
@@ -310,6 +248,44 @@ test "lake build working-set headroom composes SQL budgets without bypassing opa
     try std.testing.expectEqual(@as(?usize, null), WorkingSetAllocator.headroom(unknown.allocator()));
 }
 
+test "external lake publication quota enables adaptive spill ownership and preserves backing failure identity" {
+    const local = @import("antfly_local_sources");
+    const Quota = @import("antfly_platform").allocator.reclamation.Quota;
+    var build = try WorkingSetAllocator.init(std.testing.allocator, .{ .max_working_set_bytes = 2 << 20 });
+    defer build.deinit();
+    var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = build.allocator() };
+    var marker: u8 = 0;
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var manager: local.sql_spill.Manager = .{ .alloc = allocations.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = Check.check, .async_writes = false };
+    defer manager.deinit();
+    var pages = try local.sql_spill.JoinPayloads.init(&manager);
+    defer pages.close();
+    const values = [_]local.sql_scalar.Datum{local.sql_scalar.Datum.json(.{ .string = "publication quota" })};
+    const rows = [_][]const local.sql_scalar.Datum{&values};
+    const offset = try pages.appendBatch(.{ .rows = &rows });
+    try pages.file.seal();
+    var reader = local.sql_spill.PayloadReader.init(&pages);
+    defer reader.deinit();
+    const payload = try reader.read(.{ .offset = offset, .index = 0 });
+    defer payload.release();
+    try std.testing.expect(reader.cache.registered);
+    try std.testing.expectEqual(@as(usize, 1), manager.payload_budget_count);
+    try std.testing.expect(Quota.owner(build.allocator()).?.residency.active());
+    try std.testing.expect(!build.limitExceeded());
+    var region = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer region.deinit();
+    var region_build = try WorkingSetAllocator.init(region.allocator(), .{});
+    defer region_build.deinit();
+    try std.testing.expect(local.sql_memory_budget.reusableHeadroom(region_build.allocator()) == null);
+    var denied = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var genuine = try WorkingSetAllocator.init(denied.allocator(), .{});
+    defer genuine.deinit();
+    try std.testing.expectError(error.OutOfMemory, genuine.allocator().alloc(u8, 8));
+    try std.testing.expect(!genuine.limitExceeded());
+}
+
 test "optional block retention respects a request cap above an opaque backing allocator" {
     var buffer: [128 * 1024]u8 = undefined;
     var buffer_allocator = std.heap.FixedBufferAllocator.init(&buffer);
@@ -320,5 +296,5 @@ test "optional block retention respects a request cap above an opaque backing al
     const bytes = try a.alloc(u8, 32 * 1024);
     defer a.free(bytes);
     try std.testing.expectEqual(@as(?usize, 96 * 1024), WorkingSetAllocator.cacheHeadroom(a));
-    try std.testing.expect(!bounded.limit_exceeded);
+    try std.testing.expect(!bounded.limitExceeded());
 }

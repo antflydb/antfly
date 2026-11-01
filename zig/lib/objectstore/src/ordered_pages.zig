@@ -68,7 +68,7 @@ pub const Pages = struct {
         result.body = &.{};
         return body; // ordered_tree.decodePage authenticates domain and digest.
     }
-    fn readMany(raw: *anyopaque, a: A, refs: []const tree.Ref, output: []tree.Page) !void {
+    fn readMany(raw: *anyopaque, a: A, refs: []const tree.Ref, output: []tree.NavigationPage) !void {
         const self: *Pages = @ptrCast(@alignCast(raw));
         if (refs.len != output.len or refs.len > tree.max_read_batch) return error.InvalidGraphPage;
         var total: u64 = 0;
@@ -84,7 +84,7 @@ pub const Pages = struct {
         while (begin < refs.len) {
             if (refs[begin].bytes > 256 * 1024) {
                 const encoded = try get(raw, a, refs[begin]);
-                output[begin] = try tree.decodePage(a, self.domain, refs[begin], encoded);
+                output[begin] = try tree.decodeNavigationPage(a, self.domain, refs[begin], encoded);
                 initialized += 1;
                 begin += 1;
                 continue;
@@ -112,7 +112,7 @@ pub const Pages = struct {
             for (results, 0..) |*result, i| {
                 const body = (result.* orelse return error.FileNotFound).body;
                 result.*.?.body = &.{};
-                output[begin + i] = try tree.decodePage(a, self.domain, refs[begin + i], body);
+                output[begin + i] = try tree.decodeNavigationPage(a, self.domain, refs[begin + i], body);
                 initialized += 1;
             }
             begin += count;

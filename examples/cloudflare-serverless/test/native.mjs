@@ -16,14 +16,8 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const root = fileURLToPath(new URL("../../../", import.meta.url));
 const result = spawnSync(process.env.ANTFLY_ZIG ?? "zig", [
-  "test", "--dep", "objectstore", "--dep", "antfly_platform",
-  "-Mroot=zig/pkg/antfly/src/serverless_host_test_root.zig",
-  "--dep", "antfly_platform", "-Mobjectstore=zig/lib/objectstore/src/root.zig",
-  "-Mantfly_platform=zig/lib/platform/src/root.zig",
-  ...["serverless live", "serverless indexed", "serverless visibility", "serverless query cursors", "serverless mutation decoder", "serverless embedding checkpoints"]
-    .flatMap(name => ["--test-filter", name]),
-], { cwd: root, stdio: "inherit" });
+  "build", "antfly-cloudflare-host-test", "-Dmetal=false", "-j2",
+], { cwd: fileURLToPath(new URL("zig/", new URL("../../../", import.meta.url))), stdio: "inherit" });
 if (result.error) throw result.error;
 process.exitCode = result.status ?? 1;

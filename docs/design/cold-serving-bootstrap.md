@@ -491,3 +491,11 @@ See [independent offered-load qualification](cloudflare-independent-http.md) for
 the implemented external runner, complete eight-service evidence and recovered
 memory-error retention. Those changes improve measurement and failure detection;
 new hosted measurements and the historical memory root cause remain open.
+
+The later [platform baseline and latest-main integration](cloudflare-platform-baselines.md#latest-main-integration)
+merges `a3b0410c9f`, preserves main's navigation/quota improvements in the shared
+engine, rebuilds all three modules and validates native/actual-workerd lifecycles.
+Earlier latency tables remain explicitly pre-integration measurements. The
+hosted primitive fixture also separates existing-actor reconstruction from new
+object creation and measures R2/owner costs without claiming a universal floor
+or closing the historical memory error.

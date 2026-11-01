@@ -518,7 +518,7 @@ pub const QuerySession = struct {
             var no_writes: u64 = 0;
             var pages = PageStore{ .domain = domain, .artifacts = artifacts, .cancellation = cancellation, .remaining_read_bytes = remaining, .remaining_write_bytes = &no_writes, .coalesce_reads = true };
             const store = pages.store();
-            var decoded: [tree.max_read_batch]tree.Page = undefined;
+            var decoded: [tree.max_read_batch]tree.NavigationPage = undefined;
             try store.read_many.?.read(store.read_many.?.ptr, a, misses[0..needed], decoded[0..needed]);
             defer for (decoded[0..needed]) |*page| page.deinit(a);
             for (decoded[0..needed], owners[0..needed]) |page, owner| @memcpy(batch.items[owner].buffer(), page.bytes);

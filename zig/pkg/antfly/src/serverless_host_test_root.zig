@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const antfly_sources = @import("source_owner_physical.zig");
+
 test {
     _ = @import("serverless/hosted_embedding_checkpoint.zig");
     _ = @import("serverless/query/live_view.zig");
@@ -21,3 +23,5 @@ test {
     _ = @import("serverless/visibility.zig");
     _ = @import("serverless/wal/indexed_object_store.zig");
 }
+
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
