@@ -307,10 +307,28 @@ def worker(args):
         save()
         if args.warmup_requests:
             warmed = generate([conversation(i) for i in range(args.warmup_requests)])
-            assert all(
+            warmup_parity = all(
                 o.outputs[0].text == references[i % len(images)]["text"]
                 for i, o in enumerate(warmed)
-            ), "Warmup output differs from serial reference"
+            )
+            # Keep failure evidence in this already-private report. Otherwise
+            # the strict assertion discards the very outputs needed to tell a
+            # formatting variation from a content or batching defect.
+            report["warmup"] = dict(
+                serial_reference_parity=warmup_parity,
+                outputs=[
+                    dict(
+                        request_index=i,
+                        image_index=i % len(images),
+                        text=o.outputs[0].text,
+                        finish_reason=o.outputs[0].finish_reason,
+                        completion_tokens=len(o.outputs[0].token_ids),
+                    )
+                    for i, o in enumerate(warmed)
+                ],
+            )
+            save()
+            assert warmup_parity, "Warmup output differs from serial reference"
             report["warmup_completed"] = len(warmed)
             save()
         for round_index in range(args.rounds):
