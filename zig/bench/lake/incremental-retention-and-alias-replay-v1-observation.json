@@ -1,0 +1,3746 @@
+{
+  "schema_version": 1,
+  "purpose": "Remove quadratic quota-grown spill-cache recounts and replace repeated large-field owning-token analysis reuse with compact normalized alias replay.",
+  "runtime_source": "3d058bc003189c73b49f190fdf17ecea423d67ac",
+  "qualification_source": "ebd79013e3c088d3639a8f1acb21f18db68fae6a",
+  "merge_commit": "69406fefe50f10d706b1b681ddfe88e6717a6b22",
+  "main_commit": "97945ad58e8194815ad377a0ba853a4583d83ec4",
+  "runtime_abi": 83,
+  "reader_protocol": 97,
+  "persisted_formats_changed": false,
+  "server": {
+    "runtime_source": "3d058bc003189c73b49f190fdf17ecea423d67ac",
+    "qualification_source": "ebd79013e3c088d3639a8f1acb21f18db68fae6a",
+    "main_commit": "97945ad58e8194815ad377a0ba853a4583d83ec4",
+    "binary_sha256": "c7d11c617fcbe8c4441e71e2c489cca2f1ea32e6f94bb6116c1604b6089ad674",
+    "bytes": 803622312
+  },
+  "probes": {
+    "qualification_source": "ebd79013e3c088d3639a8f1acb21f18db68fae6a",
+    "runtime_source": "3d058bc003189c73b49f190fdf17ecea423d67ac",
+    "main_commit": "97945ad58e8194815ad377a0ba853a4583d83ec4",
+    "binaries": {
+      "before": {
+        "source_commit": "f73f851f05112e7f016132cd1402ee41d80ec342",
+        "binary_sha256": "c2e267576315b3b211c7fbe829423c83f07275ff00946d518f1033f3f439f13e",
+        "bytes": 1293416,
+        "harness": "zig/bench/lake/spill_residency_probe.zig",
+        "harness_sha256": "b1a4b0125b66b45e1036294a63b744d507efbba4e2751b076a3d9c3241a2e19a"
+      },
+      "after": {
+        "source_commit": "ebd79013e3c088d3639a8f1acb21f18db68fae6a",
+        "binary_sha256": "4a1bf471026d34d40e439928404357d41362f8fb515507e40bd9ddb7d68e679c",
+        "bytes": 1293288,
+        "harness": "zig/bench/lake/spill_residency_probe.zig",
+        "harness_sha256": "b1a4b0125b66b45e1036294a63b744d507efbba4e2751b076a3d9c3241a2e19a"
+      },
+      "capture": {
+        "source_commit": "ebd79013e3c088d3639a8f1acb21f18db68fae6a",
+        "binary_sha256": "6ba6db37a2be3ce2a436322fba7580bbb5c417e4b6c0a4a93a56ac9c0c7a641c",
+        "bytes": 1123128,
+        "harness": "zig/bench/lake/source_capture_probe.zig",
+        "harness_sha256": "29b677391fc67a5a1505adebf77966fc9b7cce7625640edbb6770077f53e0ec2"
+      },
+      "typed": {
+        "source_commit": "ebd79013e3c088d3639a8f1acb21f18db68fae6a",
+        "binary_sha256": "14aef3289a535c301319b619ade61d7b13ff6f0e1eb1e3484ac485c8d7f14186",
+        "bytes": 1292712,
+        "harness": "zig/bench/lake/typed_spill_merge_probe.zig",
+        "harness_sha256": "913963ed60df48a0c4667482f9059cde2f9ac5764dbaa87691477890de0e6c5f"
+      }
+    }
+  },
+  "build_commands": {
+    "native_probes": {
+      "cwd": "zig",
+      "command": [
+        "/Users/ajroetker/bin/zig",
+        "build",
+        "lake-native-bench-build",
+        "-Doptimize=fast",
+        "--summary",
+        "all"
+      ],
+      "environment": {
+        "ZIG_GLOBAL_CACHE_DIR": ".zig-cache/global"
+      }
+    },
+    "server": {
+      "cwd": "zig",
+      "command": [
+        "/Users/ajroetker/bin/zig",
+        "build",
+        "antfly",
+        "--summary",
+        "all"
+      ],
+      "environment": {
+        "ZIG_GLOBAL_CACHE_DIR": ".zig-cache/global"
+      }
+    }
+  },
+  "methodology": {
+    "scope": "Optimized native spill and capture kernels, with separate Debug native indexing and real-file HTTP correctness qualification.",
+    "residency_baseline": "Frozen quota-governed probe from f73f851f05112e7f016132cd1402ee41d80ec342 (runtime 04e87128ffef7efe9fb1ea0fee64ae29e4651ae7, main f91c9c0e4682a3ff20e39fce9a44d67b658a7b55). The identical harness is SHA-verified. Merged main changes do not reach the exercised native spill kernel; this is not a same-main whole-server speedup claim.",
+    "pairing": "One excluded warmup per variant/cohort, then three alternating measured pairs. No task-owned builds, tests or cleanup overlap final measurements. Other host activity and OS caches are uncontrolled.",
+    "cache_controls": "Both variants use quota-governed residency, the same hard quotas, a 4-MiB workspace and complete value/key/ordinal/NULL oracles. Reads, writes, payload decodes, roots and merge counts must match.",
+    "cache_timing": "CAPACITY includes the complete leased drain and all oracles; TYPED_MERGE includes add, finish, drain and sort teardown. Manager construction and process startup are excluded.",
+    "capture_controls": "One and two bindings, simple and English analyzers, repeated four-term and diverse 4096-term fixtures. Each variant analyzes once, visits every binding, encodes offsets once, and retires temporary owners during timing. Input, token/span and complete encoded-byte fingerprints must match across all samples.",
+    "capture_timing": "Includes analysis, callback validation, encoding and temporary teardown. Excludes immutable input generation, analyzer fingerprinting, process startup, encoded-output verification and final Capture teardown. Callback hashes stand in for consumers, not complete postings construction.",
+    "memory": "Tracked allocator high-water bytes exclude immutable capture input; they are not peak RSS. Quotas are unchanged within every pair.",
+    "capacity_controls": "Separate 64-MiB quota controls expect materialized OutOfMemory and successful compact replay. These are negative capacity controls, not failing product tests."
+  },
+  "residency": [
+    {
+      "rows": 8192,
+      "compressed": false,
+      "variants": {
+        "before": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 9661750,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15913659,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 73599292,
+                "reads": 13020790,
+                "writes": 10714991,
+                "merges": 0,
+                "peak": 15913659,
+                "quota": 33554432
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 9812459,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15913659,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 74060917,
+                "reads": 13020790,
+                "writes": 10714991,
+                "merges": 0,
+                "peak": 15913659,
+                "quota": 33554432
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 9560000,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15913659,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 74135625,
+                "reads": 13020790,
+                "writes": 10714991,
+                "merges": 0,
+                "peak": 15913659,
+                "quota": 33554432
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 74060917,
+            "reads": 13020790,
+            "writes": 10714991,
+            "merges": 0,
+            "peak": 15913659,
+            "quota": 33554432,
+            "drain_cpu_ns": 9661750,
+            "payload_reads": 513,
+            "roots": 513
+          }
+        },
+        "after": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 8831083,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15921859,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 72423000,
+                "reads": 13020790,
+                "writes": 10714991,
+                "merges": 0,
+                "peak": 15921859,
+                "quota": 33554432
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 8587083,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15921859,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 73239125,
+                "reads": 13020790,
+                "writes": 10714991,
+                "merges": 0,
+                "peak": 15921859,
+                "quota": 33554432
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 8813291,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15921859,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 72879375,
+                "reads": 13020790,
+                "writes": 10714991,
+                "merges": 0,
+                "peak": 15921859,
+                "quota": 33554432
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 72879375,
+            "reads": 13020790,
+            "writes": 10714991,
+            "merges": 0,
+            "peak": 15921859,
+            "quota": 33554432,
+            "drain_cpu_ns": 8813291,
+            "payload_reads": 513,
+            "roots": 513
+          }
+        }
+      },
+      "cpu_ns_change_percent": -1.5953650695413324,
+      "drain_cpu_ns_change_percent": -8.781628586953705,
+      "reads_change_percent": 0.0,
+      "writes_change_percent": 0.0,
+      "peak_change_percent": 0.05152806152248779,
+      "faster_pairs": 3
+    },
+    {
+      "rows": 8192,
+      "compressed": true,
+      "variants": {
+        "before": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 13359125,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15968229,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 81114959,
+                "reads": 2227505,
+                "writes": 842634,
+                "merges": 0,
+                "peak": 15968229,
+                "quota": 33554432
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 11708292,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15968229,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 79290834,
+                "reads": 2227505,
+                "writes": 842634,
+                "merges": 0,
+                "peak": 15968229,
+                "quota": 33554432
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 12681542,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15968229,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 80586416,
+                "reads": 2227505,
+                "writes": 842634,
+                "merges": 0,
+                "peak": 15968229,
+                "quota": 33554432
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 80586416,
+            "reads": 2227505,
+            "writes": 842634,
+            "merges": 0,
+            "peak": 15968229,
+            "quota": 33554432,
+            "drain_cpu_ns": 12681542,
+            "payload_reads": 513,
+            "roots": 513
+          }
+        },
+        "after": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 10821083,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15976429,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 80673292,
+                "reads": 2227505,
+                "writes": 842634,
+                "merges": 0,
+                "peak": 15976429,
+                "quota": 33554432
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 11366833,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15976429,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 77812958,
+                "reads": 2227505,
+                "writes": 842634,
+                "merges": 0,
+                "peak": 15976429,
+                "quota": 33554432
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 8192,
+                "drain_cpu_ns": 10514875,
+                "payload_reads": 513,
+                "roots": 513,
+                "owners": 513,
+                "cache_bytes": 15739810,
+                "peak": 15976429,
+                "quota": 33554432
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 8192,
+                "workspace": 4194304,
+                "cpu_ns": 78178250,
+                "reads": 2227505,
+                "writes": 842634,
+                "merges": 0,
+                "peak": 15976429,
+                "quota": 33554432
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 78178250,
+            "reads": 2227505,
+            "writes": 842634,
+            "merges": 0,
+            "peak": 15976429,
+            "quota": 33554432,
+            "drain_cpu_ns": 10821083,
+            "payload_reads": 513,
+            "roots": 513
+          }
+        }
+      },
+      "cpu_ns_change_percent": -2.988302643959251,
+      "drain_cpu_ns_change_percent": -14.670605514692136,
+      "reads_change_percent": 0.0,
+      "writes_change_percent": 0.0,
+      "peak_change_percent": 0.05135196896286498,
+      "faster_pairs": 3
+    },
+    {
+      "rows": 65536,
+      "compressed": false,
+      "variants": {
+        "before": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 201214500,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 126901509,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 693609375,
+                "reads": 107101684,
+                "writes": 87731252,
+                "merges": 1,
+                "peak": 126901509,
+                "quota": 268435456
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 204049834,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 126901509,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 684361916,
+                "reads": 107101684,
+                "writes": 87731252,
+                "merges": 1,
+                "peak": 126901509,
+                "quota": 268435456
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 201926958,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 126901509,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 691209541,
+                "reads": 107101684,
+                "writes": 87731252,
+                "merges": 1,
+                "peak": 126901509,
+                "quota": 268435456
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 691209541,
+            "reads": 107101684,
+            "writes": 87731252,
+            "merges": 1,
+            "peak": 126901509,
+            "quota": 268435456,
+            "drain_cpu_ns": 201926958,
+            "payload_reads": 4097,
+            "roots": 4097
+          }
+        },
+        "after": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 87577417,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 126967053,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 570164583,
+                "reads": 107101684,
+                "writes": 87731252,
+                "merges": 1,
+                "peak": 126967053,
+                "quota": 268435456
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 87864417,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 126967053,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 581650625,
+                "reads": 107101684,
+                "writes": 87731252,
+                "merges": 1,
+                "peak": 126967053,
+                "quota": 268435456
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 87686791,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 126967053,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 574228042,
+                "reads": 107101684,
+                "writes": 87731252,
+                "merges": 1,
+                "peak": 126967053,
+                "quota": 268435456
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 574228042,
+            "reads": 107101684,
+            "writes": 87731252,
+            "merges": 1,
+            "peak": 126967053,
+            "quota": 268435456,
+            "drain_cpu_ns": 87686791,
+            "payload_reads": 4097,
+            "roots": 4097
+          }
+        }
+      },
+      "cpu_ns_change_percent": -16.924173070695502,
+      "drain_cpu_ns_change_percent": -56.574995301023655,
+      "reads_change_percent": 0.0,
+      "writes_change_percent": 0.0,
+      "peak_change_percent": 0.05164950402598567,
+      "faster_pairs": 3
+    },
+    {
+      "rows": 65536,
+      "compressed": true,
+      "variants": {
+        "before": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 218895541,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 126961391,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 734119209,
+                "reads": 18816979,
+                "writes": 7624924,
+                "merges": 1,
+                "peak": 126961391,
+                "quota": 268435456
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 216840917,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 126961391,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 725189958,
+                "reads": 18816979,
+                "writes": 7624924,
+                "merges": 1,
+                "peak": 126961391,
+                "quota": 268435456
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 220251292,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 126961391,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 728370417,
+                "reads": 18816979,
+                "writes": 7624924,
+                "merges": 1,
+                "peak": 126961391,
+                "quota": 268435456
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 728370417,
+            "reads": 18816979,
+            "writes": 7624924,
+            "merges": 1,
+            "peak": 126961391,
+            "quota": 268435456,
+            "drain_cpu_ns": 218895541,
+            "payload_reads": 4097,
+            "roots": 4097
+          }
+        },
+        "after": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 105496208,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 127026935,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 616439750,
+                "reads": 18816979,
+                "writes": 7624924,
+                "merges": 1,
+                "peak": 127026935,
+                "quota": 268435456
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 104709667,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 127026935,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 618464584,
+                "reads": 18816979,
+                "writes": 7624924,
+                "merges": 1,
+                "peak": 127026935,
+                "quota": 268435456
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 65536,
+                "drain_cpu_ns": 104876750,
+                "payload_reads": 4097,
+                "roots": 4097,
+                "owners": 4097,
+                "cache_bytes": 125916660,
+                "peak": 127026935,
+                "quota": 268435456
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 65536,
+                "workspace": 4194304,
+                "cpu_ns": 618829541,
+                "reads": 18816979,
+                "writes": 7624924,
+                "merges": 1,
+                "peak": 127026935,
+                "quota": 268435456
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 618464584,
+            "reads": 18816979,
+            "writes": 7624924,
+            "merges": 1,
+            "peak": 127026935,
+            "quota": 268435456,
+            "drain_cpu_ns": 104876750,
+            "payload_reads": 4097,
+            "roots": 4097
+          }
+        }
+      },
+      "cpu_ns_change_percent": -15.089277438350434,
+      "drain_cpu_ns_change_percent": -52.08822001540909,
+      "reads_change_percent": 0.0,
+      "writes_change_percent": 0.0,
+      "peak_change_percent": 0.051625143268951845,
+      "faster_pairs": 3
+    },
+    {
+      "rows": 262144,
+      "compressed": false,
+      "variants": {
+        "before": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 3978487375,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507392569,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 5927460500,
+                "reads": 433103397,
+                "writes": 354505728,
+                "merges": 5,
+                "peak": 507392569,
+                "quota": 1073741824
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 3990729875,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507392569,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 5944047250,
+                "reads": 433103397,
+                "writes": 354505728,
+                "merges": 5,
+                "peak": 507392569,
+                "quota": 1073741824
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 3959667708,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507392569,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 5924782792,
+                "reads": 433103397,
+                "writes": 354505728,
+                "merges": 5,
+                "peak": 507392569,
+                "quota": 1073741824
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 5927460500,
+            "reads": 433103397,
+            "writes": 354505728,
+            "merges": 5,
+            "peak": 507392569,
+            "quota": 1073741824,
+            "drain_cpu_ns": 3978487375,
+            "payload_reads": 16385,
+            "roots": 16385
+          }
+        },
+        "after": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 445992958,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507654721,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 2400487417,
+                "reads": 433103397,
+                "writes": 354505728,
+                "merges": 5,
+                "peak": 507654721,
+                "quota": 1073741824
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 455197917,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507654721,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 2411984750,
+                "reads": 433103397,
+                "writes": 354505728,
+                "merges": 5,
+                "peak": 507654721,
+                "quota": 1073741824
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": false,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 445177250,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507654721,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": false,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 2403313666,
+                "reads": 433103397,
+                "writes": 354505728,
+                "merges": 5,
+                "peak": 507654721,
+                "quota": 1073741824
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 2403313666,
+            "reads": 433103397,
+            "writes": 354505728,
+            "merges": 5,
+            "peak": 507654721,
+            "quota": 1073741824,
+            "drain_cpu_ns": 445992958,
+            "payload_reads": 16385,
+            "roots": 16385
+          }
+        }
+      },
+      "cpu_ns_change_percent": -59.45458150248323,
+      "drain_cpu_ns_change_percent": -88.78988630697867,
+      "reads_change_percent": 0.0,
+      "writes_change_percent": 0.0,
+      "peak_change_percent": 0.05166650361407843,
+      "faster_pairs": 3
+    },
+    {
+      "rows": 262144,
+      "compressed": true,
+      "variants": {
+        "before": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 4144870875,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507405337,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 6242034083,
+                "reads": 77055998,
+                "writes": 32133149,
+                "merges": 5,
+                "peak": 507405337,
+                "quota": 1073741824
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 4155429709,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507405337,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 6231043041,
+                "reads": 77055998,
+                "writes": 32133149,
+                "merges": 5,
+                "peak": 507405337,
+                "quota": 1073741824
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 4146418416,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507405337,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 6225070959,
+                "reads": 77055998,
+                "writes": 32133149,
+                "merges": 5,
+                "peak": 507405337,
+                "quota": 1073741824
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 6231043041,
+            "reads": 77055998,
+            "writes": 32133149,
+            "merges": 5,
+            "peak": 507405337,
+            "quota": 1073741824,
+            "drain_cpu_ns": 4146418416,
+            "payload_reads": 16385,
+            "roots": 16385
+          }
+        },
+        "after": {
+          "samples": [
+            {
+              "sample": 0,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 585113125,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507667489,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 2668983791,
+                "reads": 77055998,
+                "writes": 32133149,
+                "merges": 5,
+                "peak": 507667489,
+                "quota": 1073741824
+              }
+            },
+            {
+              "sample": 1,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 572754875,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507667489,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 2643259875,
+                "reads": 77055998,
+                "writes": 32133149,
+                "merges": 5,
+                "peak": 507667489,
+                "quota": 1073741824
+              }
+            },
+            {
+              "sample": 2,
+              "drain": {
+                "compressed": true,
+                "expanded": true,
+                "rows": 262144,
+                "drain_cpu_ns": 567419208,
+                "payload_reads": 16385,
+                "roots": 16385,
+                "owners": 16385,
+                "cache_bytes": 503671824,
+                "peak": 507667489,
+                "quota": 1073741824
+              },
+              "full_sort": {
+                "compressed": true,
+                "rows": 262144,
+                "workspace": 4194304,
+                "cpu_ns": 2654579625,
+                "reads": 77055998,
+                "writes": 32133149,
+                "merges": 5,
+                "peak": 507667489,
+                "quota": 1073741824
+              }
+            }
+          ],
+          "medians": {
+            "cpu_ns": 2654579625,
+            "reads": 77055998,
+            "writes": 32133149,
+            "merges": 5,
+            "peak": 507667489,
+            "quota": 1073741824,
+            "drain_cpu_ns": 572754875,
+            "payload_reads": 16385,
+            "roots": 16385
+          }
+        }
+      },
+      "cpu_ns_change_percent": -57.39750780835603,
+      "drain_cpu_ns_change_percent": -86.18675643562935,
+      "reads_change_percent": 0.0,
+      "writes_change_percent": 0.0,
+      "peak_change_percent": 0.051665203513606706,
+      "faster_pairs": 3
+    }
+  ],
+  "capture": [
+    {
+      "analyzer": "simple",
+      "diverse": false,
+      "bindings": 1,
+      "variants": {
+        "materialized": {
+          "samples": [
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 16441417,
+              "wall_ns": 16442000,
+              "peak": 94546401,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 15788750,
+              "wall_ns": 15787000,
+              "peak": 94546401,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 15323417,
+              "wall_ns": 15324000,
+              "peak": 94546401,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 15788750,
+            "wall_ns": 15787000,
+            "peak": 94546401
+          }
+        },
+        "replay": {
+          "samples": [
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 16841375,
+              "wall_ns": 16841000,
+              "peak": 8295214,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 16678000,
+              "wall_ns": 16678000,
+              "peak": 8295214,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 16406250,
+              "wall_ns": 16406000,
+              "peak": 8295214,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 16678000,
+            "wall_ns": 16678000,
+            "peak": 8295214
+          }
+        }
+      },
+      "cpu_ns_change_percent": 5.632174808012036,
+      "wall_ns_change_percent": 5.6438842085259955,
+      "peak_change_percent": -91.22630379129926,
+      "output_equivalence": true
+    },
+    {
+      "analyzer": "simple",
+      "diverse": false,
+      "bindings": 2,
+      "variants": {
+        "materialized": {
+          "samples": [
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 16696917,
+              "wall_ns": 16697000,
+              "peak": 94546401,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 16790916,
+              "wall_ns": 16791000,
+              "peak": 94546401,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 17118458,
+              "wall_ns": 17118000,
+              "peak": 94546401,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 16790916,
+            "wall_ns": 16791000,
+            "peak": 94546401
+          }
+        },
+        "replay": {
+          "samples": [
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 19460875,
+              "wall_ns": 19461000,
+              "peak": 8296470,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 19115041,
+              "wall_ns": 19115000,
+              "peak": 8296470,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 19028500,
+              "wall_ns": 19029000,
+              "peak": 8296470,
+              "quota": 268435456,
+              "token_hash": "1321746ce170f27c",
+              "encoded_sha256": "0cee4e7444cd4007c5e777a42f399721dd584361d31be6907b8bcd5db807f4b0",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 19115041,
+            "wall_ns": 19115000,
+            "peak": 8296470
+          }
+        }
+      },
+      "cpu_ns_change_percent": 13.841561711106177,
+      "wall_ns_change_percent": 13.840748019772487,
+      "peak_change_percent": -91.22497534305933,
+      "output_equivalence": true
+    },
+    {
+      "analyzer": "simple",
+      "diverse": true,
+      "bindings": 1,
+      "variants": {
+        "materialized": {
+          "samples": [
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 31372875,
+              "wall_ns": 31370000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 31232625,
+              "wall_ns": 31233000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 31254625,
+              "wall_ns": 31255000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 31254625,
+            "wall_ns": 31255000,
+            "peak": 143603598
+          }
+        },
+        "replay": {
+          "samples": [
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 42933416,
+              "wall_ns": 42934000,
+              "peak": 9608160,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 42315750,
+              "wall_ns": 42316000,
+              "peak": 9608160,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 42752500,
+              "wall_ns": 42752000,
+              "peak": 9608160,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 42752500,
+            "wall_ns": 42752000,
+            "peak": 9608160
+          }
+        }
+      },
+      "cpu_ns_change_percent": 36.78775541219898,
+      "wall_ns_change_percent": 36.78451447768356,
+      "peak_change_percent": -93.30924842147758,
+      "output_equivalence": true
+    },
+    {
+      "analyzer": "simple",
+      "diverse": true,
+      "bindings": 2,
+      "variants": {
+        "materialized": {
+          "samples": [
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 32522333,
+              "wall_ns": 32525000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 32600291,
+              "wall_ns": 32600000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 32748125,
+              "wall_ns": 32749000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 32600291,
+            "wall_ns": 32600000,
+            "peak": 143603598
+          }
+        },
+        "replay": {
+          "samples": [
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 46332125,
+              "wall_ns": 46332000,
+              "peak": 9609056,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 45799083,
+              "wall_ns": 45802000,
+              "peak": 9609056,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 45991916,
+              "wall_ns": 45992000,
+              "peak": 9609056,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 45991916,
+            "wall_ns": 45992000,
+            "peak": 9609056
+          }
+        }
+      },
+      "cpu_ns_change_percent": 41.07823761450473,
+      "wall_ns_change_percent": 41.079754601226995,
+      "peak_change_percent": -93.30862448167908,
+      "output_equivalence": true
+    },
+    {
+      "analyzer": "english",
+      "diverse": false,
+      "bindings": 1,
+      "variants": {
+        "materialized": {
+          "samples": [
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 31253333,
+              "wall_ns": 31253000,
+              "peak": 141772729,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 30794167,
+              "wall_ns": 30794000,
+              "peak": 141772729,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 31214792,
+              "wall_ns": 31215000,
+              "peak": 141772729,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 31214792,
+            "wall_ns": 31215000,
+            "peak": 141772729
+          }
+        },
+        "replay": {
+          "samples": [
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 34354834,
+              "wall_ns": 34355000,
+              "peak": 8296135,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 34014250,
+              "wall_ns": 34012000,
+              "peak": 8296135,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 34485292,
+              "wall_ns": 34486000,
+              "peak": 8296135,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 34354834,
+            "wall_ns": 34355000,
+            "peak": 8296135
+          }
+        }
+      },
+      "cpu_ns_change_percent": 10.059467959933865,
+      "wall_ns_change_percent": 10.059266378343734,
+      "peak_change_percent": -94.14828573977722,
+      "output_equivalence": true
+    },
+    {
+      "analyzer": "english",
+      "diverse": false,
+      "bindings": 2,
+      "variants": {
+        "materialized": {
+          "samples": [
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 32279250,
+              "wall_ns": 32279000,
+              "peak": 141772729,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 32076917,
+              "wall_ns": 32074000,
+              "peak": 141772729,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 32110750,
+              "wall_ns": 32112000,
+              "peak": 141772729,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 32110750,
+            "wall_ns": 32112000,
+            "peak": 141772729
+          }
+        },
+        "replay": {
+          "samples": [
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 37086458,
+              "wall_ns": 37084000,
+              "peak": 8297391,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 36708625,
+              "wall_ns": 36709000,
+              "peak": 8297391,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            },
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": false,
+              "input": 1835008,
+              "tokens": 262144,
+              "cpu_ns": 36885875,
+              "wall_ns": 36886000,
+              "peak": 8297391,
+              "quota": 268435456,
+              "token_hash": "45f4a25b903278d1",
+              "encoded_sha256": "25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a",
+              "input_sha256": "36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 36885875,
+            "wall_ns": 36886000,
+            "peak": 8297391
+          }
+        }
+      },
+      "cpu_ns_change_percent": 14.870798720054811,
+      "wall_ns_change_percent": 14.866716492277021,
+      "peak_change_percent": -94.14739981481206,
+      "output_equivalence": true
+    },
+    {
+      "analyzer": "english",
+      "diverse": true,
+      "bindings": 1,
+      "variants": {
+        "materialized": {
+          "samples": [
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 30571042,
+              "wall_ns": 30571000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 30244917,
+              "wall_ns": 30245000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": true,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 30594417,
+              "wall_ns": 30642000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 30571042,
+            "wall_ns": 30571000,
+            "peak": 143603598
+          }
+        },
+        "replay": {
+          "samples": [
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 44622542,
+              "wall_ns": 44626000,
+              "peak": 9609312,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 45157583,
+              "wall_ns": 45158000,
+              "peak": 9609312,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": false,
+              "bindings": 1,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 44852334,
+              "wall_ns": 44850000,
+              "peak": 9609312,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 44852334,
+            "wall_ns": 44850000,
+            "peak": 9609312
+          }
+        }
+      },
+      "cpu_ns_change_percent": 46.71509724791192,
+      "wall_ns_change_percent": 46.707664126132606,
+      "peak_change_percent": -93.30844621316523,
+      "output_equivalence": true
+    },
+    {
+      "analyzer": "english",
+      "diverse": true,
+      "bindings": 2,
+      "variants": {
+        "materialized": {
+          "samples": [
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 31639417,
+              "wall_ns": 31639000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 32437166,
+              "wall_ns": 32437000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": true,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 32384541,
+              "wall_ns": 32385000,
+              "peak": 143603598,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 32384541,
+            "wall_ns": 32385000,
+            "peak": 143603598
+          }
+        },
+        "replay": {
+          "samples": [
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 49565625,
+              "wall_ns": 49566000,
+              "peak": 9609056,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 49523083,
+              "wall_ns": 49527000,
+              "peak": 9609056,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            },
+            {
+              "legacy": false,
+              "bindings": 2,
+              "diverse": true,
+              "input": 3407872,
+              "tokens": 262144,
+              "cpu_ns": 48793375,
+              "wall_ns": 48791000,
+              "peak": 9609056,
+              "quota": 268435456,
+              "token_hash": "d90db780a4f17615",
+              "encoded_sha256": "b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48",
+              "input_sha256": "c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2"
+            }
+          ],
+          "medians": {
+            "cpu_ns": 49523083,
+            "wall_ns": 49527000,
+            "peak": 9609056
+          }
+        }
+      },
+      "cpu_ns_change_percent": 52.92198521510618,
+      "wall_ns_change_percent": 52.93191292264938,
+      "peak_change_percent": -93.30862448167908,
+      "output_equivalence": true
+    }
+  ],
+  "negative_capacity_controls": [
+    {
+      "kind": "quota",
+      "diverse": false,
+      "variant": "materialized",
+      "output": "1/1 source_capture_probe.test.lake streaming source capture probe...FAIL (OutOfMemory)\n0 passed; 0 skipped; 1 failed.\n"
+    },
+    {
+      "kind": "quota",
+      "diverse": false,
+      "variant": "replay",
+      "output": "1/1 source_capture_probe.test.lake streaming source capture probe...CAPTURE legacy=false bindings=2 diverse=false input=1835008 tokens=262144 cpu_ns=38082709 wall_ns=38083000 peak=8297391 quota=67108864 token_hash=45f4a25b903278d1 encoded_sha256=25f53c7537a12bdecccd3cfcf462e03eb3c70d205e2d1be50f4e51937239c47a input_sha256=36ec6160401163b24a440c2cdb5432e2932c80ceff2aaffc4553643292c11033\nOK\nAll 1 tests passed.\n"
+    },
+    {
+      "kind": "quota",
+      "diverse": true,
+      "variant": "materialized",
+      "output": "1/1 source_capture_probe.test.lake streaming source capture probe...FAIL (OutOfMemory)\n0 passed; 0 skipped; 1 failed.\n"
+    },
+    {
+      "kind": "quota",
+      "diverse": true,
+      "variant": "replay",
+      "output": "1/1 source_capture_probe.test.lake streaming source capture probe...CAPTURE legacy=false bindings=2 diverse=true input=3407872 tokens=262144 cpu_ns=48700000 wall_ns=48700000 peak=9609056 quota=67108864 token_hash=d90db780a4f17615 encoded_sha256=b3cdaaab8cc90d2ef6e2156ce2fb559e1b63164cd5450cf3d7cecb1f6ac4ce48 input_sha256=c80f38d5ccce6cc9a92d05092f9677db257fee9e2236c3aec3af441c176322b2\nOK\nAll 1 tests passed.\n"
+    }
+  ],
+  "commands": [
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "8192",
+        "ANTFLY_MERGE_QUOTA": "33554432",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-8192-after--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "8192",
+        "ANTFLY_MERGE_QUOTA": "33554432",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-8192-before--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "8192",
+        "ANTFLY_MERGE_QUOTA": "33554432",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-8192-before-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "8192",
+        "ANTFLY_MERGE_QUOTA": "33554432",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-8192-after-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "8192",
+        "ANTFLY_MERGE_QUOTA": "33554432",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-8192-after-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "8192",
+        "ANTFLY_MERGE_QUOTA": "33554432",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-8192-before-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "8192",
+        "ANTFLY_MERGE_QUOTA": "33554432",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-8192-before-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "8192",
+        "ANTFLY_MERGE_QUOTA": "33554432",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-8192-after-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "65536",
+        "ANTFLY_MERGE_QUOTA": "268435456",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-65536-after--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "65536",
+        "ANTFLY_MERGE_QUOTA": "268435456",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-65536-before--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "65536",
+        "ANTFLY_MERGE_QUOTA": "268435456",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-65536-before-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "65536",
+        "ANTFLY_MERGE_QUOTA": "268435456",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-65536-after-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "65536",
+        "ANTFLY_MERGE_QUOTA": "268435456",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-65536-after-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "65536",
+        "ANTFLY_MERGE_QUOTA": "268435456",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-65536-before-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "65536",
+        "ANTFLY_MERGE_QUOTA": "268435456",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-65536-before-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "65536",
+        "ANTFLY_MERGE_QUOTA": "268435456",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-65536-after-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "262144",
+        "ANTFLY_MERGE_QUOTA": "1073741824",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-262144-after--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "262144",
+        "ANTFLY_MERGE_QUOTA": "1073741824",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-262144-before--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "262144",
+        "ANTFLY_MERGE_QUOTA": "1073741824",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-262144-before-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "262144",
+        "ANTFLY_MERGE_QUOTA": "1073741824",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-262144-after-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "262144",
+        "ANTFLY_MERGE_QUOTA": "1073741824",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-262144-after-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "262144",
+        "ANTFLY_MERGE_QUOTA": "1073741824",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-262144-before-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/before"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "262144",
+        "ANTFLY_MERGE_QUOTA": "1073741824",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-262144-before-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/after"
+      ],
+      "environment": {
+        "ANTFLY_MERGE_ROWS": "262144",
+        "ANTFLY_MERGE_QUOTA": "1073741824",
+        "ANTFLY_MERGE_WORKSPACE": "4194304"
+      },
+      "label": "cache-262144-after-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1"
+      },
+      "label": "capture-simple-False-1-replay--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-False-1-materialized--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-False-1-materialized-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1"
+      },
+      "label": "capture-simple-False-1-replay-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1"
+      },
+      "label": "capture-simple-False-1-replay-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-False-1-materialized-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-False-1-materialized-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1"
+      },
+      "label": "capture-simple-False-1-replay-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2"
+      },
+      "label": "capture-simple-False-2-replay--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-False-2-materialized--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-False-2-materialized-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2"
+      },
+      "label": "capture-simple-False-2-replay-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2"
+      },
+      "label": "capture-simple-False-2-replay-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-False-2-materialized-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-False-2-materialized-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2"
+      },
+      "label": "capture-simple-False-2-replay-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-simple-True-1-replay--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-True-1-materialized--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-True-1-materialized-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-simple-True-1-replay-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-simple-True-1-replay-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-True-1-materialized-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-True-1-materialized-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-simple-True-1-replay-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-simple-True-2-replay--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-True-2-materialized--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-True-2-materialized-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-simple-True-2-replay-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-simple-True-2-replay-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-True-2-materialized-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-simple-True-2-materialized-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-simple-True-2-replay-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1"
+      },
+      "label": "capture-english-False-1-replay--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-False-1-materialized--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-False-1-materialized-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1"
+      },
+      "label": "capture-english-False-1-replay-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1"
+      },
+      "label": "capture-english-False-1-replay-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-False-1-materialized-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-False-1-materialized-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1"
+      },
+      "label": "capture-english-False-1-replay-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1"
+      },
+      "label": "capture-english-False-2-replay--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-False-2-materialized--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-False-2-materialized-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1"
+      },
+      "label": "capture-english-False-2-replay-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1"
+      },
+      "label": "capture-english-False-2-replay-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-False-2-materialized-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-False-2-materialized-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1"
+      },
+      "label": "capture-english-False-2-replay-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-english-True-1-replay--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-True-1-materialized--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-True-1-materialized-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-english-True-1-replay-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-english-True-1-replay-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-True-1-materialized-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-True-1-materialized-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "1",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-english-True-1-replay-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-english-True-2-replay--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-True-2-materialized--1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-True-2-materialized-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-english-True-2-replay-0",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-english-True-2-replay-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-True-2-materialized-1",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "capture-english-True-2-materialized-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "capture-english-True-2-replay-2",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_QUOTA": "67108864",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "quota-False-materialized",
+      "exit_code": 1,
+      "expected_exit_code": 1
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_QUOTA": "67108864"
+      },
+      "label": "quota-False-replay",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_QUOTA": "67108864",
+        "ANTFLY_CAPTURE_DIVERSE": "1",
+        "ANTFLY_MATERIALIZED_CAPTURE": "1"
+      },
+      "label": "quota-True-materialized",
+      "exit_code": 1,
+      "expected_exit_code": 1
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/capture"
+      ],
+      "environment": {
+        "ANTFLY_CAPTURE_REPEATS": "65536",
+        "ANTFLY_CAPTURE_BINDINGS": "2",
+        "ANTFLY_CAPTURE_ENGLISH": "1",
+        "ANTFLY_CAPTURE_QUOTA": "67108864",
+        "ANTFLY_CAPTURE_DIVERSE": "1"
+      },
+      "label": "quota-True-replay",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    },
+    {
+      "command": [
+        "/Users/ajroetker/antfly/.worktrees/perf-lake-ordered-demand/.benchmark-results/lake/incremental-replay-v1/probes/typed"
+      ],
+      "environment": {},
+      "label": "typed-supported-target",
+      "exit_code": 0,
+      "expected_exit_code": 0
+    }
+  ],
+  "validation": {
+    "native": {
+      "command": [
+        "/Users/ajroetker/bin/zig",
+        "build",
+        "lake-api-test",
+        "-Dtest-filter=api.lake_wal_image.",
+        "-Dtest-filter=api.lake_retained_cut.",
+        "-Dtest-filter=api.lake_index_page_mutations.",
+        "-Dtest-filter=api.lake_row_",
+        "-Dtest-filter=api.lake_index_text_directory.",
+        "-Dtest-filter=api.lake_index_aggregate_",
+        "-Dtest-filter=api.lake_index_serving_compaction.",
+        "-Dtest-filter=api.lake_index_text_forward.",
+        "-Dtest-filter=highlight",
+        "-Dtest-filter=SQL adaptive payload cache",
+        "-Dtest-filter=SQL shared",
+        "-Dtest-filter=SQL memory",
+        "-Dtest-filter=SQL monotonic",
+        "-Dtest-filter=SQL nested",
+        "-Dtest-filter=SQL native",
+        "-Dtest-filter=SQL compact delivery",
+        "-Dtest-filter=storage.resource_manager.test.",
+        "-Dtest-filter=external lake metadata navigation",
+        "-Dtest-filter=external lake dynamic exact keys",
+        "-Dtest-filter=external lake bounded window profiles",
+        "-Dtest-filter=external lake Parquet",
+        "-Dtest-filter=external lake leased publication",
+        "-Dtest-filter=external lake warm tie pagination",
+        "-Dtest-filter=external lake ordered",
+        "-Dtest-filter=external lake aggregate persistent state admits",
+        "-Dtest-filter=external lake publication quota",
+        "-Dtest-filter=external lake native coordinator",
+        "-Dtest-filter=lake build working-set",
+        "-Dtest-filter=sql.spill.test.",
+        "--summary",
+        "all"
+      ],
+      "shared_passed": 412,
+      "api_passed": 187,
+      "additional_bounded_native_indexing_passed": 1,
+      "unique_passed": 600,
+      "failed": 0,
+      "skipped": 0,
+      "leaked": 0,
+      "log_sha256": "84b76d3e023958e063bcbaeb0e3460b3dd68c57fd224f47deed94bac5d65cc38"
+    },
+    "bounded_native_indexing": {
+      "input_bytes": 1245184,
+      "token_count": 393217,
+      "peak_tracked_bytes": 6565096,
+      "quota_bytes": 67108864,
+      "analyses": 1,
+      "reuses": 1,
+      "postings_and_search_exact": true,
+      "log_sha256": "6b8f56a856449f7f22c7cfa7291b91e75ad4c9ab7de79bd7c81290d016115a59"
+    },
+    "e2e": {
+      "command": [
+        "zig/e2e/antfly/.venv/bin/python",
+        "-B",
+        "-m",
+        "pytest",
+        "zig/e2e/antfly/test_lake_archive_qualification.py",
+        "zig/e2e/antfly/test_iceberg_sql.py",
+        "-n2",
+        "-q"
+      ],
+      "environment": {
+        "ANTFLY_BIN": "frozen server identified above",
+        "ANTFLY_E2E_FULL_LAKE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "TZ": "UTC"
+      },
+      "passed": 50,
+      "seconds": 391.96,
+      "log_sha256": "5063571de1948e86a7257b78be4433411a7dc7ba353b7a12ff629c93c213737a"
+    },
+    "checks": {
+      "license": {
+        "command": [
+          "python3",
+          "-B",
+          "scripts/license_headers.py",
+          "--check"
+        ],
+        "exit_code": 0,
+        "seconds": 2.36
+      },
+      "fmt": {
+        "command": [
+          "/Users/ajroetker/bin/zig",
+          "fmt",
+          "--check",
+          "zig/bench/lake/source_capture_probe.zig",
+          "zig/pkg/antfly-embedded/src/introducer.zig",
+          "zig/pkg/antfly-embedded/src/runtime_failure_abi.zig",
+          "zig/pkg/antfly-embedded/src/search/analysis.zig",
+          "zig/pkg/antfly-embedded/src/section/analysis_reuse.zig",
+          "zig/pkg/antfly-embedded/src/section/source_capture.zig",
+          "zig/pkg/antfly-embedded/src/section/source_token_spool.zig",
+          "zig/pkg/antfly-embedded/src/source_catalog.zig",
+          "zig/pkg/antfly-embedded/src/source_catalog_control.zig",
+          "zig/pkg/antfly-embedded/src/sql/spill.zig"
+        ],
+        "exit_code": 0,
+        "seconds": 0.044
+      },
+      "whitespace": {
+        "command": [
+          "git",
+          "diff",
+          "--check",
+          "origin/main"
+        ],
+        "exit_code": 0,
+        "seconds": 0.12
+      },
+      "fmt_final": {
+        "command": [
+          "/Users/ajroetker/bin/zig",
+          "fmt",
+          "--check",
+          "zig/bench/lake/borrowed_payload_probe.zig",
+          "zig/bench/lake/bounded_payload_permutation.zig",
+          "zig/bench/lake/compact_fence_probe.zig",
+          "zig/bench/lake/compact_metadata_probe.zig",
+          "zig/bench/lake/compact_write_probe.zig",
+          "zig/bench/lake/physical_page_probe.zig",
+          "zig/bench/lake/source_capture_probe.zig",
+          "zig/bench/lake/spill_residency_probe.zig",
+          "zig/bench/lake/typed_spill_merge_probe.zig",
+          "zig/build_support/antfly/imports.zig",
+          "zig/lib/platform/src/allocator.zig",
+          "zig/lib/platform/src/allocator_reclamation.zig",
+          "zig/pkg/antfly-embedded/src/api/query_contract.zig",
+          "zig/pkg/antfly-embedded/src/introducer.zig",
+          "zig/pkg/antfly-embedded/src/metadata/lake_index_catalog.zig",
+          "zig/pkg/antfly-embedded/src/runtime_failure_abi.zig",
+          "zig/pkg/antfly-embedded/src/search/analysis.zig",
+          "zig/pkg/antfly-embedded/src/search/highlight.zig",
+          "zig/pkg/antfly-embedded/src/search/query.zig",
+          "zig/pkg/antfly-embedded/src/search/search.zig",
+          "zig/pkg/antfly-embedded/src/search/wildcard.zig",
+          "zig/pkg/antfly-embedded/src/section/analysis_reuse.zig",
+          "zig/pkg/antfly-embedded/src/section/doc_values.zig",
+          "zig/pkg/antfly-embedded/src/section/source_capture.zig",
+          "zig/pkg/antfly-embedded/src/section/source_column.zig",
+          "zig/pkg/antfly-embedded/src/section/source_offsets.zig",
+          "zig/pkg/antfly-embedded/src/section/source_token_spool.zig",
+          "zig/pkg/antfly-embedded/src/segment.zig",
+          "zig/pkg/antfly-embedded/src/segment_source.zig",
+          "zig/pkg/antfly-embedded/src/serverless/query/lake_decoded_cache.zig",
+          "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_admission.zig",
+          "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_cursor.zig",
+          "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_page.zig",
+          "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_rowgroup.zig",
+          "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_selected.zig",
+          "zig/pkg/antfly-embedded/src/serverless/query/lake_read_context.zig",
+          "zig/pkg/antfly-embedded/src/serverless/query/lake_serving_cache.zig",
+          "zig/pkg/antfly-embedded/src/serverless/query/lake_stream.zig",
+          "zig/pkg/antfly-embedded/src/source_catalog.zig",
+          "zig/pkg/antfly-embedded/src/source_catalog_control.zig",
+          "zig/pkg/antfly-embedded/src/sql/memory_budget.zig",
+          "zig/pkg/antfly-embedded/src/sql/parallel_scheduler.zig",
+          "zig/pkg/antfly-embedded/src/sql/spill.zig",
+          "zig/pkg/antfly-embedded/src/storage/db/column_source.zig",
+          "zig/pkg/antfly-embedded/src/storage/db/document_mapper.zig",
+          "zig/pkg/antfly-embedded/src/storage/db/query/search_exec.zig",
+          "zig/pkg/antfly-embedded/src/storage/resource_manager.zig",
+          "zig/pkg/antfly-embedded/src/storage/typed_json.zig",
+          "zig/pkg/antfly/build/benches.zig",
+          "zig/pkg/antfly/build/tests.zig",
+          "zig/pkg/antfly/src/api/http_server.zig",
+          "zig/pkg/antfly/src/api/lake_artifact_ranges.zig",
+          "zig/pkg/antfly/src/api/lake_index_aggregate_artifact.zig",
+          "zig/pkg/antfly/src/api/lake_index_aggregate_reductions.zig",
+          "zig/pkg/antfly/src/api/lake_index_aggregate_rows.zig",
+          "zig/pkg/antfly/src/api/lake_index_aggregate_tree.zig",
+          "zig/pkg/antfly/src/api/lake_index_coordinator.zig",
+          "zig/pkg/antfly/src/api/lake_index_cover_columns.zig",
+          "zig/pkg/antfly/src/api/lake_index_decoded_metadata.zig",
+          "zig/pkg/antfly/src/api/lake_index_gc.zig",
+          "zig/pkg/antfly/src/api/lake_index_gc_progress.zig",
+          "zig/pkg/antfly/src/api/lake_index_native_directory.zig",
+          "zig/pkg/antfly/src/api/lake_index_native_files.zig",
+          "zig/pkg/antfly/src/api/lake_index_native_rows.zig",
+          "zig/pkg/antfly/src/api/lake_index_native_text.zig",
+          "zig/pkg/antfly/src/api/lake_index_navigation_pages.zig",
+          "zig/pkg/antfly/src/api/lake_index_ordered_rows.zig",
+          "zig/pkg/antfly/src/api/lake_index_pack_proof.zig",
+          "zig/pkg/antfly/src/api/lake_index_page_mutations.zig",
+          "zig/pkg/antfly/src/api/lake_index_page_ranges.zig",
+          "zig/pkg/antfly/src/api/lake_index_predicate_ranges.zig",
+          "zig/pkg/antfly/src/api/lake_index_publication_builders.zig",
+          "zig/pkg/antfly/src/api/lake_index_refinements_test.zig",
+          "zig/pkg/antfly/src/api/lake_index_seekable_text.zig",
+          "zig/pkg/antfly/src/api/lake_index_serving_compaction.zig",
+          "zig/pkg/antfly/src/api/lake_index_sort_stream.zig",
+          "zig/pkg/antfly/src/api/lake_index_source_projection.zig",
+          "zig/pkg/antfly/src/api/lake_index_sql_rows.zig",
+          "zig/pkg/antfly/src/api/lake_index_term_directory.zig",
+          "zig/pkg/antfly/src/api/lake_index_text_directory.zig",
+          "zig/pkg/antfly/src/api/lake_index_text_forward.zig",
+          "zig/pkg/antfly/src/api/lake_index_text_frontier.zig",
+          "zig/pkg/antfly/src/api/lake_index_text_query.zig",
+          "zig/pkg/antfly/src/api/lake_query_metrics.zig",
+          "zig/pkg/antfly/src/api/lake_row_fragments.zig",
+          "zig/pkg/antfly/src/api/lake_row_identity.zig",
+          "zig/pkg/antfly/src/api/lake_row_identity_build.zig",
+          "zig/pkg/antfly/src/api/lake_row_identity_delta.zig",
+          "zig/pkg/antfly/src/api/lake_row_identity_reader.zig",
+          "zig/pkg/antfly/src/api/lake_row_payloads.zig",
+          "zig/pkg/antfly/src/api/lake_row_translation_delta.zig",
+          "zig/pkg/antfly/src/api/lake_source_navigation.zig",
+          "zig/pkg/antfly/src/api/lake_text_delivery.zig",
+          "zig/pkg/antfly/src/api/lake_text_pack_wave.zig",
+          "zig/pkg/antfly/src/api/public_table_http.zig",
+          "zig/pkg/antfly/src/api/sql_memory_owner.zig",
+          "zig/pkg/antfly/src/api/table_contract.zig",
+          "zig/pkg/antfly/src/api_http_runtime_test_root.zig",
+          "zig/pkg/antfly/src/lake_integration_test_root.zig",
+          "zig/pkg/antfly/src/lake_text_frontier_test_root.zig",
+          "zig/pkg/antfly/src/serverless/api/http_handler.zig",
+          "zig/pkg/antfly/src/serverless/build/builder.zig",
+          "zig/pkg/antfly/src/serverless/build/lake_build_limits.zig",
+          "zig/pkg/antfly/src/serverless/build/lake_replay.zig",
+          "zig/pkg/antfly/src/serverless/build/lake_sidecar_algebraic.zig",
+          "zig/pkg/antfly/src/serverless/build/lake_sidecar_graph.zig",
+          "zig/pkg/antfly/src/serverless/build/lake_sidecar_sparse.zig",
+          "zig/pkg/antfly/src/serverless/build/lake_sidecar_text.zig",
+          "zig/pkg/antfly/src/serverless/build/lake_sidecar_vector.zig",
+          "zig/pkg/antfly/src/serverless/build/retention.zig",
+          "zig/pkg/antfly/src/serverless/enrichment/media_checkpoint.zig",
+          "zig/pkg/antfly/src/serverless/enrichment/worker.zig",
+          "zig/pkg/antfly/src/serverless/graph_segment/page_store.zig",
+          "zig/pkg/antfly/src/serverless/graph_segment/page_tree.zig",
+          "zig/pkg/antfly/src/storage/kernel_owner_test.zig"
+        ],
+        "exit_code": 0,
+        "seconds": 0.207
+      },
+      "whitespace_final": {
+        "command": [
+          "git",
+          "diff",
+          "--check",
+          "origin/main"
+        ],
+        "exit_code": 0,
+        "seconds": 0.072
+      },
+      "artifact_syntax": {
+        "json_files": 51,
+        "python_sources": 16,
+        "pass": true
+      },
+      "artifact_syntax_final": {
+        "json_files": 52,
+        "python_sources": 18,
+        "pass": true
+      },
+      "apache_boundary": {
+        "exit_code": 0,
+        "source_files": 2349,
+        "log_sha256": "4ef8ca5b3dd9a21c5a9a01555a0f1d37d688691414a030cb8cbe6897524667ec"
+      },
+      "make_gc": {
+        "command": [
+          "make",
+          "gc"
+        ],
+        "exit_code": 0,
+        "seconds": 0.04,
+        "timed_out": false,
+        "outcome": "scripts/cache_gc.sh\nNative build active or process inspection unavailable; skipping cache cleanup."
+      }
+    }
+  },
+  "limitations": [
+    "Compact alias replay materially lowers tracked memory but adds CPU in the capture kernel. It is retained for bounded working memory and quota availability, not claimed as an unconditional ingestion throughput improvement.",
+    "Current evidence makes no optimized-server throughput, HTTP publication latency, cloud retention, archive-scale, cold-cache or RSS claim. Earlier observations retain their own source/binary identities.",
+    "Real-provider retention qualification remains deferred; the external 142577-row HN fixture is unavailable on this machine; a full WASM bundle is not qualified by this run."
+  ]
+}

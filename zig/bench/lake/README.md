@@ -3060,3 +3060,92 @@ Apache boundary, license, formatting and whole-branch whitespace checks pass.
 No task-owned builds, tests or cleanup overlap final measurements. Host activity
 and OS caches remain uncontrolled. These optimized native kernel observations
 do not qualify optimized-server throughput, peak RSS, cloud or archive scale.
+
+
+### Incremental retention and compact alias replay
+
+`lake-spill-residency-bench` retains the same kernel harness and quotas for the
+incremental-accounting comparison. Both the before and after binaries use
+quota-governed residency: this comparison isolates the removal of whole-cache
+recounts, rather than changing the residency cap. The frozen before probe is
+source `f73f851f05112e7f016132cd1402ee41d80ec342`; merged main changes do not reach
+its exercised native spill kernel. Record the distinct source/main identities
+instead of presenting this as a same-main server comparison.
+
+The supported capture probe now accepts `ANTFLY_CAPTURE_BINDINGS=1..4` and
+`ANTFLY_CAPTURE_DIVERSE=1`. The default repeated fixture contains four terms;
+the diverse fixture contains 4,096 distinct terms. Both variants analyze once,
+visit every binding, encode source offsets once and retire temporary owners
+inside timing. The materialized control retains an owning token array through
+all aliases; the compact variant sends the first analysis directly to its
+consumer, then replays interned term IDs and original spans for aliases.
+
+```sh
+# Run from zig/, after building the supported optimized targets.
+ANTFLY_CAPTURE_BINDINGS=2 ANTFLY_CAPTURE_ENGLISH=1 \
+  ANTFLY_MATERIALIZED_CAPTURE=1 zig-out/bin/lake-source-capture-bench
+ANTFLY_CAPTURE_BINDINGS=2 ANTFLY_CAPTURE_ENGLISH=1 \
+  zig-out/bin/lake-source-capture-bench
+ANTFLY_CAPTURE_BINDINGS=2 ANTFLY_CAPTURE_ENGLISH=1 ANTFLY_CAPTURE_DIVERSE=1 \
+  zig-out/bin/lake-source-capture-bench
+```
+
+`ANTFLY_CAPTURE_QUOTA=67108864` provides a separate capacity control. An expected
+materialized `OutOfMemory` is recorded as a negative capacity control, never as
+a passing product regression test. The compact path must complete with identical
+output at that quota. Tracked peaks exclude immutable input and are not process
+RSS. The native indexing budget test additionally covers actual postings and
+search under a 64-MiB budget; capture-kernel timing alone is not ingestion
+throughput. Compact replay trades additional CPU for lower working memory;
+keep both measurements visible for repeated and diverse vocabularies.
+
+
+[incremental-retention-and-alias-replay-v1-observation.json](incremental-retention-and-alias-replay-v1-observation.json)
+records runtime `3d058bc003189c73b49f190fdf17ecea423d67ac`, the benchmark/test-only
+follow-up `ebd79013e3c088d3639a8f1acb21f18db68fae6a`, main
+`97945ad58e8194815ad377a0ba853a4583d83ec4`, frozen binary/harness identities,
+warmups and three alternating measured pairs. The supported native targets
+build and run without ignored source snapshots.
+
+At 262,144 rows, a 4-MiB workspace and the unchanged 1-GiB quota:
+
+| Compression | Recounting median full-sort CPU | Incremental median full-sort CPU | CPU change | Drain CPU change |
+| --- | ---: | ---: | ---: | ---: |
+| None | 5,927.460 ms | 2,403.314 ms | 59.5% lower | 88.8% lower |
+| Snappy | 6,231.043 ms | 2,654.580 ms | 57.4% lower | 86.2% lower |
+
+Reads, writes, payload decodes, roots and merge counts match in every cohort.
+Tracked peak rises by 262,152 bytes (about 0.05%) for owner metadata in the large
+cohort, within the same quota. Every measured pair is faster. At 65,536 rows,
+full-sort CPU falls 16.9% uncompressed and 15.1% with Snappy; the tight 8,192-row,
+32-MiB control falls only 1.6–3.0%. The stronger large-cohort improvement is
+consistent with removing whole-cache recounts.
+
+For two bindings, capture observes one analysis and one replay:
+
+| Analyzer / vocabulary | Owning-token tracked peak | Compact tracked peak | Peak change | CPU change |
+| --- | ---: | ---: | ---: | ---: |
+| Simple / four repeated terms | 94,546,401 | 8,296,470 | 91.2% lower | 13.8% higher |
+| English / four repeated terms | 141,772,729 | 8,297,391 | 94.1% lower | 14.9% higher |
+| Simple / 4,096 distinct terms | 143,603,598 | 9,609,056 | 93.3% lower | 41.1% higher |
+| English / 4,096 distinct terms | 143,603,598 | 9,609,056 | 93.3% lower | 52.9% higher |
+
+Repeated inputs contain 1,835,008 bytes; diverse inputs contain 3,407,872 bytes.
+Every binding's token/span hash and every complete offset/input SHA-256 match.
+Both materialized English controls fail at a 64-MiB quota; compact replay
+completes under that same quota with identical output. These expected failures
+are separate negative capacity controls. The independent native indexing test
+additionally builds exact postings and searches a 1,245,184-byte field with
+`body`/`_all` bindings under a 64-MiB quota: 6,565,096 tracked peak bytes,
+393,217 tokens, one analysis and one reuse. The memory benefit supports the
+compact path; the CPU increase prevents an ingestion-speedup claim.
+
+Final qualification passes **412 shared + 187 API + one additional bounded
+indexing native check (600 total)**, with zero failures, skips or leaks, plus
+**50 real Parquet/Iceberg E2E cases in 391.96 seconds** against the frozen Debug
+server. The merged main WAL and retained-cut checks are included. Apache
+boundary, license, formatting and whole-branch whitespace checks pass. Runtime
+ABI 83 fences new state; reader protocol 97 and persisted encodings are unchanged.
+No task-owned builds, tests or cleanup overlap final measurements. Other host
+activity and OS caches remain uncontrolled. These results establish no current
+optimized-server, cloud, archive-scale, cold-cache or RSS gain.

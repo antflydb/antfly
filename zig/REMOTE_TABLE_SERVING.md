@@ -2832,3 +2832,52 @@ I/O/memory and shows no CPU improvement. Repeated four-term capture fixtures use
 smaller simple-analyzer fixture takes 14.2% more CPU. These kernel observations
 are separate from earlier complete-publication measurements; no current HTTP,
 archive, cloud or RSS gain is claimed.
+
+
+### Incremental retention accounting and compact alias replay
+
+Payload-cache adoption now accounts each immutable block and dependency once.
+Lazy JSON owners publish arena-capacity growth to stable cache subscriptions;
+cache operations drain atomic deltas instead of walking every retained owner.
+Each physical owner has one subscription per cache, even when several roots
+refer to it. Eviction removes the subscription before subtracting its final
+capacity and freeing metadata. The subscription lifetime lock encloses no
+allocation or cache callback, so publishing under a JSON mutation lock cannot
+invert allocator/cache locks. Partial failed JSON allocations publish their
+capacity too. Statement/host admission and required-work reclamation remain
+authoritative throughout; a larger cache no longer implies quadratic recounting.
+
+For large supported text shared by physical bindings such as `body` and `_all`,
+the document-local analysis lease can retain compact normalized replay instead
+of an owning Token array. The first binding consumes the analyzer directly while
+interned-term IDs and original spans append to the bounded spool. Later aliases
+replay those records. Each binding keeps its own position base and field norm;
+source-offset encoding happens once per source field/analyzer fingerprint. The
+last binding closes replay memory and private disk state. Different source
+fields or fingerprints never share replay. Small fields and unsupported analyzer
+pipelines keep their existing owning-token reuse; no source format changes.
+
+Admitted in-memory records are read directly; spilled records keep the seekable
+run path. Token scratch resets in bounded microbatches, with a 64-KiB retention
+limit and the existing allocator quota. This reduces per-token reset overhead
+without extending the caller's promised token lifetime. Compact replay is a
+memory-efficiency improvement, with CPU tradeoffs measured explicitly for both
+repeated and diverse vocabularies. It is not an unconditional ingestion speedup.
+Runtime ABI 83 fences the new state; reader protocol 97 is unchanged.
+
+
+The [incremental-retention and alias-replay observation](bench/lake/incremental-retention-and-alias-replay-v1-observation.json)
+qualifies runtime `3d058bc003189c73b49f190fdf17ecea423d67ac`, with main
+`97945ad58e8194815ad377a0ba853a4583d83ec4`. Three alternating optimized native
+pairs at 262,144 rows reduce median full-sort CPU by 59.5% uncompressed and
+57.4% with Snappy; reads, writes, merges, roots and the 1-GiB quota match. Both
+variants already use quota-governed residency. This isolates removal of the
+recounts that penalized large caches, rather than further increasing residency.
+
+Two-binding capture uses 91.2–94.1% less tracked peak memory on repeated text
+and 93.3% less on 4,096-term text, with 13.8–52.9% more CPU. A separate native
+postings/search test builds a 1,245,184-byte field shared by `body` and `_all`
+with 6,565,096 tracked peak bytes under a 64-MiB quota, one analysis and one
+reuse. All 600 native checks and 50 real Parquet/Iceberg E2E cases pass. These
+kernel and correctness results do not establish optimized-server throughput,
+cloud retention, archive-scale or RSS improvements.
