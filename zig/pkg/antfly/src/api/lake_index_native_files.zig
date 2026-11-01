@@ -1450,8 +1450,8 @@ test "external lake native publication chunk waves overlap preserve order reuse 
     try std.testing.expect(fixture.peak.load(.acquire) > 1 and fixture.peak.load(.acquire) <= 3);
     const paged = try native_directory.persist(a, out, &store, .{ .domain = @splat(7), .files = &.{prefix} }, null, .none, &work);
     try std.testing.expectEqual(@as(u64, 17), prefix.chunk_root.?.records);
-    try std.testing.expectEqual(@as(usize, 0), capture_budget.live_bytes);
-    try std.testing.expect(!capture_budget.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 0), capture_budget.liveBytes());
+    try std.testing.expect(!capture_budget.limitExceeded());
     const before_noop = fixture.puts.load(.acquire);
     generation = bytes.len;
     work = 0;

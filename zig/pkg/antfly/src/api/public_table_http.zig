@@ -866,6 +866,26 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
     };
 }
 
+/// Preserve operation outcomes across query adapters before dependency-error
+/// classification can mistake cancellation for an upstream provider failure.
+pub fn queryCancellationError(err: anyerror) ?error{ Timeout, DeadlineExceeded, Canceled } {
+    return switch (err) {
+        error.Timeout => error.Timeout,
+        error.DeadlineExceeded => error.DeadlineExceeded,
+        error.Canceled, error.Cancelled => error.Canceled,
+        else => null,
+    };
+}
+
+test "highlight query cancellation classification preserves deadline identity before dependency normalization" {
+    try std.testing.expectEqual(error.Timeout, queryCancellationError(error.Timeout).?);
+    try std.testing.expectEqual(error.DeadlineExceeded, queryCancellationError(error.DeadlineExceeded).?);
+    try std.testing.expectEqual(error.Canceled, queryCancellationError(error.Canceled).?);
+    try std.testing.expectEqual(error.Canceled, queryCancellationError(error.Cancelled).?);
+    try std.testing.expect(queryCancellationError(error.ConnectionResetByPeer) == null);
+    try std.testing.expect(queryCancellationError(error.OutOfMemory) == null);
+}
+
 pub fn queryDependencyErrorOwnedResponse(
     alloc: std.mem.Allocator,
     status: u16,

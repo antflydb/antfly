@@ -341,7 +341,6 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
         if (std.meta.eql(space.ordering_cohort, key_recipe)) self.prior_ordering_keys = space.ordering_keys;
     }
     var ordering_edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
-    ordering_edits.private_pages.phase = self.store.io_phase;
     defer ordering_edits.deinit();
     self.ordering_edits = &ordering_edits;
     defer self.ordering_edits = null;
@@ -890,7 +889,6 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
     defer manager.deinit();
     var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
     defer edits.deinit();
-    edits.private_pages.phase = self.store.io_phase;
     const views = try out.alloc(Provider.FragmentView, recipes.len);
     const owners = try a.alloc(usize, recipes.len);
     defer a.free(owners);
@@ -1303,7 +1301,6 @@ const Spool = struct {
         self.route_store = try @import("../serverless/graph_segment/page_store.zig").PrivatePages.beginRun(&self.routes);
         var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &self.manager, self.route_store);
         defer edits.deinit();
-        edits.private_pages.phase = store.io_phase;
         var read_bytes: u64 = 0;
         var write_bytes: u64 = 0;
         var pages = self.owner.pageStore(&read_bytes, &write_bytes);
@@ -1391,7 +1388,6 @@ const Spool = struct {
         // physical-to-logical sort, or source payload reread is needed.
         var edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &self.manager, self.route_store);
         defer edits.deinit();
-        edits.private_pages.phase = store.io_phase;
         // Verification already certified the complete capture ID census. Join
         // only selected radix ranges, coalescing adjacent dirty leaves.
         var first: usize = 0;
@@ -1860,7 +1856,10 @@ test "external lake logical fragments retain boundaries and isolate append remov
 }
 
 test "external lake logical fragments split oversized radix leaves without physical reads" {
-    const a = std.testing.allocator;
+    // Preserve checked ownership without unwinding every successful allocation.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const a = fixture_allocator.allocator();
     var directory = try local.common_test_directory.TestDirectory.init("logical-fragment-split");
     defer directory.cleanup();
     var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
@@ -2097,7 +2096,7 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
             defer parsed.deinit(a);
             const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
             defer local.storage_schema.freeSchema(a, runtime);
-            try captured.?.configureOrdering(runtime, &store);
+            try captured.?.configureOrdering(runtime);
         }
         const opening = provider.provider();
         const source = try opening.open_with_cancellation_fn.?(opening.ptr, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .index_config_hash = "test", .column_bindings = &.{ "id", "body", "price" } }, .none);
