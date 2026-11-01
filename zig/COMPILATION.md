@@ -848,6 +848,15 @@ work or establish that every same-named function is identical. The profile
 workflow retains this report for all production owners. Native CPU observations
 do not lower the separately qualified GPU, Linux or cross-SDK reservations.
 
+Backend exclusion must cover implementation owners, including cleanup, runtime
+backend dispatch and shared dry-run entry points. A runtime null check in cleanup
+still instantiates the disabled backend's destructor; a CLI-only capability
+check still compiles GPU execution when the same runner serves CPU admission. Keep compile-time
+guards at those owners and inspect the emitted production archive. Preserve
+admission-only dry runs before the execution guard. See the
+[production retention investigation](../docs/design/compilation/history/production-retention-2026-11-01.md)
+for the CUDA caller evidence and a rejected mutation outlining experiment.
+
 ### Artifact and duplication budget
 
 Phase 4ab's accepted API split intentionally grew the executable to

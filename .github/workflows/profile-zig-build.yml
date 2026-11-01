@@ -93,9 +93,14 @@ jobs:
             owner=$(basename "$archive" .a)
             artifacts+=(--artifact "$owner=$archive")
           done
+          cuda_checks=()
+          if [ "$BUILD_OPTIMIZE" = fast ]; then
+            cuda_checks+=(--forbid 'libantfly-inference-core=ops.cuda.cuda_compute.')
+          fi
           python3 scripts/report_zig_archive_work.py "${artifacts[@]}" \
             --forbid 'libantfly-runtime-local_query=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
             --forbid 'libantfly-storage-kernel=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
+            "${cuda_checks[@]}" \
             --output .benchmark-results/compile-costs/archive-work.json
       - name: Attribute linked symbols and embedded asset candidates
         if: ${{ success() && inputs.step == 'antfly' }}
