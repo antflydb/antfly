@@ -309,9 +309,35 @@ operations.
 
 Implications: consolidate on every maintenance pass and rebuild rarely (a
 much higher deleted threshold, or a recall-drift trigger), and make
-rebuilds stop needing embeddings, for example by rebuilding the graph from
-the stored codes (or a small int8 copy) instead of exact vectors. That
-experiment is next.
+rebuilds stop needing embeddings.
+
+### Rebuilding without embeddings
+
+`Index.rebuildFromCodes` builds a new graph over the live nodes and keeps
+their RaBitQ codes unchanged, so it needs no embeddings. The graph is built
+either from the codes' own reconstructions or from a guide copy of the
+vectors. Same workload as above (`--churn-set rebuild`), recall@10 and
+recomputations per query at ef 1024:
+
+| Rebuild source | Extra storage | After 1st rebuild | After 2nd rebuild | Embeddings for rebuilds |
+|---|---|---|---|---:|
+| Exact embeddings | none | 0.903, 205/q | 0.889, 211/q | 200,000 |
+| 1-bit codes alone | none | 0.860, 251/q | 0.867, 246/q | 0 |
+| int8 copy | 256 B/vector at 256-d | 0.900, 205/q | 0.891, 210/q | 0 |
+
+- A graph built from 1-bit reconstructions is clearly worse: recall drops
+  ~0.04 and recomputations rise ~22%. It does not compound, since the codes
+  never change, but it is about where never rebuilding leaves you after 50%
+  churn (consolidation alone ended at 0.869), so it buys little.
+- An int8 copy matches exact embeddings, but adds ~2.6x the index's bytes
+  at 256-d (the index is ~97 B/vector; less, relatively, at higher dims).
+- Inserts linked with estimates do fine; it is the full build that needs
+  better-than-1-bit vectors, because pruning and neighbor selection compare
+  many close pairs.
+
+Options in between, not yet measured: a 4-bit copy (half of int8), or
+multi-bit RaBitQ codes as the index's codes, which would also tighten the
+search-time bounds.
 
 ## Table integration
 
