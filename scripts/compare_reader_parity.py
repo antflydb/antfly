@@ -43,7 +43,13 @@ def checked_hash(value, length=64):
 
 
 def positive_number(value):
-    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+    if type(value) not in (int, float) or value <= 0:
+        raise ValueError("missing or invalid measurement")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        finite = False
+    if not finite:
         raise ValueError("missing or invalid measurement")
     return value
 
@@ -93,7 +99,8 @@ def checked_receipt(report, *, native, concurrency):
             text = checked_hash(row.get("text_sha256"))
             if (
                 row.get("http_status") != 200
-                or row.get("items") != 1
+                or type(row.get("items")) is not int
+                or row["items"] != 1
                 or row.get("tail_pass") is not True
                 or row.get("statuses") != ["completed"]
             ):
@@ -125,7 +132,7 @@ def checked_receipt(report, *, native, concurrency):
             raise ValueError("capture changed page ordering or counts between rounds")
     for observation in rounds:
         cohorts.append(positive_number(observation["seconds"]))
-    elapsed = statistics.median(cohorts)
+    elapsed = positive_number(statistics.median(cohorts))
     return {
         "revision": revision,
         "script": report["benchmark_script_sha256"],
@@ -134,7 +141,7 @@ def checked_receipt(report, *, native, concurrency):
         "samples": dict(samples),
         "prompt_tokens": dict(prompt_tokens),
         "seconds": elapsed,
-        "pages_per_second": len(shape) / elapsed,
+        "pages_per_second": positive_number(len(shape) / elapsed),
         "rounds": len(rounds),
         "warmup_rounds": len(warmup),
     }
@@ -185,7 +192,9 @@ def compare(native_serial, native_batch, reference_serial, reference_batch):
             "reference_median_seconds": reference["seconds"],
             "native_pages_per_second": native["pages_per_second"],
             "reference_pages_per_second": reference["pages_per_second"],
-            "native_over_reference_latency": native["seconds"] / reference["seconds"],
+            "native_over_reference_latency": positive_number(
+                native["seconds"] / reference["seconds"]
+            ),
             "parity": native["seconds"] <= reference["seconds"],
         }
     return {

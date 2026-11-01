@@ -110,6 +110,24 @@ class ReaderParityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prompt-token"):
             self.result()
 
+    def test_derived_nonfinite_measurements_are_rejected(self):
+        for native, reference in [
+            (1e200, 1e-200),
+            (1e-200, 1e200),
+            (1e308, 10),
+            (10**1000, 10),
+        ]:
+            with self.subTest(native=native, reference=reference):
+                self.setUp()
+                for report in self.captures[:2]:
+                    for observation in report["observations"]:
+                        observation["seconds"] = native
+                for report in self.captures[2:]:
+                    for observation in report["observations"]:
+                        observation["seconds"] = reference
+                with self.assertRaisesRegex(ValueError, "measurement"):
+                    self.result()
+
     def test_speed_alone_cannot_qualify(self):
         for observation in self.captures[1]["observations"]:
             observation["requests"][0]["text_sha256"] = "a" * 64
