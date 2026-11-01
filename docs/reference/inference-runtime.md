@@ -40,6 +40,17 @@ Existing diagnostic environment overrides remain available.
 requests to reach the scheduler. Public `max_items_per_request: 1` does not
 prevent batching independent callers.
 
+On Ampere-or-newer CUDA devices, LightOn's automatic kernel policy uses split
+paged decode attention and tensor-core prefill for the two supported checkpoint
+geometries. Unsupported layouts retain the existing CUDA path. Explicit
+`ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION=0` and
+`ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off` disable the respective selections.
+These choices do not raise memory or request ceilings. Decoder row batching is
+independent of vision batching: the canonical reader profile reserves one page's
+vision workspace, so a single full-size page does not require an eight-image
+scratch reservation. Wider vision batches remain diagnostic overrides requiring
+their own memory and output qualification.
+
 ```json
 {
   "resources": {"inference": {

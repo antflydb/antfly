@@ -34,6 +34,36 @@ import urllib.error
 import urllib.request
 
 
+def normalized_text(text):
+    return "".join(c for c in text.casefold() if c.isalnum())
+
+
+def reference_expectations(path):
+    report = json.loads(path.read_text())
+    if report.get("status") != "ok" or not report.get("references"):
+        raise ValueError(
+            "reference report must contain successful completed references"
+        )
+    result = {}
+    for item in report["references"]:
+        index = item["image_index"]
+        if type(index) is not int or not 0 <= index < len(report["images"]):
+            raise ValueError("reference report contains an invalid image index")
+        digest = report["images"][index]["sha256"]
+        text = item["text"]
+        expected = (
+            hashlib.sha256(text.encode()).hexdigest(),
+            hashlib.sha256("".join(text.split()).encode()).hexdigest(),
+            hashlib.sha256(normalized_text(text).encode()).hexdigest(),
+        )
+        if digest in result and result[digest] != expected:
+            raise ValueError(
+                "reference report contains conflicting outputs for one image"
+            )
+        result[digest] = expected
+    return result
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--url", required=True)
@@ -44,12 +74,27 @@ def main():
     p.add_argument("--concurrency", type=int, default=1)
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--require-native-batch", action="store_true")
+    p.add_argument(
+        "--reference-report",
+        type=pathlib.Path,
+        help="Private benchmark_vllm_offline report; only comparison hashes are written",
+    )
+    p.add_argument(
+        "--require-reference-parity",
+        action="store_true",
+        help="Fail unless every output exactly matches its image-hash-matched reference",
+    )
     p.add_argument("--output", type=pathlib.Path, required=True)
     args = p.parse_args()
     if not 1 <= args.rounds <= 4 or not 1 <= args.concurrency <= 16:
         p.error("qualification is bounded to 1–4 rounds and 1–16 concurrent requests")
     if not 1 <= len(args.pages) <= 64:
         p.error("qualification is bounded to 1–64 pages per round")
+    if args.require_reference_parity and args.reference_report is None:
+        p.error("--require-reference-parity requires --reference-report")
+    references = (
+        reference_expectations(args.reference_report) if args.reference_report else None
+    )
     manifest = json.loads((args.fixtures / "manifest.json").read_text())
     expected = json.loads((args.fixtures / "expectations.json").read_text())["cases"]
     norm = lambda s: re.sub("[^a-z0-9]", "", s.casefold())
@@ -59,6 +104,10 @@ def main():
         image = (args.fixtures / pathlib.Path(item["image"]).name).read_bytes()
         if hashlib.sha256(image).hexdigest() != item["image_sha256"]:
             raise ValueError("fixture hash mismatch: " + page)
+        if references is not None and item["image_sha256"] not in references:
+            raise ValueError(
+                "reference report does not contain this image hash: " + page
+            )
         payloads.append(
             (
                 page,
@@ -83,6 +132,10 @@ def main():
         "concurrency": args.concurrency,
         "observations": [],
     }
+    if args.reference_report:
+        receipt["reference_report_sha256"] = hashlib.sha256(
+            args.reference_report.read_bytes()
+        ).hexdigest()
 
     def request(item):
         page, digest, body = item
@@ -95,6 +148,7 @@ def main():
             with urllib.request.urlopen(req, timeout=360) as response:
                 row["http_status"] = response.status
                 data = json.load(response)
+            row["seconds"] = round(time.monotonic() - start, 3)
             texts = [x.get("text", "") for x in data.get("data", [])]
             text = "\n".join(texts)
             row.update(
@@ -106,6 +160,17 @@ def main():
                 execution=data.get("execution"),
                 statuses=[x.get("status") for x in data.get("data", [])],
             )
+            if references is not None:
+                exact, whitespace, normalized = references[digest]
+                row["reference_exact"] = row["text_sha256"] == exact
+                row["reference_whitespace_exact"] = (
+                    hashlib.sha256("".join(text.split()).encode()).hexdigest()
+                    == whitespace
+                )
+                row["reference_alphanumeric_exact"] = (
+                    hashlib.sha256(normalized_text(text).encode()).hexdigest()
+                    == normalized
+                )
         except urllib.error.HTTPError as e:
             row["http_status"] = e.code
             try:
@@ -113,7 +178,10 @@ def main():
                 row["error_code"] = error.get("error", error.get("code"))
             except (ValueError, AttributeError):
                 row["error_code"] = "unparseable_error"
-        row["seconds"] = round(time.monotonic() - start, 3)
+        except (urllib.error.URLError, TimeoutError):
+            row["error_code"] = "CLIENT_TRANSPORT_ERROR"
+        if "seconds" not in row:
+            row["seconds"] = round(time.monotonic() - start, 3)
         print(json.dumps(row), flush=True)
         return row
 
@@ -135,6 +203,7 @@ def main():
         row.get("http_status") == 200
         and row.get("items") == 1
         and row.get("tail_pass")
+        and (not args.require_reference_parity or row.get("reference_exact") is True)
         and (
             not args.require_native_batch
             or (row.get("execution") or {}).get("native_items", 0) == 1

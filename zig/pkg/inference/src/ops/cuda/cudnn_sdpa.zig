@@ -18,6 +18,10 @@
 //! a link-time cuDNN dependency.
 const std = @import("std");
 
+// Covers the unmerged vision patches of full-resolution OCR pages, including
+// square pages. Decoder tokens are reduced by the model's spatial merger.
+pub const max_ocr_vision_sequence: usize = 16_384;
+
 const Desc = ?*anyopaque;
 const Handle = ?*anyopaque;
 const Status = c_int;
@@ -459,7 +463,7 @@ fn eligible(key: Key, version: usize) bool {
     // EmbeddingGemma defaults to unrelated model heads or longer pages.
     const ocr_vision = key.ocr_vision and !key.padding_mask and key.local_window_radius == 0 and
         key.batch <= 16 and (key.q_heads == 12 or key.q_heads == 16) and key.kv_heads == key.q_heads and
-        key.dim == 64 and key.sequence <= 4096 and scale_bits == @as(u32, @bitCast(@as(f32, 0.125)));
+        key.dim == 64 and key.sequence <= max_ocr_vision_sequence and scale_bits == @as(u32, @bitCast(@as(f32, 0.125)));
     if (key.ocr_vision) return ocr_vision;
     const text_base = key.q_heads == 4 and key.kv_heads == 2 and key.dim == 256 and
         scale_bits == @as(u32, @bitCast(@as(f32, 1.0)));
@@ -574,7 +578,11 @@ test "LightOnOCR3 CUDA cuDNN OCR vision geometry remains separate from embedding
     key.batch = 17;
     try std.testing.expect(!eligible(key, 92000));
     key.batch = 4;
-    key.sequence = 4097;
+    for ([_]usize{ 4097, 7656, 12996, max_ocr_vision_sequence }) |sequence| {
+        key.sequence = sequence;
+        try std.testing.expect(eligible(key, 92000));
+    }
+    key.sequence = max_ocr_vision_sequence + 1;
     try std.testing.expect(!eligible(key, 92000));
     key.sequence = 662;
     key.padding_mask = true;

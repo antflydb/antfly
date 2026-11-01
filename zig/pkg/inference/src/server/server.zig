@@ -6541,7 +6541,7 @@ pub const Node = struct {
                 null,
             );
             defer handle.release();
-            if (model.pin) try handle.markStartupManaged();
+            try handle.applyStartupPolicy(model.pin);
             return;
         } else |_| {}
         try self.warmLoadOnlyModel(allocator, model);

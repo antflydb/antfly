@@ -28,11 +28,22 @@ pub fn deviceSupported(compute_major: i32) bool {
     return compute_major >= 8;
 }
 
+pub fn validRowGeometry(rows: usize, batch: usize) bool {
+    return rows > 0 and rows <= 65536 and batch > 0 and batch <= 16 and
+        rows % batch == 0 and rows / batch <= cudnn.max_ocr_vision_sequence;
+}
+
 test "LightOnOCR3 BF16 vision device contract includes Ampere and Blackwell" {
     try std.testing.expect(!deviceSupported(7));
     try std.testing.expect(deviceSupported(8));
     try std.testing.expect(deviceSupported(9));
     try std.testing.expect(deviceSupported(12));
+    try std.testing.expect(validRowGeometry(7656, 1));
+    try std.testing.expect(validRowGeometry(12996 * 4, 4));
+    try std.testing.expect(validRowGeometry(65536, 4));
+    try std.testing.expect(!validRowGeometry(16385, 1));
+    try std.testing.expect(!validRowGeometry(12996 * 8, 8));
+    try std.testing.expect(!validRowGeometry(1, 0));
 }
 
 pub const Precision = enum {
@@ -161,7 +172,7 @@ pub const Module = struct {
     /// stream consumer. Nothing in this module owns page or decoder state.
     pub fn block(self: *Module, ctx: *context.CudaContext, blas: *cublas.CublasLt, attention: *cudnn.Module, key: cudnn.Key, arena: buffer.DeviceBuffer, layout: Layout, gemm_workspace: buffer.DeviceBuffer, request: Request) !void {
         const r = request;
-        if (r.rows == 0 or r.rows > 65536 or r.batch == 0 or r.batch > 16 or r.rows % r.batch != 0 or r.rows / r.batch > 4096 or !std.math.isFinite(r.epsilon) or r.epsilon <= 0 or !std.math.isFinite(r.theta) or r.theta <= 0) return error.InvalidShape;
+        if (!validRowGeometry(r.rows, r.batch) or !std.math.isFinite(r.epsilon) or r.epsilon <= 0 or !std.math.isFinite(r.theta) or r.theta <= 0) return error.InvalidShape;
         const expected = try Layout.init(r.rows, r.hidden, r.intermediate, layout.lengths[8]);
         if (!std.meta.eql(expected, layout)) return error.InvalidShape;
         const h_bytes = layout.lengths[0];

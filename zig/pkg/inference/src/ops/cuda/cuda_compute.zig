@@ -2309,7 +2309,7 @@ pub const CudaCompute = struct {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const compact = @import("lighton_vision_bf16.zig");
         _ = try compact.Layout.init(rows, hidden, intermediate, 0);
-        if (batch == 0 or batch > 16 or rows % batch != 0 or rows / batch > 4096 or positions.len != try checkedMul(rows, 2)) return error.InvalidShape;
+        if (!compact.validRowGeometry(rows, batch) or positions.len != try checkedMul(rows, 2)) return error.InvalidShape;
         if (!std.math.isFinite(eps) or eps <= 0 or !std.math.isFinite(theta) or theta <= 0) return error.InvalidShape;
         const input = tensorFromCt(input_ct);
         if (input.strict_resident_training or input.quant_type != null or (input.dtype != .f32 and input.dtype != .bf16)) return error.UnsupportedTensorType;
@@ -2406,7 +2406,7 @@ pub const CudaCompute = struct {
             self.ctx.info.compute_major < 8 or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
             !platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN") or dim != 64 or
             (heads != 12 and heads != 16) or batch == 0 or batch > (if (self.lighton_wide_microbatches) @as(usize, 16) else 8)) return null;
-        if (rows == 0 or rows % batch != 0 or rows / batch > 4096 or positions.len != try checkedMul(rows, 2) or
+        if (rows == 0 or rows % batch != 0 or rows / batch > cudnn_sdpa_mod.max_ocr_vision_sequence or positions.len != try checkedMul(rows, 2) or
             !std.math.isFinite(theta) or theta <= 0) return error.InvalidShape;
         const input = tensorFromCt(packed_ct);
         if (input.strict_resident_training) return null;
@@ -5073,6 +5073,7 @@ pub const CudaCompute = struct {
                 load_context,
             );
         kernels.qwen3vl_automatic_prefill = qwen3VlAutomaticPrefillForProfile(profile);
+        kernels.lighton_automatic_prefill = profile == .lightonocr3;
         errdefer {
             var kernels_mut = kernels;
             kernels_mut.unload(&ctx);
@@ -12478,10 +12479,6 @@ fn cudaDebugGraphCaptureDeviceScalarsEnabled(self: *const CudaCompute) bool {
         (cudaMtpTargetReplayEnabled() and cudaMtpUnsafeTargetReplayEnabled());
 }
 
-fn cudaTurboquantSplitAttentionEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION", false);
-}
-
 // Eager launches cover this sequence, not every other page in the pool.
 // Graphs with device-updated lengths must still cover their reserved capacity.
 fn cudaSplitAttentionCapacity(logical_tokens: usize, physical_tokens: usize, dynamic_length: bool) usize {
@@ -12492,10 +12489,6 @@ test "LightOnOCR3 CUDA split attention plans logical context and preserves graph
     try std.testing.expectEqual(@as(usize, 662), cudaSplitAttentionCapacity(662, 65536, false));
     try std.testing.expectEqual(@as(usize, 65536), cudaSplitAttentionCapacity(662, 65536, true));
     try std.testing.expectEqual(@as(usize, 1024), cudaSplitAttentionCapacity(1024, 512, true));
-}
-
-fn cudaTurboquantSplitAttentionChunkSize() usize {
-    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK") orelse 128;
 }
 
 fn cudaDebugGraphAutoAdvanceDecodeScalarsEnabled() bool {
@@ -24681,7 +24674,7 @@ fn sdpaQwen3VlVision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize
     // contract as the existing cuDNN BF16 vision route. Keep it opt-in until
     // full-checkpoint quality and throughput have both been qualified.
     if (self.capability_profile == .lightonocr3 and head_dim == 64 and
-        (num_heads == 12 or num_heads == 16) and batch >= 1 and batch <= (if (self.lighton_wide_microbatches) @as(usize, 16) else 8) and seq_len <= 4096 and
+        (num_heads == 12 or num_heads == 16) and batch >= 1 and batch <= (if (self.lighton_wide_microbatches) @as(usize, 16) else 8) and seq_len <= cudnn_sdpa_mod.max_ocr_vision_sequence and
         platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN") and
         !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
     {
@@ -25436,7 +25429,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     ) != null;
     if (!self.kernels.gqaSplitkOnlineDecodeProfileSelected() and
         !score_prework_selected and
-        cudaTurboquantSplitAttentionEnabled() and
+        self.runtime_policy.splitAttentionEnabled(self.capability_profile == .lightonocr3 and !self.resident_training_cache and self.lazy_host_store == null, self.ctx.info.compute_major) and
         batch == 1 and
         attention.query_sequence_len == 1 and
         bias_mode == 0 and
@@ -25444,7 +25437,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         (paged.format == cuda_kv_format_polar4 or paged.format == cuda_kv_format_f16) and
         paged.base_key_row_bytes == paged.key_row_bytes)
     split_attention_blk: {
-        const configured_chunk_size = cudaTurboquantSplitAttentionChunkSize();
+        const configured_chunk_size = self.runtime_policy.splitAttentionChunk(self.capability_profile == .lightonocr3);
         if (configured_chunk_size == 0) break :split_attention_blk;
         const warp_f16 = self.kernels.e4bF16WarpSplitSelected(num_heads, num_kv_heads, head_dim, paged.format, layer.value_format);
         const full_capacity = cudaSplitAttentionCapacity(

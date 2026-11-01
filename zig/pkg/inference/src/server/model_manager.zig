@@ -4414,6 +4414,10 @@ pub const CompositeAssetsHandle = struct {
     }
 
     pub fn markStartupManaged(self: *CompositeAssetsHandle) !void {
+        try self.applyStartupPolicy(true);
+    }
+
+    pub fn applyStartupPolicy(self: *CompositeAssetsHandle, pin: bool) !void {
         const assets = self.assets orelse return;
         self.manager.lockLoadedModels();
         defer self.manager.unlockLoadedModels();
@@ -4428,7 +4432,9 @@ pub const CompositeAssetsHandle = struct {
             }
             result.value_ptr.* = assets.preferred_backends[0];
         }
-        assets.startup_managed = true;
+        // Explicit startup backend selection also applies to evictable loads.
+        // Cache identity must not depend on whether the model is pinned.
+        if (pin) assets.startup_managed = true;
     }
 
     pub fn release(self: *CompositeAssetsHandle) void {

@@ -965,6 +965,30 @@ fn qwen3VlAutomaticM32GqaPrefillEligible(
         gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
 }
 
+/// LightOn's two original checkpoint geometries use the same admitted,
+/// page-16 F16 storage as the explicit MMA profile. Keep this automatic
+/// selection local to OCR; other models and explicit profiles are independent.
+fn lightOnAutomaticM32GqaPrefillEligible(compute_major: i32, batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
+    return compute_major >= 8 and batch == 1 and head_dim == 256 and
+        ((num_heads == 8 and num_kv_heads == 2) or (num_heads == 16 and num_kv_heads == 4)) and
+        gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
+}
+
+test "LightOnOCR3 automatic tensor core prefill covers both full page geometries" {
+    for ([_]i32{ 8, 9, 12 }) |major| {
+        try std.testing.expect(lightOnAutomaticM32GqaPrefillEligible(major, 1, 1914, 8, 2, 256, 0, 0));
+        try std.testing.expect(lightOnAutomaticM32GqaPrefillEligible(major, 1, 4096, 16, 4, 256, 0, 0));
+    }
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(7, 1, 1914, 8, 2, 256, 0, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 2, 1914, 8, 2, 256, 0, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 1, 1, 8, 2, 256, 0, 0));
+    try std.testing.expect(lightOnAutomaticM32GqaPrefillEligible(12, 1, 8192, 8, 2, 256, 0, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 1, 1914, 16, 8, 256, 0, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 1, 1914, 8, 2, 128, 0, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 1, 1914, 8, 2, 256, 1, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 1, 1914, 8, 2, 256, 0, 1));
+}
+
 fn fastGqaPrefillEligible(profile: GqaPrefillProfile, batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
     return profile.selectsFast() and
         gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
@@ -2390,6 +2414,7 @@ pub const KernelModule = struct {
     /// Model-scoped opt-in for Qwen3-VL automatic prefill routes. Explicit
     /// operator-selected profiles remain available to every architecture.
     qwen3vl_automatic_prefill: bool = false,
+    lighton_automatic_prefill: bool = false,
     gqa_splitk_online_decode_telemetry_word: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_fast_f32: driver_mod.CUfunction = null,
@@ -4545,6 +4570,7 @@ pub const KernelModule = struct {
             self.attention_match_repeat_launches = 0;
             self.gqa_prefill_profile = .automatic;
             self.qwen3vl_automatic_prefill = false;
+            self.lighton_automatic_prefill = false;
             self.gqa_score_prework_mode = .automatic;
             self.gqa_score_prework_consumer_mode = .serial;
             for (&self.gqa_prefill_route_log_words) |*word| word.store(0, .monotonic);
@@ -11684,10 +11710,9 @@ pub const KernelModule = struct {
                     }
                 },
                 .automatic => {
-                    if (self.qwen3vl_automatic_prefill and
-                        ctx.driver.fns.cuFuncSetAttribute != null and
+                    if (ctx.driver.fns.cuFuncSetAttribute != null and
                         mmaM32GqaPrefillEnabled() and
-                        qwen3VlAutomaticM32GqaPrefillEligible(
+                        ((self.qwen3vl_automatic_prefill and qwen3VlAutomaticM32GqaPrefillEligible(
                             ctx.info.compute_major,
                             ctx.info.compute_minor,
                             batch,
@@ -11697,7 +11722,16 @@ pub const KernelModule = struct {
                             head_dim,
                             mask_len,
                             bias_mode,
-                        ))
+                        )) or (self.lighton_automatic_prefill and lightOnAutomaticM32GqaPrefillEligible(
+                            ctx.info.compute_major,
+                            batch,
+                            q_seq_len,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            mask_len,
+                            bias_mode,
+                        ))))
                     {
                         if (self.gqa_attention_prefill_turboquant_mma_m32_f32) |mma_m32_function| {
                             function = mma_m32_function;

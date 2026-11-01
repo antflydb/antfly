@@ -90,6 +90,41 @@ Retry affected source versions after the policy change and require complete
 artifact coverage before semantic or graph enrichment. Avoid automatic image
 tiling without a tested ordering/deduplication policy.
 
+## Large-page vLLM comparison
+
+The reader throughput target is parity with vLLM, preferably faster, while
+preserving complete extraction. A faster short response does not qualify.
+Compare both LightOn checkpoints independently, using the original checkpoint,
+identical image hashes, image-only prompts, greedy decoding, and the same output
+allowance. Include dense full pages and mixed page lengths at concurrency one
+and the proposed serving concurrency. Compare pages per second and latency
+distributions; token accounting can differ by whether the terminator is counted.
+
+Use `benchmark_vllm_offline.py` to produce a private reference report and
+`scripts/qualify_reader_page_latency.py --reference-report REPORT` to compare
+native HTTP responses without copying document text into public receipts. The
+report records exact, whitespace-insensitive, and alphanumeric comparisons
+separately. Only exact comparison is an automatic parity gate
+(`--require-reference-parity`); an alphanumeric match alone cannot qualify
+punctuation, layout, or correctness. Review every differing full output against
+the source image. Record formatting-only differences explicitly rather than
+stripping separators or punctuation from production responses to match an oracle.
+
+Verify the GPU has no competing compute processes before each run and that the
+server owns the measured GPU process. Drain and unload each model before stopping
+its server. Keep uninstrumented timing runs separate from profiler runs and
+report the HTTP versus in-process boundary. Disable reference prefix and processor
+caches and use fresh media identifiers. Measure cached-weight startup, new-node
+artifact download, and first-request compilation separately; a warm local model
+load does not establish Cloud cold-start latency.
+
+Qualify the final runtime defaults, not only a diagnostic environment profile.
+Recheck mixed-page batching, model eviction/reload, complete tails, memory limits,
+and overload behavior with those defaults. DGX Spark results establish a useful
+kernel comparison but do not qualify the A100 serving deployment or its container
+libraries. Require the paired released runtime/operator and an A100 canary before
+changing the live shared reader pool.
+
 ## Embeddings and extraction
 
 EmbeddingGemma 2's CUDA/BF16 execution recipe has a different `model_identity`

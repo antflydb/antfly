@@ -213,6 +213,11 @@ pub fn Features(comptime Hooks: type) type {
                 return forProfile(.conservative, cfg, 1);
             var result = forProfile(profile, cfg, rows);
             if (backend == .cuda) {
+                // Canonical batching groups decode work independently of
+                // vision. An eight-image vision reservation can exceed the
+                // whole scratch budget for one full-size page. Wider vision
+                // batches remain an explicit, separately qualified override.
+                result.vision_batch_items = 1;
                 result = result.withCudaTokenBurstOverride(platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"), platform.env.getenv("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"));
                 result = result.withDecodeStreakOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_DECODE_STREAK"));
                 result = result.withQueuedPhasePriorityOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_QUEUED_PHASE_PRIORITY"));
@@ -515,6 +520,7 @@ test "LightOnOCR3 configured execution selects CUDA reader profile without envir
         const enabled = F.resolveWithPolicy(cfg, .cuda, true, 2);
         try std.testing.expect(enabled.prepared);
         try std.testing.expectEqual(@as(u16, 2), enabled.scheduling_rows);
+        try std.testing.expectEqual(@as(u8, 1), enabled.vision_batch_items);
         try std.testing.expect(!F.resolveWithPolicy(cfg, .cuda, false, 2).prepared);
         cfg.qwen35_device_only_state = false;
         try std.testing.expect(!F.resolveWithPolicy(cfg, .cuda, true, 2).prepared);
