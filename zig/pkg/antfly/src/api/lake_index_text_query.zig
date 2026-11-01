@@ -2159,6 +2159,10 @@ const Execution = struct {
                         else => return err,
                     };
                     if (ordered) |result| return result;
+                    // A consumed optional prefix has already spent this query's
+                    // ordered probe allowance. Window planning and the final
+                    // collector must not reopen the same skewed prefix.
+                    if (attempt.scanned != 0) attempt.prefer_text_candidates = true;
                 }
             }
         }
