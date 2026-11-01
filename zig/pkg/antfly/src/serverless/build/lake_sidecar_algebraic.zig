@@ -94,7 +94,7 @@ pub fn buildAlgebraicGroupBySidecarFromRowSourceAlloc(
 ) !AlgebraicGroupBySidecarBuildResult {
     var working_set = try lake_build_limits.WorkingSetAllocator.init(alloc, options.limits);
     return buildAlgebraicGroupBySidecarBoundedAlloc(working_set.allocator(), source, binding, options) catch |err| {
-        if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarBuildBudgetExceeded;
+        if (err == error.OutOfMemory and working_set.limitExceeded()) return error.LakeSidecarBuildBudgetExceeded;
         return err;
     };
 }
@@ -189,7 +189,7 @@ pub fn buildAlgebraicExpressionSidecarFromRowSourceAlloc(
 ) !AlgebraicExpressionSidecarBuildResult {
     var working_set = try lake_build_limits.WorkingSetAllocator.init(alloc, options.limits);
     return buildAlgebraicExpressionSidecarBoundedAlloc(working_set.allocator(), source, binding, options) catch |err| {
-        if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarBuildBudgetExceeded;
+        if (err == error.OutOfMemory and working_set.limitExceeded()) return error.LakeSidecarBuildBudgetExceeded;
         return err;
     };
 }

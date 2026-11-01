@@ -137,6 +137,10 @@ pub const CatchUpOptions = struct {
 
 pub const catch_up_max_records_per_window_default: usize = 2048;
 pub const catch_up_max_chunk_bytes_default: u64 = 16 * 1024 * 1024;
+/// Detached owners pin primary roots while constructing a window. Bound that
+/// retention independently of foreground/explicit catch-up batch amortization.
+pub const catch_up_background_max_records: usize = 64;
+pub const catch_up_background_max_chunk_bytes: u64 = 1024 * 1024;
 pub const dense_replay_estimated_vector_bytes_default: u64 = 384 * @sizeOf(f32);
 
 pub fn targetHintForManagedIndex(index_ref: index_manager_mod.ManagedIndexRef) change_journal_mod.TargetHint {

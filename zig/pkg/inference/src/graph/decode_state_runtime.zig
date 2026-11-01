@@ -91,6 +91,8 @@ pub const NativeDecodeState = struct {
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     qwen35_linear_cache: ?gpt_arch.Qwen35LinearCache = null,
     batched_decode_steps: usize = 0,
+    /// Largest successfully executed decoder step for this sequence.
+    max_native_step_items: usize = 0,
     gemma4_layer_spec_cache: gpt_arch.Gemma4LayerSpecCache = .{},
     deepseek_v4_compressed_cache: ?gpt_arch.DeepSeekV4CompressedCache = null,
     force_full_recompute: bool = false,

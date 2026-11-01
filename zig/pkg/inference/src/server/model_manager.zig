@@ -4383,21 +4383,21 @@ pub const CompositeAssetsHandle = struct {
     }
 
     pub fn markStartupManaged(self: *CompositeAssetsHandle) !void {
+        try self.applyStartupPolicy(true);
+    }
+
+    pub fn applyStartupPolicy(self: *CompositeAssetsHandle, pin: bool) !void {
         const assets = self.assets orelse return;
         self.manager.lockLoadedModels();
         defer self.manager.unlockLoadedModels();
         // Startup policy selects the default request backend for this artifact.
         // Keep explicit backend acquisitions separate; never alias cache entries
         // with different placement constraints or artifact generations.
-        if (assets.preferred_backends.len == 1) {
-            const result = try self.manager.composite_startup_backends.getOrPut(self.manager.allocator, assets.model_dir);
-            if (!result.found_existing) {
-                errdefer _ = self.manager.composite_startup_backends.remove(assets.model_dir);
-                result.key_ptr.* = try self.manager.allocator.dupe(u8, assets.model_dir);
-            }
-            result.value_ptr.* = assets.preferred_backends[0];
-        }
-        assets.startup_managed = true;
+        if (assets.preferred_backends.len == 1)
+            try self.manager.setStartupLoadPolicyLocked(assets.model_dir, .{ .backend = assets.preferred_backends[0] });
+        // Explicit startup backend selection also applies to evictable loads.
+        // Cache identity must not depend on whether the model is pinned.
+        if (pin) assets.startup_managed = true;
     }
 
     pub fn release(self: *CompositeAssetsHandle) void {
@@ -4790,9 +4790,9 @@ pub const ModelManager = struct {
     tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
-    /// Strict startup backend policies, keyed by resolved model directory.
+    /// Durable startup load policies, keyed by resolved model directory.
     /// Values are copied under load_lock; request lookup is O(1).
-    composite_startup_backends: std.StringHashMapUnmanaged(backends.BackendType) = .{},
+    startup_load_policies: std.StringHashMapUnmanaged(StartupLoadPolicy) = .{},
     runtime_epoch: u64,
     next_runtime_sequence: u64 = 1,
     /// Protects loaded-model maps and the in-flight registry. Expensive tokenizer,
@@ -6727,9 +6727,10 @@ pub const ModelManager = struct {
     /// including required-backend and A4B policy keys. Never load cold assets
     /// or join a load flight while reading request-admission metadata.
     pub fn acquireCachedFromDir(self: *ModelManager, model_dir: []const u8) !?ModelHandle {
+        const defaults = self.defaultModelLoadPolicy(model_dir);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try self.session_manager.requiredBackendCandidates(
-            self.session_manager.preferred_backends,
+            defaults.preferred_backends,
             &required_backend_scratch,
         );
         self.lockLoadedModels();
@@ -6738,7 +6739,7 @@ pub const ModelManager = struct {
             model_dir,
             effective_backends,
             true,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
+            defaults.cache_policy,
         )) orelse return null;
         model.active_handles += 1;
         return .{ .manager = self, .model = model };
@@ -7076,9 +7077,9 @@ pub const ModelManager = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.composite_assets.deinit(self.allocator);
-        var startup_keys = self.composite_startup_backends.keyIterator();
+        var startup_keys = self.startup_load_policies.keyIterator();
         while (startup_keys.next()) |key| self.allocator.free(key.*);
-        self.composite_startup_backends.deinit(self.allocator);
+        self.startup_load_policies.deinit(self.allocator);
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -7632,18 +7633,66 @@ pub const ModelManager = struct {
         return hash.finalResult();
     }
 
-    fn defaultCompositeBackends(self: *ModelManager, model_dir: []const u8) []const backends.BackendType {
+    /// Startup selection is configuration, not cache residency. Copy policy
+    /// values under the lock; returned backend slices have static lifetime.
+    pub const StartupLoadPolicy = struct {
+        backend: ?backends.BackendType = null,
+        gliner_cuda_precision: ?session_factory.GlinerCudaPrecision = null,
+        a4b_request: ?backend_contracts.A4bInferenceRequest = null,
+    };
+
+    pub fn setStartupLoadPolicy(self: *ModelManager, model_dir: []const u8, policy: StartupLoadPolicy) !void {
         self.lockLoadedModels();
-        const configured = self.composite_startup_backends.get(model_dir);
-        self.unlockLoadedModels();
-        // Static slices outlive the lock and any later policy registration.
-        return switch (configured orelse return self.session_manager.preferred_backends) {
+        defer self.unlockLoadedModels();
+        try self.setStartupLoadPolicyLocked(model_dir, policy);
+    }
+
+    fn setStartupLoadPolicyLocked(self: *ModelManager, model_dir: []const u8, policy: StartupLoadPolicy) !void {
+        const entry = try self.startup_load_policies.getOrPut(self.allocator, model_dir);
+        if (!entry.found_existing) {
+            errdefer _ = self.startup_load_policies.remove(model_dir);
+            entry.key_ptr.* = try self.allocator.dupe(u8, model_dir);
+        }
+        entry.value_ptr.* = policy;
+    }
+
+    fn startupLoadPolicy(self: *ModelManager, model_dir: []const u8) StartupLoadPolicy {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        return self.startup_load_policies.get(model_dir) orelse .{};
+    }
+
+    fn startupBackends(self: *ModelManager, policy: StartupLoadPolicy) []const backends.BackendType {
+        return switch (policy.backend orelse return self.session_manager.preferred_backends) {
             .native => &.{.native},
             .metal => &.{.metal},
             .cuda => &.{.cuda},
             .pjrt => &.{.pjrt},
             .wasm => &.{.wasm},
         };
+    }
+
+    fn defaultModelBackends(self: *ModelManager, model_dir: []const u8) []const backends.BackendType {
+        return self.startupBackends(self.startupLoadPolicy(model_dir));
+    }
+
+    const DefaultModelLoadPolicy = struct {
+        preferred_backends: []const backends.BackendType,
+        cache_policy: ModelLoadCachePolicy,
+    };
+
+    fn defaultModelLoadPolicy(self: *ModelManager, model_dir: []const u8) DefaultModelLoadPolicy {
+        const startup = self.startupLoadPolicy(model_dir);
+        const a4b_request = startup.a4b_request orelse self.session_manager.a4b_inference_request;
+        var policy = inheritedA4bCachePolicy(a4b_request, startup.backend != null);
+        policy.gliner_cuda_precision = startup.gliner_cuda_precision;
+        if (startup.gliner_cuda_precision != null) policy.accept_default_alias = false;
+        return .{ .preferred_backends = self.startupBackends(startup), .cache_policy = policy };
+    }
+
+    fn defaultModelLoad(self: *ModelManager, model_dir: []const u8, control: ?InferenceExecutionControl) !ModelHandle {
+        const defaults = self.defaultModelLoadPolicy(model_dir);
+        return self.loadFromDirCoordinated(model_dir, defaults.preferred_backends, true, defaults.cache_policy, control);
     }
 
     /// Lazy, single-flight component runtime. The handle pins both sessions,
@@ -7658,7 +7707,7 @@ pub const ModelManager = struct {
         return self.acquireCompositeRuntimeWithPreferredBackends(
             model_dir,
             component_paths,
-            self.defaultCompositeBackends(model_dir),
+            self.defaultModelBackends(model_dir),
             if (kind == .seq2seq) .rewriter else .transcriber,
             kind,
             control,
@@ -7676,7 +7725,7 @@ pub const ModelManager = struct {
         return self.acquireCompositeRuntimeWithPreferredBackends(
             model_dir,
             component_paths,
-            self.defaultCompositeBackends(model_dir),
+            self.defaultModelBackends(model_dir),
             model_type,
             kind,
             control,
@@ -7808,13 +7857,7 @@ pub const ModelManager = struct {
     /// Acquire a model for the duration of one operation. The returned handle
     /// prevents eviction until release.
     pub fn acquireFromDir(self: *ModelManager, model_dir: []const u8) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            self.session_manager.preferred_backends,
-            true,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
-            null,
-        );
+        return self.defaultModelLoad(model_dir, null);
     }
 
     pub fn acquireFromDirWithControl(
@@ -7822,13 +7865,7 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         control: InferenceExecutionControl,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            self.session_manager.preferred_backends,
-            true,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
-            control,
-        );
+        return self.defaultModelLoad(model_dir, control);
     }
 
     pub fn acquireFromDirWithPreferredBackends(
@@ -7882,7 +7919,7 @@ pub const ModelManager = struct {
     ) !ModelHandle {
         return self.loadFromDirCoordinated(
             model_dir,
-            self.session_manager.preferred_backends,
+            self.defaultModelBackends(model_dir),
             true,
             .{ .a4b_request = a4b_request, .accept_default_alias = false },
             null,
@@ -7897,7 +7934,7 @@ pub const ModelManager = struct {
     ) !ModelHandle {
         return self.loadFromDirCoordinated(
             model_dir,
-            self.session_manager.preferred_backends,
+            self.defaultModelBackends(model_dir),
             true,
             .{ .a4b_request = a4b_request, .accept_default_alias = false },
             control,
@@ -15329,4 +15366,66 @@ test "integrated CUDA combined override constrains simultaneous CPU and GPU leas
     var cpu = try controller.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = limit / 2 + 1 }, false);
     defer cpu.release();
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, .{}, .{ .backend_weight_bytes = limit / 2 + 1 }, false));
+}
+
+test "startup load policy survives LRU eviction and explicit acquisitions stay separate" {
+    const allocator = std.testing.allocator;
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    try writeCancellationTestModel(first.dir, allocator);
+    try writeCancellationTestModel(second.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", first.sub_path[0..] });
+    defer allocator.free(root);
+    const peer = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", second.sub_path[0..] });
+    defer allocator.free(peer);
+    // A policy-free reload cannot use the global preference on this CPU fixture.
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.cuda} });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureModelCache(0, 1);
+    try manager.setStartupLoadPolicy(root, .{ .backend = .native });
+    var loaded = try manager.acquireFromDir(root);
+    const first_id = loaded.get().runtime_id;
+    try std.testing.expect(!loaded.get().pinned);
+    try std.testing.expectEqual(backends.BackendType.native, loaded.get().session.backend());
+    loaded.release();
+    var other = try manager.acquireFromDirWithPreferredBackends(peer, &.{.native}, false);
+    other.release();
+    var reloaded = try manager.acquireFromDirWithControl(root, .{});
+    defer reloaded.release();
+    try std.testing.expect(first_id != reloaded.get().runtime_id);
+    try std.testing.expectEqual(backends.BackendType.native, reloaded.get().session.backend());
+    var metadata = (try manager.acquireCachedFromDir(root)).?;
+    defer metadata.release();
+    try std.testing.expectEqual(reloaded.get().runtime_id, metadata.get().runtime_id);
+    // An explicitly different backend cannot consume the configured alias.
+    manager.lockLoadedModels();
+    const explicit_cuda = try manager.lookupLoadedModelLocked(root, &.{.cuda}, true, inheritedA4bCachePolicy(null, true));
+    manager.unlockLoadedModels();
+    try std.testing.expect(explicit_cuda == null);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.native}, manager.defaultModelBackends(root));
+}
+
+test "startup load policy owns directory keys and preserves precision and A4B selection" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    var dir = [_]u8{ 'm', 'o', 'd', 'e', 'l' };
+    try manager.setStartupLoadPolicy(&dir, .{ .backend = .cuda, .gliner_cuda_precision = .bf16 });
+    dir[0] = 'X';
+    const policy = manager.startupLoadPolicy("model");
+    try std.testing.expectEqual(backends.BackendType.cuda, policy.backend.?);
+    try std.testing.expectEqual(session_factory.GlinerCudaPrecision.bf16, policy.gliner_cuda_precision.?);
+    const default_precision = manager.defaultModelLoadPolicy("model");
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, default_precision.preferred_backends);
+    try std.testing.expectEqual(session_factory.GlinerCudaPrecision.bf16, default_precision.cache_policy.gliner_cuda_precision.?);
+    try std.testing.expect(!default_precision.cache_policy.accept_default_alias);
+    // Updating policy never aliases the caller's buffer or drops key ownership.
+    try manager.setStartupLoadPolicy("model", .{ .backend = .native, .a4b_request = .{ .residency_mode = .streamed, .memory_budget_mb = 4096 } });
+    const updated = manager.startupLoadPolicy("model");
+    try std.testing.expect(updated.gliner_cuda_precision == null);
+    try std.testing.expectEqual(backend_contracts.A4bResidencyMode.streamed, updated.a4b_request.?.residency_mode);
+    try std.testing.expectEqual(@as(u32, 4096), updated.a4b_request.?.memory_budget_mb);
+    try std.testing.expectEqualDeep(updated.a4b_request, manager.defaultModelLoadPolicy("model").cache_policy.a4b_request);
 }

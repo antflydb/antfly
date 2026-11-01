@@ -40,26 +40,40 @@ pub const LockedAllocator = struct {
     }
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
+        @import("spill.zig").Manager.prepareAllocator(self.allocator(), len);
+        @import("memory_budget.zig").AllocationGuard.enter(self.shared_mutex orelse &self.mutex);
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
         return self.backing.rawAlloc(len, alignment, ra);
     }
     fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
+        @import("spill.zig").Manager.prepareAllocator(self.allocator(), len -| bytes.len);
+        @import("memory_budget.zig").AllocationGuard.enter(self.shared_mutex orelse &self.mutex);
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
         return self.backing.rawResize(bytes, alignment, len, ra);
     }
     fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
+        @import("spill.zig").Manager.prepareAllocator(self.allocator(), len -| bytes.len);
+        @import("memory_budget.zig").AllocationGuard.enter(self.shared_mutex orelse &self.mutex);
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.lock();
         defer self.unlock();
         return self.backing.rawRemap(bytes, alignment, len, ra);
     }
     fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *LockedAllocator = @ptrCast(@alignCast(raw));
-        self.lock();
-        defer self.unlock();
+        const Guard = @import("memory_budget.zig").AllocationGuard;
+        const mutex = self.shared_mutex orelse &self.mutex;
+        const reuse = Guard.reuse(mutex);
+        Guard.enter(mutex);
+        defer Guard.leave();
+        if (!reuse) self.lock();
+        defer if (!reuse) self.unlock();
         self.backing.rawFree(bytes, alignment, ra);
     }
 };
@@ -196,25 +210,65 @@ pub const Scheduler = struct {
     /// Speculative tasks retain no result buffers outside independently bounded
     /// caches. Release execution admission at completion, while Task still owns
     /// the join and the descriptor needed for canceled-before-start workers.
+    /// A parked coordinator owns bounded retained workspace and one pull slot.
+    /// Its child phases separately admit runnable I/O and CPU work. Optional
+    /// callers decline when capacity is unavailable instead of queuing inline.
+    pub fn submitPullTransient(self: *Scheduler, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+        self.lock();
+        // Optional coordinators leave half of retained-state capacity for
+        // required operators. They never make a required pull queue behind
+        // speculative work just to obtain its descriptor or workspace.
+        const worker_limit = self.max_pull_workers / 2;
+        const byte_limit = self.max_pull_bytes / 2;
+        const allowed = self.pull_workers < worker_limit and bytes <= byte_limit -| self.pull_bytes;
+        if (allowed) {
+            self.pull_workers += 1;
+            self.pull_bytes += bytes;
+        }
+        self.mutex.unlock();
+        if (!allowed) return null;
+        const admission = std.heap.page_allocator.create(Admission) catch {
+            self.releasePull(1, bytes);
+            return null;
+        };
+        admission.* = .{ .scheduler = self, .bytes = bytes, .class = .cpu, .pull = true, .io = io };
+        return self.launchTransient(io, admission, function, args);
+    }
     pub fn submitTransient(self: *Scheduler, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
-        return self.submitTransientClass(.cpu, io, bytes, function, args);
+        return self.submitTransientClass(.cpu, io, bytes, null, false, function, args);
     }
     pub fn submitIoTransient(self: *Scheduler, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
-        return self.submitTransientClass(.io, io, bytes, function, args);
+        return self.submitTransientClass(.io, io, bytes, null, false, function, args);
     }
-    fn submitTransientClass(self: *Scheduler, class: Class, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
-        const Result = @TypeOf(@call(.auto, function, args));
-        if (!self.acquireClass(class, bytes)) return null;
+    /// Notify only after execution admission is released and readiness published.
+    /// A bounded coordinator can drain whichever phase finishes first without
+    /// retaining a CPU slot during provider I/O or polling ordered futures.
+    pub fn submitNotified(self: *Scheduler, io: std.Io, bytes: usize, done: *std.Io.Event, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+        return self.submitTransientClass(.cpu, io, bytes, done, false, function, args);
+    }
+    pub fn submitIoNotified(self: *Scheduler, io: std.Io, bytes: usize, done: *std.Io.Event, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+        return self.submitTransientClass(.io, io, bytes, done, false, function, args);
+    }
+    pub fn submitNotifiedWithIoReserve(self: *Scheduler, io: std.Io, bytes: usize, done: *std.Io.Event, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+        return self.submitTransientClass(.cpu, io, bytes, done, true, function, args);
+    }
+    fn submitTransientClass(self: *Scheduler, class: Class, io: std.Io, bytes: usize, done: ?*std.Io.Event, reserve_io: bool, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+        if (!self.acquireClassReserved(class, bytes, reserve_io)) return null;
         const admission = std.heap.page_allocator.create(Admission) catch {
             self.releaseClass(class, bytes);
             return null;
         };
-        admission.* = .{ .scheduler = self, .bytes = bytes, .class = class };
+        admission.* = .{ .scheduler = self, .bytes = bytes, .class = class, .done = done, .io = io };
+        return self.launchTransient(io, admission, function, args);
+    }
+    fn launchTransient(self: *Scheduler, io: std.Io, admission: *Admission, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+        const Result = @TypeOf(@call(.auto, function, args));
         const Worker = struct {
             fn run(control: *Admission, arguments: @TypeOf(args)) Result {
                 defer {
                     control.release();
                     control.completed.store(true, .release);
+                    if (control.done) |event| event.set(control.io);
                 }
                 return @call(.auto, function, arguments);
             }
@@ -224,7 +278,7 @@ pub const Scheduler = struct {
             std.heap.page_allocator.destroy(admission);
             return null;
         };
-        return .{ .scheduler = self, .bytes = bytes, .class = class, .future = future, .transient = admission };
+        return .{ .scheduler = self, .bytes = admission.bytes, .class = admission.class, .future = future, .transient = admission };
     }
     pub fn submit(self: *Scheduler, io: std.Io, bytes: usize, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
         return self.submitClass(.cpu, io, bytes, function, args);
@@ -350,13 +404,18 @@ pub const Execution = struct {
 };
 
 const Admission = struct {
+    done: ?*std.Io.Event = null,
+    io: std.Io,
     scheduler: *Scheduler,
     bytes: usize,
     class: Class,
+    pull: bool = false,
     released: std.atomic.Value(bool) = .init(false),
     completed: std.atomic.Value(bool) = .init(false),
     fn release(self: *Admission) void {
-        if (!self.released.swap(true, .acq_rel)) self.scheduler.releaseClass(self.class, self.bytes);
+        if (!self.released.swap(true, .acq_rel)) {
+            if (self.pull) self.scheduler.releasePull(1, self.bytes) else self.scheduler.releaseClass(self.class, self.bytes);
+        }
     }
 };
 pub fn Task(comptime Result: type) type {
@@ -389,6 +448,32 @@ pub fn Task(comptime Result: type) type {
         }
     };
 }
+/// Join notified void jobs in completion order. Failures and caller cancellation
+/// retire every sibling before the coordinator can release callback storage.
+/// Every active task must use submit*Notified with this same readiness event.
+pub fn joinNotified(io: std.Io, ready: *std.Io.Event, tasks: []?Task(anyerror!void)) anyerror!void {
+    errdefer for (tasks) |*task| if (task.*) |*held| {
+        _ = held.cancel(io) catch {};
+        task.* = null;
+    };
+    while (true) {
+        ready.reset();
+        var pending = false;
+        for (tasks) |*task| if (task.*) |*held| {
+            std.debug.assert(held.transient != null and held.transient.?.done == ready);
+            if (!held.isComplete()) {
+                pending = true;
+                continue;
+            }
+            const outcome = held.await(io);
+            task.* = null;
+            try outcome;
+        };
+        if (!pending) return;
+        try ready.wait(io);
+    }
+}
+
 test "SQL shared scheduling bounds overlapping operators and releases canceled admissions" {
     const Worker = struct {
         fn run() anyerror!usize {
@@ -692,4 +777,74 @@ test "SQL shared allocator lock protects overlapping parent and child regions" {
     try result;
     for (child_values) |value| for (value) |byte| try std.testing.expectEqual(@as(u8, 0xaa), byte);
     for (parent_values) |value| for (value) |byte| try std.testing.expectEqual(@as(u8, 0xbb), byte);
+}
+
+test "external lake Parquet pull coordinators leave execution and required state capacity free" {
+    const Worker = struct {
+        fn run(io: std.Io, gate: *std.Io.Event) !usize {
+            try gate.wait(io);
+            return 7;
+        }
+    };
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |cancel| {
+        var scheduler: Scheduler = .{ .max_pull_workers = 2, .max_pull_bytes = 200, .max_workers = 1, .max_io_workers = 1 };
+        var gate: std.Io.Event = .unset;
+        var task = scheduler.submitPullTransient(io, 100, Worker.run, .{ io, &gate }).?;
+        defer if (task.future != null) {
+            _ = task.cancel(io) catch {};
+        };
+        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.pull_workers);
+        try std.testing.expect(scheduler.submitPullTransient(io, 1, Worker.run, .{ io, &gate }) == null);
+        try std.testing.expect(scheduler.reservePull(1, 100));
+        scheduler.releasePull(1, 100);
+        if (cancel) {
+            try std.testing.expectError(error.Canceled, task.cancel(io));
+        } else {
+            gate.set(io);
+            while (!task.isComplete()) try io.sleep(.fromMilliseconds(1), .awake);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.pull_workers);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+            try std.testing.expectEqual(@as(usize, 7), try task.await(io));
+        }
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+    }
+}
+
+test "SQL shared notified joins cancel parked siblings before callback teardown" {
+    const State = struct {
+        scheduler: Scheduler = .{ .max_io_workers = 2 },
+        gate: std.Io.Event = .unset,
+        entered: [2]std.Io.Event = @splat(.unset),
+        joining: std.Io.Event = .unset,
+        live: std.atomic.Value(usize) = .init(0),
+        fn child(self: *@This(), index: usize) anyerror!void {
+            _ = self.live.fetchAdd(1, .acq_rel);
+            defer _ = self.live.fetchSub(1, .acq_rel);
+            self.entered[index].set(std.testing.io);
+            try self.gate.wait(std.testing.io);
+        }
+        fn coordinator(self: *@This()) anyerror!void {
+            const io = std.testing.io;
+            var ready: std.Io.Event = .unset;
+            var tasks: [2]?Task(anyerror!void) = @splat(null);
+            defer for (&tasks) |*task| if (task.*) |*held| {
+                _ = held.cancel(io) catch {};
+            };
+            for (&tasks, 0..) |*task, i| task.* = self.scheduler.submitIoNotified(io, 1, &ready, child, .{ self, i }) orelse return error.TestUnexpectedSaturation;
+            for (&self.entered) |*event| try event.wait(io);
+            self.joining.set(io);
+            try joinNotified(io, &ready, &tasks);
+        }
+    };
+    var state: State = .{};
+    var parent = try std.testing.io.concurrent(State.coordinator, .{&state});
+    try state.joining.wait(std.testing.io);
+    try std.testing.expectError(error.Canceled, parent.cancel(std.testing.io));
+    try std.testing.expectEqual(@as(usize, 0), state.live.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), state.scheduler.io_workers);
+    try std.testing.expectEqual(@as(usize, 0), state.scheduler.io_bytes);
 }

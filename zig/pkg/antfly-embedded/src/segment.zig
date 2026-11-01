@@ -55,6 +55,9 @@ const roaring = @import("encoding/roaring.zig");
 const magic: [4]u8 = "AFSM".*; // AntFly SegMent
 const segment_version: u32 = 5; // v5: authenticated page directory; v4 remains readable.
 const integrity = @import("segment_integrity.zig");
+/// Recipe-fenced lake source bodies live in independently compressed columns.
+/// This non-JSON marker cannot be mistaken for a legacy source document.
+pub const columnar_source_marker = "AFCS1";
 const stored_fields_version_block_compressed: u8 = 4;
 /// Index-only segments carry document ordinals and search sections but no
 /// primary-key or source record per document. The footer remains authoritative
@@ -1541,9 +1544,9 @@ pub const SegmentReader = struct {
 
     /// Chunk payload borrows this reader/source; the returned reader owns its
     /// navigation directory and must be deinitialized before this reader.
-    pub fn storedColumnScoped(self: *const SegmentReader, alloc: Allocator, field: []const u8) !?@import("section/doc_values.zig").DocValuesReader {
+    pub fn storedColumnScoped(self: *const SegmentReader, alloc: Allocator, field: []const u8) !?@import("section/source_column.zig").Reader {
         const view = (try self.sectionView(field, .columnar_stored)) orelse return null;
-        return try @import("section/doc_values.zig").DocValuesReader.initRanges(alloc, view);
+        return try @import("section/source_column.zig").Reader.init(alloc, view);
     }
 
     pub fn invertedIndexScoped(self: *const SegmentReader, allocator: Allocator, field_name: []const u8) !?inverted.ScopedInvertedIndexReader {
@@ -1615,9 +1618,24 @@ pub const SegmentReader = struct {
             const data_start = loc.doc_offset + 4;
             if (data_start > block.len or data_len > block.len - data_start) return error.InvalidSegment;
             if (data_len != loc.raw_len) return error.InvalidSegment;
-            return .{ .id = raw.id, .data = try alloc.dupe(u8, block[data_start..][0..data_len]) };
+            return .{ .id = raw.id, .data = try self.materializeStoredSource(alloc, doc_idx, block[data_start..][0..data_len]) };
         }
         return error.InvalidSegment;
+    }
+
+    fn materializeStoredSource(self: *const SegmentReader, a: Allocator, doc: u32, data: []const u8) ![]u8 {
+        if (!std.mem.eql(u8, data, columnar_source_marker)) return a.dupe(u8, data);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var object: std.json.ObjectMap = .empty;
+        for (self.fields) |field| {
+            var column = (try self.storedColumnScoped(sa, field.name)) orelse continue;
+            defer column.deinit();
+            const value = (try column.get(doc, 1024)) orelse continue;
+            try object.put(sa, field.name, try @import("storage/typed_json.zig").decodeBinary(sa, value));
+        }
+        return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = object }, .{});
     }
 
     fn decodeStoredBlock(self: *const SegmentReader, allocator: Allocator, location: V4StoredDocLocation) ![]u8 {
@@ -1670,22 +1688,30 @@ pub const SegmentReader = struct {
     pub const StoredDocCursor = struct {
         scratch: SegmentReadScratch,
         identities: SegmentReadScratch,
+        materialized: SegmentReadScratch,
         reader: ?*const SegmentReader = null,
         block: ?u32 = null,
         decoded: []const u8 = &.{},
         decode_count: usize = 0,
 
         pub fn init(allocator: Allocator) StoredDocCursor {
-            return .{ .scratch = SegmentReadScratch.init(allocator, 2 * stored_fields_block_raw_target), .identities = SegmentReadScratch.init(allocator, 64 * 1024) };
+            return .{ .materialized = SegmentReadScratch.init(allocator, 1024 * 1024), .scratch = SegmentReadScratch.init(allocator, 2 * stored_fields_block_raw_target), .identities = SegmentReadScratch.init(allocator, 64 * 1024) };
         }
 
         pub fn deinit(self: *StoredDocCursor) void {
             self.scratch.deinit();
             self.identities.deinit();
+            self.materialized.deinit();
             self.* = undefined;
         }
 
         pub fn get(self: *StoredDocCursor, reader: *const SegmentReader, doc: u32) !?StoredDocRef {
+            self.materialized.reset();
+            const raw = (try self.getRaw(reader, doc)) orelse return null;
+            if (!std.mem.eql(u8, raw.data, columnar_source_marker)) return raw;
+            return .{ .id = raw.id, .data = try reader.materializeStoredSource(self.materialized.allocator(), doc, raw.data) };
+        }
+        pub fn getRaw(self: *StoredDocCursor, reader: *const SegmentReader, doc: u32) !?StoredDocRef {
             self.identities.reset();
             const loc = (if (reader.native != null) try reader.nativeStoredLocation(doc, self.identities.allocator()) else try reader.v4StoredDocLocation(doc)) orelse return null;
             if (self.reader != reader or self.block != loc.block_idx) {
@@ -1715,6 +1741,7 @@ pub const SegmentReader = struct {
         const Entry = struct { reader: *const SegmentReader, block: u32, decoded: []u8 };
         allocator: Allocator,
         identities: SegmentReadScratch,
+        materialized: SegmentReadScratch,
         byte_budget: usize,
         entries: std.ArrayListUnmanaged(Entry) = .empty,
         count: usize = 0,
@@ -1722,7 +1749,7 @@ pub const SegmentReader = struct {
         decode_count: usize = 0,
 
         pub fn init(allocator: Allocator, byte_budget: usize) StoredDocBlockCache {
-            return .{ .allocator = allocator, .byte_budget = byte_budget, .identities = SegmentReadScratch.init(allocator, 64 * 1024) };
+            return .{ .materialized = SegmentReadScratch.init(allocator, 1024 * 1024), .allocator = allocator, .byte_budget = byte_budget, .identities = SegmentReadScratch.init(allocator, 64 * 1024) };
         }
 
         fn evict(self: *StoredDocBlockCache) void {
@@ -1736,10 +1763,17 @@ pub const SegmentReader = struct {
             while (self.count != 0) self.evict();
             self.entries.deinit(self.allocator);
             self.identities.deinit();
+            self.materialized.deinit();
             self.* = undefined;
         }
 
         pub fn get(self: *StoredDocBlockCache, reader: *const SegmentReader, doc: u32) !?StoredDocRef {
+            self.materialized.reset();
+            const raw = (try self.getRaw(reader, doc)) orelse return null;
+            if (!std.mem.eql(u8, raw.data, columnar_source_marker)) return raw;
+            return .{ .id = raw.id, .data = try reader.materializeStoredSource(self.materialized.allocator(), doc, raw.data) };
+        }
+        pub fn getRaw(self: *StoredDocBlockCache, reader: *const SegmentReader, doc: u32) !?StoredDocRef {
             self.identities.reset();
             const loc = (if (reader.native != null) try reader.nativeStoredLocation(doc, self.identities.allocator()) else try reader.v4StoredDocLocation(doc)) orelse return null;
             var found: ?usize = null;
@@ -3727,6 +3761,11 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
             try built_field.sections.append(alloc, .{ .section_type = .typed_doc_values, .offset = typed_start, .length = sink.len() - typed_start, .checksum = try sink.crc32Range(typed_start, sink.len() - typed_start) });
         }
 
+        const source_start = sink.len();
+        sink.beginSection();
+        if (try writeMergedSourceColumn(alloc, sink, inputs, field_name, null)) {
+            try built_field.sections.append(alloc, .{ .section_type = .columnar_stored, .offset = source_start, .length = sink.len() - source_start, .checksum = try sink.crc32Range(source_start, sink.len() - source_start) });
+        }
         try built_fields.append(alloc, built_field);
     }
 
@@ -3850,6 +3889,11 @@ fn writeSortedMergedSegmentToSink(
             try built_field.sections.append(alloc, .{ .section_type = .typed_doc_values, .offset = typed_start, .length = sink.len() - typed_start, .checksum = try sink.crc32Range(typed_start, sink.len() - typed_start) });
         }
 
+        const source_start = sink.len();
+        sink.beginSection();
+        if (try writeMergedSourceColumn(alloc, sink, inputs, field_name, plan.ordered())) {
+            try built_field.sections.append(alloc, .{ .section_type = .columnar_stored, .offset = source_start, .length = sink.len() - source_start, .checksum = try sink.crc32Range(source_start, sink.len() - source_start) });
+        }
         try built_fields.append(alloc, built_field);
     }
 
@@ -4189,6 +4233,39 @@ fn appendStoredIdentitySpan(sink: *SegmentSink, source: @import("segment_source.
     }
 }
 
+fn writeMergedSourceColumn(a: Allocator, sink: *SegmentSink, inputs: []const MergeInput, field: []const u8, order: ?SortedRecords) !bool {
+    const dv = @import("section/source_column.zig");
+    const cursors = try a.alloc(?dv.Cursor, inputs.len);
+    @memset(cursors, null);
+    defer {
+        for (cursors) |*cursor| if (cursor.*) |*value| value.deinit();
+        a.free(cursors);
+    }
+    var any = false;
+    for (inputs, cursors) |input, *cursor| if (try input.reader.storedColumnScoped(a, field)) |column| {
+        cursor.* = dv.Cursor.init(column);
+        any = true;
+    };
+    if (!any) return false;
+    var writer = try dv.Writer.init(a, sink);
+    defer writer.deinit();
+    var ordinal: u32 = 0;
+    if (order) |records| {
+        var iterator = records.iterator();
+        while (try iterator.next()) |record| {
+            if (cursors[record.ref.input_idx]) |*cursor| try writer.copy(ordinal, cursor, record.ref.doc_id);
+            ordinal += 1;
+        }
+    } else for (inputs, cursors) |input, *cursor| {
+        var live = LiveDocs.init(&input, 0, input.reader.doc_count);
+        while (live.next()) |doc| {
+            if (cursor.*) |*value| try writer.copy(ordinal, value, doc);
+            ordinal += 1;
+        }
+    }
+    return writer.finish();
+}
+
 fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_count: u32) !u64 {
     sink.beginSection();
     const stored_start = sink.len();
@@ -4246,7 +4323,7 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
                 continue;
             }
 
-            const stored = (try stored_cursor.get(input.reader, doc_id)) orelse {
+            const stored = (try stored_cursor.getRaw(input.reader, doc_id)) orelse {
                 continue;
             };
             if (chunk.items.len > 0 and (docs_in_block >= stored_fields_block_doc_target or chunk.items.len +| 4 +| stored.data.len > stored_fields_block_raw_target)) {
@@ -4378,7 +4455,7 @@ fn writeMergedStoredFieldsInOrderWithReuse(
                 continue;
             }
         }
-        const stored = (try stored_cursor.get(inputs[record.ref.input_idx].reader, record.ref.doc_id)) orelse return error.InvalidSegment;
+        const stored = (try stored_cursor.getRaw(inputs[record.ref.input_idx].reader, record.ref.doc_id)) orelse return error.InvalidSegment;
         if (chunk.items.len > 0 and (docs_in_block >= stored_fields_block_doc_target or chunk.items.len +| 4 +| stored.data.len > stored_fields_block_raw_target)) {
             try flushMergedStoredBlock(alloc, sink, &chunk, block_offsets_start, block_checksums_start, data_start, block_idx);
             block_idx += 1;

@@ -854,16 +854,36 @@ pub fn maxResidentVisionBatchItems(backend: ops.BackendKind) usize {
     return if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES")) resident_vision_batch_capacity else 8;
 }
 
-/// Exact resized geometry for a bounded, independent-image vision batch.
-pub fn residentBatchGeometryKey(config: gpt_config.Config, bytes: []const u8, limits: Limits) !u64 {
+/// Kernel geometry bounds are independent of the admission byte budget. CUDA
+/// supports full pages, but the total packed row count must still fit every
+/// vision-block kernel. Metal retains its qualified per-image envelope.
+pub fn residentVisionBatchItemLimit(backend: ops.BackendKind, patches: usize) usize {
+    if (patches == 0) return 0;
+    return switch (backend) {
+        .cuda => if (patches <= 16_384) @min(maxResidentVisionBatchItems(backend), 65_536 / patches) else 0,
+        .metal => if (patches <= 4096) maxResidentVisionBatchItems(backend) else 0,
+        else => 0,
+    };
+}
+
+pub const ResidentBatchGeometry = struct { key: u64, max_items: usize };
+
+pub fn residentBatchGeometryForShape(backend: ops.BackendKind, geometry: Geometry) !ResidentBatchGeometry {
+    const patches = std.math.mul(usize, geometry.grid_x, geometry.grid_y) catch return error.UnsupportedBatchedVision;
+    const max_items = residentVisionBatchItemLimit(backend, patches);
+    if (max_items == 0 or geometry.width == 0 or geometry.height == 0 or geometry.width > std.math.maxInt(u32) or geometry.height > std.math.maxInt(u32)) return error.UnsupportedBatchedVision;
+    return .{ .key = (@as(u64, @intCast(geometry.width)) << 32) | @as(u64, @intCast(geometry.height)), .max_items = max_items };
+}
+
+/// Exact resized geometry and backend capacity for independent-image batching.
+pub fn residentBatchGeometry(backend: ops.BackendKind, config: gpt_config.Config, bytes: []const u8, limits: Limits) !ResidentBatchGeometry {
     try limits.validate();
     if (bytes.len == 0 or bytes.len > limits.max_encoded_image_bytes) return error.VisionAdmissionExceeded;
     const cfg = try configFromResidentModel(config);
     const info = try image.inspectEncodedForInference(bytes, null);
     if (try admissionMul(info.width, info.height) > limits.max_decoded_pixels) return error.VisionAdmissionExceeded;
     const geometry = try targetGeometry(cfg, info.width, info.height, limits);
-    if (geometry.patchCount() > 4096) return error.UnsupportedBatchedVision;
-    return (@as(u64, @intCast(geometry.width)) << 32) | @as(u64, @intCast(geometry.height));
+    return residentBatchGeometryForShape(backend, geometry);
 }
 
 /// Caller admits the sum of the per-image working sets before invoking this
@@ -882,8 +902,9 @@ pub fn encodeProjectedImagesResidentBatched(
     if (images.len == 0 or images.len > maxResidentVisionBatchItems(cb.kind()) or images.len > limits.max_images) return error.ImageLimitExceeded;
     const cfg = try configFromResidentModel(config);
     if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedBatchedVision;
-    const key = try residentBatchGeometryKey(config, images[0], limits);
-    for (images[1..]) |bytes| if (try residentBatchGeometryKey(config, bytes, limits) != key) return error.VisionBatchGeometryMismatch;
+    const geometry = try residentBatchGeometry(cb.kind(), config, images[0], limits);
+    if (images.len > geometry.max_items) return error.UnsupportedBatchedVision;
+    for (images[1..]) |bytes| if ((try residentBatchGeometry(cb.kind(), config, bytes, limits)).key != geometry.key) return error.VisionBatchGeometryMismatch;
     const Check = struct {
         fn check(raw: ?*const anyopaque) !void {
             const backend: *const ComputeBackend = @ptrCast(@alignCast(raw.?));
@@ -944,6 +965,7 @@ fn encodePreparedProjectedImagesResidentBatchedPolicy(
         try prepared.validateFor(cfg, limits);
         if (!std.meta.eql(prepared.geometry, prepared_images[0].geometry)) return error.VisionBatchGeometryMismatch;
     }
+    if (prepared_images.len > 1 and prepared_images.len > residentVisionBatchItemLimit(cb.kind(), prepared_images[0].geometry.patchCount())) return error.UnsupportedBatchedVision;
     const output = try allocator.alloc(ProjectedImages, prepared_images.len);
     var completed: usize = 0;
     errdefer {
@@ -1738,7 +1760,9 @@ const ResidentVisionScope = struct {
 // deliberately retain their separate nn.GELU() (exact-erf) operation.
 fn tryLightOnVisionNormQkv(cb: *const ComputeBackend, weights: *WeightCache, cfg: Config, input: CT, rows: usize, layer: usize) !?CT {
     if (comptime !build_options.enable_cuda) return null;
-    if (cb.kind() != .cuda or !cfg.is_qwen35 or !platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_QKV")) return null;
+    if (cb.kind() != .cuda or !cfg.is_qwen35) return null;
+    const compute: *const @import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    if (!compute.lightOnVisionQkvEnabled()) return null;
     var name: [128]u8 = undefined;
     const norm_w = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln1.weight", .{layer}));
     const norm_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln1.bias", .{layer}));
@@ -1756,8 +1780,9 @@ fn tryLightOnVisionMlp(
     layer: usize,
 ) !?CT {
     if (comptime !@import("build_options").enable_cuda) return null;
-    if (cb.kind() != .cuda or !cfg.is_qwen35 or !cfg.block_gelu_tanh or
-        !platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_MLP")) return null;
+    if (cb.kind() != .cuda or !cfg.is_qwen35 or !cfg.block_gelu_tanh) return null;
+    const compute: *const @import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    if (!compute.lightOnVisionMlpEnabled()) return null;
     var name: [128]u8 = undefined;
     const norm_w = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln2.weight", .{layer}));
     const norm_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln2.bias", .{layer}));
@@ -3163,6 +3188,30 @@ test "LightOnOCR3 CUDA resident vision batch width preserves other backend ceili
     try std.testing.expectEqual(@as(usize, 4), maxResidentVisionBatchItems(.native));
 }
 
+test "LightOnOCR3 full page vision batching fits the CUDA kernel contract and preserves Metal bounds" {
+    const cuda_geometry = @import("../ops/cuda/encoder_block_bf16.zig");
+    for ([_]usize{ 1, 4096, 7600, 8192, 16_384 }) |patches| {
+        const count = residentVisionBatchItemLimit(.cuda, patches);
+        try std.testing.expect(count >= 2);
+        try std.testing.expect(cuda_geometry.validRowGeometry(patches * count, count));
+    }
+    try std.testing.expectEqual(@as(usize, 4), residentVisionBatchItemLimit(.cuda, 16_384));
+    try std.testing.expectEqual(@as(usize, 0), residentVisionBatchItemLimit(.cuda, 16_385));
+    try std.testing.expectEqual(@as(usize, 0), residentVisionBatchItemLimit(.cuda, 0));
+    try std.testing.expectEqual(@as(usize, 4), residentVisionBatchItemLimit(.metal, 4096));
+    try std.testing.expectEqual(@as(usize, 0), residentVisionBatchItemLimit(.metal, 4097));
+    try std.testing.expectEqual(@as(usize, 0), residentVisionBatchItemLimit(.native, 1));
+    const geometry = Geometry{ .width = 2048, .height = 2048, .grid_x = 128, .grid_y = 128, .merged_x = 64, .merged_y = 64 };
+    const shape = try residentBatchGeometryForShape(.cuda, geometry);
+    try std.testing.expectEqual((@as(u64, 2048) << 32) | 2048, shape.key);
+    try std.testing.expectEqual(@as(usize, 4), shape.max_items);
+    // Callers must use their existing serial encoder for this Metal shape.
+    try std.testing.expectError(error.UnsupportedBatchedVision, residentBatchGeometryForShape(.metal, geometry));
+    var invalid = geometry;
+    invalid.grid_x = std.math.maxInt(usize);
+    try std.testing.expectError(error.UnsupportedBatchedVision, residentBatchGeometryForShape(.cuda, invalid));
+}
+
 test "LightOnOCR3 CUDA vision block activation follows checkpoint tanh GELU independently of exact merger GELU" {
     const a = std.testing.allocator;
     const model_config = try gpt_config.parseConfig(a, @embedFile("../models/testdata/lightonocr3/config.json"));
@@ -3229,7 +3278,7 @@ test "LightOnOCR3 CUDA learned positions preserve host interpolation merge order
     for ([_]usize{ 768, 1024 }) |dim| for ([_]bool{ false, true }) |bf16| {
         var compute = try CudaCompute.init(a);
         defer compute.deinit();
-        if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+        if (!@import("../ops/cuda/paged_attention_bf16.zig").packetSupported(compute.ctx.info.compute_major, compute.ctx.info.driver_version)) return error.SkipZigTest;
         compute.capability_profile = .lightonocr3;
         const cb = compute.computeBackend();
         const values = try a.alloc(f32, 48 * 48 * dim);

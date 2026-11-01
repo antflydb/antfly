@@ -38,6 +38,9 @@ pub fn Features(comptime Hooks: type) type {
         epoch_auxiliary: bool = false,
         single_frame: bool = false,
         gpu_token_burst: bool = false,
+        // An epoch-owned executor can retain a pure greedy continuation even
+        // when its backend does not select multi-token device bursts.
+        executor_tail: bool = false,
         gpu_token_burst_width: u8 = 2,
         cuda_burst_extra_bytes: usize = 0,
         gpu_greedy_stream: bool = false,
@@ -90,14 +93,15 @@ pub fn Features(comptime Hooks: type) type {
                 .prepared_rows = if (rows > 64) 128 else if (rows > 32) 64 else if (rows > 16) 32 else 16,
                 .scheduling_rows = @intCast(rows),
                 .cpu_preprocess = true,
-                .vision_batch_items = if (cuda and !large) 8 else 1,
+                .vision_batch_items = 1,
                 .vision_frame_blocks = if (cuda) 1 else if (large) 3 else 4,
                 .prefill_decode_streak = 0,
                 .activation_pool = !cuda,
                 .worker = true,
                 .epoch_auxiliary = true,
                 .single_frame = !cuda,
-                .gpu_token_burst = !cuda,
+                .gpu_token_burst = true,
+                .executor_tail = true,
                 .gpu_token_burst_width = 4,
                 .vision_workspace_cache = !cuda,
                 .device_vision_features = cuda,
@@ -197,7 +201,11 @@ pub fn Features(comptime Hooks: type) type {
         }
 
         pub fn resolve(cfg: gpt_model_mod.Config, backend: runtime.kv.pool.BackendKind) @This() {
-            const profile = selectProfile(cfg, backend, Hooks.cudaLightOnBatchProfileEnabled(), metal_runtime.appleSimdgroupDeviceDefault(), metal_runtime.lightOnThroughputProfileEnabled());
+            return resolveWithPolicy(cfg, backend, Hooks.cudaLightOnBatchProfileEnabled(), Hooks.effectiveLightOnReadRows());
+        }
+
+        pub fn resolveWithPolicy(cfg: gpt_model_mod.Config, backend: runtime.kv.pool.BackendKind, cuda_requested: bool, rows: usize) @This() {
+            const profile = selectProfile(cfg, backend, cuda_requested, metal_runtime.appleSimdgroupDeviceDefault(), metal_runtime.lightOnThroughputProfileEnabled());
             // Profiling and concurrent planned dispatch do not share the
             // selected frame/lifetime contract. Fall back as one complete mode.
             const restricted_metal_mode = backend == .metal and
@@ -207,9 +215,14 @@ pub fn Features(comptime Hooks: type) type {
                     platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") != null);
             if (!platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_PREPARED_DECODE", true) or restricted_metal_mode)
                 return forProfile(.conservative, cfg, 1);
-            var result = forProfile(profile, cfg, Hooks.effectiveLightOnReadRows());
+            var result = forProfile(profile, cfg, rows);
             if (backend == .cuda) {
-                result = result.withCudaTokenBurstOverride(platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"), platform.env.getenv("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"));
+                // Canonical batching groups decode work independently of
+                // vision. An eight-image vision reservation can exceed the
+                // whole scratch budget for one full-size page. Wider vision
+                // batches remain an explicit, separately qualified override.
+                result.vision_batch_items = 1;
+                result = result.withCudaTokenBurstOverride(platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST", result.gpu_token_burst), platform.env.getenv("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"));
                 result = result.withDecodeStreakOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_DECODE_STREAK"));
                 result = result.withQueuedPhasePriorityOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_QUEUED_PHASE_PRIORITY"));
                 result = result.withPreparedPrefillChunkOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS"));
@@ -325,6 +338,7 @@ test "LightOnOCR3 conservative reader leaves Metal prepared capacity unconfigure
     // Metal accepts only 16, 32 or 64 prepared rows. The default profile
     // must not configure capacity it never uses.
     try std.testing.expectEqual(@as(?usize, null), F.forProfile(.conservative, cfg, 1).preparedRowCapacity());
+    try std.testing.expect(!F.forProfile(.conservative, cfg, 1).executor_tail);
     for ([_]F.Profile{ .metal_lighton08, .metal_lighton4b }) |profile| {
         for ([_]usize{ 0, 1, 16, 17, 33, 64, 999 }) |requested| {
             const rows = F.forProfile(profile, cfg, requested).preparedRowCapacity() orelse return error.TestUnexpectedResult;
@@ -379,6 +393,7 @@ test "LightOnOCR3 selected reader profiles retain admission ownership row caps a
         try std.testing.expectEqual(if (cuda) @as(u8, 128) else 64, selected.scheduling_rows);
         try std.testing.expect(selected.needsAuxiliary());
         try std.testing.expect(selected.packed_mixed and selected.prepared and selected.worker and selected.shared_decoder_scratch);
+        try std.testing.expect(selected.executor_tail);
         try std.testing.expect(!selected.gpu_greedy_stream and !selected.stream_chunks and !selected.prefill_activation_pool and selected.stream_first_layers == 0 and selected.prefill_stream_layers == 0);
         const full = selected.auxiliaryAmounts();
         const partial = F.forProfile(profile, cfg, 48);
@@ -454,15 +469,19 @@ test "LightOnOCR3 CUDA prefill fairness limit preserves selected defaults and op
     try std.testing.expectEqualDeep(fallback, fallback.withDecodeStreakOverride("8"));
 }
 
-test "LightOnOCR3 CUDA token chaining opt in shares bounded admission configuration" {
+test "LightOnOCR3 CUDA automatic token chaining preserves explicit disable and bounded admission" {
     const F = Features(struct {});
     const selected = F.forProfile(.cuda_lighton4b, .{}, 128);
-    try std.testing.expectEqualDeep(selected, selected.withCudaTokenBurstOverride(false, null));
+    const disabled = selected.withCudaTokenBurstOverride(false, null);
+    try std.testing.expect(selected.gpu_token_burst);
+    try std.testing.expect(!disabled.gpu_token_burst);
+    try std.testing.expect(disabled.executor_tail);
+    try std.testing.expectEqualDeep(selected, disabled.withCudaTokenBurstOverride(true, null));
     const burst = selected.withCudaTokenBurstOverride(true, "8");
     try std.testing.expect(burst.gpu_token_burst);
     try std.testing.expectEqual(@as(u8, 8), burst.gpu_token_burst_width);
-    try std.testing.expect(burst.auxiliaryAmounts().backend_scratch_bytes > selected.auxiliaryAmounts().backend_scratch_bytes);
-    try std.testing.expect(burst.auxiliaryAmounts().host_scratch_bytes > selected.auxiliaryAmounts().host_scratch_bytes);
+    try std.testing.expect(burst.auxiliaryAmounts().backend_scratch_bytes > disabled.auxiliaryAmounts().backend_scratch_bytes);
+    try std.testing.expect(burst.auxiliaryAmounts().host_scratch_bytes > disabled.auxiliaryAmounts().host_scratch_bytes);
     for ([_][]const u8{ "", "-1", "1", "9", "256", "junk" }) |text| try std.testing.expectEqualDeep(selected.withCudaTokenBurstOverride(true, null), selected.withCudaTokenBurstOverride(true, text));
     const fallback = F.forProfile(.conservative, .{}, 1);
     try std.testing.expectEqualDeep(fallback, fallback.withCudaTokenBurstOverride(true, "8"));
@@ -501,4 +520,19 @@ test "LightOnOCR3 CUDA device vision profile keeps existing admission and host r
     }
     for ([_]F.Profile{ .metal_lighton08, .metal_lighton4b, .conservative }) |profile|
         try std.testing.expect(!F.forProfile(profile, .{}, 64).device_vision_features);
+}
+
+test "LightOnOCR3 configured execution selects CUDA reader profile without environment switches" {
+    const F = Features(struct {});
+    for ([_][]const u8{ @embedFile("../models/testdata/lightonocr3/config.json"), @embedFile("../models/testdata/lightonocr3/config-4b.json") }) |json| {
+        var cfg = try gpt_model_mod.parseConfig(std.testing.allocator, json);
+        cfg.qwen35_device_only_state = true;
+        const enabled = F.resolveWithPolicy(cfg, .cuda, true, 2);
+        try std.testing.expect(enabled.prepared);
+        try std.testing.expectEqual(@as(u16, 2), enabled.scheduling_rows);
+        try std.testing.expectEqual(@as(u8, 1), enabled.vision_batch_items);
+        try std.testing.expect(!F.resolveWithPolicy(cfg, .cuda, false, 2).prepared);
+        cfg.qwen35_device_only_state = false;
+        try std.testing.expect(!F.resolveWithPolicy(cfg, .cuda, true, 2).prepared);
+    }
 }

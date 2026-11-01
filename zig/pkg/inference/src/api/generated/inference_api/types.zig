@@ -129,11 +129,33 @@ pub const BatchExecutionReport = struct {
     requested_items: i64,
     native_batches: i64,
     native_items: i64,
+    /// Largest successfully executed native decoder step observed by these items, including peers from other requests. Zero or absent means unobserved, one means singleton execution. This is measured at execution, never inferred from native_items or request cardinality.
+    max_native_step_items: ?i64 = null,
     serial_items: i64,
     /// Items rejected before model execution by validation, resolution, or admission.
     rejected_items: i64,
     fallback_items: i64,
     fallback_reason: OpenApiOptionalNullable([]const u8) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "requested_items", "requested_items", false },
+        .{ "native_batches", "native_batches", false },
+        .{ "native_items", "native_items", false },
+        .{ "max_native_step_items", "max_native_step_items", true },
+        .{ "serial_items", "serial_items", false },
+        .{ "rejected_items", "rejected_items", false },
+        .{ "fallback_items", "fallback_items", false },
+        .{ "fallback_reason", "fallback_reason", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -143,6 +165,10 @@ pub const BatchExecutionReport = struct {
         try jw.write(self.native_batches);
         try jw.objectField("native_items");
         try jw.write(self.native_items);
+        if (self.max_native_step_items) |value| {
+            try jw.objectField("max_native_step_items");
+            try jw.write(value);
+        }
         try jw.objectField("serial_items");
         try jw.write(self.serial_items);
         try jw.objectField("rejected_items");
@@ -4129,7 +4155,7 @@ pub const ReadRequest = struct {
     images: ?[]const ImageURL = null,
     /// Optional task prompt for document understanding models. - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
     prompt: ?[]const u8 = null,
-    /// Maximum tokens to generate
+    /// Maximum output tokens per page. When omitted, the selected reader model supplies its default, bounded by deployment limits. Explicit values override the model default and must fit model and server limits.
     max_tokens: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

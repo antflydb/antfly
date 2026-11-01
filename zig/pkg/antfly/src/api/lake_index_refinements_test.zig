@@ -673,3 +673,56 @@ test "external lake global frontier GC upgrades maintenance and already marked m
         try std.testing.expectEqual(@as(u32, 2), collector.marked.count());
     }
 }
+
+test "external lake bounded window profiles stored highlight consumer owns output across cursor teardown and allocation faults" {
+    const a = std.testing.allocator;
+    const Column = local.section_source_column;
+    const Search = local.storage_db_query_search_exec;
+    const body = try a.alloc(u8, 8192);
+    defer a.free(body);
+    @memset(body, '.');
+    @memcpy(body[4092..][0.."é needle running".len], "é needle running");
+    var memory = local.segment.MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var writer = try Column.Writer.init(a, &sink);
+    defer writer.deinit();
+    try writer.add(0, .{ .string = body }, &.{&local.search_analysis.default_analyzer});
+    try std.testing.expect(try writer.finish());
+    const view = try local.segment_source.View.init(.{ .contiguous = memory.out.items }, 0, memory.out.items.len);
+    const Run = struct {
+        fn run(alloc: std.mem.Allocator, source: local.segment_source.View, text: []const u8) !void {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const queries = [_]Search.HighlightQuery{
+                .{ .query = .{ .match = .{ .field = "body", .text = "needle" } }, .text_analysis = .{}, .runtime_schema = .{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{.{ .path = "body", .emitted_name = "body", .analyzer = "standard" }} }} } },
+                .{ .query = .{ .prefix = .{ .field = "body", .prefix = "run" } }, .text_analysis = .{}, .runtime_schema = .{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{.{ .path = "body", .emitted_name = "body", .analyzer = "standard" }} }} } },
+            };
+            var prepared = try Search.PreparedHighlights.init(alloc, .{ .fields = &.{"body"}, .max_fragments = 1, .fragment_size = 64 }, &queries);
+            defer prepared.deinit();
+            var output: Search.PreparedHighlights.Accumulator = .{};
+            defer output.deinit(alloc);
+            {
+                var cursor = Column.Cursor.init(try Column.Reader.init(alloc, source));
+                defer cursor.deinit();
+                const value = (try cursor.text(0)).?;
+                try std.testing.expect(try prepared.appendStoredSourceField(alloc, sa, &output, null, "body", value));
+            }
+            var reference: local.storage_db_types.SearchHit = .{ .id = try alloc.dupe(u8, "row") };
+            defer reference.deinit(alloc);
+            var parsed: std.json.Value = .{ .object = .empty };
+            try parsed.object.put(sa, "body", .{ .string = text });
+            try prepared.attachValue(alloc, sa, &reference, parsed);
+            const expected = try std.json.Stringify.valueAlloc(alloc, reference.highlights, .{});
+            defer alloc.free(expected);
+            const found = try std.json.Stringify.valueAlloc(alloc, output.fields.items, .{});
+            defer alloc.free(found);
+            try std.testing.expectEqualStrings(expected, found);
+            try std.testing.expectEqual(@as(usize, 1), output.fields.items.len);
+        }
+    };
+    try Run.run(a, view, body);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ view, body });
+}

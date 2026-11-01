@@ -30,6 +30,78 @@ matching prior behavior. `kernel_jit` takes the same fields as standalone's
 }
 ```
 
+For native LightOn CUDA readers, `inference.generation_batching.mode: "on"`
+also enables the continuous OCR scheduler. `max_step_items` bounds physical
+reader rows (up to 16 without an experimental wide profile); its active window
+is bounded to twice that value. Generic text generation retains its own
+qualified two-row ceiling. `off` and `auto` do not opt into the new reader path.
+Diagnostic `ANTFLY_LIGHTONOCR3_CUDA_BATCH=0` overrides canonical activation;
+`ANTFLY_LIGHTONOCR3_BATCH_ROWS` and `ANTFLY_LIGHTONOCR3_BATCH_WINDOW` override
+their respective defaults, bounded by physical capacity. Setting both to `1`
+provides a singleton rollback. Without an explicit window, canonical mode uses
+twice the resolved row count. Admission, execution, and discovery use the same
+resolved settings.
+`resources.inference.admission.max_concurrent_requests` must allow overlapping
+requests to reach the scheduler. Public `max_items_per_request: 1` does not
+prevent batching independent callers.
+
+On Ampere-or-newer CUDA devices, LightOn's automatic kernel policy uses split
+paged decode attention and tensor-core prefill for the two supported checkpoint
+geometries. Unsupported layouts retain the existing CUDA path. Explicit
+`ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION=0` and
+`ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off` disable the respective selections.
+These choices do not raise memory or request ceilings. Decoder row batching is
+independent of vision batching: the canonical reader profile reserves one page's
+vision workspace, so a single full-size page does not require an eight-image
+scratch reservation. Wider vision batches remain diagnostic overrides requiring
+their own memory and output qualification.
+
+```json
+{
+  "resources": {"inference": {
+    "admission": {"max_concurrent_requests": 4, "max_work_units": 64},
+    "request_limits": {"max_items_per_request": 1}
+  }},
+  "inference": {
+    "keep_alive": "0",
+    "generation_batching": {"mode": "on", "max_step_items": 2}
+  }
+}
+```
+
+Start at two reader rows and qualify higher widths against representative pages,
+request deadlines and peak memory. A larger active window does not guarantee
+that all pages fit memory simultaneously. For a pool that scales to zero,
+`keep_alive: "0"` avoids unloading an idle model while the pod remains running;
+model-count and memory-pressure eviction still apply. Preload the primary model
+before routing to the newly activated pod. Set `inference.preload[].pin: false`
+to warm the evictable cache rather than permanently reserving the model slot;
+the default remains `true` for intentionally resident preloads. Explicit
+per-model backend, GLiNER CUDA precision, and A4B load settings survive eviction
+and apply to subsequent automatic cold loads. Pinning only controls residency;
+explicit request placement remains separate.
+
+Reader performance qualification must distinguish native executor attribution
+from observed batching. `execution.max_native_step_items` reports the largest
+successful decoder step that a returned page participated in, including pages
+from other requests. Zero or absent means unobserved; one means singleton.
+`scripts/qualify_reader_page_latency.py --require-native-batch` requires at
+least two observed rows for every request; `--min-native-step-items` can raise
+that target up to the selected concurrency. Exact reference parity and complete
+output checks remain independent requirements. Native item/epoch counts or
+CUDA graph replay counts alone do not establish multirow execution.
+
+
+CUDA model loads log host preparation, device initialization, weight upload and
+total elapsed time. Host preparation may map rather than read all weight bytes:
+subsequent page faults and conversions can appear in the upload phase. These
+are wall-clock timings rather than synchronized GPU profiling spans.
+The optional `ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE=bf16_vision` admits
+Ampere-or-newer devices with a CUDA 13-or-newer driver through generic vendor
+kernels (the embedded vision artifact uses PTX 9.0); F32 remains the default.
+Architecture-specific fused kernels retain their own guards. Qualify output
+correctness and memory on the target GPU before promotion.
+
 Pull the referenced models into that directory before starting the process.
 Client-only `inference.api_url` and `inference.api_key` may stay in a shared
 configuration file: both inference serving executables accept and ignore them.
@@ -61,7 +133,7 @@ is required to start the server; configure its listener with `--host` and `--por
 Explicit CLI options override config regardless of argument order. Supplying
 one or more `--preload-model` flags replaces the config preload list rather than
 appending to it. For an exact match of kind, model reference (including artifact
-variant), and backend, config-only `residency_mode` and `memory_budget_mb`
+variant), and backend, config-only `residency_mode`, `memory_budget_mb`, and `pin`
 policies are retained; unrelated config models are not loaded. Duplicate config
 entries matching the same CLI selection are rejected as ambiguous.
 A model-count limit of zero disables that limit. When paths are

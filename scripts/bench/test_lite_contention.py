@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import queue
+from contextlib import nullcontext
 import sys
 import tempfile
 import unittest
@@ -158,7 +159,9 @@ class ContentionReportTests(unittest.TestCase):
                     or (zero if phases.count("snapshot") == 1 else final)
                 ),
             ),
-            patch.object(bench.time, "monotonic", side_effect=[0, 1, 1.1, 2.1, 2.2, 3]),
+            patch.object(
+                bench.time, "monotonic", side_effect=[0, 1, 1.1, 1.2, 2.1, 2.2, 3]
+            ),
             patch.object(bench.time, "perf_counter_ns", side_effect=[100, 150]),
         ):
             bench.native_worker(
@@ -206,7 +209,9 @@ class ContentionReportTests(unittest.TestCase):
         with (
             patch.object(bench, "sdk", return_value=api),
             patch.object(bench, "measurement_stats", side_effect=[stats, stats]),
-            patch.object(bench.time, "monotonic", side_effect=[0, 1, 1.1, 2.1, 2.2, 3]),
+            patch.object(
+                bench.time, "monotonic", side_effect=[0, 1, 1.1, 1.2, 2.1, 2.2, 3]
+            ),
             patch.object(bench.time, "perf_counter_ns", side_effect=[100, 150]),
         ):
             bench.native_worker(
@@ -274,6 +279,14 @@ class ContentionReportTests(unittest.TestCase):
         self.assertEqual(partial["status"], "starved_workers")
         self.assertEqual(partial["workers_without_success"], 1)
         self.assertEqual(partial["successful_calls_per_second"], 1)
+        # Initial progress cannot conceal a worker that stalls for the rest
+        # of a soak while its peers keep succeeding.
+        late_stall = {**progressing, "success_windows": [1, 0]}
+        sustained = {**progressing, "success_windows": [1, 1]}
+        late = bench.aggregate([late_stall, sustained])
+        self.assertEqual(late["status"], "stalled_workers")
+        self.assertEqual(late["workers_with_stalled_windows"], 1)
+        self.assertEqual(late["workers_without_success"], 0)
 
     def test_unsampled_admission_has_no_latency_even_with_successful_calls(self):
         worker = {
@@ -295,6 +308,28 @@ class ContentionReportTests(unittest.TestCase):
         self.assertIsNone(result["admission_mean_ns"])
         self.assertIsNone(result["admission_max_ns"])
         self.assertIsNone(result["admission_p99_upper_ns"])
+
+    def test_churn_verification_catches_a_lost_earlier_key_despite_a_later_success(
+        self,
+    ):
+        # Slot zero last succeeded at 0; its attempt at 128 returned Busy.
+        # Slot one's successful 129 cannot stand in for slot zero's receipt.
+        earlier = {"key": "worker-0-0", "sequence": 0}
+        latest = {"key": "worker-0-1", "sequence": 129}
+        workers = [{"last_write": latest, "latest_churn_writes": [earlier, latest]}]
+        database = SimpleNamespace(
+            lookup=lambda key: {
+                "sequence": {"worker-0-0": 128, "worker-0-1": 129}[key]
+            },
+            check=lambda: {"valid": True},
+            stats=lambda: {},
+        )
+        library = SimpleNamespace(open=lambda *args, **kwargs: nullcontext(database))
+        with patch.object(bench, "sdk", return_value=library):
+            with self.assertRaisesRegex(RuntimeError, "worker-0-0"):
+                bench.verify(
+                    "unused", Path("unused"), bench.acknowledged_writes(workers)
+                )
 
     def test_worker_setup_failure_notifies_parent_before_start_barrier(self):
         ready, results = queue.Queue(), queue.Queue()

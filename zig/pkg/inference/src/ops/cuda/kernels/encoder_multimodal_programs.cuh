@@ -420,7 +420,9 @@ extern "C" __global__ void termite_embedding_gemma2_attention_bf16(
 
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-extern "C" __global__ void termite_embedding_gemma2_attention_local_flash_bf16(
+// Keep two 512-thread blocks resident on devices with a 64K register file.
+// A small register-count increase must not halve attention occupancy.
+extern "C" __global__ __launch_bounds__(512, 2) void termite_embedding_gemma2_attention_local_flash_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* q, const __nv_bfloat16* k,
     const __nv_bfloat16* v, const long long* mask, unsigned batch,
     unsigned seq, unsigned q_heads, unsigned kv_heads, unsigned dim,
@@ -454,10 +456,11 @@ extern "C" __global__ void termite_embedding_gemma2_attention_local_flash_bf16(
 
     // Four query subtiles; HD256 uses one output fragment per warp and HD512
     // uses two.
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> out_frag[4][2];
-    #pragma unroll
-    for (unsigned qsub = 0; qsub < 4; ++qsub)
-        for (unsigned f = 0; f < 2; ++f) wmma::fill_fragment(out_frag[qsub][f], 0.0f);
+    // Use the PTX m16n8k16 ABI rather than indexing opaque WMMA fragments.
+    // Each lane owns adjacent columns in rows lane/4 and lane/4+8. Two
+    // m16n8 tiles form one m16n16 tile, keeping online rescaling in registers.
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float
+    float out_frag[4][2][2][4] = {};
     const unsigned fragments = (dim / 16) / WARPS;
 
     unsigned first = 0, last = seq;
@@ -541,25 +544,34 @@ extern "C" __global__ void termite_embedding_gemma2_attention_local_flash_bf16(
         }
         __syncthreads();
         for (unsigned qsub = 0; qsub < 4; ++qsub) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16,
-                __nv_bfloat16, wmma::row_major> pf;
-            wmma::load_matrix_sync(pf, probs + qsub * MMA * KT, KT);
+            unsigned pf[4];
+            const unsigned pp = __cvta_generic_to_shared(
+                probs + qsub * MMA * KT + (lane % 16) * KT + (lane / 16) * 8);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(pf[0]), "=r"(pf[1]), "=r"(pf[2]), "=r"(pf[3]) : "r"(pp));
             for (unsigned f = 0; f < fragments; ++f) {
                 const unsigned ot = warp + f * WARPS;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16,
-                    __nv_bfloat16, wmma::row_major> vf;
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> tf;
-                wmma::load_matrix_sync(vf, kvs + ot * MMA, dim);
-                wmma::fill_fragment(tf, 0.0f);
-                wmma::mma_sync(tf, pf, vf, tf);
+                unsigned vf[4];
+                const unsigned vp = __cvta_generic_to_shared(
+                    kvs + (lane % 16) * dim + ot * MMA + (lane / 16) * 8);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(vf[0]), "=r"(vf[1]), "=r"(vf[2]), "=r"(vf[3]) : "r"(vp));
                 #pragma unroll
-                for (unsigned i = 0; i < out_frag[qsub][f].num_elements; ++i) {
-                    // SM80+ WMMA m16n16 accumulator ownership: each lane owns
-                    // two columns in rows lane/4 and lane/4+8. Applying alpha
-                    // here avoids a store/scale/reload of every output tile.
-                    const unsigned fragment_row = (lane >> 2) + ((i & 2u) ? 8u : 0u);
-                    out_frag[qsub][f].x[i] *= alpha[qsub * MMA + fragment_row];
-                    out_frag[qsub][f].x[i] += tf.x[i];
+                for (unsigned half = 0; half < 2; ++half) {
+                    float tf[4] = {};
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(tf[0]), "+f"(tf[1]), "+f"(tf[2]), "+f"(tf[3])
+                        : "r"(pf[0]), "r"(pf[1]), "r"(pf[2]), "r"(pf[3]),
+                          "r"(vf[half * 2]), "r"(vf[half * 2 + 1]));
+                    #pragma unroll
+                    for (unsigned i = 0; i < 4; ++i) {
+                        const unsigned row = qsub * MMA + (lane >> 2) + (i >= 2 ? 8 : 0);
+                        // Preserve the previous multiply-then-add boundary.
+                        out_frag[qsub][f][half][i] *= alpha[row];
+                        out_frag[qsub][f][half][i] += tf[i];
+                    }
                 }
             }
         }
@@ -569,15 +581,17 @@ extern "C" __global__ void termite_embedding_gemma2_attention_local_flash_bf16(
     for (unsigned qsub = 0; qsub < 4; ++qsub) {
         for (unsigned f = 0; f < fragments; ++f) {
             const unsigned ot = warp + f * WARPS;
-            float* scratch = warp_scratch + warp * MMA * KT;
-            wmma::store_matrix_sync(scratch, out_frag[qsub][f], KT, wmma::mem_row_major);
-            __syncwarp();
-            for (unsigned i = lane; i < MMA * KT; i += 32) {
-                const unsigned row = qsub * MMA + i / KT, col = i % KT;
-                if (row < valid_rows && ot * MMA + col < dim) {
-                    const float denom = running_sum[row];
-                    out[(((size_t)b * seq + qt + row) * q_heads + qh) * dim + ot * MMA + col] =
-                        __float2bfloat16_rn(denom > 0.0f ? scratch[i] / denom : 0.0f);
+            #pragma unroll
+            for (unsigned half = 0; half < 2; ++half) {
+                #pragma unroll
+                for (unsigned i = 0; i < 4; ++i) {
+                    const unsigned row = qsub * MMA + (lane >> 2) + (i >= 2 ? 8 : 0);
+                    const unsigned col = half * 8 + (lane % 4) * 2 + (i & 1);
+                    if (row < valid_rows && ot * MMA + col < dim) {
+                        const float denom = running_sum[row];
+                        out[(((size_t)b * seq + qt + row) * q_heads + qh) * dim + ot * MMA + col] =
+                            __float2bfloat16_rn(denom > 0.0f ? out_frag[qsub][f][half][i] / denom : 0.0f);
+                    }
                 }
             }
         }
