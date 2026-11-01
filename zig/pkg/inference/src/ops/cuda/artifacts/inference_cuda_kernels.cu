@@ -18,6 +18,7 @@
 #include <mma.h>
 #include "../../../graph/templates/cuda_q4_0_bf16_staged.cuh"
 #include "../kernels/embedding_gemma2.cuh"
+#include "../kernels/rms_q8_1_2560.cuh"
 
 using namespace nvcuda;
 
@@ -21392,6 +21393,8 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b
         partial_indices[global_tile] = best_index;
     }
 }
+
+#include "../kernels/gemma4_e4b_prefetch.cuh"
 
 extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
     float* dst,

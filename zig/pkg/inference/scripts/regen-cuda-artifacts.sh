@@ -441,6 +441,12 @@ required_symbols=(
   termite_activation_multiply_fused_gate_up_f32
   termite_rms_norm_add_weighted_embedding_i32_q6_k_f32
   termite_rms_norm_f32_bf16
+  antfly_rms_q8_1_2560_tile256
+  antfly_gemma4_e4b_head_prefetch_l2
+  antfly_gemma4_e4b_pair_prefetch_l2
+  antfly_gemma4_e4b_down_prefetch_l2
+  antfly_rms_add_q8_1_2560_tile256
+  antfly_rms_add_scale_q8_1_2560_tile256
   termite_rms_norm_add_f32_bf16
   termite_linear_q4_0_gated_down_f32_tile4_w4
   termite_linear_q4_0_activation_slice_last_dim_f32_tile4

@@ -81,6 +81,10 @@ pub const CudaTensor = struct {
 
     buffer: buffer_mod.DeviceBuffer,
     bf16_mirror: buffer_mod.DeviceBuffer = .{},
+    /// Exact Q8_1 representation of an immutable RMS output. Views resolve
+    /// through resident_parent instead of copying this validity bit.
+    q8_1_mirror: buffer_mod.DeviceBuffer = .{},
+    q8_1_mirror_valid: bool = false,
     /// Stable page-locked storage used by repeated training-input uploads.
     /// Keeping the source alive lets cuMemcpyHtoDAsync remain asynchronous;
     /// compiled training steps synchronize before the next overwrite.
@@ -94,6 +98,7 @@ pub const CudaTensor = struct {
     owns_buffer: bool = true,
     owns_tc_quant: bool = true,
     owns_bf16_mirror: bool = true,
+    owns_q8_1_mirror: bool = true,
     owns_training_upload_host: bool = true,
     owns_shape: bool = true,
     owned_by_tensor: bool = true,
@@ -1508,6 +1513,8 @@ pub const RuntimeStats = struct {
     f16_cublaslt_fallbacks: usize = 0,
     f16_scalar_linear_calls: usize = 0,
     rms_norm_bf16_mirror_hits: usize = 0,
+    rms_norm_q8_1_mirror_produces: usize = 0,
+    rms_norm_q8_1_mirror_hits: usize = 0,
     pinned_bulk_downloads: usize = 0,
     qkv_fallback_unsupported: usize = 0,
     qkv_kernel_unavailable: usize = 0,
@@ -4173,6 +4180,7 @@ pub const CudaCompute = struct {
     lazy_access_epoch: u64 = 1,
     decoder_runtime_linear_slots: std.AutoHashMapUnmanaged(usize, CudaDecoderRuntimeLinearSlot) = .empty,
     decoder_runtime_rms_norm_slots: std.AutoHashMapUnmanaged(usize, CudaDecoderRuntimeRmsNormSlot) = .empty,
+    rms_q8_1_missing_reported: bool = false,
     decoder_runtime_next_dynamic_slot: usize = 1,
     decoder_runtime_family_state: CudaDecoderRuntimeFamilyState = .{},
     run_budget: ?*run_memory.RunBudget = null,
@@ -8680,6 +8688,7 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
         }
     }
     if (cuda_tensor.owns_bf16_mirror) releaseDeviceBuffer(self, &cuda_tensor.bf16_mirror);
+    if (cuda_tensor.owns_q8_1_mirror) releaseDeviceBuffer(self, &cuda_tensor.q8_1_mirror);
     if (cuda_tensor.owns_training_upload_host) cuda_tensor.training_upload_host.free(&self.ctx);
     if (cuda_tensor.model_constant) {
         self.embedding_gemma2_constant_bytes -= cuda_tensor.elem_count * @sizeOf(f32);
@@ -8705,6 +8714,10 @@ fn freeCudaTensorStorageUncached(self: *CudaCompute, cuda_tensor: *CudaTensor) v
     if (cuda_tensor.owns_bf16_mirror and cuda_tensor.bf16_mirror.ptr != 0) {
         self.stats.device_free_calls += 1;
         cuda_tensor.bf16_mirror.free(&self.ctx);
+    }
+    if (cuda_tensor.owns_q8_1_mirror and cuda_tensor.q8_1_mirror.ptr != 0) {
+        self.stats.device_free_calls += 1;
+        cuda_tensor.q8_1_mirror.free(&self.ctx);
     }
     if (cuda_tensor.owns_training_upload_host) cuda_tensor.training_upload_host.free(&self.ctx);
     if (cuda_tensor.owns_buffer and cuda_tensor.buffer.ptr != 0) {
@@ -13398,6 +13411,9 @@ fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
     borrowed.owns_buffer = false;
     borrowed.owns_tc_quant = false;
     borrowed.owns_bf16_mirror = false;
+    borrowed.q8_1_mirror = .{};
+    borrowed.q8_1_mirror_valid = false;
+    borrowed.owns_q8_1_mirror = false;
     borrowed.owns_training_upload_host = false;
     borrowed.owns_shape = false;
     borrowed.owned_by_tensor = false;
@@ -13436,7 +13452,7 @@ fn decoderRuntimeSlotPinsBuffer(self: *const CudaCompute, buffer: buffer_mod.Dev
 }
 
 fn cudaTensorDeviceBytes(tensor: *const CudaTensor) usize {
-    const mirror_bytes = tensor.bf16_mirror.len;
+    const mirror_bytes = tensor.bf16_mirror.len + tensor.q8_1_mirror.len;
     if (tensor.quant_type) |quant_type| {
         const block_size = gguf_tensor_types.bytesPerBlock(quant_type) orelse return tensor.buffer.len + mirror_bytes;
         const values_per_block = gguf_tensor_types.valuesPerBlock(quant_type) orelse return tensor.buffer.len + mirror_bytes;
@@ -16137,6 +16153,140 @@ fn createTensorWithDTypeAndBf16Mirror(
     return tensor;
 }
 
+fn borrowRmsQ8Mirror(tensor: *const CudaTensor, rows: usize, in_dim: usize) ?buffer_mod.DeviceBuffer {
+    if (rows != 1 or in_dim != 2560 or tensor.elem_count != 2560 or tensor.buffer.len < 2560 * @sizeOf(f32) or tensor.dtype != .f32 or tensor.quant_type != null) return null;
+    var current = tensor;
+    while (true) {
+        if (current.q8_1_mirror_valid and current.q8_1_mirror.ptr != 0 and current.q8_1_mirror.len >= 80 * 36) return current.q8_1_mirror;
+        const parent = current.resident_parent orelse return null;
+        // Only an unchanged full-buffer reshape can borrow this layout. A
+        // slice must not silently reinterpret the original row's Q8 groups.
+        if (parent.buffer.ptr != tensor.buffer.ptr or parent.elem_count != tensor.elem_count) return null;
+        current = parent;
+    }
+}
+
+fn invalidateRmsQ8Mirror(tensor: *CudaTensor) void {
+    tensor.q8_1_mirror_valid = false;
+    // Keep the owned allocation until normal tensor teardown. Its stream-
+    // ordered consumers may still be in flight when a later write is queued.
+    if (tensor.resident_parent) |parent| invalidateRmsQ8Mirror(parent);
+}
+
+const PreparedQ8Input = struct {
+    buffer: buffer_mod.DeviceBuffer,
+    owned: bool,
+
+    fn deinit(self: *@This(), compute: *CudaCompute) void {
+        if (self.owned) releaseDeviceBuffer(compute, &self.buffer);
+    }
+};
+
+fn prepareQ8Input(self: *CudaCompute, input: *const CudaTensor, rows: usize, in_dim: usize) !PreparedQ8Input {
+    if (borrowRmsQ8Mirror(input, rows, in_dim)) |mirror| {
+        if (self.stats.rms_norm_q8_1_mirror_hits == 0)
+            std.log.info("cuda_rms_q8_1_mirror: consumer=active rows=1 dim=2560 cached_quantization=exact", .{});
+        self.stats.rms_norm_q8_1_mirror_hits += 1;
+        return .{ .buffer = mirror, .owned = false };
+    }
+    const bytes = try checkedMul(try checkedMul(rows, in_dim / 32), 36);
+    var buffer = try allocDeviceBuffer(self, bytes);
+    errdefer releaseDeviceBuffer(self, &buffer);
+    try self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, buffer, input.buffer, rows, in_dim);
+    return .{ .buffer = buffer, .owned = true };
+}
+
+fn tryRmsQ8Mirror(
+    self: *CudaCompute,
+    operation: kernels_mod.KernelModule.RmsQ8Operation,
+    device: buffer_mod.DeviceBuffer,
+    shape: []i64,
+    input: *const CudaTensor,
+    weight: *const CudaTensor,
+    residual: ?*const CudaTensor,
+    scalar: ?*const CudaTensor,
+    dim: usize,
+    eps: f32,
+) !?CT {
+    if (dim != 2560 or input.elem_count != dim or self.capability_profile != .gemma4 or
+        self.ctx.info.compute_major < 8 or !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RMS_Q8_1_MIRROR", false)) return null;
+    if (!self.kernels.hasRmsQ8Mirror2560(operation)) {
+        if (!self.rms_q8_1_missing_reported) {
+            self.rms_q8_1_missing_reported = true;
+            std.log.warn("cuda_rms_q8_1_mirror: requested=1 active=0 reason=kernel_unavailable operation={s}", .{@tagName(operation)});
+        }
+        return null;
+    }
+    var mirror = allocDeviceBuffer(self, 80 * 36) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => return null,
+        else => return err,
+    };
+    var mirror_owned = true;
+    defer if (mirror_owned) releaseDeviceBuffer(self, &mirror);
+    self.kernels.launchRmsQ8Mirror2560(&self.ctx, operation, device, mirror, input.buffer, weight.buffer, if (residual) |value| value.buffer else .{}, if (scalar) |value| value.buffer else .{}, eps) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => return null,
+        else => return err,
+    };
+    const output = try createTensor(self, device, shape, input.elem_count);
+    const tensor = tensorFromCt(output);
+    tensor.q8_1_mirror = mirror;
+    tensor.q8_1_mirror_valid = true;
+    mirror_owned = false;
+    if (self.stats.rms_norm_q8_1_mirror_produces == 0)
+        std.log.info("cuda_rms_q8_1_mirror: producer=active rows=1 dim=2560 f32_output=retained q8_1=exact tiled_ctas=10", .{});
+    self.stats.rms_norm_q8_1_mirror_produces += 1;
+    self.stats.launch_norm += 1;
+    switch (operation) {
+        .norm => self.stats.launch_norm_rms += 1,
+        .add => {
+            self.stats.launch_norm_rms_add += 1;
+            self.stats.rms_norm_add_fused += 1;
+        },
+        .add_scale => {
+            self.stats.launch_norm_rms_add_output_scale += 1;
+            self.stats.rms_norm_add_output_scale_fused += 1;
+        },
+    }
+    return output;
+}
+
+test "CUDA RMS Q8 mirror views follow owner validity and preserve allocation accounting" {
+    var shape = [_]i64{ 1, 2560 };
+    var owner = CudaTensor{
+        .buffer = .{ .ptr = 0x10000, .len = 2560 * @sizeOf(f32) },
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 2560,
+        .q8_1_mirror = .{ .ptr = 0x20000, .len = 80 * 36 },
+        .q8_1_mirror_valid = true,
+    };
+    var view = CudaTensor{
+        .buffer = owner.buffer,
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 2560,
+        .resident_parent = &owner,
+        .owns_buffer = false,
+    };
+    try std.testing.expectEqual(owner.q8_1_mirror.ptr, borrowRmsQ8Mirror(&view, 1, 2560).?.ptr);
+    try std.testing.expect(borrowRmsQ8Mirror(&view, 2, 1280) == null);
+    view.buffer.ptr += 4;
+    try std.testing.expect(borrowRmsQ8Mirror(&view, 1, 2560) == null);
+    view.buffer.ptr -= 4;
+    view.elem_count -= 1;
+    try std.testing.expect(borrowRmsQ8Mirror(&view, 1, 2560) == null);
+    view.elem_count += 1;
+    invalidateRmsQ8Mirror(&view);
+    try std.testing.expect(!owner.q8_1_mirror_valid);
+    try std.testing.expect(borrowRmsQ8Mirror(&view, 1, 2560) == null);
+    // Invalidation cannot recycle storage used by earlier stream consumers.
+    try std.testing.expectEqual(@as(u64, 0x20000), owner.q8_1_mirror.ptr);
+    try std.testing.expectEqual(@as(usize, 2560 * @sizeOf(f32) + 80 * 36), cudaTensorDeviceBytes(&owner));
+    const borrowed = borrowedSlotTensor(&owner);
+    try std.testing.expectEqual(@as(u64, 0), borrowed.q8_1_mirror.ptr);
+    try std.testing.expect(!borrowed.owns_q8_1_mirror and !borrowed.q8_1_mirror_valid);
+}
+
 fn convertDTypeOp(ctx: *anyopaque, tensor_ct: CT, target: ops.GraphDType) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const tensor = tensorFromCt(tensor_ct);
@@ -16208,6 +16358,7 @@ fn trainingOverwriteF32Op(ctx: *anyopaque, tensor_ct: CT, data: []const f32, sha
     if (tensor.training_upload_generation == self.training_upload_generation) {
         return error.TrainingUploadStillPending;
     }
+    invalidateRmsQ8Mirror(tensor);
     const data_bytes = std.mem.sliceAsBytes(data);
     if (tensor.training_upload_host.len != data_bytes.len) {
         tensor.training_upload_host.free(&self.ctx);
@@ -16244,6 +16395,7 @@ fn trainingAccumulateF32Op(ctx: *anyopaque, accum_ct: CT, grad_ct: CT, elem_coun
     try ensureF32(accum);
     try ensureF32(grad);
     if (elem_count != accum.elem_count or elem_count != grad.elem_count) return error.InvalidShape;
+    invalidateRmsQ8Mirror(accum);
     try self.kernels.launchTrainingAccumulateF32(&self.ctx, accum.buffer, grad.buffer, elem_count, scale, first);
 }
 
@@ -16263,6 +16415,9 @@ fn trainingAdamWManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingAdamWBatc
             input.elem_count != m.elem_count or
             input.elem_count != v.elem_count) return error.InvalidShape;
         if (input.bias_correction1 <= 0.0 or input.bias_correction2 <= 0.0) return error.InvalidOptimizerState;
+        invalidateRmsQ8Mirror(weight);
+        invalidateRmsQ8Mirror(m);
+        invalidateRmsQ8Mirror(v);
         try self.kernels.launchTrainingAdamWF32(
             &self.ctx,
             weight.buffer,
@@ -17163,6 +17318,7 @@ fn copyRows2DOp(
     if (src_offset > src_tensor.buffer.len or src_bytes > src_tensor.buffer.len - src_offset) return error.InvalidShape;
     const dst_buffer = buffer_mod.DeviceBuffer{ .ptr = dst_tensor.buffer.ptr + dst_offset, .len = dst_bytes };
     const src_buffer = buffer_mod.DeviceBuffer{ .ptr = src_tensor.buffer.ptr + src_offset, .len = src_bytes };
+    invalidateRmsQ8Mirror(dst_tensor);
     if (src_size == dst_size) try copyFromDeviceTracked(self, dst_buffer, src_buffer, dst_bytes) else {
         const module = try self.embeddingGemma2Module();
         try module.launchF32ToBf16(&self.ctx, dst_buffer, src_buffer, @intCast(count));
@@ -18817,6 +18973,9 @@ fn boundaryMixedWeight(self: *CudaCompute, weight: *const CudaTensor) ?CudaTenso
     view.tc_quant = null;
     view.owns_tc_quant = false;
     view.bf16_mirror = .{};
+    view.q8_1_mirror = .{};
+    view.q8_1_mirror_valid = false;
+    view.owns_q8_1_mirror = false;
     view.owns_bf16_mirror = false;
     view.owns_buffer = false;
     view.owns_shape = false;
@@ -19234,7 +19393,7 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
 fn tryLaunchLinearQ4_0Q8_1Dp4a(
     self: *CudaCompute,
     device: buffer_mod.DeviceBuffer,
-    input: buffer_mod.DeviceBuffer,
+    input: *const CudaTensor,
     weight: buffer_mod.DeviceBuffer,
     rows: usize,
     in_dim: usize,
@@ -19247,15 +19406,12 @@ fn tryLaunchLinearQ4_0Q8_1Dp4a(
     const q8_bytes = try checkedMul(q8_blocks, 36);
     if (q8_bytes == 0) return false;
 
-    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-        error.CudaGraphCaptureUnsafeTempAlloc => return false,
+    var prepared = prepareQ8Input(self, input, rows, in_dim) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => return false,
         else => return err,
     };
-    defer releaseDeviceBuffer(self, &q8_input);
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
-        else => return err,
-    };
+    defer prepared.deinit(self);
+    const q8_input = prepared.buffer;
     var launched_tile8 = false;
     var prefill_variant: kernels_mod.Q4_0Q8_1PrefillRowsVariant = .none;
     if (cudaQ4_0LinearQ8_1Tile8Enabled()) tile8_linear: {
@@ -19290,7 +19446,7 @@ fn tryLaunchLinearQ4_0PairQ8_1Dp4a(
     self: *CudaCompute,
     device_a: buffer_mod.DeviceBuffer,
     device_b: buffer_mod.DeviceBuffer,
-    input: buffer_mod.DeviceBuffer,
+    input: *const CudaTensor,
     weight_a: buffer_mod.DeviceBuffer,
     weight_b: buffer_mod.DeviceBuffer,
     rows: usize,
@@ -19304,15 +19460,12 @@ fn tryLaunchLinearQ4_0PairQ8_1Dp4a(
     const q8_bytes = try checkedMul(q8_blocks, 36);
     if (q8_bytes == 0) return false;
 
-    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-        error.CudaGraphCaptureUnsafeTempAlloc => return false,
+    var prepared = prepareQ8Input(self, input, rows, in_dim) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => return false,
         else => return err,
     };
-    defer releaseDeviceBuffer(self, &q8_input);
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
-        else => return err,
-    };
+    defer prepared.deinit(self);
+    const q8_input = prepared.buffer;
     var prefill_variant: kernels_mod.Q4_0Q8_1PrefillRowsVariant = .none;
     if (cudaQ4_0PairQ8_1Tile8Enabled()) {
         self.kernels.launchLinearQ4_0PairNoBiasQ8_1Tile8F32(&self.ctx, device_a, device_b, q8_input, weight_a, weight_b, rows, in_dim, out_dim) catch |err| switch (err) {
@@ -19342,7 +19495,7 @@ fn tryLaunchLinearQ4_0QkvQ8_1Dp4a(
     q_device: buffer_mod.DeviceBuffer,
     k_device: buffer_mod.DeviceBuffer,
     v_device: buffer_mod.DeviceBuffer,
-    input: buffer_mod.DeviceBuffer,
+    input: *const CudaTensor,
     q_weight: buffer_mod.DeviceBuffer,
     k_weight: buffer_mod.DeviceBuffer,
     v_weight: buffer_mod.DeviceBuffer,
@@ -19358,15 +19511,12 @@ fn tryLaunchLinearQ4_0QkvQ8_1Dp4a(
     const q8_bytes = try checkedMul(q8_blocks, 36);
     if (q8_bytes == 0) return false;
 
-    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-        error.CudaGraphCaptureUnsafeTempAlloc => return false,
+    var prepared = prepareQ8Input(self, input, rows, in_dim) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => return false,
         else => return err,
     };
-    defer releaseDeviceBuffer(self, &q8_input);
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
-        else => return err,
-    };
+    defer prepared.deinit(self);
+    const q8_input = prepared.buffer;
     var prefill_variant: kernels_mod.Q4_0Q8_1PrefillRowsVariant = .none;
     if (cudaQ4_0QkvQ8_1Tile8Enabled(self)) {
         if (cudaQ4_0QkvQ8_1Tile8W8Enabled(in_dim)) {
@@ -19596,7 +19746,7 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
                         .grid = .{ (rows * out_dim + 255) / 256, 1, 1 },
                         .block = .{ 256, 1, 1 },
                     };
-                    if (try tryLaunchLinearQ4_0Q8_1Dp4a(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+                    if (try tryLaunchLinearQ4_0Q8_1Dp4a(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim)) {
                         route = if (cudaQ4_0LinearQ8_1Tile8Enabled()) .{
                             .kernel_id = "termite_linear_q4_0_q8_1_f32_tile8",
                             .grid = .{ (out_dim + 7) / 8, rows, 1 },
@@ -20187,6 +20337,9 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
                 .ptr = input_tensor.buffer.ptr + last_row_bytes,
                 .len = row_bytes,
             };
+            last_row_tensor.q8_1_mirror = .{};
+            last_row_tensor.q8_1_mirror_valid = false;
+            last_row_tensor.owns_q8_1_mirror = false;
             last_row_tensor.shape = last_row_shape[0..];
             last_row_tensor.elem_count = in_dim;
             last_row_tensor.owns_buffer = false;
@@ -20475,25 +20628,17 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             self.kernels.hasGemma4A4BExactLmHeadPrimitive();
         const launched_q8_1 = if (cudaQ6KLmHeadQ8_1Enabled(self) or generated_q8_1_candidate) blk: {
             if (rows != 1 or in_dim % 256 != 0) break :blk false;
-            const q8_row_blocks = in_dim / 32;
-            const q8_blocks = checkedMul(rows, q8_row_blocks) catch break :blk false;
-            const q8_bytes = checkedMul(q8_blocks, 36) catch break :blk false;
-            var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-                error.CudaGraphCaptureUnsafeTempAlloc => {
+            const q8_blocks = checkedMul(rows, in_dim / 32) catch break :blk false;
+            _ = checkedMul(q8_blocks, 36) catch break :blk false;
+            var prepared = prepareQ8Input(self, input_tensor, rows, in_dim) catch |err| switch (err) {
+                error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => {
                     if (generated_q8_1_candidate) self.stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks += 1;
                     break :blk false;
                 },
                 else => return err,
             };
-            defer releaseDeviceBuffer(self, &q8_input);
-
-            self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
-                error.CudaKernelUnavailable, error.InvalidCudaState => {
-                    if (generated_q8_1_candidate) self.stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks += 1;
-                    break :blk false;
-                },
-                else => return err,
-            };
+            defer prepared.deinit(self);
+            const q8_input = prepared.buffer;
 
             const launched_generated = if (generated_q8_1_candidate) generated: {
                 self.kernels.launchLinearQ6KQ8_1GeneratedArgmaxRowsTile8F32(
@@ -21197,7 +21342,7 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
             q_device,
             k_device,
             v_device,
-            input_tensor.buffer,
+            input_tensor,
             q_weight_tensor.buffer,
             k_weight_tensor.buffer,
             v_weight_tensor.buffer,
@@ -21759,7 +21904,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
             self,
             device_a,
             device_b,
-            input_tensor.buffer,
+            input_tensor,
             weight_a_tensor.buffer,
             weight_b_tensor.buffer,
             rows,
@@ -22006,19 +22151,12 @@ fn linearNoBiasPairActivationQ4_0(
         .block = .{ 128, 1, 1 },
     };
     if (cudaQ4_0PairActivationQ8_1Dp4aEnabled(self)) q8_1_blk: {
-        const row_blocks = in_dim / 32;
-        const q8_blocks = try checkedMul(rows, row_blocks);
-        const q8_bytes = try checkedMul(q8_blocks, 36);
-        var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-            error.CudaGraphCaptureUnsafeTempAlloc => break :q8_1_blk,
+        var prepared = prepareQ8Input(self, input_tensor, rows, in_dim) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
             else => return err,
         };
-        defer releaseDeviceBuffer(self, &q8_input);
-
-        self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
-            error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
-            else => return err,
-        };
+        defer prepared.deinit(self);
+        const q8_input = prepared.buffer;
         if (cudaQ4_0PairActivationQ8_1Tile8Enabled()) {
             self.kernels.launchLinearQ4_0PairActivationQ8_1Tile8F32(
                 &self.ctx,
@@ -22495,6 +22633,7 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
     errdefer device.free(&self.ctx);
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
+    if (try tryRmsQ8Mirror(self, .norm, device, shape, input_tensor, weight_tensor, null, null, dim, eps)) |result| return result;
     if (input_tensor.elem_count / dim > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
         var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
@@ -22574,6 +22713,7 @@ fn rmsNormAddOutputScaleTensor(ctx: *anyopaque, input: CT, weight: CT, residual:
     errdefer device.free(&self.ctx);
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
+    if (try tryRmsQ8Mirror(self, .add_scale, device, shape, input_tensor, weight_tensor, residual_tensor, scalar_tensor, dim, eps)) |result| return result;
     self.kernels.launchRmsNormAddOutputScaleF32(
         &self.ctx,
         device,
@@ -22618,6 +22758,7 @@ fn rmsNormAddTensor(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: u
     errdefer device.free(&self.ctx);
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
+    if (try tryRmsQ8Mirror(self, .add, device, shape, input_tensor, weight_tensor, residual_tensor, null, dim, eps)) |result| return result;
     if (input_tensor.elem_count / dim > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
         var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
@@ -23025,9 +23166,55 @@ fn addBiasRowsConsume(ctx: *anyopaque, input: CT, bias: CT, rows: usize, out_dim
     try ensureF32(bias_tensor);
     if (input_tensor.elem_count != try checkedMul(rows, out_dim)) return error.InvalidShape;
     if (bias_tensor.elem_count != out_dim) return error.InvalidShape;
+    invalidateRmsQ8Mirror(input_tensor);
     try self.kernels.launchAddBiasRowsF32(&self.ctx, input_tensor.buffer, bias_tensor.buffer, rows, out_dim);
     self.stats.launch_elementwise += 1;
     return input;
+}
+
+test "CUDA RMS Q8 consumed bias invalidates owner and sibling views before launch" {
+    var shape = [_]i64{ 1, 2560 };
+    var bias_shape = [_]i64{2560};
+    var owner = CudaTensor{
+        .buffer = .{ .ptr = 0x10000, .len = 2560 * @sizeOf(f32) },
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 2560,
+        .q8_1_mirror = .{ .ptr = 0x20000, .len = 80 * 36 },
+        .q8_1_mirror_valid = true,
+    };
+    var first_view = CudaTensor{
+        .buffer = owner.buffer,
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 2560,
+        .resident_parent = &owner,
+        .owns_buffer = false,
+    };
+    var consumed_view = first_view;
+    consumed_view.resident_parent = &first_view;
+    const sibling_view = first_view;
+    var bias = CudaTensor{
+        // Inject a launch-validation failure after logical shape validation.
+        // No context/driver is initialized or GPU work performed in this test.
+        .buffer = .{ .ptr = 0x30000, .len = @sizeOf(f32) },
+        .dtype = .f32,
+        .shape = &bias_shape,
+        .elem_count = 2560,
+    };
+    var compute: CudaCompute = undefined;
+    compute.kernels = .{};
+    try std.testing.expect(borrowRmsQ8Mirror(&consumed_view, 1, 2560) != null);
+    try std.testing.expect(borrowRmsQ8Mirror(&sibling_view, 1, 2560) != null);
+    try std.testing.expectError(error.InvalidShape, addBiasRowsConsume(&compute, @ptrCast(&consumed_view), @ptrCast(&bias), 1, 2559));
+    try std.testing.expect(owner.q8_1_mirror_valid);
+    try std.testing.expectError(error.InvalidCudaState, addBiasRowsConsume(&compute, @ptrCast(&consumed_view), @ptrCast(&bias), 1, 2560));
+    try std.testing.expect(!owner.q8_1_mirror_valid);
+    try std.testing.expect(borrowRmsQ8Mirror(&consumed_view, 1, 2560) == null);
+    try std.testing.expect(borrowRmsQ8Mirror(&sibling_view, 1, 2560) == null);
+    // Invalidation must retain allocation used by already queued consumers.
+    try std.testing.expectEqual(@as(u64, 0x20000), owner.q8_1_mirror.ptr);
+    try std.testing.expectEqual(@as(usize, 80 * 36), owner.q8_1_mirror.len);
 }
 
 fn multiply(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
@@ -23373,19 +23560,12 @@ fn linearNoBiasActivationSliceLastDim(
 
     var used_q8_1_dp4a = false;
     if (cudaQ4_0ActivationSliceQ8_1Dp4aEnabled(self)) q8_1_blk: {
-        const row_blocks = in_dim / 32;
-        const q8_blocks = try checkedMul(rows, row_blocks);
-        const q8_bytes = try checkedMul(q8_blocks, 36);
-        var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-            error.CudaGraphCaptureUnsafeTempAlloc => break :q8_1_blk,
+        var prepared = prepareQ8Input(self, input_tensor, rows, in_dim) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
             else => return err,
         };
-        defer releaseDeviceBuffer(self, &q8_input);
-
-        self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
-            error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
-            else => return err,
-        };
+        defer prepared.deinit(self);
+        const q8_input = prepared.buffer;
         self.kernels.launchLinearQ4_0ActivationSliceLastDimQ8_1Tile4F32(
             &self.ctx,
             device,
@@ -24131,6 +24311,7 @@ fn preprocessEmbeddingGemma2ImagePatchesIntoOp(ctx: *anyopaque, destination_ct: 
     const count = try checkedMul(rows, 768);
     if (offset > destination.elem_count or count > destination.elem_count - offset) return error.InvalidShape;
     const output: buffer_mod.DeviceBuffer = .{ .ptr = destination.buffer.ptr + offset * 4, .len = count * 4 };
+    invalidateRmsQ8Mirror(destination);
     const result = (try preprocessEmbeddingGemma2Patches(self, rgb, null, width, height, stride, target_width, target_height, output)) orelse return false;
     freeTensor(self, result);
     self.embedding_gemma2_patch_rows_written += rows;

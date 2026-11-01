@@ -102,20 +102,30 @@ def post(base, route, body, timeout=600):
     return value, time.perf_counter() - started, headers
 
 
-def sse_generate(base, model, tokens, route="/ai/v1/generate", extra_body=None, prompt=None):
-    body = {"model": model, "backend": "cuda", "temperature": 0,
+def generation_request(model, tokens, *, prompt=None, backend="cuda", extra_body=None):
+    """One request constructor shared by timed generation and untimed preflight."""
+    body = {"model": model, "temperature": 0,
             "messages": [{"role": "user", "content": prompt or
                 "Write a detailed factual explanation of how a compiler works, covering lexing, parsing, type checking, optimization, and machine code. Continue for at least 1500 words."}],
             "chat_template_kwargs": {"enable_thinking": False},
             "stream": True, "stream_options": {"include_usage": True}, "max_tokens": tokens}
+    if backend is not None:
+        body["backend"] = backend
     if extra_body:
         body.update(extra_body)
+    return body
+
+
+def sse_generate(base, model, tokens, route="/ai/v1/generate", extra_body=None, prompt=None, backend="cuda"):
+    body = generation_request(model, tokens, prompt=prompt, backend=backend, extra_body=extra_body)
     request = urllib.request.Request(base + route, json.dumps(body).encode(), {
         "Content-Type": "application/json", "X-Antfly-Inference-Timeout-Ms": "600000"})
     started = time.perf_counter()
     first = usage_time = None
     usage = None
     chunks = []
+    engine_timings = []
+    first_content_characters = None
     done = False
     finish = None
     try:
@@ -137,6 +147,8 @@ def sse_generate(base, model, tokens, route="/ai/v1/generate", extra_body=None, 
                 raise RuntimeError(f"Non-JSON SSE data: {raw.decode(errors='replace')[:1000]}") from error
             if event.get("error"):
                 raise RuntimeError(str(event["error"]))
+            if event.get("timings") is not None:
+                engine_timings.append(event["timings"])
             if event.get("usage") is not None:
                 usage = event["usage"]
                 usage_time = time.perf_counter()
@@ -146,6 +158,7 @@ def sse_generate(base, model, tokens, route="/ai/v1/generate", extra_body=None, 
                 if content:
                     if first is None:
                         first = time.perf_counter()
+                        first_content_characters = len(content)
                     chunks.append(content)
                 if choice.get("finish_reason") is not None:
                     finish = choice["finish_reason"]
@@ -159,6 +172,11 @@ def sse_generate(base, model, tokens, route="/ai/v1/generate", extra_body=None, 
             "decode_seconds": usage_time - first,
             "decode_tokens_per_second": (count - 1) / (usage_time - first),
             "end_to_end_tokens_per_second": count / (ended - started),
+            "stream_accounting": {"content_chunks": len(chunks),
+                "first_content_characters": first_content_characters,
+                "decode_metric": "(completion_tokens - 1) / (terminal_usage_time - first_visible_content_time)",
+                "decode_metric_assumption": "first visible content represents one generated token; chunk sizes do not establish token counts"},
+            "engine_reported_timings": engine_timings,
             "finish_reason": finish, "text": "".join(chunks), "headers": headers}
 
 
