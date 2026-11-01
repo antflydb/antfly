@@ -1173,7 +1173,9 @@ and index inputs in each recovery slot. Allocator-only checkpoints and scoped
 reader leases preserve those identities, so admission can retain an unchanged
 serving runtime after both physical slots advance. Allocator caches independently
 validate journal ancestry and the current seal; a repeated physical root ID does
-not establish a cache hit.
+not establish a cache hit. Compaction assigns fresh identities to every logical
+root family before sealing its replacement generation; allocator-only publication
+normalization preserves those identities.
 
 Schema and SQL recovery-state writes atomically mark their namespace in a durable
 recovery agenda. Admission checks pending namespaces instead of opening every
@@ -1183,7 +1185,9 @@ cursor schedules discovery; it never authorizes access. Every operation checks
 its affected namespaces, and catalog-dependent operations check their schema
 participants, before admission. Read-only handles carry a clean-sweep witness
 across pages for the same logical metadata generation; data-only commits preserve
-it and new DDL invalidates it. Revision-3 conversion bootstraps this agenda before
+it and new DDL invalidates it. An interrupted namespace check disqualifies the
+sweep from certifying cleanliness, including when its cursor has already advanced.
+Revision-3 conversion bootstraps this agenda before
 publishing the replacement generation.
 
 Detached replay uses per-index-kind feedback retained by the namespace scheduling

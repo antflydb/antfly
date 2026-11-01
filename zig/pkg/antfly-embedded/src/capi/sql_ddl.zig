@@ -225,6 +225,13 @@ fn recoverAgenda(handle: *h.Handle, storage: anytype) !void {
     // agenda page wraps past a root marker earlier than the cursor.
     try @import("sql_fk.zig").recover(handle);
     const read_only = !canRecoverWrite(handle);
+    // Cursor progress is retained for fairness, including on failed namespace
+    // opens. An interrupted sweep can never certify the unchecked remainder;
+    // reaching its end must wrap and successfully inspect a complete sweep.
+    errdefer if (read_only) {
+        handle.sql_ddl_agenda_scan_complete = false;
+        handle.sql_ddl_recovery_needed = true;
+    };
     const generation = storage.file.activeCheckpoint().logical.metadata;
     if (read_only and (!handle.sql_ddl_agenda_scan_started or
         !std.mem.eql(u8, &handle.sql_ddl_agenda_scan_generation, &generation)))

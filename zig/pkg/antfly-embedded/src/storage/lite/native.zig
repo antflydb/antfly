@@ -9853,6 +9853,13 @@ pub const NativeFile = struct {
             .namespace_directory_root_page = namespace_directory_root_page,
             .document_index_root_page = document_index_root_page,
         };
+        if (indexed) {
+            // A replacement inode has a new logical lineage. Its freshly copied
+            // roots are also the private writer's baseline, so ordinary root
+            // comparison cannot stamp these identities during allocator bootstrap.
+            inline for (@typeInfo(LogicalGenerations).@"struct".field_names) |identity|
+                try io.randomSecure(&@field(checkpoint.logical, identity));
+        }
         var compact_header = Header{
             .reader_epoch_namespace = if (indexed) try @import("reader_epochs.zig").namespaceForPublicationWithDurability(self.allocator, io, self.path, self.no_sync) else @splat(0),
             .indexed_reclamation = indexed,
@@ -21381,4 +21388,37 @@ test "lite logical byte accounting distinguishes control families and namespace 
     }
     try std.testing.expectEqual(report.live_bytes, bytes);
     try std.testing.expectEqual(report.live_file_count, records);
+}
+
+test "lite logical generations vacuum images establish independent identities" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "vacuum-logical-identities.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    try writer.putDocument("doc", "value");
+    var first = try writer.prepareVacuum(null);
+    defer first.deinit();
+    const first_ids = first.prepared.activeCheckpoint().logical;
+    try writer.putDocument("\x00antfly/embedded/sql-ddl", "pending");
+    var second = try writer.prepareVacuum(null);
+    defer second.deinit();
+    const second_ids = second.prepared.activeCheckpoint().logical;
+    const zero: [16]u8 = @splat(0);
+    inline for (@typeInfo(LogicalGenerations).@"struct".field_names) |identity| {
+        try std.testing.expect(!std.mem.eql(u8, &zero, &@field(first_ids, identity)));
+        try std.testing.expect(!std.mem.eql(u8, &@field(first_ids, identity), &@field(second_ids, identity)));
+        try std.testing.expect(!std.mem.eql(u8, &@field(writer.activeCheckpoint().logical, identity), &@field(second_ids, identity)));
+    }
+    // Allocator-only publication normalization must retain the new lineage,
+    // and both the identity extension and allocator certificate must reopen.
+    try second.prepared.preparePublicationSequence(second.prepared.activeCheckpoint().commit_sequence + 10);
+    try std.testing.expectEqualDeep(second_ids, second.prepared.activeCheckpoint().logical);
+    var reopened = try NativeFile.openWithIo(a, io, second.prepared.path, .{ .read_only = true, .internal_reader = true });
+    defer reopened.close();
+    try std.testing.expectEqualDeep(second_ids, reopened.activeCheckpoint().logical);
+    try std.testing.expect((try reopened.check()).valid);
 }

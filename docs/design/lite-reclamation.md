@@ -667,8 +667,11 @@ independently checks each affected namespace, including schema participants of
 catalog-dependent operations; cursor progress cannot bypass unfinished DDL.
 Read-only clean sweeps accumulate across pages of one logical metadata generation,
 including across foreign data-only checkpoints. New metadata invalidates that
-witness. Snapshot recovery only inspects its captured cut and cannot publish
-repairs.
+witness. Every interrupted namespace check disqualifies its sweep; cursor
+progress cannot certify an unchecked namespace. Snapshot recovery only inspects
+its captured cut and cannot publish repairs. Replacement compaction images
+receive fresh primary, metadata and index identities before allocator sealing;
+publication-sequence normalization retains those identities.
 
 Logical-byte accounting strips the physical namespace wrapper before applying
 the shared internal-key classifier. Authored primary/relational rows and
