@@ -468,3 +468,16 @@ immutable-flight caller ownership, RPC-owned data and native point continuations
 The WASM modules remain unchanged from the integrated native build above. Guarded
 `make gc` skips cleanup because other native builds are active; no caches used by
 those builds are forcibly removed.
+
+## Approved-control paired follow-up
+
+A subsequent [paired Cloudflare HTTP trial](cloudflare-paired-http-trial.md)
+compares the exact approved `c44896ac8c` control against this candidate using a
+separate Cloudflare request driver. All four roles are reconstructed on both
+sides, including the control's reader actors. Both orders complete 944 timed
+reads and 128 writes with correct bodies/fences/counts and pinned versions;
+1,112 known driver attempts reconcile with their diagnostic terminals. Cold p95
+improves 4.8–6.6× and mixed reads/writes 2.3–3.0×/2.3–2.7×. Warm gain is unstable,
+and one mixed candidate p95 is 1,594 ms. The full gate and historical memory
+failure therefore remain open. The linked record contains every paired result,
+coverage limits, preserved evidence and verified test-resource retirement.

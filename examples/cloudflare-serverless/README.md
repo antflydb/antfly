@@ -842,3 +842,11 @@ failed/mixed-version populations instead of treating a later retry as a clean ru
 The `--control-report=PATH` local latency option reuses and hash-checks saved
 `serving-durable` bundles and exact bindings; it does not select or alter the
 approved hosted control.
+
+For a small approved-control comparison driven from Cloudflare, see the
+[paired HTTP diagnostic trial](../../docs/design/cloudflare-paired-http-trial.md).
+`qualification/paired-http-trial.mjs` coordinates two sealed stacks and a bounded
+HTTP driver. Its timings exclude the local host and external client transit;
+these are separate from the full gate. The driver rejects redirects, pins
+versions, retains every failed member, advances fences only after durable ACKs,
+and runs all rounds remotely. Native serving/control source remains unchanged.
