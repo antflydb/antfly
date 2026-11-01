@@ -148,7 +148,8 @@ finish reasons cannot qualify, even if expected tail words appear.
 | --- | ---: | ---: |
 | vLLM in-process, two fresh rounds | 33.01–33.05 | 7.08–7.12 |
 | vLLM HTTP, same client and prompts | 32.93–33.02 | Not measured |
-| Native canonical defaults, main-merged runtime | 44.70–44.84 | 12.24–12.31 |
+| Earlier native defaults, main-merged runtime | 44.70–44.84 | 12.24–12.31 |
+| Current automatic capability policy | 40.68–40.71 | 9.77–9.87 |
 | Best measured diagnostic profile | 35.24–35.44 | 8.18–8.21 |
 | Two-image vision diagnostic, after geometry fix | Not measured | 11.58–11.75 |
 
@@ -157,7 +158,10 @@ continuation, and optional decoder graphs. It captures four graphs and replays
 766 times without graph admission denials over two rounds. Bounded 1,024-row
 prefill chunks reduce its four-page time from 35.46–35.52 to 35.24–35.44 seconds.
 The 0.8B diagnostic uses its independently selected eager profile and a four-token
-executor burst; the burst improves 8.28–8.36 to 8.18–8.21 seconds. These are not runtime defaults.
+executor burst; the burst improves 8.28–8.36 to 8.18–8.21 seconds. These complete
+precision/chunk/burst configurations remain distinct from automatic policy.
+Portable packing, graph prerequisites and owned continuation now select
+automatically; BF16 vision and the diagnostic chunk/burst settings remain explicit.
 Paired feed-forward weight copies add little improvement over recurrent-input
 packing; projection-output BF16, bounded matrix tuning, and a simple batched
 matrix-vector prototype did not improve on the selected path. They were not
@@ -176,10 +180,10 @@ successful run listed above retains complete tails; failed experiments are
 excluded from those timing ranges. This is bounded same-page coverage, not a corpus-wide accuracy
 qualification.
 
-With canonical defaults, the two 4B pages take 52.96–52.97 seconds serially,
+With the earlier defaults, the two 4B pages took 52.96–52.97 seconds serially,
 compared with the earlier clean 57.22–57.23-second vLLM serial control. Four-page
 native decoding improved from approximately 51 seconds before the packet changes
-to 44.7 seconds with the current defaults. The stronger diagnostic profiles must
+to 44.7 seconds in that earlier default-policy measurement. Diagnostic profiles must
 remain distinct from these default-policy measurements.
 
 Clean software-timestamp profiles attribute 34.52 seconds of GPU busy time to
@@ -189,8 +193,9 @@ chunk kernels take 1.33 seconds versus 0.70 seconds for the reference decode
 attention, and native also spends more time in prefill and vocabulary reduction.
 The profile is diagnostic evidence, not a replacement for uninstrumented timing.
 Attention variants measured at actual page contexts pass independent numerical,
-canary and input-immutability checks, but kernel microbenchmarks alone do not
-authorize changing a serving default. Throughput parity remains an open gate.
+canary and input-immutability checks. Kernel microbenchmarks establish kernel
+behavior; uninstrumented full-page runs measure serving throughput. Throughput
+parity remains open.
 
 The long-context packet passes 64 independent GPU numerical and graph-replay
 oracle cases, including sparse/permuted tables and contexts through 8,192 tokens.
@@ -237,7 +242,10 @@ unsupported compute/driver, disabled dependency, unavailable cuBLASLt, insuffici
 plan cache, noncapturable arithmetic/execution, or enabled. Epoch ownership,
 immutable weights, greedy eligibility, admission and cancellation still gate
 individual claims. A bounded request can use eager CUDA even when the session
-supports graphs.
+supports graphs. Projectors query the resolved backend vision policy instead of
+rereading old opt-in environment flags; explicit disables apply at both caller
+and execution paths. End-to-end checks require the selected path counters,
+not just successful text responses.
 
 Encoder BF16 mirrors, bounded DeBERTa attention, portable quantized routes and
 generic graph replay support select from compiled tensor-core capability rather
@@ -260,13 +268,38 @@ Arithmetic-changing precision profiles and experimental
 algorithms retain their independent explicit settings. Resource capacities stay
 bounded; no DGX benchmark memory or 128-row preset becomes a serving default.
 
-Benchmark results above describe the earlier runtime and diagnostic controls.
-After changing automatic selection, rerun the default-policy workload and report
-its own binary and timings. Use `scripts/check_cuda_generated_matmul.py --output REPORT` from the inference
+The current automatic-policy run uses the same 20/34/4/8 GiB host/device/KV/
+scratch envelope, four decoder rows, one image per request, and original pinned
+checkpoints. Four mixed pages take 40.68–40.71 seconds for 4B and 9.77–9.87
+seconds for 0.8B; two serial 4B pages take 51.68–52.06 seconds. Portable vision
+QKV/MLP counters confirm execution without opt-in flags. Diagnostic precision,
+chunk and burst configurations remain separate; throughput parity is still open.
+The final binary SHA-256 is
+`3cf76237db376d4dbf10038e2b5357b50ce576ed8709c594079b3abd5ee316b1`.
+The isolated run passes all seven phases, including model switch/reload,
+complete reference hashes, cancellation/recovery and unloading. An 8-second
+request receives `504 INFERENCE_TIMEOUT` while its peer completes correctly;
+all 37 readiness probes succeed. Automatic QKV and MLP counters each reach
+576 calls; normalization-cache hits and pinned metadata uploads are positive.
+Graph capture/replay is observed for both readers. No diagnostic optimization
+flags are set. Startup is 10.1 seconds with locally cached artifacts, not a
+new-node download measurement.
+Use `scripts/check_cuda_generated_matmul.py --output REPORT` from the inference
 package to check bundled portable Q4 kernels against a CPU FP64 reference,
 including output guards and readonly inputs. A100 test coverage is an evidence
 gap, not an additional software allowlist or a requirement for manually enabling compatible
 paths.
+
+Final focused CUDA validation selected 165 tests: 164 passed and one optional
+BF16-prefill scratch case skipped. This includes the automatic policy and
+explicit-disable checks, immutable evidence/portable execution contracts,
+generated selectors, graph and cancellation ownership, and the A4B baseline
+primitive smoke test. Additional focused resolved-vision policy and CUDA
+recipe-pin regressions pass. A4B admission now checks its loaded resident primitives;
+its exact geometry and memory envelope remain enforced. The GB10 smoke uses
+small synthetic expert matrices, not a full 26B model qualification. Six
+independent bundled Q4 matmul checks passed (maximum absolute error 2.33e-7),
+as did 16 profile/benchmark Python tests and five artifact-policy tests.
 
 ## Portable EmbeddingGemma attention
 
@@ -310,7 +343,12 @@ before changing an index's serving recipe.
 EmbeddingGemma 2's CUDA/BF16 execution recipe has a different `model_identity`
 from CPU/F32, and optimized arithmetic profiles also have distinct identities.
 Discover the serving identity, pin it in the index configuration, and use the
-same compatible recipe for document and query vectors. A request with an old
+same compatible recipe for document and query vectors. Portable default
+attention advances the CUDA recipe to `embeddinggemma2-cuda-bf16-mean-v3-portable-mma`:
+compatible GPUs can replace a previous scalar route with BF16 tiled attention.
+CPU/Metal artifact identities remain unchanged. Existing CUDA pins must use a
+new index/identity after reindexing, including conservatively invalidating old
+SM89 pins even though the tested kernel outputs match bitwise. A request with an old
 identity must fail with a conflict, not silently produce vectors from a changed
 recipe. Verify index recovery and query caches preserve the pin. Rebuild into a
 new index when the recipe changes; do not mix the two vector spaces. Run the
