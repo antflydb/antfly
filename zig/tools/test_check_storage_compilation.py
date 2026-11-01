@@ -224,11 +224,14 @@ class BuildFailureEvidence(unittest.TestCase):
             ("warm", set()),
             (
                 "read coordination",
-                {"antfly-runtime-distributed", "antfly-storage-kernel"},
+                {"antfly-runtime-distributed", "antfly-runtime-local_query"},
             ),
             ("write coordination", {"antfly-runtime-distributed"}),
-            ("physical DB", {"antfly-storage-kernel"}),
-            ("physical local query", {"antfly-storage-kernel"}),
+            ("physical DB", {"antfly-storage-kernel", "antfly-runtime-local_query"}),
+            (
+                "physical local query",
+                {"antfly-storage-kernel", "antfly-runtime-local_query"},
+            ),
             ("owner integration test", {"storage-owner-tests"}),
             ("consumer test root", {"api-table-read-tests"}),
             *(
@@ -243,6 +246,7 @@ class BuildFailureEvidence(unittest.TestCase):
                 "storage contract",
                 {
                     "antfly-storage-kernel",
+                    "antfly-runtime-local_query",
                     "antfly-runtime-distributed",
                     "storage-owner-tests",
                 },
@@ -648,14 +652,20 @@ class ParallelAuditIsolation(unittest.TestCase):
         sources = {
             "api/table_reads.zig": (
                 "read coordination",
-                {"antfly-runtime-distributed", "antfly-storage-kernel"},
+                {"antfly-runtime-distributed", "antfly-runtime-local_query"},
             ),
             "api/table_writes.zig": (
                 "write coordination",
                 {"antfly-runtime-distributed"},
             ),
-            "storage/db/db.zig": ("physical DB", {"antfly-storage-kernel"}),
-            "storage/query.zig": ("physical local query", {"antfly-storage-kernel"}),
+            "storage/db/db.zig": (
+                "physical DB",
+                {"antfly-storage-kernel", "antfly-runtime-local_query"},
+            ),
+            "storage/query.zig": (
+                "physical local query",
+                {"antfly-storage-kernel", "antfly-runtime-local_query"},
+            ),
             "storage/kernel_owner_test.zig": (
                 "owner integration test",
                 {"storage-owner-tests"},
@@ -668,6 +678,7 @@ class ParallelAuditIsolation(unittest.TestCase):
                 "storage contract",
                 {
                     "antfly-storage-kernel",
+                    "antfly-runtime-local_query",
                     "antfly-runtime-distributed",
                     "storage-owner-tests",
                 },
@@ -868,7 +879,7 @@ pub fn create(b: *std.Build) ?void {
         }),
     });
     b.step("unrelated", "unrelated").dependOn(&unrelated.step);
-    inline for (.{ "cli", "distributed", "storage_kernel", "enrichment_compute", "serverless", "inference", "api_kernel" }) |unit| {
+    inline for (.{ "cli", "distributed", "storage_kernel", "local_query", "enrichment_compute", "serverless", "inference", "api_kernel" }) |unit| {
         _ = b.step("runtime-unit-" ++ unit, unit);
     }
     return {};

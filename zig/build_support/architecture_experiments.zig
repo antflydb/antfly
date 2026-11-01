@@ -27,6 +27,11 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
         aggregate.dependOn(&plan_run.step);
     }
 
+    const query_contract_tests = b.addTest(.{ .name = "local-query-contract-tests", .root_module = imports.storage_boundary.query, .filters = &.{"query DB borrow"} });
+    const query_contract_run = b.addRunArtifact(query_contract_tests);
+    b.step("local-query-contract-test", "Check fail-closed native query borrows without a database").dependOn(&query_contract_run.step);
+    aggregate.dependOn(&query_contract_run.step);
+
     const abi = b.createModule(.{ .root_source_file = b.path("build_support/architecture_probe_abi.zig"), .target = target, .optimize = optimize });
     abi.addImport("runtime_failure_abi", imports.storage_boundary.failure);
     inline for (.{ "index", "fused_cpu" }) |name| {

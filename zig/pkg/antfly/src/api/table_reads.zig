@@ -30641,7 +30641,7 @@ fn implementationTests() type {
                     var response: abi.QueryOwnedResponse = .{};
                     var failure: abi.FailureIdentity = .{};
                     const status = provider.execute(&.{
-                        .db = @ptrCast(&db),
+                        .db = .borrow(&db),
                         .table_name = .fromSlice("docs"),
                         .request_json = .fromSlice(body),
                         .execution_options = .{ .enabled = 1, .raw_search_result = @intFromBool(raw) },

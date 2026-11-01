@@ -40,8 +40,6 @@ comptime {
     _ = @import("antfly_local_sources").capi_db;
 }
 
-const local_query_exports = @import("storage/local_query_provider.zig");
-
 const lite_runtime = @import("cmd/lite.zig");
 
 fn runLite(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
@@ -224,8 +222,6 @@ comptime {
     exportInternal(&storage_kernel_exports.storageWalStatsSnapshot, "antfly_storage_wal_stats_snapshot");
     exportInternal(&storage_kernel_exports.storageWalLastLsn, "antfly_storage_wal_last_lsn");
     exportInternal(&storage_kernel_exports.storageOwnerBufferDestroy, "antfly_storage_owner_buffer_destroy");
-    exportInternal(&local_query_exports.execute, "antfly_local_query_execute");
-    exportInternal(&local_query_exports.bufferDestroy, "antfly_local_query_buffer_destroy");
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

@@ -20,6 +20,7 @@ pub const RuntimeLibraryUnit = enum {
     api_kernel,
     distributed,
     storage_kernel,
+    local_query,
     enrichment_compute,
     // Serverless/lake execution is a large, independently deployable graph.
     // Keep it out of the PIC storage kernel so LLVM never has to optimize the
@@ -46,6 +47,9 @@ pub const CompileMemoryProfile = struct {
 };
 
 pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProfile) usize {
+    // New operation owner: retain conservative admission until matched profiles
+    // measure it. Historical seven-unit samples do not qualify this archive.
+    if (unit == .local_query) return @as(usize, if (profile.optimize == .debug) 8 else 12) * 1024 * 1024 * 1024;
     const target = profile.target;
     const baseline_cpu = std.Target.Cpu.baseline(target.cpu.arch, target.os);
     if (profile.linux_macos_sdk26_release and
@@ -62,6 +66,7 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         const gib: usize = switch (unit) {
             .api_kernel => 17,
             .distributed => 10,
+            .local_query => unreachable,
             .storage_kernel => 11,
             .enrichment_compute => 3,
             .serverless => 6,
@@ -91,6 +96,7 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         const gib: usize = switch (unit) {
             .api_kernel => 14,
             .distributed => 10,
+            .local_query => unreachable,
             .storage_kernel => 18,
             .enrichment_compute => 3,
             .serverless => 7,
@@ -114,6 +120,7 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         const gib: usize = switch (unit) {
             .api_kernel => 15,
             .distributed => 12,
+            .local_query => unreachable,
             .storage_kernel => 20,
             .enrichment_compute => 4,
             .serverless => 10,
@@ -152,6 +159,7 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         const gib: usize = if (profile.optimize == .safe) switch (unit) {
             .api_kernel => 7,
             .distributed => 8,
+            .local_query => unreachable,
             .storage_kernel => 12,
             .enrichment_compute => 3,
             .serverless => 5,
@@ -160,6 +168,7 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         } else switch (unit) {
             .api_kernel => 5,
             .distributed => 5,
+            .local_query => unreachable,
             .storage_kernel => 8,
             .enrichment_compute => 2,
             .serverless => 4,
@@ -208,6 +217,7 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // Keep the measured Linux profiles separate. The other macOS bumps
         // below are provisional 25% margins over claims reported as exceeded;
         // replace them with cold-build evidence before lowering them.
+        .local_query => unreachable,
         .storage_kernel => @as(usize, if (target.os.tag == .macos) 28 else 20) * 1024 * 1024 * 1024,
         // Hosted object-table integration raised the measured aarch64-macOS
         // ReleaseFast distributed peak to 15.41 GB. Reserve >=25% headroom

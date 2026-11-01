@@ -113,7 +113,7 @@ pub fn build(b: *std.Build) void {
     for (audited_tests, found) |name, present| {
         if (!present) std.debug.panic("missing audited storage test artifact: {s}", .{name});
     }
-    inline for (.{ "cli", "distributed", "storage_kernel", "enrichment_compute", "serverless", "inference", "api_kernel" }) |unit| {
+    inline for (.{ "cli", "distributed", "storage_kernel", "local_query", "enrichment_compute", "serverless", "inference", "api_kernel" }) |unit| {
         check.dependOn(&b.top_level_steps.get("runtime-unit-" ++ unit).?.step);
     }
     if (measured_memory) {

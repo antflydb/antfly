@@ -34,6 +34,7 @@ pub const runtime_library_link_order = [_]RuntimeLibraryUnit{
     .distributed,
     .api_kernel,
     .storage_kernel,
+    .local_query,
     .enrichment_compute,
     .inference,
 };
@@ -142,26 +143,26 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .target = target,
             .optimize = if (unit == .cli) cli_optimize else optimize,
             .sanitize_thread = sanitize_thread,
-            .pic = if (unit == .storage_kernel or unit == .enrichment_compute) true else null,
+            .pic = if (unit == .storage_kernel or unit == .local_query or unit == .enrichment_compute) true else null,
         });
         var role_imports = production_antfly_imports;
         role_imports.boundary_profile = switch (unit) {
             .cli, .inference => .common,
             .distributed, .api_kernel, .serverless => .owner,
             .enrichment_compute => .enrichment,
-            .storage_kernel => .all,
+            .storage_kernel, .local_query => .all,
         };
         switch (unit) {
             .cli => role_imports.configureCli(role_mod, link_libc),
             .inference => role_imports.configureInference(b, role_mod, link_libc),
-            .distributed, .storage_kernel => role_imports.configureStorage(b, role_mod, link_libc),
+            .distributed, .storage_kernel, .local_query => role_imports.configureStorage(b, role_mod, link_libc),
             .enrichment_compute => role_imports.configureEnrichment(b, role_mod, link_libc),
             .api_kernel => role_imports.configureApi(role_mod, link_libc),
             .serverless => role_imports.configureServerless(b, role_mod, link_libc),
         }
         // Compute owns document/media processing, not a physical storage handle.
-        // Only the storage kernel may declare physical DB source inputs.
-        role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel, true, role_imports.boundary_profile);
+        // Storage and complete local query operations declare physical DB inputs.
+        role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel and unit != .local_query, true, role_imports.boundary_profile);
         if (unit == .inference) {
             const native_exports = b.createModule(.{
                 .root_source_file = b.path("pkg/inference/src/host/native_exports.zig"),
@@ -171,7 +172,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             production_antfly_imports.configureInference(b, native_exports, link_libc);
             role_mod.addImport("antfly_inference_native_exports", native_exports);
         }
-        if (unit == .storage_kernel) {
+        if (unit == .storage_kernel or unit == .local_query) {
             const capi_options = b.addOptions();
             capi_options.addOption(bool, "linked_storage", true);
             // This archive is shared by the default `libantfly` and by the
@@ -183,8 +184,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             role_mod.addOptions("capi_build_options", capi_options);
         }
         addMacosSdkPaths(b, role_mod, target);
-        if (unit == .cli or unit == .distributed or unit == .storage_kernel) role_mod.addImport("antfly-client", antfly_client_pkg_mod);
-        if (unit == .storage_kernel) role_mod.addImport("antfly_storage_root", role_mod);
+        if (unit == .cli or unit == .distributed or unit == .storage_kernel or unit == .local_query) role_mod.addImport("antfly-client", antfly_client_pkg_mod);
+        if (unit == .storage_kernel or unit == .local_query) role_mod.addImport("antfly_storage_root", role_mod);
         if (unit != .cli and unit != .inference and unit != .enrichment_compute) {
             const role_usermgr_storage_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
@@ -239,7 +240,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             if (options.native_storage) |owner| runtime_unit_step.dependOn(&owner.step);
         }
         runtime_library_artifacts[@backingInt(unit)] = role_artifact;
-        if (unit == .storage_kernel) {
+        if (unit == .storage_kernel or unit == .local_query) {
             // The executable and C ABI libraries share this one optimized
             // PIC object. Give the final links enough section granularity
             // to retain only the C ABI roots in the shared libraries while
@@ -255,6 +256,11 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             defer visited.deinit();
             setStripRecursively(role_mod, &visited);
         }
+    }
+
+    const query_archives = b.step("query-owner-archives", "Install the independently compiled storage adapter and complete query owner archives");
+    inline for (.{ .storage_kernel, .local_query }) |unit| {
+        query_archives.dependOn(&b.addInstallArtifact(runtime_library_artifacts[@backingInt(@as(RuntimeLibraryUnit, unit))].?, .{}).step);
     }
 
     if (options.native_storage) |owner| {
@@ -357,6 +363,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         }
         if (role != .inference) {
             role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.storage_kernel)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.local_query)].?);
             role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.enrichment_compute)].?);
             role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
         }

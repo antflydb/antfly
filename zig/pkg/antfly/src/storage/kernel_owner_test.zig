@@ -2099,6 +2099,14 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     );
     try std.testing.expectEqualStrings("InvalidAbiVersion", invalid_abi_failure.errorName());
 
+    // Reject a non-null incompatible native borrow before pointer alignment
+    // or dereference. Such a pointer must never reach a provider cast.
+    invalid_abi_request = .{ .db = .{ .ptr = @ptrFromInt(1) }, .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") };
+    const incompatible_db_status = abi.antfly_local_query_execute(&invalid_abi_request, &invalid_abi_response, &invalid_abi_failure);
+    try std.testing.expectEqual(abi.Status.invalid_abi, incompatible_db_status);
+    try std.testing.expectEqualStrings("InvalidAbiVersion", invalid_abi_failure.errorName());
+    try std.testing.expectEqual(@as(u64, 0), invalid_abi_response.buffer.len);
+
     // Every operation family crossing the storage-owner boundary carries the
     // same complete envelope even when it remains in the storage unit.
     var operation_response: abi.OwnedBytes = .{};

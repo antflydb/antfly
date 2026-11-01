@@ -7,7 +7,7 @@ on:
       step:
         type: choice
         default: memory-test
-        options: [memory-test, unit-storage-compile, architecture-probe-test, antfly]
+        options: [memory-test, unit-storage-compile, architecture-probe-test, local-query-contract-test, local-query-owner-test, antfly-storage-owner-test, runtime-unit-local_query, antfly]
       optimize:
         type: choice
         default: debug
@@ -92,6 +92,10 @@ jobs:
         run: |
           python3 zig/tools/check_architecture_probe_cache.py --family index --report .benchmark-results/compile-costs/index-cache.json
           python3 zig/tools/check_architecture_probe_cache.py --family inference --report .benchmark-results/compile-costs/inference-cache.json
+      - name: Verify production query and storage owner cache isolation
+        if: ${{ success() && (inputs.step == 'antfly-storage-owner-test' || inputs.step == 'local-query-owner-test') }}
+        run: |
+          python3 zig/tools/check_query_owner_cache.py --report .benchmark-results/compile-costs/query-owner-cache.json
       - name: Retain measurements even on compiler failure
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

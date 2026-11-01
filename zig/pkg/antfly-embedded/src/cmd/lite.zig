@@ -1037,7 +1037,7 @@ fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
         var failure: kernel_owner_abi.FailureIdentity = .{};
         const response = try local_query_client.executeJsonAlloc(
             allocator,
-            @ptrCast(db),
+            db,
             "docs",
             body,
             .public,

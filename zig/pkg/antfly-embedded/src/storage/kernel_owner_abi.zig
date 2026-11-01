@@ -19,40 +19,17 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-// Version 85 adds a borrowed ordinary-document batch experiment.
+// Version 86 checks native DB borrows before independently compiled queries.
 // Older owners must reject their operation identifiers before dispatch.
-pub const abi_version: u32 = 85;
+pub const abi_version: u32 = 86;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
 pub const failure_error_name_capacity = failure_abi.failure_error_name_capacity;
 
-pub const BorrowedBytes = extern struct {
-    ptr: ?[*]const u8 = null,
-    len: u64 = 0,
-
-    pub fn fromSlice(value: []const u8) BorrowedBytes {
-        return .{
-            .ptr = if (value.len == 0) null else value.ptr,
-            .len = @intCast(value.len),
-        };
-    }
-
-    pub fn slice(self: BorrowedBytes) []const u8 {
-        if (self.len == 0) return "";
-        return self.ptr.?[0..@intCast(self.len)];
-    }
-};
-
-pub const OwnedBytes = extern struct {
-    ptr: ?[*]u8 = null,
-    len: u64 = 0,
-
-    pub fn slice(self: OwnedBytes) []const u8 {
-        if (self.len == 0) return "";
-        return self.ptr.?[0..@intCast(self.len)];
-    }
-};
+const query_abi = @import("local_query_abi");
+pub const BorrowedBytes = query_abi.BorrowedBytes;
+pub const OwnedBytes = query_abi.OwnedBytes;
 
 pub const VersionedOwnedBytes = extern struct {
     buffer: OwnedBytes = .{},
@@ -62,15 +39,7 @@ pub const VersionedOwnedBytes = extern struct {
     _reserved: [7]u8 = @splat(0),
 };
 
-/// Provider-owned encoded query response plus the exact storage snapshot
-/// generation used to produce it. The generation is transport metadata, not
-/// part of the public JSON representation.
-pub const QueryOwnedResponse = extern struct {
-    buffer: OwnedBytes = .{},
-    identity_read_generation: u64 = 0,
-    has_identity_read_generation: u8 = 0,
-    _reserved0: [7]u8 = @splat(0),
-};
+pub const QueryOwnedResponse = query_abi.QueryOwnedResponse;
 
 /// The WAL boundary owns the physical ordered store in the storage archive.
 /// Control units retain only this opaque handle and cross once per logical
@@ -190,106 +159,13 @@ pub const TxnStatus = enum(u32) {
 /// because extraction metadata is naturally textual and heterogeneous; the
 /// callback is never invoked once per store operation or index mutation.
 /// Stable stages for failures originating in the enrichment compute unit.
-/// Selects the existing query wire dialect. Distributed/local-owner calls use
-/// the resolved internal representation; public C API and Lite calls retain
-/// public validation and translation inside the query provider.
-pub const LocalQueryDialect = enum(u32) {
-    internal = 0,
-    public = 1,
-};
-
-/// Complete operation families owned by the compiled local-query provider. New
-/// values are append-only. The storage owner remains responsible for handle
-/// lifetime and admission; parsing, physical execution, and response encoding
-/// stay together on the provider side.
-pub const LocalQueryKind = enum(u32) {
-    search = 0,
-    graph_expand = 1,
-    graph_hydrate = 2,
-    graph_edges = 3,
-    text_stats = 4,
-    algebraic_partials = 5,
-    preflight = 6,
-};
-
-/// Stable diagnostic identities for the stages of one local-query call. These
-/// values are ABI data: append new operations, never renumber existing ones.
-/// Control flow continues to use `FailureIdentity.status`; `operation` tells
-/// operators which side and stage produced that exact status.
-pub const LocalQueryOperation = enum(u32) {
-    validate_request = 1,
-    parse_internal_request = 2,
-    parse_public_request = 3,
-    execute_internal_query = 4,
-    execute_public_query = 5,
-    encode_internal_response = 6,
-    encode_public_response = 7,
-    validate_provider_response = 8,
-    text_stats = 9,
-    algebraic_partials = 10,
-    parse_graph_expand = 11,
-    execute_graph_expand = 12,
-    encode_graph_expand = 13,
-    parse_graph_hydrate = 14,
-    execute_graph_hydrate = 15,
-    encode_graph_hydrate = 16,
-    parse_graph_edges = 17,
-    execute_graph_edges = 18,
-    encode_graph_edges = 19,
-    parse_aggregation = 20,
-    execute_aggregation = 21,
-    encode_aggregation = 22,
-    preflight = 23,
-    graph_metric_maintenance = 24,
-    scan_stream = 25,
-};
-
-pub const LocalQueryReturnMode = enum(u32) {
-    parent = 0,
-    chunk = 1,
-    parent_with_chunks = 2,
-    unit = 3,
-    unit_with_chunks = 4,
-    /// Return each indexed source member without hierarchy grouping.
-    /// Appended to preserve the established numeric ABI.
-    member = 5,
-};
-
-/// Request-local execution details that are not losslessly represented by the
-/// existing public/distributed JSON envelope. They are applied only when
-/// `enabled` is set, after parsing and before DB execution.
-pub const LocalQueryExecutionOptions = extern struct {
-    enabled: u8 = 0,
-    include_stored: u8 = 1,
-    /// Return a raw shard result for coordinator finalization. Keep aggregation
-    /// specifications during search: they also govern exact candidate totals.
-    raw_search_result: u8 = 0,
-    _reserved0: u8 = 0,
-    return_mode: LocalQueryReturnMode = .parent,
-    max_chunks_per_parent: u32 = 0,
-    /// Presentation only; never used for storage lookup or authorization.
-    /// Borrowed through this synchronous call and response serialization.
-    response_table_name: BorrowedBytes = .{},
-};
-
-/// One complete local query against a DB owned by the storage archive. The DB
-/// and cancellation token are opaque borrowed handles valid only for this
-/// synchronous call. No posting, candidate, stored document, or index handle
-/// crosses the compiled boundary.
-pub const LocalQueryRequest = extern struct {
-    version: u32 = abi_version,
-    dialect: LocalQueryDialect = .internal,
-    kind: LocalQueryKind = .search,
-    has_execution_deadline: u8 = 0,
-    _reserved0: [3]u8 = @splat(0),
-    db: ?*anyopaque = null,
-    table_name: BorrowedBytes = .{},
-    request_json: BorrowedBytes = .{},
-    execution_options: LocalQueryExecutionOptions = .{},
-    cancellation_ctx: ?*anyopaque = null,
-    cancellation_fn: ?CancellationCheckFn = null,
-    execution_deadline_ns: u64 = 0,
-};
+pub const LocalQueryDialect = query_abi.LocalQueryDialect;
+pub const LocalQueryKind = query_abi.LocalQueryKind;
+pub const LocalQueryOperation = query_abi.LocalQueryOperation;
+pub const LocalQueryReturnMode = query_abi.LocalQueryReturnMode;
+pub const LocalQueryExecutionOptions = query_abi.LocalQueryExecutionOptions;
+pub const LocalQueryDb = query_abi.LocalQueryDb;
+pub const LocalQueryRequest = query_abi.LocalQueryRequest;
 
 /// Process-scoped physical-storage owner. The handle owns shared caches and
 /// admission state; individual table/group owners borrow it for their full
@@ -1705,7 +1581,7 @@ pub const ArtifactOperation = enum(u32) {
     apply_child_range_batch = 6,
 };
 
-pub const CancellationCheckFn = *const fn (?*anyopaque) callconv(.c) u8;
+pub const CancellationCheckFn = query_abi.CancellationCheckFn;
 
 /// One complete artifact mutation, reprocessing, or repair operation. The JSON
 /// payload is the same coarse request shape used by the internal HTTP routes.
@@ -2373,13 +2249,8 @@ pub extern fn antfly_storage_owner_buffer_destroy(
     buffer: *OwnedBytes,
 ) callconv(.c) void;
 
-pub extern fn antfly_local_query_execute(
-    request: *const LocalQueryRequest,
-    out_response: *QueryOwnedResponse,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-
-pub extern fn antfly_local_query_buffer_destroy(buffer: *OwnedBytes) callconv(.c) void;
+pub const antfly_local_query_execute = query_abi.antfly_local_query_execute;
+pub const antfly_local_query_buffer_destroy = query_abi.antfly_local_query_buffer_destroy;
 
 pub const MergeArtifactsPageRequest = extern struct {
     version: u32 = abi_version,

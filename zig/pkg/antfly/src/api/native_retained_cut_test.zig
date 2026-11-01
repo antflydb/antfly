@@ -285,6 +285,11 @@ fn verifyForwardedNativeCut(a: std.mem.Allocator) !void {
 }
 
 test "external lake single-range remote text continuation executes its already bound checkpoint" {
+    try verifySingleRangeRemoteContinuation(false);
+}
+
+/// Both source-level and production-archive tests run the same continuation.
+pub fn verifySingleRangeRemoteContinuation(comptime compiled: bool) !void {
     const a = std.testing.allocator;
     var repository_directory = try local.common_test_directory.TestDirectory.init("single-range-cursor-repository");
     defer repository_directory.cleanup();
@@ -338,10 +343,14 @@ test "external lake single-range remote text continuation executes its already b
         try request_body.value.object.put(request_body.arena.allocator(), "profile", .{ .bool = profile });
         const bytes = try std.json.Stringify.valueAlloc(a, request_body.value, .{});
         defer a.free(bytes);
-        const request: abi.LocalQueryRequest = .{ .db = &carrier, .table_name = .fromSlice("docs"), .request_json = .fromSlice(bytes), .execution_options = .{ .enabled = 1, .raw_search_result = 1 } };
+        const request: abi.LocalQueryRequest = .{ .db = .borrow(&carrier), .table_name = .fromSlice("docs"), .request_json = .fromSlice(bytes), .execution_options = .{ .enabled = 1, .raw_search_result = 1 } };
         var response: abi.QueryOwnedResponse = .{};
         var failure: abi.FailureIdentity = .{};
-        try std.testing.expectEqual(abi.Status.ok, @import("../storage/local_query_provider.zig").execute(&request, &response, &failure));
+        const status = if (compiled)
+            abi.antfly_local_query_execute(&request, &response, &failure)
+        else
+            @import("../storage/local_query_provider.zig").execute(&request, &response, &failure);
+        try std.testing.expectEqual(abi.Status.ok, status);
         defer std.heap.c_allocator.free(response.buffer.ptr.?[0..@intCast(response.buffer.len)]);
         var parsed = try std.json.parseFromSlice(std.json.Value, a, response.buffer.ptr.?[0..@intCast(response.buffer.len)], .{});
         defer parsed.deinit();

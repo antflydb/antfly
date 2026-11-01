@@ -27,7 +27,7 @@ pub const test_sources = [_][]const u8{
 
 /// Exercise the same storage archive linked by serving and embedded consumers.
 /// Root composition attaches these runs to the owning test aggregates.
-pub const Result = struct { runs: [3]*std.Build.Step.Run, benchmark: *std.Build.Step.Compile };
+pub const Result = struct { runs: [4]*std.Build.Step.Run, benchmark: *std.Build.Step.Compile };
 
 pub fn add(
     b: *std.Build,
@@ -46,7 +46,7 @@ pub fn add(
         .optimize = optimize,
         .version = "test",
     });
-    var runs: [3]*std.Build.Step.Run = undefined;
+    var runs: [4]*std.Build.Step.Run = undefined;
     var benchmark: *std.Build.Step.Compile = undefined;
     inline for (.{ "storage_kernel_owner_test_root.zig", "storage_kernel_provisioned_source_test_root.zig", "enrichment_compute_test_root.zig", "storage_boundary_bench.zig" }, 0..) |root, index| {
         const module = b.createModule(.{
@@ -89,7 +89,7 @@ pub fn add(
             if (index == 2) {
                 tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
             } else {
-                inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+                inline for (.{ .storage_kernel, .local_query, .enrichment_compute, .inference }) |unit|
                     tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
             }
         } else {
@@ -103,10 +103,29 @@ pub fn add(
             });
         }
         if (index == 3) {
-            inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+            inline for (.{ .storage_kernel, .local_query, .enrichment_compute, .inference }) |unit|
                 module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
         }
     }
+    const query_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/local_query_owner_test_root.zig"), .target = target, .optimize = optimize });
+    imports.configureStorage(b, query_module, true);
+    imports.storage_boundary.configureProfile(query_module, false, true, .all);
+    query_module.addImport("antfly_storage_root", query_module);
+    const query_options = b.addOptions();
+    query_options.addOption(bool, "linked_storage", true);
+    query_options.addOption(bool, "inference_enabled", true);
+    query_module.addOptions("capi_build_options", query_options);
+    const query_tests = @import("linked_tests.zig").add(b, .{
+        .name = "local-query-owner-tests",
+        .root_module = query_module,
+        .filters = &.{"compiled query owner"},
+    });
+    query_tests.executable.root_module.addObject(test_metadata.object);
+    inline for (.{ .storage_kernel, .local_query, .enrichment_compute, .inference }) |unit|
+        query_tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
+    runs[3] = query_tests.run(b);
+    b.step("local-query-owner-test", "Check retained-generation continuation through the production query archive").dependOn(&runs[3].step);
+
     const physical_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage_kernel_owner_physical_test_root.zig"),
         .target = target,
@@ -125,7 +144,7 @@ pub fn add(
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     handoff_tests.executable.root_module.addObject(test_metadata.object);
-    inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+    inline for (.{ .storage_kernel, .local_query, .enrichment_compute, .inference }) |unit|
         handoff_tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
     b.step("antfly-storage-owner-handoff-reopen-test", "Run physical shared-context owner handoff receipt reopen regression")
         .dependOn(&handoff_tests.run(b).step);

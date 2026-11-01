@@ -53,6 +53,7 @@ ARCHIVES = {
             "serverless",
             "inference",
             "api_kernel",
+            "local_query",
         )
     ),
 }
@@ -685,9 +686,12 @@ def main() -> None:
                 "api/table_reads.zig",
                 # A retained multi-range cut leases its DB generations inside
                 # the physical owner and reuses the canonical read merger.
-                # Both owners must therefore invalidate this shared source.
-                {"antfly-runtime-distributed", "antfly-storage-kernel"},
-                (ARCHIVES - {"antfly-runtime-distributed", "antfly-storage-kernel"})
+                # The query and distributed owners invalidate this shared source.
+                {"antfly-runtime-distributed", "antfly-runtime-local_query"},
+                (
+                    ARCHIVES
+                    - {"antfly-runtime-distributed", "antfly-runtime-local_query"}
+                )
                 | {"storage-owner-tests", "storage-owner-enrichment-tests"},
             ),
             (
@@ -700,8 +704,8 @@ def main() -> None:
             (
                 "physical DB",
                 "storage/db/db.zig",
-                {"antfly-storage-kernel"},
-                (ARCHIVES - {"antfly-storage-kernel"})
+                {"antfly-storage-kernel", "antfly-runtime-local_query"},
+                (ARCHIVES - {"antfly-storage-kernel", "antfly-runtime-local_query"})
                 | {
                     "storage-owner-tests",
                     "storage-owner-source-tests",
@@ -712,8 +716,8 @@ def main() -> None:
             (
                 "physical local query",
                 "storage/query.zig",
-                {"antfly-storage-kernel"},
-                (ARCHIVES - {"antfly-storage-kernel"})
+                {"antfly-storage-kernel", "antfly-runtime-local_query"},
+                (ARCHIVES - {"antfly-storage-kernel", "antfly-runtime-local_query"})
                 | {
                     "storage-owner-tests",
                     "storage-owner-source-tests",
@@ -738,6 +742,7 @@ def main() -> None:
                 "storage/kernel_owner_abi.zig",
                 {
                     "antfly-storage-kernel",
+                    "antfly-runtime-local_query",
                     "antfly-runtime-distributed",
                     "storage-owner-tests",
                 },

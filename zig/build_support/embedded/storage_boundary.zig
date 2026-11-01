@@ -31,6 +31,7 @@ pub const Modules = struct {
     failure: *std.Build.Module,
     identity: *std.Build.Module,
     owner: *std.Build.Module,
+    query: *std.Build.Module,
     enrichment: *std.Build.Module,
     query_client: *std.Build.Module,
     physical_sources: *std.Build.Step.Options,
@@ -63,6 +64,7 @@ pub const Modules = struct {
         module.addImport("kernel_error_identity", self.identity);
         if (profile == .owner or profile == .all) {
             module.addImport("kernel_owner_abi", self.owner);
+            module.addImport("local_query_abi", self.query);
             module.addImport("local_query_client", self.query_client);
         }
         if (profile == .enrichment or profile == .all)
@@ -74,7 +76,7 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lan
     return createWithOptions(b, target, optimize, .{});
 }
 
-pub const Options = struct { sanitize_thread: bool = false, error_names: ?*std.Build.Module = null };
+pub const Options = struct { sanitize_thread: bool = false, error_names: ?*std.Build.Module = null, runtime_abi: ?*std.Build.Module = null };
 
 pub fn createWithOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, options: Options) Modules {
     const supported_os = target.result.os.tag == .macos or target.result.os.tag == .linux;
@@ -100,13 +102,17 @@ pub fn createWithOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimi
     const failure = b.createModule(.{ .root_source_file = local_path.path(b, "runtime_failure_abi.zig"), .target = target, .optimize = optimize });
     const identity = b.createModule(.{ .root_source_file = local_path.path(b, "runtime_failure_identity.zig"), .target = target, .optimize = optimize });
     identity.addImport("runtime_failure_abi", failure);
+    const query = b.createModule(.{ .root_source_file = local_path.path(b, "storage/local_query_abi.zig"), .target = target, .optimize = optimize });
+    query.addImport("runtime_failure_abi", failure);
+    query.addImport("antfly_runtime_abi", options.runtime_abi orelse b.createModule(.{ .root_source_file = b.path("lib/runtime/src/root.zig"), .target = target, .optimize = optimize }));
     const owner = b.createModule(.{ .root_source_file = local_path.path(b, "storage/kernel_owner_abi.zig"), .target = target, .optimize = optimize });
     owner.addImport("runtime_failure_abi", failure);
+    owner.addImport("local_query_abi", query);
     const enrichment = b.createModule(.{ .root_source_file = local_path.path(b, "storage/enrichment_compute_abi.zig"), .target = target, .optimize = optimize });
     enrichment.addImport("runtime_failure_abi", failure);
     enrichment.addImport("runtime_memory_abi", memory);
     const query_client = b.createModule(.{ .root_source_file = local_path.path(b, "storage/query_client.zig"), .target = target, .optimize = optimize });
-    query_client.addImport("kernel_owner_abi", owner);
+    query_client.addImport("local_query_abi", query);
     query_client.addImport("kernel_error_identity", identity);
     const physical_sources = b.addOptions();
     physical_sources.addOption(bool, "control_only", false);
@@ -134,6 +140,7 @@ pub fn createWithOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimi
         .failure = failure,
         .identity = identity,
         .owner = owner,
+        .query = query,
         .enrichment = enrichment,
         .query_client = query_client,
         .physical_sources = physical_sources,

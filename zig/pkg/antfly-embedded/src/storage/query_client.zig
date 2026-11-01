@@ -16,7 +16,7 @@
 //! Contract-only client for the compiled local-query provider.
 
 const std = @import("std");
-const abi = @import("kernel_owner_abi");
+const abi = @import("local_query_abi");
 const error_identity = @import("kernel_error_identity");
 
 pub const QueryResponse = struct {
@@ -26,7 +26,7 @@ pub const QueryResponse = struct {
 
 pub fn executeJsonAlloc(
     alloc: std.mem.Allocator,
-    db: *anyopaque,
+    db: anytype,
     table_name: []const u8,
     request_json: []const u8,
     dialect: abi.LocalQueryDialect,
@@ -39,7 +39,7 @@ pub fn executeJsonAlloc(
     return executeAlloc(alloc, .{
         .dialect = dialect,
         .kind = .search,
-        .db = db,
+        .db = .borrow(db),
         .table_name = .fromSlice(table_name),
         .request_json = .fromSlice(request_json),
         .execution_options = execution_options,
@@ -53,7 +53,7 @@ pub fn executeJsonAlloc(
 pub fn executeControlledJsonAlloc(
     alloc: std.mem.Allocator,
     kind: abi.LocalQueryKind,
-    db: *anyopaque,
+    db: anytype,
     table_name: []const u8,
     request_json: []const u8,
     execution_deadline_ns: ?u64,
@@ -64,7 +64,7 @@ pub fn executeControlledJsonAlloc(
     std.debug.assert(kind != .search);
     const response = try executeAlloc(alloc, .{
         .kind = kind,
-        .db = db,
+        .db = .borrow(db),
         .table_name = .fromSlice(table_name),
         .request_json = .fromSlice(request_json),
         .has_execution_deadline = @intFromBool(execution_deadline_ns != null),
