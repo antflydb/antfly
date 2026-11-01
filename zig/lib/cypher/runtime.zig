@@ -139,6 +139,7 @@ pub const NodeCursor = struct {
     query: ast.Query,
     original_match: ast.Match,
     fields: ?[]const []const u8,
+    read_demand: ?@import("read_fields.zig").Demand = null,
     columns: []const []const u8,
     started: bool = false,
     done: bool = false,
@@ -608,6 +609,8 @@ pub const NodeCursor = struct {
             if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
             defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
             if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.cursor.fields);
+            if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, self.cursor.read_demand);
+            defer if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, null);
             defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
             const prior_nulls = e.allow_null_filters;
             e.allow_null_filters = true;
@@ -748,6 +751,8 @@ pub const NodeCursor = struct {
         if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
         defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
         if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.fields);
+        if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, self.read_demand);
+        defer if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, null);
         defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
         if (predicate) |admission| if (e.constant(admission, &.{})) |value| {
             if (value == .null or (value == .boolean and !value.boolean)) return .{ .keys = &.{}, .descending = &.{}, .last = null };
@@ -1048,8 +1053,9 @@ pub const NodeCursor = struct {
         errdefer if (engine.statement_byte_pool) |pool| pool.deinit();
         const columns = try a.alloc([]const u8, projection.items.len);
         for (owned_query.clauses[1].operation.project.value.items, columns) |item, *out| out.* = item.alias orelse try engine.expressionName(item.expression);
-        const fields = try @import("read_fields.zig").required(a, owned_query, graph);
-        self.* = .{ .backing = allocator, .budget = budget, .arena = arena, .engine = engine, .query = owned_query, .original_match = owned_query.clauses[0].operation.match, .weighted_arena = .init(budget.allocator()), .adjacency_cache = .{ .budget = .{ .backing = budget.allocator(), .limit = @min(8 << 20, limits.memory_bytes / 16) } }, .fields = fields, .columns = columns };
+        const read_plan = try @import("read_fields.zig").analyze(a, owned_query, graph);
+        const fields = read_plan.fields;
+        self.* = .{ .backing = allocator, .budget = budget, .arena = arena, .engine = engine, .query = owned_query, .original_match = owned_query.clauses[0].operation.match, .weighted_arena = .init(budget.allocator()), .adjacency_cache = .{ .budget = .{ .backing = budget.allocator(), .limit = @min(8 << 20, limits.memory_bytes / 16) } }, .fields = fields, .read_demand = read_plan.demand, .columns = columns };
         arena_moved = true;
         engine.adjacency_cache = &self.adjacency_cache;
         engine.a = self.arena.allocator();
@@ -1061,6 +1067,10 @@ pub const NodeCursor = struct {
         // must have a stable address for the whole cursor, and rebinding must
         // not invalidate routes suspended between pulls.
         try backend.vtable.bind(backend.ptr, self.arena.allocator(), graph);
+        if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.fields);
+        defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
+        if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, self.read_demand);
+        defer if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, null);
         if (!try self.planAnchor()) {
             self.close();
             return null;
@@ -1139,6 +1149,8 @@ pub const NodeCursor = struct {
         if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
         defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
         if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.fields);
+        if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, self.read_demand);
+        defer if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, null);
         defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
         var projection = self.query.clauses[1].operation.project.value;
         const orders = try e.a.alloc(ast.Order, requested.len);
@@ -1172,6 +1184,8 @@ pub const NodeCursor = struct {
         if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
         defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
         if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.fields);
+        if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, self.read_demand);
+        defer if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, null);
         defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
         var projection = self.query.clauses[1].operation.project.value;
         const orders = try e.a.alloc(ast.Order, requested.len);
@@ -1204,6 +1218,8 @@ pub const NodeCursor = struct {
         if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
         defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
         if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.fields);
+        if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, self.read_demand);
+        defer if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, null);
         defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
         if (self.window_projection) |projection| {
             if (!self.window_loaded) {
@@ -1676,6 +1692,8 @@ pub const NodeCursor = struct {
         if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
         defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
         if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.fields);
+        if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, self.read_demand);
+        defer if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, null);
         defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
         const call: ast.Expr = .{ .span = .{}, .value = .{ .call = .{ .name = "count", .args = &.{}, .star = true } } };
         const clauses = [_]ast.Clause{ .{ .span = self.query.clauses[0].span, .operation = .{ .match = self.original_match } }, .{ .span = .{}, .operation = .{ .project = .{ .final = true, .value = .{ .items = &.{.{ .expression = &call, .alias = "count" }} } } } } };
@@ -1721,7 +1739,10 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = &engine, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
     defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
     const writes = queryHasWrites(compiled.query);
-    if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, if (writes) null else try @import("read_fields.zig").required(engine.a, compiled.query, graph));
+    const read_plan: ?@import("read_fields.zig").Analysis = if (writes) null else try @import("read_fields.zig").analyze(engine.a, compiled.query, graph);
+    if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, if (read_plan) |plan| plan.fields else null);
+    if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, if (read_plan) |plan| plan.demand else null);
+    defer if (backend.vtable.set_read_demand) |configure| configure(backend.ptr, null);
     defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
     engine.cache_reads = !writes;
     engine.read_only = !writes;

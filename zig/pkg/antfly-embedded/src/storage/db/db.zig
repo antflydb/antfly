@@ -28441,6 +28441,7 @@ pub const DB = struct {
 
     /// Graph language reads require a retained immutable query cut. Physical
     /// paging keeps adjacency memory bounded and preserves parallel edge IDs.
+    pub const cypher_metadata_projection = true;
     pub fn graphEdgesForCypherPageAt(
         self: *DB,
         alloc: Allocator,
@@ -28495,7 +28496,7 @@ pub const DB = struct {
         try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
-        var result = try entry.index.getCypherEdgesByTypesPageAt(alloc, key, edge_types, direction, cursor, limits, ttl_now_ns);
+        var result = try entry.index.getCypherEdgesByTypesPageAtProjected(alloc, key, edge_types, direction, cursor, limits, ttl_now_ns, try @import("query/cypher_projection.zig").EdgeProjection.init(alloc, limits.metadata_projection_json));
         errdefer result.deinit(alloc);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
@@ -41762,6 +41763,7 @@ pub const DB = struct {
             .lower = lower,
             .upper = upper,
             .fields = parsed.value.fields,
+            .cypher_presence_fields = parsed.value.cypher_presence_fields,
             .conditions = conditions,
             .primary_lower = if (from_key.len != 0) .{ .key = from_key, .inclusive = opts.inclusive_from } else null,
             .primary_upper = if (to_key.len != 0) .{ .key = to_key, .inclusive = !opts.exclusive_to } else null,
@@ -41932,7 +41934,7 @@ pub const DB = struct {
         if (columnar_progress.delivered != 0) fallback_opts.inclusive_from = false;
 
         var stream_plan = if (visitor.borrow_documents and opts.include_documents and !projection_plan.special.all_artifacts and !projection_plan.special.all_chunks and !projection_plan.special.all_embeddings)
-            try @import("document_query.zig").SpanProjectionPlan.init(alloc, .{ .fields = opts.fields, .include_all_fields = opts.include_all_fields })
+            try @import("document_query.zig").SpanProjectionPlan.init(alloc, .{ .fields = opts.fields, .include_all_fields = opts.include_all_fields, .cypher_presence_fields = opts.cypher_presence_fields })
         else
             null;
         defer if (stream_plan) |*plan| plan.deinit();
@@ -42201,11 +42203,13 @@ pub const DB = struct {
                         else
                             try projectLookupStoredBytesTxn(state.projection_context, state.alloc, raw_key, logical_value.?, .{
                                 .fields = state.opts.fields,
+                                .cypher_presence_fields = state.opts.cypher_presence_fields,
                                 .include_all_fields = state.opts.include_all_fields,
                             })
                     else
                         try projectLookupStoredBytesTxn(state.projection_context, state.alloc, raw_key, logical_value.?, .{
                             .fields = state.opts.fields,
+                            .cypher_presence_fields = state.opts.cypher_presence_fields,
                             .include_all_fields = state.opts.include_all_fields,
                         })
                 else

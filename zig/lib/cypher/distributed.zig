@@ -239,7 +239,10 @@ pub const ReadSet = struct {
         self.* = undefined;
     }
     pub fn backend(self: *ReadSet) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .count_nodes = countNodes, .expand_many = expandMany, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .count_nodes = countNodes, .expand_many = expandMany, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .set_read_demand = setReadDemand } };
+    }
+    fn setReadDemand(ptr: *anyopaque, demand: ?@import("read_fields.zig").Demand) void {
+        for (cast(ptr).snapshots) |snapshot| if (snapshot.backend.vtable.set_read_demand) |configure| configure(snapshot.backend.ptr, demand);
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         for (cast(ptr).snapshots) |snapshot| if (snapshot.backend.vtable.set_read_fields) |configure| configure(snapshot.backend.ptr, fields);

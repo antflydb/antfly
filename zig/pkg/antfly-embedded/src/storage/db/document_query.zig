@@ -41,7 +41,8 @@ pub const BorrowedSpanProjection = struct {
     fields: []const []const u8,
     include_all_fields: bool,
     pub fn matches(self: @This(), opts: types.LookupOptions) bool {
-        return self.fields.ptr == opts.fields.ptr and self.fields.len == opts.fields.len and self.include_all_fields == opts.include_all_fields;
+        for (self.plan.presence, 0..) |name, i| if (i >= opts.cypher_presence_fields.len or !std.mem.eql(u8, name, opts.cypher_presence_fields[i])) return false;
+        return self.fields.ptr == opts.fields.ptr and self.fields.len == opts.fields.len and self.include_all_fields == opts.include_all_fields and self.plan.presence.len == opts.cypher_presence_fields.len;
     }
 };
 
@@ -52,6 +53,7 @@ pub const SpanProjectionPlan = struct {
     excluded: []const []const u8,
     include_all: bool,
     passthrough: bool,
+    presence: []const []const u8 = &.{},
 
     pub fn init(alloc: Allocator, opts: types.LookupOptions) !?@This() {
         if (!spanProjectionSupported(opts.fields)) return null;
@@ -88,6 +90,8 @@ pub const SpanProjectionPlan = struct {
         for (paths.items) |*path| {
             if (path.parts.len > 2) path.selector = if (paths.items.len == 1) selector else try @import("query/json_projection_plan.zig").compile(a, &.{path.*});
         }
+        const presence = try a.alloc([]const u8, opts.cypher_presence_fields.len);
+        for (opts.cypher_presence_fields, presence) |name, *owned| owned.* = try a.dupe(u8, name);
         return .{
             .arena = arena,
             .selector = selector,
@@ -95,6 +99,7 @@ pub const SpanProjectionPlan = struct {
             .excluded = excluded.items,
             .include_all = include_all or (!has_positive and has_negative),
             .passthrough = opts.fields.len == 0 and opts.include_all_fields,
+            .presence = presence,
         };
     }
     pub fn deinit(self: *@This()) void {
@@ -188,6 +193,31 @@ fn writePassthroughFields(alloc: Allocator, writer: *std.Io.Writer, raw: []const
     return true;
 }
 fn lookupJsonDestination(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool, writer: ?*std.Io.Writer, complete_object: bool, omissions: []const Omission) !types.LookupResult {
+    if (plan.presence.len != 0) {
+        const fields = try alloc.alloc([]const u8, plan.paths.len);
+        defer alloc.free(fields);
+        for (plan.paths, fields) |path, *name| {
+            if (path.parts.len != 1) return error.InvalidArgument;
+            name.* = path.parts[0];
+        }
+        var projection_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer projection_arena.deinit();
+        const projected = try @import("query/cypher_projection.zig").record(projection_arena.allocator(), raw, fields, plan.presence);
+        if (writer) |sink| {
+            if (complete_object) try std.json.Stringify.value(projected, .{}, sink) else {
+                var iterator = projected.object.iterator();
+                while (iterator.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, "_id")) continue;
+                    try sink.writeByte(',');
+                    try std.json.Stringify.value(entry.key_ptr.*, .{}, sink);
+                    try sink.writeByte(':');
+                    try std.json.Stringify.value(entry.value_ptr.*, .{}, sink);
+                }
+            }
+            return .{ .json = @constCast("") };
+        }
+        return .{ .json = try std.json.Stringify.valueAlloc(output, projected, .{}) };
+    }
     if (writer == null and plan.passthrough and sources.len == 0) return .{ .json = try output.dupe(u8, raw) };
     if (!complete_object and writer != null and plan.passthrough and sources.len == 0 and try writePassthroughFields(alloc, writer.?, raw)) return .{ .json = @constCast("") };
     var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));

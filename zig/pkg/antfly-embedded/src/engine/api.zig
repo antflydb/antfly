@@ -1549,6 +1549,24 @@ test "embedded api Cypher document scans project wide inputs before owning outpu
     defer a.free(payload);
     const seeded = try api.batchJson(a, payload);
     defer a.free(seeded);
+    const catalog = try api.graphCatalogJson(a,
+        \\{"action":"put","name":"demand","definition":{"labels":[{"name":"D","table":"docs"},{"name":"Wide","table":"docs","where":{"body":"unmatched"}}],"relationships":[]}}
+    );
+    defer a.free(catalog);
+    for ([_][]const u8{
+        "MATCH(n:D) RETURN sum(1)",
+        "MATCH(n:D) RETURN sum(CASE WHEN n.body IS NOT NULL THEN 1 ELSE 0 END)",
+        "MATCH(n:D) WHERE n.body IS NOT NULL RETURN sum(1)",
+    }) |query| {
+        const request = try std.json.Stringify.valueAlloc(a, .{ .query = query, .limits = .{ .memory_bytes = 1 << 20 } }, .{});
+        defer a.free(request);
+        const response = try api.cypherJson(a, "demand", request);
+        defer a.free(response);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("2", parsed.value.object.get("rows").?.array.items[0].array.items[0].object.get("value").?.string);
+        try std.testing.expect(parsed.value.object.get("stats").?.object.get("memory_bytes").?.integer < 1 << 20);
+    }
     for ([_][]const u8{ "", "{\"term\":{\"tenant\":\"keep\"}}" }, [_]usize{ 2, 1 }) |filter, expected| {
         const buffer = try a.alloc(u8, 256 << 10);
         defer a.free(buffer);

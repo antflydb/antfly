@@ -54,6 +54,7 @@ pub const RowFilter = struct {
     }
 };
 pub const Request = struct {
+    cypher_presence_fields: []const []const u8 = &.{},
     reverse: bool = false,
     include_primary_digest: bool = false,
     /// Stateful internal readers already retain a cursor; public stateless
@@ -131,6 +132,7 @@ pub const Page = struct {
 };
 
 pub const Reader = struct {
+    cypher_presence_fields: []const []const u8 = &.{},
     row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
     alloc: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -458,6 +460,7 @@ pub const Reader = struct {
             .owned_lower = owned_lower,
             .owned_upper = owned_upper,
             .fields = fields,
+            .cypher_presence_fields = try clonePresence(owned, request.cypher_presence_fields),
             .now_ns = now_ns,
             .authenticated = authenticated,
             .include_primary_digest = request.include_primary_digest,
@@ -1031,7 +1034,11 @@ pub const Reader = struct {
                         }
                         const typed_projection = if (typed_output and !native) try row.projectSqlTypedAlloc(page, projection) else null;
                         const typed = if (typed_projection) |projected| projected.value else null;
-                        const json = if (typed_output) "" else try row.projectAlloc(temporary, projection);
+                        const json = if (typed_output) "" else if (self.cypher_presence_fields.len == 0) try row.projectAlloc(temporary, projection) else projected: {
+                            var context: @import("query/streamed_projection.zig").Context = .{ .scratch = temporary, .value = .{ .row = .{ .plan = .{ .base = projection, .arena = .init(temporary) }, .row = row } } };
+                            const value = (try context.borrow().countProjection(temporary, self.cypher_presence_fields)) orelse return error.InvalidRelationalRowsRequest;
+                            break :projected try std.json.Stringify.valueAlloc(temporary, value, .{});
+                        };
                         const json_null_fields = if (typed_output) &.{} else try row.projectJsonNullFieldsAlloc(page, projection);
                         var null_metadata_bytes: usize = json_null_fields.len * @sizeOf([]const u8);
                         for (json_null_fields) |name| null_metadata_bytes +|= name.len;
@@ -1161,4 +1168,10 @@ pub fn visitCypherRows(reader: *Reader, alloc: Allocator, io: ?std.Io, limit: us
         defer page.deinit();
         if (!page.more) break;
     }
+}
+
+fn clonePresence(a: Allocator, input: []const []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, input.len);
+    for (input, out) |name, *copy| copy.* = try a.dupe(u8, name);
+    return out;
 }

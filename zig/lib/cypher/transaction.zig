@@ -362,7 +362,7 @@ pub const Overlay = struct {
             return !self.from_base or self.dirty or self.created;
         }
     };
-    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .probe_where = probeWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .get_relationship = getRelationship, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
+    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .probe_where = probeWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .get_relationship = getRelationship, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .set_read_demand = setReadDemand, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
     const projecting_vtable: b.Backend.VTable = projected: {
         var value = plain_vtable;
         value.project_node = projectNode;
@@ -383,6 +383,10 @@ pub const Overlay = struct {
     fn checkpoint(ptr: *anyopaque) !void {
         const self = cast(ptr);
         try self.base.vtable.checkpoint(self.base.ptr);
+    }
+    fn setReadDemand(ptr: *anyopaque, demand: ?@import("read_fields.zig").Demand) void {
+        const self = cast(ptr);
+        if (self.base.vtable.set_read_demand) |configure| configure(self.base.ptr, if (self.active and (self.nodes.items.len != 0 or self.retain_scan_preimages)) null else demand);
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         const self = cast(ptr);

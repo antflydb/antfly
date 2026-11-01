@@ -174,7 +174,7 @@ pub fn scan(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8,
 /// Document point reads retain the primary bytes and use span projection, so
 /// wide unrequested payloads never become a DOM or escape into reply storage.
 pub fn get(db: anytype, a: A, cut: *Snapshot, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
-    const results = try getMany(db, a, cut, &.{key}, .{ .include_documents = true, .fields = opts.fields, .include_all_fields = opts.include_all_fields, .execution_deadline_ns = opts.execution_deadline_ns, .cancellation = opts.cancellation, .row_policy_principal_proof = opts.row_policy_principal_proof, .row_policy_database = opts.row_policy_database });
+    const results = try getMany(db, a, cut, &.{key}, .{ .include_documents = true, .fields = opts.fields, .cypher_presence_fields = opts.cypher_presence_fields, .include_all_fields = opts.include_all_fields, .execution_deadline_ns = opts.execution_deadline_ns, .cancellation = opts.cancellation, .row_policy_principal_proof = opts.row_policy_principal_proof, .row_policy_database = opts.row_policy_database });
     defer a.free(results);
     return results[0];
 }
@@ -240,7 +240,7 @@ pub fn getMany(db: anytype, a: A, cut: *Snapshot, keys: []const []const u8, inpu
     var read = try cut.primary.forkRead();
     defer read.abort();
     const projection = @import("document_query.zig");
-    const lookup: types.LookupOptions = .{ .fields = opts.fields, .include_all_fields = opts.include_all_fields };
+    const lookup: types.LookupOptions = .{ .fields = opts.fields, .cypher_presence_fields = opts.cypher_presence_fields, .include_all_fields = opts.include_all_fields };
     var plan = try projection.SpanProjectionPlan.init(temporary, lookup);
     defer if (plan) |*value| value.deinit();
     const internal = @import("../internal_keys.zig");
@@ -300,12 +300,13 @@ pub fn edges(db: anytype, a: A, cut: *Snapshot, name: []const u8, key: []const u
     const entry = db.core.graphIndex(name) orelse return error.CatalogGenerationChanged;
     var page_read = try pinned.context.fork();
     defer page_read.deinit();
-    return entry.index.getCypherEdgesByTypesPageInRead(a, key, edge_types, direction, cursor, limits, cut.now, &page_read);
+    return entry.index.getCypherEdgesByTypesPageInReadProjected(a, key, edge_types, direction, cursor, limits, cut.now, &page_read, try @import("query/cypher_projection.zig").EdgeProjection.init(a, limits.metadata_projection_json));
 }
 
 /// Native adapter facade over a statement-owned immutable storage cut.
 pub fn Database(comptime DB: type) type {
     return struct {
+        pub const cypher_metadata_projection = true;
         source: *DB,
         core: @FieldType(DB, "core"),
         cut: DB.CypherPinnedSnapshot,
@@ -428,7 +429,7 @@ pub fn Database(comptime DB: type) type {
                 .out => .out,
                 .in => .in,
                 .both => .both,
-            }, cursor, .{ .max_edges = limits.max_edges, .max_owned_bytes = limits.max_owned_bytes, .max_scanned_rows = limits.max_scanned_rows, .peer_key = limits.peer_key });
+            }, cursor, .{ .max_edges = limits.max_edges, .max_owned_bytes = limits.max_owned_bytes, .max_scanned_rows = limits.max_scanned_rows, .peer_key = limits.peer_key, .metadata_projection_json = if (comptime @hasField(@TypeOf(limits), "metadata_projection_json")) limits.metadata_projection_json else "" });
         }
     };
 }

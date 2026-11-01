@@ -233,7 +233,10 @@ pub const Backend = struct {
         prefer_count_nodes: bool = true,
         count_nodes: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, CountInput) anyerror!?CountResult = null,
         expand_many: ?*const fn (*anyopaque, std.mem.Allocator, catalog.Relationship, []const v.Identity, ast.Direction, usize, usize) anyerror!?ExpansionBatch = null,
-        /// Borrowed until reset. Null retains complete entities, an empty set
+        /// Borrowed compiler proof, reset after each execution/pull. Capable
+        /// adapters project only after complete source authorization.
+        set_read_demand: ?*const fn (*anyopaque, ?@import("read_fields.zig").Demand) void = null,
+        /// Legacy field union. Null retains complete entities; an empty set
         /// requests identities only. Authorization always sees the full row.
         set_read_fields: ?*const fn (*anyopaque, ?[]const []const u8) void = null,
         bind: *const fn (*anyopaque, std.mem.Allocator, catalog.Graph) anyerror!void,

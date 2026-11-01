@@ -106,6 +106,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             /// Private count inputs may carry nullness and membership views;
             /// policies cannot be derived from their projected payloads.
             project_stored: ?*const fn (*anyopaque, A, *const v.Node) anyerror!?*const v.Node = null,
+            prepare_metadata: ?*const fn (*anyopaque, A, []const u8) anyerror!root.read_fields.PreparedMetadata = null,
             project_relationship: *const fn (*anyopaque, A, *const v.Relationship) anyerror!?*const v.Relationship,
             search: ?*const fn (*anyopaque, A, []const u8, b.SearchInput) anyerror!b.SearchPage = null,
             read_authorization: ?*const fn (*anyopaque, A, []const u8) anyerror!ReadAuthorization = null,
@@ -129,9 +130,27 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         work: ?b.Work = null,
         membership_units: usize = 0,
         read_fields: ?[]const []const u8 = null,
+        read_demand: ?root.read_fields.Demand = null,
 
         pub fn backend(self: *Self) b.Backend {
-            return .{ .ptr = self, .vtable = &.{ .prefer_count_nodes = false, .adjacency_routes = adjacencyRoutes, .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .count_nodes = countNodes, .expand_many = expandMany, .planned_domains = if (@hasDecl(DB, "RelationalReadSession")) @hasDecl(DB.RelationalReadSession, "seekPrefix") else false, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+            return .{ .ptr = self, .vtable = &.{ .prefer_count_nodes = false, .adjacency_routes = adjacencyRoutes, .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .count_nodes = countNodes, .expand_many = expandMany, .planned_domains = if (@hasDecl(DB, "RelationalReadSession")) @hasDecl(DB.RelationalReadSession, "seekPrefix") else false, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .set_read_demand = setReadDemand } };
+        }
+        fn setReadDemand(ptr: *anyopaque, demand: ?root.read_fields.Demand) void {
+            cast(ptr).read_demand = demand;
+        }
+        fn observedGraph(self: *Self, a: A) !root.catalog.Graph {
+            var graph = self.graph.?;
+            if (self.authority.project_stored == null) return graph;
+            const demand = self.read_demand orelse return graph;
+            const names = demand.labels orelse return graph;
+            const labels = try a.alloc(root.catalog.Label, names.len);
+            for (names, labels) |name, *label| label.* = graph.label(name) orelse return error.CypherInvalidBackendPage;
+            graph.labels = labels;
+            return graph;
+        }
+        fn nodeDemand(self: *Self) ?root.read_fields.Entity {
+            if (self.authority.project_stored == null or !self.authority.storage_projection) return null;
+            return if (self.read_demand) |demand| demand.nodes else null;
         }
         fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
             cast(ptr).read_fields = fields;
@@ -146,11 +165,13 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         }
         const ScanOptions = if (@hasDecl(DB, "cypherDocumentScanOptions")) @typeInfo(@typeInfo(@TypeOf(DB.cypherDocumentScanOptions)).@"fn".return_type.?).error_union.payload else void;
         fn scanOptions(self: *Self, a: A, db: *DB, input: ScanOptions) !ScanOptions {
-            return self.scanOptionsInGraph(a, db, input, self.graph.?);
+            return self.scanOptionsInGraph(a, db, input, try self.observedGraph(a));
         }
         fn scanOptionsInGraph(self: *Self, a: A, db: *DB, input: ScanOptions, graph: root.catalog.Graph) !ScanOptions {
             var opts = try db.cypherDocumentScanOptions(a, input);
-            if (self.read_fields) |required| if (opts.relational_query) |*query| {
+            const node_demand = self.nodeDemand();
+            const requested = if (node_demand) |demand| demand.fields else self.read_fields;
+            if (requested) |required| if (opts.relational_query) |*query| {
                 var fields: std.ArrayList([]const u8) = .empty;
                 for (query.fields) |field| for (required) |name| {
                     if (std.mem.eql(u8, field, name)) {
@@ -159,6 +180,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     }
                 };
                 query.fields = fields.items;
+                if (node_demand) |demand| query.cypher_presence_fields = demand.presence;
             } else if (self.authority.storage_projection) {
                 var fields: std.StringHashMapUnmanaged(void) = .empty;
                 for (required) |field| try fields.put(a, field, {});
@@ -175,6 +197,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 for (names) |*name| name.* = iterator.next().?.*;
                 opts.fields = names;
                 opts.include_all_fields = false;
+                if (node_demand) |demand| opts.cypher_presence_fields = demand.presence;
             };
             return opts;
         }
@@ -201,6 +224,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         fn selected(self: *Self, name: []const u8) !*DB {
             for (self.tables) |table| if (std.mem.eql(u8, table.name, name)) return table.db;
             return error.UndefinedGraphTable;
+        }
+        fn storageTableName(self: *Self, logical: []const u8) ?[]const u8 {
+            for (self.tables) |table| if (std.mem.eql(u8, table.name, logical)) return table.storage_name;
+            return null;
         }
         fn matchesStorageTable(self: *Self, logical: []const u8, actual: []const u8) bool {
             if (std.mem.eql(u8, logical, actual)) return true;
@@ -257,7 +284,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             self.graph = graph;
         }
         pub fn node(self: *Self, a: A, table: []const u8, key: []const u8, json: []const u8) !?*const v.Node {
-            const fields = self.read_fields orelse return self.fullNode(a, table, key, json);
+            const fields = (if (self.nodeDemand()) |demand| demand.fields else self.read_fields) orelse return self.fullNode(a, table, key, json);
             // Membership and policies inspect complete documents. Decode them
             // in reclaimable scratch, then retain only the authorized projection.
             var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
@@ -283,7 +310,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             return self.projectNodeValue(a, table, key, input, false);
         }
         fn projectNodeValue(self: *Self, a: A, table: []const u8, key: []const u8, input: std.json.Value, stored: bool) !?*const v.Node {
-            return self.projectNodeValueInGraph(a, table, key, input, stored, self.graph.?);
+            return self.projectNodeValueInGraph(a, table, key, input, stored, try self.observedGraph(a));
         }
         fn projectNodeValueInGraph(self: *Self, a: A, table: []const u8, key: []const u8, input: std.json.Value, stored: bool, graph: root.catalog.Graph) !?*const v.Node {
             const value = try v.Value.fromJson(a, input);
@@ -466,7 +493,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             var fold: Fold = .{ .adapter = self, .projection = projection, .input = input, .graph = membership_graph, .table = table, .quota = quota, .parent = self.work, .meter = .{ .a = quota.allocator(), .backend = self.backend(), .limit = input.max_work }, .counts = counts };
             const previous_work = self.work;
             const previous_fields = self.read_fields;
+            const previous_demand = self.read_demand;
+            self.read_demand = null;
             defer {
+                self.read_demand = previous_demand;
                 self.work = previous_work;
                 self.read_fields = previous_fields;
             }
@@ -1599,11 +1629,11 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const db = try self.selected(identity.table);
             const authorization = try self.readAuthorization(temporary, identity.table);
             const result = if (comptime @hasDecl(DB, "cypherDocumentScanOptions")) projected: {
-                if (self.read_fields != null) {
+                if (self.read_fields != null or self.nodeDemand() != null) {
                     const opts = try self.scanOptions(temporary, db, .{ .inclusive_from = true, .include_documents = true, .limit = 1, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns });
                     if (opts.relational_query == null) {
                         if (opts.include_all_fields) break :projected try self.getFull(a, temporary, db, identity, authorization);
-                        var document = (try db.getDocument(temporary, identity.key, .{ .fields = opts.fields, .include_all_fields = false, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns })) orelse break :projected null;
+                        var document = (try db.getDocument(temporary, identity.key, .{ .fields = opts.fields, .cypher_presence_fields = opts.cypher_presence_fields, .include_all_fields = false, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns })) orelse break :projected null;
                         defer document.deinit(temporary);
                         break :projected try self.node(a, identity.table, identity.key, document.json);
                     }
@@ -1648,23 +1678,50 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             if ((position.incoming and !incoming_possible) or (!position.incoming and !outgoing_possible)) return .{ .items = &.{} };
             const db = try self.selected(source_table);
             const authorization = try self.readAuthorization(temporary, source_table);
+            const projects_metadata = if (@hasDecl(DB, "cypher_metadata_projection")) DB.cypher_metadata_projection else false;
+            const projection_json = if (projects_metadata and self.authority.prepare_metadata != null and self.read_demand != null and self.read_demand.?.relationships.fields != null)
+                try std.json.Stringify.valueAlloc(temporary, .{
+                    .fields = self.read_demand.?.relationships.fields.?,
+                    .presence = self.read_demand.?.relationships.presence,
+                    .source = source_table,
+                    .target = target_table,
+                    .source_storage = self.storageTableName(source_table),
+                    .target_storage = self.storageTableName(target_table),
+                    .skip_self_loops = position.incoming and outgoing_possible,
+                }, .{})
+            else
+                "";
+            const PageFunction = if (@hasDecl(DB, "graphEdgesForCypherPageAuthorizedAt")) @TypeOf(DB.graphEdgesForCypherPageAuthorizedAt) else @TypeOf(DB.graphEdgesForCypherPageAt);
+            const PageLimits = @typeInfo(PageFunction).@"fn".param_types[7] orelse struct {
+                max_edges: usize,
+                max_owned_bytes: usize,
+                max_scanned_rows: usize,
+                peer_key: ?[]const u8,
+                metadata_projection_json: []const u8 = "",
+            };
+            var page_limits: PageLimits = .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = @min(4096, @max(1, max_examined)), .peer_key = if (peer) |value| value.key else null };
+            if (comptime @hasField(PageLimits, "metadata_projection_json")) page_limits.metadata_projection_json = projection_json;
             var page = captured: {
                 if (comptime @hasDecl(DB, "graphEdgesForCypherCapturePageAuthorizedAt")) {
                     for (self.tables) |table| if (table.db == db and std.mem.eql(u8, table.name, source_table)) {
-                        if (table.capture_fence) |fence| break :captured try db.graphEdgesForCypherCapturePageAuthorizedAt(fence, temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = @min(4096, @max(1, max_examined)), .peer_key = if (peer) |value| value.key else null }, self.ttl_now_ns, authorization.proof, authorization.database);
+                        if (table.capture_fence) |fence| break :captured try db.graphEdgesForCypherCapturePageAuthorizedAt(fence, temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, page_limits, self.ttl_now_ns, authorization.proof, authorization.database);
                     };
                 }
                 break :captured if (comptime @hasDecl(DB, "graphEdgesForCypherPageAuthorizedAt"))
-                    try db.graphEdgesForCypherPageAuthorizedAt(temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = @min(4096, @max(1, max_examined)), .peer_key = if (peer) |value| value.key else null }, self.ttl_now_ns, authorization.proof, authorization.database)
+                    try db.graphEdgesForCypherPageAuthorizedAt(temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, page_limits, self.ttl_now_ns, authorization.proof, authorization.database)
                 else blk: {
                     if (authorization.proof.len != 0) return error.CypherRowPolicyUnsupported;
-                    break :blk try db.graphEdgesForCypherPageAt(temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = @min(4096, @max(1, max_examined)), .peer_key = if (peer) |value| value.key else null }, self.ttl_now_ns);
+                    break :blk try db.graphEdgesForCypherPageAt(temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, page_limits, self.ttl_now_ns);
                 };
             };
             defer page.deinit(temporary);
             var result: std.ArrayList(*const v.Relationship) = .empty;
             for (page.edges) |edge| {
-                const metadata = if (edge.metadata.len == 0) std.json.Value{ .object = .empty } else try std.json.parseFromSliceLeaky(std.json.Value, a, edge.metadata, .{ .parse_numbers = false });
+                const projected_metadata = if (self.read_demand) |demand| if (demand.relationships.fields != null and self.authority.prepare_metadata != null)
+                    try self.authority.prepare_metadata.?(self.authority.ptr, a, if (edge.metadata.len == 0) "{}" else edge.metadata)
+                else
+                    null else null;
+                const metadata = if (projected_metadata) |projected| projected.headers else if (edge.metadata.len == 0) std.json.Value{ .object = .empty } else try std.json.parseFromSliceLeaky(std.json.Value, a, edge.metadata, .{ .parse_numbers = false });
                 if (metadata != .object) return error.CypherInvalidRelationshipMetadata;
                 const actual_source = metadata.object.get("source_table") orelse .null;
                 const actual_target = metadata.object.get("target_table") orelse .null;
@@ -1679,7 +1736,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 if (position.incoming and outgoing_possible and source.eql(target)) continue;
                 const relationship = try a.create(v.Relationship);
                 var properties: std.ArrayList(v.Entry) = .empty;
-                const encoded_properties = try root.wire.relationshipProperties(a, metadata);
+                const encoded_properties = if (projected_metadata) |projected| try projected.project(projected.context, a, edge.weight, self.read_demand.?.relationships) else try root.wire.relationshipProperties(a, metadata);
                 if (encoded_properties) |decoded| {
                     try properties.appendSlice(a, decoded);
                 } else {

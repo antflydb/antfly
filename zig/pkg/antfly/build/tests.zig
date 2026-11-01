@@ -1272,11 +1272,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     if (document_predicate_mod.import_table.contains("antfly_storage_root")) document_predicate_mod.addImport("antfly_storage_root", document_predicate_mod);
     const document_predicate_tests = b.addTest(.{
         .root_module = document_predicate_mod,
-        .filters = &.{"prepared pattern filters"},
+        .filters = &.{ "prepared pattern filters", "Cypher demand projection" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("cypher-document-predicate-test", "Verify borrowed document predicate semantics, validation and allocation bounds")
         .dependOn(&addFilteredTestRunArtifact(b, document_predicate_tests).step);
+    const edge_projection_tests = b.addTest(.{
+        .root_module = document_predicate_mod,
+        .filters = &.{"graph bounded adjacency pages"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-edge-projection-test", "Verify projected winner metadata preserves bounded ownership, TTL and continuations")
+        .dependOn(&addFilteredTestRunArtifact(b, edge_projection_tests).step);
     embedded_test_step.dependOn(&run_embedded_api_tests.step);
     // db.zig is also its own module (embedded_db_mod) rather than a file
     // reachable from embedded_mod's root, so its tests need the same

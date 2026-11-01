@@ -219,6 +219,10 @@ pub const CypherEdgePage = struct {
 };
 
 pub const EdgePageLimits = struct {
+    /// Private Cypher projection descriptor; ordinary graph APIs leave this empty.
+    metadata_projection_json: []const u8 = "",
+    /// Soft selected-input quantum, independent of projected output size.
+    max_input_metadata_bytes: usize = 4 << 20,
     /// Restrict the physical key range to one adjacent identity.
     peer_key: ?[]const u8 = null,
     max_edges: usize,
@@ -8579,7 +8583,7 @@ pub const GraphIndex = struct {
         defer a.free(copy.winner_hex);
         return copy.clone(a);
     }
-    fn appendCypherWinner(a: Allocator, field_mapping: bool, read: *backend_erased.ReadTxn, output: *std.ArrayListUnmanaged(Edge), state: CypherEdgeScanCursor, owner: []const u8, winner: []const u8, owned_bytes: *usize, max_bytes: usize) !bool {
+    fn appendCypherWinner(a: Allocator, field_mapping: bool, read: *backend_erased.ReadTxn, output: *std.ArrayListUnmanaged(Edge), state: CypherEdgeScanCursor, owner: []const u8, winner: []const u8, owned_bytes: *usize, max_bytes: usize, input_bytes: *usize, max_input_bytes: usize, projection: anytype) !bool {
         if (winner.len == 0) return true;
         const value = try read.get(winner);
         if (value.len < 8) return error.InvalidGraphEdgeValue;
@@ -8588,7 +8592,7 @@ pub const GraphIndex = struct {
         const producer = if (edge.edge_id.len != 0) edge.owner_document else if (state.has_artifacts or !std.mem.eql(u8, owner, edge.source)) owner else "";
         const field_derived = field_mapping and std.mem.eql(u8, owner, edge.source) and (state.phase == .field or !state.has_artifacts);
         const selected: Edge = .{ .field_derived = field_derived, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = producer, .artifact_derived = !field_derived and (if (edge.edge_id.len != 0) state.winner_rank != 0 and state.winner_rank != std.math.maxInt(u64) else state.has_artifacts), .metadata = decoded.metadata, .weight = decoded.weight, .created_at = decoded.created_at, .updated_at = decoded.updated_at, .winner_rank = state.winner_rank };
-        appendCypherEdge(a, output, selected, owned_bytes, max_bytes) catch |err| {
+        appendCypherEdge(a, output, selected, owned_bytes, max_bytes, input_bytes, max_input_bytes, projection) catch |err| {
             if (err == error.GraphExploredEdgeBytesBudgetExceeded and output.items.len != 0) return false;
             return err;
         };
@@ -8599,11 +8603,14 @@ pub const GraphIndex = struct {
     /// with many contenders can span pages without retaining payloads or rescanning
     /// its prefix; many producers never have to fit in one adjacency page.
     pub fn getCypherEdgesByTypesPageAt(self: *GraphIndex, a: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection, scan_cursor: ?CypherEdgeScanCursor, limits: EdgePageLimits, now_ns: u64) !CypherEdgePage {
+        return self.getCypherEdgesByTypesPageAtProjected(a, key, edge_types, direction, scan_cursor, limits, now_ns, IdentityMetadata{});
+    }
+    pub fn getCypherEdgesByTypesPageAtProjected(self: *GraphIndex, a: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection, scan_cursor: ?CypherEdgeScanCursor, limits: EdgePageLimits, now_ns: u64, projection: anytype) !CypherEdgePage {
         if (limits.max_edges == 0 or limits.max_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
         if (limits.max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
         var context = try self.beginEdgeReadContextWithProof(direction);
         defer context.deinit();
-        return self.getCypherEdgesByTypesPageInRead(a, key, edge_types, direction, scan_cursor, limits, now_ns, &context);
+        return self.getCypherEdgesByTypesPageInReadProjected(a, key, edge_types, direction, scan_cursor, limits, now_ns, &context, projection);
     }
     pub const EndpointRange = struct { empty: bool = false, min: []const u8 = "", max: []const u8 = "" };
     /// Four bounded seeks over the same physical roots as adjacency reads.
@@ -8635,6 +8642,9 @@ pub const GraphIndex = struct {
 
     /// Read every assertion page from the same captured ownership pair.
     pub fn getCypherEdgesByTypesPageInRead(self: *GraphIndex, a: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection, scan_cursor: ?CypherEdgeScanCursor, limits: EdgePageLimits, now_ns: u64, context: *EdgeReadContext) !CypherEdgePage {
+        return self.getCypherEdgesByTypesPageInReadProjected(a, key, edge_types, direction, scan_cursor, limits, now_ns, context, IdentityMetadata{});
+    }
+    pub fn getCypherEdgesByTypesPageInReadProjected(self: *GraphIndex, a: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection, scan_cursor: ?CypherEdgeScanCursor, limits: EdgePageLimits, now_ns: u64, context: *EdgeReadContext, projection: anytype) !CypherEdgePage {
         if (limits.max_edges == 0 or limits.max_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
         if (limits.max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
         if (scan_cursor) |input| if (input.physical) |cursor| if (cursor.read_generation != null) try context.validateContinuation(cursor);
@@ -8656,6 +8666,7 @@ pub const GraphIndex = struct {
         }
         var scanned: usize = 0;
         var owned_bytes: usize = 0;
+        var input_metadata_bytes: usize = 0;
         var finished = false;
         const read = &context.reads.incoming.?;
         page: while (scanned < limits.max_scanned_rows and output.items.len < limits.max_edges) {
@@ -8696,7 +8707,7 @@ pub const GraphIndex = struct {
                 const decoded = try decodeEdgeValue(try read.get(physical_key));
                 if (!self.edgeExpiredAt(decoded, now_ns)) {
                     const selected: Edge = .{ .field_derived = field_mapping, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = edge.owner_document, .weight = decoded.weight, .created_at = decoded.created_at, .updated_at = decoded.updated_at, .metadata = decoded.metadata };
-                    appendCypherEdge(a, &output, selected, &owned_bytes, limits.max_owned_bytes) catch |err| {
+                    appendCypherEdge(a, &output, selected, &owned_bytes, limits.max_owned_bytes, &input_metadata_bytes, limits.max_input_metadata_bytes, projection) catch |err| {
                         if (err == error.GraphExploredEdgeBytesBudgetExceeded and output.items.len != 0) break :page;
                         return err;
                     };
@@ -8737,7 +8748,7 @@ pub const GraphIndex = struct {
                     var component = try decodeGraphKeyComponent(temporary, entry.key[prefix.len..owner_end]);
                     defer component.deinit(temporary);
                     if (has_owner and !std.mem.eql(u8, owner.items, component.bytes)) {
-                        if (!try appendCypherWinner(a, field_mapping, read, &output, state, owner.items, winner.items, &owned_bytes, limits.max_owned_bytes)) break :page;
+                        if (!try appendCypherWinner(a, field_mapping, read, &output, state, owner.items, winner.items, &owned_bytes, limits.max_owned_bytes, &input_metadata_bytes, limits.max_input_metadata_bytes, projection)) break :page;
                         has_owner = false;
                         winner.clearRetainingCapacity();
                         state.winner_rank = std.math.maxInt(u64);
@@ -8767,7 +8778,7 @@ pub const GraphIndex = struct {
                 resume_key.clearRetainingCapacity();
                 continue;
             }
-            if (has_owner and !try appendCypherWinner(a, field_mapping, read, &output, state, owner.items, winner.items, &owned_bytes, limits.max_owned_bytes)) break;
+            if (has_owner and !try appendCypherWinner(a, field_mapping, read, &output, state, owner.items, winner.items, &owned_bytes, limits.max_owned_bytes, &input_metadata_bytes, limits.max_input_metadata_bytes, projection)) break;
             has_owner = false;
             resume_key.clearRetainingCapacity();
             winner.clearRetainingCapacity();
@@ -8789,7 +8800,18 @@ pub const GraphIndex = struct {
         return .{ .edges = try output.toOwnedSlice(a), .next_cursor = next, .owned_bytes = owned_bytes, .scanned_rows = scanned };
     }
 
-    fn appendCypherEdge(alloc: Allocator, output: *std.ArrayListUnmanaged(Edge), edge: Edge, owned_bytes: *usize, max_bytes: usize) !void {
+    const IdentityMetadata = struct {
+        pub fn project(_: @This(), _: Allocator, edge: Edge) ![]const u8 {
+            return edge.metadata;
+        }
+    };
+    fn appendCypherEdge(alloc: Allocator, output: *std.ArrayListUnmanaged(Edge), input: Edge, owned_bytes: *usize, max_bytes: usize, input_bytes: *usize, max_input_bytes: usize, projection: anytype) !void {
+        if (output.items.len != 0 and input.metadata.len > max_input_bytes -| input_bytes.*) return error.GraphExploredEdgeBytesBudgetExceeded;
+        input_bytes.* +|= input.metadata.len;
+        var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer scratch.deinit();
+        var edge = input;
+        edge.metadata = try projection.project(scratch.allocator(), input);
         var bytes = edgeOwnedBytes(edge);
         bytes = std.math.add(usize, bytes, edge.edge_id.len) catch return error.GraphExploredEdgeBytesBudgetExceeded;
         bytes = std.math.add(usize, bytes, edge.owner_document.len) catch return error.GraphExploredEdgeBytesBudgetExceeded;
@@ -40332,4 +40354,68 @@ test "graph endpoint envelopes retain producer endpoints binary keys and immutab
     try std.testing.expect(std.mem.order(u8, incoming.max, "b\x00target") != .lt);
     try std.testing.expect(std.mem.order(u8, outgoing.min, "0") == .gt);
     try std.testing.expect(std.mem.order(u8, incoming.max, "zz") == .lt);
+}
+
+test "graph bounded adjacency pages project borrowed winner metadata before owning payloads" {
+    const a = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "links", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const wide = try a.alloc(u8, 128 << 10);
+    defer a.free(wide);
+    @memset(wide, 'x');
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .body = wide }, .{});
+    defer a.free(raw);
+    for (0..16) |i| {
+        const id = try std.fmt.allocPrint(a, "edge-{d}", .{i});
+        defer a.free(id);
+        try graph.batchApply(&.{.{ .source = "a", .target = "b", .edge_type = "R", .edge_id = id, .metadata_json = raw }}, &.{});
+    }
+    const Projection = struct {
+        pub fn project(_: @This(), _: Allocator, edge: Edge) ![]const u8 {
+            try std.testing.expect(edge.metadata.len >= 128 << 10);
+            return "{}";
+        }
+    };
+    var quota: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 128 << 10 };
+    var page = try graph.getCypherEdgesByTypesPageAtProjected(quota.allocator(), "a", &.{"R"}, .out, null, .{ .max_edges = 16, .max_owned_bytes = 64 << 10, .max_scanned_rows = 128 }, 10, Projection{});
+    defer page.deinit(quota.allocator());
+    try std.testing.expectEqual(@as(usize, 16), page.edges.len);
+    if (page.next_cursor) |cursor| {
+        var end = try graph.getCypherEdgesByTypesPageAtProjected(quota.allocator(), "a", &.{"R"}, .out, cursor, .{ .max_edges = 16, .max_owned_bytes = 64 << 10, .max_scanned_rows = 128 }, 10, Projection{});
+        defer end.deinit(quota.allocator());
+        try std.testing.expectEqual(@as(usize, 0), end.edges.len);
+        try std.testing.expect(end.next_cursor == null);
+    }
+    for (page.edges) |edge| try std.testing.expectEqualStrings("{}", edge.metadata);
+    try std.testing.expect(page.owned_bytes < 64 << 10);
+    try std.testing.expect(quota.peak < 128 << 10);
+
+    // A single input may exceed the soft quantum, but resuming must advance
+    // exactly once per winner even when every subsequent input ends the page.
+    var cursor: ?CypherEdgeScanCursor = null;
+    defer if (cursor) |*value| value.deinit(a);
+    var seen = std.StringHashMap(void).init(a);
+    defer {
+        var keys = seen.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        seen.deinit();
+    }
+    var pages: usize = 0;
+    while (true) {
+        var next = try graph.getCypherEdgesByTypesPageAtProjected(a, "a", &.{"R"}, .out, cursor, .{ .max_edges = 16, .max_owned_bytes = 64 << 10, .max_scanned_rows = 128, .max_input_metadata_bytes = 1 }, 10, Projection{});
+        defer next.deinit(a);
+        if (cursor) |*value| value.deinit(a);
+        cursor = null;
+        pages += 1;
+        try std.testing.expect(pages <= 17);
+        try std.testing.expect(next.edges.len <= 1);
+        for (next.edges) |edge| {
+            try std.testing.expect(!seen.contains(edge.edge_id));
+            try seen.put(try a.dupe(u8, edge.edge_id), {});
+        }
+        cursor = next.next_cursor;
+        next.next_cursor = null;
+        if (cursor == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 16), seen.count());
 }

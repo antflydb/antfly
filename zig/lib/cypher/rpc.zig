@@ -111,6 +111,7 @@ pub const Request = struct {
     max_examined: usize = 1_000_000,
     max_work: usize = 1_000_000,
     read_fields: ?[]const []const u8 = null,
+    read_demand: ?@import("read_fields.zig").Demand = null,
     document: ?std.json.Value = null,
     apply_defaults: bool = false,
     json_null_fields: []const []const u8 = &.{},
@@ -200,8 +201,12 @@ pub const Client = struct {
     allowed_versions: []const Version = &.{},
     work: ?b.Work = null,
     read_fields: ?[]const []const u8 = null,
+    read_demand: ?@import("read_fields.zig").Demand = null,
     pub fn backend(self: *Client) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .count_nodes = countNodes, .expand_many = expandMany, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .probe_where = probeWhere, .count_nodes = countNodes, .expand_many = expandMany, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .population_upper_bound = populationUpperBound, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields, .set_read_demand = setReadDemand } };
+    }
+    fn setReadDemand(ptr: *anyopaque, demand: ?@import("read_fields.zig").Demand) void {
+        cast(ptr).read_demand = demand;
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         cast(ptr).read_fields = fields;
@@ -215,6 +220,7 @@ pub const Client = struct {
     fn invoke(self: *Client, a: A, request: Request) !Reply {
         var bounded = request;
         bounded.read_fields = self.read_fields;
+        bounded.read_demand = self.read_demand;
         if (self.work) |work| if (work.remaining) |remaining| {
             const left = remaining(work.ptr);
             bounded.max_work = if (request.operation == .count) @min(bounded.max_work, left) else left;
@@ -365,7 +371,7 @@ pub const Client = struct {
         defer scratch.deinit();
         const temporary = scratch.allocator();
         var envelope = std.Io.Writer.Discarding.init(&.{});
-        try std.json.Stringify.value(.{ .table = table, .read_fields = self.read_fields }, .{}, &envelope.writer);
+        try std.json.Stringify.value(.{ .table = table, .read_fields = self.read_fields, .read_demand = self.read_demand }, .{}, &envelope.writer);
         const bytes_budget = ((1 << 20) - 2048) -| envelope.fullCount();
         const input = if (self.channel.owner_local) try @import("sparse_seek.zig").prepareBounded(temporary, filters, after, bytes_budget) else @import("sparse_seek.zig").Input{ .filters = filters, .after = after };
         var selected = input.filters;
@@ -374,7 +380,7 @@ pub const Client = struct {
             // Count before allocating. Include variable projection/table bytes;
             // fixed request fields fit within the reserved header allowance.
             var count = std.Io.Writer.Discarding.init(&.{});
-            try std.json.Stringify.value(.{ .filters = input.filters, .table = table, .read_fields = self.read_fields }, .{}, &count.writer);
+            try std.json.Stringify.value(.{ .filters = input.filters, .table = table, .read_fields = self.read_fields, .read_demand = self.read_demand }, .{}, &count.writer);
             if (count.fullCount() > (1 << 20) - 2048)
                 selected = try @import("sparse_seek.zig").planning(temporary, input.filters);
             var planned_size = std.Io.Writer.Discarding.init(&.{});
@@ -402,7 +408,7 @@ pub const Client = struct {
         if (identities.len == 0 or identities.len > 16) return null;
         var arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer arena.deinit();
-        const request: Request = .{ .read_fields = self.read_fields, .operation = .expand_many, .relationship = mapping.name, .identities = identities, .direction = direction, .limit = limit, .max_examined = maximum, .graph_incarnation = self.incarnation, .graph_revision = self.revision };
+        const request: Request = .{ .read_fields = self.read_fields, .read_demand = self.read_demand, .operation = .expand_many, .relationship = mapping.name, .identities = identities, .direction = direction, .limit = limit, .max_examined = maximum, .graph_incarnation = self.incarnation, .graph_revision = self.revision };
         var size = std.Io.Writer.Discarding.init(&.{});
         try std.json.Stringify.value(request, .{}, &size.writer);
         if (size.fullCount() > (1 << 20) - 2048) return null;
@@ -419,7 +425,7 @@ pub const Client = struct {
     }
     fn countNodes(ptr: *anyopaque, a: A, table: []const u8, input: b.CountInput) !?b.CountResult {
         const self = cast(ptr);
-        const request: Request = .{ .read_fields = self.read_fields, .operation = .count, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .max_examined = input.max_examined, .max_work = input.max_work, .count = .{ .arguments = input.arguments, .node = input.node, .predicate = input.predicate, .parameters = .{ .value = .{ .map = input.parameters } }, .source = input.source, .memory_bytes = input.memory_bytes } };
+        const request: Request = .{ .read_fields = self.read_fields, .read_demand = self.read_demand, .operation = .count, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .max_examined = input.max_examined, .max_work = input.max_work, .count = .{ .arguments = input.arguments, .node = input.node, .predicate = input.predicate, .parameters = .{ .value = .{ .map = input.parameters } }, .source = input.source, .memory_bytes = input.memory_bytes } };
         var size = std.Io.Writer.Discarding.init(&.{});
         try std.json.Stringify.value(request, .{}, &size.writer);
         if (size.fullCount() > (1 << 20) - 2048) return null;
@@ -574,6 +580,8 @@ pub const Owner = struct {
     pub fn executeTyped(self: Owner, scratch: A, request: Request) !Reply {
         if (self.backend.vtable.set_read_fields) |configure| configure(self.backend.ptr, request.read_fields);
         defer if (self.backend.vtable.set_read_fields) |configure| configure(self.backend.ptr, null);
+        if (self.backend.vtable.set_read_demand) |configure| configure(self.backend.ptr, request.read_demand);
+        defer if (self.backend.vtable.set_read_demand) |configure| configure(self.backend.ptr, null);
         if (request.graph_incarnation != self.graph.incarnation or request.graph_revision != self.graph.revision) return error.CatalogGenerationChanged;
         if ((request.limit == 0 and request.operation != .scan_ordered) or request.limit > 1024) return error.CypherOwnerBudgetExceeded;
         try self.backend.vtable.checkpoint(self.backend.ptr);

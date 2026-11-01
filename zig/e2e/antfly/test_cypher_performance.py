@@ -1700,6 +1700,65 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
             )
             assert bounded["stats"]["memory_bytes"] < 1 << 20, bounded
             assert bounded["stats"]["scanned_anchors"] == 32, bounded
+        # The same demand proof licenses ordinary expressions and aggregates,
+        # including a catalog predicate that the query does not observe.
+        for graph_name in (prefix, wide_graph):
+            for query, expected in (
+                ("MATCH(n:D) RETURN sum(1)", 32),
+                (
+                    "MATCH(n:D) RETURN sum(CASE WHEN n.body IS NOT NULL THEN 1 ELSE 0 END)",
+                    16,
+                ),
+                ("MATCH(n:D) WHERE n.body IS NOT NULL RETURN sum(1)", 16),
+                ("MATCH(n:D) WHERE n.body IS NULL RETURN sum(1)", 16),
+                (
+                    "MATCH(n:D) WITH n AS x RETURN sum(CASE WHEN x.body IS NULL THEN 0 ELSE 1 END)",
+                    16,
+                ),
+            ):
+                bounded = call(
+                    f"/graphs/{graph_name}/query",
+                    {
+                        "query": query,
+                        "limits": {"memory_bytes": 1 << 20, "scanned_anchors": 32},
+                    },
+                )
+                assert bounded["rows"] == [
+                    [{"type": "integer", "value": str(expected)}]
+                ], bounded
+                assert bounded["stats"]["scanned_anchors"] == 32, bounded
+                assert bounded["stats"]["memory_bytes"] < 1 << 20, bounded
+                print(
+                    json.dumps(
+                        {
+                            "demand_storage": "relational"
+                            if relational
+                            else "document",
+                            "wide_label": graph_name == wide_graph,
+                            "query": query,
+                            "stats": bounded["stats"],
+                        },
+                        sort_keys=True,
+                    )
+                )
+        # A value observer upgrades nullness to actual values; whole nodes and
+        # labels() retain their complete entity/membership contracts.
+        mixed = call(
+            f"/graphs/{wide_graph}/query",
+            {
+                "query": "MATCH(n:D) WHERE antfly.documentKey(n)='n1' RETURN n.body IS NOT NULL,n.body,labels(n)",
+                "limits": {"memory_bytes": 16 << 20},
+            },
+        )
+        assert mixed["rows"][0][0] == {"type": "boolean", "value": True}, mixed
+        assert mixed["rows"][0][1] == {
+            "type": "string",
+            "value": 'escaped\\"\n' + "x" * (512 << 10),
+        }, mixed
+        assert mixed["rows"][0][2] == {
+            "type": "list",
+            "value": [{"type": "string", "value": "D"}],
+        }, mixed
         # Repeated parameter/literal probes share one lazy invariant domain.
         for size in (512, 2048, 4096):
             ids = [f"n{i}" for i in range(size)]
@@ -1794,6 +1853,20 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
                     sort_keys=True,
                 )
             )
+        for session, expected in ((admin, 16), (reader, 8)):
+            observed = call(
+                f"/graphs/{prefix}/query",
+                {
+                    "query": "MATCH(n:D) RETURN sum(CASE WHEN n.body IS NOT NULL THEN 1 ELSE 0 END)",
+                    "limits": {"memory_bytes": 1 << 20, "scanned_anchors": 32},
+                },
+                session=session,
+            )
+            assert observed["rows"] == [
+                [{"type": "integer", "value": str(expected)}]
+            ], observed
+            assert observed["stats"]["scanned_anchors"] == 32, observed
+            assert observed["stats"]["memory_bytes"] < 1 << 20, observed
         # The retained scan applies effective row filters once. Rejected rows
         # still consume physical progress before policy evaluation.
         denied_budget = reader.post(
@@ -1974,4 +2047,140 @@ def test_authenticated_cypher_count_nullness_streams_wide_properties(relational)
     finally:
         reader.close()
         admin.close()
+        server.stop()
+
+
+def test_authenticated_cypher_relationship_demand_skips_unused_metadata():
+    """Relationship projections share scalar demand without truncating returned entities."""
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port(), pgwire=True)
+    session = requests.Session()
+    session.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+    name = "cypher_edge_demand_" + uuid.uuid4().hex
+    base = server.api_url.rstrip("/")
+    body = "x" * (128 << 10)
+
+    def call(path, payload=None, method="POST"):
+        response = session.request(method, base + path, json=payload, timeout=45)
+        assert response.status_code in (200, 201, 202), (
+            response.status_code,
+            response.text,
+            server.log_path.read_text()[-4000:],
+        )
+        return response.json()
+
+    try:
+        call(
+            f"/tables/{name}",
+            {
+                "num_shards": 1,
+                "indexes": {
+                    "links": {"type": "graph", "edge_types": [{"name": "link"}]}
+                },
+            },
+        )
+        deadline = time.monotonic() + 60
+        while True:
+            index = call(f"/tables/{name}/indexes/links", method="GET")
+            ready = index.get("status", {}).get("milestones", {}).get("complete", {})
+            if ready.get("reached") and not ready.get("blockers"):
+                break
+            assert time.monotonic() < deadline, index
+            time.sleep(0.1)
+        call(
+            f"/graphs/{name}",
+            {
+                "labels": [{"name": "D", "table": name}],
+                "relationships": [
+                    {
+                        "name": "R",
+                        "index": "links",
+                        "source_label": "D",
+                        "target_label": "D",
+                        "stored_type": "link",
+                    }
+                ],
+            },
+        )
+        call(
+            f"/tables/{name}/batch",
+            {
+                "inserts": {"a": {"id": "a"}, "b": {"id": "b"}},
+                "graph_writes": [
+                    {
+                        "index_name": "links",
+                        "source": "a",
+                        "target": "b",
+                        "edge_type": "link",
+                        "edge_id": str(i),
+                        "metadata_json": json.dumps({"rank": i, "body": body}),
+                    }
+                    for i in range(16)
+                ],
+                "sync_level": "full_index",
+            },
+        )
+        prefix = "MATCH(a:D)-[r:R]->(b:D) WHERE antfly.documentKey(a)='a' RETURN "
+        for typed in (False, True):
+            if typed:
+                call(
+                    f"/graphs/{name}/query",
+                    {
+                        "query": "MATCH(a:D {id:'a'}),(b:D {id:'b'}) CREATE(a)-[r:R {rank:99,body:$body}]->(b) RETURN 1",
+                        "parameters": {"body": body},
+                        "write_request_id": uuid.uuid4().hex,
+                    },
+                )
+            expected_count, expected_sum = (17, 219) if typed else (16, 120)
+            for projection, expected in (
+                ("count(*)", expected_count),
+                ("count(r)", expected_count),
+                ("count(r.body)", expected_count),
+                ("sum(r.rank)", expected_sum),
+                ("sum(CASE WHEN r.body IS NOT NULL THEN 1 ELSE 0 END)", expected_count),
+            ):
+                result = call(
+                    f"/graphs/{name}/query",
+                    {
+                        "query": prefix + projection,
+                        "limits": {
+                            "memory_bytes": 1 << 20,
+                            "explored_edges": expected_count,
+                        },
+                    },
+                )
+                assert result["rows"] == [
+                    [{"type": "integer", "value": str(expected)}]
+                ], result
+                assert result["stats"]["explored_edges"] == expected_count, result
+                assert result["stats"]["memory_bytes"] < 1 << 20, result
+                print(
+                    json.dumps(
+                        {
+                            "edge_demand": projection,
+                            "typed": typed,
+                            "stats": result["stats"],
+                        },
+                        sort_keys=True,
+                    )
+                )
+            complete = call(
+                f"/graphs/{name}/query",
+                {"query": prefix + "r LIMIT 1", "limits": {"memory_bytes": 32 << 20}},
+            )
+            properties = complete["rows"][0][0]["value"]["properties"]["value"]
+            assert properties["body"] == {"type": "string", "value": body}, complete
+        denied = session.post(
+            base + f"/graphs/{name}/query",
+            json={"query": prefix + "count(*)", "limits": {"explored_edges": 16}},
+            timeout=45,
+        )
+        assert (
+            denied.status_code == 429
+            and denied.json().get("code") == "CypherEdgeBudgetExceeded"
+        ), denied.text
+    finally:
+        session.close()
         server.stop()

@@ -17,4 +17,6 @@
 pub const antfly_sources = @import("source_owner_storage.zig");
 test {
     _ = @import("storage/db/query/graph_exec.zig");
+    _ = @import("storage/db/query/cypher_projection.zig");
+    _ = @import("graph/graph.zig");
 }

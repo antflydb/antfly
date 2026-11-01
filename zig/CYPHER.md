@@ -5219,3 +5219,64 @@ work bounds; they do not claim latency improvements from Debug builds.
 
 This change includes `origin/main` at `97945ad58e`, merged as `e94a10b854` before
 implementation.
+
+### Ordinary read demand and borrowed relationship projection
+
+Read-only execution now derives a shared statement-wide demand certificate for
+node properties, relationship properties, and observable catalog memberships.
+Each property is either a complete value or presence-only. Direct `IS NULL`,
+`IS NOT NULL`, and non-distinct `COUNT(entity.property)` can use presence; any
+actual-valued observer upgrades that property for the entire statement. Aliases,
+subqueries, pattern comprehensions, search, unions, and whole entity/path returns
+participate in the same analysis. Keeping this union statement-wide preserves
+the runtime's identity cache contract across different bindings of one entity.
+
+Unused catalog predicates no longer force ordinary scans to read their fields.
+Explicit labels and relationship endpoint labels retain their predicates;
+unlabeled scans and search retain a complete membership cover for each table.
+`labels()` and returned nodes/paths restore complete catalog membership. The
+retained graph and its authorization scope remain complete; membership pruning
+uses a local view only after the storage authority certifies projected reads.
+Adapters without that certificate continue using the conservative field hint.
+
+Document spans and relational cells can supply private true/null presence views
+without decoding wide strings or containers. Membership predicate dependencies
+retain real values. These views are internal compiler-to-storage inputs, travel
+through pinned, distributed, and RPC reads, and are disabled when transaction
+preimages or writes require complete entities. Public JSON contracts are
+unchanged.
+
+Relationship demand is applied to borrowed winner metadata before constructing
+an owned adjacency page. Namespace headers are checked before property conversion;
+native metadata and exact private mutation envelopes retain their distinct
+decoding rules, including synthetic native weight. Projection retains syntax,
+duplicate-key, and demanded-value validation. Whole relationship consumers retain
+the original representation. Projected pages independently bound owned output,
+selected input bytes, and physical scan progress; the first selected input may
+exceed the soft input quantum to guarantee continuation progress. The public
+graph paging APIs retain identity projection by default.
+
+On the 32-row authenticated wide-record fixture, adding an unused label predicate
+on the 512 KiB escaped body no longer exhausts either a 1 MiB memory ceiling or
+the work budget for ordinary reads. With that label present, `SUM(1)` peaks at
+64,146 bytes for documents and 257,112 bytes for relational rows. Ordinary
+`SUM(CASE WHEN n.body IS NOT NULL THEN 1 ELSE 0 END)` peaks at 238,434 and 401,668
+bytes respectively, while examining all 32 anchors. Alias, missing/null,
+actual-value, complete-label, and filtered-reader controls pass alongside these
+cases.
+
+For 16 native edges with an unused 128 KiB body per edge, `COUNT(*)` peaks at
+212,527 bytes instead of the previously measured 7,878,064 bytes. `SUM(r.rank)`
+uses 213,507 bytes and ordinary relationship nullness uses 214,071 bytes. The
+same queries also pass after adding a Cypher-written private-envelope edge, with
+exact 17-edge accounting; a 16-edge ceiling rejects that query. Complete
+relationship returns preserve the full body. These CPU Debug results qualify
+allocation and work bounds, without making latency claims.
+
+This follow-up also merges `origin/main` at `761ae62410`. The Go SDK is regenerated
+from the merged schema to resolve the compressed embedded-spec conflict.
+
+Verification covers 543 Cypher core tests, five authenticated performance
+campaigns, the portable embedded host, borrowed projection and allocation-failure
+tests, adjacency owner/TTL/continuation tests, and the independent runtime scan
+sink error-domain tests. The merged Go SDK passes `go test ./...`.

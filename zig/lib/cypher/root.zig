@@ -67,3 +67,9 @@ test {
     _ = bounded_json;
     _ = regex;
 }
+
+pub const read_fields = @import("read_fields.zig");
+
+test {
+    _ = @import("read_fields_test.zig");
+}

@@ -57,7 +57,7 @@ pub fn Host(comptime DB: type) type {
             proofs: []const tracking.Proof = &.{},
             next_entity: u64 = 0,
             pub fn pinnedBackend(self: *Statement) cypher.backend.Backend {
-                return .{ .ptr = self, .vtable = &.{ .prefer_count_nodes = true, .count_nodes = pinnedCount, .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .scan_ordered = pinnedScanOrdered, .estimate_where = pinnedEstimateWhere, .probe_where = pinnedProbeWhere, .get = pinnedGet, .get_many = pinnedGetMany, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
+                return .{ .ptr = self, .vtable = &.{ .prefer_count_nodes = true, .count_nodes = pinnedCount, .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .scan_ordered = pinnedScanOrdered, .estimate_where = pinnedEstimateWhere, .probe_where = pinnedProbeWhere, .get = pinnedGet, .get_many = pinnedGetMany, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .set_read_demand = pinnedReadDemand, .normalize_node = normalize, .document_relationships = documentRelationships } };
             }
             fn pinnedBind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
                 const backend = cast(ptr).adapter.backend();
@@ -66,6 +66,10 @@ pub fn Host(comptime DB: type) type {
             fn pinnedWork(ptr: *anyopaque, work: ?cypher.backend.Work) void {
                 const backend = cast(ptr).adapter.backend();
                 backend.vtable.set_work.?(backend.ptr, work);
+            }
+            fn pinnedReadDemand(ptr: *anyopaque, demand: ?cypher.read_fields.Demand) void {
+                const backend = cast(ptr).adapter.backend();
+                backend.vtable.set_read_demand.?(backend.ptr, demand);
             }
             fn pinnedReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
                 const backend = cast(ptr).adapter.backend();
@@ -245,7 +249,7 @@ pub fn Host(comptime DB: type) type {
             statement.pinned = .{ .source = self.root, .core = self.root.core, .cut = try self.root.captureCypherPinnedSnapshot(owned, &fence, graph, self.table) };
             defer statement.pinned.cut.deinit();
             for (graph.labels, statement.tables) |label, *table| table.* = .{ .name = label.table, .db = &statement.pinned };
-            statement.adapter = .{ .tables = statement.tables, .ttl_now_ns = statement.pinned.cut.now, .authority = .{ .ptr = &statement, .bind = Statement.bind, .checkpoint = Statement.checkpoint, .project = Statement.project, .project_relationship = Statement.projectRelationship, .storage_projection = true, .ordered_projection = true } };
+            statement.adapter = .{ .tables = statement.tables, .ttl_now_ns = statement.pinned.cut.now, .authority = .{ .ptr = &statement, .bind = Statement.bind, .checkpoint = Statement.checkpoint, .project = Statement.project, .project_stored = Statement.project, .prepare_metadata = @import("db/query/cypher_projection.zig").prepareMetadata, .project_relationship = Statement.projectRelationship, .storage_projection = true, .ordered_projection = true } };
             if (writes) {
                 var txn = try self.root.core.store.beginReadTxn();
                 defer txn.abort();
