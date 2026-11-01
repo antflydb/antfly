@@ -4053,3 +4053,48 @@ are included whenever that comparison crosses the same material-cost rule.
 | original-wide-large / full | -33.6% [-35.2, -32.4] | -26.4% [-28.0, -25.1] |
 | original-wide-large / conditional | -2.3% [-3.5, -1.2] | -0.4% [-2.4, +1.6] |
 | original-wide-large / reference | -0.2% [-1.5, +1.8] | -0.3% [-1.5, +1.6] |
+
+
+### Qualification after the latest main integration
+
+Merge `808b9907862c` includes main `a3b0410c9f1a` and retains both the
+upstream column projection cache and native envelope delivery at their shared
+encoding boundary. The merged optimized contracts/server build passes
+**144/144 steps**. Custom suites report **226 query**, **33 provider**,
+**57 compiled-owner**, **84 gateway** (two optional skips), and
+**45 provisioned-source** cases without failures or leaks. One provider
+fixture initially encountered a sandbox-localhost 502; the same compiled
+suite passes 33/33 with localhost enabled, and the complete cached release
+build then passes. No source change was required for that fixture.
+
+The merged CLI build passes **7/7 steps**. Real HTTP indexed/segmented
+transport integration passes **67 tests**, with seven optional profiling
+skips. Separate concurrent native-media attribution records one verification,
+three proof hits, four native results/views, twelve witnesses and zero
+canonical-byte comparisons per request; two requests record two/three
+flight waits. This checks attribution and correctness, not balanced elapsed
+performance after integration.
+
+The merged focused reader build passes **71/71 steps** and **206/206
+standard tests**, plus the actual Lite/LSM hydration fixture (one passed,
+zero failures or leaks). Retained snapshots survive updates/deletes; mixed
+legacy/current rows, duplicate order, allocation failures and soft byte
+windows are covered. For its 1,048,605-byte source, scoped primary backing
+reads are zero bytes on LSM and 40,960 on Lite; scoped allocator peaks are
+3,826 and 28,276 bytes respectively. These are fixture-local counters, not
+process RSS or elapsed-performance comparisons.
+
+The merged server SHA-256 is
+`d88434da226d0a8c1745e542d6862c39759ba8331f627adbe112ddf1d40d9768`
+(233,745,720 bytes). The CLI remains byte-identical at
+`e8f7f1ec76751de7cf1fc9157cc9d50a0d2ce41e795d9dfb32d8c18b28caaf25`
+(7,596,584 bytes). Both use pinned Zig 0.17, ReleaseFast and stripping.
+Native/Python source hashes and actual binary hashes are verified against
+the integration manifest. Formatting, license headers, Apache boundary
+validation (2,351 source files), and the storage control catalog pass.
+
+The balanced performance tables above remain pinned to measured candidate
+`1b9f74ed7c88` on main `97945ad58e`; they are not measurements of the newer
+merged executable. Public API and primary persisted layout are unchanged by
+this follow-up. Raw manifests, reports and logs remain ignored. Full GitHub
+CI remains subject to the repository's human approval gate.
