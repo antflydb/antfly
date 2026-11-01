@@ -11460,6 +11460,14 @@ pub const NativeFile = struct {
         self.allocator_verification_base = null;
     }
 
+    /// Bind and sync an exclusively owned, unpublished image before a caller's
+    /// atomic rename. No readers may borrow this inode during preparation.
+    pub fn preparePrivatePublication(self: *NativeFile, destination_path: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+        try self.bindPrivateEpochNamespace(destination_path);
+        try self.syncIfRequired();
+    }
+
     /// Atomically publishes a fully built Lite generation into this file and
     /// adopts its already-open descriptor. The destination writer lock stays
     /// with `self`; `prepared` receives the retired descriptor and can be
@@ -11469,8 +11477,7 @@ pub const NativeFile = struct {
         if (std.mem.eql(u8, self.path, prepared.path)) return error.InvalidNativeSnapshotPath;
 
         const io = self.runtimeIo();
-        try prepared.bindPrivateEpochNamespace(self.path);
-        try prepared.syncIfRequired();
+        try prepared.preparePrivatePublication(self.path);
         try renameFilePath(io, prepared.path, self.path);
 
         std.mem.swap(std.Io.File, &self.file, &prepared.file);

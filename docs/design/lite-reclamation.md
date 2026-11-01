@@ -601,7 +601,7 @@ unmatched namespace cannot promote retirement or reuse pages. This remains true
 when a link was created after a reader registered, the original name was removed,
 or its parent directory was recreated. Marker creation, scanning and close use
 captured directory descriptors so parent renames cannot redirect those operations.
-New private snapshots and replacement generations bind their final destination
+New private snapshots, portable restores, and replacement generations bind their final destination
 before the existing sync/rename barriers; a matching checked allocator seal can
 be retargeted without changing ownership. A manual filesystem move/copy may fall
 back to inode fencing until a private generation rewrite establishes its new

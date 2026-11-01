@@ -3778,6 +3778,15 @@ pub fn restorePortableSourceToLiteFile(
 
     if (cancel) |token| try token.check();
 
+    {
+        // The populated temporary inode has no remaining borrowers. Bind its
+        // epoch authority to the final name before the rename commit point;
+        // publishing the temporary namespace would disable reuse after restore.
+        var prepared = try antfly.lite.native.NativeFile.openWithIo(alloc, io, tmp_path, .{ .externally_locked = true });
+        defer prepared.close();
+        try prepared.preparePrivatePublication(dest_path);
+    }
+
     capiRenameFilePath(io, tmp_path, dest_path) catch |err| {
         capiDeleteFilePath(io, tmp_path) catch {};
         return err;
