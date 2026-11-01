@@ -343,8 +343,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_imports.configure(b, test_mod.*, true, true);
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
-    const review_cdc_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[7], .filters = &.{"metadata.replication_backfill."} });
-    b.step("review-cdc-test", "Review CDC tests").dependOn(&b.addRunArtifact(review_cdc_tests).step);
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
     const media_status_owners = [_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[2], api_http_runtime_test_mod };
     const media_status_filters = [_][]const []const u8{ &.{"runtime status"}, &.{"runtime status output counters"}, &.{ "runtime status media output counters", "index encoders expose local shard runtime status" } };
