@@ -77,9 +77,8 @@ fn appendInteger(a: std.mem.Allocator, out: *std.ArrayList(u8), value: i64) !voi
     while (bits >= 128) : (bits >>= 7) try out.append(a, @as(u8, @truncate(bits)) | 128);
     try out.append(a, @intCast(bits));
 }
-fn encodeValue(a: std.mem.Allocator, out: *std.ArrayList(u8), value: Json, depth: usize) anyerror!void {
-    if (depth > 64) return error.SqlProgramLimitExceeded;
-    const tag: WireTag = switch (value) {
+fn wireTag(value: Json) WireTag {
+    return switch (value) {
         .null => .nil,
         .bool => |v| if (v) .yes else .no,
         .integer => .integer,
@@ -100,6 +99,53 @@ fn encodeValue(a: std.mem.Allocator, out: *std.ArrayList(u8), value: Json, depth
             };
         },
     };
+}
+/// Allocation-free exact AJV1 size. Build admission and segment splitting use
+/// the same tags as the encoder, without constructing a transient JSON row.
+pub fn encodedSize(value: Json) !u64 {
+    return try valueSize(value, 0) + 4;
+}
+fn integerSize(value: i64) u64 {
+    var bits: u64 = @as(u64, @bitCast(value << 1)) ^ @as(u64, @bitCast(value >> 63));
+    var size: u64 = 1;
+    while (bits >= 128) : (bits >>= 7) size += 1;
+    return size;
+}
+fn textSize(text: []const u8) !u64 {
+    _ = std.math.cast(u32, text.len) orelse return error.SqlProgramLimitExceeded;
+    return 4 + @as(u64, @intCast(text.len));
+}
+fn valueSize(value: Json, depth: usize) anyerror!u64 {
+    if (depth > 64) return error.SqlProgramLimitExceeded;
+    var size: u64 = 1;
+    switch (value) {
+        .null, .bool => {},
+        .integer => |v| size += integerSize(v),
+        .float => size += 8,
+        .string, .number_string => |v| size += try textSize(v),
+        .object => |v| {
+            _ = std.math.cast(u32, v.count()) orelse return error.SqlProgramLimitExceeded;
+            size += 4;
+            for (v.keys(), v.values()) |key, item| size = try std.math.add(u64, size, try textSize(key) + try valueSize(item, depth + 1));
+        },
+        .array => |v| {
+            _ = std.math.cast(u32, v.items.len) orelse return error.SqlProgramLimitExceeded;
+            size += 4;
+            const tag = wireTag(value);
+            for (v.items) |item| size = try std.math.add(u64, size, switch (tag) {
+                .integers => integerSize(item.integer),
+                .floats => 8,
+                .bools => 1,
+                .nulls => 0,
+                else => try valueSize(item, depth + 1),
+            });
+        },
+    }
+    return size;
+}
+fn encodeValue(a: std.mem.Allocator, out: *std.ArrayList(u8), value: Json, depth: usize) anyerror!void {
+    if (depth > 64) return error.SqlProgramLimitExceeded;
+    const tag = wireTag(value);
     try out.append(a, @backingInt(tag));
     switch (value) {
         .null, .bool => {},
@@ -134,11 +180,21 @@ pub fn decodeBinary(a: std.mem.Allocator, bytes: []const u8) !Json {
     if (reader.at != bytes.len) return error.InvalidTypedJson;
     return value;
 }
+/// Strings and object keys borrow the authenticated encoded chunk. The caller
+/// must retain its lease until every value/container allocated in `a` is retired.
+pub fn decodeBinaryBorrowed(a: std.mem.Allocator, bytes: []const u8) !Json {
+    if (!std.mem.startsWith(u8, bytes, "AJV1")) return error.InvalidTypedJson;
+    var reader: BinaryReader = .{ .a = a, .bytes = bytes, .at = 4, .borrow_text = true };
+    const value = try reader.value(0);
+    if (reader.at != bytes.len) return error.InvalidTypedJson;
+    return value;
+}
 const BinaryReader = struct {
     a: std.mem.Allocator,
     bytes: []const u8,
     at: usize,
     remaining_values: usize = 4 * 1024 * 1024,
+    borrow_text: bool = false,
     fn take(self: *@This(), n: usize) ![]const u8 {
         if (n > self.bytes.len - self.at) return error.InvalidTypedJson;
         defer self.at += n;
@@ -149,7 +205,8 @@ const BinaryReader = struct {
     }
     fn text(self: *@This()) ![]const u8 {
         const length = try self.int(u32);
-        return self.a.dupe(u8, try self.take(length));
+        const bytes = try self.take(length);
+        return if (self.borrow_text) bytes else self.a.dupe(u8, bytes);
     }
     fn integer(self: *@This()) !i64 {
         var bits: u64 = 0;
@@ -226,4 +283,23 @@ test "external lake bounded WAL typed JSON binary preserves numeric identity and
     for (0..bytes.len) |end| try std.testing.expectError(error.InvalidTypedJson, decodeBinary(a, bytes[0..end]));
     try std.testing.expectError(error.InvalidTypedJson, decodeBinary(a, "AJV1\x07\xff\xff\xff\xff"));
     try std.testing.expectError(error.InvalidTypedJson, decodeBinary(a, "AJV1\x0c\xff\xff\xff\xff"));
+}
+
+test "external lake bounded window profiles typed source sizing exactly matches native encoding" {
+    const a = std.testing.allocator;
+    const documents = [_][]const u8{
+        "null",                        "true",      "false",        "-9223372036854775808", "9223372036854775807", "0",                                                                           "1.5",
+        "[0,-1,128,9007199254740993]", "[1.5,2.5]", "[true,false]", "[null,null]",          "[]",                  "{\"text\":\"escaped \\u0000 \\n\",\"nested\":[null,1,\"two\",{\"k\":true}]}",
+    };
+    for (documents) |json| {
+        const parsed = try std.json.parseFromSlice(Json, a, json, .{});
+        defer parsed.deinit();
+        const encoded = try encodeBinary(a, parsed.value);
+        defer a.free(encoded);
+        try std.testing.expectEqual(@as(u64, @intCast(encoded.len)), try encodedSize(parsed.value));
+    }
+    const token: Json = .{ .number_string = "123456789012345678901234567890.1234" };
+    const encoded = try encodeBinary(a, token);
+    defer a.free(encoded);
+    try std.testing.expectEqual(@as(u64, @intCast(encoded.len)), try encodedSize(token));
 }

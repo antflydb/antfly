@@ -36,6 +36,7 @@ pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
     _ = @import("api/resolvers.zig");
+    _ = @import("api/managed_sources.zig");
     _ = @import("api/protected_future.zig");
     _ = @import("api/sql_connection_record.zig");
     _ = @import("api/sql_connections.zig");
@@ -83,13 +84,23 @@ test "system catalog routing and transport discovery" {
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
 test {
+    _ = @import("antfly_local_sources").section_source_capture;
     _ = @import("api/lake_sql_cursor.zig");
     _ = @import("api/native_query_repository.zig");
     _ = @import("api/lake_query_metrics.zig");
     _ = @import("api/lake_index_native_text.zig");
     _ = @import("api/lake_index_text_query.zig");
     _ = @import("api/lake_index_ordered_rows.zig");
+    _ = @import("api/lake_index_sort_stream.zig");
+    _ = @import("serverless/build/lake_build_limits.zig");
+    _ = @import("api/lake_index_coordinator.zig");
+    _ = @import("api/lake_index_sql_rows.zig");
+    _ = @import("api/sql_memory_owner.zig");
+    _ = @import("api/lake_artifact_ranges.zig");
     _ = @import("api/lake_index_text_statistics.zig");
+    _ = @import("api/lake_index_page_mutations.zig");
+    _ = @import("api/lake_row_identity_delta.zig");
+    _ = @import("api/lake_index_text_directory.zig");
     _ = @import("api/lake_index_seekable_text.zig");
     _ = @import("api/lake_index_text_opening_pack.zig");
 }

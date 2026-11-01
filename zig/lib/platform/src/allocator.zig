@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+pub const reclamation = @import("allocator_reclamation.zig");
 
 /// Checked backing for measured allocation-heavy test fixtures. Keep safety,
 /// poisoning and leak checks; capture successful allocation stacks on demand.

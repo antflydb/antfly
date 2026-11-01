@@ -195,6 +195,12 @@ class UnsupportedError(AntflyError):
 
 
 class StalledError(AntflyError):
+    """Derived work stalled; a batch's primary write may already be committed.
+
+    Inspect the error detail and pending-work diagnostics. Do not replay a
+    batch reported as committed; resume derived work instead.
+    """
+
     CODE = STALLED
 
 

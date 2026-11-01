@@ -38,8 +38,9 @@ export enum ErrorCode {
    */
   Unsupported = 8,
   /**
-   * A bounded drain such as runUntilIdle detected a managed index making no
-   * forward progress and gave up.
+   * Derived work stalled or failed. A batch may already have committed its
+   * primary write: inspect the error detail and pending-work diagnostics.
+   * Do not replay a batch reported as committed.
    */
   Stalled = 9,
   /**

@@ -5543,7 +5543,7 @@ pub fn replicationCutoverRetirementMatches(
         );
 }
 
-fn isExpectedCdcRoundError(err: anyerror) bool {
+pub fn isExpectedCdcRoundError(err: anyerror) bool {
     return switch (err) {
         error.UnknownReplicationSource,
         error.UnsupportedReplicationSource,
@@ -5817,6 +5817,17 @@ pub const MetadataService = struct {
     store_status_backfill_marker_cache: StoreStatusBackfillMarkerCache = .{},
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
+    // Resume points for the snapshot and streaming backfill coordinators,
+    // carried across rounds on this leader so a source stuck past its
+    // round's quantum does not starve sources later in the table/source
+    // list every round (see replication_backfill.SourceRoundCursor).
+    // In-memory scheduling state only: it resets on restart or on a
+    // leadership change (a new MetadataService), which is fine -- the
+    // worst case is one extra round at the old resume order, not lost
+    // replication work. Guarded by `cdc_runtime_mutex`, the same lock that
+    // already serializes this leader's other CDC round state.
+    cdc_snapshot_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
+    cdc_streaming_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
@@ -8395,19 +8406,18 @@ pub const MetadataService = struct {
         write_source.backend_runtime = runtime;
         _ = write_source.withSecretStore(self.secret_store);
         _ = write_source.withDestinationAuthorization(self.destination_authorizer);
-        var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
+        var cursors = loadCdcCursors(self);
+        defer storeCdcCursors(self, cursors);
+
+        const summary = metadata_replication_backfill.runSnapshotRound(self.alloc, self, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = runtime.io() orelse std.Options.debug_io,
-                .registry = &self.cdc_backfill_registry,
-                .write_source = write_source.source(),
-                .secret_store = self.secret_store,
-                .work_permit = cdcWorkPermit(self),
-                .destination_authorizer = self.destination_authorizer,
-            },
-        };
-        const summary = coordinator.runRound(self) catch |err| {
+            .io = runtime.io() orelse std.Options.debug_io,
+            .registry = &self.cdc_backfill_registry,
+            .write_source = write_source.source(),
+            .secret_store = self.secret_store,
+            .work_permit = cdcWorkPermit(self),
+            .destination_authorizer = self.destination_authorizer,
+        }, metadata_replication_backfill.default_runtime_quantum_ns, &cursors.snapshot) catch |err| {
             if (!isExpectedCdcRoundError(err)) return err;
             std.log.warn("metadata cdc snapshot round skipped: {s}", .{@errorName(err)});
             return;
@@ -8425,19 +8435,15 @@ pub const MetadataService = struct {
                 },
             );
         }
-        var streaming = metadata_replication_backfill.StreamingReplicationCoordinator{
+        const stream_summary = metadata_replication_backfill.runStreamingRound(self.alloc, self, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = runtime.io() orelse std.Options.debug_io,
-                .registry = &self.cdc_backfill_registry,
-                .write_source = write_source.source(),
-                .secret_store = self.secret_store,
-                .work_permit = cdcWorkPermit(self),
-                .destination_authorizer = self.destination_authorizer,
-            },
-        };
-        const stream_summary = streaming.runRound(self) catch |err| {
+            .io = runtime.io() orelse std.Options.debug_io,
+            .registry = &self.cdc_backfill_registry,
+            .write_source = write_source.source(),
+            .secret_store = self.secret_store,
+            .work_permit = cdcWorkPermit(self),
+            .destination_authorizer = self.destination_authorizer,
+        }, metadata_replication_backfill.default_runtime_quantum_ns, &cursors.streaming) catch |err| {
             if (!isExpectedCdcRoundError(err)) return err;
             std.log.warn("metadata cdc streaming round skipped: {s}", .{@errorName(err)});
             return;
@@ -8561,6 +8567,12 @@ pub const MetadataHttpService = struct {
     store_status_backfill_marker_cache: StoreStatusBackfillMarkerCache = .{},
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
+    // See MetadataService.cdc_snapshot_cursor / cdc_streaming_cursor: the
+    // same persisted-resume-point fix, guarded by the same
+    // `cdc_runtime_mutex` this struct already uses for its other CDC round
+    // state.
+    cdc_snapshot_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
+    cdc_streaming_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
@@ -13177,19 +13189,18 @@ pub const MetadataHttpService = struct {
         );
         _ = hosted_write_source.withDestinationAuthorization(self.destination_authorizer);
         const write_source = self.cdc_write_source_override orelse hosted_write_source.source();
-        var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
+        var cursors = loadCdcCursors(self);
+        defer storeCdcCursors(self, cursors);
+
+        const summary = metadata_replication_backfill.runSnapshotRound(self.alloc, self, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = runtime.io() orelse std.Options.debug_io,
-                .registry = &self.cdc_backfill_registry,
-                .write_source = write_source,
-                .secret_store = self.secret_store,
-                .work_permit = cdcWorkPermit(self),
-                .destination_authorizer = self.destination_authorizer,
-            },
-        };
-        const summary = coordinator.runRound(self) catch |err| {
+            .io = runtime.io() orelse std.Options.debug_io,
+            .registry = &self.cdc_backfill_registry,
+            .write_source = write_source,
+            .secret_store = self.secret_store,
+            .work_permit = cdcWorkPermit(self),
+            .destination_authorizer = self.destination_authorizer,
+        }, metadata_replication_backfill.default_runtime_quantum_ns, &cursors.snapshot) catch |err| {
             if (!isExpectedCdcRoundError(err)) return err;
             if (comptime builtin.is_test) {
                 std.debug.print("metadata http cdc snapshot round skipped: {s}\n", .{@errorName(err)});
@@ -13210,19 +13221,15 @@ pub const MetadataHttpService = struct {
                 },
             );
         }
-        var streaming = metadata_replication_backfill.StreamingReplicationCoordinator{
+        const stream_summary = metadata_replication_backfill.runStreamingRound(self.alloc, self, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = runtime.io() orelse std.Options.debug_io,
-                .registry = &self.cdc_backfill_registry,
-                .write_source = write_source,
-                .secret_store = self.secret_store,
-                .work_permit = cdcWorkPermit(self),
-                .destination_authorizer = self.destination_authorizer,
-            },
-        };
-        const stream_summary = streaming.runRound(self) catch |err| {
+            .io = runtime.io() orelse std.Options.debug_io,
+            .registry = &self.cdc_backfill_registry,
+            .write_source = write_source,
+            .secret_store = self.secret_store,
+            .work_permit = cdcWorkPermit(self),
+            .destination_authorizer = self.destination_authorizer,
+        }, metadata_replication_backfill.default_runtime_quantum_ns, &cursors.streaming) catch |err| {
             if (!isExpectedCdcRoundError(err)) return err;
             std.log.warn("metadata http cdc streaming round skipped: {s}", .{@errorName(err)});
             return;
@@ -14923,6 +14930,28 @@ test "metadata cdc provider quantum is bounded by observed lease remainder" {
         @as(u64, 5_000 * std.time.ns_per_ms / 3),
         try cdcProviderQuantumNs(5_000, 3_000),
     );
+}
+
+const CdcRoundCursors = struct {
+    snapshot: metadata_replication_backfill.SourceRoundCursor,
+    streaming: metadata_replication_backfill.SourceRoundCursor,
+};
+
+/// Read both round cursors under `cdc_runtime_mutex`, the same lock that
+/// already guards this leader's other CDC round state
+/// (`cdc_job_in_flight`, `cdc_next_round_at_ms`, ...).
+fn loadCdcCursors(service: anytype) CdcRoundCursors {
+    service.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+    defer service.cdc_runtime_mutex.unlock(std.Options.debug_io);
+    return .{ .snapshot = service.cdc_snapshot_cursor, .streaming = service.cdc_streaming_cursor };
+}
+
+/// Persist both round cursors after a round, under the same lock.
+fn storeCdcCursors(service: anytype, cursors: CdcRoundCursors) void {
+    service.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+    defer service.cdc_runtime_mutex.unlock(std.Options.debug_io);
+    service.cdc_snapshot_cursor = cursors.snapshot;
+    service.cdc_streaming_cursor = cursors.streaming;
 }
 
 fn cdcWorkPermit(service: anytype) metadata_replication_backfill.WorkPermit {

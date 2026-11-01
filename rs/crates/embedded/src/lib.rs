@@ -68,8 +68,8 @@ pub use transactions::{TxnId, TxnStatus};
 
 #[cfg(feature = "serde")]
 pub use maintenance::{
-    CheckReport, CompactReport, StableSnapshotReport, VacuumReport, check_file,
-    copy_stable_snapshot_file,
+    CheckReport, CompactReport, LiveByteAccounting, LiveByteCategory, StableSnapshotReport,
+    VacuumReport, check_file, copy_stable_snapshot_file,
 };
 #[cfg(feature = "serde")]
 pub use status::{

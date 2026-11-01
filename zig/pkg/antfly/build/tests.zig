@@ -459,6 +459,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "SQL pgwire native", "SQL stateless fallback" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const managed_sources_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"managed source"} });
+    b.step("antfly-api-managed-sources-test", "Run managed CDC source configuration and status contracts").dependOn(&addFilteredTestRunArtifact(b, managed_sources_tests).step);
     b.step("antfly-api-sql-native-cells-test", "Verify native SQL result cells and retained-read requirements")
         .dependOn(&addFilteredTestRunArtifact(b, sql_native_cells_tests).step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
@@ -1386,6 +1388,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "postgres libpq cancelled FIFO head hands capacity to next waiter",
         "postgres libpq idle reclamation transfers only missing capacity",
         "postgres libpq reclamation leaves permit scheduling responsive",
+        "postgres libpq connection-error sanitizer",
         "query embedding cache owns results and coalesces misses",
         "query embedding cache keys isolate security domains",
         "managed embedder deadlines bound provider pacing and transport",
@@ -3031,9 +3034,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const text_frontier_tests = b.addTest(.{
         .root_module = text_frontier_mod,
         .filters = selectTestFilters(b, &.{ "external lake global frontier", "external lake metadata navigation", "external lake bounded window profiles", "external lake exact segment admission", "external lake bounded transforms", "external lake bounded window lookahead", "external lake bounded WAL", "constant score" }),
-        // The combined real-file/cloud owner peaks near 10 GB under optimized
-        // codegen; declare headroom instead of compiling twice on RSS retry.
-        .max_rss = @as(usize, if (optimize == .debug) 8 else 12) * 1024 * 1024 * 1024,
+        // The full external-lake Debug selection measured 12.92 GB on macOS;
+        // optimized codegen peaks near 10 GB. Reserve compiler headroom so a
+        // broader test filter can run without a failed RSS admission/recompile.
+        .max_rss = @as(usize, if (optimize == .debug) (if (target.result.os.tag == .macos) 16 else 8) else 12) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-text-frontier-test", "Verify metadata-only global admission, score bounds, ties and bounded profile aggregation")
@@ -5137,6 +5141,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"system catalog standalone relation coordinator"},
     });
     b.step("antfly-standalone-pgwire-ddl-test", "Run standalone relation publication and guarded DDL tests").dependOn(&addFilteredTestRunArtifact(b, standalone_ddl_tests).step);
+    const standalone_cdc_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"standalone cdc"},
+    });
+    b.step("antfly-standalone-cdc-test", "Run standalone PostgreSQL CDC scheduling and status tests").dependOn(&addFilteredTestRunArtifact(b, standalone_cdc_tests).step);
 
     // This filter set boots the real CLI/standalone and Lite server paths
     // (HA, hot-standby, Lite adoption, ...), which reach the real
@@ -6374,7 +6383,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lite_merge_publication_runtime_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions" },
+        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions", "db manual text producers merge capacity without optional workers", "db bulk ingest keeps full text merge maintenance live", "db text merge structural pause rejects manual turns", "db text merge stop does not deadlock against a producer's assisted fallback", "text merge publication handoff releases index lease before global contention", "db delete full text index drains active merge before closing generation", "db close stops text admission before joining derived publishers", "db structural mutation autonomously retries transient maintenance restart failures" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-merge-publication-runtime-test", "Verify incremental merge publication handoff and shutdown")

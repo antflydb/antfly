@@ -26,8 +26,10 @@ pub const Context = struct {
     checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
     additional_checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
     pub fn ensureActive(self: Context) !void {
-        if (self.cancellation) |token| try token.check();
+        // The scoped deadline remains precise when an in-flight transport
+        // adapter reports that same expiration through a boolean callback.
         if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        if (self.cancellation) |token| try token.check();
         if (self.checkpoint) |hook| try hook.check(hook.ptr);
         if (self.additional_checkpoint) |hook| try hook.check(hook.ptr);
     }
@@ -161,4 +163,17 @@ test "external lake object requests reject cancellation and expired deadlines be
     signal.store(false, .release);
     store.context.deadline_ns = 0;
     try std.testing.expectError(error.DeadlineExceeded, client.statObject("bucket", "part"));
+}
+
+test "external lake bounded window profiles deadline identity survives flattened transport cancellation" {
+    const Bool = struct {
+        fn canceled(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    var state: u8 = 0;
+    const expired: Context = .{ .deadline_ns = 1, .cancellation = storage.CancellationToken.fromCallback(&state, Bool.canceled) };
+    try std.testing.expectError(error.DeadlineExceeded, expired.ensureActive());
+    const canceled_context: Context = .{ .cancellation = expired.cancellation };
+    try std.testing.expectError(error.Canceled, canceled_context.ensureActive());
 }

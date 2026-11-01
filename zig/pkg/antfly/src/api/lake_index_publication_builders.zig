@@ -783,8 +783,8 @@ test "external lake file-first publication shares one decode across five native 
     var bounded = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 1024 * 1024 });
     args.a = bounded.allocator();
     try std.testing.expect((try build(args)) == null);
-    try std.testing.expectEqual(@as(usize, 0), bounded.live_bytes);
-    try std.testing.expect(!bounded.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 0), bounded.liveBytes());
+    try std.testing.expect(!bounded.limitExceeded());
     args.a = a;
     var streaming_scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_bytes = 128 * 1024 * 1024 };
     args.scheduler = &streaming_scheduler;
@@ -895,7 +895,7 @@ test "external lake file-first publication shares one decode across five native 
         try std.testing.expectEqual(@as(usize, 1), limited.ordered.len);
         try std.testing.expect(limited_replay.captures < 21);
     }
-    try std.testing.expectEqual(@as(usize, 0), modest.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), modest.liveBytes());
     // At 248 MiB, including the new 8 MiB state sort, these consumers admit
     // the second source cursor while retaining single-batch backpressure.
     var borrowed_budget = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 248 * 1024 * 1024 });
@@ -921,8 +921,8 @@ test "external lake file-first publication shares one decode across five native 
         try std.testing.expectEqual(@as(u64, 12), borrowed_ordered.page.?.records);
         try std.testing.expectEqual(@as(usize, 0), borrowed_scheduler.workers);
     }
-    try std.testing.expectEqual(@as(usize, 0), borrowed_budget.live_bytes);
-    try std.testing.expect(!borrowed_budget.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 0), borrowed_budget.liveBytes());
+    try std.testing.expect(!borrowed_budget.limitExceeded());
     // A file larger than replay admission streams ordinarily. Every consumer
     // still receives all rows and no reader pins the failed temporary replay.
     replay.max_spill_bytes = 1;

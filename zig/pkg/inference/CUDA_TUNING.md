@@ -220,17 +220,20 @@ is an optimization gap and does not fail the semantic model check. The
 means every emitted signature probe resolved, not that every possible runtime
 route is promoted.
 
-The checked-in exact catalog currently targets CUDA `sm_89` only. Its scope is
+The checked-in catalog currently records CUDA `sm_89` benchmark evidence. Its scope is
 selected Q4_0 and Q4_K row-1 matmuls, Q4_0 x Q8_1 fused FFN shapes, Q6_K x
 Q8_1 K=2560 and K=3840 tile-argmax candidates, and Gemma 4 decode-attention
 topologies. In the merged unified generated-artifact registry, 21 CUDA entries
 are non-promoted; no single Q4_K route represents the remaining candidate set.
 The generated Q4 runtime routes are default-off. When a route is explicitly
-enabled, it is target-guarded to SM89; other compute capabilities use the
-handwritten fallback even when their code objects are present in the fatbin.
-Development experiments can bypass this target and promotion guard with
-`ANTFLY_INFERENCE_CUDA_ALLOW_UNPROMOTED_GENERATED_KERNELS=1`; results from that
-mode are not production evidence.
+enabled, execution follows the renderer's typed instruction/layout contract,
+loaded symbols, supported shapes and resource bounds. Portable SIMT routes
+support SM75+ without relabeling SM89 benchmark evidence as measurements on
+other GPUs. Generated Flash-prefill implementations that index opaque WMMA
+fragments retain their actual layout restriction. Unsupported contracts use the
+handwritten CUDA fallback. There is no device/promotion bypass environment
+variable; candidate promotion and explicit runtime controls remain independent
+of execution compatibility.
 `production_enabled` records benchmark qualification; it does not imply
 runtime-default dispatch. The five qualified Q4_0 routes require their positive
 runtime opt-ins, and the master disable gate remains authoritative. The
