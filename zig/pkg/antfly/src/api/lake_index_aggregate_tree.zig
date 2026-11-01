@@ -139,41 +139,48 @@ fn differences(a: A, backing: tree.Store, left: ?tree.Ref, right: ?tree.Ref, vis
 /// Zip routing intervals rather than child positions. Splits, merges and a new
 /// minimum key may change fences while retaining nearly every child reference.
 fn differencesRange(a: A, backing: tree.Store, left: ?tree.Ref, right: ?tree.Ref, lower: []const u8, upper: ?[]const u8, visitor: anytype) anyerror!void {
+    return differencesViews(a, backing, left, right, tree.KeyView.from(lower), if (upper) |bound| tree.KeyView.from(bound) else null, visitor);
+}
+fn differencesViews(a: A, backing: tree.Store, left: ?tree.Ref, right: ?tree.Ref, lower: tree.KeyView, upper: ?tree.KeyView, visitor: anytype) anyerror!void {
     try backing.check(backing.ptr);
     if (same(left, right)) return;
-    var lp: ?tree.Page = if (left != null and left.?.height != 0) try tree.readPage(a, backing, left.?) else null;
+    var lp: ?tree.NavigationPage = if (left != null and left.?.height != 0) try tree.readNavigationPage(a, backing, left.?) else null;
     defer if (lp) |*page| page.deinit(a);
-    var rp: ?tree.Page = if (right != null and right.?.height != 0) try tree.readPage(a, backing, right.?) else null;
+    var rp: ?tree.NavigationPage = if (right != null and right.?.height != 0) try tree.readNavigationPage(a, backing, right.?) else null;
     defer if (rp) |*page| page.deinit(a);
     if (lp != null or rp != null) {
         var li: usize = 0;
         var ri: usize = 0;
         var begin = lower;
         while (true) {
-            if (lp) |page| while (li + 1 < page.entries.len and std.mem.order(u8, page.entries[li + 1].key, begin) != .gt) {
+            if (lp) |page| while (li + 1 < page.entries.len and page.key(li + 1).order(begin) != .gt) {
                 li += 1;
             };
-            if (rp) |page| while (ri + 1 < page.entries.len and std.mem.order(u8, page.entries[ri + 1].key, begin) != .gt) {
+            if (rp) |page| while (ri + 1 < page.entries.len and page.key(ri + 1).order(begin) != .gt) {
                 ri += 1;
             };
             var end = upper;
             if (lp) |page| if (li + 1 < page.entries.len) {
-                const fence = page.entries[li + 1].key;
-                if (end == null or std.mem.order(u8, fence, end.?) == .lt) end = fence;
+                const fence = page.key(li + 1);
+                if (end == null or fence.order(end.?) == .lt) end = fence;
             };
             if (rp) |page| if (ri + 1 < page.entries.len) {
-                const fence = page.entries[ri + 1].key;
-                if (end == null or std.mem.order(u8, fence, end.?) == .lt) end = fence;
+                const fence = page.key(ri + 1);
+                if (end == null or fence.order(end.?) == .lt) end = fence;
             };
-            try differencesRange(a, backing, if (lp) |page| page.entries[li].valueEntry().child else left, if (rp) |page| page.entries[ri].valueEntry().child else right, begin, end, visitor);
-            if (end == null or (upper != null and std.mem.eql(u8, end.?, upper.?))) break;
+            try differencesViews(a, backing, if (lp) |page| page.entries[li].valueEntry().child else left, if (rp) |page| page.entries[ri].valueEntry().child else right, begin, end, visitor);
+            if (end == null or (upper != null and end.?.order(upper.?) == .eq)) break;
             begin = end.?;
         }
         return;
     }
-    var lc = try tree.Cursor.init(a, backing, left, lower, upper);
+    const lower_bytes = try lower.dupe(a);
+    defer a.free(lower_bytes);
+    const upper_bytes = if (upper) |bound| try bound.dupe(a) else null;
+    defer if (upper_bytes) |bytes| a.free(bytes);
+    var lc = try tree.Cursor.init(a, backing, left, lower_bytes, upper_bytes);
     defer lc.deinit();
-    var rc = try tree.Cursor.init(a, backing, right, lower, upper);
+    var rc = try tree.Cursor.init(a, backing, right, lower_bytes, upper_bytes);
     defer rc.deinit();
     var l = try lc.next();
     var r = try rc.next();
@@ -317,7 +324,7 @@ fn incremental(a: A, backing: tree.Store, recipe: Recipe, left: Index, right: In
     return .{ .domain = left.domain, .layout = 2, .page = root };
 }
 
-test "external lake aggregate interval differences skip retained pages across fences splits and height changes" {
+test "external lake metadata navigation aggregate interval differences skip retained pages across fences splits and height changes" {
     const a = std.testing.allocator;
     var memory: tree.testing.MemoryStore = .{ .alloc = a };
     defer memory.deinit();
@@ -367,7 +374,7 @@ test "external lake aggregate interval differences skip retained pages across fe
     try std.testing.expect(memory.reads - before <= 1);
 }
 
-test "external lake aggregate incremental batches retain absent-key successors and exact old snapshots" {
+test "external lake metadata navigation aggregate incremental batches retain absent-key successors and exact old snapshots" {
     const a = std.testing.allocator;
     var memory: tree.testing.MemoryStore = .{ .alloc = a };
     defer memory.deinit();

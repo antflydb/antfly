@@ -71,13 +71,13 @@ def test_separate_object_tables_and_scoped_cloud_keys():
         native_plan("antfly-showcases", "invalid", current)
 
 
-def test_first_boot_uses_exact_rc7_and_rejects_stale_or_unverified_images():
+def test_first_boot_uses_exact_rc8_and_rejects_stale_or_unverified_images():
     request = management_plan("antfly-showcases")["create-instance.json"]
     assert (
         request["tier"] == "standard"
     )  # Starter forbids the supplied custom capacity.
     assert request["initial_runtime"] == {
-        "version": "v0.3.0-rc.7",
+        "version": "v0.3.0-rc.8",
         "image": RUNTIME["image"],
         "image_digest": RUNTIME["image"].split("@")[1],
     }
@@ -95,7 +95,7 @@ def test_first_boot_uses_exact_rc7_and_rejects_stale_or_unverified_images():
         "ghcr.io/antflydb/antfly@sha256:" + "a" * 64,
         "ghcr.io/antflydb/antfly:v0.3.0-rc.5@" + digest,
     ):
-        with pytest.raises(ValueError, match="RC.7"):
+        with pytest.raises(ValueError, match="RC.8"):
             management_plan("antfly-showcases", image)
 
 

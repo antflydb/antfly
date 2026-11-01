@@ -619,3 +619,35 @@ def test_sql_sessions_own_native_arrays_and_numeric_pages_across_reopen(tmp_path
                 assert session.execute("SELECT id FROM items WHERE tags=ARRAY['pending']")["rows"] == [["1"]]
                 session.execute("COMMIT")
                 assert len(second.sql("SELECT id,n,tags FROM items")["rows"]) == 2
+
+
+@pytest.mark.parametrize("filename_bytes", [247, 250])
+def test_long_database_filename_with_reader_epochs(tmp_path: Path, filename_bytes: int) -> None:
+    path = tmp_path / ("d" * (filename_bytes - len(".aflite")) + ".aflite")
+    assert len(path.name.encode()) == filename_bytes
+    with antfly_embedded.create(path, no_sync=True) as db:
+        db.batch_json({"inserts": {"doc": {"text": "alpha", "value": 1}}})
+        db.run_until_idle()
+        assert db.lookup("doc")["value"] == 1
+    with antfly_embedded.open(path, no_sync=True) as db:
+        assert db.lookup("doc")["value"] == 1
+        db.batch_json({"inserts": {"doc": {"text": "beta", "value": 2}}})
+        db.run_until_idle()
+        assert db.lookup("doc")["value"] == 2
+        assert db.check()["valid"] is True
+
+
+def test_portable_restore_retains_reader_epoch_page_reuse(tmp_path: Path) -> None:
+    with antfly_embedded.create(tmp_path / "source.aflite", no_sync=True) as source:
+        source.batch_json({"inserts": {"doc": {"payload": "x" * 8192, "value": 0}}})
+        backup = source.backup()
+    path = tmp_path / "restored.aflite"
+    antfly_embedded.restore(path, backup, storage=antfly_embedded.Storage.LITE)
+    with antfly_embedded.open(path, no_sync=True) as restored:
+        for value in range(80):
+            restored.batch_json({"inserts": {"doc": {"payload": "x" * 8192, "value": value}}})
+        assert restored.status()["storage"]["reclamation"]["reused_pages"] > 0
+        assert restored.lookup("doc")["value"] == 79
+        assert restored.check()["valid"] is True
+    with antfly_embedded.open(path, no_sync=True) as restored:
+        assert restored.lookup("doc")["value"] == 79

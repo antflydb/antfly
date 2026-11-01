@@ -289,7 +289,7 @@ fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !v
 }
 
 const CatalogWrite = struct {
-    kind: enum { put, append, rename, delete, sync },
+    kind: enum { put, append, rename, delete },
     path: []const u8,
     value: []const u8 = "",
     fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
@@ -299,7 +299,6 @@ const CatalogWrite = struct {
             .append => try file.appendIndexCatalogRecord(self.path, self.value),
             .rename => try file.renameIndexCatalogRecord(self.path, self.value),
             .delete => try file.deleteIndexCatalogRecord(self.path),
-            .sync => try file.sync(),
         }
     }
 };
@@ -492,8 +491,7 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
 fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var mutation = CatalogWrite{ .kind = .sync, .path = path };
-    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
+    try self.docs.syncIndexContents();
 }
 
 fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -2254,6 +2252,81 @@ test "lite artifact leases survive owner close and do not pin document retiremen
     defer cursor.deinit();
     try std.testing.expect((try cursor.next()) == null);
     try std.testing.expect((try reopened.checkWithCancel(null)).valid);
+}
+
+test "lite artifact leases close without reentering writer admission" {
+    const Admission = struct {
+        calls: usize = 0,
+        fn enter(ptr: *anyopaque, _: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.FileBusy;
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "source-close-no-admission.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    try adapter.storage().writeFileAbsolute("/segment", "immutable");
+    var source = try docs.openArtifactSource("/segment");
+    defer source.close();
+    var admission: Admission = .{};
+    docs.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    source.close();
+    docs.writer_admission = null;
+    try std.testing.expectEqual(@as(usize, 0), admission.calls);
+    try docs.maintainOnce(false);
+    var cursor = try docs.file.metadataCatalogCursor(docs.file.activeCheckpoint(), native.NativeFile.artifact_lease_key_prefix);
+    defer cursor.deinit();
+    try std.testing.expect((try cursor.next()) == null);
+}
+
+test "lite artifact leases share immutable inputs across serving owners without publication" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "shared-source.aflite");
+    defer a.free(path);
+    var first = try docstore.Store.createWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    var first_open = true;
+    defer if (first_open) first.close();
+    first.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &first);
+    const payload: [32768]u8 = @splat('a');
+    try adapter.storage().writeFileAbsolute("/segment", &payload);
+    var one = try first.openArtifactSource("/segment");
+    defer one.close();
+    var second = try docstore.Store.openWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    defer second.close();
+    second.maintenance_start_suppressed = true;
+    const before = second.file.header;
+    var two = try second.openArtifactSource("/segment");
+    defer two.close();
+    try std.testing.expectEqual(one.ranges.ptr, two.ranges.ptr);
+    try std.testing.expectEqualDeep(before, second.file.header);
+    one.enableIdleExpiry();
+    first.close();
+    first_open = false;
+    var out: [64]u8 = undefined;
+    try two.readInto(123, &out);
+    try std.testing.expectEqualSlices(u8, payload[123..][0..out.len], &out);
+    // Reusing the pathname with different content must create a new source.
+    var second_adapter = Store.init(a, &second);
+    const changed: [32768]u8 = @splat('b');
+    try second_adapter.storage().writeFileAbsolute("/segment", &changed);
+    var three = try second.openArtifactSource("/segment");
+    defer three.close();
+    try std.testing.expect(one.ranges.ptr != three.ranges.ptr);
+    try three.readInto(123, &out);
+    try std.testing.expectEqualSlices(u8, changed[123..][0..out.len], &out);
+    try two.readInto(123, &out);
+    try std.testing.expectEqualSlices(u8, payload[123..][0..out.len], &out);
 }
 
 test "lite artifact leases transfer retired inode accounting between readers" {

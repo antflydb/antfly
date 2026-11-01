@@ -39,6 +39,10 @@ pub const Config = struct {
     // Bound producer latency when a source is corrupt, quarantined, or owned
     // by a stuck worker. FD admission remains the final safety boundary.
     backpressure_max_wait_ms: u64 = 5_000,
+    /// Owners without optional workers must drive a merge before waiting for
+    /// producer capacity. Productive merges renew their no-progress budget;
+    /// the total elapsed work is still included in backpressure telemetry.
+    manual_producer_assistance: bool = false,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
 };
 
@@ -52,6 +56,7 @@ pub const BackpressureOutcome = enum {
 };
 
 pub var test_block_after_task_begin: std.atomic.Value(bool) = .init(false);
+pub var test_manual_merge_delay_ms: std.atomic.Value(u64) = .init(0);
 pub var test_task_begin_entered: std.atomic.Value(bool) = .init(false);
 pub var test_release_after_task_begin: std.atomic.Value(bool) = .init(false);
 pub var test_stop_entered: std.atomic.Value(bool) = .init(false);
@@ -176,6 +181,10 @@ const PlatformTextMergeRuntime = struct {
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
     lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    assisted_merges: ?*AssistedMerge = null,
+    active_assistance: usize = 0,
+    active_producers: usize = 0,
+    active_manual_turns: usize = 0,
     desired_running: bool = false,
     paused: bool = false,
     shutdown: bool = false,
@@ -299,34 +308,46 @@ const PlatformTextMergeRuntime = struct {
     /// Structural catalog mutations call this before moving or closing an
     /// inline index runtime, so no task can retain a pointer across mutation.
     pub fn stop(self: *TextMergeRuntime) bool {
-        if (!self.config.enabled) return false;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
         self.desired_running = false;
         self.paused = true;
         self.setAdmissionClosedLocked(true);
-        return self.stopLocked();
+        const stopped = self.stopLocked();
+        if (self.io) |io| {
+            self.mutex.lockUncancelable(io);
+            while (self.active_assistance != 0 or self.active_producers != 0)
+                self.cond.waitUncancelable(io, &self.mutex);
+            self.mutex.unlock(io);
+        }
+        return stopped;
     }
 
     /// Temporarily prevents worker publication while preserving the desired
     /// running state. A failed resume can therefore be retried safely without
     /// racing a later structural catalog mutation.
     pub fn pause(self: *TextMergeRuntime) bool {
-        if (!self.config.enabled) return false;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
+        const resume_needed = !self.paused;
         self.paused = true;
-        const desired = self.desired_running;
         _ = self.stopLocked();
-        return desired;
+        return resume_needed;
     }
 
     pub fn resumeAfterPause(self: *TextMergeRuntime) !void {
-        if (!self.config.enabled) return;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
         self.paused = false;
-        if (self.desired_running) try self.startLocked();
+        if (self.desired_running) {
+            try self.startLocked();
+        } else {
+            const io = self.io orelse return;
+            self.mutex.lockUncancelable(io);
+            self.shutdown = false;
+            self.mutex.unlock(io);
+            self.signalProducerAdmissionChanged();
+        }
     }
 
     /// Used by the DB restart supervisor. False means a structural mutation
@@ -361,23 +382,105 @@ const PlatformTextMergeRuntime = struct {
 
     fn stopLocked(self: *TextMergeRuntime) bool {
         const io = self.io orelse return false;
-        if (self.future == null) return false;
+        const had_work = self.future != null or self.assisted_merges != null;
         if (builtin.is_test) test_stop_entered.store(true, .release);
-
         self.mutex.lockUncancelable(io);
         self.shutdown = true;
         self.notified = true;
         self.cond.broadcast(io);
         self.mutex.unlock(io);
         self.native_storage_pool.signalAdmissionChanged(io);
-
-        // A merge can be asleep in descriptor admission, whose predicate is
-        // owned by the process-wide pool and does not change when this runtime
-        // shuts down. Cancel wakes that Io cancellation point and still joins
-        // the worker before returning.
-        self.future.?.cancel(io);
+        // Both execution lanes borrow inline index state. Cancellation also
+        // wakes descriptor admission; joining only the worker is insufficient
+        // when a foreground producer is assisting a manual runtime.
+        if (self.future) |*future| future.cancel(io);
         self.future = null;
-        return true;
+        while (self.assisted_merges) |task| {
+            self.assisted_merges = task.next;
+            task.drain();
+            task.release();
+        }
+        self.mutex.lockUncancelable(io);
+        while (self.active_manual_turns != 0) self.cond.waitUncancelable(io, &self.mutex);
+        self.mutex.unlock(io);
+        return had_work;
+    }
+
+    const AssistedMerge = struct {
+        runtime: *TextMergeRuntime,
+        alloc: Allocator,
+        io: Io,
+        group: Io.Group = .init,
+        drain_mutex: std.atomic.Mutex = .unlocked,
+        references: std.atomic.Value(u32) = .init(2),
+        next: ?*AssistedMerge = null,
+        done: Io.Event = .unset,
+        result: anyerror!bool = undefined,
+
+        fn run(self: *@This()) void {
+            self.result = self.runtime.runOnceTask();
+            self.done.set(self.io);
+        }
+        fn drain(self: *@This()) void {
+            lockAtomicWithBackoff(&self.drain_mutex);
+            defer self.drain_mutex.unlock();
+            self.group.cancel(self.io);
+        }
+        fn release(self: *@This()) void {
+            if (self.references.fetchSub(1, .acq_rel) == 1) self.alloc.destroy(self);
+        }
+    };
+
+    fn runAssistedOnce(self: *TextMergeRuntime) !bool {
+        const io = self.io orelse return false;
+        const task: ?*AssistedMerge = register: {
+            // A producer must be able to leave during stop(), which holds
+            // the lifecycle lock while draining active producer calls.
+            if (!self.lifecycle_mutex.tryLock()) return false;
+            defer self.lifecycle_mutex.unlock();
+            if (self.paused or self.shutdown) return false;
+            // Retain at most the active/last cohort, rather than accumulating
+            // one group allocation per historical merge until shutdown.
+            var link = &self.assisted_merges;
+            while (link.*) |previous| {
+                if (!previous.done.isSet()) {
+                    link = &previous.next;
+                    continue;
+                }
+                link.* = previous.next;
+                previous.drain();
+                previous.release();
+            }
+            const work = try self.alloc.create(AssistedMerge);
+            work.* = .{ .runtime = self, .alloc = self.alloc, .io = io, .next = self.assisted_merges };
+            work.group.concurrent(io, AssistedMerge.run, .{work}) catch |err| {
+                work.drain();
+                self.alloc.destroy(work);
+                if (err == error.ConcurrencyUnavailable) break :register null;
+                return err;
+            };
+            self.assisted_merges = work;
+            self.mutex.lockUncancelable(io);
+            self.active_assistance += 1;
+            self.mutex.unlock(io);
+            break :register work;
+        };
+        const registered = task orelse return self.runOnce();
+        defer {
+            // Free caller-owned state before allowing permanent shutdown to
+            // destroy the runtime/allocator. No lifecycle lock is needed here.
+            registered.release();
+            self.mutex.lockUncancelable(io);
+            self.active_assistance -= 1;
+            if (self.shutdown) self.cond.broadcast(io);
+            self.mutex.unlock(io);
+        }
+        const waited = registered.done.wait(io);
+        // Caller cancellation drains only its task. Lifecycle cancellation and
+        // this drain serialize through the node, without blocking bookkeeping.
+        registered.drain();
+        try waited;
+        return registered.result;
     }
 
     pub fn notify(self: *TextMergeRuntime) void {
@@ -391,6 +494,26 @@ const PlatformTextMergeRuntime = struct {
     }
 
     pub fn runOnce(self: *TextMergeRuntime) !bool {
+        const io = self.io orelse return false;
+        self.mutex.lockUncancelable(io);
+        if (self.shutdown) {
+            self.mutex.unlock(io);
+            return false;
+        }
+        self.active_manual_turns += 1;
+        self.mutex.unlock(io);
+        defer {
+            self.mutex.lockUncancelable(io);
+            self.active_manual_turns -= 1;
+            if (self.shutdown) self.cond.broadcast(io);
+            self.mutex.unlock(io);
+        }
+        // Explicit manual turns retain their caller's I/O/cancellation context,
+        // including borrowed runtimes that cannot spawn concurrent work.
+        return self.runOnceTask();
+    }
+
+    fn runOnceTask(self: *TextMergeRuntime) !bool {
         var maybe_task: ?index_manager_mod.IndexManager.TextMergeTask = null;
         const io = self.io orelse return false;
         // A bare tryLockExclusive() has no writer-preference: under a
@@ -611,6 +734,22 @@ const PlatformTextMergeRuntime = struct {
         segment_count: u64,
         byte_count: u64,
     ) !ProducerPermit {
+        const producer_io = self.io;
+        if (producer_io) |io| {
+            self.mutex.lockUncancelable(io);
+            if (self.admission_closed) {
+                self.mutex.unlock(io);
+                return error.TextMergeRuntimeShutdown;
+            }
+            self.active_producers += 1;
+            self.mutex.unlock(io);
+        }
+        defer if (producer_io) |io| {
+            self.mutex.lockUncancelable(io);
+            self.active_producers -= 1;
+            if (self.shutdown) self.cond.broadcast(io);
+            self.mutex.unlock(io);
+        };
         if (builtin.is_test and test_wait_for_producer_shutdown.swap(false, .acq_rel)) {
             test_producer_shutdown_wait_entered.store(true, .release);
             const shutdown_wait_started_ns = self.backpressureNowNs();
@@ -637,13 +776,14 @@ const PlatformTextMergeRuntime = struct {
             return error.TextPublicationExceedsSegmentLimit;
 
         const started_ns = self.backpressureNowNs();
+        var wait_started_ns = started_ns;
         var recorded_wait = false;
         var waiter = ProducerAdmissionWaiter{ .index_name = index_name };
         defer self.removeProducerAdmissionWaiter(&waiter);
         defer if (recorded_wait) self.recordBackpressureElapsed(started_ns);
         self.notify();
         while (true) {
-            if (self.backpressureExpired(started_ns)) {
+            if (self.backpressureExpired(wait_started_ns)) {
                 self.recordBackpressureTerminal(.timed_out);
                 return error.TextMergeBackpressureTimeout;
             }
@@ -664,7 +804,7 @@ const PlatformTextMergeRuntime = struct {
                 }
                 const wait_epoch = self.producer_wait_epoch.load(.acquire);
                 self.mutex.unlock(io);
-                if (!try self.waitForProducerAdmissionChange(wait_epoch, started_ns)) {
+                if (!try self.waitForProducerAdmissionChange(wait_epoch, wait_started_ns)) {
                     if (self.isAdmissionClosed()) return error.TextMergeRuntimeShutdown;
                     self.recordBackpressureTerminal(.timed_out);
                     return error.TextMergeBackpressureTimeout;
@@ -760,7 +900,58 @@ const PlatformTextMergeRuntime = struct {
                 recorded_wait = true;
             }
             self.mutex.unlock(io);
-            if (!try self.waitForProducerAdmissionChange(snapshot_wait_epoch, started_ns)) {
+            if (self.config.manual_producer_assistance) {
+                const merged = self.runAssistedOnce() catch |err| failed: {
+                    if (isShutdown(self)) return error.TextMergeRuntimeShutdown;
+                    switch (err) {
+                        error.OutOfMemory,
+                        error.OutcomeUnknown,
+                        error.DurabilityOutcomeUnknown,
+                        error.WriteOutcomeUnknown,
+                        error.SqlTransactionOutcomeUnknown,
+                        error.SqlMutationOutcomeUnknown,
+                        error.CommitDecisionUnknown,
+                        => return err,
+                        else => {},
+                    }
+                    // The global scheduler can select another index. Task
+                    // failures already quarantine its source; recheck this
+                    // producer's constrained dimensions before refusing it.
+                    // Transient source cancellation also needs a fresh turn.
+                    break :failed false;
+                };
+                if (!merged) {
+                    // Failed execution can signal admission without freeing
+                    // capacity. Waiting on the pre-attempt epoch would return
+                    // immediately and busy-spin on the same resource refusal.
+                    const max_wait_ns = std.math.mul(u64, self.config.backpressure_max_wait_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+                    const elapsed_ns = self.backpressureNowNs() -| wait_started_ns;
+                    if (elapsed_ns >= max_wait_ns) continue;
+                    const retry_ns = std.math.mul(u64, @max(1, self.config.idle_interval_ms), std.time.ns_per_ms) catch std.math.maxInt(u64);
+                    try io.sleep(.fromNanoseconds(@intCast(@min(retry_ns, max_wait_ns - elapsed_ns))), .awake);
+                    continue;
+                }
+                if (builtin.is_test) {
+                    const delay_ms = test_manual_merge_delay_ms.load(.acquire);
+                    if (delay_ms != 0) try io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake);
+                }
+                lockApplyShared(self.apply_mutex);
+                const segments_after = self.index_manager.textActiveSegmentCountSnapshot(index_name);
+                const heap_after = if (!request_bytes_admissible)
+                    self.index_manager.textMergeStatsSnapshot().pending_heap_bytes
+                else
+                    stats_snapshot.pending_heap_bytes;
+                self.apply_mutex.unlockShared();
+                // A manual owner has no worker to make progress during a
+                // sleep. Credit only a reduction in a blocked dimension, not
+                // stale tasks or merges for an unrelated index. One slow but
+                // successful merge must not make the next capacity check fail.
+                if ((!segments_admissible and segments_after < active_segments) or
+                    (!request_bytes_admissible and heap_after < stats_snapshot.pending_heap_bytes))
+                    wait_started_ns = self.backpressureNowNs();
+                continue;
+            }
+            if (!try self.waitForProducerAdmissionChange(snapshot_wait_epoch, wait_started_ns)) {
                 if (self.isAdmissionClosed()) return error.TextMergeRuntimeShutdown;
                 self.recordBackpressureTerminal(.timed_out);
                 return error.TextMergeBackpressureTimeout;
@@ -981,7 +1172,7 @@ fn workerStep(runtime: *TextMergeRuntime) ?u64 {
         };
         runtime.native_storage_pool.releaseDescriptorsForTest(io, 1);
     }
-    const ran = runtime.runOnce() catch |err| {
+    const ran = runtime.runOnceTask() catch |err| {
         if (index_manager_mod.IndexManager.isTextMergeCancellation(err)) {
             // A canceled wait is not necessarily a graceful shutdown: the
             // maintenance scheduler itself can cancel and re-arm this

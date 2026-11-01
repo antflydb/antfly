@@ -15,7 +15,7 @@
 
 //! Native single-file Antfly Lite format primitives.
 //!
-//! This module owns revision-3 compatibility and the revision-4 indexed `.aflite`
+//! This module owns revision-3 compatibility and the revision-6 indexed `.aflite`
 //! format, checkpoint publication, ownership retirement, and physical page reuse.
 
 const std = @import("std");
@@ -313,7 +313,8 @@ test "lite allocator v4 allocator-only service does not retire new certificate p
     try std.testing.expectEqual(index_root, file.activeCheckpoint().index_catalog_root_page);
     var peer = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
     defer peer.close();
-    try std.testing.expect(!try peer.inheritAllocatorCertificate());
+    try std.testing.expect(try peer.inheritAllocatorCertificate());
+    try std.testing.expect((try peer.getIndexCatalogRecordAlloc(a, NativeFile.allocator_certificate_key)) == null);
     try std.testing.expect((try peer.check()).valid);
 }
 
@@ -614,6 +615,79 @@ test "lite allocator v4 detached proof follows local append-only commits and ena
     try std.testing.expect((try file.check()).valid);
 }
 
+test "lite allocator v4 verified cache transfer consumes only an exact clean donor" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "verified-cache-transfer.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.allocator_certificate_on_commit = true;
+    try writer.putDocument("doc", "original");
+    try std.testing.expect(try writer.certifyAllocator());
+    var donor = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true, .no_sync = true });
+    defer donor.close();
+    try std.testing.expect(try donor.inheritAllocatorCertificate());
+    const original = donor.ledger.?;
+    const digest_work = original.digestWork();
+    var replacement = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true, .no_sync = true });
+    defer replacement.close();
+    donor.checkpoint_publication_uncertain = true;
+    try std.testing.expect(!try replacement.takeVerifiedAllocator(&donor));
+    try std.testing.expectEqual(original, donor.ledger.?);
+    donor.checkpoint_publication_uncertain = false;
+    try std.testing.expect(try replacement.takeVerifiedAllocator(&donor));
+    try std.testing.expect(donor.ledger == null);
+    try std.testing.expectEqual(original, replacement.ledger.?);
+    try std.testing.expectEqual(digest_work, replacement.ledger.?.digestWork());
+    try std.testing.expectEqual(original, try replacement.loadLedger(replacement.activeCheckpoint()));
+    try replacement.putDocument("doc", "replacement");
+    try std.testing.expect(!try replacement.takeVerifiedAllocator(&writer));
+    try std.testing.expect(writer.ledger != null);
+    try std.testing.expect((try replacement.check()).valid);
+}
+
+test "lite allocator v4 peer certificate validates a rebased cache before reuse" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "verified-cache-rebase.aflite");
+    defer a.free(path);
+    var owner = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer owner.close();
+    owner.allocator_certificate_on_commit = true;
+    owner.incremental_checkpoints = true;
+    try owner.putDocument("seed", "original");
+    try std.testing.expect(try owner.certifyAllocator());
+    var peer = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true, .no_sync = true });
+    defer peer.close();
+    peer.allocator_certificate_on_commit = true;
+    peer.incremental_checkpoints = true;
+    try peer.inheritAllocatorVerification(&owner);
+    try peer.putDocument("peer", "new primary");
+    try std.testing.expect(try peer.certifyAllocator());
+    var verifier = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+    defer verifier.close();
+    try std.testing.expect(try verifier.takeAllocatorRebaseBase(&owner));
+    try std.testing.expect(!verifier.free_pages_verified);
+    try std.testing.expect(try verifier.inheritAllocatorCertificate());
+    try std.testing.expect(verifier.free_pages_verified);
+    // Small allocators may rotate their snapshot anchor. Both paths must
+    // produce the same independently rebuilt digest and retain no alias.
+    var independent = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+    defer independent.close();
+    try std.testing.expect(try independent.inheritAllocatorCertificate());
+    try std.testing.expectEqual(try independent.ledger.?.fingerprint(), try verifier.ledger.?.fingerprint());
+    const cached = verifier.ledger.?;
+    cached.counts.items[0] ^= 1;
+    try std.testing.expect(!try verifier.inheritAllocatorCertificate());
+    cached.counts.items[0] ^= 1;
+    try std.testing.expect(try verifier.inheritAllocatorCertificate());
+    try std.testing.expect(owner.ledger == null);
+    try std.testing.expect((try verifier.check()).valid);
+}
+
 test "lite allocator v4 detached proof follows an unchecked reopened writer" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -863,9 +937,9 @@ pub const WriteOptions = struct {
 
 pub const magic = "AFLITE\x03P";
 const unpacked_v3_magic = "AFLITE\x03N";
-const indexed_v4_magic = "AFLITE\x04P";
+const indexed_magic = "AFLITE\x06P";
 pub const format_version: u32 = 3;
-pub const indexed_format_version: u32 = 4;
+pub const indexed_format_version: u32 = 6;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -926,7 +1000,7 @@ test "lite allocator v4 overwrite reuses pages across reopen" {
     defer a.free(reopened);
     try std.testing.expectEqualSlices(u8, value, reopened);
 }
-test "lite coordinated readers permit reuse while preserving snapshots and foreign fences" {
+test "lite coordinated data readers permit reuse while preserving snapshots and foreign fences" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -940,7 +1014,10 @@ test "lite coordinated readers permit reuse while preserving snapshots and forei
     writer.reader_coordinator = &coordinator;
     var value: [8192]u8 = @splat('a');
     for (0..80) |_| try writer.putDocument("doc", &value);
-    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &coordinator });
+    // This contract deliberately retains only logical document data. Generic
+    // read-only opens also inspect allocator metadata and use full fences.
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true, .reader_coordinator = &coordinator });
+    try reader.acquireReaderFence(writer.activeCheckpoint().commit_sequence, &writer);
     var reader_open = true;
     defer if (reader_open) reader.close();
     const before = (try writer.allocatorStats()).?.reused_pages;
@@ -968,7 +1045,7 @@ test "lite coordinated readers permit reuse while preserving snapshots and forei
     try std.testing.expect((try writer.check()).valid);
 }
 
-test "lite coordinated readers refuse reuse after an unrecognized publication" {
+test "lite epoch readers preserve snapshots across foreign writer publications" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -983,15 +1060,14 @@ test "lite coordinated readers refuse reuse after an unrecognized publication" {
     var value: [8192]u8 = @splat('a');
     for (0..80) |_| try writer.putDocument("doc", &value);
     var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &coordinator });
-    // Simulate another process's writer. It honors the shared inode fence,
-    // but does not know this process's reader retirement frontier.
+    // A raw peer writer has no local coordinator but scans the shared epochs.
     writer.reader_coordinator = null;
     value[0] = 'b';
     for (0..4) |_| try writer.putDocument("doc", &value);
     writer.reader_coordinator = &coordinator;
     const before = (try writer.allocatorStats()).?.reused_pages;
     for (0..4) |_| try writer.putDocument("doc", &value);
-    try std.testing.expectEqual(before, (try writer.allocatorStats()).?.reused_pages);
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages > before);
     const captured = (try reader.getDocumentAlloc(a, "doc")).?;
     defer a.free(captured);
     try std.testing.expectEqual(@as(u8, 'a'), captured[0]);
@@ -1001,7 +1077,134 @@ test "lite coordinated readers refuse reuse after an unrecognized publication" {
     try std.testing.expect((try writer.check()).valid);
 }
 
-test "lite coordinated readers reject late registration after external retirement" {
+test "issue1362 full snapshots retain allocator metadata while same-owner writers reuse pages" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "full-snapshot-reuse.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.reader_coordinator = &coordinator;
+    const value: [8192]u8 = @splat('v');
+    try writer.putDocument("keep", &value);
+    for (0..128) |i| {
+        var key: [32]u8 = undefined;
+        try writer.putDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+    }
+    for (0..128) |i| {
+        var key: [32]u8 = undefined;
+        try writer.deleteDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+    }
+    _ = try writer.reclaimPages(8192);
+    try std.testing.expect((try writer.allocatorStats()).?.reusable_pages > 64);
+    var snapshot = try writer.captureFullReadSnapshot();
+    defer snapshot.close();
+    const captured_size = (try snapshot.file.stat(io)).size;
+    const before = (try writer.allocatorStats()).?.reused_pages;
+    for (0..32) |i| {
+        var key: [32]u8 = undefined;
+        try writer.putDocument(try std.fmt.bufPrint(&key, "new-{d}", .{i}), &value);
+    }
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages > before);
+    // No cache may conceal overwritten old ledger pages. Check both captured
+    // recovery slots and their allocator after the writer has advanced far.
+    try std.testing.expect(snapshot.ledger == null);
+    try std.testing.expect((try snapshot.checkAtFileSizeWithCancel(captured_size, null)).valid);
+    const captured = (try snapshot.getDocumentAlloc(a, "keep")).?;
+    defer a.free(captured);
+    try std.testing.expectEqualSlices(u8, &value, captured);
+    try std.testing.expect((try writer.check()).valid);
+    const reused = (try writer.allocatorStats()).?.reused_pages;
+    writer.reader_coordinator = null;
+    try writer.putDocument("unrecognized-publication", "external writer");
+    writer.reader_coordinator = &coordinator;
+    try writer.putDocument("after-unrecognized-publication", "must retain the snapshot epoch");
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages >= reused);
+    try std.testing.expect((try snapshot.checkAtFileSizeWithCancel(captured_size, null)).valid);
+    try std.testing.expect((try writer.check()).valid);
+}
+
+test "issue1362 full snapshots retain unpublished standalone roots through sync" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "full-snapshot-deferred.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true });
+    defer writer.close();
+    writer.reader_coordinator = &coordinator;
+    try writer.beginTransaction();
+    try writer.putDocument("private", "pending");
+    try writer.commitTransactionWithDurability(false);
+    try std.testing.expect(writer.durable_header != null);
+    var snapshot = try writer.captureFullReadSnapshot();
+    defer snapshot.close();
+    const captured_size = (try snapshot.file.stat(io)).size;
+    const before = (try snapshot.getDocumentAlloc(a, "private")).?;
+    defer a.free(before);
+    try std.testing.expectEqualStrings("pending", before);
+    try writer.sync();
+    try writer.putDocument("private", "published later");
+    const after = (try snapshot.getDocumentAlloc(a, "private")).?;
+    defer a.free(after);
+    try std.testing.expectEqualStrings("pending", after);
+    try std.testing.expect((try snapshot.checkAtFileSizeWithCancel(captured_size, null)).valid);
+    try std.testing.expect((try writer.check()).valid);
+}
+
+test "issue1362 one allocator resumes verified reuse after a foreign reader closes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Scenario = enum { standalone, coordinated, unverified };
+    for (std.meta.tags(Scenario)) |scenario| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "reader-release-mid-batch.aflite");
+        defer a.free(path);
+        var coordinator = ReaderCoordinator.init(a, io);
+        defer coordinator.deinit();
+        var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer writer.close();
+        if (scenario != .standalone) writer.reader_coordinator = &coordinator;
+        const value: [8192]u8 = @splat('v');
+        for (0..80) |_| try writer.putDocument("pool", &value);
+        _ = try writer.reclaimPages(4096);
+        try std.testing.expect((try writer.allocatorStats()).?.reusable_pages != 0);
+        var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+        var reader_open = true;
+        defer if (reader_open) reader.close();
+        if (scenario == .unverified) {
+            writer.free_pages_verified = false;
+            writer.defer_allocator_verification = true;
+        }
+        const checkpoint = writer.activeCheckpoint();
+        if (scenario == .standalone) writer.max_file_bytes = (checkpoint.page_count + 64) * writer.header.page_size;
+        var pages = try writer.pageAllocatorFromFreeMap(checkpoint);
+        var pages_open = true;
+        defer if (pages_open) pages.deinit();
+        for (0..64) |_| try std.testing.expect(try pages.allocate() >= checkpoint.page_count);
+        reader.close();
+        reader_open = false;
+        var reused = false;
+        for (0..64) |_| if (try pages.allocate() < checkpoint.page_count) {
+            reused = true;
+            break;
+        };
+        try std.testing.expectEqual(scenario != .unverified, reused);
+        pages.deinit();
+        pages_open = false;
+        try std.testing.expect((try writer.check()).valid);
+    }
+}
+
+test "lite coordinated readers retain readonly inode authority after foreign writes" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1450,6 +1653,7 @@ const version_offset: usize = 8;
 const page_size_offset: usize = 12;
 const header_size_offset: usize = 16;
 const active_checkpoint_offset: usize = 20;
+const reader_epoch_namespace_offset: usize = 24;
 const checkpoint_slots_offset: usize = 64;
 const checkpoint_slots_end: usize = checkpoint_slots_offset + checkpoint_slot_count * checkpoint_slot_size;
 const checkpoint_slot_payload_size: usize = 64;
@@ -1490,6 +1694,11 @@ const catalog_external_value_flag: u32 = 1 << 30;
 const document_delete_flag: u8 = 1 << 0;
 const document_external_value_flag: u8 = 1 << 1;
 const document_namespace_link_flag: u8 = 1 << 2;
+const document_content_digest_flag: u8 = 1 << 3;
+
+fn documentHeaderSize(key: []const u8) usize {
+    return if (std.mem.indexOf(u8, key, "\x00\x00__metadata__:") != null) 60 else 28;
+}
 const namespace_directory_key = "\x00antfly.document_namespaces.v1";
 pub const secret_catalog_prefix = "\x00antfly.secrets.v1/";
 const namespace_directory_magic = "AFNSIDX2";
@@ -2987,6 +3196,7 @@ pub const DocumentEntry = struct {
     is_delete: bool = false,
     external_value_root_page: u64 = 0,
     external_value_len: usize = 0,
+    content_digest: ?[32]u8 = null,
 };
 
 const ValuePage = struct {
@@ -3024,6 +3234,8 @@ const PageAllocator = struct {
     ledger: ?*allocator_v4.State = null,
     ledger_persisted: bool = false,
     can_reuse: bool = false,
+    reuse_retry_enabled: bool = false,
+    reuse_retry_pages: u8 = 0,
     append_only: bool = false,
     reused: std.AutoHashMapUnmanaged(u64, void) = .empty,
     pending_values: std.AutoHashMapUnmanaged(u64, u64) = .empty,
@@ -3033,6 +3245,7 @@ const PageAllocator = struct {
     pub fn deinit(self: *PageAllocator) void {
         if (self.data_lock_file) |lock_file| {
             lock_file.close(self.file.runtimeIo());
+            self.file.epoch_window = null;
         }
         if (self.coordinated_reader_window) self.file.endReaderWindow();
         self.file.allocator.free(self.free_pages);
@@ -3114,8 +3327,16 @@ const PageAllocator = struct {
     // Encoded payloads fit one native page. Reuse scratch across records and
     // roots; writeRecord copies bytes before the next encoding can overwrite it.
     fn writeDocument(self: *PageAllocator, entry: DocumentEntry) !u64 {
+        var encoded_entry = entry;
+        if (!entry.is_delete and documentHeaderSize(entry.key) == 60 and
+            (entry.external_value_root_page == 0 or entry.value.len != 0))
+        {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(entry.value, &digest, .{});
+            encoded_entry.content_digest = digest;
+        }
         self.encoded_record.clearRetainingCapacity();
-        try encodeDocumentEntry(self.file.allocator, &self.encoded_record, entry);
+        try encodeDocumentEntry(self.file.allocator, &self.encoded_record, encoded_entry);
         return self.writeRecord(.document, self.encoded_record.items);
     }
 
@@ -3168,6 +3389,13 @@ const PageAllocator = struct {
     }
 
     fn allocate(self: *PageAllocator) !u64 {
+        if (self.reuse_retry_enabled and !self.can_reuse) if (self.ledger) |state| if (state.free_pages != 0 and self.file.free_pages_verified) {
+            self.reuse_retry_pages += 1;
+            if (self.reuse_retry_pages == 64) {
+                self.reuse_retry_pages = 0;
+                try self.resumeReuseIfUnblocked();
+            }
+        };
         if (self.ledger) |state| if (self.can_reuse) {
             if (try state.allocate()) |page| {
                 try self.reused.put(self.file.allocator, page, {});
@@ -3184,11 +3412,43 @@ const PageAllocator = struct {
 
         const page_id = self.next_page_id;
         if (self.file.max_file_bytes) |limit| {
-            if (page_id >= limit / self.file.header.page_size) return error.LiteStorageBudgetExceeded;
+            if (page_id >= limit / self.file.header.page_size) {
+                try self.resumeReuseIfUnblocked();
+                if (self.can_reuse and self.ledger != null and self.ledger.?.free_pages != 0) return self.allocate();
+                return error.LiteStorageBudgetExceeded;
+            }
         }
+        self.file.allocator_work.appended_pages +|= 1;
+        if (self.ledger) |state| if (!self.can_reuse and state.free_pages != 0) {
+            self.file.allocator_work.reuse_blocked_append_pages +|= 1;
+        };
         self.next_page_id = try std.math.add(u64, self.next_page_id, 1);
         if (self.ledger) |state| try state.reserveTail(page_id);
         return page_id;
+    }
+
+    fn resumeReuseIfUnblocked(self: *PageAllocator) !void {
+        if (!self.reuse_retry_enabled or self.can_reuse or !self.file.free_pages_verified or self.ledger == null or self.ledger.?.free_pages == 0) return;
+        // The initial shared-reader conflict may have disappeared during a
+        // large batch. Retry without sleeping or changing its proof/frontier.
+        // Unsuspended own readers and every foreign reader still fence reuse.
+        if (self.coordinated_reader_window) {
+            if (self.file.reader_window_lock == null) {
+                const lock = self.file.acquireEpochReuseLock() catch |err| switch (err) {
+                    error.WouldBlock => return,
+                    else => return err,
+                };
+                self.file.reader_window_lock = lock.file;
+            }
+            self.can_reuse = true;
+        } else {
+            const lock = self.file.acquireEpochReuseLock() catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return err,
+            };
+            self.data_lock_file = lock.file;
+            self.can_reuse = true;
+        }
     }
 
     /// Free pages were validated against both durable checkpoint slots when
@@ -3355,6 +3615,7 @@ pub const CreateOptions = struct {
 };
 
 pub const Header = struct {
+    reader_epoch_namespace: [32]u8 = @splat(0),
     indexed_reclamation: bool = false,
     packed_records: bool = true,
     page_size: u32 = default_page_size,
@@ -4172,7 +4433,14 @@ test "lite header fingerprints cache unchanged state and fence every header fiel
             }
         } else {
             file.header = original;
-            if (comptime Field == bool) @field(file.header, field) = !@field(original, field) else @field(file.header, field) += 1;
+            if (comptime Field == bool) {
+                @field(file.header, field) = !@field(original, field);
+            } else if (comptime Field == [32]u8) {
+                file.header.indexed_reclamation = true;
+                const indexed = NativeFile.fingerprintHeader(file.header);
+                @field(file.header, field)[0] ^= 1;
+                try std.testing.expect(!std.mem.eql(u8, &indexed, &file.headerFingerprint()));
+            } else @field(file.header, field) += 1;
             try std.testing.expectEqual(NativeFile.fingerprintHeader(file.header), file.headerFingerprint());
             try std.testing.expect(!std.mem.eql(u8, &expected, &file.headerFingerprint()));
         }
@@ -4256,6 +4524,9 @@ pub const NativeFile = struct {
     reader_fence: ?*ReaderCoordinator.Fence = null,
     reader_window_depth: usize = 0,
     reader_window_lock: ?std.Io.File = null,
+    epoch_window: ?@import("reader_epochs.zig").Frontier = null,
+    minimum_metadata_reader_sequence: ?u64 = null,
+    reader_window_previous_metadata_frontier: ?u64 = null,
     reader_window_previous_frontier: ?u64 = null,
     header: Header,
     header_fingerprint_cache: HeaderFingerprintCache = .{},
@@ -4267,10 +4538,16 @@ pub const NativeFile = struct {
     /// commits. Primitives retain explicit certification and proof semantics.
     allocator_certificate_on_commit: bool = false,
     allocator_certificate_staged: bool = false,
+    /// A previously checked cache may follow a bounded journal suffix, but
+    /// cannot enable reuse until the new checkpoint certificate matches.
+    allocator_rebase_header: ?Header = null,
+    allocator_ledger_rebased: bool = false,
+    allocator_work: @import("reclamation.zig").AllocatorWork = .{},
     transaction_writes: ?*TransactionWrites = null,
     flushing_transaction: bool = false,
     transaction_pages: ?*PageAllocator = null,
     durable_header: ?Header = null,
+    last_synced_header: ?Header = null,
     change_capture: ?*ChangeCapture = null,
     read_only: bool = false,
     no_sync: bool = false,
@@ -4409,7 +4686,10 @@ pub const NativeFile = struct {
             .page_cache_enabled = .init(true),
         };
         if (opts.read_only and !opts.internal_reader and !opts.externally_locked) {
-            if (opts.reader_coordinator) |coordinator| result.reader_fence = try coordinator.register(file, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint());
+            if (opts.reader_coordinator) |coordinator| result.reader_fence = if (header.indexed_reclamation)
+                try coordinator.registerEpoch(file, path, header.reader_epoch_namespace, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint(), true)
+            else
+                try coordinator.registerFull(file, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint());
         }
         if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
@@ -4506,7 +4786,7 @@ pub const NativeFile = struct {
         var initialized_header: Header = .{};
         if (indexed) {
             // Finish every fallible initialization step on the private inode.
-            var staged = NativeFile{ .allocator = allocator, .io_impl = undefined, .borrowed_io = io, .path = owned_path, .file = file, .header = .{}, .read_only = false, .no_sync = no_sync, .page_cache_enabled = .init(false) };
+            var staged = NativeFile{ .allocator = allocator, .io_impl = undefined, .borrowed_io = io, .path = owned_path, .file = file, .header = .{ .reader_epoch_namespace = try @import("reader_epochs.zig").namespaceForPublicationWithDurability(allocator, io, create_target, no_sync) }, .read_only = false, .no_sync = no_sync, .page_cache_enabled = .init(false) };
             defer staged.invalidateLedger();
             defer staged.page_cache.deinit(allocator);
             try staged.initializeIndexedAllocator();
@@ -4597,7 +4877,8 @@ pub const NativeFile = struct {
         if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain or
             self.header.page_size != header.page_size or self.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
         if (std.meta.eql(self.header, header)) return;
-        self.invalidateLedger();
+        self.allocator_rebase_header = if (self.free_pages_verified and self.ledger != null) self.header else null;
+        if (self.allocator_rebase_header == null) self.invalidateLedger();
         self.page_cache.clear(self.allocator);
         if (self.secondary_page_cache) |cache| cache.clear(self.allocator);
         self.free_pages_verified = false;
@@ -4632,6 +4913,55 @@ pub const NativeFile = struct {
         }
         self.free_pages_verified = true;
         self.allocator_verification_base = null;
+    }
+
+    /// Move an exclusively owned verifier's cache before index initialization
+    /// can publish leases. Verification inheritance alone deliberately does not
+    /// share mutable state with snapshots or retired serving runtimes.
+    pub fn takeVerifiedAllocator(self: *NativeFile, donor: *NativeFile) !bool {
+        if (self == donor or !donor.free_pages_verified or donor.ledger == null or
+            !std.meta.eql(self.allocator, donor.allocator) or
+            !std.meta.eql(self.header, donor.header) or !std.mem.eql(u8, self.path, donor.path) or
+            self.transaction_header != null or donor.transaction_header != null or
+            self.durable_header != null or donor.durable_header != null or
+            self.checkpoint_publication_uncertain or donor.checkpoint_publication_uncertain) return false;
+        if ((try self.file.stat(self.runtime())).inode != (try donor.file.stat(donor.runtime())).inode) return false;
+        const state = donor.ledger.?;
+        if (state.root_page != self.activeCheckpoint().free_map_root_page or
+            state.changes.count() != 0 or state.added.items.len != 0 or state.completed.items.len != 0) return false;
+        self.invalidateLedger();
+        self.ledger = state;
+        donor.ledger = null;
+        self.allocator_work.absorb(&donor.allocator_work);
+        self.allocator_work.cache_transfers +|= 1;
+        self.free_pages_verified = true;
+        self.allocator_verification_base = null;
+        return true;
+    }
+
+    /// The caller exclusively owns the donor cache. This only transfers a
+    /// validation base: it grants no authority to allocate at the new tip.
+    pub fn takeAllocatorRebaseBase(self: *NativeFile, donor: *NativeFile) !bool {
+        if (self == donor or !donor.free_pages_verified or donor.ledger == null or
+            !std.meta.eql(self.allocator, donor.allocator) or !std.mem.eql(u8, self.path, donor.path) or
+            !self.header.indexed_reclamation or !donor.header.indexed_reclamation or
+            self.header.page_size != donor.header.page_size or
+            self.activeCheckpoint().commit_sequence < donor.activeCheckpoint().commit_sequence or
+            self.transaction_header != null or donor.transaction_header != null or
+            self.durable_header != null or donor.durable_header != null or
+            self.checkpoint_publication_uncertain or donor.checkpoint_publication_uncertain) return false;
+        if ((try self.file.stat(self.runtime())).inode != (try donor.file.stat(donor.runtime())).inode) return false;
+        const state = donor.ledger.?;
+        if (state.root_page != donor.activeCheckpoint().free_map_root_page or state.digest_cache == null or
+            state.changes.count() != 0 or state.added.items.len != 0 or state.completed.items.len != 0) return false;
+        self.invalidateLedger();
+        self.ledger = donor.ledger;
+        donor.ledger = null;
+        self.allocator_work.absorb(&donor.allocator_work);
+        self.allocator_work.cache_transfers +|= 1;
+        self.allocator_rebase_header = donor.header;
+        self.free_pages_verified = false;
+        return true;
     }
 
     /// Prepare reuse against a separately inode-fenced reader, without holding
@@ -4677,6 +5007,37 @@ pub const NativeFile = struct {
         return reader;
     }
 
+    /// Capture under the path-writer lease (or standalone writer ownership).
+    /// Full scans need allocator metadata as well as logical data protected.
+    /// Same-owner writers may suspend this inode lock only while both
+    /// retirement frontiers retain the captured recovery slots.
+    pub fn captureFullReadSnapshot(self: *NativeFile) !NativeFile {
+        if (self.transaction_header != null or self.checkpoint_publication_uncertain) return error.FileBusy;
+        // Deferred standalone images have unpublished roots. Preserve their
+        // existing whole-inode protection until a durability barrier publishes
+        // them; the shared coordinator only recognizes published headers.
+        const coordinated = self.reader_coordinator != null and self.durable_header == null and !self.read_only;
+        var reader = try NativeFile.openWithIo(self.allocator, self.runtime(), self.path, .{
+            .read_only = true,
+            .internal_reader = coordinated,
+            .reader_coordinator = if (coordinated) self.reader_coordinator else null,
+            .no_sync = self.no_sync,
+            .resource_manager = self.page_cache.resource_manager,
+        });
+        errdefer reader.close();
+        const inode = (try reader.file.stat(reader.runtime())).inode;
+        if ((self.durable_header == null and !std.meta.eql(self.header, reader.header)) or inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentWaitCanceled;
+        reader.header = self.header;
+        if (coordinated) {
+            try reader.file.lock(reader.runtime(), .shared);
+            reader.reader_fence = if (self.header.indexed_reclamation)
+                try self.reader_coordinator.?.registerEpoch(reader.file, self.path, self.header.reader_epoch_namespace, inode, reader.metadataReuseFrontier(), self.headerFingerprint(), true)
+            else
+                try self.reader_coordinator.?.registerFull(reader.file, inode, reader.metadataReuseFrontier(), self.headerFingerprint());
+        }
+        return reader;
+    }
+
     pub fn completeAllocatorVerification(self: *NativeFile) !void {
         const cancel = self.allocator_cancel_token;
         if (cancel) |token| try token.check();
@@ -4707,7 +5068,7 @@ pub const NativeFile = struct {
         return digest;
     }
 
-    fn headerFingerprint(self: *NativeFile) [32]u8 {
+    pub fn headerFingerprint(self: *NativeFile) [32]u8 {
         const header = self.transaction_header orelse self.header;
         if (self.header_fingerprint_cache.lookup(header)) |digest| return digest;
         // Hash outside the cache lock. Concurrent first readers may duplicate
@@ -4765,8 +5126,17 @@ pub const NativeFile = struct {
     pub fn inheritAllocatorCertificate(self: *NativeFile) !bool {
         if (!self.header.indexed_reclamation or self.transaction_header != null or
             self.durable_header != null or self.checkpoint_publication_uncertain) return false;
-        // Live handoff is physical bookkeeping. Keep the primary catalog
-        // untouched, while accepting legacy clean-close seals from it too.
+        const checkpoint = self.activeCheckpoint();
+        if (checkpoint.free_map_root_page != 0) {
+            const root = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
+            defer self.allocator.free(root);
+            _ = try allocator_v4.State.decodeRoot(root);
+            if (root.len == 192) {
+                if (!std.mem.eql(u8, root[128..160], &self.headerFingerprint())) return false;
+                return self.acceptAllocatorDigest(root[160..192], true);
+            }
+        }
+        // Older checked publications stored seals in a catalog record.
         if (try self.inheritAllocatorCertificateFrom(.index)) return true;
         return self.inheritAllocatorCertificateFrom(.metadata);
     }
@@ -4782,10 +5152,41 @@ pub const NativeFile = struct {
         if (!live and !std.mem.eql(u8, certificate[0..8], allocator_certificate_magic)) return false;
         const header_hash = self.headerFingerprint();
         if (!std.mem.eql(u8, certificate[8..40], &header_hash)) return false;
+        return self.acceptAllocatorDigest(certificate[40..72], live);
+    }
+
+    fn acceptAllocatorDigest(self: *NativeFile, expected: []const u8, live: bool) !bool {
+        self.free_pages_verified = false;
         const state = try self.loadLedgerForDigest(self.activeCheckpoint(), self.allocator_cancel_token, false);
-        const ownership_hash = if (live) try state.rebuildFingerprint() else try allocatorFingerprint(state);
-        if (!std.mem.eql(u8, certificate[40..72], &ownership_hash)) return false;
+        const canceled = if (self.allocator_cancel_token) |token| &token.requested else null;
+        const digest_started = std.Io.Clock.awake.now(self.runtime());
+        var rebuilding = live and !self.allocator_ledger_rebased;
+        defer if (rebuilding) {
+            self.allocator_work.digest_rebuilds +|= 1;
+            self.allocator_work.digest_rebuild_ns +|= @intCast(@max(0, digest_started.durationTo(std.Io.Clock.awake.now(self.runtime())).nanoseconds));
+        };
+        var ownership_hash = if (live)
+            if (self.allocator_ledger_rebased) try state.incrementalFingerprint() else try state.rebuildFingerprintWithCancel(canceled)
+        else
+            try allocatorFingerprint(state);
+        if (self.allocator_ledger_rebased and !std.mem.eql(u8, expected, &ownership_hash)) {
+            // A reused physical journal anchor is not logical ancestry. The
+            // certificate must match an independent reload before admitting
+            // reuse; a cache miss must not force an unnecessary graph proof.
+            self.invalidateLedger();
+            const independent = try self.loadLedgerForDigest(self.activeCheckpoint(), self.allocator_cancel_token, false);
+            rebuilding = live;
+            ownership_hash = if (live) try independent.rebuildFingerprintWithCancel(canceled) else try allocatorFingerprint(independent);
+        }
+        if (!std.mem.eql(u8, expected, &ownership_hash)) {
+            self.free_pages_verified = false;
+            self.allocator_rebase_header = null;
+            self.allocator_ledger_rebased = false;
+            return false;
+        }
         self.free_pages_verified = true;
+        self.allocator_rebase_header = null;
+        self.allocator_ledger_rebased = false;
         self.allocator_verification_base = null;
         return true;
     }
@@ -4797,6 +5198,12 @@ pub const NativeFile = struct {
         if (!self.header.indexed_reclamation or !self.free_pages_verified or
             self.transaction_header != null or self.durable_header != null or
             self.checkpoint_publication_uncertain) return false;
+        if (self.allocator_certificate_on_commit) {
+            const checkpoint = self.activeCheckpoint();
+            const root = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
+            defer self.allocator.free(root);
+            if (root.len == 192 and std.mem.eql(u8, root[128..160], &self.headerFingerprint())) return true;
+        }
         // Use the ordinary rollback/publication boundary. Allocation, budget
         // and page-write errors must leave no unpublished tail at clean close;
         // commitTransaction retains the fence if publication becomes uncertain.
@@ -4857,12 +5264,26 @@ pub const NativeFile = struct {
     pub fn acquireReaderFence(self: *NativeFile, sequence: u64, owner: *NativeFile) !void {
         try self.file.lock(self.runtime(), .shared);
         errdefer self.file.unlock(self.runtime());
-        if (self.reader_coordinator) |coordinator| self.reader_fence = try coordinator.register(self.file, (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint());
+        // A read-only owner's inode is its lock authority, including snapshots
+        // opened where no sidecar can be installed. Never switch that authority
+        // merely because its directory becomes writable during the read.
+        if (self.reader_coordinator) |coordinator| self.reader_fence = if (self.header.indexed_reclamation and !owner.read_only)
+            try coordinator.registerEpoch(self.file, self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false)
+        else
+            try coordinator.registerInodeOnly(self.file, (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint());
     }
     pub fn releaseReaderFence(self: *NativeFile) void {
         if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
         self.reader_fence = null;
         self.file.unlock(self.runtime());
+    }
+    fn acquireEpochReuseLock(self: *NativeFile) !LockFile {
+        self.epoch_window = null;
+        const lock = try acquireDataRewriteLock(self.runtime(), self.path);
+        errdefer lock.file.close(self.runtime());
+        if (self.activeCheckpoint().free_map_root_page != 0 and (try lock.file.stat(self.runtime())).inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentSourceChanged;
+        if (self.header.indexed_reclamation) self.epoch_window = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode);
+        return lock;
     }
     fn beginReaderWindow(self: *NativeFile) !bool {
         const coordinator = self.reader_coordinator orelse return false;
@@ -4871,15 +5292,23 @@ pub const NativeFile = struct {
             return true;
         }
         const inode = (try self.file.stat(self.runtime())).inode;
-        const frontier = coordinator.begin(inode, self.headerFingerprint(), self.free_pages_verified);
+        const frontier = coordinator.beginWithMetadata(inode, self.headerFingerprint(), self.free_pages_verified);
         errdefer coordinator.end();
         self.reader_window_previous_frontier = self.minimum_reader_sequence;
-        if (frontier) |sequence| self.minimum_reader_sequence = @min(self.minimum_reader_sequence orelse sequence, sequence);
+        if (frontier.data) |sequence| self.minimum_reader_sequence = @min(self.minimum_reader_sequence orelse sequence, sequence);
         errdefer self.minimum_reader_sequence = self.reader_window_previous_frontier;
-        const held = if (self.free_pages_verified) acquireDataRewriteLock(self.runtime(), self.path) catch |err| switch (err) {
-            error.WouldBlock => null,
+        self.reader_window_previous_metadata_frontier = self.minimum_metadata_reader_sequence;
+        if (frontier.metadata) |sequence| self.minimum_metadata_reader_sequence = @min(self.minimum_metadata_reader_sequence orelse sequence, sequence);
+        errdefer self.minimum_metadata_reader_sequence = self.reader_window_previous_metadata_frontier;
+        // Even an append-only owner must fence and account for readers before
+        // promoting retirement. Proof authority separately controls page reuse.
+        const held = self.acquireEpochReuseLock() catch |err| switch (err) {
+            error.WouldBlock => blk: {
+                self.allocator_work.reuse_lock_refusals +|= 1;
+                break :blk null;
+            },
             else => return err,
-        } else null;
+        };
         self.reader_window_lock = if (held) |lock| lock.file else null;
         self.reader_window_depth = 1;
         return true;
@@ -4890,11 +5319,15 @@ pub const NativeFile = struct {
         if (self.reader_window_depth != 0) return;
         if (self.reader_window_lock) |held| held.close(self.runtime());
         self.reader_window_lock = null;
+        self.epoch_window = null;
         self.minimum_reader_sequence = self.reader_window_previous_frontier;
+        self.minimum_metadata_reader_sequence = self.reader_window_previous_metadata_frontier;
         self.reader_coordinator.?.end();
     }
 
     fn invalidateLedger(self: *NativeFile) void {
+        self.allocator_rebase_header = null;
+        self.allocator_ledger_rebased = false;
         if (self.ledger) |state| {
             state.deinit();
             self.allocator.destroy(state);
@@ -4928,12 +5361,34 @@ pub const NativeFile = struct {
             if (prepare_digest) try state.prepareDigestWithCancel(if (cancel) |token| &token.requested else null);
             return state;
         };
+        if (self.allocator_rebase_header != null) if (self.ledger) |state| {
+            errdefer self.invalidateLedger();
+            const started = std.Io.Clock.awake.now(self.runtime());
+            if (try state.rebase(.{
+                .context = self,
+                .allocate = ledgerReadOnlyAllocate,
+                .read = ledgerRead,
+                .write = ledgerReadOnlyWrite,
+                .payload_bytes = self.maxPagePayloadBytes(),
+                .cancel_requested = if (cancel) |token| &token.requested else null,
+            }, checkpoint.free_map_root_page, 128)) {
+                if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+                self.allocator_ledger_rebased = true;
+                self.allocator_work.journal_rebases +|= 1;
+                self.allocator_work.journal_rebase_ns +|= @intCast(@max(0, started.durationTo(std.Io.Clock.awake.now(self.runtime())).nanoseconds));
+                self.allocator_rebase_header = null;
+                return state;
+            }
+        };
         self.invalidateLedger();
         if (checkpoint.free_map_root_page != 0) {
             const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
             defer self.allocator.free(payload);
             if ((try allocator_v4.State.decodeRoot(payload)).covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
         }
+        const started = std.Io.Clock.awake.now(self.runtime());
+        self.allocator_work.full_loads +|= 1;
+        defer self.allocator_work.full_load_ns +|= @intCast(@max(0, started.durationTo(std.Io.Clock.awake.now(self.runtime())).nanoseconds));
         const state = try self.allocator.create(allocator_v4.State);
         errdefer self.allocator.destroy(state);
         state.* = if (checkpoint.free_map_root_page == 0) allocator_v4.State.init(self.allocator) else try allocator_v4.State.load(self.allocator, .{
@@ -5263,10 +5718,16 @@ pub const NativeFile = struct {
         if (self.durable_header) |durable| for (durable.checkpoints) |slot| {
             if (validCheckpointSlot(slot)) frontier = @min(frontier, slot.commit_sequence);
         };
-        return frontier;
+        if (self.epoch_window) |epochs| if (epochs.metadata) |sequence| {
+            frontier = @min(frontier, sequence);
+        };
+        return @min(frontier, self.minimum_metadata_reader_sequence orelse frontier);
     }
     fn reuseFrontier(self: *NativeFile) u64 {
-        const frontier = self.metadataReuseFrontier();
+        var frontier = self.metadataReuseFrontier();
+        if (self.epoch_window) |epochs| if (epochs.data) |sequence| {
+            frontier = @min(frontier, sequence);
+        };
         return @min(@min(frontier, self.minimum_reader_sequence orelse frontier), if (self.reader_frontier) |readers| readers.load(.acquire) else frontier);
     }
 
@@ -5280,7 +5741,10 @@ pub const NativeFile = struct {
     }
 
     fn drainRetirement(self: *NativeFile, state: *allocator_v4.State, checkpoint: CheckpointSlot, budget: usize) !usize {
-        if (budget == 0) return 0;
+        // A registering reader may still hold its shared inode lock before
+        // publishing its epoch. Without the exclusive scan fence, even logical
+        // promotion would let a later writer consume that reader's old pages.
+        if (budget == 0 or self.epoch_window == null) return 0;
         const frontier = self.reuseFrontier();
         const metadata_frontier = self.metadataReuseFrontier();
         // Completed data/chain pages use the metadata fence too: recovery can
@@ -5482,6 +5946,11 @@ pub const NativeFile = struct {
         pending_data_objects: u64,
         reused_pages: u64,
         serviced_objects: u64,
+        journal_bytes: u64,
+        data_frontier: u64,
+        metadata_frontier: u64,
+        oldest_data_epoch: ?u64,
+        oldest_metadata_epoch: ?u64,
     };
 
     pub fn allocatorStats(self: *NativeFile) !?AllocatorStats {
@@ -5492,7 +5961,18 @@ pub const NativeFile = struct {
         if (cancel) |token| try token.check();
         if (!self.header.indexed_reclamation) return null;
         const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
-        return .{ .reusable_pages = state.free_pages, .pending_objects = state.pending.count(), .pending_data_objects = state.data_pending, .reused_pages = state.allocations, .serviced_objects = state.collected };
+        return .{
+            .reusable_pages = state.free_pages,
+            .pending_objects = state.pending.count(),
+            .pending_data_objects = state.data_pending,
+            .reused_pages = state.allocations,
+            .serviced_objects = state.collected,
+            .journal_bytes = state.root.delta_bytes,
+            .data_frontier = self.reuseFrontier(),
+            .metadata_frontier = self.metadataReuseFrontier(),
+            .oldest_data_epoch = if (state.heap.peek()) |item| item.epoch else null,
+            .oldest_metadata_epoch = if (state.metadata_heap.peek()) |item| item.epoch else null,
+        };
     }
 
     pub fn retirementNeedsService(self: *NativeFile) !bool {
@@ -7821,6 +8301,28 @@ pub const NativeFile = struct {
         return self.lookupDocumentIndexPage(checkpoint, key);
     }
 
+    /// Logical content identity survives physical page reuse. New metadata
+    /// records carry the digest in their checksummed record, avoiding payload
+    /// hydration; older records use the same digest computed on demand.
+    pub fn documentFingerprintAtCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8) !?[32]u8 {
+        const page = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return null;
+        var reader: ValuePageReader = undefined;
+        reader.init();
+        defer reader.deinit(self);
+        const entry = try decodeDocumentEntry(try reader.readPayload(self, checkpoint, page, 1, .document));
+        if (!std.mem.eql(u8, entry.key, key)) return error.InvalidDocumentIndex;
+        if (entry.is_delete) return null;
+        if (entry.content_digest) |digest| return digest;
+        const bytes = if (entry.external_value_root_page != 0)
+            try self.readValuePagesAtCheckpointAlloc(self.allocator, entry.external_value_root_page, entry.external_value_len, checkpoint)
+        else
+            null;
+        defer if (bytes) |owned| self.allocator.free(owned);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(bytes orelse entry.value, &digest, .{});
+        return digest;
+    }
+
     /// Resolve the pinned document once; nearby requested fields share one
     /// extent read and independent spans reuse the same page reader.
     pub fn readDocumentRangesAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
@@ -8870,7 +9372,7 @@ pub const NativeFile = struct {
     fn copyVacuumValue(self: *NativeFile, file: std.Io.File, next_page: *u64, entry: CatalogEntry, tree: bool, cancel: ?*const maintenance.CancelToken, tracking: ?*PageAllocator) !VacuumValue {
         const len = if (entry.external_value_root_page == 0) entry.value.len else entry.external_value_len;
         if (entry.external_value_root_page == 0) return .{ .inline_value = entry.value, .len = len };
-        const header_len: usize = if (tree) 16 else 28;
+        const header_len: usize = if (tree) 16 else documentHeaderSize(entry.key);
         if (header_len + entry.key.len + len <= self.maxPagePayloadBytes()) {
             // Re-inlining an external value allocates at most one page.
             const value = try self.catalogEntryValueAlloc(self.allocator, entry);
@@ -8967,6 +9469,7 @@ pub const NativeFile = struct {
                 .value = value.inline_value,
                 .external_value_root_page = value.root,
                 .external_value_len = value.len,
+                .content_digest = if (documentHeaderSize(record.key) == 60) try self.documentFingerprintAtCheckpoint(self.activeCheckpoint(), record.key) else null,
             });
             try document_index.add(record.key, document_root_page.*);
             if (namespace_directory.getPtr(namespace)) |head| {
@@ -8996,6 +9499,10 @@ pub const NativeFile = struct {
         if (self.read_only) return error.ReadOnly;
         var data_lock = try acquireDataRewriteLock(self.runtimeIo(), self.path);
         defer data_lock.file.close(self.runtimeIo());
+        if (self.header.indexed_reclamation) {
+            const epochs = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode);
+            if (epochs.data != null) return error.WouldBlock;
+        }
         var image = try self.prepareVacuum(cancel);
         defer image.deinit();
         try self.publishVacuum(&image);
@@ -9218,6 +9725,7 @@ pub const NativeFile = struct {
             .document_index_root_page = document_index_root_page,
         };
         var compact_header = Header{
+            .reader_epoch_namespace = if (indexed) try @import("reader_epochs.zig").namespaceForPublicationWithDurability(self.allocator, io, self.path, self.no_sync) else @splat(0),
             .indexed_reclamation = indexed,
             .page_size = self.header.page_size,
             .active_checkpoint = 0,
@@ -9302,9 +9810,9 @@ pub const NativeFile = struct {
                 try out_file.writePositionalAll(io, buffer[0..len], offset);
                 offset += len;
             }
-            var snapshot_header: [header_size]u8 = undefined;
-            encodeHeader(&snapshot_header, self.header);
-            try out_file.writePositionalAll(io, &snapshot_header, 0);
+            var destination = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(dest_path), .file = out_file, .header = self.header, .no_sync = false, .page_cache_enabled = .init(false) };
+            defer destination.page_cache.deinit(self.allocator);
+            try destination.bindPrivateEpochNamespace(dest_path);
             try out_file.setLength(io, snapshot_size);
             try out_file.sync(io);
         }
@@ -9379,7 +9887,7 @@ pub const NativeFile = struct {
 
     fn validateDocumentMutation(self: *const NativeFile, mutation: DocumentMutation) !void {
         if (mutation.key.len > std.math.maxInt(u32) or mutation.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
-        const fixed_len = 28 + mutation.key.len;
+        const fixed_len = documentHeaderSize(mutation.key) + mutation.key.len;
         if (fixed_len > self.maxPagePayloadBytes()) return error.PageTooLarge;
         if (mutation.external_value_root_page != 0) {
             if (self.transaction_header == null or mutation.is_delete or mutation.value.len != 0 or mutation.external_value_len == 0 or mutation.external_value_len > std.math.maxInt(u32) or mutation.external_value_root_page >= self.activeCheckpoint().page_count) return error.InvalidNativeValueChain;
@@ -9393,7 +9901,7 @@ pub const NativeFile = struct {
     }
 
     fn documentEntryFitsInline(self: *const NativeFile, key: []const u8, value: []const u8) bool {
-        const fixed_len = 28 + key.len;
+        const fixed_len = documentHeaderSize(key) + key.len;
         return fixed_len <= self.maxPagePayloadBytes() and value.len <= self.maxPagePayloadBytes() - fixed_len;
     }
 
@@ -10016,13 +10524,17 @@ pub const NativeFile = struct {
             }
             const coordinated = try self.beginReaderWindow();
             errdefer if (coordinated) self.endReaderWindow();
-            const lock = if (self.free_pages_verified and !coordinated) acquireDataRewriteLock(self.runtimeIo(), self.path) catch |err| switch (err) {
+            const lock = if (!coordinated) self.acquireEpochReuseLock() catch |err| switch (err) {
                 error.WouldBlock => null,
                 else => return err,
             } else null;
-            errdefer if (lock) |held| held.file.close(self.runtimeIo());
+            errdefer if (lock) |held| {
+                held.file.close(self.runtimeIo());
+                self.epoch_window = null;
+            };
             _ = try self.drainRetirement(state, checkpoint, self.retirement_work_pages);
-            return .{ .file = self, .free_pages = &.{}, .next_page_id = checkpoint.page_count, .ledger = state, .can_reuse = lock != null or (coordinated and self.reader_window_lock != null), .coordinated_reader_window = coordinated, .data_lock_file = if (lock) |held| held.file else null };
+            const can_reuse = self.free_pages_verified and (lock != null or (coordinated and self.reader_window_lock != null));
+            return .{ .file = self, .free_pages = &.{}, .next_page_id = checkpoint.page_count, .ledger = state, .can_reuse = can_reuse, .reuse_retry_enabled = self.free_pages_verified and !can_reuse, .coordinated_reader_window = coordinated, .data_lock_file = if (lock) |held| held.file else null };
         }
         var free_pages = try self.readFreePagesAlloc(checkpoint);
         errdefer self.allocator.free(free_pages);
@@ -10457,7 +10969,7 @@ pub const NativeFile = struct {
                 if (source == .catalog and source.catalog == .metadata and std.mem.startsWith(u8, record.key, artifact_lease_key_prefix)) continue;
                 const len = if (record.external_value_root_page == 0) record.value.len else record.external_value_len;
                 const is_catalog = cursor.kind == .catalog;
-                const header_len: usize = if (is_catalog) 16 else 28;
+                const header_len: usize = if (is_catalog) 16 else documentHeaderSize(record.key);
                 live_bytes +|= record.key.len + len;
                 const external = header_len + record.key.len + len > self.maxPagePayloadBytes();
                 const record_size = header_len + record.key.len + (if (external) @as(usize, 8) else len);
@@ -10808,21 +11320,12 @@ pub const NativeFile = struct {
         var next = self.activeCheckpoint();
         const changed = next.commit_sequence != previous.checkpoints[previous.active_checkpoint].commit_sequence;
         const deferred_publication = !durable and !self.no_sync and !self.externally_locked;
-        const prior_checkpoint = previous.checkpoints[previous.active_checkpoint];
-        const graph_changed = next.catalog_root_page != prior_checkpoint.catalog_root_page or
-            next.document_root_page != prior_checkpoint.document_root_page or
-            next.index_catalog_root_page != prior_checkpoint.index_catalog_root_page or
-            next.namespace_directory_root_page != prior_checkpoint.namespace_directory_root_page or
-            next.document_index_root_page != prior_checkpoint.document_index_root_page;
-        // Sealing allocator-only service would retire certificate pages in the
-        // very turn consuming retirement, preventing idle maintenance from
-        // settling. Such tips conservatively retain normal proof admission.
-        if (changed and graph_changed and !deferred_publication and self.allocator_certificate_on_commit and !self.allocator_certificate_staged and
+        if (changed and !deferred_publication and self.allocator_certificate_on_commit and
             self.header.indexed_reclamation and self.free_pages_verified and self.durable_header == null and
             !self.checkpoint_publication_uncertain)
         {
-            try self.stageAllocatorCertificate(.index);
-            next = self.activeCheckpoint();
+            next.commit_sequence = previous.checkpoints[previous.active_checkpoint].commit_sequence + 1;
+            try self.sealAllocatorCheckpoint(previous, next);
         }
         self.header = previous;
         self.transaction_header = null;
@@ -10849,6 +11352,23 @@ pub const NativeFile = struct {
             try self.syncIfRequired();
             try self.publishCheckpoint(next);
         } else try self.sync();
+    }
+
+    /// The allocator root is already private to this transaction. Sealing it
+    /// adds no allocation, catalog mutation, retirement, or durability barrier.
+    /// Both recovery slots and the canonical ledger are covered independently.
+    fn sealAllocatorCheckpoint(self: *NativeFile, previous: Header, next: CheckpointSlot) !void {
+        for (previous.checkpoints) |slot| if (slot.free_map_root_page == next.free_map_root_page) return;
+        const state = try self.loadLedgerForDigest(next, self.allocator_cancel_token, true);
+        var published = previous;
+        published.active_checkpoint = 1 - previous.active_checkpoint;
+        published.checkpoints[published.active_checkpoint] = next;
+        var root: [192]u8 = @splat(0);
+        allocator_v4.State.encodeRoot(state.root, root[0..128]);
+        std.mem.writeInt(u64, root[56..64], 3, .little);
+        @memcpy(root[128..160], &fingerprintHeader(published));
+        @memcpy(root[160..192], &try state.incrementalFingerprint());
+        try self.writePage(next.free_map_root_page, .free_map, &root);
     }
 
     fn publishCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot) !void {
@@ -10883,6 +11403,7 @@ pub const NativeFile = struct {
         self.header.checkpoints[next_slot] = checkpoint;
         self.header.active_checkpoint = next_slot;
         self.checkpoint_publication_uncertain = false;
+        self.last_synced_header = self.header;
         if (self.ledger) |state| {
             self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
             self.retirement_activity_bytes +|= state.retired_inline_bytes;
@@ -10901,13 +11422,50 @@ pub const NativeFile = struct {
 
     pub fn sync(self: *NativeFile) !void {
         if (self.transaction_header != null) return;
+        if (!self.checkpoint_publication_uncertain and self.durable_header == null)
+            if (self.last_synced_header) |synced| if (std.meta.eql(synced, self.header)) return;
         try self.syncIfRequired();
         if (self.durable_header != null) try self.publishCheckpoint(self.activeCheckpoint());
+        self.last_synced_header = self.header;
     }
 
     pub fn failNextGenerationDirectorySyncForTest(self: *NativeFile) void {
         std.debug.assert(builtin.is_test);
         self.test_fail_generation_directory_sync = true;
+    }
+
+    /// Only a fresh/unpublished inode may change its namespace. Preserve a
+    /// valid checked allocator seal: neither ownership nor recovery roots
+    /// changed when this private image acquired its final publication name.
+    fn bindPrivateEpochNamespace(self: *NativeFile, destination_path: []const u8) !void {
+        if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain) return error.InvalidTransactionState;
+        var next = self.header;
+        if (next.indexed_reclamation) {
+            next.reader_epoch_namespace = try @import("reader_epochs.zig").namespaceForPublicationWithDurability(self.allocator, self.runtime(), destination_path, self.no_sync);
+            const checkpoint = self.activeCheckpoint();
+            if (checkpoint.free_map_root_page != 0) {
+                const root = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
+                defer self.allocator.free(root);
+                if (root.len == 192 and std.mem.eql(u8, root[128..160], &self.headerFingerprint())) {
+                    @memcpy(root[128..160], &fingerprintHeader(next));
+                    try self.writePage(checkpoint.free_map_root_page, .free_map, root);
+                }
+            }
+        }
+        var encoded: [header_size]u8 = undefined;
+        encodeHeader(&encoded, next);
+        try self.file.writePositionalAll(self.runtimeIo(), &encoded, 0);
+        self.header = next;
+        self.last_synced_header = null;
+        self.allocator_verification_base = null;
+    }
+
+    /// Bind and sync an exclusively owned, unpublished image before a caller's
+    /// atomic rename. No readers may borrow this inode during preparation.
+    pub fn preparePrivatePublication(self: *NativeFile, destination_path: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+        try self.bindPrivateEpochNamespace(destination_path);
+        try self.syncIfRequired();
     }
 
     /// Atomically publishes a fully built Lite generation into this file and
@@ -10918,8 +11476,8 @@ pub const NativeFile = struct {
         if (self.read_only or prepared.read_only) return error.ReadOnly;
         if (std.mem.eql(u8, self.path, prepared.path)) return error.InvalidNativeSnapshotPath;
 
-        try prepared.syncIfRequired();
         const io = self.runtimeIo();
+        try prepared.preparePrivatePublication(self.path);
         try renameFilePath(io, prepared.path, self.path);
 
         std.mem.swap(std.Io.File, &self.file, &prepared.file);
@@ -11603,11 +12161,12 @@ pub fn inspectBytes(raw: []const u8) InspectReport {
 
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
-    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) indexed_v4_magic else if (header.packed_records) magic else unpacked_v3_magic);
-    std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) @as(u32, 4) else format_version, .little);
+    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) indexed_magic else if (header.packed_records) magic else unpacked_v3_magic);
+    std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) indexed_format_version else format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
     out[active_checkpoint_offset] = header.active_checkpoint;
+    if (header.indexed_reclamation) @memcpy(out[reader_epoch_namespace_offset..][0..32], &header.reader_epoch_namespace);
 
     for (header.checkpoints, 0..) |slot, index| {
         encodeCheckpointSlot(out[checkpointOffset(index)..][0..checkpoint_slot_size], slot);
@@ -11619,12 +12178,12 @@ pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
 pub fn decodeHeader(raw: []const u8) !Header {
     if (raw.len < header_size) return error.TruncatedNativeHeader;
     const header_raw = raw[0..header_size];
-    const indexed_reclamation = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_v4_magic);
+    const indexed_reclamation = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
     const has_packed_records = indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
     if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v3_magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    if (version != (if (indexed_reclamation) @as(u32, 4) else format_version)) return error.UnsupportedNativeFormatVersion;
+    if (version != (if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
@@ -11656,6 +12215,7 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const active_checkpoint = try selectActiveCheckpoint(checkpoints, valid_slots, active_hint);
 
     return .{
+        .reader_epoch_namespace = if (indexed_reclamation) header_raw[reader_epoch_namespace_offset..][0..32].* else @splat(0),
         .packed_records = has_packed_records,
         .indexed_reclamation = indexed_reclamation,
         .page_size = page_size,
@@ -11942,18 +12502,20 @@ fn encodeDocumentEntry(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), e
 
     const start = out.items.len;
     const stored_value_len: usize = if (external_value) 8 else value_len;
-    const header_len: usize = 28;
+    const header_len: usize = if (entry.content_digest != null) 60 else 28;
     try out.resize(allocator, start + header_len + entry.key.len + stored_value_len);
     const encoded = out.items[start..];
     std.mem.writeInt(u64, encoded[0..8], entry.previous_page, .little);
     encoded[8] =
         (if (entry.is_delete) document_delete_flag else 0) |
         (if (external_value) document_external_value_flag else 0) |
-        document_namespace_link_flag;
+        document_namespace_link_flag |
+        (if (entry.content_digest != null) document_content_digest_flag else 0);
     @memset(encoded[9..12], 0);
     std.mem.writeInt(u32, encoded[12..16], @intCast(entry.key.len), .little);
     std.mem.writeInt(u32, encoded[16..20], @intCast(value_len), .little);
     std.mem.writeInt(u64, encoded[20..28], entry.previous_namespace_page, .little);
+    if (entry.content_digest) |digest| @memcpy(encoded[28..60], &digest);
     @memcpy(encoded[header_len..][0..entry.key.len], entry.key);
     if (external_value) {
         std.mem.writeInt(u64, encoded[header_len + entry.key.len ..][0..8], entry.external_value_root_page, .little);
@@ -11966,7 +12528,7 @@ fn decodeDocumentEntry(raw: []const u8) !DocumentEntry {
     if (raw.len < 20) return error.TruncatedNativeDocumentEntry;
     const previous_page = std.mem.readInt(u64, raw[0..8], .little);
     const flags = raw[8];
-    if (flags & ~(document_delete_flag | document_external_value_flag | document_namespace_link_flag) != 0) return error.InvalidNativeDocumentEntryFlags;
+    if (flags & ~(document_delete_flag | document_external_value_flag | document_namespace_link_flag | document_content_digest_flag) != 0) return error.InvalidNativeDocumentEntryFlags;
     const is_delete = flags & document_delete_flag != 0;
     const external_value = flags & document_external_value_flag != 0;
     const has_namespace_link = flags & document_namespace_link_flag != 0;
@@ -11976,7 +12538,7 @@ fn decodeDocumentEntry(raw: []const u8) !DocumentEntry {
     const key_len = std.mem.readInt(u32, raw[12..16], .little);
     const value_len = std.mem.readInt(u32, raw[16..20], .little);
     const stored_value_len: u64 = if (external_value) 8 else value_len;
-    const header_len: usize = 28;
+    const header_len: usize = if (flags & document_content_digest_flag != 0) 60 else 28;
     if (raw.len < header_len) return error.TruncatedNativeDocumentEntry;
     const payload_len = @as(u64, key_len) + stored_value_len;
     if (payload_len > raw.len - header_len) return error.TruncatedNativeDocumentEntry;
@@ -11992,6 +12554,7 @@ fn decodeDocumentEntry(raw: []const u8) !DocumentEntry {
     return .{
         .previous_page = previous_page,
         .previous_namespace_page = std.mem.readInt(u64, raw[20..28], .little),
+        .content_digest = if (flags & document_content_digest_flag != 0) raw[28..60].* else null,
         .key = raw[key_start..key_end],
         .value = if (external_value) raw[key_end..key_end] else raw[key_end..stored_value_end],
         .is_delete = is_delete,
@@ -20136,9 +20699,10 @@ test "lite allocator v4 live Merkle certificates retain their cache across commi
         try std.testing.expect(ledger.digestWork() - before < 400);
         var peer = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
         defer peer.close();
-        const certificate = (try peer.getIndexCatalogRecordAlloc(a, NativeFile.allocator_certificate_key)).?;
+        const certificate = try peer.readPagePayloadByKindAllocForCheckpoint(a, peer.activeCheckpoint().free_map_root_page, .free_map, peer.activeCheckpoint());
         defer a.free(certificate);
-        try std.testing.expectEqualStrings("AFACERT2", certificate[0..8]);
+        try std.testing.expectEqual(@as(usize, 192), certificate.len);
+        try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, certificate[56..64], .little));
         try std.testing.expect(try peer.inheritAllocatorCertificate());
         const loaded = try peer.loadLedger(peer.activeCheckpoint());
         loaded.counts.items[0] ^= 1;
@@ -20147,4 +20711,241 @@ test "lite allocator v4 live Merkle certificates retain their cache across commi
         try std.testing.expect(try peer.inheritAllocatorCertificate());
         try std.testing.expect((try peer.check()).valid);
     }
+}
+
+test "issue1431 ordinary coordinated reader retains allocator metadata" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "full-snapshot-reuse.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.reader_coordinator = &coordinator;
+    const value: [8192]u8 = @splat('v');
+    try writer.putDocument("keep", &value);
+    for (0..128) |i| {
+        var key: [32]u8 = undefined;
+        try writer.putDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+    }
+    for (0..128) |i| {
+        var key: [32]u8 = undefined;
+        try writer.deleteDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+    }
+    _ = try writer.reclaimPages(8192);
+    try std.testing.expect((try writer.allocatorStats()).?.reusable_pages > 64);
+    var snapshot = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &coordinator });
+    defer snapshot.close();
+    const captured_size = (try snapshot.file.stat(io)).size;
+    const before = (try writer.allocatorStats()).?.reused_pages;
+    for (0..32) |i| {
+        var key: [32]u8 = undefined;
+        try writer.putDocument(try std.fmt.bufPrint(&key, "new-{d}", .{i}), &value);
+    }
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages > before);
+    // No cache may conceal overwritten old ledger pages. Check both captured
+    // recovery slots and their allocator after the writer has advanced far.
+    try std.testing.expect(snapshot.ledger == null);
+    const captured_report = try snapshot.checkAtFileSizeWithCancel(captured_size, null);
+    std.debug.print("review1436 ordinary snapshot valid={any} issue={any}\n", .{ captured_report.valid, captured_report.issue });
+    try std.testing.expect(captured_report.valid);
+    const captured = (try snapshot.getDocumentAlloc(a, "keep")).?;
+    defer a.free(captured);
+    try std.testing.expectEqualSlices(u8, &value, captured);
+    try std.testing.expect((try writer.check()).valid);
+    const reused = (try writer.allocatorStats()).?.reused_pages;
+    writer.reader_coordinator = null;
+    try writer.putDocument("unrecognized-publication", "external writer");
+    writer.reader_coordinator = &coordinator;
+    try writer.putDocument("after-unrecognized-publication", "must retain the snapshot epoch");
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages >= reused);
+    try std.testing.expect((try snapshot.checkAtFileSizeWithCancel(captured_size, null)).valid);
+    try std.testing.expect((try writer.check()).valid);
+}
+
+test "lite reader epoch aliases hardlink snapshot preserves original data" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "original.aflite");
+    defer a.free(path);
+    const alias = try testPath(a, tmp, "alias.aflite");
+    defer a.free(alias);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    var value: [8192]u8 = @splat('a');
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    try std.Io.Dir.cwd().hardLink(path, std.Io.Dir.cwd(), alias, io, .{});
+    var reader = try NativeFile.openWithIo(a, io, alias, .{ .read_only = true, .reader_coordinator = &coordinator });
+    defer reader.close();
+    reader.page_cache_enabled.store(false, .monotonic);
+    value[0] = 'b';
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqual(@as(u8, 'a'), captured[0]);
+}
+
+const EpochAliasCase = enum { same_path, symlink_alias, data_alias, late_alias, recreated_parent };
+fn testEpochAliasCase(scenario: EpochAliasCase) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try testPath(a, tmp, "original-parent");
+    defer a.free(parent);
+    try std.Io.Dir.cwd().createDir(io, parent, .fromMode(0o700));
+    const path = try std.fs.path.join(a, &.{ parent, "original.aflite" });
+    defer a.free(path);
+    const alias = try testPath(a, tmp, "alias.aflite");
+    defer a.free(alias);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    var value: [8192]u8 = @splat('a');
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    if (scenario == .data_alias) try std.Io.Dir.cwd().hardLink(path, std.Io.Dir.cwd(), alias, io, .{});
+    if (scenario == .symlink_alias) {
+        const target = try realPathAlloc(a, io, path);
+        defer a.free(target);
+        try std.Io.Dir.cwd().symLink(io, target, alias, .{});
+    }
+    var reader = try NativeFile.openWithIo(a, io, if (scenario == .data_alias or scenario == .symlink_alias) alias else path, .{
+        .read_only = true,
+        .internal_reader = scenario == .data_alias,
+        .reader_coordinator = &coordinator,
+    });
+    defer reader.close();
+    reader.page_cache_enabled.store(false, .monotonic);
+    if (scenario == .data_alias) {
+        try reader.acquireReaderFence(writer.activeCheckpoint().commit_sequence, &writer);
+        try std.testing.expect(reader.reader_fence.?.epoch == null);
+        try std.testing.expect(reader.reader_fence.?.inode_only);
+        // Even the same local coordinator must not temporarily unlock this
+        // alias while an independent writer scans the original namespace.
+        writer.reader_coordinator = &coordinator;
+        try std.testing.expect(try writer.beginReaderWindow());
+        try std.testing.expect(writer.reader_window_lock == null);
+        try std.testing.expect(!reader.reader_fence.?.suspended);
+        writer.endReaderWindow();
+    } else try std.testing.expect(reader.reader_fence.?.epoch != null);
+    const before = (try writer.allocatorStats()).?.reused_pages;
+    value[0] = 'b';
+    if (scenario == .late_alias) {
+        try std.Io.Dir.cwd().hardLink(path, std.Io.Dir.cwd(), alias, io, .{});
+        // A link-count check would now see one link and miss the live reader
+        // which registered before this alias existed.
+        try deleteFilePath(io, path);
+        var peer = try NativeFile.openWithIo(a, io, alias, .{ .externally_locked = true, .no_sync = true });
+        defer peer.close();
+        try std.testing.expectEqual(@as(std.Io.File.NLink, 1), (try peer.file.stat(io)).nlink);
+        for (0..80) |_| try peer.putDocument("doc", &value);
+        try std.testing.expectEqual(@as(u64, 0), (try peer.allocatorStats()).?.reused_pages);
+        try std.testing.expect((try peer.check()).valid);
+    } else {
+        if (scenario == .recreated_parent) {
+            const moved = try testPath(a, tmp, "moved-parent");
+            defer a.free(moved);
+            try renameFilePath(io, parent, moved);
+            try std.Io.Dir.cwd().createDir(io, parent, .fromMode(0o700));
+            const moved_file = try std.fs.path.join(a, &.{ moved, "original.aflite" });
+            defer a.free(moved_file);
+            try std.Io.Dir.cwd().hardLink(moved_file, std.Io.Dir.cwd(), path, io, .{});
+            try deleteFilePath(io, moved_file);
+        }
+        for (0..80) |_| try writer.putDocument("doc", &value);
+        const after = (try writer.allocatorStats()).?.reused_pages;
+        if (scenario == .same_path or scenario == .symlink_alias) try std.testing.expect(after > before) else try std.testing.expectEqual(before, after);
+        try std.testing.expect((try writer.check()).valid);
+    }
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqual(@as(u8, 'a'), captured[0]);
+}
+
+test "lite reader epoch aliases same path retains coordinated reuse" {
+    try testEpochAliasCase(.same_path);
+}
+test "lite reader epoch aliases symlinks retain the canonical namespace" {
+    try testEpochAliasCase(.symlink_alias);
+}
+test "lite reader epoch aliases data fences cannot be suspended" {
+    try testEpochAliasCase(.data_alias);
+}
+test "lite reader epoch aliases created after capture remain safe after unlink" {
+    try testEpochAliasCase(.late_alias);
+}
+test "lite reader epoch aliases recreated parent cannot hide moved epochs" {
+    try testEpochAliasCase(.recreated_parent);
+}
+
+test "lite reader epoch aliases private copies and rewrites bind final namespace" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "source.aflite");
+    defer a.free(path);
+    const copy = try testPath(a, tmp, "copy.aflite");
+    defer a.free(copy);
+    var original = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer original.close();
+    const value: [8192]u8 = @splat('v');
+    original.allocator_certificate_on_commit = true;
+    for (0..80) |_| try original.putDocument("doc", &value);
+    try std.testing.expect(try original.certifyAllocator());
+    _ = try original.copyStableSnapshotToPath(copy, false);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var destination = try NativeFile.openWithIo(a, io, copy, .{ .no_sync = true, .reader_coordinator = &coordinator });
+    defer destination.close();
+    try std.testing.expect(try destination.inheritAllocatorCertificate());
+    var snapshot = try destination.captureFullReadSnapshot();
+    var snapshot_open = true;
+    defer if (snapshot_open) snapshot.close();
+    try std.testing.expect(snapshot.reader_fence.?.epoch != null);
+    const before = (try destination.allocatorStats()).?.reused_pages;
+    for (0..8) |_| try destination.putDocument("new", &value);
+    try std.testing.expect((try destination.allocatorStats()).?.reused_pages > before);
+    snapshot.close();
+    snapshot_open = false;
+    _ = try destination.vacuum();
+    try std.testing.expectEqual(try @import("reader_epochs.zig").namespaceForPublication(a, io, copy), destination.header.reader_epoch_namespace);
+    var rewritten_snapshot = try destination.captureFullReadSnapshot();
+    defer rewritten_snapshot.close();
+    try std.testing.expect(rewritten_snapshot.reader_fence.?.epoch != null);
+    try std.testing.expect((try destination.check()).valid);
+}
+
+test "lite reader epoch aliases long filenames retain epoch reuse" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var name: [250]u8 = @splat('d');
+    @memcpy(name[243..], ".aflite");
+    const path = try testPath(a, tmp, &name);
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    const value: [8192]u8 = @splat('v');
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &coordinator });
+    defer reader.close();
+    try std.testing.expect(reader.reader_fence.?.epoch != null);
+    const before = (try writer.allocatorStats()).?.reused_pages;
+    for (0..8) |_| try writer.putDocument("new", &value);
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages > before);
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqualSlices(u8, &value, captured);
 }

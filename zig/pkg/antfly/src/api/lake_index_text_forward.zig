@@ -105,7 +105,6 @@ pub fn retractMeasured(a: A, store: *stores.ArtifactStore, manager: *local.sql_s
     }
     var changes = Mutations.init(a, manager, storage);
     defer changes.deinit();
-    changes.private_pages.phase = store.io_phase;
     const terms = try a.alloc([]const u8, counts.count());
     defer a.free(terms);
     var it = counts.keyIterator();

@@ -116,12 +116,18 @@ pub fn searchPlanAlloc(alloc: std.mem.Allocator, pattern: []const u8) !SearchPla
 /// byte. Matching is allocation-free and uses the standard last-star
 /// backtracking algorithm.
 pub fn match(pattern: []const u8, text: []const u8) bool {
+    return matchControlled(pattern, text, .none) catch unreachable;
+}
+pub fn matchControlled(pattern: []const u8, text: []const u8, control: @import("antfly_cancellation").CancellationToken) !bool {
+    var steps: usize = 0;
     var pattern_index: usize = 0;
     var text_index: usize = 0;
     var star_resume_pattern: ?usize = null;
     var star_resume_text: usize = 0;
 
     while (text_index < text.len) {
+        if (steps % 4096 == 0) try control.check();
+        steps += 1;
         if (tokenAt(pattern, pattern_index)) |parsed| {
             switch (parsed.token) {
                 .literal => |byte| {
@@ -152,6 +158,8 @@ pub fn match(pattern: []const u8, text: []const u8) bool {
     }
 
     while (tokenAt(pattern, pattern_index)) |parsed| {
+        if (steps % 4096 == 0) try control.check();
+        steps += 1;
         if (parsed.token != .star) return false;
         pattern_index = parsed.next;
     }

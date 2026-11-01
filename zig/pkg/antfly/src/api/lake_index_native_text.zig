@@ -73,9 +73,10 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     }
     if (!store_source) return original;
     var hash = std.crypto.hash.Blake3.init(.{});
-    // v2 stores the complete declared relational row even when `field`
-    // selects only one searchable text field. v1 retained only that field.
-    hash.update("native-lake-text-stored-source-v2");
+    // v10 adds suffix-safe block spacing summaries to compact source-order
+    // selection and block-compressed inline small-field offsets. Analyzer
+    // fingerprints fence the evidence across projection and compaction.
+    hash.update("native-lake-text-stored-source-v10");
     hash.update(&original);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
@@ -1261,7 +1262,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer local.introducer.freeTextAnalysisConfig(a, analysis);
         var batch_arena = std.heap.ArenaAllocator.init(a);
         defer batch_arena.deinit();
-        var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+        var builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
         var file_arena = std.heap.ArenaAllocator.init(a);
         defer file_arena.deinit();
         var patch_serving: ?Root = null;
@@ -1439,7 +1440,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
                         leases.clear();
                         _ = batch_arena.reset(.free_all);
-                        builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                        builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
                     const batch = (rows.next(a) catch |err| return buildFailure(err, "read_rows", file_ordinal, segments.items.len)) orelse break;
@@ -1459,7 +1460,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
                         leases.clear();
                         _ = batch_arena.reset(.free_all);
-                        builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                        builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     };
                     for (0..batch.rowCount()) |row| {
@@ -1484,7 +1485,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                             if (retained) try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source) else try flush(&compactor, builder.batch(), analysis, store_source);
                             leases.clear();
                             _ = batch_arena.reset(.free_all);
-                            builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                            builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
                             input_bytes = 0;
                         }
                     }
@@ -1517,7 +1518,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         ordinals = physical.Builder.init(a, fa, store, cancellation);
                         leases.clear();
                         _ = batch_arena.reset(.free_all);
-                        builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                        builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                         previous_id = null;
                         continue;
@@ -1551,7 +1552,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             group.admissions = admissions.items;
             group.sort_bounds = if (sort_bounds.items.len == segments.items.len) sort_bounds.items else &.{};
             _ = batch_arena.reset(.free_all);
-            builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+            builder = mapper.TextProjectionBatchBuilder.initWithSourceColumns(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
             if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
             try group.validate(store.upload_scope.?.domain);
@@ -2567,7 +2568,7 @@ const Compactor = struct {
     }
 };
 fn flush(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, store_source: bool) !void {
-    return flushWithOptions(compactor, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .index_sort = compactor.index_sort });
+    return flushWithOptions(compactor, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .store_source_columns = store_source, .index_sort = compactor.index_sort });
 }
 fn flushWithOptions(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, build_options: mapper.BuildTextSegmentsOptions) !void {
     try compactor.finishEncoding();
@@ -2772,7 +2773,7 @@ fn flushRetained(compactor: *Compactor, arena: *std.heap.ArenaAllocator, leases:
             arena.* = .init(compactor.a);
             leases.* = .{};
             transferred = true;
-            try encoder.enqueue(batch, owned, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .index_sort = compactor.index_sort });
+            try encoder.enqueue(batch, owned, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .store_source_columns = store_source, .index_sort = compactor.index_sort });
             return;
         }
     }
@@ -3181,14 +3182,14 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
         manifests.prefetch(ref);
         try std.testing.expect(manifests.pending != null);
         try probe.entered.wait(std.testing.io);
-        const held = try bounded.alloc(u8, budget.max_live_bytes - budget.live_bytes);
+        const held = try bounded.alloc(u8, budget.maxBytes() - budget.liveBytes());
         probe.gate.set(std.testing.io);
         while (!manifests.pending.?.task.isComplete()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
         bounded.free(held);
-        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), budget.liveBytes());
         // A completed successful read retains only its independently admitted
         // bytes: required reducer allocations may still use their entire quota.
-        const required_work = try bounded.alloc(u8, budget.max_live_bytes);
+        const required_work = try bounded.alloc(u8, budget.maxBytes());
         bounded.free(required_work);
         try std.testing.expect(scheduler.pull_bytes != 0);
         const before = probe.reads.load(.acquire);
@@ -3200,16 +3201,16 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
         try std.testing.expect(manifests.pending == null and probe.execution.active);
         try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
         required.deinit();
-        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), budget.liveBytes());
         manifests.prefetch(ref);
         try std.testing.expect(manifests.pending != null);
         while (!manifests.pending.?.task.isComplete()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
-        try std.testing.expect(budget.live_bytes >= ref.byte_len);
-        try std.testing.expectError(error.OutOfMemory, bounded.alloc(u8, budget.max_live_bytes));
+        try std.testing.expect(budget.liveBytes() >= ref.byte_len);
+        try std.testing.expectError(error.OutOfMemory, bounded.alloc(u8, budget.maxBytes()));
         const cached_reads = probe.reads.load(.acquire);
         _ = try manifests.load(arena.allocator(), ref);
         try std.testing.expectEqual(cached_reads, probe.reads.load(.acquire));
-        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), budget.liveBytes());
     }
     // A completed result retains its independent node reservation until join.
     scheduler.max_pull_bytes = 1;
@@ -3542,7 +3543,7 @@ test "external lake canonical multi-pack publication keeps worker allocations ou
     try std.testing.expect(probe.peak.load(.acquire) > 1);
     try std.testing.expectEqual(@as(usize, 1), segments.items.len);
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
-    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.liveBytes());
 }
 
 test "external lake text row deltas merge retained postings without reanalyzing old rows" {

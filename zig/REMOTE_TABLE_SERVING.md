@@ -1521,6 +1521,689 @@ only if every live input attests it. A complete validated sorted merge may mint 
 new completeness witness; append cannot upgrade unproven historical or projected
 input gaps into semantic NULLs.
 
+### Ordered demand, primary boundaries and fallback accounting
+
+Field-sorted top-k preserves native physical ordering for an admitted window
+before trying a global metadata cursor. Unfiltered native-compatible requests
+stay on that path; complete single-term counts use the same selectivity costing
+as the native collector. Other compatible global ordered cursors run before
+constructing a physical pack selection. Optional pack enumeration after a decline
+uses a row-goal admission bound (4,096–65,536 candidates); this is planning work,
+not a matching-row or result limit. A broader predicate stays in exact native
+membership. Exact counts and evaluation retain complete enumeration, and
+relocated pack proofs retain their independent translation allowance.
+
+An incomplete public order carries an operation-owned primary comparison
+capability. It binds the cursor's pinned index definition, normalized equality
+prefix, per-key physical directions and NULL placement to the write-side tuple
+codec. A page retains its last authenticated key while its references are
+processed. Once all children in that page finish, a strictly worse primary tuple
+proves that later rows cannot enter the winning tie group. The proof does not
+require another text or residual match, does not decode Parquet values, and never
+uses private row IDs to resolve public ties. Forward/backward cursors and physical
+reversal remain independent; equal primary prefixes must remain live.
+
+The shared probe/read/memory limits still bound this optional attempt. An
+unfinished boundary or exhausted membership budget falls back to exact native
+windows. After consuming and declining an ordered prefix, the operation retains
+text-candidate preference through window planning and the final collector. The
+collector must not reopen that prefix with a fresh allowance; this decision also
+applies when profiling is disabled. Physical rows without text ordinals still
+consume the probe allowance. Profiles retain child decoration counters, ordered
+reference visits and elapsed preparation/execution time from the abandoned
+attempt. Successful pages report `ordered_lake_index`; a declined global attempt reports
+`ordered_lake_index_then_text_windows` alongside the final collector reason.
+Attempt elapsed time replaces its nested child timers before adding fallback
+collector time, so counters survive without double-counting elapsed execution.
+
+Lazy Boolean membership carries a conservative segment-local candidate ceiling.
+A required finite row selection bounds a conjunction even when term checks remain
+lazy; required disjunctions use the sum of child ceilings divided by their
+minimum match count. Unknown producers retain the full segment ceiling, and
+exclusions do not narrow this estimate. This is a costing bound, never an exact
+count or a reason to discard matching rows. It keeps a tiny admitted page from
+choosing an ordered stream over every unrelated row in its child segment.
+
+
+### Sparse ordered membership and selected-pack waves
+
+Identity-only index pages retain row references and one authenticated boundary
+key, without allocating every full tuple or unused cover descriptor. Wide
+nonconstant secondary suffixes therefore cannot consume a page-sized multiple
+of the boundary workspace. Forward and backward pulls retain the same private
+coordinate validation, relocation and public tie semantics.
+
+Ordered candidates are translated to sorted native ordinals before text
+membership. Sparse supported Boolean/term plans use bounded batch posting probes;
+dense candidates and unsupported phrase/pattern shapes retain compressed bitmap
+membership. Four pack entries share an 8 MiB query budget, including their probe
+programs and up to four segment cursors apiece. Only shared pins opened by the
+outer execution may survive a child arena: their publication, source metadata,
+read capability and cancellation context remain alive until all probes close.
+Deletion masks are checked before a finite selection becomes an exact witness.
+
+The private witness binds the prepared text program, leased snapshot and exact
+finite include slice. It permits replacing only repeated text eligibility with
+match-all; metadata residuals, authorization, exclusions and visibility remain
+normal constraints. The original score expression is frozen before that
+replacement and scores only selected winners. No witness applies across a
+snapshot/program/selection change, and exact counts keep their complete path.
+Zero-ceiling segments skip membership materialization entirely.
+
+Each ordered page groups references by serving pack. At most four pack opens
+prefetch through the existing shared I/O scheduler, with separate bounded task
+workspace and native cache/resource-manager admission for retained pins.
+Saturation leaves required opens inline. Every task joins or cancels before
+its results, publication callback or read context can be released. A prefetch
+failure remains optional and retries through the authoritative reader. All
+packs in the current metadata page finish before its boundary can stop traversal.
+
+
+The global ordered attempt uses exact prepared single-term cardinality for every
+compatible metadata ordering, including orders different from native physical
+order. If postings are cheaper, that choice remains attached to the attempt:
+optional metadata pack enumeration cannot recreate the declined prefix walk.
+Required predicate membership and exact counts retain their existing proofs.
+Profiles preserve the final text collector source when no ordered rows were read.
+
+Bitmap admission protects the current pack's prepared patterns while evicting
+older membership entries and retrying allocation. If no other entry can be
+reclaimed, the pack remembers the declined bitmap admission for this attempt;
+subsequent pages cannot repeatedly allocate an oversized bitmap. Sparse probes
+retain their independent bounded state.
+
+When all final winners share one stored-source pack, the coordinator retains its
+outer shared pin and validates every winner before restoring native ordinals.
+Otherwise complete, request-owned winner locators permit native delivery across
+packs for both ordered and ordinary text windows. A compact permutation groups
+only final hits by pack without changing result order. Each wave opens at most
+four packs through the shared scheduler, releases each consumed pin promptly,
+and joins all remaining work on errors or cancellation. Missing locators decline
+before changing any hits. Optional open failures retry through the authoritative
+reader; integrity and cancellation failures propagate. WAL/overlay results retain
+the established overlay-aware hydration path.
+
+Every delivery batch applies authenticated stored-field coverage, reads uncovered
+fields through the physical source, verifies native keys, and clears temporary
+native ordinals before releasing its pin. Locator keys outlive result retirement
+and postprocessing. Hydration metrics distinguish covered native batches from
+physical source batches (`hydration_native` and `hydration_source`); they are
+nested process counters, not request-attributed deltas. Health metrics refresh
+asynchronously, so isolated E2E counter assertions wait for the refreshed query
+snapshot. The real Parquet test spans multiple serving packs and verifies covered
+projection and hidden highlight fields before and after restart with the original
+Parquet object unavailable.
+
+
+### Boolean costing and independently readable stored source
+
+Optional ordered demand uses a conservative prepared text candidate ceiling,
+including required Boolean intersections and minimum-should-match unions. Required
+children take the minimum ceiling; required disjunctions sum child ceilings before
+dividing by their minimum match count. Unrestricted and unknown producers,
+including phrase leaves, retain the corpus ceiling; required term children in a
+lowered phrase can still provide a bound. Exclusions never increase selectivity.
+This ceiling only chooses a driver: exact counts, eligibility, scoring, authorization and cursor
+proofs continue to use their authoritative implementations. A postings choice
+survives pack routing and the downstream collector even without profiling.
+
+The stored-source recipe v4 writes the complete declared row as independently
+compressed `columnar_stored` sections using the existing typed AJV1 value codec.
+An authenticated non-JSON marker occupies each ordinary stored-body slot; it is
+not a second serialized row. Unindexed large fields remain available as source
+columns without becoming text postings. Native projection opens only the requested
+columns, validates the stored row identity, and decodes selected values under the
+request allocator. Four field cursors retain at most one decoded chunk each;
+ordinary chunks have a 64 KiB raw target, and an oversized required value owns its
+own chunk. A nested path reads its containing native JSON column. No new public
+configuration is required: `store_source` owns this representation.
+
+Whole-document consumers explicitly reconstruct JSON through the existing stored
+reader API. Highlight attachment uses projected native values too, including fields
+excluded from the response. The representation therefore preserves source and
+highlight semantics while allowing a small projection to avoid an unrelated large
+payload. Field cursors expire before their pack pin, and shared segment caches do
+not retain request-decoded source values.
+
+Both append and physically sorted compaction stream source columns through the
+same live-document and ordinal mapping as the text sections. They retain the raw
+marker rather than reconstructing full JSON rows. Delete masks, sparse field
+presence, scalar kinds and exact integers survive the rewrite. The authenticated
+recipe changes when this source representation changes, so reuse cannot claim
+column capability for a monolithic producer. Local embedded builders retain their
+existing source mode unless they explicitly select column storage.
+
+
+### Bounded source batches and indexed chunk navigation
+
+Native source projection processes one requested column across the returned
+selection before moving to the next column, checking cancellation in 64-row tiles. A compact ordinal permutation retains the
+public rank order and validates every native row key under the current pack pin.
+Four reusable field cursors still bound live decoded state; a projection wider
+than four fields no longer reopens every column for every row. Legacy monolithic
+rows keep one parse per projected row. The existing result owner retains projected
+values and frees partial output if allocation or cancellation fails.
+
+Recipe v4 uses a source-column directory with a payload-relative end offset and
+inclusive first/last document IDs per chunk. These row ranges are authenticated
+by the enclosing segment, checked for monotonicity, and verified against each
+selected decoded chunk. Sparse gaps can return without opening payloads. Random
+seeks decode the selected chunk only. A per-chunk record-offset index is validated
+once, so individual value reads do not repeatedly parse all entries. Append and
+sorted compaction use the same cursors; old columns advance to an adjacent chunk
+before falling back to payload-bound navigation. Chunk raw-byte and oversized-value
+rules remain in force. The source recipe fences the new producer capability.
+
+Native Parquet/Iceberg text builders retain typed source directly. Allocation-free
+AJV1 sizing shares the encoder's tag selection and exact integer/array widths;
+batch thresholds, segment splitting and scratch admission do not depend on a
+throwaway full-row JSON string. Retained source trees remain charged as inputs,
+and selected-field indexing still cannot claim sort/doc-value coverage for an
+omitted non-null field. Ordinary embedded source builders retain their existing
+representation unless they select source-column mode.
+
+Prepared highlights own a source-dependency plan. Explicit fields and static
+source aliases require only their source columns; unknown or dynamic mappings
+conservatively require complete source. The lake path maps these dependencies
+once per batch, reuses already projected values when they cover the plan, and
+fetches hidden fields under the same native identity checks when needed. Final
+response projection continues to hide fields requested only for highlighting.
+Hidden source uses the same field-major visitor as projected source. It retains
+only a row permutation, row-type context, four field cursors and finished
+snippets. Each decoded field value is borrowed for one callback and released
+before the next row. The shared highlight consumer appends disjoint source-field
+results and restores explicit highlight-field order; it does not retain complete
+hidden rows. Alias, nested-array, cancellation and row-key checks remain shared
+with ordinary hydration. More than four hidden fields therefore do not cycle
+all cursors once per result.
+
+### Compressed ordered-key navigation
+
+Authenticated ordered pages retain their common key prefix once, alongside
+borrowed suffix views. Structural validation checks the same full logical key
+lengths, aggregate record counts and strict ordering without reconstructing a
+buffer per entry. A shared-prefix sibling comparison skips the common bytes;
+comparisons across pages or against seek bounds compare both key pieces.
+
+Decoded navigation caches retain this compact representation. Forward, reverse,
+rank and window cursors validate parent routing boundaries using complete key
+views under the original page lease. Identity-only row scans check the coordinate
+in the final 16 logical key bytes and materialize only a required final page
+boundary. Complete tuple keys remain available for ordinary key consumers and
+mutation/visitor paths; those allocations belong to the operation, not a shared
+cached page. No sort components, public-ID ties, authentication or range bounds
+are discarded.
+
+Read-only rank, batched point/lower-bound lookup, membership, range cardinality
+and sorted-range zipper probes use the same compact page leases. Each request
+bound is checked against the common prefix once per reached page before suffix
+comparisons. Zipper frames refresh those bound views whenever their shared range
+producer advances, including advancement inside a recursive child. Cross-page
+separator checks still compare complete logical keys. Batched lookups own only
+the keys and values they return; rank/count/membership probes allocate no key
+buffers on a warm decoded cache. An unbounded count authenticates the root before
+using its record count. Navigation I/O admission reserves encoded bytes and
+compact descriptors, without reserving a complete expanded-key buffer per page.
+
+Sorted publication and incremental mutation packing use compressed occupancy
+when a store opts into key prefixes. The shared prefix is one indivisible
+page overhead; the soft target bounds the unshared payload. The original
+expanded-page hard cap still bounds builder arenas and contiguous-key readers.
+Pending packed children reserve their final locator bytes before admission, and
+occupancy repair cannot merge compressed siblings whose combined expanded
+shape would exceed that cap. New builds and rewritten pages benefit without
+forcing unchanged publications to rebuild. The page format and publication
+recipes remain unchanged.
+
+### Projection-pruned covering delivery
+
+Ordered row publications add a compact physical-coordinate tree for covering
+reads. Each entry binds the 16-byte physical coordinate, immutable cover locator,
+row ordinal and a domain-separated SHA-256 witness of the complete logical tuple
+key. The witness hashes the logical key length and both prefix/suffix pieces;
+it is independent of page compression. A covering gather verifies its requested
+source, snapshot, identity version and physical coordinate before using this map.
+The cover's identity stripe must match both the requested physical coordinate
+and the same witness. Full-key equality is
+replaced by an authenticated hash equality proof, never omitted. Old publications
+can use their complete-key path until a new publication builds the compact map.
+
+A cover batch stores two objects: a small authenticated directory and one pack.
+The directory commits contiguous, nonoverlapping ranges and a SHA-256 digest for
+an identity stripe and every typed value column. The identity stripe stores
+physical coordinates and fixed-size key witnesses rather than complete tuple
+strings. Value stripes keep
+native SQL types, SQL-null flags, numeric payloads and row ordinals. Every loaded
+stripe must agree with the directory's row count and identity ordinals. Packs
+and directories share the publication domain and are retained as dependencies.
+
+SQL windows load projection and predicate dependencies; already-ranked gathers
+load only requested columns. Selected stripes retain decoded cache leases and
+row identity while preserving caller rank. Independent blocks use joined I/O
+waves with bounded workspace and exact selected-range read admission. Unrequested
+stripes are not fetched or decoded. Preparation also uses joined, scheduler-admitted
+waves of at most four directories. An authenticated decoded-directory lease is
+shared with direct reads, checked against a 1 MiB decode allowance, and held
+until the payload wave is consumed. Cold directory misses can overlap; warm
+preparation needs neither raw-cache residency nor JSON reparsing. Directory
+wire bytes are admitted before preparation and exact selected stripe bytes
+before payload jobs start. Every failure joins all jobs before releasing leases
+or allocator owners. The small result view has null placeholders
+for omitted columns and is consumed only under the supplied projection plan.
+
+Incremental publication changes the forward, reverse and physical-cover roots
+atomically. Retirement removes the physical map entries for retired coordinates;
+updates install new immutable cover locators and witnesses. Retained readers keep
+the prior root and cover packs. Reuse validation includes pack retention proofs,
+and resumable GC expands each directory once before marking its pack. Ordered
+metadata versions 11/12 and native reader protocol 90 fence older workers from
+interpreting the new layout. Existing unchanged cover blocks remain readable;
+no duplicate serialized source row is introduced.
+
+
+### Shared bounded range and field-major delivery
+
+Navigation pages and covering stripes use one authenticated range-wave planner.
+The adapter retains the navigation page limit and its bounded gap policy; covering
+stripes permit 4 MiB ranges and coalesce exact adjacency only. Omitted columns are
+never gap traffic. Each wave contains at most 16 logical units, keeps per-unit raw
+cache identities, verifies every requested digest, and joins all workers before
+releasing provider/context state. Required reads run inline if shared I/O slots
+are occupied. Distinct ranges within a pack can run concurrently; block waves
+retain their existing shared scheduler admission.
+
+Cover readers acquire decoded stripe leases before physical preparation. Hits
+remain pinned through the wave without a second lookup. Warm decoded stripes require no raw-cache residency and do not refetch evicted wire
+bytes. Uncached single-unit ranges transfer transport ownership without a second
+large allocation. Decoded metadata and retained raw bodies remain operation-owned
+and release on successful consumption, cancellation and allocation failures. The
+publication layout, recipe and reader protocol are unchanged by this refinement.
+
+Stored-source delivery validates identities and sorts only a permutation of the
+returned hits. It visits one field across the entire returned selection, checking
+cancellation at most every 64 positions, before advancing to the next field. Four
+cursors suffice even for wider projections; native field chunks stay open across
+those processing tiles. Metadata is proportional to the existing returned-hit
+set, never source-table cardinality. Legacy source documents are parsed once per
+returned row for the complete projection. Result order and hidden-field isolation
+retain the same contracts.
+
+
+### Projection-independent decoded stripes and selected source read-ahead
+
+A successful required decoded interpretation is identified by its immutable
+artifact, interpretation and authorization scope. Query workspace limits are
+admission policy, rather than value identity. Every required lookup/acquisition
+checks the retained decoded footprint against its own limit before returning a
+lease, including when it joins a wider loader. Failed required loads publish no
+value; a wider reader may retry with its own allowance. Optional interpretations
+that cache a deterministic size-decline value retain their policy-specific key.
+This keeps narrow and wide covering queries from storing duplicate successful
+stripes without letting warm-cache state bypass memory admission.
+
+Stored-source hydration keeps an ordinal vector proportional to returned hits.
+After each required chunk transition, its authenticated row-range directory
+identifies up to four subsequent chunks containing selected rows, with at most
+1 MiB of compressed hint bytes and at most 64 selection probes per call. A binary
+jump skips repeated IDs in the current chunk; a full byte allowance stops lookahead. Only chunks containing selected rows create hints; legacy columns and
+oversized values remain demand reads. Physical reads retain the native source
+block granularity and its separately admitted transport bounds. Hints enter the
+existing query-owned native source
+queue, which owns shared I/O admission, deduplication, cancellation and joins.
+They perform no source decode and transfer no cursor/value ownership. Required
+reads continue validating every selected chunk and row identity, whether a hint
+was admitted, declined, canceled or completed.
+
+Phrase driver costing uses an upper bound for each position: the sum of observed
+document frequencies of its alternatives, capped at collection cardinality.
+The phrase ceiling is the minimum across positions. Unknown statistics retain
+the collection ceiling, and an empty phrase has ceiling zero. This estimate only
+chooses between ordered traversal and text candidates; positional matching,
+residual predicates, authorization, scoring and cursor proofs remain authoritative.
+
+### Prepared highlight routing and cancellable fragment kernels
+
+A lake execution retains one prepared highlight plan through every result batch.
+Positive query clauses are grouped once by query and indexed field, including
+keyword and substring matcher adaptations. Static source/analyzer routes are
+compiled by the same declaration emitter used during indexing and ordinary
+source mapping. The selected document type chooses its own immutable field
+plan. Unknown types and value-dependent mappings retain the shared mapper;
+dynamic inference and selected-field schema-less exact companions keep their
+existing value and byte-length eligibility rules.
+
+Projected and hidden source use the same controlled fragment kernel. Request
+checks run between hits/fields and inside tokenization allocations, matching,
+span normalization, density scoring and selection. Kernel scratch has a separate
+lifetime from returned fragments; partial analyzer output is region-owned on
+allocation failure or cancellation. A timeout cannot leave a partially prepared
+plan or retain token/window buffers as result source.
+
+Normalized, disjoint match spans feed two monotone density frontiers. Each
+frontier advances at most once per span. Candidate windows use an in-place
+priority heap and the existing greedy non-overlap selection, avoiding an
+all-spans rescan for each window and a complete candidate sort. Density and
+source-start ranking remain authoritative; equal-density/equal-start windows
+now choose the shorter UTF-8-clipped end deterministically. Cooperative small
+sorts and merge passes keep span normalization cancellable. Span and candidate
+storage remains linear in matches; fragment count and response limits remain
+unchanged.
+
+Query and aggregation HTTP boundaries classify operation outcomes consistently:
+deadlines use the existing public HTTP 504 `query_timeout` envelope and
+`Retry-After` contract; cancellation returns HTTP 499 `client closed request`.
+Internal faults retain their existing error handling. Real Parquet and Iceberg E2Es compare projected/hidden snippets after
+restart with source data unavailable, check deadline responses, and verify a
+healthy request after a timeout.
+
+### Original-offset source pages and native result leases
+
+Native stored-source recipe v5 (reader protocol 91) encodes large UTF-8 string
+fields as independent 64-KiB Snappy pages, followed by an indexed document
+metadata stream. Small values and structured values retain typed AJV1 encoding.
+The metadata includes a compact UTF-8 continuation bitmap and original source
+byte offsets for each eligible analyzer pipeline. Vectors are independently
+compressed and fetched only for the requested fingerprint; ordinary projection
+reads page navigation without fetching token payloads. The fingerprint covers the
+character filters, tokenizer, token filters and an explicit interpretation
+version; request cancellation capabilities never enter persisted configuration.
+Source bytes and offset evidence share the same authenticated segment and
+publication identity. Compaction copies compressed source pages and rebases
+section-relative offsets while preserving analyzer evidence.
+
+A highlight consumer requires complete static document-type/source routing and
+an exact pipeline fingerprint for every contributing query binding. Compatible
+term, prefix, wildcard, regexp and fuzzy clauses match persisted vectors, select
+the same density-ranked fragments, and decode only source pages overlapping
+those fragments. Unsupported mappings, expanding analyzer pipelines, arrays,
+substring/literal clauses, or unavailable vectors retain controlled source
+analysis. Returned snippets own their text; borrowed metadata and hidden field
+bodies cannot escape their cursor callback. This adds publication storage and
+build work in exchange for avoiding repeated analysis and full-field decoding.
+Build allocations remain under the existing working-set admission owner.
+
+The shared source analyzer caches tokenization by source byte identity and
+analyzer for one field/value callback. Query-owned term and prefix lookup tables
+replace scanning every exact clause for every token; other pattern semantics and
+per-query fragment selection are preserved. Byte checkpoints cover Unicode and
+whitespace tokenization, character-filter scans, lowercase conversion, English
+stemmer region scans, regexp transitions and wildcard traversal. Scoped deadline
+checks remain authoritative when a transport exposes only boolean cancellation.
+
+Fully covered native result projections create typed column pages directly.
+Small typed values borrow immutable, reference-counted decoded chunks; large
+strings decode directly into the result page's arena. Containers borrow retained
+encoded strings and allocate their structure once. Cursor advancement, cache
+replacement and hydrator teardown release their references without invalidating
+results. The existing ColumnSource encoder handles these pages without an owned
+JSON source-object copy. Mixed Parquet/native projections retain the shared
+hydration fallback. Fragment and response-size limits continue to apply.
+
+Small-query selection remains cost aware. Byte-scan checkpoints share one
+4-KiB budget across successive short token runs. A single static field binding
+uses kernel-local token scratch; bindings that can share analysis use the
+value-scoped cache. Tiny matcher lists use direct comparisons, while larger
+clause lists use compiled term/prefix lookups, including duplicate clauses.
+Already projected small fields borrow their column page for shared highlighting;
+large scalar fields retain stored-offset selection. This keeps the native
+result lease path from forcing a second field-major hydration of small projected
+values. The benchmark controls cover both small/wide and large/dense shapes.
+
+### Selective original-offset vectors and shared indexing analysis
+
+Stored-source recipe **v8** (`AFSC0004`, `AFST4`) keeps independently compressed
+64-KiB source pages and replaces flat token vectors with relocatable term
+navigation (`AFOV0003`). A ceiling directory routes exact and prefix matchers to
+compressed dictionary pages of at most 64 terms. Other supported patterns inspect
+the dictionary once per distinct term. Each matching term names independently
+compressed occurrence blocks of at most 1,024 records, containing a signed source
+start delta, span length and original token position as varints. Dictionary and
+navigation payloads use 64-KiB compression frames, including indivisible long
+terms. Query checkpoints run between frames and bounded occurrence batches.
+
+The reader fetches the selected analyzer's navigation and matching occurrence
+blocks. It does not materialize unrelated token records or replay expensive
+patterns for each occurrence. Source-byte spans pass through the shared sorting,
+density and fragment-selection kernels. Exact fields, prefix bounds, keyword and
+substring companions, dynamic routing, missing analyzer fingerprints and unknown
+mappings retain their existing semantics and controlled full-source fallback.
+A request's selected-vector memo includes both analyzer fingerprint and matcher
+group; two queries sharing analysis cannot borrow each other's selection.
+
+Native ingestion captures original offsets during the first eligible indexing
+analysis for each `(document, source field, analyzer fingerprint)`. Capture uses
+a build-owned seekable postings run when native I/O is available; only compressed
+variant locators survive the analysis callback. The private descriptor owns its
+unlinked file and releases it on completion, cancellation or allocation failure.
+Memory-only hosts retain allocator-admitted memory storage. Column writers copy
+captured variants without analyzing source again. Physically reordered documents
+use the same output ordinal for indexing capture and column writing; the input
+permutation selects the matching source value. Append/sorted compaction copies
+relocatable blobs through a bounded 64-KiB buffer. Source bodies, offsets and
+analyzer fingerprints remain authenticated by their enclosing native section.
+The source recipe, native reader protocol and compiled runtime ABI fence this
+layout; old derived publications rebuild through the normal reconciliation path.
+
+Projected scalar strings prepare their canonical encoded length and ASCII status
+in one vector pass. Valid plain strings borrow their result-page lease and write
+directly between JSON quotes, avoiding another escape scan. Escaped strings,
+invalid UTF-8 and nondefault serializer options preserve standard serialization.
+Unicode validation and overflow checks remain in the preparation contract. Final
+response size limits are unchanged.
+
+The native qualification checks selective physical reads, term-level matching,
+exact source spans, prefix boundaries, partial-output cancellation, allocation
+failures, analyzer aliases and private-file ownership. Real Parquet and Iceberg
+E2E coverage includes a large vocabulary with rare exact, prefix, wildcard and
+fuzzy matches after restart with the original source objects unavailable.
+Performance reports belong in ignored `.benchmark-results/lake/`; their
+binary/input identities, query shapes, execution order and environment qualify any timing claim.
+
+### Dense occurrence streams, Unicode metadata and equivalent bindings
+
+Recipe v8 keeps UTF-8 continuation maps beside their individual 64-KiB source
+pages. A 32-byte descriptor per page names the compressed source and optional
+boundary map; ASCII pages omit the map. Snippet clipping retains two decoded
+maps, each at most 8 KiB, instead of decoding a whole-value bitmap. Sorted and
+append compaction copy both payloads and rebase their descriptors. Metadata and
+payloads retain the enclosing native section's authentication and lifetime.
+
+Offset vectors attest whether input source spans are ordered. Serving prepares
+only matching term/block navigation. Dense ordered selections merge one current
+occurrence block per term into source order, union touching/overlapping spans,
+and retain a sliding density queue. Unordered analyzer output, tiny selections
+and highly diverse matches retain the general vector kernel. No ordered claim
+is inferred from an analyzer name; the writer checks actual emitted spans and
+the reader validates each term's order while consuming it.
+
+Fragment selection is exact. A candidate is determined by its integer unsnapped
+start. UTF-8 clipping changes either endpoint by at most three bytes, so a chosen
+window overlaps fewer than `2 * fragment_size + 20` distinct candidates. Keeping
+`(max_fragments - 1) * (2 * fragment_size + 20) + 1` best candidates preserves all
+winners of the existing greedy selection, including density and offset ties.
+A second bounded replay gathers spans only for those output windows. Candidate
+state depends on requested output size rather than occurrence count. Block
+buffers, density queues and candidate heaps use reclaimable admitted scratch;
+cancellation and allocation failures release partial output and every owner.
+
+Index builds discover repeated `(source field, input bytes, analyzer fingerprint)`
+contributions within each document. Equivalent materialized analyzer bindings
+share immutable tokens and, where eligible, original offsets. Only repeated
+bindings retain an independent analysis region; the last consumer releases it.
+Grouped contributions copy retained term keys before releasing that region, so
+position bases, frequencies, field norms and sorted output identities remain
+unchanged. Unique bindings retain ordinary short-lived scratch. The existing
+allocation-free substring producer keeps its bounded streaming implementation;
+reuse does not materialize its expanded suffix stream. These lifetimes are
+independent of private captured-offset runs, which still outlive analysis only
+through compressed variant locators.
+
+The optional process-wide compiled-contribution cache serves a different
+representation: compact term dictionaries and positions, without original byte
+spans. Source capture and active document-local token leases take precedence;
+compiled contributions may replace analysis only when neither needs the token
+stream. This keeps cross-document acceleration available for ordinary builds
+and substring producers without dropping highlight offsets or retaining a
+second token owner. A warm-cache oracle covers both single and grouped bindings.
+
+No API options or result-size limits change. Native reader protocol 94 and
+compiled runtime ABI 70 fence the new source layout; older derived text
+publications rebuild through reconciliation. Qualification includes exact
+comparison against the full fragment selector across UTF-8 boundaries, fragment
+counts and sizes, bounded live-memory probes, analyzer aliases, allocation
+failures, cancellation and real Parquet/Iceberg restart without source objects.
+
+
+### Exact occurrence-block pruning and physical result builders
+
+Stored-source recipe v8 adds a prefix maximum source end to each occurrence
+block and minimum consecutive start spacing and end-to-start gap to each term.
+The writer separately attests strict disjointness of all emitted source spans;
+ordered overlapping spans can seek but cannot use the density certificate.
+Summaries share the enclosing section's authenticated publication identity.
+Each block reference grows from 20 to 24 wire bytes, and each dictionary term
+adds eight bytes. Compaction copies this relocatable evidence without reanalysis.
+
+For an integer window of width `W`, a repeated disjoint term contributes at most
+one occurrence when `W <= minimum_gap + 1`, otherwise at most
+`2 + floor((W - 2 - minimum_gap) / minimum_start)`. Cap each term by its remaining
+occurrence count and sum across matching terms. Omitting unmatched terms can
+only widen gaps. UTF-8 clipping permits at most six extra bytes; ASCII descriptors
+prove no expansion. A full candidate heap can stop when this upper bound cannot
+beat its worst retained candidate, including monotone source-start and end ties.
+Checks run every 256 candidates. This preserves the existing greedy fragment
+selection exactly. Missing disjointness or an inconclusive bound retains the
+complete streaming pass, including arbitrary overlapping analyzer output.
+
+After choosing fragments, binary searches over block prefix maxima skip blocks
+whose spans all end before each output interval. Prefix maxima retain an early
+long span crossing a later interval. Each term then decodes locally from the
+selected block; replay stops after the interval. Lookahead hints cover only
+selected occurrence blocks, at most four references and 256 KiB per hint batch.
+The enclosing source owns bounded asynchronous work on the shared I/O scheduler,
+including cancellation, joining and cache admission. Hints remain optional.
+Local warm benchmarks cannot qualify the cloud-latency benefit of prefetch.
+
+Native result pages allocate physical scalar buffers as values arrive, preserving
+nullable i64, f64, boolean and string vectors without an intermediate matrix of
+JSON cells. Only genuinely heterogeneous or structured values use generic
+cells. Widening copies the previous scalar representation once and frees it;
+builder buffers remain individually reclaimable under memory admission and
+become the final vectors without a finishing copy. Result leases retain borrowed
+payloads. Field-major hydration uses a single request-local field-name lookup
+instead of scanning all projected names for every cell. Projected highlighting
+materializes only its own field dependencies; unrelated lazy JSON columns stay
+encoded. Final response-size limits are unchanged.
+
+Native oracles compare streaming/pruned fragments with the full selector across
+fragment counts, widths, UTF-8 boundaries and overlapping spans, and cover exact
+large integers, nulls, heterogeneous widening, allocation failures and cleanup.
+Real Parquet/Iceberg restart tests and [historical typed-result comparison](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/typed_results.py) exercise
+public delivery. Keep candidate/block-work and retained-byte measurements
+separate from local Debug timing and provider qualification.
+
+### Exact layout bounds and small-field offset blocks
+
+Stored-source recipe **v10**, native reader protocol **96** and runtime ABI **72**
+fence `AFSC0005` / `AFST5` source columns and `AFOV0005` offset navigation.
+Publication rebuilds the affected native text representation rather than mixing
+old and new offset semantics.
+
+Uniform disjoint occurrences attest a first start, constant stride and constant
+span length. For an ASCII source, fragment candidates have a fixed alignment
+relative to those spans. The reader bounds their exact interior overlap count
+and both clamped edge windows, rather than bounding every possible window
+alignment. This lets equally spaced seven-byte words with an eight-byte stride
+prune exactly as six-byte words with a seven-byte stride do. Variable layouts,
+multiple selected terms and UTF-8 boundary expansion retain the conservative
+spacing bounds and exact scan fallback. Each inverted block records local
+minimum start spacing and end-to-start gap, including the transition from the
+previous block. Navigation computes suffix minima once. Expired blocks then
+stop weakening future density bounds: an early dense cluster does not force a
+scan through a regular remainder. Prefix maximum ends remain unchanged for
+crossing-span seeks. No approximate snippet ranking is used.
+
+A diverse ordered vector also contains a source-order lane: independently
+compressed blocks of delta-coded start, length, position and dictionary term ID.
+Their prefix maximum ends support exact seeks even across long overlapping
+spans. Broad selections use that lane instead of decoding one head block per
+selected term. Sparse selections retain inverted occurrence reads; the lane is
+chosen only for at least 64 selected terms covering at least one eighth of the
+source occurrences. Broad plans retain a dictionary-ID bitset and compact
+12-byte density summaries for repeated-term blocks; singleton terms need only an
+aggregate count. Source-order blocks also attest suffix spacing for the union
+of all tokens. Any selected subset is bounded by that union, so dense broad
+selections can prune even when all matching terms occur only once. The reader
+uses either safe union or per-term bounds, whichever proves sufficient.
+These plans retain neither selected term strings nor inverted read references.
+The span-only iterator tests the bitset directly, without a binary search for
+every occurrence. Public full-token iteration and materialization
+lazily expand the selected inverted navigation when term strings are required.
+A selection that proves too sparse falls back using the already matched bitset,
+without evaluating patterns again. The fragment kernel retains one occurrence
+block, bounded windows and the output spans. It does not retain a decoded token
+vector for each selected term. Reads and future-block hints use the existing
+cancellation, read-admission and shared source-I/O scheduling paths.
+
+Compatible original strings from 256 bytes through 4 KiB now retain analyzed
+source offsets in an inline source descriptor (`AFSI1`). These descriptors and
+payloads are compressed together in the existing indexed doc-value block, so
+repeated analyzer fingerprints and navigation metadata share block compression.
+No per-small-field remote object or read is introduced. Term navigation is
+admitted only when it can fit, and total encoded variants plus their descriptors
+are capped at twice the source length. Rejected small captures do not open or
+append to a private spill run. Larger strings retain
+independently readable 64-KiB pages; smaller and unsupported strings retain
+query-time analysis. The 256-byte threshold is an internal cost policy, not a
+public API guarantee. Original UTF-8 bytes, analyzer signatures and compaction
+semantics stay authoritative. Inline descriptors are copied intact during
+compaction and never retain a reader-owned decode past its callback.
+
+Covering-index hydration groups the verified physical rows under one typed
+result page per decoded covering group. Fields are resolved once per group;
+scalar vectors are final result storage, with owned payload bytes and explicit
+row leases. SQL NUMERIC/array normalization, SQL nulls, declared `_type` and
+physical identity witnesses apply before publication to the result page. Pages
+can outlive the covering read wave without retaining its request or reader.
+
+
+### Request-owned projection plans and scalar delivery
+
+Final column encoding compiles simple masks against the immutable column names
+once per request/schema when multiple hits can reuse them, preserving include
+order, wildcard/duplicate semantics,
+exclusions, internal-field removal and exact JSON sizing. The request owns at
+most four plans, including copies of names and masks; no plan holds a result-page
+lease, source payload or reader. Schema comparison uses names and order rather
+than pointer identity, so allocator reuse cannot bind a plan to the wrong page.
+Single-hit responses, further schemas and nested masks use the existing exact
+projector, avoiding unamortized schema-plan allocation. Preparation
+resets per-hit scratch, allocates one exact field descriptor array and emits
+small JSON scalars from inline storage. Canonical float formatting and integers
+above `2^53` retain their original precision.
+
+Physical hydration honors whole-field negative masks, including `*` followed by
+exclusions and exclusion-only masks. This lets a covering index satisfy the
+selected fields even when a large excluded column is unavailable in the provider.
+Nested exclusions stay conservative to preserve empty-object and absent-parent
+semantics, and computed outputs always re-add their declared dependencies.
+Highlight dependencies remain independently selected before public projection.
+
+Owned `source_column.Reader.get` and the cursor share source-descriptor dispatch.
+Inline `AFSI1` values are decoded into ordinary typed JSON before whole-document
+materialization, just as paged `AFST5` values are. Descriptors and transient decode
+buffers are released on every error path; inline payloads need no external view.
+
+Covering gathers publish exactly their requested source columns. Physical row
+references and authenticated identity witnesses remain outside `_source`;
+selecting a covering path cannot inject `_id` or `_type` into wildcard results.
+Declared `_type` columns retain their stored values and nulls; the index's
+default document type does not invent a source column. Explicit virtual `_id`
+references (including computed-output dependencies) request generated identity
+independently of the physical access path, matching the provider cursor contract.
+Accepted overlay rows follow the same rules and preserve declared type nulls and
+values; routing defaults never overwrite source data.
+
 ## Cloud generations and retention evidence
 
 Cloud publications pin exact provider object versions. An immutable hash-radix
@@ -1557,3 +2240,736 @@ or delete markers, and deletes only exact versions absent from every live closur
 Map pages are reachability roots. Completed collections persist a paged mark set,
 and vacuum then removes unmarked map records, visiting at most four radix leaves
 per pass with a durable cursor.
+
+### Shared source navigation and composed typed delivery
+
+Native source-offset roots and dictionary pages have an optional immutable
+interpretation capability on the segment source. The serving provider keys its
+bounded decoded cache by connection scope, authenticated directory identity,
+source interval, codec interpretation and validation parameters. Roots retain
+page ceilings and source-order summaries; dictionary pages retain validated
+terms and block references. Query matchers, selected masks, density plans,
+source readers and operation callbacks never enter those cached values. Every
+hit checks the current read capability and its original authority/deadline
+hooks. Decoders borrow the source only while loading; admission pressure falls
+back to call-scoped decoding. Each interpretation has a 1-MiB loading bound and
+shares the existing global byte/entry/singleflight limits. Contiguous and other
+providers without this capability retain exact local decoding.
+
+Partial native source coverage composes with Parquet column pages instead of
+merging owned JSON row trees. The result page retains each distinct parent page
+once and binds output rows and fields to their original physical vectors. The
+bindings preserve requested field order, exact scalar types, SQL NULL flags and
+non-null JSON nulls. Source preparation follows those bindings directly; generic
+vector readers retain an on-demand materialization boundary. Explicit virtual
+`_id` comes from already-admitted hit identity, so combining it with stored
+columns does not reopen the original Parquet object.
+
+Large projected native strings retain bounded UTF-8 chunks. Full projection
+decodes each physical text page once, carries an incomplete code point into the
+next page, and reclaims compressed/decompression scratch immediately. Prepared
+wire values know their exact canonical JSON length and escape chunks directly
+into response residency or the existing response spool. They need no contiguous
+full-string allocation or provider callback during transport. Page leases keep
+all borrowed chunk bytes alive until preparation/spooling consumes them. Nested
+projection, computed expressions and generic value consumers can explicitly
+materialize a string when their semantics require it.
+
+Highlight routing inspects an existing scalar's length before building a JSON
+projection view. A large returned string can therefore keep the stored-offset
+snippet path without first making a full-string scratch copy. Hidden fields
+still use field-major hydration and exact, bounded fragment selection.
+
+These in-memory ownership and callback changes use runtime ABI **73**. The
+stored-source recipe remains **v10**, reader protocol **96**, with `AFOV0005`:
+there is no new on-disk encoding in this refinement.
+
+### Live page admission and compiled result bindings
+
+Parquet cursor admission follows live bytes rather than assigning every column an
+identical fraction of the cursor budget. A large string page can share a cohort
+with many small scalar pages when their combined footprint fits. The existing
+input, uncompressed-data and structural limits remain authoritative. The cursor
+checks uncompressed page evidence cumulatively, and admits actual decoded vector,
+allocator capacity and decompression allocations against the combined decoded
+and structural allowance. This does not turn the decoded allowance into a new
+response-size limit or replace the enclosing statement and delivery budgets.
+Optional page-directory admission remains separately bounded and can fall back
+to sequential page discovery.
+
+A heap-owned admission owner survives cursor teardown when results still retain
+its pages. Reference-counted credits pin dictionary evidence and cached arena
+capacity through the last result lease. Cache hits reapply the consuming cursor's
+limits; cache keys do not contain query quotas. A loading adapter composes the
+cache's existing global loader admission with the initiating cursor's live-byte
+admission, then removes only the cursor's transient charge before publication.
+Shared cache waiters each admit the immutable result under their own limits.
+Local decoding keeps a stable admitted allocator rather than a stack-scoped
+worker allocator. Dictionaries shared by local pages stay charged until their
+last dependent page retires.
+
+The coordinator retires every expired page in an advancing cohort before
+scheduling replacements. Encoded ranges use separate transient input credits;
+parallel readers wait on a condition variable when the same input allowance is
+busy. Deadlines and cancellation remain active while waiting. All scheduled
+workers join before metadata is destroyed. These limits apply to one cursor's
+live cohort and its retained leases; the statement, shared scheduler, global
+cache and response delivery each retain their existing independent admission.
+
+Horizontal result composition compiles field lookup once per distinct parent
+schema. One row-selection map is shared by all physical columns, and aligned
+stored columns reuse their existing NULL flags. The page retains only parents
+used by the output. A cell no longer carries a copied column descriptor or
+searches column names during composition. Generic readers still traverse the
+same immutable bindings and keep JSON null separate from SQL NULL.
+
+Global text planning resolves term frequencies through bounded exact multi-seek
+batches. Routing pages are shared within a batch; missing terms, duplicates and
+caller order are preserved before the recent-WAL contribution is added with
+checked arithmetic. Chunked JSON output copies escape-free strings directly;
+mixed content uses vector classification to copy clean runs and visits the
+canonical encoder only for actual escape bytes. Unicode-escape and byte-array
+output options keep the standard encoder's semantics.
+
+This preceding layout revision used runtime ABI **74** and reader protocol
+**96**. The refinement below supersedes both. Stored-source recipe **v10**,
+`AFOV0005` and persisted artifact layouts remain unchanged.
+
+### Reader-local failures, shared text payloads and compact writes
+
+A shared cold decode does not give its initiating reader authority over another
+reader's memory policy. Waiters retry `ParquetPageTooLarge`, alongside other
+reader-local allocation and cancellation failures, using their own loader and
+live-byte owner. Physical cache keys remain independent of query quotas. An
+initiating reader still fails its own limit; a waiter cannot bypass that limit
+on its behalf.
+
+Native source interpretations distinguish compact navigation from decoded text
+payloads. Text pages use an independent bounded cache: at most 32 MiB resident
+(and no more than half the configured range-cache allowance), 512 entries and
+8 MiB of active loader admission. Each interpretation remains bounded to a
+64-KiB raw source page, authenticated by the immutable artifact, exact encoded
+range, codec and raw length. Its loader retains no source or request callbacks.
+Authority, cancellation and deadlines are checked even on warm hits. Cache
+pressure can fall back to independently owned bounded decoding.
+
+Result pages adopt decoded payload pins and borrow their UTF-8 chunks. A
+codepoint crossing a physical page boundary is copied into a tiny owned chunk;
+ordinary chunks share immutable page bytes. A synchronous optional transfer
+keeps the pin with its caller until the adopter consumes it, including a rejected
+foreign ABI call. Pins outlive the corpus cursor and
+release before the result arena. Result residency includes pinned arena capacity,
+including uncached values returned when residency is unavailable. Snippet reads
+reuse a decoded page transiently and copy only their requested interval. There
+is no change to final response limits or canonical JSON escaping.
+
+Parquet advancement separates encoded fetching from CPU decoding. A coordinator
+keeps at most four column phases active and drains whichever phase completes
+first. Fetching uses I/O admission; only a complete encoded lease can enter CPU
+decoding. Dictionary pages return to fetching before the next data page. Encoded
+input credits remain owned across that transition, including while a decoder is
+queued. A resource rejection can retry once after competing decoders drain,
+under identical limits and without another provider read. A quota that still
+cannot accommodate the page fails normally. Cancellation joins every phase and releases even a decoder's input whose
+worker never started. Typed cached columns and dictionaries own reclaimable
+allocations: temporary codec arrays, vector growth and discarded staging buffers
+are freed rather than retained in an arena. Cached residency charges the final
+owned vectors. Saturated execution admission retains a single caller
+fallback; scheduler workspace estimates do not replace actual cursor admission.
+
+Compact keys now remain as prefix/suffix views through sorted publication,
+incremental edits, retention, boundary joins, range differences, reductions and
+GC. Each builder level owns one seed and suffixes against it. Long comparisons
+use bounded vector loads; mutation probes normalize onto their input page once.
+Maintenance callbacks that require contiguous keys reuse one key buffer rather
+than expanding a complete page. Explicit compatibility `readPage` calls still
+reject more than 1 MiB of key expansion. Serving and maintenance use compact
+navigation, including row-identity health checks and aggregate routing.
+
+Prefix-enabled occupancy is bounded by encoded bytes, with the existing 1-MiB
+hard page limit, individual key/record limits, aggregate allowance and pending
+pack-locator reservation. The wire's logical key-byte total remains a checked
+u32. A long shared prefix no longer forces one object for each small handful of
+identities. This changes neither identity nor ordering semantics. Runtime ABI
+**75** fences the new callback layouts, and native reader protocol **97** fences
+publications whose compact pages exceed the older expansion policy. Stored
+source recipe **v10**, `AFOV0005`, `AFSC0005` and the page wire layout remain
+unchanged; older compact pages remain readable by the new reader.
+
+
+### Physical page admission and owned compact routing fences
+
+Scheduling uses physical work estimates independently of request policy. Header
+workers reserve at most 64 KiB for bounded header discovery. OffsetIndex ranges
+enter the payload phase directly after directory pruning, so skipping unequal
+pages cannot leave a reservation sized for an earlier page. A payload gets a
+separate I/O task charged for its exact encoded length, and its header is checked
+against the authenticated directory before decoding. CPU admission starts after that complete input lease exists and
+uses uncompressed bytes plus a conservative per-row codec allowance. The cursor
+still limits the cohort to four phases; raw, resident and input quotas remain
+unchanged. Input credits follow the encoded lease through queued decoding and a
+bounded retry. Completed header probes that already contain the full page are
+transferred directly, and saturated admission consumes the prepared payload in
+one caller lane without repeating header discovery. Cancellation joins header,
+payload and decode tasks before releasing request state.
+
+This avoids estimating each task as a fraction of a 256-MiB request limit: under
+the previous calculation, ordinary two-column scans requested 128 MiB per fetch
+against a 32-MiB shared I/O allowance and therefore advanced serially. Native
+qualification blocks both payload reads simultaneously under default limits,
+checks exact physical reservations and zero CPU occupancy, admits unrelated CPU
+work, and tests cancellation and a fully saturated I/O scheduler.
+
+Single-page scalar, nullable and dictionary scanners transfer the decoder's final
+owned vector directly. They retain chunk aggregation only when additional pages
+require it. This preserves the existing timestamp scaling, exact numeric,
+physical validation and vector destruction contracts without retaining a second
+aggregation allocation. A bounded native check admits exactly one uncompressed
+payload plus one final i64 vector; the previous extra copy cannot fit that budget.
+
+Mutation child fences also have independent compact ownership. A reference-counted
+immutable seed is shared by adjacent long routing keys; children own only their
+suffix and aggregate. Ownership transfers through rebalancing, retention and
+boundary joins without pinning a decoded input page or expanding every untouched
+fence. Small independent keys retain their single-allocation representation.
+Encoded page occupancy, identity, ordering, reader protocol and all wire formats
+are unchanged. A dense internal-page fixture built by the production builder
+exercises a single-key mutation with a 4-MiB allocator, and allocation-failure
+checks cover shared seed creation, reuse and teardown.
+
+
+### Parked lookahead and borrowed physical payloads
+
+Row-group lookahead uses a bounded pull coordinator. While a provider read is
+pending it holds its retained-state reservation, but no runnable CPU slot.
+Optional coordinators can consume at most half the shared pull descriptors and
+retained-byte allowance, leaving capacity for required query operators.
+Bloom probes, page-directory discovery, headers and encoded payloads run as
+separately admitted I/O phases. A decode requests CPU admission only after its
+encoded lease is ready, and leaves the established I/O byte headroom available.
+Sibling phases drain before a pending decode retries admission. When no live
+phase can make progress under pressure, optional warming stops; it never runs
+unadmitted fetches or decodes on a caller lane. Required query advancement keeps
+its existing bounded caller fallback. Cancellation joins every phase before
+releasing input leases, cursor state or query metadata.
+
+An uncompressed physical page, including a V2 page whose values are explicitly
+uncompressed, borrows its fetched encoded payload during synchronous decoding.
+Decompressed payloads still own their allocation. Final typed vectors and
+cached dictionaries own their values independently of the input lease.
+Deferred projection framing explicitly promotes borrowed payloads to owned
+storage before returning to the caller, since selected-value evaluation can
+outlive the fetch. This removes a payload-sized copy from complete decoding
+without introducing a cache or result lifetime dependency on a remote read.
+Runtime ABI **76** fences the in-memory payload, cursor and scheduler layout
+changes. Reader protocol **97**, stored recipes and all persisted formats remain
+unchanged.
+
+Native qualification blocks one- and two-column speculative reads and checks
+zero CPU occupancy while I/O is parked, unrelated CPU progress, cancellation,
+CPU/I/O saturation, required-query fallback and complete reservation release.
+Ownership checks overwrite encoded input before deferred nullable string and
+numeric evaluation, and cover allocation failures. A single 8192-row PLAIN i64
+page now needs only its 64-KiB final vector in the decoder allocator; a borrowed
+payload consumes no allocation there. Compressed codecs and retained projection
+payloads keep their existing ownership costs.
+
+### Pressure-safe speculation and leased publication
+
+Speculative Parquet reads try to reserve encoded-input capacity once. They do
+not park a provider task waiting for another optional page to release input.
+A decode waiting for CPU admission retries after a live sibling decoder finishes;
+a pending provider read alone is not a CPU wakeup source. If no decoder can
+supply that progress, optional work declines and joins its phases. Required
+reads keep their existing wait and bounded inline fallback. This prevents a
+CPU/input dependency cycle without enlarging either admission limit.
+
+Decoded text-page residency is checked before issuing raw lookahead hints.
+The resident-only source capability accepts a decode identity, never a loader,
+and acquires a short lease with the same artifact, scope, interpretation and
+live authority checks as required decoding. A hit suppresses only that page's
+hint; misses retain ordinary bounded prefetch and required reads. The lookup
+lease is released immediately, so the optimization does not pin future pages
+or assume they remain resident. Runtime ABI **77** fences this callback boundary;
+reader protocol **97** and stored formats remain unchanged.
+
+Index publication consumes leased sort records and bounded leased windows.
+Builders finish consuming borrowed record bytes before the next advance, and
+covering stripes encode physical/frozen columns directly through the shared
+batch encoder. Publication is single-pass: independent replay or layout
+comparisons build independent input streams. Each window owns one pressure-aware keyed sort page,
+with at most 256 rows and the existing caller's 512-KiB ceiling. Ordinary result
+delivery retains its separate 64-row/128-KiB target. The shared spill engine's
+physical target and current allocation headroom can return a shorter productive
+prefix. Unread indirect references remain in the sort's bounded backlog; an
+allocation refusal must never skip a key. Direct resident/spilled rows and
+indirect payloads use the same keyed-page interface. Resident rows borrow the
+finished sort's typed stores until their page releases. JSON size accounting
+inspects frozen frames without constructing a DOM.
+
+The aggregate fallback drains variable physical batches through EOF. Its output
+pins survive stream closure until synchronous consumption finishes. EOF,
+cancellation, allocation failures and publisher teardown retire every lease.
+No leased payload or sort owner escapes publication. Identity witnesses,
+ordinals and covering stripe version retain the owning publisher's semantics.
+Each returned batch matches the owning encoder's artifact bytes for those rows;
+admission may change where publication splits batches.
+
+### Covering ranges across logical decode batches
+
+A covering pack's complete selected stripe set is planned before scheduling raw
+reads. Decoded residency is checked first; omitted columns and resident decoded
+stripes stay out of the raw plan. Adjacent misses share a physical range up to
+the existing 4-MiB artifact limit, independently of stripe/decode boundaries.
+The planner admits at most 1025 logical units (1024 columns plus identity), and
+runs at most 16 physical jobs in one wave. It charges all logical bytes and any
+explicitly permitted physical gaps before provider work. Query, scheduler,
+cache and final response limits are unchanged.
+
+Each stripe keeps its own checksum and immutable cache identity. Coalescing
+neither weakens authentication nor makes an omitted column a decode dependency.
+Encoded transport bytes retire after cache decoding or transfer to the uncached
+result's explicit byte owner. Completion notifications drain whichever read
+finishes first: a failed later request cancels parked siblings before joining
+and retiring their provider contexts. Genuine allocation, integrity and request
+cancellation failures still propagate.
+
+Runtime ABI remains **77** and reader protocol **97**: this refinement changes
+no callback layout, stored recipe or persisted format. Local qualification
+checks a cold 128-column, 32-row covering pack: **nine range GETs become one** for
+the same 72,622 bytes. A warm projection performs zero GETs; sparse projection
+reads only identity and required stripes. These are provider-call counts, not
+measured cloud latency or whole-query throughput.
+
+### Adaptive spill residency and completion-driven joins
+
+Wide sorted payloads use a statement-owned, byte-budgeted LRU rather than a
+four-entry, 64-KiB cache. Root and physical-address indexes provide constant-time
+lookups. The owner graph counts each retained block once, including shared
+bodies, while separately decoded allocations at the same physical offset keep
+their own accounting and address aliases. Lazy scalar growth is refreshed on
+access, periodically across the owner graph, and before cache growth. Metadata
+is individually reclaimable and charged to the same statement allocator.
+
+A reader targets at most 16 MiB and half of its retained bytes plus current
+statement headroom, less its pending output reservation. The target contracts
+as sibling work consumes memory. Unknown allocator headroom retains a 64-KiB
+fallback. Arena, monotonic and opaque free paths keep that conservative target
+and four root slots, and stay outside shared reclamation. Cache metadata uses independently
+reclaimable scratch allocation without bypassing enclosing quotas. Root entries and unique-owner metadata are separately bounded at 1024
+and 4096. One required indivisible block may exceed the optional target; required
+allocations can reclaim that cache reference. Pins retain their data until the
+borrower releases them. No statement, disk, scheduler or response quota grows.
+
+Scoped spill managers share a round-robin reclamation registry. Stable reclaim
+hooks also attach that registry to each enclosing known statement budget, so
+result encoding and other direct budget allocations can release idle spill
+residency. Hooks select caches charged to that budget and unregister before the
+manager retires; empty statements take an atomic fast path without a list lock.
+Budget hook and cache-directory locks have an explicit order, with nonblocking
+reverse lookup to keep concurrent registration and reclamation independent.
+Before required allocation, they reclaim idle sibling cache roots until
+admission fits or no reclaimable root remains. Known budget and synchronization
+wrappers preflight before their locks. A thread-local guard tracks allocator
+locks held by the current thread. Reclamation pre-acquires every known free path
+without waiting; only proven refundable teardown can reuse those locks for
+deallocation. Ordinary allocation remains non-reentrant. This covers arena
+growth behind a shared synchronization wrapper without reclaiming arena-owned
+payloads. Busy cache metadata or allocator locks are skipped; no provider work
+runs under the registry lock. Cache metadata admission
+can decline without losing the required row or poisoning its budget. Genuine
+allocator and integrity errors still propagate. Cache teardown unregisters its
+stable owner before retiring every retained block and metadata allocation.
+
+Covering-directory preparation, covering payloads and raw range waves share a
+notified join. It observes whichever job completes, and joins/cancels every
+sibling before releasing callback storage when any job fails or the caller is
+canceled. An inline failure also cancels pending jobs immediately. This removes
+the outer wave's ordered-await gap, where an immediate later failure could be
+hidden behind a blocked earlier read and replaced by that read's timeout.
+Scoped deadline and authority checks remain authoritative on failure.
+
+Runtime ABI **78** fences the changed in-process spill owner layouts. Reader
+protocol **97** and persisted artifact formats remain unchanged. Qualification
+compares fixed and adaptive cache policies in the same binary, with equal
+statement limits, independently checked keys and values, and unchanged spill
+writes. Spill byte counters and thread CPU samples describe that native drain;
+real-file E2E qualification is recorded separately from kernel measurements.
+
+### Host-governed optional residency and leased range owners
+
+SQL spill residency recognizes the real statement-to-host allocator chain.
+Only the ResourceManager's explicitly reclaiming, synchronized allocator
+participates; ordinary callback-free allocators, arenas and opaque wrappers
+retain conservative caching. Recognition never substitutes a backing allocator
+for an allocation: host reservations, statement quotas, pins and refund
+semantics still govern every byte.
+
+Statement and host owners share an allocation-free residency registry with
+stable hook lifetimes and round-robin reclamation. Required host allocations
+preflight idle spill roots as well as statement allocations. Reclamation takes
+known deallocation locks without waiting, skips busy owners, and reuses only
+locks held by the current thread for refundable frees. Registration and teardown
+retain the existing nonblocking reverse lookup. The generic lock guard lives
+with the platform allocator contract so storage owners do not depend on SQL.
+Host headroom includes unused reservation credit already owned by that allocator;
+this credit is reusable capacity, not additional node or slice admission.
+
+Covering stripe reads retain immutable raw-cache or physical-response leases.
+Adjacent selected units can share one authenticated response after its wave
+retires; uncached response owners use reference counts, and cached responses
+retain their actual cache owner. Each unit keeps its existing integrity, scope,
+read-budget and persistent-cache identity. The decoded cache still owns its
+independent wire framing. This removes the intermediate result-buffer copy
+without borrowing a stack-owned allocator or provider callback. Owning range
+callers retain the original adapter. Allocation-failure tests exercise cached
+and uncached lease admission and partial results.
+
+Runtime ABI **79** fences the shared host-budget and residency layouts. Reader
+protocol **97** and persisted formats are unchanged. SMP allocator identity is
+checked only in threaded builds; page-allocator-only single-threaded execution
+uses the same refundable-owner contract. Qualification compares fixed and
+adaptive spill policies through `sql_memory_owner`, with identical statement
+and host limits, and compares owning and leased range delivery against equal
+physical reads and independently checked bytes.
+
+### Publication quota reclamation
+
+Native publication uses the shared platform `reclamation.Quota` through its
+`WorkingSetAllocator` adapter. The allocator remains synchronized and retains
+its build working-set limit, live/peak accounting, and existing limit-error
+classification. Every allocation still passes through the original quota and
+backing allocator. Spill discovery recognizes this explicit refundable owner;
+it never treats an unknown wrapper as unlimited or unwraps an arena under it.
+
+Quota, statement and host owners register the same stable round-robin residency
+hooks. Required growth preflights idle spill roots before acquiring the quota
+mutex. Reclamation acquires known free-path locks without waiting and reuses
+already-held locks only for refundable teardown. Busy owners are skipped and
+borrower pins remain valid. Coordinator teardown checks that all quota hooks and
+live allocations have retired, including canceled and failed publication.
+
+Runtime ABI **80** fences this allocator contract. Reader protocol **97** and
+persisted artifact formats remain unchanged. Publication performance is measured
+separately from SQL execution: the drain fixture uses the actual quota/lock
+chain, while the real-Parquet runner measures table creation through the first
+queryable index revision and verifies the complete ordered result afterward.
+
+### Scan-resistant spill admission
+
+An adaptive payload cache enables a lazily allocated, fixed-size frequency sketch
+only after a full cache sees a consecutive miss run at least twice its root
+count (minimum 16 requests, maximum 2048). A full cache with fitting phase changes
+keeps ordinary LRU adaptation. Twice-capacity consecutive hits retire the sketch
+and restore ordinary LRU after a new fitting hot set settles. The four 1024-counter lanes retain no
+row IDs or payload bytes. Counters saturate and age after a bounded number of
+requests proportional to the admitted root count. A candidate replaces the LRU
+root only when its estimated reuse exceeds the victim's; equal-frequency cyclic
+scans preserve resident roots. Aging lets a new hot set replace an old one.
+Ordinary fitting working sets do not allocate a sketch.
+
+The sketch uses the existing optional metadata allocator and quota, and retires
+with the last root. Required borrowers retain their pins; shared pressure can
+still evict any idle root. Small and opaque allocator paths keep conservative
+admission. All requests advance periodic lazy-growth accounting, including
+misses. Rejected misses avoid walking the entire owner graph; admitted growth
+still refreshes retained owner sizes before trimming and adoption. Genuine
+allocator failures propagate, while optional quota refusals can decline cache
+admission without losing the required row.
+
+Runtime ABI **81** fences the changed in-process cache layout. Reader protocol
+**97** and persisted artifact formats are unchanged. Qualification includes a
+cyclic working set larger than the cache, adaptation to a replacement hot set,
+metadata allocation failures, and complete sorted row/value oracles.
+
+A bounded external-permutation prototype also sorts compact references by
+physical payload address, gathers typed payload batches, then sorts the gathered
+payloads by their original keys and ordinals without further indirection. This
+preserves existing memory, disk and descriptor limits, but adds reference-sort
+and payload-sort passes. It remains benchmark-only: the measured reduction in
+reads did not pay for its additional CPU and writes on local spill storage.
+A future planner must qualify the full cost for the actual storage and workload
+before selecting repacking; reduced read counters alone are insufficient.
+
+
+### One private metadata reduction
+
+Row maps, translation maps, text directories, fragment navigation and aggregate
+metadata stage mutations in one byte-bounded external sort. The sort owns the
+memory admission, bounded merge fan-in, shared spill extents, disk quota and
+file quota. A fixed record count no longer closes each small sort and starts a
+second page-tree merge forest. Private staging runs are not durable publication
+checkpoints; the maintenance reducers that actually persist checkpoints retain
+their durable merge forests.
+
+The final merge feeds leased keys and values directly into `page_tree.applySorted`.
+Equal keys are reduced in stable mutation-ordinal order. Ordinary updates select
+the latest mutation; addition-priority updates select the latest addition if one
+exists, otherwise a deletion. This policy applies across every spill run. The
+source retains only a winner and one lookahead lease, including when a key has
+many updates. It releases both on success, cancellation or failure without
+materializing owning rows or an intermediate authenticated page tree.
+
+The destination still owns authentication, publication I/O accounting, aggregate
+reductions and copy-on-write subtree reuse. Persisted formats and reader/runtime
+protocols are unchanged. No root is returned on partial failure, and the prior
+root remains valid. Raw spill staging does not need a separate artifact I/O phase
+or an addition policy duplicated in a second reducer.
+
+
+The measured comparison is recorded in
+[private-metadata-reduction-v1-observation.json](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/private-metadata-reduction-v1-observation.json).
+Three alternating pairs of real local Parquet publications verify every row and
+all ten columns outside the timed interval. At 8,192 rows, median publication
+falls from 6,349.022 to 5,581.567 ms (12.1%); all three candidates are faster. At
+65,536 rows, the median rises from 43,619.621 to 44,190.543 ms (1.3%); only one
+candidate pair is faster. The larger cohort does not establish a publication
+speedup. These Debug measurements retain OS caches, and unrelated host work,
+including an inference benchmark during the larger cohort, was uncontrolled.
+The smaller-cohort gain and removal of a redundant staging layer support this
+shape; they do not establish large-archive or cloud throughput improvements.
+
+Qualification covers 403 shared native checks and 182 API checks, including
+allocation-failure sweeps for row identity and translations. An initial test
+incorrectly bounded cumulative writes by the live spill quota; restoring its
+recycling invariant and directly importing the metadata modules into the API
+test root produces nine passing focused checks. That correction changes no
+production code. All 50 real Parquet/Iceberg E2E cases pass against the frozen
+implementation binary. Memory, spill-byte and file-count admission remain in
+force, including cumulative writes exceeding a bounded live disk quota.
+
+
+### Ordered identity maps and typed spill merges
+
+Fresh complete row-map builds consume the already ID-sorted pending stream
+through the existing leased record interface. With no retained membership,
+queued mutations or prior result root, the by-ID tree can be built directly.
+Single-cohort input evidence has a constant recipe prefix and can use the same
+ordered tree writer. Queued removals, retained rows, multiple interleaved cohorts
+and repeated finishes retain the mutation reducer where its ordering proof is
+needed. Duplicate IDs are checked before insertion; copy-on-write publication,
+input evidence, authentication and root validation keep their existing rules.
+
+Native spill merges expose selected primitive wire lanes as physical columns.
+Fixed and dictionary integers, doubles, booleans and strings are gathered in
+native vectors; string payload bytes remain borrowed from pinned input blocks.
+SQL NULL flags stay distinct from JSON null. Decimal, heterogeneous JSON and
+shared/unsupported encodings decline before gathering and retain the existing
+scalar or frozen codec. Floating-point bits, including signed zero, are preserved.
+
+Merge tiles below 16 rows keep scalar encoding so boundary flushes do not pay
+for physical gathering. A productive merge gathers and encodes one column at a
+time using the existing bounded
+column scratch arena. Row sizing retains the prior block boundaries, so wide
+rows do not retain a full matrix of gathered columns. Input blocks remain pinned
+through the synchronous encode, and all added scratch uses the existing manager
+allocator and quotas. The ordinary borrowed-batch write path remains available.
+Runtime ABI 81, reader protocol 97 and persisted formats are unchanged.
+
+
+The [ordered-map and typed-merge observation](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/ordered-identity-and-typed-merges-v1-observation.json)
+qualifies runtime `4fb464d08b12f1aaf1d570ebf7d00698d285ecde` against the
+post-main-merge baseline `bbbede9c8de3250f7e0f9eb9499c7c8891496e2f`.
+Three alternating complete real-Parquet publication pairs reduce median latency
+from 5,384.655 to 5,063.972 ms at 8,192 rows (6.0%), and from 45,459.256 to
+39,718.982 ms at 65,536 rows (12.6%). Every candidate is faster, and every row
+and all ten columns are independently verified outside timing.
+
+The native full-sort probe at 65,536 rows and a 4-MiB workspace reduces median
+thread CPU by 6.9% uncompressed and 3.3% with Snappy. Reads, writes and tracked
+peaks stay identical under the same quota. The 1-MiB case is essentially flat
+and 64-KiB results are mixed. These Debug local-storage observations retain OS
+caches and uncontrolled host activity; they establish no optimized-build,
+cloud, archive-scale or peak-RSS gain. The final runtime passes 404 shared native
+checks, 183 API checks and all 50 real Parquet/Iceberg E2E cases. Main
+`f91c9c0e4682a3ff20e39fce9a44d67b658a7b55` is included in both server binaries.
+
+
+### Quota-governed payload residency and streamed source capture
+
+Refundable, registered SQL payload-cache owners now size their payload, root,
+owner and frequency metadata allowances from live statement/host headroom.
+The prior 16-MiB, 1,024-root and 4,096-owner defaults no longer stop a healthy
+registered cache from using its admitted share. Payload and metadata allocations
+still pass through the same authoritative byte admission, and required work can
+reclaim idle optional owners. Half-headroom targeting leaves room for required
+operators and sibling readers. Unknown or monotonic allocators keep the small
+conservative fallback; explicit ceilings remain available for qualification.
+The count-min admission sketch scales with resident roots and is refunded with
+the cache. This trades spare admitted memory for fewer physical payload reads;
+it does not raise the statement or host memory limit.
+
+Large, singly bound source fields can stream nonexpanding token-local analysis
+into postings while capturing original spans in compact replay storage. Each
+16-byte record stores an interned term ID, byte bounds and position. The compact
+prefix stages up to an eighth of recognized initial headroom in record bytes, capped at 4 MiB
+(256 KiB for an unknown owner), before moving once to an admitted private run.
+Backing capacity, distinct-term interning, occurrence links and run read buffers
+remain charged to the build owner. This removes the owning per-occurrence Token
+array and duplicate term strings; it does not make indexing constant-memory.
+
+The replay source and ordinary token slices instantiate the same native offset
+encoder. Persisted dictionary, occurrence and source-order lanes are unchanged.
+Character filters, expanding/stateful filters and unsupported tokenizers retain
+the authoritative materialized analyzer. Repeated physical bindings retain their
+existing document-local shared analysis, rather than analyzing each alias again.
+Small fields retain the ordinary path. The retained streaming path prioritizes
+bounded build memory: CPU can be slightly higher, especially for English
+stemming, so its kernel measurements are reported separately from publication.
+Runtime ABI 82 fences the changed cache state; reader protocol 97 is unchanged.
+
+Native probes have supported build targets, including all generated product and
+platform dependencies. `zig build lake-native-bench-build -Doptimize=fast` builds
+all three probes without referring to disposable cache-generated files. See the
+[benchmark instructions](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/README.md#quota-governed-residency-and-streamed-capture)
+for controls, exact timer boundaries and measured tradeoffs.
+
+
+The [governed-residency and capture observation](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/governed-residency-and-streamed-capture-v1-observation.json)
+qualifies this runtime with 592 native checks and 50 real Parquet/Iceberg E2E
+cases. Three alternating optimized native pairs at 65,536 rows show 16.3–18.0%
+lower full-sort CPU and 88.5–89.0% fewer physical read bytes against the same
+binary's fixed-cap policy control. Tracked peaks rise from about 17 MB to 127 MB
+under the unchanged 256-MiB quota. The tight 32-MiB-quota cohort keeps identical
+I/O/memory and shows no CPU improvement. Repeated four-term capture fixtures use
+91–94% less tracked peak memory; English capture takes 5.7–7.4% more CPU and the
+smaller simple-analyzer fixture takes 14.2% more CPU. These kernel observations
+are separate from earlier complete-publication measurements; no current HTTP,
+archive, cloud or RSS gain is claimed.
+
+
+### Incremental retention accounting and compact alias replay
+
+Payload-cache adoption now accounts each immutable block and dependency once.
+Lazy JSON owners publish arena-capacity growth to stable cache subscriptions;
+cache operations drain atomic deltas instead of walking every retained owner.
+Each physical owner has one subscription per cache, even when several roots
+refer to it. Eviction removes the subscription before subtracting its final
+capacity and freeing metadata. The subscription lifetime lock encloses no
+allocation or cache callback, so publishing under a JSON mutation lock cannot
+invert allocator/cache locks. Partial failed JSON allocations publish their
+capacity too. Statement/host admission and required-work reclamation remain
+authoritative throughout; a larger cache no longer implies quadratic recounting.
+
+For large supported text shared by physical bindings such as `body` and `_all`,
+the document-local analysis lease can retain compact normalized replay instead
+of an owning Token array. The first binding consumes the analyzer directly while
+interned-term IDs and original spans append to the bounded spool. Later aliases
+replay those records. Each binding keeps its own position base and field norm;
+source-offset encoding happens once per source field/analyzer fingerprint. The
+last binding closes replay memory and private disk state. Different source
+fields or fingerprints never share replay. Small fields and unsupported analyzer
+pipelines keep their existing owning-token reuse; no source format changes.
+
+Admitted in-memory records are read directly; spilled records keep the seekable
+run path. Token scratch resets in bounded microbatches, with a 64-KiB retention
+limit and the existing allocator quota. This reduces per-token reset overhead
+without extending the caller's promised token lifetime. Compact replay is a
+memory-efficiency improvement, with CPU tradeoffs measured explicitly for both
+repeated and diverse vocabularies. It is not an unconditional ingestion speedup.
+Runtime ABI 83 fences the new state; reader protocol 97 is unchanged.
+
+
+The [incremental-retention and alias-replay observation](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/incremental-retention-and-alias-replay-v1-observation.json)
+qualifies runtime `3d058bc003189c73b49f190fdf17ecea423d67ac`, with main
+`97945ad58e8194815ad377a0ba853a4583d83ec4`. Three alternating optimized native
+pairs at 262,144 rows reduce median full-sort CPU by 59.5% uncompressed and
+57.4% with Snappy; reads, writes, merges, roots and the 1-GiB quota match. Both
+variants already use quota-governed residency. This isolates removal of the
+recounts that penalized large caches, rather than further increasing residency.
+
+Two-binding capture uses 91.2–94.1% less tracked peak memory on repeated text
+and 93.3% less on 4,096-term text, with 13.8–52.9% more CPU. A separate native
+postings/search test builds a 1,245,184-byte field shared by `body` and `_all`
+with 6,565,096 tracked peak bytes under a 64-MiB quota, one analysis and one
+reuse. All 600 native checks and 50 real Parquet/Iceberg E2E cases pass. These
+kernel and correctness results do not establish optimized-server throughput,
+cloud retention, archive-scale or RSS improvements.
+
+
+### Sequential normalized replay and bounded term grouping
+
+Compact original-offset records keep their normalized term IDs through encoding.
+The producer records term counts and conservative source-order/disjointness flags
+once. Materialized token slices retain the reference preparation path; both
+preparations feed one offset encoder, so dictionary order, source lanes, geometry
+bounds, compression and persisted bytes remain identical.
+
+Memory-backed occurrences use compact index links without hashing their terms
+again. Disk-backed occurrences use stable MSD partitioning by lexical term rank.
+Each pass reads sequential blocks into sixteen small buffers in one admitted
+private run. Leaves use counting scatter within a bounded workspace, adapting to
+live quota headroom; an oversized single term streams directly. Equal-term
+occurrences preserve input order, including repeated positions and overlapping
+spans. Private partition runs share the existing capacity reservations and are
+closed on success, allocation failure or provider failure. The maximum radix
+depth is bounded by the 32-bit term-ID width, rather than the occurrence count.
+
+The grouped output is consumed in lexical order. Aliases and the dense
+source-order lane read the original spool through block cursors. Memory sources
+borrow immutable bytes directly; disk cursors retain only their current block.
+This removes the term-by-term scattered disk access at the memory-to-file
+threshold without lifting that threshold or changing source-offset formats.
+Temporary cursor and partition buffers use refundable scratch allocators while
+preserving enclosing statement/host quotas. The final alias still closes the
+original spool and interned terms. Runtime ABI 84 fences the new state; reader
+protocol 97 and persisted encodings are unchanged.
+
+
+The [partitioned normalized replay observation](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/partitioned-normalized-replay-v1-observation.json)
+qualifies runtime `3efae3aac45cdf8a8aa2783a04381ca08bbfbe7a` against the frozen
+pre-fix probe on the same main. Three alternating pairs show 75.7–78.8% lower
+CPU for diverse disk-backed capture across simple/English analysis and one/two
+bindings, with about 11% lower CPU for the memory-fitting cohorts. Every tested
+pair is faster and complete token/span/input/encoded-byte hashes match. The
+English two-binding threshold case drops from 242.113 to 58.949 ms and performs
+775 physical private-run reads for 262,148 tokens. The larger case drops from
+471.839 to 104.286 ms, with 1,920 reads for 524,288 tokens.
+
+Tracked compact capture peak is 8,647,856 bytes in these diverse cohorts, about
+94% below the owning-token control. The compact path still takes 28.3–76.6% more
+CPU than owning tokens on the measured diverse fixtures; repeated-term English
+capture takes 5.1–15.1% more CPU. This fixes the disk amplification while retaining
+the deliberate bounded-memory tradeoff. Both 64-MiB owning-token controls exhaust
+their quota while normalized capture completes with identical output. The larger
+native postings/search fixture uses 9,506,567 tracked peak bytes under that same
+64-MiB quota. All 602 native checks and 50 real Parquet/Iceberg E2E cases pass.
+These kernel observations do not establish whole-ingestion or cloud speedups.
+
+
+### Shared read ownership across normalized term groups
+
+A prepared disk-backed offset input owns one bounded group-reader buffer for
+its lifetime. Lexical encoding consumes consecutive groups through that reader,
+including records already read ahead across the next term boundary. A group
+borrows an exclusive reader lease; a second active group is rejected. Closing
+an unconsumed suffix releases the lease without imposing a drain requirement.
+An explicit nonconsecutive or backward group seek resets the read coordinates
+while retaining the buffer capacity. Returned tokens borrow interned term bytes,
+so moving or reusing the read buffer never invalidates them.
+
+The prepared owner supplies the buffer allocator and outlives every group lease.
+A borrower does not retain its own scratch allocator or free the shared buffer.
+Read/allocation failures make the active reader terminal for that lease; a new
+lease resets it before retrying, preventing partially advanced read coordinates
+from skipping records. Final owner teardown requires all group leases closed,
+then frees the buffer before closing its grouped private run. Memory-backed
+occurrence links keep their existing independent traversal.
+
+This replaces one buffer allocation per disk term with one normal sequential
+reader allocation, capped at 64 KiB and still charged to the same statement/host
+quota. Persisted offset bytes, source geometry, term ordering and native postings
+remain unchanged. Runtime ABI 85 fences the owner/lease state; reader protocol
+97 is unchanged. Capture timing and complete native segment-build timing are
+measured separately; neither alone establishes HTTP publication or cloud latency.
+
+The [shared-reader qualification](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/shared-normalized-reader-v1-observation.json)
+records a same-main, identical-harness comparison: disk diverse capture uses
+3.3–16.9% less median CPU and complete native-index construction uses 5.2–10.8%
+less for diverse aliases. Allocation count falls from 4,096 buffers to one,
+with identical output bytes and tracked peaks. Memory-fitting diverse capture
+is 1.9–5.2% slower, and repeated-term capture gains little; retain these controls
+when evaluating later changes. All 604 native checks and 50 real Parquet/Iceberg
+E2E cases pass against the merged-main runtime. The observation distinguishes
+private reads, tracked memory and native build timing from network, RSS and
+complete publication latency.

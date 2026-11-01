@@ -52,7 +52,9 @@ pub enum Error {
     /// platform or filesystem. Retrying unchanged will not succeed.
     Unsupported,
     /// Derived work stalled or a derived worker failed. Inspect pending-work
-    /// diagnostics and repair or reopen the database.
+    /// diagnostics and repair or reopen the database. A batch may already
+    /// have committed: inspect its error detail and do not replay a batch
+    /// reported as committed.
     Stalled,
     /// The operation was cancelled, including a pending replacement or a
     /// progress/stream callback returning `false`, or an IO interruption.
