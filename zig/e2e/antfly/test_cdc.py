@@ -1364,16 +1364,44 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
         f"{_metadata_admin_snapshot(stateful_api)}"
     )
 
+    # Document recovery and the metadata replication status both replay from
+    # durable state after restart, but through separate paths (the data
+    # group's storage recovery vs. the metadata group's Raft log replay).
+    # `recovered_doc` only proves the data group has caught up; the metadata
+    # group can still be a few log entries behind at that exact instant,
+    # especially under load. Poll here instead of reading the status once,
+    # the same way the pre-restart checks above poll for status records to
+    # appear.
+    def matching_statuses_caught_up() -> list[dict[str, Any]] | None:
+        statuses = _metadata_replication_status_records(stateful_api)
+        matching = [
+            status
+            for status in statuses
+            if int(status.get("table_id", 0)) == table_id
+            and int(status.get("source_ordinal", -1)) == 0
+        ]
+        if not matching:
+            return None
+        if not any(
+            status.get("prepared_checkpoint") == prepared_checkpoint_before_restart
+            and status.get("stream_checkpoint") == stream_checkpoint_before_restart
+            for status in matching
+        ):
+            return None
+        return matching
+
+    matching_after_restart = wait_until(
+        matching_statuses_caught_up,
+        timeout_s=30.0,
+        interval_s=0.25,
+    )
     statuses_after_restart = _metadata_replication_status_records(stateful_api)
-    matching_after_restart = [
-        status
-        for status in statuses_after_restart
-        if int(status.get("table_id", 0)) == table_id
-        and int(status.get("source_ordinal", -1)) == 0
-    ]
     assert matching_after_restart, (
-        "missing replication status after restart\n"
-        f"{_metadata_admin_snapshot(stateful_api)}"
+        "replication status after restart never caught up to the "
+        "pre-restart checkpoint\n"
+        f"before=(prepared={prepared_checkpoint_before_restart!r}, "
+        f"stream={stream_checkpoint_before_restart!r}) "
+        f"after={statuses_after_restart!r}"
     )
     assert any(
         status.get("prepared_checkpoint") == prepared_checkpoint_before_restart
