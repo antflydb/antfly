@@ -315,3 +315,36 @@ SHA-256 `d8836e685e8a670505e43c8ab5145fafdda5a0210eb85ee5584896fc6f62c6e9`. The 
 reverifies unchanged; no old results or seals were rewritten. Live Cloudflare
 qualification and historical `SQLITE_NOMEM` remain open. No cloud resources or
 credentials were created by the integration checks.
+
+## Local qualification artifact retention
+
+On 2026-11-01 UTC, at the user's request, pruned **1,786 archived payloads /
+24,782,331,937 bytes**: 1,713 WASM copies, 30 native executables and 43
+Git-backed source archives. Source commits are retained through 40 local
+`refs/qualification/source/<sha>` refs. Source archives without a recoverable
+Git commit, experiment patches/bundles, reports, samples, logs, manifests, hashes
+and toolchain records are retained. Active runtime modules and one exact copy of
+each of the two approved control modules are preserved.
+
+The original seals remain historical manifests. **Their removed binary/archive
+payloads can no longer be fully reverified.** This intentional pruning does not
+change the recorded measurements, but source SHAs alone do not guarantee
+byte-identical rebuilds. Use retained lockfiles/toolchains when rebuilding and
+verify new hashes; a rebuilt control must not silently replace approved bytes.
+The local retention record and append-only removal ledger are:
+
+- `dist/qualification/local-retention-20261101T004120Z/retention.json`
+- `dist/qualification/local-retention-20261101T004120Z/removed.jsonl`
+
+The retention record identifies the relocated exact approved control modules.
+Source refs are local to this repository; they are not an off-machine backup.
+The reusable cleanup tool defaults to dry run, excludes credential paths,
+symlinks, active modules and retention records, and preserves unknown/dirty source
+archives:
+
+```sh
+# From examples/cloudflare-serverless:
+python3 -B qualification/prune-local-artifacts.py
+python3 -B qualification/prune-local-artifacts.py --apply
+python3 -B test/prune-local-artifacts.test.py
+```
