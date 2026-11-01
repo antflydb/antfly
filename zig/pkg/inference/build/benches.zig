@@ -44,6 +44,22 @@ fn createCpuComputeModule(ctx: Context, source: []const u8) *std.Build.Module {
     return module;
 }
 
+/// Standalone device-image qualification uses the same driver contract options
+/// as other native tools, without requiring a statically linked CUDA toolkit.
+pub fn addCudaFlashPrefill(ctx: Context) void {
+    const module = ctx.b.createModule(.{
+        .root_source_file = ctx.path("src/quant_kernel_cuda_flash_prefill_prototype.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "build_options", .module = ctx.graph.build_options_mod }},
+    });
+    const executable = ctx.b.addExecutable(.{ .name = "antfly-cuda-flash-prefill-prototype", .root_module = module });
+    ctx.step("build-cuda-flash-prefill-prototype", "Build the shared CUDA Flash-prefill qualification harness").dependOn(&ctx.b.addInstallArtifact(executable, .{}).step);
+    const tests = ctx.b.addTest(.{ .root_module = module });
+    ctx.step("test-cuda-flash-prefill-prototype", "Test the CUDA Flash-prefill qualification contracts without a GPU").dependOn(&ctx.addRunArtifact(tests).step);
+}
+
 pub fn addPagedAttention(ctx: Context) void {
     const b = ctx.b;
     const bench_exe = b.addExecutable(.{

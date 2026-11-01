@@ -5857,8 +5857,8 @@ static __device__ void reference_prefill_body(
 #ifndef ANTFLY_FLASH_NAMESPACE
 #error "ANTFLY_FLASH_NAMESPACE must name a unique renderer-owned namespace"
 #endif
-#ifndef ANTFLY_FLASH_KERNEL
-#error "ANTFLY_FLASH_KERNEL must name the exported production entry point"
+#if !defined(ANTFLY_FLASH_KERNEL) && !defined(ANTFLY_FLASH_REFERENCE_KERNEL)
+#error "Flash template requires a production or reference entry point"
 #endif
 #ifndef ANTFLY_FLASH_HEAD_DIM
 #error "ANTFLY_FLASH_HEAD_DIM must be 256 or 512"
@@ -5910,6 +5910,7 @@ using ANTFLY_FLASH_NAMESPACE = antfly_flash_common::Geometry<ANTFLY_FLASH_KV_HEA
     key_row_bytes, base_key_row_bytes, value_row_bytes, block_count, \
     page_size_tokens, format, value_format, physical_token_capacity, decode_scalars
 
+#ifdef ANTFLY_FLASH_KERNEL
 extern "C" __global__ void
 ANTFLY_FLASH_KERNEL(
     ANTFLY_FLASH_ARGUMENTS
@@ -5921,6 +5922,8 @@ ANTFLY_FLASH_KERNEL(
         ANTFLY_FLASH_HEAD_DIM,
         ANTFLY_FLASH_SLIDING_WINDOW>(ANTFLY_FORWARD_ARGUMENTS, storage);
 }
+
+#endif
 
 #ifdef ANTFLY_FLASH_REFERENCE_KERNEL
 extern "C" __global__ void
@@ -6013,8 +6016,8 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 #ifndef ANTFLY_FLASH_NAMESPACE
 #error "ANTFLY_FLASH_NAMESPACE must name a unique renderer-owned namespace"
 #endif
-#ifndef ANTFLY_FLASH_KERNEL
-#error "ANTFLY_FLASH_KERNEL must name the exported production entry point"
+#if !defined(ANTFLY_FLASH_KERNEL) && !defined(ANTFLY_FLASH_REFERENCE_KERNEL)
+#error "Flash template requires a production or reference entry point"
 #endif
 #ifndef ANTFLY_FLASH_HEAD_DIM
 #error "ANTFLY_FLASH_HEAD_DIM must be 256 or 512"
@@ -6066,6 +6069,7 @@ using ANTFLY_FLASH_NAMESPACE = antfly_flash_common::Geometry<ANTFLY_FLASH_KV_HEA
     key_row_bytes, base_key_row_bytes, value_row_bytes, block_count, \
     page_size_tokens, format, value_format, physical_token_capacity, decode_scalars
 
+#ifdef ANTFLY_FLASH_KERNEL
 extern "C" __global__ void
 ANTFLY_FLASH_KERNEL(
     ANTFLY_FLASH_ARGUMENTS
@@ -6077,6 +6081,8 @@ ANTFLY_FLASH_KERNEL(
         ANTFLY_FLASH_HEAD_DIM,
         ANTFLY_FLASH_SLIDING_WINDOW>(ANTFLY_FORWARD_ARGUMENTS, storage);
 }
+
+#endif
 
 #ifdef ANTFLY_FLASH_REFERENCE_KERNEL
 extern "C" __global__ void
@@ -6169,8 +6175,8 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 #ifndef ANTFLY_FLASH_NAMESPACE
 #error "ANTFLY_FLASH_NAMESPACE must name a unique renderer-owned namespace"
 #endif
-#ifndef ANTFLY_FLASH_KERNEL
-#error "ANTFLY_FLASH_KERNEL must name the exported production entry point"
+#if !defined(ANTFLY_FLASH_KERNEL) && !defined(ANTFLY_FLASH_REFERENCE_KERNEL)
+#error "Flash template requires a production or reference entry point"
 #endif
 #ifndef ANTFLY_FLASH_HEAD_DIM
 #error "ANTFLY_FLASH_HEAD_DIM must be 256 or 512"
@@ -6222,6 +6228,7 @@ using ANTFLY_FLASH_NAMESPACE = antfly_flash_common::Geometry<ANTFLY_FLASH_KV_HEA
     key_row_bytes, base_key_row_bytes, value_row_bytes, block_count, \
     page_size_tokens, format, value_format, physical_token_capacity, decode_scalars
 
+#ifdef ANTFLY_FLASH_KERNEL
 extern "C" __global__ void
 ANTFLY_FLASH_KERNEL(
     ANTFLY_FLASH_ARGUMENTS
@@ -6233,6 +6240,8 @@ ANTFLY_FLASH_KERNEL(
         ANTFLY_FLASH_HEAD_DIM,
         ANTFLY_FLASH_SLIDING_WINDOW>(ANTFLY_FORWARD_ARGUMENTS, storage);
 }
+
+#endif
 
 #ifdef ANTFLY_FLASH_REFERENCE_KERNEL
 extern "C" __global__ void
@@ -6325,8 +6334,8 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 #ifndef ANTFLY_FLASH_NAMESPACE
 #error "ANTFLY_FLASH_NAMESPACE must name a unique renderer-owned namespace"
 #endif
-#ifndef ANTFLY_FLASH_KERNEL
-#error "ANTFLY_FLASH_KERNEL must name the exported production entry point"
+#if !defined(ANTFLY_FLASH_KERNEL) && !defined(ANTFLY_FLASH_REFERENCE_KERNEL)
+#error "Flash template requires a production or reference entry point"
 #endif
 #ifndef ANTFLY_FLASH_HEAD_DIM
 #error "ANTFLY_FLASH_HEAD_DIM must be 256 or 512"
@@ -6378,6 +6387,7 @@ using ANTFLY_FLASH_NAMESPACE = antfly_flash_common::Geometry<ANTFLY_FLASH_KV_HEA
     key_row_bytes, base_key_row_bytes, value_row_bytes, block_count, \
     page_size_tokens, format, value_format, physical_token_capacity, decode_scalars
 
+#ifdef ANTFLY_FLASH_KERNEL
 extern "C" __global__ void
 ANTFLY_FLASH_KERNEL(
     ANTFLY_FLASH_ARGUMENTS
@@ -6389,6 +6399,8 @@ ANTFLY_FLASH_KERNEL(
         ANTFLY_FLASH_HEAD_DIM,
         ANTFLY_FLASH_SLIDING_WINDOW>(ANTFLY_FORWARD_ARGUMENTS, storage);
 }
+
+#endif
 
 #ifdef ANTFLY_FLASH_REFERENCE_KERNEL
 extern "C" __global__ void

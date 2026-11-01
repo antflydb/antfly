@@ -1547,6 +1547,7 @@ pub fn build(b: *std.Build) void {
     );
     e2b_prefill_route_check_step.dependOn(e2b_prefill_route_tail.?);
 
+    workflows_benches.addCudaFlashPrefill(workflow_ctx);
     workflows_benches.addPagedAttention(workflow_ctx);
 
     const turboquant_distortion_bench_exe = b.addExecutable(.{

@@ -8952,6 +8952,26 @@ fn NativeProjectionFamily(comptime n: usize) type {
             return true;
         }
 
+        inline fn prepared(self: @This(), comptime layout: QuantizedStorage.PreparedQuantLayout) ?[n][]const u8 {
+            var result: [n][]const u8 = undefined;
+            inline for (self.storage, 0..) |storage, i| result[i] = storage.preparedBytes(layout) orelse return null;
+            return result;
+        }
+
+        inline fn applyQ8_0(self: @This(), allocator: std.mem.Allocator, io: ?std.Io, input: []const f32, rows: usize, in_dim: usize, out_dim: usize) !void {
+            var raw: [n][]const u8 = undefined;
+            var blocks: [n]?[]const u8 = undefined;
+            var panels: [n]?[]const u8 = undefined;
+            var panels8: [n]?[]const u8 = undefined;
+            inline for (self.storage, 0..) |storage, i| {
+                raw[i] = storage.raw_bytes;
+                blocks[i] = storage.preparedBytes(.row_major_blocks);
+                panels[i] = storage.preparedBytes(.panel4);
+                panels8[i] = storage.preparedBytes(.panel8);
+            }
+            return linearQ8_0Projections(n, allocator, io, input, raw, blocks, panels, panels8, self.biases, self.outputs, rows, in_dim, out_dim);
+        }
+
         inline fn addBias(self: @This(), rows: usize, out_dim: usize) void {
             inline for (0..n) |i| if (self.biases[i]) |bias| addLinearBiasRows(self.outputs[i], bias, rows, out_dim);
         }
@@ -9220,24 +9240,7 @@ pub fn linearNoBiasQuantizedPair(
             }
             // Avoid the runtime dot-function pair fallback for Q8_0; use the
             // specialized MR/NR tiled path with one shared worker dispatch.
-            try linearNoBiasQ8_0Pair(
-                allocator,
-                io,
-                input,
-                storage_a.raw_bytes,
-                storage_b.raw_bytes,
-                storage_a.preparedBytes(.row_major_blocks),
-                storage_b.preparedBytes(.row_major_blocks),
-                storage_a.preparedBytes(.panel4),
-                storage_b.preparedBytes(.panel4),
-                storage_a.preparedBytes(.panel8),
-                storage_b.preparedBytes(.panel8),
-                output_a,
-                output_b,
-                rows,
-                in_dim,
-                out_dim,
-            );
+            try projections.applyQ8_0(allocator, io, input, rows, in_dim, out_dim);
             noteNativeQuantDispatch(.q8_0_pair);
             return true;
         } else if (known == .Q8_1) {
@@ -9573,32 +9576,31 @@ pub fn linearQuantizedTriple(
             if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
             const input_blocks = in_dim / 32;
             if (shouldUseQ8_0ActivationQuant(rows, out_dim, input_blocks)) {
-                if (storage_a.preparedBytes(.row_major_blocks)) |prepared_a| {
-                    if (storage_b.preparedBytes(.row_major_blocks)) |prepared_b| {
-                        if (storage_c.preparedBytes(.row_major_blocks)) |prepared_c| {
-                            try linearQ1_0PreparedActivationTriple(
-                                storage_a.allocator,
-                                io,
-                                input,
-                                prepared_a,
-                                prepared_b,
-                                prepared_c,
-                                storage_a.preparedBytes(.panel4),
-                                storage_b.preparedBytes(.panel4),
-                                storage_c.preparedBytes(.panel4),
-                                bias_a,
-                                bias_b,
-                                bias_c,
-                                output_a,
-                                output_b,
-                                output_c,
-                                rows,
-                                in_dim,
-                                out_dim,
-                            );
-                            return true;
-                        }
-                    }
+                if (projections.prepared(.row_major_blocks)) |prepared| {
+                    const prepared_a = prepared[0];
+                    const prepared_b = prepared[1];
+                    const prepared_c = prepared[2];
+                    try linearQ1_0PreparedActivationTriple(
+                        storage_a.allocator,
+                        io,
+                        input,
+                        prepared_a,
+                        prepared_b,
+                        prepared_c,
+                        storage_a.preparedBytes(.panel4),
+                        storage_b.preparedBytes(.panel4),
+                        storage_c.preparedBytes(.panel4),
+                        bias_a,
+                        bias_b,
+                        bias_c,
+                        output_a,
+                        output_b,
+                        output_c,
+                        rows,
+                        in_dim,
+                        out_dim,
+                    );
+                    return true;
                 }
             }
             if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
@@ -9610,49 +9612,48 @@ pub fn linearQuantizedTriple(
             if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
             const row_blocks = in_dim / values_per_block;
             if (shouldUseQ4_Q5_KQ8KActivationQuant(rows, out_dim, row_blocks)) {
-                if (storage_a.preparedBytes(.row_major_blocks)) |prepared_a| {
-                    if (storage_b.preparedBytes(.row_major_blocks)) |prepared_b| {
-                        if (storage_c.preparedBytes(.row_major_blocks)) |prepared_c| {
-                            if (known == .Q3_K and q3KNoDmnGroupedEnabledFor(rows, out_dim, row_blocks, 3)) {
-                                if (storage_a.preparedBytes(.panel4_k16_no_min)) |q3_panel_a| {
-                                    if (storage_b.preparedBytes(.panel4_k16_no_min)) |q3_panel_b| {
-                                        if (storage_c.preparedBytes(.panel4_k16_no_min)) |q3_panel_c| {
-                                            try linearQ3KNoDmnPanelActivationTriple(
-                                                storage_a.allocator,
-                                                io,
-                                                input,
-                                                prepared_a,
-                                                prepared_b,
-                                                prepared_c,
-                                                q3_panel_a,
-                                                q3_panel_b,
-                                                q3_panel_c,
-                                                bias_a,
-                                                bias_b,
-                                                bias_c,
-                                                output_a,
-                                                output_b,
-                                                output_c,
-                                                rows,
-                                                in_dim,
-                                                out_dim,
-                                            );
-                                            return true;
-                                        }
-                                    }
+                if (projections.prepared(.row_major_blocks)) |prepared| {
+                    const prepared_a = prepared[0];
+                    const prepared_b = prepared[1];
+                    const prepared_c = prepared[2];
+                    if (known == .Q3_K and q3KNoDmnGroupedEnabledFor(rows, out_dim, row_blocks, 3)) {
+                        if (storage_a.preparedBytes(.panel4_k16_no_min)) |q3_panel_a| {
+                            if (storage_b.preparedBytes(.panel4_k16_no_min)) |q3_panel_b| {
+                                if (storage_c.preparedBytes(.panel4_k16_no_min)) |q3_panel_c| {
+                                    try linearQ3KNoDmnPanelActivationTriple(
+                                        storage_a.allocator,
+                                        io,
+                                        input,
+                                        prepared_a,
+                                        prepared_b,
+                                        prepared_c,
+                                        q3_panel_a,
+                                        q3_panel_b,
+                                        q3_panel_c,
+                                        bias_a,
+                                        bias_b,
+                                        bias_c,
+                                        output_a,
+                                        output_b,
+                                        output_c,
+                                        rows,
+                                        in_dim,
+                                        out_dim,
+                                    );
+                                    return true;
                                 }
                             }
-                            const panel8_a = if (k16Panel8DirectEnabledFor(known)) storage_a.preparedBytes(.panel8) else null;
-                            const panel8_b = if (k16Panel8DirectEnabledFor(known)) storage_b.preparedBytes(.panel8) else null;
-                            const panel8_c = if (k16Panel8DirectEnabledFor(known)) storage_c.preparedBytes(.panel8) else null;
-                            if (known == .Q2_K) {
-                                try linearK16PreparedQ8KActivationTriple(true, storage_a.allocator, io, input, prepared_a, prepared_b, prepared_c, storage_a.preparedBytes(.panel4), storage_b.preparedBytes(.panel4), storage_c.preparedBytes(.panel4), panel8_a, panel8_b, panel8_c, bias_a, bias_b, bias_c, output_a, output_b, output_c, rows, in_dim, out_dim);
-                            } else {
-                                try linearK16PreparedQ8KActivationTriple(false, storage_a.allocator, io, input, prepared_a, prepared_b, prepared_c, storage_a.preparedBytes(.panel4), storage_b.preparedBytes(.panel4), storage_c.preparedBytes(.panel4), panel8_a, panel8_b, panel8_c, bias_a, bias_b, bias_c, output_a, output_b, output_c, rows, in_dim, out_dim);
-                            }
-                            return true;
                         }
                     }
+                    const panel8_a = if (k16Panel8DirectEnabledFor(known)) storage_a.preparedBytes(.panel8) else null;
+                    const panel8_b = if (k16Panel8DirectEnabledFor(known)) storage_b.preparedBytes(.panel8) else null;
+                    const panel8_c = if (k16Panel8DirectEnabledFor(known)) storage_c.preparedBytes(.panel8) else null;
+                    if (known == .Q2_K) {
+                        try linearK16PreparedQ8KActivationTriple(true, storage_a.allocator, io, input, prepared_a, prepared_b, prepared_c, storage_a.preparedBytes(.panel4), storage_b.preparedBytes(.panel4), storage_c.preparedBytes(.panel4), panel8_a, panel8_b, panel8_c, bias_a, bias_b, bias_c, output_a, output_b, output_c, rows, in_dim, out_dim);
+                    } else {
+                        try linearK16PreparedQ8KActivationTriple(false, storage_a.allocator, io, input, prepared_a, prepared_b, prepared_c, storage_a.preparedBytes(.panel4), storage_b.preparedBytes(.panel4), storage_c.preparedBytes(.panel4), panel8_a, panel8_b, panel8_c, bias_a, bias_b, bias_c, output_a, output_b, output_c, rows, in_dim, out_dim);
+                    }
+                    return true;
                 }
             }
             if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
@@ -9664,34 +9665,33 @@ pub fn linearQuantizedTriple(
             if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
             const row_blocks = in_dim / values_per_block;
             if (shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks)) {
-                if (storage_a.preparedBytes(.row_major_blocks)) |prepared_a| {
-                    if (storage_b.preparedBytes(.row_major_blocks)) |prepared_b| {
-                        if (storage_c.preparedBytes(.row_major_blocks)) |prepared_c| {
-                            try linearLegacyPreparedActivationTriple(
-                                storage_a.allocator,
-                                io,
-                                input,
-                                prepared_a,
-                                prepared_b,
-                                prepared_c,
-                                storage_a.preparedBytes(.panel4),
-                                storage_b.preparedBytes(.panel4),
-                                storage_c.preparedBytes(.panel4),
-                                bias_a,
-                                bias_b,
-                                bias_c,
-                                output_a,
-                                output_b,
-                                output_c,
-                                rows,
-                                in_dim,
-                                out_dim,
-                                known != .Q4_0,
-                            );
-                            noteNativeQuantDispatch(.legacy_activation_triple);
-                            return true;
-                        }
-                    }
+                if (projections.prepared(.row_major_blocks)) |prepared| {
+                    const prepared_a = prepared[0];
+                    const prepared_b = prepared[1];
+                    const prepared_c = prepared[2];
+                    try linearLegacyPreparedActivationTriple(
+                        storage_a.allocator,
+                        io,
+                        input,
+                        prepared_a,
+                        prepared_b,
+                        prepared_c,
+                        storage_a.preparedBytes(.panel4),
+                        storage_b.preparedBytes(.panel4),
+                        storage_c.preparedBytes(.panel4),
+                        bias_a,
+                        bias_b,
+                        bias_c,
+                        output_a,
+                        output_b,
+                        output_c,
+                        rows,
+                        in_dim,
+                        out_dim,
+                        known != .Q4_0,
+                    );
+                    noteNativeQuantDispatch(.legacy_activation_triple);
+                    return true;
                 }
             }
             if (genericQuantPairDotFn(storage_a.tensor_type)) |dot_fn| {
@@ -9706,32 +9706,7 @@ pub fn linearQuantizedTriple(
                 if (!(try projections.applyIndependent(io, input, rows, in_dim, out_dim))) return false;
                 return true;
             }
-            try linearQ8_0Triple(
-                storage_a.allocator,
-                io,
-                input,
-                storage_a.raw_bytes,
-                storage_b.raw_bytes,
-                storage_c.raw_bytes,
-                storage_a.preparedBytes(.row_major_blocks),
-                storage_b.preparedBytes(.row_major_blocks),
-                storage_c.preparedBytes(.row_major_blocks),
-                storage_a.preparedBytes(.panel4),
-                storage_b.preparedBytes(.panel4),
-                storage_c.preparedBytes(.panel4),
-                storage_a.preparedBytes(.panel8),
-                storage_b.preparedBytes(.panel8),
-                storage_c.preparedBytes(.panel8),
-                bias_a,
-                bias_b,
-                bias_c,
-                output_a,
-                output_b,
-                output_c,
-                rows,
-                in_dim,
-                out_dim,
-            );
+            try projections.applyQ8_0(storage_a.allocator, io, input, rows, in_dim, out_dim);
             noteNativeQuantDispatch(.q8_0_triple);
             return true;
         } else if (known == .Q8_1) {
@@ -9743,35 +9718,34 @@ pub fn linearQuantizedTriple(
                 return true;
             }
             if (shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks)) {
-                if (storage_a.preparedBytes(.row_major_blocks)) |prepared_a| {
-                    if (storage_b.preparedBytes(.row_major_blocks)) |prepared_b| {
-                        if (storage_c.preparedBytes(.row_major_blocks)) |prepared_c| {
-                            try linearQ8_1PreparedActivationTriple(
-                                storage_a.allocator,
-                                io,
-                                input,
-                                prepared_a,
-                                prepared_b,
-                                prepared_c,
-                                storage_a.preparedBytes(.panel4),
-                                storage_b.preparedBytes(.panel4),
-                                storage_c.preparedBytes(.panel4),
-                                storage_a.preparedBytes(.panel8),
-                                storage_b.preparedBytes(.panel8),
-                                storage_c.preparedBytes(.panel8),
-                                bias_a,
-                                bias_b,
-                                bias_c,
-                                output_a,
-                                output_b,
-                                output_c,
-                                rows,
-                                in_dim,
-                                out_dim,
-                            );
-                            return true;
-                        }
-                    }
+                if (projections.prepared(.row_major_blocks)) |prepared| {
+                    const prepared_a = prepared[0];
+                    const prepared_b = prepared[1];
+                    const prepared_c = prepared[2];
+                    try linearQ8_1PreparedActivationTriple(
+                        storage_a.allocator,
+                        io,
+                        input,
+                        prepared_a,
+                        prepared_b,
+                        prepared_c,
+                        storage_a.preparedBytes(.panel4),
+                        storage_b.preparedBytes(.panel4),
+                        storage_c.preparedBytes(.panel4),
+                        storage_a.preparedBytes(.panel8),
+                        storage_b.preparedBytes(.panel8),
+                        storage_c.preparedBytes(.panel8),
+                        bias_a,
+                        bias_b,
+                        bias_c,
+                        output_a,
+                        output_b,
+                        output_c,
+                        rows,
+                        in_dim,
+                        out_dim,
+                    );
+                    return true;
                 }
             }
         } else if (known == .Q8_K) {
@@ -27883,27 +27857,6 @@ fn linearNoBiasQ8_0WithPolicy(
     q8_0F32Apply(input, weight_raw, prepared_blocks, prepared_panel_blocks, null, output, rows, in_dim, out_dim, 0, out_dim);
 }
 
-fn linearNoBiasQ8_0Pair(
-    allocator: std.mem.Allocator,
-    io: ?std.Io,
-    input: []const f32,
-    weight_raw_a: []const u8,
-    weight_raw_b: []const u8,
-    prepared_blocks_a: ?[]const u8,
-    prepared_blocks_b: ?[]const u8,
-    prepared_panel_blocks_a: ?[]const u8,
-    prepared_panel_blocks_b: ?[]const u8,
-    prepared_panel8_blocks_a: ?[]const u8,
-    prepared_panel8_blocks_b: ?[]const u8,
-    output_a: []f32,
-    output_b: []f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-) !void {
-    try linearQ8_0Pair(allocator, io, input, weight_raw_a, weight_raw_b, prepared_blocks_a, prepared_blocks_b, prepared_panel_blocks_a, prepared_panel_blocks_b, prepared_panel8_blocks_a, prepared_panel8_blocks_b, null, null, output_a, output_b, rows, in_dim, out_dim);
-}
-
 // Cardinality is static; existing quantized and F32 microkernels retain their
 // schedules. Only validation, activation ownership and plane routing are shared.
 const ActivationProjectionCodec = enum { q1, q8 };
@@ -28102,35 +28055,6 @@ fn linearQ8_0Pair(
     out_dim: usize,
 ) !void {
     return linearQ8_0Projections(2, allocator, io, input, .{ weight_raw_a, weight_raw_b }, .{ prepared_blocks_a, prepared_blocks_b }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b }, .{ prepared_panel8_blocks_a, prepared_panel8_blocks_b }, .{ bias_a, bias_b }, .{ output_a, output_b }, rows, in_dim, out_dim);
-}
-
-fn linearQ8_0Triple(
-    allocator: std.mem.Allocator,
-    io: ?std.Io,
-    input: []const f32,
-    weight_raw_a: []const u8,
-    weight_raw_b: []const u8,
-    weight_raw_c: []const u8,
-    prepared_blocks_a: ?[]const u8,
-    prepared_blocks_b: ?[]const u8,
-    prepared_blocks_c: ?[]const u8,
-    prepared_panel_blocks_a: ?[]const u8,
-    prepared_panel_blocks_b: ?[]const u8,
-    prepared_panel_blocks_c: ?[]const u8,
-    prepared_panel8_blocks_a: ?[]const u8,
-    prepared_panel8_blocks_b: ?[]const u8,
-    prepared_panel8_blocks_c: ?[]const u8,
-    bias_a: ?[]const f32,
-    bias_b: ?[]const f32,
-    bias_c: ?[]const f32,
-    output_a: []f32,
-    output_b: []f32,
-    output_c: []f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-) !void {
-    return linearQ8_0Projections(3, allocator, io, input, .{ weight_raw_a, weight_raw_b, weight_raw_c }, .{ prepared_blocks_a, prepared_blocks_b, prepared_blocks_c }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b, prepared_panel_blocks_c }, .{ prepared_panel8_blocks_a, prepared_panel8_blocks_b, prepared_panel8_blocks_c }, .{ bias_a, bias_b, bias_c }, .{ output_a, output_b, output_c }, rows, in_dim, out_dim);
 }
 
 fn linearNoBiasI2SActivationQuantized(
@@ -48965,6 +48889,37 @@ test "shared packed projection schedules cover arities raw prepared bias and col
             outputs[pidx] = &actual[pidx];
         }
         if (kind == .Q8_0) {
+            // Exercise admission/preparation through the production family,
+            // including a missing sibling cache and heterogeneous bias slots.
+            for (0..4) |missing| {
+                const saved: QuantizedStorage.PreparedQuantCache = if (missing < 3) storage[missing].prepared else .{};
+                if (missing < 3) storage[missing].prepared = .{};
+                defer if (missing < 3) {
+                    storage[missing].prepared = saved;
+                };
+                inline for (.{ 2, 3 }) |arity| {
+                    actual = @splat(@splat(-12345));
+                    var blocks: [arity]?[]const u8 = undefined;
+                    var panel4: [arity]?[]const u8 = undefined;
+                    var panel8: [arity]?[]const u8 = undefined;
+                    var stores: [arity]*const QuantizedStorage = undefined;
+                    inline for (0..arity) |i| {
+                        stores[i] = &storage[i];
+                        blocks[i] = if (missing == i) null else prepared[i];
+                        panel4[i] = storage[i].preparedBytes(.panel4);
+                        panel8[i] = storage[i].preparedBytes(.panel8);
+                    }
+                    const family = NativeProjectionFamily(arity){ .storage = stores, .outputs = outputs[0..arity].*, .biases = bias_views[0..arity].* };
+                    try std.testing.expectEqual(missing >= arity, family.prepared(.row_major_blocks) != null);
+                    var expected_outputs: [arity][]f32 = undefined;
+                    inline for (0..arity) |i| expected_outputs[i] = &expected[i];
+                    try linearQ8_0Projections(arity, a, null, &input, raw_weights[0..arity].*, blocks, panel4, panel8, bias_views[0..arity].*, expected_outputs, rows, in_dim, out_dim);
+                    try family.applyQ8_0(a, null, &input, rows, in_dim, out_dim);
+                    inline for (0..arity) |i| try std.testing.expectEqualSlices(f32, &expected[i], &actual[i]);
+                }
+            }
+
+            expected = @splat(@splat(-12345));
             var quantized: [rows * in_dim]u8 = undefined;
             var scales: [rows * (in_dim / 32)]f32 = undefined;
             quantizeQ8_0ActivationRows(&input, &quantized, &scales, rows, in_dim, in_dim / 32);

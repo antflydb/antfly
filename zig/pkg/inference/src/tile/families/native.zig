@@ -46,7 +46,6 @@ pub const regions = r.regions(&.{
     r.metalFamily("elementwise.apply", @import("native/metal_elementwise_apply.zig")),
     r.metalFamily("elementwise.lora", @import("native/metal_elementwise_lora.zig")),
     r.metalFamily("elementwise.gated_product", @import("native/metal_elementwise_gated_product.zig")),
-    r.metalFamily("quant_metal.q4_0_shared", @import("native/metal_quant_metal_q4_0_shared.zig")),
     r.metalFamily("quant_metal.q4_0_mmv_pair", @import("native/metal_quant_metal_q4_0_mmv_pair.zig")),
     r.metalFamily("quant_metal.q4_0_mmv_linear", @import("native/metal_quant_metal_q4_0_mmv_linear.zig")),
     r.metalFamily("quant_metal.q8_0_linear_r_ext", @import("native/metal_quant_metal_q8_0_linear_r_ext.zig")),

@@ -65,6 +65,14 @@ int main(int argc, char **argv) { @autoreleasepool {
     NSMutableArray *results = [NSMutableArray array]; bool passed = true;
     for (NSDictionary *test in manifest[@"cases"]) { @autoreleasepool {
         NSString *name = test[@"kernel"], *mode = test[@"math_mode"] ?: @"safe";
+        NSDictionary *launches[2];
+        for (int version = 0; version < 2; ++version) {
+            NSMutableDictionary *launch = [test mutableCopy];
+            NSDictionary *override = test[version ? @"candidate_launch" : @"baseline_launch"];
+            for (NSString *key in override)
+                require([@[@"kernel", @"grid", @"threads", @"dispatch", @"scratch"] containsObject:key], @"Invalid launch override");
+            [launch addEntriesFromDictionary:override ?: @{}]; launches[version] = launch;
+        }
         id<MTLComputePipelineState> pipelines[2];
         NSString *pipelineOrder = manifest[@"pipeline_order"] ?: @"AB";
         require([pipelineOrder isEqual:@"AB"] || [pipelineOrder isEqual:@"BA"], @"Invalid pipeline creation order");
@@ -82,7 +90,7 @@ int main(int argc, char **argv) { @autoreleasepool {
                 library = [device newLibraryWithSource:source options:options error:&error];
                 require(library != nil, error.description ?: @"Shader compilation failed"); libraries[key] = library;
             }
-            id<MTLFunction> function = [library newFunctionWithName:name]; require(function != nil, name);
+            id<MTLFunction> function = [library newFunctionWithName:launches[version][@"kernel"]]; require(function != nil, name);
             pipelines[version] = [device newComputePipelineStateWithFunction:function error:&error];
             require(pipelines[version] != nil, error.description ?: @"Pipeline creation failed");
         }
@@ -118,7 +126,7 @@ int main(int argc, char **argv) { @autoreleasepool {
             }
         }
         for (int version = 0; version < 2; ++version)
-            dispatch(queue, pipelines[version], test, buffers[version], data, 1);
+            dispatch(queue, pipelines[version], launches[version], buffers[version], data, 1);
         bool exact = true, guards = true, reference = true; NSUInteger i = 0, outputs = 0, reference_outputs = 0;
         for (NSDictionary *binding in test[@"bindings"]) {
             if ([binding[@"output"] boolValue]) {
@@ -164,7 +172,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         double warmup_gpu_ns[2];
         unsigned long long warmup_dispatches[2] = {(unsigned long long)warmup, (unsigned long long)warmup};
         for (int version = 0; version < 2; ++version)
-            warmup_gpu_ns[version] = dispatch(queue, pipelines[version], test, buffers[0], data, warmup) * warmup;
+            warmup_gpu_ns[version] = dispatch(queue, pipelines[version], launches[version], buffers[0], data, warmup) * warmup;
         const double warmup_ms = [manifest[@"warmup_ms"] doubleValue];
         require(std::isfinite(warmup_ms) && warmup_ms >= 0, @"Invalid warmup duration");
         if (warmup_ms > 0) {
@@ -173,7 +181,7 @@ int main(int argc, char **argv) { @autoreleasepool {
             const auto started = std::chrono::steady_clock::now();
             int version = 0;
             do {
-                warmup_gpu_ns[version] += dispatch(queue, pipelines[version], test, buffers[0], data, repeats) * repeats;
+                warmup_gpu_ns[version] += dispatch(queue, pipelines[version], launches[version], buffers[0], data, repeats) * repeats;
                 warmup_dispatches[version] += repeats;
                 version ^= 1;
             } while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() < warmup_ms);
@@ -182,7 +190,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         std::vector<double> times[2]; NSMutableArray *arms = [NSMutableArray array];
         for (NSUInteger arm = 0; arm < order.length; ++arm) {
             unichar label = [order characterAtIndex:arm]; require(label == 'A' || label == 'B', @"Invalid arm label");
-            int version = label == 'B'; double ns = dispatch(queue, pipelines[version], test, buffers[0], data, repeats);
+            int version = label == 'B'; double ns = dispatch(queue, pipelines[version], launches[version], buffers[0], data, repeats);
             times[version].push_back(ns); [arms addObject:@{@"arm":@(version), @"ns":@(ns)}];
         }
         require(times[0].size() == times[1].size() && times[0].size() >= 2, @"Unbalanced/short timing protocol");
@@ -194,7 +202,8 @@ int main(int argc, char **argv) { @autoreleasepool {
         double ratio = medians[1] / medians[0]; double p95ratio = times[1][(times[1].size()-1)*95/100] / times[0][(times[0].size()-1)*95/100]; bool ok = ratio <= 1.05 && p95ratio <= 1.10 && resources; passed &= ok;
         [results addObject:@{@"name":test[@"name"], @"kernel":name, @"exact":@(exact), @"guards":@(guards),
             @"baseline_ns":@(medians[0]), @"candidate_ns":@(medians[1]), @"ratio":@(ratio), @"p95_ratio":@(p95ratio), @"pass":@(ok),
-            @"resources_pass":@(resources), @"arms":arms, @"pipeline_order":pipelineOrder,
+            @"resources_pass":@(resources), @"arms":arms,
+            @"baseline_launch":test[@"baseline_launch"] ?: @{}, @"candidate_launch":test[@"candidate_launch"] ?: @{}, @"pipeline_order":pipelineOrder,
             @"warmup_ms":@(warmup_ms), @"warmup_dispatches":@[@(warmup_dispatches[0]), @(warmup_dispatches[1])],
             @"warmup_gpu_ns":@[@(warmup_gpu_ns[0]), @(warmup_gpu_ns[1])], @"launches_per_arm":@(repeats),
             @"reference_outputs":@(reference_outputs), @"reference_pass":reference_outputs ? @(reference) : [NSNull null],

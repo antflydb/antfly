@@ -46,10 +46,8 @@ static_assert(ANTFLY_FLASH_V3_MIN_BLOCKS_PER_SM == 0 ||
 #endif
 
 // Reuse the standalone scalar reference implementations under the symbols the
-// existing guard/poison/determinism harness expects. The generated Flash-v1
-// entry points are deliberately renamed and never launched.
+// existing guard/poison/determinism harness expects, without a Flash-v1 export.
 #define ANTFLY_FLASH_NAMESPACE antfly_flash_prefill_v3_reference_hd256
-#define ANTFLY_FLASH_KERNEL antfly_gqa_attention_prefill_flash_f16_sm89_hd256_swa512_f32_v1_unused_v3
 #define ANTFLY_FLASH_REFERENCE_KERNEL antfly_gqa_attention_prefill_reference_f16_hd256_swa512_f32_prototype
 #define ANTFLY_FLASH_HEAD_DIM 256
 #define ANTFLY_FLASH_SLIDING_WINDOW 512
@@ -57,11 +55,9 @@ static_assert(ANTFLY_FLASH_V3_MIN_BLOCKS_PER_SM == 0 ||
 #undef ANTFLY_FLASH_SLIDING_WINDOW
 #undef ANTFLY_FLASH_HEAD_DIM
 #undef ANTFLY_FLASH_REFERENCE_KERNEL
-#undef ANTFLY_FLASH_KERNEL
 #undef ANTFLY_FLASH_NAMESPACE
 
 #define ANTFLY_FLASH_NAMESPACE antfly_flash_prefill_v3_reference_hd512
-#define ANTFLY_FLASH_KERNEL antfly_gqa_attention_prefill_flash_f16_sm89_hd512_global_f32_v1_unused_v3
 #define ANTFLY_FLASH_REFERENCE_KERNEL antfly_gqa_attention_prefill_reference_f16_hd512_global_f32_prototype
 #define ANTFLY_FLASH_HEAD_DIM 512
 #define ANTFLY_FLASH_SLIDING_WINDOW 0
@@ -69,7 +65,6 @@ static_assert(ANTFLY_FLASH_V3_MIN_BLOCKS_PER_SM == 0 ||
 #undef ANTFLY_FLASH_SLIDING_WINDOW
 #undef ANTFLY_FLASH_HEAD_DIM
 #undef ANTFLY_FLASH_REFERENCE_KERNEL
-#undef ANTFLY_FLASH_KERNEL
 #undef ANTFLY_FLASH_NAMESPACE
 
 namespace antfly_flash_prefill_v3_gqa2 {

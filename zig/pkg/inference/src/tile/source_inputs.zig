@@ -138,7 +138,6 @@ pub const paths = [_][]const u8{
     "src/tile/families/native/metal_quant_metal_q4_0_mmv_pair.zig",
     "src/tile/families/native/metal_quant_metal_q4_0_pair_activation_mm_m32_n32.zig",
     "src/tile/families/native/metal_quant_metal_q4_0_pair_activation_mm_m32_n64.zig",
-    "src/tile/families/native/metal_quant_metal_q4_0_shared.zig",
     "src/tile/families/native/metal_quant_metal_q4_k_pair.zig",
     "src/tile/families/native/metal_quant_metal_q6_k_nbodd.zig",
     "src/tile/families/native/metal_quant_metal_q8_0_activation_rhs_rows.zig",
