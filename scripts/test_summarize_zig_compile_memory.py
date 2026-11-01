@@ -20,6 +20,28 @@ from summarize_zig_compile_memory import GIB, summarize
 
 
 class SummaryTests(unittest.TestCase):
+    def test_configurer_module_names_are_not_response_files(self):
+        report = summarize(
+            "header\nnow\t0\t10\t1024\t1\tzig build-exe --name configurer --dep @build --dep @dependencies -Mroot=configurer.zig\t0\n"
+        )
+        self.assertEqual(report["compilations"][0]["name"], "configurer")
+
+    def test_test_compilers_with_same_name_keep_distinct_filters_and_peaks(self):
+        report = summarize(
+            "header\n"
+            "now\t1\t10\t1024\t1\tzig test --name test --test-filter first -Odebug -Mroot=root.zig\t0\n"
+            "now\t1\t11\t2048\t2\tzig test --name test --test-filter second -Ofast -Mroot=root.zig\t0\n"
+            "now\t3\t10\t4096\t4\tzig test --name test --test-filter first -Odebug -Mroot=root.zig\t1\n"
+        )
+        self.assertEqual(len(report["compilations"]), 2)
+        first, second = report["compilations"]
+        self.assertEqual(first["compile_filters"], ["first"])
+        self.assertEqual(second["compile_filters"], ["second"])
+        self.assertEqual(first["peak_rss_bytes"], 4096 * 1024)
+        self.assertEqual(first["observed_span_s"], 2)
+        self.assertEqual(first["roots"], ["-Mroot=root.zig"])
+        self.assertTrue(report["timing_is_sampled_lower_bound"])
+
     def test_units_and_concurrent_peak_keep_polls_distinct(self):
         trace = "header\n"
         trace += f"now\t0\t10\t{8 * GIB // 1024}\t8192\tzig build-lib --name antfly-storage-kernel -OReleaseFast\t0\n"

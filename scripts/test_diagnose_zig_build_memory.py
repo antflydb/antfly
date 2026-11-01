@@ -34,7 +34,7 @@ class DiagnosticTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 'if [ "$1" = build ]; then\n'
                 '  printf "%s" "$2" > "$ARGUMENT_FILE"\n'
-                '  "$0" build-lib "@$RESPONSE_FILE" &\n'
+                '  "$0" test "@$RESPONSE_FILE" &\n'
                 '  wait "$!"\n'
                 "else\n"
                 "  sleep 1\n"
@@ -84,6 +84,7 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertTrue(fields[3])
             report = summarize((root / "logs/command.rss.tsv").read_text())
             self.assertGreater(report["units"]["storage_kernel"]["peak_rss_bytes"], 0)
+            self.assertEqual(report["compilations"][0]["kind"], "test")
             response.unlink()
             self.assertEqual(
                 summarize(

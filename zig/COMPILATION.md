@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-10-28
+Last updated: 2026-11-01
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -35,6 +35,70 @@ compiler timings and memory reservations are historical, not measurements of
 the current source roots. The matched x86_64 GNU release measurement below
 updates admission claims only for that measured profile; ARM64/musl and GPU
 profiles still need their own release measurements.
+
+## Compile-cost experiments
+
+The opt-in **Profile Zig compile costs** workflow measures `memory-test`,
+`unit-storage-compile`, or `antfly` on a heavy Linux runner. It retains the exact
+commit/toolchain/CPU profile, build summary, compiler RSS and CPU samples,
+response files, and (for `antfly`) an unstripped ELF symbol/section report.
+`postlink-stripped-bytes.txt` measures a stripped copy of that same image; it is
+not a separate `-Dstrip=true` compilation qualification. No release or functional
+CI defaults change. Run matched baseline and candidate revisions with the same
+profile before drawing whole-product conclusions.
+
+Local equivalents, run from the repository/worktree root:
+
+```sh
+scripts/diagnose-zig-build-memory.sh --command --label storage-debug \
+  --target native --optimize debug --install-step unit-storage-compile -- \
+  python3 tools/run_bounded_zig_build.py -- build unit-storage-compile -Doptimize=debug --summary all
+python3 scripts/report_zig_binary_size.py zig/zig-out/bin/antfly \
+  --source-root zig --output .benchmark-results/compile-costs/binary-size.json
+```
+
+The symbol report requires an unstripped ELF image and `llvm-nm`/`llvm-size`.
+Use `--source-root zig` alone for the lexical asset inventory on macOS. Asset
+references include tests and inactive backends; their sizes do not establish
+release reachability. Mutation function families identify specialization
+candidates, not proven duplicate machine code. The process sampler now includes
+`zig test` and attributes every observed compiler PID, including unnamed test
+artifacts, rather than only Antfly runtime names. Per-process observed spans
+are sampled lower bounds; exact step durations remain in the Zig summary.
+Response files preserve argument boundaries, whereas `ps` output may lose
+quoting. A cached or very short compilation can have no samples.
+
+Current experiments:
+
+- `memory-test` and `memory-dependency-test` share one compiled policy artifact;
+  the dependency slice selects its tests at runtime. Both suites passed locally
+  (370 named policy tests and 37 dependency tests). The shared Debug compilation
+  reported 11 seconds and sampled 1,266,941,952 bytes peak RSS. This is one small
+  consolidation, not evidence that merging the large storage shards lowers RSS.
+- Transform preparation shares its MVCC reads and relational reconstruction
+  through one concrete `PreparedBatchOwner` helper. Only request-key collection
+  remains specialized by write/receiver type. Allocation ownership and schema
+  pin lifetimes stay inside the existing preparation scope. Release binary size
+  and request throughput still require matched qualification.
+- `-Dcli-optimize=small` changes only the CLI runtime entry module. Shared
+  dependencies retain the product mode. Default releases remain `fast`.
+  A native Apple Silicon Zig 0.17.0 CPU-only, stripped `fast` product experiment
+  produced CLI archives of 6,706,272 bytes (`fast`) and 4,951,456 bytes (`small`),
+  a 26.2% archive reduction. Sampled CLI compiler peaks increased from
+  1,379,549,184 to 1,607,712,768 bytes. Observed compiler spans were 88 and 48
+  seconds, with dependencies warmer for the second build. These are archive
+  observations, not matched cold-build or final executable measurements.
+- `make -C zig watch` retains the Linux incremental loop from PR #1437 and the
+  cacheable `unit-storage-compile` emission. Native macOS Zig 0.17.0 panicked
+  with `TODO(MachO2): load archive` under `-fincremental`; macOS therefore
+  defaults to ordinary watch. `WATCH_INCREMENTAL=true` permits testing a fixed
+  compiler. Ordinary watch does not promise the Linux 4–6 second edit timings.
+
+Production already splits runtime owners into archives, functional CI already
+uses Debug, and packaging already strips releases. Further codec/vector splits,
+large test mergers, external asset loading, or generic-owner refactors should
+be driven by these reports. Externalizing assets would also change standalone
+deployment; no such dependency is introduced by these experiments.
 
 ## Main goal
 

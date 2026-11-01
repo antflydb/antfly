@@ -1,0 +1,96 @@
+name: Profile Zig compile costs
+
+# Opt-in experiments only. Normal CI keeps its existing Debug/release lanes.
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        type: choice
+        default: memory-test
+        options: [memory-test, unit-storage-compile, antfly]
+      optimize:
+        type: choice
+        default: debug
+        options: [debug, fast, safe]
+      cli_optimize:
+        description: CLI entry module experiment (shared dependencies retain product mode)
+        type: choice
+        default: inherit
+        options: [inherit, small]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-global-cache
+  ANTFLY_ZIG_MAX_RSS: '21474836480'
+
+jobs:
+  profile:
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+      - uses: ./.github/actions/load-toolchain-policy
+        id: toolchain
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Install diagnostic tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config llvm time
+      - uses: ./.github/actions/prepare-zig-dependencies
+        with:
+          mirror-only: 'true'
+      - name: Verify diagnostic attribution
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*zig*memory.py'
+          python3 -m unittest discover -s scripts -p test_report_zig_binary_size.py
+      - name: Record exact experiment profile
+        env:
+          BUILD_STEP: ${{ inputs.step }}
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
+          CLI_OPTIMIZE: ${{ inputs.cli_optimize }}
+        run: |
+          mkdir -p .benchmark-results/compile-costs
+          {
+            git rev-parse HEAD
+            zig version
+            uname -a
+            lscpu
+            printf 'step=%s\noptimize=%s\ncli_optimize=%s\nstrip=false\n' "$BUILD_STEP" "$BUILD_OPTIMIZE" "$CLI_OPTIMIZE"
+          } > .benchmark-results/compile-costs/profile.txt
+      - name: Measure selected build without changing concurrency
+        env:
+          BUILD_STEP: ${{ inputs.step }}
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
+          CLI_OPTIMIZE: ${{ inputs.cli_optimize }}
+        run: |
+          args=(build "$BUILD_STEP" -Dtarget=x86_64-linux-gnu -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" -Dstrip=false -Dmetal=false -Dcuda=false --summary all)
+          if [ "$CLI_OPTIMIZE" != inherit ]; then args+=("-Dcli-optimize=$CLI_OPTIMIZE"); fi
+          scripts/diagnose-zig-build-memory.sh --command --label build --no-stack-sample \
+            --target x86_64-linux-gnu --optimize "$BUILD_OPTIMIZE" --strip false --install-step "$BUILD_STEP" -- \
+            /usr/bin/time -v python3 tools/run_bounded_zig_build.py -- "${args[@]}"
+      - name: Attribute linked symbols and embedded asset candidates
+        if: ${{ success() && inputs.step == 'antfly' }}
+        run: |
+          python3 scripts/report_zig_binary_size.py zig/zig-out/bin/antfly --source-root zig \
+            --output .benchmark-results/compile-costs/binary-size.json
+          llvm-strip --strip-all -o .benchmark-results/compile-costs/antfly.stripped zig/zig-out/bin/antfly
+          stat -c '%s' .benchmark-results/compile-costs/antfly.stripped > .benchmark-results/compile-costs/postlink-stripped-bytes.txt
+          rm .benchmark-results/compile-costs/antfly.stripped
+      - name: Retain measurements even on compiler failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compile-costs-${{ inputs.step }}-${{ inputs.optimize }}-${{ inputs.cli_optimize }}
+          path: .benchmark-results/compile-costs/
+          if-no-files-found: error

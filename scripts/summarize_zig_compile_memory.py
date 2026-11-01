@@ -35,8 +35,12 @@ def expand_response_files(command, response_dir=None, cache=None, capture_dir=No
 
     def expand(arguments, active=()):
         result = []
-        for argument in arguments:
-            if not argument.startswith("@"):
+        for index, argument in enumerate(arguments):
+            # Zig 0.17's configurer names modules @build/@dependencies.
+            # A dependency name is an argument, never a response file.
+            if not argument.startswith("@") or (
+                index and arguments[index - 1] == "--dep"
+            ):
                 result.append(argument)
                 continue
             path = Path(argument[1:])
@@ -70,6 +74,7 @@ def expand_response_files(command, response_dir=None, cache=None, capture_dir=No
 
 def summarize(text, response_dir=None, capture_dir=None):
     units = {}
+    compilations = {}
     samples = {}
     precise_samples = True
     response_cache = {}
@@ -90,6 +95,43 @@ def summarize(text, response_dir=None, capture_dir=None):
         expanded = expand_response_files(
             command, response_dir, response_cache, capture_dir
         )
+        arguments = shlex.split(expanded)
+        kind = next(
+            (
+                a
+                for a in arguments
+                if a in ("test", "build-exe", "build-lib", "build-obj")
+            ),
+            None,
+        )
+        if kind is not None:
+
+            def values(flag):
+                return [
+                    arguments[i + 1] for i, a in enumerate(arguments[:-1]) if a == flag
+                ]
+
+            names = values("--name")
+            # PID identifies separate compilations with the same name (Zig
+            # defaults test artifacts to "test"). Do not merge their peaks.
+            row = compilations.setdefault(
+                pid,
+                {
+                    "pid": int(pid),
+                    "name": names[0] if names else "test",
+                    "kind": kind,
+                    "command": expanded,
+                    "roots": [a for a in arguments if a.startswith("-M")],
+                    "compile_filters": values("--test-filter"),
+                    "optimize_flags": [a for a in arguments if a.startswith("-O")],
+                    "first_observed_s": float(elapsed),
+                    "last_observed_s": float(elapsed),
+                    "peak_rss_bytes": 0,
+                },
+            )
+            row["last_observed_s"] = float(elapsed)
+            row["peak_rss_bytes"] = max(row["peak_rss_bytes"], size)
+            row["observed_span_s"] = row["last_observed_s"] - row["first_observed_s"]
         match = re.search(
             r"(?:^|\s)--name\s+(antfly(?:-[\w-]+)?|libantfly)(?:\s|$)",
             expanded,
@@ -115,6 +157,9 @@ def summarize(text, response_dir=None, capture_dir=None):
     return {
         "format_version": 1,
         "units": units,
+        "compilations": list(compilations.values()),
+        "timing_is_sampled_lower_bound": True,
+        "argument_attribution_note": "Response files preserve arguments; ps command strings may lose quoting.",
         "sampled_compiler_aggregate_peak_bytes": max(
             (sum(p.values()) for p in samples.values()), default=0
         ),

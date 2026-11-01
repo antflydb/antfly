@@ -210,9 +210,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             deletes: []const []const u8,
             transforms: []const types.DocumentTransform,
         ) !TransformReadSnapshot {
-            var result = TransformReadSnapshot{};
-            errdefer result.deinit(alloc);
-            if (transforms.len == 0) return result;
+            if (transforms.len == 0) return .{};
 
             // Only transforms whose first base comes from storage need a read-set
             // predicate. Writes/deletes and an earlier transform establish an
@@ -229,7 +227,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try request_keys.put(alloc, transform.key, {});
                 try keys.append(alloc, transform.key);
             }
-            if (keys.items.len == 0) return result;
+            if (keys.items.len == 0) return .{};
+
+            // Only request-key collection depends on the write/receiver type.
+            // Share MVCC reads and row reconstruction across DB, recovery and
+            // prepared receivers, just as the commit path shares its owner.
+            if (@TypeOf(self) == *S.PreparedBatchOwner)
+                return captureTransformReadSnapshotForKeys(self, alloc, keys.items);
+            var owner = S.PreparedBatchOwner.from(self);
+            return captureTransformReadSnapshotForKeys(&owner, alloc, keys.items);
+        }
+
+        noinline fn captureTransformReadSnapshotForKeys(
+            self: *S.PreparedBatchOwner,
+            alloc: Allocator,
+            keys: []const []const u8,
+        ) !TransformReadSnapshot {
+            var result = TransformReadSnapshot{};
+            errdefer result.deinit(alloc);
 
             // Read values and version timestamps from the same MVCC snapshot. This
             // replaces two point transactions per transform and allows transform
@@ -238,15 +253,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer read_txn.abort();
             var schema_view = S.ownerField(self, "core").*.acquireSchemaView();
             defer if (schema_view) |*view| view.release();
-            const entries = try alloc.alloc(TransformReadSnapshot.Entry, keys.items.len);
+            const entries = try alloc.alloc(TransformReadSnapshot.Entry, keys.len);
             var initialized: usize = 0;
             errdefer {
                 for (entries[0..initialized]) |entry| if (entry.value) |value| alloc.free(value);
                 alloc.free(entries);
             }
-            try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.items.len) orelse
+            try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.len) orelse
                 return error.InvalidBatchRequest);
-            for (keys.items, 0..) |key, index| {
+            for (keys, 0..) |key, index| {
                 const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
                 defer alloc.free(store_key);
                 const raw = read_txn.get(store_key) catch |err| switch (err) {

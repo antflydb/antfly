@@ -26,8 +26,8 @@ Usage:
 
 Options:
   --zig-dir DIR          Directory containing build.zig. Default: zig
-  --out-dir DIR          Directory for logs. Default: /tmp/antfly-zig-build-memory
-  --prefix DIR           Zig install prefix. Default: /tmp/antfly-zig-build-memory-prefix
+  --out-dir DIR          Directory for logs. Default: .benchmark-results/compile-costs
+  --prefix DIR           Zig install prefix. Default: zig/zig-out
   --target TARGET        Zig target. Default: aarch64-linux-musl
   --optimize MODE        Zig optimize mode. Default: fast
   --strip true|false     Omit debug information. Default: false
@@ -53,8 +53,8 @@ EOF
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 zig_dir="${repo_root}/zig"
-out_dir="/tmp/antfly-zig-build-memory"
-prefix="/tmp/antfly-zig-build-memory-prefix"
+out_dir="${repo_root}/.benchmark-results/compile-costs"
+prefix="${zig_dir}/zig-out"
 target="aarch64-linux-musl"
 optimize="fast"
 strip="false"
@@ -162,6 +162,12 @@ case "${strip}" in
         ;;
 esac
 
+# A blocked sampler must not produce a successful report with a zero peak.
+if ! ps -p "$$" -o rss= >/dev/null 2>&1; then
+    echo "compiler memory profiling requires permission to inspect processes with ps" >&2
+    exit 2
+fi
+
 mkdir -p "${out_dir}" "${prefix}"
 
 if [ -z "${label}" ]; then
@@ -190,7 +196,7 @@ find_zig_compile_pids() {
     ps -Ao pid=,ppid=,comm=,args= | awk -v root_pid="${root_pid}" '
         {
             parents[$1]=$2
-            if ($0 ~ /zig build-(exe|lib|obj)/) candidates[$1]=1
+            if ($0 ~ /zig (build-(exe|lib|obj)|test)( |$)/) candidates[$1]=1
         }
         END {
             for (pid in candidates) {

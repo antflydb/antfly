@@ -131,13 +131,16 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     });
 
     var runtime_library_artifacts: [@typeInfo(RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile = @splat(null);
+    // Experiment on the cold command entry module without changing the
+    // optimization of shared storage/search/inference dependencies or tests.
+    const cli_optimize = b.option(std.lang.Optimize, "cli-optimize", "Optimization of the CLI runtime entry module (defaults to product mode)") orelse optimize;
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
         // The server executable and focused server artifacts reuse their owning
         // runtime units. Public embedded products have independent owners.
         const role_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("pkg/antfly/src/runtime_{s}_root.zig", .{@tagName(unit)})),
             .target = target,
-            .optimize = optimize,
+            .optimize = if (unit == .cli) cli_optimize else optimize,
             .sanitize_thread = sanitize_thread,
             .pic = if (unit == .storage_kernel or unit == .enrichment_compute) true else null,
         });
@@ -199,7 +202,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         const compile_max_rss = if (unit == .inference and production_antfly_imports.shared_inference_core) 4 * 1024 * 1024 * 1024 else runtimeCompileMaxRss(unit, .{
             .host = b.graph.host.result,
             .target = target.result,
-            .optimize = optimize,
+            .optimize = if (unit == .cli) cli_optimize else optimize,
             .strip = strip,
             .cpu_inference = options.cpu_inference,
             .sanitize_thread = sanitize_thread,

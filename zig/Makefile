@@ -52,11 +52,19 @@ antfly-unit-test: ## Run hermetic Antfly unit tests with bounded scheduler memor
 # rebuilds and reruns in seconds instead of minutes.
 WATCH_STEP ?= antfly-storage-db-test
 WATCH_FILTER ?=
+# Zig 0.17's incremental Mach-O linker panics on linked archives
+# (TODO(MachO2): load archive). Keep watch usable on macOS, with an override
+# for testing newer compilers. Linux retains the measured incremental loop.
+ifeq ($(shell uname -s),Darwin)
+WATCH_INCREMENTAL ?= false
+else
+WATCH_INCREMENTAL ?= true
+endif
 
 .PHONY: watch
 
 watch: ## Rebuild and rerun WATCH_STEP on every save with incremental compilation (WATCH_FILTER selects tests).
-	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build $(WATCH_STEP) -fincremental --watch $(ZIG_BUILD_FLAGS) $(if $(WATCH_FILTER),-- "$(WATCH_FILTER)",)
+	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build $(WATCH_STEP) $(if $(filter true,$(WATCH_INCREMENTAL)),-fincremental,-fno-incremental) --watch $(ZIG_BUILD_FLAGS) $(if $(WATCH_FILTER),-- "$(WATCH_FILTER)",)
 
 .PHONY: inference-e2e-models
 
