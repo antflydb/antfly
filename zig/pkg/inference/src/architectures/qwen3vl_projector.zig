@@ -1760,7 +1760,9 @@ const ResidentVisionScope = struct {
 // deliberately retain their separate nn.GELU() (exact-erf) operation.
 fn tryLightOnVisionNormQkv(cb: *const ComputeBackend, weights: *WeightCache, cfg: Config, input: CT, rows: usize, layer: usize) !?CT {
     if (comptime !build_options.enable_cuda) return null;
-    if (cb.kind() != .cuda or !cfg.is_qwen35 or !platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_QKV")) return null;
+    if (cb.kind() != .cuda or !cfg.is_qwen35) return null;
+    const compute: *const @import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    if (!compute.lightOnVisionQkvEnabled()) return null;
     var name: [128]u8 = undefined;
     const norm_w = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln1.weight", .{layer}));
     const norm_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln1.bias", .{layer}));
@@ -1778,8 +1780,9 @@ fn tryLightOnVisionMlp(
     layer: usize,
 ) !?CT {
     if (comptime !@import("build_options").enable_cuda) return null;
-    if (cb.kind() != .cuda or !cfg.is_qwen35 or !cfg.block_gelu_tanh or
-        !platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_MLP")) return null;
+    if (cb.kind() != .cuda or !cfg.is_qwen35 or !cfg.block_gelu_tanh) return null;
+    const compute: *const @import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    if (!compute.lightOnVisionMlpEnabled()) return null;
     var name: [128]u8 = undefined;
     const norm_w = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln2.weight", .{layer}));
     const norm_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln2.bias", .{layer}));

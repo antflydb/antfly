@@ -3118,13 +3118,23 @@ pub const CudaCompute = struct {
         return output;
     }
 
+    /// Projectors consume this resolved policy instead of rereading opt-in flags.
+    pub fn lightOnVisionQkvEnabled(self: *const CudaCompute) bool {
+        return self.capability_profile == .lightonocr3 and
+            self.lighton_fused_vision_qkv_enabled and lightOnDevice(self).portableKernels();
+    }
+
+    pub fn lightOnVisionMlpEnabled(self: *const CudaCompute) bool {
+        return self.capability_profile == .lightonocr3 and
+            self.lighton_fused_vision_mlp_enabled and lightOnDevice(self).portableKernels();
+    }
+
     /// Keep layer-norm output compact until the existing QKV GEMM. The
     /// projection, bias, residual and downstream attention retain F32 policy.
     pub fn lightOnVisionNormQkv(cb: *const ops.ComputeBackend, input_ct: CT, weights: [4]CT, rows: usize, dim: usize, eps: f32) !?CT {
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (self.capability_profile != .lightonocr3 or !self.lighton_fused_vision_qkv_enabled or
-            !lightOnDevice(self).portableKernels() or
+        if (!self.lightOnVisionQkvEnabled() or
             self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
             self.resident_training_cache or self.lazy_host_store != null or self.lighton_bf16_projection_outputs or
             (dim != 768 and dim != 1024) or rows < 256 or rows > 65536 or
@@ -3169,7 +3179,7 @@ pub const CudaCompute = struct {
     pub fn lightOnVisionMlp(cb: *const ops.ComputeBackend, input_ct: CT, weights: [6]CT, rows: usize, dim: usize, hidden: usize, eps: f32) !?CT {
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (self.capability_profile != .lightonocr3 or !self.lighton_fused_vision_mlp_enabled or !lightOnDevice(self).portableKernels() or
+        if (!self.lightOnVisionMlpEnabled() or
             self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or rows == 0 or rows > 65536 or
             !((dim == 768 and hidden == 3072) or (dim == 1024 and hidden == 4096)) or
             !cudaCublasLtEnabled() or self.cublaslt == null or self.cublaslt_bf16_tuning_profile != .off) return null;
@@ -36468,4 +36478,30 @@ test "CUDA Laya portable warp eligibility depends on loaded symbol and shape" {
     compute.kernels.laya_attention_warp_f32 = @ptrFromInt(1);
     compute.laya_optimizations = false;
     try std.testing.expect(!layaWarpEligible(&compute, 2, 512, 64));
+}
+
+test "CUDA vision automatic policy consumes resolved settings without a second environment gate" {
+    var compute: CudaCompute = undefined;
+    compute.capability_profile = .lightonocr3;
+    compute.lighton_fused_vision_qkv_enabled = true;
+    compute.lighton_fused_vision_mlp_enabled = true;
+    compute.ctx.info.compute_major = 8;
+    compute.ctx.info.compute_minor = 0;
+    compute.ctx.info.driver_version = 13000;
+    try std.testing.expect(compute.lightOnVisionQkvEnabled());
+    try std.testing.expect(compute.lightOnVisionMlpEnabled());
+    compute.lighton_fused_vision_qkv_enabled = false;
+    try std.testing.expect(!compute.lightOnVisionQkvEnabled());
+    try std.testing.expect(compute.lightOnVisionMlpEnabled());
+    compute.lighton_fused_vision_mlp_enabled = false;
+    try std.testing.expect(!compute.lightOnVisionMlpEnabled());
+    compute.lighton_fused_vision_qkv_enabled = true;
+    compute.lighton_fused_vision_mlp_enabled = true;
+    compute.ctx.info.driver_version = 12000;
+    try std.testing.expect(!compute.lightOnVisionQkvEnabled());
+    try std.testing.expect(!compute.lightOnVisionMlpEnabled());
+    compute.ctx.info.driver_version = 13000;
+    compute.capability_profile = null;
+    try std.testing.expect(!compute.lightOnVisionQkvEnabled());
+    try std.testing.expect(!compute.lightOnVisionMlpEnabled());
 }
