@@ -42,6 +42,10 @@ test "lake streaming source capture probe" {
     defer std.debug.assert(budget.live == 0);
     const Capture = local.section_source_capture.Capture;
     const analyzer = if (std.c.getenv("ANTFLY_CAPTURE_ENGLISH") != null) &local.search_analysis.default_analyzer else &local.search_analysis.simple_analyzer;
+    if (std.c.getenv("ANTFLY_CAPTURE_INDEX") != null) {
+        if (legacy) return error.InvalidBenchmarkShape;
+        return buildIndex(input, repeats, bindings, analyzer, &budget);
+    }
     const signature = try local.section_source_column.fingerprint(std.heap.page_allocator, analyzer);
     const Observer = struct {
         count: u32 = 0,
@@ -59,6 +63,7 @@ test "lake streaming source capture probe" {
     };
     var observers: [4]Observer = @splat(.{});
     var replay_reads: ?usize = null;
+    var group_buffers: ?usize = null;
     const cpu = now(.THREAD_CPUTIME_ID);
     const wall = now(.MONOTONIC);
     var capture = Capture.init(budget.allocator(), true, std.testing.io, ".", null);
@@ -89,6 +94,7 @@ test "lake streaming source capture probe" {
             const tokens = try lease.visit(Capture.TokenConsumer{ .ptr = &observers[binding], .accept = Observer.accept });
             if (binding == 0) try capture.recordReplay(request, tokens);
             const spool = lease.entry.replay.?;
+            group_buffers = spool.group_buffer_allocations;
             replay_reads = spool.grouping_read_calls + if (spool.run) |run| run.read_calls else @as(usize, 0);
         }
         try std.testing.expectEqual(@as(usize, 1), cache.analyses);
@@ -112,5 +118,44 @@ test "lake streaming source capture probe" {
     std.crypto.hash.sha2.Sha256.hash(input, &input_digest, .{});
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
-    std.debug.print("CAPTURE legacy={} bindings={d} diverse={} input={d} tokens={d} cpu_ns={d} wall_ns={d} peak={d} quota={d} replay_reads={?d} token_hash={x} encoded_sha256={s} input_sha256={s}\n", .{ legacy, bindings, diverse, input.len, observed.count, elapsed, elapsed_wall, peak, budget.limit, replay_reads, observed.hash.final(), std.fmt.bytesToHex(digest, .lower), std.fmt.bytesToHex(input_digest, .lower) });
+    std.debug.print("CAPTURE legacy={} bindings={d} diverse={} input={d} tokens={d} cpu_ns={d} wall_ns={d} peak={d} quota={d} replay_reads={?d} group_buffers={?d} token_hash={x} encoded_sha256={s} input_sha256={s}\n", .{ legacy, bindings, diverse, input.len, observed.count, elapsed, elapsed_wall, peak, budget.limit, replay_reads, group_buffers, observed.hash.final(), std.fmt.bytesToHex(digest, .lower), std.fmt.bytesToHex(input_digest, .lower) });
+}
+
+/// A complete native segment build from typed source. Immutable input setup,
+/// result hashing and independent search verification are outside timing.
+fn buildIndex(input: []const u8, repeats: usize, bindings: usize, analyzer: *const local.search_analysis.Analyzer, budget: *local.sql_memory_budget) !void {
+    const a = std.heap.page_allocator;
+    var root: std.json.ObjectMap = .empty;
+    defer root.deinit(a);
+    try root.put(a, "body", .{ .string = input });
+    const names = [_][]const u8{ "body", "_all", "named_one", "named_two" };
+    var fields: [4]local.introducer.TextField = undefined;
+    for (fields[0..bindings], names[0..bindings]) |*field, name| field.* = .{ .field_name = name, .source_field = "body", .text = input };
+    var profile: local.introducer.BuildTextProfile = .{};
+    const cpu = now(.THREAD_CPUTIME_ID);
+    const wall = now(.MONOTONIC);
+    const bytes = try local.introducer.buildSegmentFromTextWithAnalysisOptions(budget.allocator(), &.{.{ .id = "row", .stored_data = "{}", .stored_source = .{ .object = root }, .text_fields = fields[0..bindings] }}, analyzer, .{}, .{ .store_source_columns = true, .profile = &profile, .postings_run_io = std.testing.io });
+    defer budget.allocator().free(bytes);
+    const elapsed = now(.THREAD_CPUTIME_ID) - cpu;
+    const elapsed_wall = now(.MONOTONIC) - wall;
+    const peak = budget.peak;
+    try std.testing.expectEqual(@as(u64, @intCast(repeats * 4 * bindings)), profile.token_count);
+    if (bindings > 1) {
+        try std.testing.expectEqual(@as(u64, 1), profile.shared_analysis_runs);
+        try std.testing.expectEqual(@as(u64, @intCast(bindings - 1)), profile.shared_analysis_reuses);
+    }
+    var writer = try local.index.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    var stream = analyzer.sourceStream(a, input).?;
+    defer stream.deinit();
+    const token = (try stream.next()).?;
+    const found = try writer.snapshot().search(a, names[bindings - 1], &.{token.term}, 1);
+    defer a.free(found.hits);
+    try std.testing.expectEqual(@as(usize, 1), found.hits.len);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    var input_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(input, &input_digest, .{});
+    std.debug.print("INDEX bindings={d} input={d} tokens={d} cpu_ns={d} wall_ns={d} peak={d} quota={d} bytes={d} analyses={d} reuses={d} encoded_sha256={s} input_sha256={s}\n", .{ bindings, input.len, profile.token_count, elapsed, elapsed_wall, peak, budget.limit, bytes.len, profile.shared_analysis_runs, profile.shared_analysis_reuses, std.fmt.bytesToHex(digest, .lower), std.fmt.bytesToHex(input_digest, .lower) });
 }

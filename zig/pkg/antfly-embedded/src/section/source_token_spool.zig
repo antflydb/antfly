@@ -37,6 +37,7 @@ pub const Spool = struct {
     previous: ?struct { start: u32, end: u32 } = null,
     group_memory_records: usize = 16 * 1024,
     grouping_read_calls: usize = 0,
+    group_buffer_allocations: usize = 0,
     count: usize = 0,
     view: ?View = null,
     pub fn init(a: A, io: ?std.Io, directory: []const u8, resources: ?*@import("../storage/resource_manager.zig").ResourceManager) Spool {
@@ -148,6 +149,7 @@ pub const Spool = struct {
         block: []const u8 = &.{},
         at: usize = 0,
         buffer: []u8 = &.{},
+        buffer_allocations: usize = 0,
         fn init(a: A, source: RecordSource) RawCursor {
             return .{ .a = @import("../sql/memory_budget.zig").reclaimingAllocator(a), .source = source };
         }
@@ -177,6 +179,7 @@ pub const Spool = struct {
                     self.a.free(self.buffer);
                     self.buffer = &.{};
                     self.buffer = try self.a.alloc(u8, n);
+                    self.buffer_allocations += 1;
                 }
                 try self.source.view.readInto(offset, self.buffer[0..n]);
                 return self.buffer[0..n];
@@ -287,7 +290,10 @@ pub const Spool = struct {
             links: []const u32,
             raw: ?RawCursor = null,
             pub fn deinit(self: *GroupCursor) void {
-                if (self.raw) |*raw| raw.deinit();
+                if (self.raw) |*raw| {
+                    self.spool.group_buffer_allocations += raw.buffer_allocations;
+                    raw.deinit();
+                }
             }
             pub fn next(self: *GroupCursor) !?analysis.Token {
                 if (self.remaining == 0) return null;
