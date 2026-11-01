@@ -367,6 +367,46 @@ bounds ×1, 200 queries:
 Recommendation: 4 bits for LEANN (3 when index bytes matter more). It is
 not yet exposed in the public `leann` config.
 
+### Multi-bit codes for HBC (measured by simulation)
+
+HBC uses its 1-bit RaBitQ codes to choose the `k * rerank_factor`
+candidates (80 at production defaults) that go on to f16 rescoring and
+exact rerank (`hbc_index.zig` native leaf scoring). Whatever the 1-bit
+estimate drops never reaches the f16 plane. `bench/vectors/rabitq_hbc_sim.zig`
+replays that on NYTimes-256 (100k, cosine): k-means leaves of ~168, probe
+the closest leaves, score every member, admit the best 80 estimates, apply
+the boundary rule. Selected rows (probe 256 leaves, 44k vectors scanned;
+true top-10 present in the scanned set: 0.951):
+
+| Codes | Bytes/vector | Admission recall | Boundary rerank/q | Score µs/q |
+|---|---:|---:|---:|---:|
+| 1-bit (HBC default, no rotation) | 48 | 0.847 | 66.5 | 1,549 |
+| 1-bit, rotated | 48 | 0.851 | 66.2 | 1,492 |
+| 2-bit extended | 80 | 0.946 | 46.1 | 9,221 |
+| 4-bit extended | 144 | 0.951 | 16.3 | 11,437 |
+| f16 copy (reference) | 512 | 0.951 | 10.2 | n/a (scalar here) |
+
+- The 1-bit admission loses ~0.10 recall at every probe width
+  (0.661/0.725/0.791/0.847 admitted vs 0.679/0.761/0.851/0.951 present for
+  32/64/128/256 leaves). 2 bits recovers nearly all of it; 4 bits all of
+  it, and cuts boundary reranks 4x.
+- Rotation does not change 1-bit admission here, so turning on
+  `use_random_ortho_trans` alone does not help; multi-bit needs it anyway.
+- Cost: the multi-bit scorer (byte-parallel SIMD for 2/4/8 bits) is still
+  6-7x slower per vector than the 1-bit popcount kernel. A quantized-query
+  integer kernel would narrow that.
+- Not yet confirmed on HBC itself: `zig build hbc-nyt-recall` runs the
+  real index on the same data and sweeps `rerank_factor`; if recall keeps
+  rising with the heap size, admission is the bottleneck. Its build needs
+  more memory than the sandbox where this was written.
+
+Integration touches HBC's metadata (`IndexMetadata`), the protobuf code
+set, the AFQD directory and AFRC row-delta formats (fixed 1-bit width
+today), incremental appends, sections and serverless segments, and needs a
+rotation. A cheaper first step is to keep 1-bit codes for the scan and add
+a second, multi-bit pass only over the leaf members near the admission
+cutoff.
+
 ## Table integration
 
 ```json

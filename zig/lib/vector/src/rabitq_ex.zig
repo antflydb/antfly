@@ -188,9 +188,15 @@ pub const Codec = struct {
         q_dist: f32,
         q_dot_c: f32,
         c_norm_sq: f32,
+        /// For 2, 4 and 8 bits: the query split by position within a code
+        /// byte, `phase[t * code_bytes + j] = unit[j * (8 / bits) + t]`
+        /// (zero past the last dimension), so scoring is a byte-parallel
+        /// SIMD dot product. Empty for other widths.
+        phase: []f32 = &.{},
 
         pub fn deinit(self: *Query, alloc: Allocator) void {
             alloc.free(self.unit);
+            if (self.phase.len > 0) alloc.free(self.phase);
             self.* = undefined;
         }
     };
@@ -203,9 +209,19 @@ pub const Codec = struct {
         if (qd > 0) {
             for (unit) |*v| v.* /= qd;
         }
+        errdefer alloc.free(unit);
         var sum: f32 = 0;
         for (unit) |v| sum += v;
+        var phase: []f32 = &.{};
+        if (self.bits == 2 or self.bits == 4 or self.bits == 8) {
+            const per_byte: usize = 8 / self.bits;
+            const nb = self.codeBytes();
+            phase = try alloc.alloc(f32, per_byte * nb);
+            @memset(phase, 0);
+            for (unit, 0..) |v, i| phase[(i % per_byte) * nb + i / per_byte] = v;
+        }
         return .{
+            .phase = phase,
             .unit = unit,
             .sum_unit = sum,
             .q_dist = qd,
@@ -223,12 +239,11 @@ pub const Codec = struct {
         const inv = readF32(row[pos + 4 ..]);
         const a = readF32(row[pos + 8 ..]);
         const half: f32 = @as(f32, @floatFromInt(self.levels())) - 0.5;
-        var acc: f32 = 0;
-        if (self.bits == 8) {
-            for (code, q.unit) |u, v| acc += @as(f32, @floatFromInt(u)) * v;
-        } else {
-            for (q.unit, 0..) |v, i| acc += @as(f32, @floatFromInt(getBits(code, i * self.bits, self.bits))) * v;
-        }
+        const acc: f32 = if (q.phase.len > 0) phasedDot(code, q.phase, self.bits) else blk: {
+            var sum: f32 = 0;
+            for (q.unit, 0..) |v, i| sum += @as(f32, @floatFromInt(getBits(code, i * self.bits, self.bits))) * v;
+            break :blk sum;
+        };
         // <y, unit> = sum(u_i * unit_i) - half * sum(unit); <o, unit> ≈ that * inv.
         const est_cos = (acc - half * q.sum_unit) * inv;
         const sigma = if (a > 0 and a < 1) @sqrt((1 - a * a) / (a * a)) / @sqrt(@as(f32, @floatFromInt(self.dims - 1))) else 0;
@@ -265,6 +280,38 @@ pub const Codec = struct {
         }
     }
 };
+
+/// sum over dimensions of code level * query, for byte-aligned widths
+/// (2, 4, 8 bits), 16 code bytes per step.
+fn phasedDot(code: []const u8, phase: []const f32, bits: u8) f32 {
+    const lanes = 16;
+    const V8 = @Vector(lanes, u8);
+    const VF = @Vector(lanes, f32);
+    const nb = code.len;
+    const per_byte: usize = 8 / @as(usize, bits);
+    const mask: u8 = @intCast((@as(u16, 1) << @intCast(bits)) - 1);
+    var acc: VF = @splat(0);
+    var j: usize = 0;
+    while (j + lanes <= nb) : (j += lanes) {
+        const bytes: V8 = code[j..][0..lanes].*;
+        var t: usize = 0;
+        while (t < per_byte) : (t += 1) {
+            const shift: @Vector(lanes, u3) = @splat(@intCast(t * bits));
+            const levels = (bytes >> shift) & @as(V8, @splat(mask));
+            const qv: VF = phase[t * nb + j ..][0..lanes].*;
+            acc += @as(VF, @floatFromInt(levels)) * qv;
+        }
+    }
+    var total = @reduce(.Add, acc);
+    while (j < nb) : (j += 1) {
+        var t: usize = 0;
+        while (t < per_byte) : (t += 1) {
+            const level: u8 = (code[j] >> @intCast(t * bits)) & mask;
+            total += @as(f32, @floatFromInt(level)) * phase[t * nb + j];
+        }
+    }
+    return total;
+}
 
 fn putBits(buf: []u8, bit_offset: usize, width: u8, value: u32) void {
     var v = value;
@@ -378,6 +425,37 @@ test "rabitq_ex: more bits estimate distances more accurately, bounds mostly hol
         prev_err = mean_err;
         try testing.expect(within * 100 >= n * 70);
         if (bits >= 4) try testing.expect(recon_err / n < 0.05);
+    }
+}
+
+test "rabitq_ex: SIMD scoring matches the scalar path" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(21);
+    const rand = prng.random();
+    for ([_]usize{ 64, 100, 257 }) |d| {
+        const centroid = try alloc.alloc(f32, d);
+        defer alloc.free(centroid);
+        @memset(centroid, 0);
+        const x = try alloc.alloc(f32, d);
+        defer alloc.free(x);
+        const q = try alloc.alloc(f32, d);
+        defer alloc.free(q);
+        randomUnitish(rand, x);
+        randomUnitish(rand, q);
+        for ([_]u8{ 2, 4, 8 }) |bits| {
+            const codec = try Codec.init(d, bits, .l2_squared);
+            const row = try alloc.alloc(u8, codec.rowBytes());
+            defer alloc.free(row);
+            try codec.encodeAlloc(alloc, centroid, x, row);
+            var query = try codec.prepare(alloc, centroid, q);
+            defer query.deinit(alloc);
+            const fast = codec.estimate(&query, row);
+            const saved = query.phase;
+            query.phase = &.{};
+            const slow = codec.estimate(&query, row);
+            query.phase = saved;
+            try testing.expectApproxEqRel(slow.distance, fast.distance, 1e-4);
+        }
     }
 }
 
