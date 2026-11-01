@@ -743,9 +743,70 @@ def native_cases(args):
                         row["verification"] = json.loads(checked.stdout)
                 except subprocess.TimeoutExpired:
                     row.update(status="verification_watchdog_timeout", censored=True)
+            if getattr(args, "require_sustained", False):
+                row["sustained_qualification"] = sustained_qualification(
+                    row, args.seconds
+                )
+                if (
+                    row["status"] == "ok"
+                    and not row["sustained_qualification"]["passed"]
+                ):
+                    row["status"] = "sustained_qualification_failed"
             yield row
             if row["status"] not in ("ok", "no_progress", "starved_workers"):
                 return
+
+
+def sustained_qualification(row: dict, seconds: float) -> dict:
+    """A surviving short run cannot qualify active-write storage or throughput.
+
+    Compare complete minute windows and sample active file size after a
+    three-minute warmup. These declared tolerances are a regression gate for
+    this bounded churn workload, not a general database space guarantee.
+    """
+    policy = {
+        "warmup_seconds": 180,
+        "maximum_tail_growth_fraction": 0.25,
+        "minimum_growth_allowance_bytes": 16 * 1024 * 1024,
+        "minimum_late_throughput_fraction": 0.75,
+    }
+    windows = row.get("per_worker_success_windows", [])
+    samples = row.get("file_size_samples", [])
+    tail = [s for s in samples if 180 <= s["elapsed_seconds"] <= seconds]
+    complete_minutes = int(seconds // 60)
+    if (
+        seconds < 600
+        or not windows
+        or any(len(w) < complete_minutes for w in windows)
+        or not tail
+        or tail[-1]["elapsed_seconds"] < seconds - 5
+    ):
+        return {
+            "passed": False,
+            "reason": "insufficient_sustained_evidence",
+            "policy": policy,
+        }
+    totals = [sum(w[i] for w in windows) for i in range(complete_minutes)]
+    early, late = sum(totals[1:4]), sum(totals[-3:])
+    fraction = late / early if early else None
+    initial = tail[0]["file_bytes"]
+    growth = max(s["file_bytes"] for s in tail) - initial
+    allowance = max(
+        policy["minimum_growth_allowance_bytes"],
+        initial * policy["maximum_tail_growth_fraction"],
+    )
+    return {
+        "passed": row.get("status") == "ok"
+        and growth <= allowance
+        and fraction is not None
+        and fraction >= policy["minimum_late_throughput_fraction"],
+        "policy": policy,
+        "minute_successful_calls": totals,
+        "late_to_early_throughput_fraction": fraction,
+        "tail_initial_file_bytes": initial,
+        "tail_growth_bytes": growth,
+        "tail_growth_allowance_bytes": allowance,
+    }
 
 
 def main():
@@ -783,6 +844,11 @@ def main():
         action="store_true",
         help="native control: remove the default full-text index before seeding",
     )
+    parser.add_argument(
+        "--require-sustained",
+        action="store_true",
+        help="require >=10 minutes of bounded active-write growth and stable throughput",
+    )
     parser.add_argument("--watchdog", type=float, default=30)
     args = parser.parse_args()
     if (
@@ -800,6 +866,12 @@ def main():
         )
     if args.mode == "native" and not args.library:
         parser.error("native mode requires --library")
+    if args.require_sustained and (
+        args.mode != "native" or args.seconds < 600 or args.workload != "churn"
+    ):
+        parser.error(
+            "--require-sustained requires native churn lasting at least 600 seconds"
+        )
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x"):

@@ -91,7 +91,7 @@ class CatalogAccounting:
             raise ValueError("page checksum mismatch")
         return raw[4], payload
 
-    def record(self, reference: int):
+    def payload(self, reference: int):
         packed = reference >> 63
         kind, payload = self.page(reference & ((1 << 47) - 1) if packed else reference)
         if packed:
@@ -112,6 +112,10 @@ class CatalogAccounting:
                 position = end
             else:
                 raise ValueError("record offset is not a boundary")
+        return kind, payload
+
+    def record(self, reference: int):
+        kind, payload = self.payload(reference)
         if kind != 2 or len(payload) < 16:
             raise ValueError("expected catalog record")
         previous, flags, value_length = struct.unpack_from("<QII", payload)
@@ -147,6 +151,12 @@ class CatalogAccounting:
         if kind != 8 or len(payload) != 16:
             raise ValueError("expected catalog descriptor")
         index = struct.unpack_from("<Q", payload, 8)[0]
+        for reference in self.references(index):
+            _, key, length, deleted = self.record(reference)
+            if not deleted:
+                yield key, length
+
+    def references(self, index: int):
         stack, visited = ([index] if index else []), set()
         while stack:
             node = stack.pop()
@@ -175,16 +185,52 @@ class CatalogAccounting:
                 if position > len(payload):
                     raise ValueError("truncated index entry")
                 if leaf:
-                    _, key, length, deleted = self.record(pointer)
-                    if not deleted:
-                        yield key, length
+                    yield pointer
                 else:
                     children.append(pointer)
             if position != len(payload):
                 raise ValueError("trailing index bytes")
             stack.extend(reversed(children))
 
-    def account(self):
+    def document(self, reference: int):
+        kind, payload = self.payload(reference)
+        if kind != 3 or len(payload) < 28:
+            raise ValueError("expected document record")
+        previous = struct.unpack_from("<Q", payload)[0]
+        flags = payload[8]
+        if flags & ~15 or not flags & 4 or (flags & 1 and flags & 2):
+            raise ValueError("invalid document flags")
+        key_length, value_length = struct.unpack_from("<II", payload, 12)
+        header = 60 if flags & 8 else 28
+        end = header + key_length
+        if end + (8 if flags & 2 else value_length) > len(payload):
+            raise ValueError("truncated document record")
+        if flags & 2 and (
+            not value_length or not struct.unpack_from("<Q", payload, end)[0]
+        ):
+            raise ValueError("invalid external document value")
+        return previous, payload[header:end], value_length, bool(flags & 1)
+
+    def documents(self):
+        if self.slot[7]:
+            for reference in self.references(self.slot[7]):
+                _, key, length, deleted = self.document(reference)
+                if not deleted:
+                    yield key, length
+            return
+        reference = self.slot[2]
+        seen_records, seen_keys = set(), set()
+        while reference:
+            if reference in seen_records:
+                raise ValueError("document history cycle")
+            seen_records.add(reference)
+            reference, key, length, deleted = self.document(reference)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                if not deleted:
+                    yield key, length
+
+    def account(self, include_documents: bool = False):
         result = {
             "format_version": self.version,
             "commit_sequence": self.slot[0],
@@ -211,16 +257,69 @@ class CatalogAccounting:
             )
             row["key_and_length_sha256"] = digest.hexdigest()
             result[label] = row
+        if include_documents:
+            for label in ("documents", "control_documents"):
+                result[label] = {"records": 0, "key_bytes": 0, "value_bytes": 0}
+            for key, length in self.documents():
+                label = "control_documents" if is_control_record(key) else "documents"
+                row = result[label]
+                row["records"] += 1
+                row["key_bytes"] += len(key)
+                row["value_bytes"] += length
+            categories = (
+                "documents",
+                "control_documents",
+                "metadata_catalog",
+                "index_catalog",
+            )
+            result["live_bytes"] = sum(
+                result[label]["key_bytes"] + result[label]["value_bytes"]
+                for label in categories
+            )
+            result["live_records"] = sum(
+                result[label]["records"] for label in categories
+            )
         return result
+
+
+def is_control_record(key: bytes) -> bool:
+    """Match storage/internal_keys.zig after stripping one physical namespace."""
+    if key.startswith(b"\x02db/"):
+        end = key.find(b"\x00")
+        if end < 0:
+            return True
+        key = key[end + 1 :]
+    if key[:1] in (b"\x02", b"\x03"):
+        return True
+    if key.startswith(b"\x01"):
+        position = 1
+        while position + 1 < len(key):
+            if key[position] != 0:
+                position += 1
+            elif key[position + 1] == 0:
+                return not (
+                    position + 3 == len(key) and key[position + 2] in (0x10, 0x12)
+                )
+            elif key[position + 1] == 0xFF:
+                position += 2
+            else:
+                return True
+        return True
+    return key.startswith((b"\x00\x00__", b"\x00antfly/"))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("database", type=Path)
+    parser.add_argument(
+        "--include-documents",
+        action="store_true",
+        help="also split physical authored/control rows and report total logical bytes",
+    )
     args = parser.parse_args()
     source = CatalogAccounting(args.database)
     try:
-        print(json.dumps(source.account(), indent=2))
+        print(json.dumps(source.account(args.include_documents), indent=2))
     finally:
         source.close()
 

@@ -37,6 +37,38 @@ def admission(*samples):
     }
 
 
+class SustainedQualificationTests(unittest.TestCase):
+    def sample(self, sizes, windows=None):
+        return {
+            "status": "ok",
+            "per_worker_success_windows": windows or [[100] * 10] * 8,
+            "file_size_samples": [
+                {"elapsed_seconds": second, "file_bytes": size}
+                for second, size in sizes
+            ],
+        }
+
+    def test_rejects_integrity_passing_continuous_growth(self):
+        row = self.sample([(180, 235_139_072), (300, 343_916_544), (599, 625_364_992)])
+        self.assertFalse(bench.sustained_qualification(row, 600)["passed"])
+
+    def test_rejects_throughput_collapse_even_after_storage_plateaus(self):
+        row = self.sample(
+            [(180, 46_300_000), (599, 46_300_000)], [[100] * 7 + [20] * 3] * 8
+        )
+        self.assertFalse(bench.sustained_qualification(row, 600)["passed"])
+
+    def test_accepts_bounded_active_growth_and_stable_throughput(self):
+        row = self.sample([(180, 46_300_000), (400, 47_000_000), (599, 46_300_000)])
+        self.assertTrue(bench.sustained_qualification(row, 600)["passed"])
+
+    def test_short_or_incomplete_evidence_cannot_qualify(self):
+        row = self.sample([(180, 46_300_000), (599, 46_300_000)])
+        self.assertFalse(bench.sustained_qualification(row, 90)["passed"])
+        row["file_size_samples"] = row["file_size_samples"][:1]
+        self.assertFalse(bench.sustained_qualification(row, 600)["passed"])
+
+
 class ContentionReportTests(unittest.TestCase):
     def test_unequal_worker_windows_and_busy_calls_are_not_successful_throughput(self):
         workers = [

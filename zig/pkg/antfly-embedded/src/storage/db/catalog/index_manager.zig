@@ -1486,6 +1486,10 @@ pub const IndexManager = struct {
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
     text_merge_scheduler: TextMergeScheduler,
+    test_before_text_merge_step: if (builtin.is_test) ?struct {
+        ptr: *anyopaque,
+        notify: *const fn (*anyopaque) anyerror!void,
+    } else void = if (builtin.is_test) null else {},
     dense_indexes: std.ArrayListUnmanaged(DenseIndex),
     retired_lsm_owner_stats: std.ArrayListUnmanaged(LsmOwnerStats) = .empty,
     retired_lsm_owner_overflow_stats: [2]lsm_backend_mod.Backend.MaintenanceStats = .{ .{}, .{} },
@@ -20188,6 +20192,7 @@ pub const IndexManager = struct {
     }
 
     pub fn runTextMergeScheduler(self: *IndexManager, max_steps: usize) !usize {
+        if (comptime builtin.is_test) if (self.test_before_text_merge_step) |hook| try hook.notify(hook.ptr);
         var completed: usize = 0;
         while (completed < max_steps) {
             var task = (try self.beginTextMergeTask()) orelse break;

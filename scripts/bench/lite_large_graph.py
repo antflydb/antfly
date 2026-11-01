@@ -151,7 +151,7 @@ def run(args):
             ("read", lambda: db.lookup("seed-0")),
         )
         for sequence, (name, operation) in enumerate(operations):
-            if name not in args.operations:
+            if args.warm_only or name not in args.operations:
                 continue
             subprocess.run(
                 [
@@ -215,7 +215,11 @@ def run(args):
                 f"INSERT INTO large_proof_numbers (n, _id) VALUES (7, 'warm-{sql_key}-setup')"
             )
             for name in ("batch", "sql"):
-                before = measurement_stats(db)
+                before = (
+                    db.pending_work_stats().get("background_publications", {})
+                    if args.warm_only
+                    else measurement_stats(db)
+                )
                 usage_before = resource.getrusage(resource.RUSAGE_SELF)
                 samples = []
                 began = time.monotonic()
@@ -239,11 +243,18 @@ def run(args):
                     samples.append(time.monotonic_ns() - started_ns)
                 wall_seconds = time.monotonic() - began
                 usage_after = resource.getrusage(resource.RUSAGE_SELF)
-                after = measurement_stats(db)
+                after = (
+                    db.pending_work_stats().get("background_publications", {})
+                    if args.warm_only
+                    else measurement_stats(db)
+                )
                 proof_walks = (
                     after["allocator_proof_walks"] - before["allocator_proof_walks"]
+                    if "allocator_proof_walks" in before
+                    and "allocator_proof_walks" in after
+                    else None
                 )
-                if proof_walks != 0:
+                if proof_walks is not None and proof_walks != 0:
                     raise RuntimeError(
                         f"warm {name} unexpectedly repeated an allocator proof"
                     )
@@ -267,10 +278,10 @@ def run(args):
             raise RuntimeError(f"integrity failed: {integrity}")
         emit(kind="integrity", status="ok", result=integrity)
     with af.open(database, busy_timeout=5.0) as db:
-        if "batch" in args.operations:
+        if not args.warm_only and "batch" in args.operations:
             measured = db.lookup("measured")
             assert measured["value"] == 1 and measured["nonce"] == run_nonce
-        if "sql" in args.operations:
+        if not args.warm_only and "sql" in args.operations:
             rows = db.sql("SELECT n FROM large_proof_numbers WHERE _id=$1", [sql_key])[
                 "rows"
             ]
@@ -320,6 +331,11 @@ if __name__ == "__main__":
             help="also measure steady batch and SQL writes after excluding initial proof work",
         )
         parser.add_argument(
+            "--warm-only",
+            action="store_true",
+            help="skip foreign handoffs; allow legacy libraries without proof counters (reported as null)",
+        )
+        parser.add_argument(
             "--reuse-fixture",
             action="store_true",
             help="resume this synthetic fixture without reseeding",
@@ -333,6 +349,8 @@ if __name__ == "__main__":
         arguments = parser.parse_args()
         if arguments.certified_handoff and arguments.foreign_library:
             parser.error("--certified-handoff cannot use --foreign-library")
+        if arguments.warm_only and not arguments.warm_iterations:
+            parser.error("--warm-only requires positive --warm-iterations")
         if arguments.warm_iterations < 0:
             parser.error("--warm-iterations must be nonnegative")
         if arguments.records < 16:

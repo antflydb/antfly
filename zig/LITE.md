@@ -1285,6 +1285,28 @@ committed/visibility-pending diagnostic. Resume derived work rather than replayi
 the batch, especially for transforms such as `$inc`. Pre-commit Busy refusals keep
 their existing retry behavior. SQL retains its committed-pending outcome.
 
+Native revision-7 background turns separate source-derived replay from immutable
+artifact maintenance. After the replay window and its source-dependent lifecycle
+work, the owner releases its primary snapshot before running at most one text
+merge and one index LSM maintenance step. Immutable inputs retain their own range
+leases. Artifact catalog reads first acquire short owner/path admission, validate
+the namespace and logical index identity, refresh the checkpoint, and register a
+read pin before releasing admission. They never traverse an old catalog root
+without a retained epoch: matching page numbers can conceal page reuse. Any
+foreign logical index change invalidates the detached artifact work, including a
+physical-root ABA. Hosted owners, legacy files without logical identities, and
+explicit idle drains preserve their existing complete maintenance lifecycle.
+
+Sustained-write qualification must measure progress and storage while writers
+remain active. `scripts/bench/lite_contention.py native --require-sustained`
+requires at least ten minutes of churn, acknowledged-write and integrity checks,
+per-worker minute progress, bounded file growth after a three-minute warmup, and
+late throughput of at least 75% of the early steady window. Its recorded policy
+allows tail growth of 25% of the warm file size or 16 MiB, whichever is larger.
+These are workload-specific regression tolerances; an idle shrink or a successful
+integrity check alone does not establish a storage plateau. Index catch-up,
+visibility under active load, search and reopen checks remain separate gates.
+
 Physical maintenance releases detached catalog/source pins before starting
 allocator service or a vacuum assessment. Bounded allocator/orphan service joins
 the fair writer queue and starts from the current checkpoint; prepared vacuum
