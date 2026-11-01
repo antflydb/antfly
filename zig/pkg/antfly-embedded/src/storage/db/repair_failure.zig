@@ -74,6 +74,14 @@ pub const repair_transient_max_attempts: u32 = 4;
 /// Total time one repair pass may spend backing off transient failures.
 pub const repair_transient_pass_budget_ns: u64 = 60 * std.time.ns_per_s;
 
+/// Total time a synchronous, query-time call (reranking, generation, the
+/// embedding dimension probe) may spend backing off an admission refusal
+/// before surfacing it to the caller. An admission refusal means the work
+/// never ran, so retrying it costs nothing but time: the model may still be
+/// loading, or another request may be briefly holding the scratch budget.
+/// Shared so every admission-retry caller uses the same ceiling.
+pub const default_admission_retry_budget_ns: u64 = 45 * std.time.ns_per_s;
+
 /// Backoff before retry `attempt` (1-based): 500ms, 1s, 2s, capped at 4s.
 pub fn repairTransientBackoffNs(attempt: u32) u64 {
     const shift: u6 = @intCast(@min(attempt -| 1, 3));
