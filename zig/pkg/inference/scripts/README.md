@@ -99,20 +99,18 @@ Host conformance and portable product compilation do not replace those gates.
 
 ## Kernel family consolidation qualification
 
-`qualify_kernel_families.py` retains baseline/candidate receipts for a complete
-campaign. `models` takes a JSON config with `arm_order` and
+`qualify_kernel_families.py` retains baseline/candidate model and operator receipts. `models` takes a JSON config with `arm_order` and
 `cases: [{"name": "case", "args": ["--model-dir", "...", "--backend", "native",
 "--warmup-iters", "25", "--measure-iters", "201"]}]`, plus optional
 `environment` and Linux `cpu_affinity`. Supply `--config`, `--baseline`,
 `--candidate` and `--results`. It records every arm, requires finite,
 byte-identical output, and applies the 5% median / 10% p95 model budgets.
 
-`source-ledger --revision REV --results DIR` counts all changed authored source,
-including new templates/renderers and inline tests, separately from generated
-regions. `cuda-static --baseline IMAGE --candidate IMAGE --cuobjdump TOOL
---results DIR` reports all instruction/resource differences on the seven packaged
-architectures; differences require review and device qualification, not automatic
-promotion. Run `test_qualify_kernel_families.py` for the runner's failure gates.
+Use `check_cuda_native_programs.py --help` for instruction/resource comparison
+across native architectures, including explicit export-retirement allowlists.
+Run `test_qualify_kernel_families.py` and `test_check_cuda_native_programs.py`
+for the comparison failure gates. Source accounting uses the dedicated
+`kernel_source_accounting.py` command below.
 
 `kernel_family_metal.mm` consumes a JSON manifest describing full baseline/current
 shader files, buffer fixture files, constant-byte bindings, output extents, grid,

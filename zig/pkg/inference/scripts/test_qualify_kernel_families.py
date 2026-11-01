@@ -227,64 +227,6 @@ class MetalPairingTests(unittest.TestCase):
                     self.assertEqual(qualification.metal_pair(SimpleNamespace(ab=paths[0], ba=paths[1], results=root)), accepted)
 
 
-class SourceLedgerTests(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.root = Path(self.directory.name)
-        self.sources = self.root / 'zig/pkg/inference/src/ops/cuda'
-        self.sources.mkdir(parents=True)
-        self.git('init')
-
-    def git(self, *args):
-        import subprocess
-        return subprocess.run(['git', '-c', 'user.name=Fixture', '-c',
-                               'user.email=fixture@example.invalid', '-c',
-                               'commit.gpgsign=false', *args], cwd=self.root,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-
-    def commit(self):
-        self.git('add', '-A')
-        self.git('commit', '-m', 'fixture')
-
-    def ledger(self):
-        results = self.root / 'results'
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertTrue(qualification.source_ledger(SimpleNamespace(
-                root=self.root, revision='HEAD', results=results)))
-        return json.loads((results / 'source-ledger.json').read_text())
-
-    def test_renames_are_neutral_deleted_owners_and_python_producers_are_charged(self):
-        (self.sources / 'old.cu').write_bytes(b'kernel body\n')
-        (self.sources / 'deleted.cu').write_bytes(b'gone\n')
-        (self.sources / 'producer.py').write_bytes(b'emit()\n')
-        (self.sources / 'old.ptx').write_bytes(b'.entry kernel\n')
-        self.commit()
-        (self.sources / 'old.cu').rename(self.sources / 'canonical.cu')
-        (self.sources / 'old.ptx').rename(self.sources / 'canonical.ptx')
-        (self.sources / 'deleted.cu').unlink()
-        addition = b'# new authored producer line\n'
-        (self.sources / 'producer.py').write_bytes(b'emit()\n' + addition)
-        self.git('add', '-A')
-        data = self.ledger()
-        self.assertEqual(data['authored']['bytes_removed'], len(b'gone\n') - len(addition))
-        self.assertEqual(data['generated']['bytes_removed'], 0)
-        self.assertTrue(any(x['path'].endswith('/deleted.cu') for x in data['files']))
-        self.assertTrue(any(x['path'].endswith('/producer.py') for x in data['files']))
-
-    def test_tile_and_quant_regions_keep_generator_ownership_separate(self):
-        path = self.sources / 'program.cu'
-        path.write_bytes(b'before\n')
-        self.commit()
-        block = (b'// tile-codegen:begin family\n'
-                 b'// quant-kernel-codegen:begin phase\nbody\n'
-                 b'// quant-kernel-codegen:end phase\n'
-                 b'// tile-codegen:end family\n')
-        path.write_bytes(b'before\n' + block)
-        (self.sources / 'owner.zig').write_bytes(b'owner\n')
-        data = self.ledger()
-        self.assertEqual(data['authored']['bytes_removed'], -len(b'owner\n'))
-        self.assertEqual(data['generated']['bytes_removed'], -len(block))
 
 
 if __name__ == '__main__':

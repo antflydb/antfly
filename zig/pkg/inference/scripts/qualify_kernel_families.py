@@ -148,82 +148,6 @@ def models(args):
     return passed
 
 
-def cuda_static(args):
-    receipt = []
-    for arch in ('sm_75', 'sm_80', 'sm_89', 'sm_90', 'sm_100', 'sm_110', 'sm_120'):
-        versions = {}
-        for label, path in [('baseline', args.baseline), ('candidate', args.candidate)]:
-            text = subprocess.check_output([str(args.cuobjdump), '--dump-sass',
-                                            '--gpu-architecture', arch, str(path)], text=True)
-            usage = subprocess.check_output([str(args.cuobjdump), '--dump-resource-usage',
-                                             '--gpu-architecture', arch, str(path)], text=True)
-            resources = dict(re.findall(r' Function (\S+):\n([^\n]+)', usage))
-            versions[label] = {m.group(1): {'sha256': digest(m.group(2).strip().encode()),
-                                'resources': resources.get(m.group(1), '').strip(),
-                                'instructions': len(re.findall(r'/\*[0-9a-f]+\*/', m.group(2)))}
-                              for m in re.finditer(r'Function\s*:\s*(\S+)\n(.*?)(?=\n\s*Function\s*:|\Z)', text, re.S)}
-            if not versions[label] or any(not r['resources'] for r in versions[label].values()):
-                raise ValueError('Missing functions/resources for ' + arch)
-        old, new = versions['baseline'], versions['candidate']
-        changed = [{'name': name, 'baseline': old.get(name), 'candidate': new.get(name)}
-                   for name in sorted(set(old) | set(new)) if old.get(name) != new.get(name)]
-        receipt.append({'arch': arch, 'baseline_count': len(old), 'candidate_count': len(new),
-                        'changed': changed})
-        save(args.results / 'cuda-static.json', receipt)
-        print(arch, 'changed', len(changed), flush=True)
-    # Differences are review evidence, not automatically a failed qualification.
-    return True
-
-
-def source_ledger(args):
-    root = args.root.resolve()
-    subprocess.run(['git', 'rev-parse', '--verify', args.revision + '^{commit}'], cwd=root,
-                   stdout=subprocess.DEVNULL, check=True)
-    tracked = subprocess.check_output(['git', 'ls-files', 'zig/pkg/inference/src'], cwd=root,
-                                      text=True).splitlines()
-    added = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard',
-                                     'zig/pkg/inference/src'], cwd=root, text=True).splitlines()
-    baseline = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', args.revision,
-                                        '--', 'zig/pkg/inference/src'], cwd=root, text=True).splitlines()
-    receipt = {'baseline_revision': args.revision, 'files': [], 'authored': {}, 'generated': {}}
-    totals = {kind: [0, 0, 0, 0] for kind in ('authored', 'generated')}
-    def regions(data):
-        authored, generated = [], []
-        depth = 0
-        for line in data.splitlines(keepends=True):
-            if re.match(rb'\s*// (?:quant-kernel|tile)-codegen:begin', line):
-                depth += 1
-            (generated if depth else authored).append(line)
-            if re.match(rb'\s*// (?:quant-kernel|tile)-codegen:end', line):
-                depth = max(0, depth - 1)
-        return {'authored': b''.join(authored), 'generated': b''.join(generated)}
-    for name in sorted(set(baseline + tracked + added)):
-        if Path(name).suffix not in {'.zig', '.m', '.cu', '.cuh', '.h', '.metal', '.py', '.ptx'}:
-            continue
-        old = subprocess.run(['git', 'show', args.revision + ':' + name], cwd=root,
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
-        current = root / name
-        new = current.read_bytes() if current.is_file() else b''
-        if old == new:
-            continue
-        if '/generated/' in name or Path(name).suffix == '.ptx':
-            parts = ({'authored': b'', 'generated': old}, {'authored': b'', 'generated': new})
-        else:
-            parts = (regions(old), regions(new))
-        entry = {'path': name, 'baseline_sha256': digest(old), 'candidate_sha256': digest(new)}
-        for kind in totals:
-            a, b = parts[0][kind], parts[1][kind]
-            count = [len(a.splitlines()), len(b.splitlines()), len(a), len(b)]
-            totals[kind] = [x + y for x, y in zip(totals[kind], count)]
-            entry[kind] = {'lines_removed': count[0] - count[1], 'bytes_removed': count[2] - count[3]}
-        receipt['files'].append(entry)
-    for kind, (a, b, x, y) in totals.items():
-        receipt[kind] = {'lines_removed': a - b, 'bytes_removed': x - y}
-    save(args.results / 'source-ledger.json', receipt)
-    print(json.dumps({k: receipt[k] for k in totals}, indent=2))
-    return True
-
-
 def pack_cuda(args):
     config = json.loads(args.config.read_text())
     tolerant = any(arg['kind'] == 'reference_output_f32' for case in config['cases'] for arg in case['arguments'])
@@ -313,15 +237,11 @@ def metal_pair(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
-    for command in ('models', 'cuda-static'):
-        p = sub.add_parser(command)
-        p.add_argument('--baseline', type=Path, required=True)
-        p.add_argument('--candidate', type=Path, required=True)
-        p.add_argument('--results', type=Path, required=True)
-        if command == 'models':
-            p.add_argument('--config', type=Path, required=True)
-        else:
-            p.add_argument('--cuobjdump', type=Path, required=True)
+    p = sub.add_parser('models')
+    p.add_argument('--baseline', type=Path, required=True)
+    p.add_argument('--candidate', type=Path, required=True)
+    p.add_argument('--results', type=Path, required=True)
+    p.add_argument('--config', type=Path, required=True)
     p = sub.add_parser('pack-cuda')
     p.add_argument('--config', type=Path, required=True)
     p.add_argument('--results', type=Path, required=True)
@@ -329,14 +249,9 @@ def main():
     p.add_argument('--ab', type=Path, required=True)
     p.add_argument('--ba', type=Path, required=True)
     p.add_argument('--results', type=Path, required=True)
-    p = sub.add_parser('source-ledger')
-    p.add_argument('--root', type=Path, default=Path.cwd())
-    p.add_argument('--revision', required=True)
-    p.add_argument('--results', type=Path, required=True)
     args = parser.parse_args()
     args.results.mkdir(parents=True, exist_ok=True)
-    return 0 if {'models': models, 'cuda-static': cuda_static,
-                 'source-ledger': source_ledger, 'pack-cuda': pack_cuda, 'metal-pair': metal_pair}[args.action](args) else 1
+    return 0 if {'models': models, 'pack-cuda': pack_cuda, 'metal-pair': metal_pair}[args.action](args) else 1
 
 
 if __name__ == '__main__':

@@ -131,26 +131,11 @@ bytes separately. Count every shared owner once. Renaming a file or generating
 several copies of one body does not itself reduce authored code. Use
 `scripts/kernel_source_accounting.py --revision BASELINE --output RECEIPT`.
 
-`check_metal_segment_blocks.m` can freeze the main shader with `--dump-source`
-and validate a source-phase refactor with `--require-source-identity`. Check
-authored owners before estimating savings from expanded-shader similarity.
-
-`check_metal_dense_tiles.m` applies the same freeze/identity workflow to decoder
-and vision tiles, with separate half-stage and full-F32 reference contracts.
-
-`check_cuda_wmma_tiles.py` compares frozen CUDA images and independent references
-for the score-product family. For source-only phase sharing, verify both native
-resources and complete production-image identity with the pinned toolchain.
-
-`check_cpu_attention_rows.zig` takes frozen/current linalg module imports for
-pipeline parity and paired timing. Static schedule sharing must preserve
-maximum-load order as well as arithmetic; compare the optimized row bodies.
-
-`check_metal_matrix_phases.m` qualifies the grouped matrix and quantized
-projection phases with complete shader identity, pipeline resources, independent
-references and optional paired timing. The CUDA WMMA fixture's `--m64-only`
-mode covers preloaded row products, compact runs and non-monotonic bucket maps.
-
+Use the shared `qualify_kernel_families.py` runner and native manifest executors
+for model and operator comparisons. `check_cuda_native_programs.py` compares
+instructions and resources across retained architectures. Their interfaces are
+documented in `zig/pkg/inference/scripts/README.md`. Build-integrated checks and
+regression tests remain with their current owners.
 
 ## Tile descriptions and native ownership
 
@@ -225,7 +210,7 @@ loading/first-launch time for a substantially smaller packaged image. Validate
 exports through `cuobjdump` entry symbol tables; compressed blobs cannot be
 checked reliably with raw byte searches. Portable PTX and standalone SM89 remain
 separate profiles. Record packaged size, native code/resource identity and
-startup cost separately; see `unified-execution-bk-outcomes.md`.
+startup cost separately in qualification receipts.
 
 Model comparisons use exact output identity by default. If a model has an
 explicit numerical budget, pin an independently generated F32 reference by SHA-256

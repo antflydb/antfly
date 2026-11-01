@@ -40,13 +40,6 @@ zig build tile-kernel-codegen -- --emit-opencl /tmp/tile_whisper_model.cl
 python scripts/tile/run_whisper_opencl.py /tmp/tile_whisper_model.cl <hf-model-dir> <reference-dir>
 ```
 
-The original prototype qualification on whisper-tiny and the JFK sample produced the same tokens as
-Hugging Face transformers (f32) and the same transcript. The CPU lowering's
-encoder output is within 5.4e-4 of the reference (values up to 17) and the
-first-step logits within 4.1e-5. The OpenCL run of the GPU templates is
-within 1.2e-3 and 1.1e-4 (block-tiled sums round differently). On a 4-core x86-64 (AVX-512) sandbox the
-CPU lowering runs the 30 s encoder in ~0.9 s and decodes at ~12 ms/token.
-
 The CPU lowering is `@Vector` code, so the `tile-whisper` step builds for
 the host CPU unless `-Dcpu`/`-Dtarget` say otherwise; the repository's
 default baseline x86-64 target (no AVX/FMA) is about 15x slower.
@@ -78,7 +71,7 @@ Use `native_program.metal` to encode readable MSL at the Objective-C boundary;
 macro splices as raw parts of `native_program.join`, preserving their canonical
 native owners instead of duplicating declarations.
 
-The registry owns 175 disjoint regions. Existing `quant-kernel-codegen` regions
+The registry declares disjoint source regions. Existing `quant-kernel-codegen` regions
 retain their owners; do not register a Tile region inside them. Shared arithmetic,
 layout and synchronization helpers stay in their existing native program headers.
 This is source specialization, distinct from the portable Tile IR above: the
@@ -95,9 +88,8 @@ To add a specialization, extend the existing program family, register its exact
 region once, and regenerate. Keep generated regions separate from other owners.
 Validate against a frozen original and an independent reference, then compare
 native resources and hardware timings. CPU emulation alone does not qualify a
-GPU schedule. The scripts under `scripts/tile/` remain useful for isolated
-primitive checks; their original PR family specs do not describe every rebased
-production region.
+GPU schedule. Use the shared model/native qualification harnesses documented
+in `scripts/README.md` for additional device and performance comparisons.
 
 Changing CUDA source means regenerating the checked-in PTX/fatbin/cubin
 with the pinned toolkit (CUDA 13.2, V13.2.86). Without a local install, the
