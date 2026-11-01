@@ -3229,3 +3229,85 @@ whitespace and artifact checks pass. Final timing overlaps no task-owned builds,
 tests or cleanup. Other host activity and OS caches remain uncontrolled. These
 kernel results qualify no whole-ingestion, optimized-server, cloud, archive-scale,
 cold-storage or RSS gain. Earlier observations retain their own identities.
+
+
+### Shared normalized group-reader buffer
+
+The supported capture probe now reports `group_buffers`, the number of successful
+read-buffer allocations retired with the normalized offset preparation. The
+sequential disk encoder should use one buffer regardless of the term count;
+memory-backed capture uses none. `replay_reads` retains its physical private-run
+read definition. Both metrics are `null` for controls that do not expose them.
+
+`ANTFLY_CAPTURE_INDEX=1` selects complete native text-segment construction from
+the same immutable typed source. It builds postings, field norms, source columns
+and offset vectors, then materializes final segment bytes. Input/root setup,
+result hashing, independent search verification and final result destruction are
+outside timing. The output segment remains charged in the tracked peak. This
+includes more production work than capture callbacks, but excludes Parquet scan,
+artifact-store publication, HTTP transport and subsequent query execution.
+
+```sh
+# From zig/, after: zig build lake-native-bench-build -Doptimize=fast
+ANTFLY_CAPTURE_INDEX=1 ANTFLY_CAPTURE_REPEATS=65537 \
+  ANTFLY_CAPTURE_BINDINGS=2 ANTFLY_CAPTURE_ENGLISH=1 \
+  ANTFLY_CAPTURE_DIVERSE=1 ANTFLY_CAPTURE_QUOTA=536870912 \
+  zig-out/bin/lake-source-capture-bench
+```
+
+The index mode accepts one to four physical bindings over one source field,
+checks expected token/analysis/reuse counts and searches the resulting segment.
+Before/after segment SHA-256 and immutable-input SHA-256 must match exactly.
+It rejects the materialized-capture control because that control is scoped to
+the capture kernel. Keep the memory-fitting, just-spilled, larger spilled and
+repeated-term controls when evaluating shared-reader changes. Do not turn a
+kernel or native segment-build result into a complete publication-latency claim.
+
+The [shared-reader observation](shared-normalized-reader-v1-observation.json)
+qualifies runtime `2b9d40a95820dd77af7c79fb7694c975150aa4b1` with main
+`761ae62410d5a04ae6a89d0365adcf53774da0ec`. Baseline
+`df04d6eeab15d16cf7f435ed68f713b9618f067f` has identical main and probe harness
+bytes, including allocation counters and the native-index mode, while retaining
+the previous per-group buffer ownership. Frozen binaries have recorded hashes.
+Each cohort excludes one warmup and uses three alternating measured pairs with
+the same 512-MiB quota; final timing overlaps no task-owned builds, tests or
+cleanup. Other host activity and OS caches remain uncontrolled.
+
+English analysis, 4,096 distinct terms, two bindings:
+
+| Tokens / compact placement | Before capture CPU | Shared capture CPU | Before native-index CPU | Shared native-index CPU | Private reads, before → after |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 262,144 / memory | 52.682 ms | 53.773 ms | 139.105 ms | 136.057 ms | 0 → 0 |
+| 262,148 / disk | 67.443 ms | 61.793 ms | 149.138 ms | 140.980 ms | 775 → 583 |
+| 524,288 / disk | 120.532 ms | 112.650 ms | 236.754 ms | 219.113 ms | 1,920 → 1,536 |
+
+Across simple/English analysis and one/two bindings, spilled diverse capture
+uses **3.3–16.9% less median CPU**, with every measured before/after pair faster.
+Complete native-index builds for spilled diverse aliases use **5.2–10.8% less
+median CPU** and **0.7–7.6% less median wall time**; these builds include postings
+and final segment bytes. Disk normalized-group buffer allocations fall from
+**4,096 to one**. The diverse capture peak remains **8,647,864 tracked bytes**;
+native-index peaks also match the baseline within each cohort.
+
+The controls limit the claim: memory-fitting diverse capture is **1.9–5.2%
+slower**, despite using no group buffers, and repeated-term capture changes by
+only **0.2–1.6%** on disk. Repeated-term native-index CPU falls **2.9–3.4%** on
+disk. Compact capture still uses **32.6–58.2% more CPU** than owning tokens on
+the diverse fixtures, while reducing tracked peak memory by about **94%**.
+This is a targeted disk-read/allocation improvement with a measured small-field
+tradeoff, not an unconditional CPU win. Every measured token/span digest, input
+hash and complete encoded-output hash matches. Final native segments are also
+searched independently. Both 64-MiB compact capture and complete native-index
+controls finish with matching outputs; the owning-token capture controls fail
+with expected OutOfMemory under that same quota.
+
+Qualification passes **417 shared + 187 API native checks (604 total)**, with
+zero failures, skips or leaks, plus **50 real Parquet/Iceberg E2E cases in
+396.06 seconds** against the frozen merged-main server. Added fault tests cover
+exclusive leases, partial closes, repeated backward seeks, allocator failures
+and retry after a partially consumed failed read. The 32,769-record diverse
+read-bound regression now uses **59 physical reads** and **1,516,557 peak bytes**
+under its unchanged 8-MiB quota. Server and supported native probe builds pass.
+Runtime ABI **85**, reader protocol **97**, and persisted-format compatibility
+are explicit in the observation; only the runtime ABI changes. These results
+establish no HTTP publication, Parquet scan, cloud, archive-scale or RSS speedup.

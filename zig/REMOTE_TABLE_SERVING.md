@@ -2931,3 +2931,41 @@ their quota while normalized capture completes with identical output. The larger
 native postings/search fixture uses 9,506,567 tracked peak bytes under that same
 64-MiB quota. All 602 native checks and 50 real Parquet/Iceberg E2E cases pass.
 These kernel observations do not establish whole-ingestion or cloud speedups.
+
+
+### Shared read ownership across normalized term groups
+
+A prepared disk-backed offset input owns one bounded group-reader buffer for
+its lifetime. Lexical encoding consumes consecutive groups through that reader,
+including records already read ahead across the next term boundary. A group
+borrows an exclusive reader lease; a second active group is rejected. Closing
+an unconsumed suffix releases the lease without imposing a drain requirement.
+An explicit nonconsecutive or backward group seek resets the read coordinates
+while retaining the buffer capacity. Returned tokens borrow interned term bytes,
+so moving or reusing the read buffer never invalidates them.
+
+The prepared owner supplies the buffer allocator and outlives every group lease.
+A borrower does not retain its own scratch allocator or free the shared buffer.
+Read/allocation failures make the active reader terminal for that lease; a new
+lease resets it before retrying, preventing partially advanced read coordinates
+from skipping records. Final owner teardown requires all group leases closed,
+then frees the buffer before closing its grouped private run. Memory-backed
+occurrence links keep their existing independent traversal.
+
+This replaces one buffer allocation per disk term with one normal sequential
+reader allocation, capped at 64 KiB and still charged to the same statement/host
+quota. Persisted offset bytes, source geometry, term ordering and native postings
+remain unchanged. Runtime ABI 85 fences the owner/lease state; reader protocol
+97 is unchanged. Capture timing and complete native segment-build timing are
+measured separately; neither alone establishes HTTP publication or cloud latency.
+
+The [shared-reader qualification](bench/lake/shared-normalized-reader-v1-observation.json)
+records a same-main, identical-harness comparison: disk diverse capture uses
+3.3–16.9% less median CPU and complete native-index construction uses 5.2–10.8%
+less for diverse aliases. Allocation count falls from 4,096 buffers to one,
+with identical output bytes and tracked peaks. Memory-fitting diverse capture
+is 1.9–5.2% slower, and repeated-term capture gains little; retain these controls
+when evaluating later changes. All 604 native checks and 50 real Parquet/Iceberg
+E2E cases pass against the merged-main runtime. The observation distinguishes
+private reads, tracked memory and native build timing from network, RSS and
+complete publication latency.
