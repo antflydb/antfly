@@ -108,6 +108,10 @@ pub const HBCConfig = struct {
     /// codes assume `use_random_ortho_trans`.
     quantization_bits: u8 = 1,
     quantization_refine: QuantizationRefine = .near_cutoff,
+    /// `near_cutoff` rescores a candidate when its 1-bit estimate minus this
+    /// many 1-bit error bounds could still enter the heap. The 1-bit bound
+    /// is roughly 1.3 standard deviations, so small values miss neighbors.
+    quantization_refine_margin: f32 = 2,
     bulk_build_algo: BulkBuildAlgo = .hilbert_seeded,
     prefer_key_local_leaf_splits: bool = false,
     key_local_leaf_split_penalty: f32 = 1.10,

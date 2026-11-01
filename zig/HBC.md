@@ -49,6 +49,61 @@ Final rerank must use borrowed/external vector loading where possible. Search
 scratch belongs in `dense.search_working_set`; retained HBC nodes and quantized
 payloads remain in `hbc.node_metadata_cache`.
 
+## Multi-bit RaBitQ codes
+
+`quantization_bits` (dense index config, 1 to 8, default 1) adds extended
+RaBitQ codes ([Gao et al., SIGMOD 2025](https://arxiv.org/abs/2409.09913),
+`antfly_vector.rabitq_ex`) next to the 1-bit codes in every quantized set.
+They describe the same residual against the same centroid with B bits per
+dimension, so their distance estimates and error bounds are much tighter.
+
+- **Why:** leaf scoring admits the best `k * rerank_factor` 1-bit estimates
+  into the candidate heap before any f16 or exact scoring. With 1-bit codes,
+  true neighbors often miss that cut (see the measurements below), and the
+  loose bounds make boundary rerank score most of the heap exactly.
+- **`quantization_refine: near_cutoff` (default):** score with the 1-bit
+  kernel, then rescore with extended codes only candidates whose 1-bit
+  estimate minus `quantization_refine_margin` (default 2) bounds could still
+  enter the heap. `all` rescores every scanned vector.
+- **Storage:** `ex_bits`/`ex_codes`/`ex_factors` fields on
+  `RaBitQuantizedVectorSet` (protobuf fields 9 to 11; older readers skip
+  them), an ex-codes flag on AFQD leaf entries and AFRC row-delta chunks
+  (older builds reject such entries instead of misreading them), and
+  `quantization_bits` in `IndexMetadata` (encoded only above 1). The stored
+  value wins on reopen.
+- **Rotation:** extended codes assume randomly rotated vectors, so bits above
+  1 turn on `use_random_ortho_trans`; opening such an index without rotation
+  fails.
+- **Cost:** about `dims * bits / 8 + 8` extra bytes per vector, plus the
+  extended scorer's CPU for refined candidates (byte-parallel SIMD for 2, 4
+  and 8 bits; 3, 5, 6, 7 use a scalar path).
+- **Not covered:** segment sections (`RBIQ`) and serverless vector segments
+  keep 1-bit codes; their quantizers have no config path yet.
+
+Measured on the real index (`hbc_adapter.zig` test "hbc multi-bit
+quantization measurement on a dataset", NYTimes-256 cosine, 20k vectors,
+100 queries, leaf 168, branching 168, epsilon 7, boundary rerank, search
+width 128, rotation on; Debug build, so no timings):
+
+| Bits | Refine | Recall@10, heap 20 | Recall@10, heap 80 | Rescored/q (heap 80) | Exact reranks/q (heap 80) |
+|---:|---|---:|---:|---:|---:|
+| 1 | n/a | 0.424 | 0.620 | 0 | 79.3 |
+| 2 | near_cutoff, margin 1 | 0.722 | 0.906 | 4,654 | 74.1 |
+| 4 | near_cutoff, margin 1 | 0.898 | 0.946 | 1,940 | 26.4 |
+| 4 | near_cutoff, margin 2 | 0.972 | 1.000 | 6,873 | 28.7 |
+| 4 | all | 0.975 | 1.000 | 20,000 | 28.9 |
+
+With 1-bit codes, exact-reranking every admitted candidate
+(`rerank_policy: always`) gives the same 0.620 as boundary rerank: the loss
+is entirely at the 1-bit admission cut, before rerank sees anything. Every
+true neighbor that makes it into the heap is already found.
+
+4 bits with margin 2 matches rescoring everything while rescoring a third
+of the scanned vectors, and cuts exact reranks to about a third. 2 bits
+fixes most of the admission loss but not the rerank volume.
+`bench/vectors/rabitq_hbc_sim.zig` reproduces the admission effect at 100k
+outside HBC.
+
 ## Dense Artifact Vectors
 
 Public writes and replay store dense vectors as primary-store artifacts. HBC

@@ -35599,3 +35599,140 @@ test "hbc multi-bit codes refine leaf admission and survive reopen" {
         return err;
     };
 }
+
+// Opt-in measurement: set ANTFLY_HBC_BENCH_DATA to an ann-benchmarks style
+// prefix (PREFIX.train.f32 / PREFIX.test.f32: u32 rows, u32 dims, f32s) and
+// optionally ANTFLY_HBC_BENCH_N (default 20000) and
+// ANTFLY_HBC_BENCH_QUERIES (default 100). Builds real HBC indexes at the
+// index manager's production defaults and compares quantization settings.
+test "hbc multi-bit quantization measurement on a dataset" {
+    const prefix = platform.env.getenv("ANTFLY_HBC_BENCH_DATA") orelse return error.SkipZigTest;
+    const alloc = std.heap.page_allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const n_limit: usize = if (platform.env.getenv("ANTFLY_HBC_BENCH_N")) |v| try std.fmt.parseInt(usize, v, 10) else 20_000;
+    const q_limit: usize = if (platform.env.getenv("ANTFLY_HBC_BENCH_QUERIES")) |v| try std.fmt.parseInt(usize, v, 10) else 100;
+    const Loaded = struct { rows: usize, dims: usize, data: []f32 };
+    const load = struct {
+        fn f(a: Allocator, i: std.Io, p: []const u8, part: []const u8, limit: usize) !Loaded {
+            const path = try std.fmt.allocPrint(a, "{s}.{s}.f32", .{ p, part });
+            defer a.free(path);
+            const raw = try std.Io.Dir.cwd().readFileAlloc(i, path, a, .limited(4 * 1024 * 1024 * 1024));
+            defer a.free(raw);
+            const rows = @min(std.mem.readInt(u32, raw[0..4], .little), limit);
+            const dims = std.mem.readInt(u32, raw[4..8], .little);
+            const out = try a.alloc(f32, rows * dims);
+            @memcpy(std.mem.sliceAsBytes(out), raw[8..][0 .. out.len * 4]);
+            for (0..rows) |r| {
+                const v = out[r * dims ..][0..dims];
+                var s: f32 = 0;
+                for (v) |x| s += x * x;
+                const norm = @sqrt(s);
+                if (norm > 0) for (v) |*x| {
+                    x.* /= norm;
+                };
+            }
+            return .{ .rows = rows, .dims = dims, .data = out };
+        }
+    }.f;
+    const data = try load(alloc, io, prefix, "train", n_limit);
+    defer alloc.free(data.data);
+    const queries = try load(alloc, io, prefix, "test", q_limit);
+    defer alloc.free(queries.data);
+    const d = data.dims;
+    const k = 10;
+    const truth = try alloc.alloc(u64, queries.rows * k);
+    defer alloc.free(truth);
+    for (0..queries.rows) |qi| {
+        const q = queries.data[qi * d ..][0..d];
+        var best_d: [k]f32 = @splat(std.math.inf(f32));
+        const best = truth[qi * k ..][0..k];
+        for (0..data.rows) |i| {
+            var dot: f32 = 0;
+            for (data.data[i * d ..][0..d], q) |a, b| dot += a * b;
+            const dist = 1 - dot;
+            if (dist >= best_d[k - 1]) continue;
+            var pos: usize = k - 1;
+            while (pos > 0 and best_d[pos - 1] > dist) : (pos -= 1) {
+                best_d[pos] = best_d[pos - 1];
+                best[pos] = best[pos - 1];
+            }
+            best_d[pos] = dist;
+            best[pos] = i + 1;
+        }
+    }
+    const items = try alloc.alloc(BatchInsertItem, data.rows);
+    defer alloc.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .vector_id = i + 1, .vector = data.data[i * d ..][0..d], .metadata = "" };
+
+    const Variant = struct { bits: u8, refine: @FieldType(HBCConfig, "quantization_refine") = .near_cutoff, margin: f32 = 2, policy: @FieldType(HBCConfig, "rerank_policy") = .boundary };
+    const variants = [_]Variant{
+        .{ .bits = 1 },
+        .{ .bits = 1, .policy = .always },
+        .{ .bits = 2, .margin = 1 },
+        .{ .bits = 4, .margin = 1 },
+        .{ .bits = 4 },
+        .{ .bits = 4, .policy = .always },
+        .{ .bits = 4, .refine = .all },
+    };
+    std.debug.print("\nHBC rows={d} dims={d} queries={d} (leaf 168, branching 168, epsilon 7, boundary rerank, rotation on)\n", .{ data.rows, d, queries.rows });
+    std.debug.print("{s:>4} {s:>12} {s:>6} {s:>8} {s:>6} {s:>8} {s:>9} {s:>10} {s:>10} {s:>10} {s:>9}\n", .{ "bits", "refine", "margin", "rerank", "width", "factor", "recall@10", "scored/q", "refined/q", "reranked/q", "ms/q" });
+    for (variants) |variant| {
+        var tp: TestPath = .{};
+        const path = tp.init();
+        defer tp.cleanup();
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = @intCast(d),
+            .metric = .cosine,
+            .leaf_size = 168,
+            .branching_factor = 168,
+            .search_width = 1008,
+            .epsilon = 7,
+            .use_quantization = true,
+            .rerank_policy = variant.policy,
+            .use_random_ortho_trans = true,
+            .quantization_bits = variant.bits,
+            .quantization_refine = variant.refine,
+            .quantization_refine_margin = variant.margin,
+            .max_cached_nodes = 100_000,
+            .max_cached_vectors = 200_000,
+        });
+        defer idx.close();
+        try idx.bulkBuildWithMetadata(items);
+        for ([_]u32{128}) |width| {
+            for ([_]usize{ 2, 8 }) |factor| {
+                var hits: usize = 0;
+                var scored: u64 = 0;
+                var refined: u64 = 0;
+                var reranked: u64 = 0;
+                const t0 = platform_time.monotonicNs();
+                for (0..queries.rows) |qi| {
+                    var profiled = try idx.searchProfiledRequest(.{ .query = queries.data[qi * d ..][0..d], .k = k, .search_width = width, .rerank_factor = factor, .load_metadata = false });
+                    defer profiled.results.deinit();
+                    scored += profiled.profile.approx_vectors_scored;
+                    refined += profiled.profile.ex_refined_vectors;
+                    reranked += profiled.profile.reranked_vectors;
+                    const gt = truth[qi * k ..][0..k];
+                    for (profiled.results.getHits()) |h| {
+                        if (std.mem.indexOfScalar(u64, gt, h.vector_id) != null) hits += 1;
+                    }
+                }
+                const nq: f64 = @floatFromInt(queries.rows);
+                std.debug.print("{d:>4} {s:>12} {d:>6.1} {s:>8} {d:>6} {d:>8} {d:>9.3} {d:>10.0} {d:>10.0} {d:>10.1} {d:>9.2}\n", .{
+                    variant.bits,
+                    @tagName(variant.refine),
+                    variant.margin,
+                    @tagName(variant.policy),
+                    width,
+                    factor,
+                    @as(f64, @floatFromInt(hits)) / (nq * k),
+                    @as(f64, @floatFromInt(scored)) / nq,
+                    @as(f64, @floatFromInt(refined)) / nq,
+                    @as(f64, @floatFromInt(reranked)) / nq,
+                    @as(f64, @floatFromInt(platform_time.monotonicNs() - t0)) / 1e6 / nq,
+                });
+            }
+        }
+    }
+}

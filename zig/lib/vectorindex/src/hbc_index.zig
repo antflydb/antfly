@@ -3967,6 +3967,7 @@ const ExRefine = struct {
     est: quantizer_mod.ExEstimator,
     set: *const proto.RaBitQuantizedVectorSet,
     all: bool,
+    margin: f32 = 2,
     refined: u64 = 0,
 
     /// Returns null when the index is 1-bit or the set has no extended codes
@@ -3977,6 +3978,7 @@ const ExRefine = struct {
             .est = try quantizer_mod.ExEstimator.init(self.alloc, set, approx_query),
             .set = set,
             .all = self.config.quantization_refine == .all,
+            .margin = self.config.quantization_refine_margin,
         };
     }
 
@@ -3985,7 +3987,7 @@ const ExRefine = struct {
     }
 
     fn apply(self: *ExRefine, results: *const search_results.ApproxSearchResults, index: usize, distance: *f32, bound: *f32) void {
-        if (!self.all and distance.* - bound.* > results.admissionCutoff()) return;
+        if (!self.all and distance.* - self.margin * bound.* > results.admissionCutoff()) return;
         const e = self.est.estimate(self.set, index);
         distance.* = e.distance;
         bound.* = e.bound;
@@ -4209,6 +4211,7 @@ fn scoreNativeLeafScan(
                 count: usize = 0,
                 refine: ?quantizer_mod.ExEstimator = null,
                 refine_all: bool = false,
+                refine_margin: f32 = 2,
                 refined: u64 = 0,
                 /// Row-aware entry from Snapshot.scoreTo: refines with the
                 /// chunk's extended codes before admission.
@@ -4216,7 +4219,7 @@ fn scoreNativeLeafScan(
                     var d = distance;
                     var b = bound;
                     if (out.refine) |*est| {
-                        if (set.hasEx() and set.ex_bits == est.codec.bits and (out.refine_all or d - b <= out.target.admissionCutoff())) {
+                        if (set.hasEx() and set.ex_bits == est.codec.bits and (out.refine_all or d - out.refine_margin * b <= out.target.admissionCutoff())) {
                             const e = est.estimate(set, row);
                             d = e.distance;
                             b = e.bound;
@@ -4238,7 +4241,7 @@ fn scoreNativeLeafScan(
                 }
             };
             const start = now();
-            var sink = Sink{ .target = results, .refine_all = self.config.quantization_refine == .all };
+            var sink = Sink{ .target = results, .refine_all = self.config.quantization_refine == .all, .refine_margin = self.config.quantization_refine_margin };
             if (self.config.quantization_bits > 1 and rows.runs.len > 0) {
                 const first = rows.runs[0].chunk.view.asProto();
                 if (first.hasEx()) sink.refine = try quantizer_mod.ExEstimator.init(self.alloc, &first, approx_query);
