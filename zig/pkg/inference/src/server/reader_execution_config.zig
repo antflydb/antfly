@@ -197,7 +197,11 @@ pub fn Features(comptime Hooks: type) type {
         }
 
         pub fn resolve(cfg: gpt_model_mod.Config, backend: runtime.kv.pool.BackendKind) @This() {
-            const profile = selectProfile(cfg, backend, Hooks.cudaLightOnBatchProfileEnabled(), metal_runtime.appleSimdgroupDeviceDefault(), metal_runtime.lightOnThroughputProfileEnabled());
+            return resolveWithPolicy(cfg, backend, Hooks.cudaLightOnBatchProfileEnabled(), Hooks.effectiveLightOnReadRows());
+        }
+
+        pub fn resolveWithPolicy(cfg: gpt_model_mod.Config, backend: runtime.kv.pool.BackendKind, cuda_requested: bool, rows: usize) @This() {
+            const profile = selectProfile(cfg, backend, cuda_requested, metal_runtime.appleSimdgroupDeviceDefault(), metal_runtime.lightOnThroughputProfileEnabled());
             // Profiling and concurrent planned dispatch do not share the
             // selected frame/lifetime contract. Fall back as one complete mode.
             const restricted_metal_mode = backend == .metal and
@@ -207,7 +211,7 @@ pub fn Features(comptime Hooks: type) type {
                     platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") != null);
             if (!platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_PREPARED_DECODE", true) or restricted_metal_mode)
                 return forProfile(.conservative, cfg, 1);
-            var result = forProfile(profile, cfg, Hooks.effectiveLightOnReadRows());
+            var result = forProfile(profile, cfg, rows);
             if (backend == .cuda) {
                 result = result.withCudaTokenBurstOverride(platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"), platform.env.getenv("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"));
                 result = result.withDecodeStreakOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_DECODE_STREAK"));
@@ -501,4 +505,18 @@ test "LightOnOCR3 CUDA device vision profile keeps existing admission and host r
     }
     for ([_]F.Profile{ .metal_lighton08, .metal_lighton4b, .conservative }) |profile|
         try std.testing.expect(!F.forProfile(profile, .{}, 64).device_vision_features);
+}
+
+test "LightOnOCR3 configured execution selects CUDA reader profile without environment switches" {
+    const F = Features(struct {});
+    for ([_][]const u8{ @embedFile("../models/testdata/lightonocr3/config.json"), @embedFile("../models/testdata/lightonocr3/config-4b.json") }) |json| {
+        var cfg = try gpt_model_mod.parseConfig(std.testing.allocator, json);
+        cfg.qwen35_device_only_state = true;
+        const enabled = F.resolveWithPolicy(cfg, .cuda, true, 2);
+        try std.testing.expect(enabled.prepared);
+        try std.testing.expectEqual(@as(u16, 2), enabled.scheduling_rows);
+        try std.testing.expect(!F.resolveWithPolicy(cfg, .cuda, false, 2).prepared);
+        cfg.qwen35_device_only_state = false;
+        try std.testing.expect(!F.resolveWithPolicy(cfg, .cuda, true, 2).prepared);
+    }
 }

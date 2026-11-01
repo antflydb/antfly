@@ -650,7 +650,7 @@ const AntflyReaderState = struct {
                 headers[count] = .{ "X-Antfly-Capability-Revision", v };
                 count += 1;
             }
-            var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
+            var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms", .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
             defer response.deinit();
             if (!response.ok()) return readHttpStatusError(response.status.code, responseCapabilityStale(response));
             return documentBatchResult(alloc, response.body orelse return error.InvalidReadResultCount);
@@ -692,6 +692,7 @@ const AntflyReaderState = struct {
             .json = body,
             .headers = headers,
             .timeout_ms = self.timeout_ms,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .max_response_size = req.max_response_bytes,
             .cancellation = self.cancellation,
         });
@@ -756,6 +757,7 @@ const AntflyReaderState = struct {
             .borrowed_body_segments = body.segments,
             .headers = header_buf[0..header_count],
             .timeout_ms = self.timeout_ms,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .max_response_size = req.max_response_bytes,
             .cancellation = self.cancellation,
         });
@@ -1274,12 +1276,12 @@ test "antfly reader sends batched images and request max tokens" {
     var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
     defer client.deinit();
 
-    const reader = try initReader(alloc, &client, .{
+    const reader = try initReaderWithOptions(alloc, &client, .{
         .provider = .antfly,
         .api_url = server.baseUrl(),
         .model = "reader",
         .max_tokens = 16,
-    });
+    }, .{ .timeout_ms = 120_000 });
     defer reader.deinit();
 
     var results: ?[]Result = null;
@@ -1543,6 +1545,8 @@ fn expectAntflyReaderBearer(req: httpx.testing_mod.RequestInfo) !void {
 
 fn expectAntflyReaderBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(httpx.Method.POST, req.method);
+    const remaining = try std.fmt.parseInt(u64, req.header("X-Antfly-Inference-Timeout-Ms") orelse return error.MissingHeader, 10);
+    try std.testing.expect(remaining > 30_000 and remaining <= 120_000);
 
     var parsed = try std.json.parseFromSlice(inference_api.ReadRequest, std.testing.allocator, req.body, .{
         .ignore_unknown_fields = true,

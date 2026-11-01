@@ -22,6 +22,19 @@ const buffer = @import("buffer.zig");
 const cublas = @import("cublaslt.zig");
 const cudnn = @import("cudnn_sdpa.zig");
 
+/// Generic BF16 tensor-core/cuBLAS/cuDNN execution starts at Ampere.
+/// Specialized fused GEMMs retain their own narrower device checks.
+pub fn deviceSupported(compute_major: i32) bool {
+    return compute_major >= 8;
+}
+
+test "LightOnOCR3 BF16 vision device contract includes Ampere and Blackwell" {
+    try std.testing.expect(!deviceSupported(7));
+    try std.testing.expect(deviceSupported(8));
+    try std.testing.expect(deviceSupported(9));
+    try std.testing.expect(deviceSupported(12));
+}
+
 pub const Precision = enum {
     f32,
     bf16_vision,

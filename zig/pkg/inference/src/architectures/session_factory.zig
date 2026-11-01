@@ -1832,6 +1832,8 @@ fn createCudaSessionWithRequiredProfile(
     gliner_precision: GlinerCudaPrecision,
 ) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    const load_started_ns = platform.time.monotonicNs();
+    defer std.log.info("inference_model_load backend=cuda phase=total elapsed_ms={d}", .{(platform.time.monotonicNs() -| load_started_ns) / std.time.ns_per_ms});
     try config.validate();
     if (config.mode.failClosed() and !load_context.allowsQualification()) {
         return error.KernelJitRequiredDynamicLoad;
@@ -1905,8 +1907,10 @@ fn createCudaSessionWithRequiredProfile(
 
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("cuda-session: create native session start path={s}", .{model_path});
+    const host_prepare_started_ns = platform.time.monotonicNs();
     var native_session = try createNativeSessionForCudaUpload(allocator, model_path, override, true);
     defer native_session.close();
+    std.log.info("inference_model_load backend=cuda phase=host_prepare elapsed_ms={d}", .{(platform.time.monotonicNs() -| host_prepare_started_ns) / std.time.ns_per_ms});
     if (debug_cuda_session) std.log.info("cuda-session: create native session done path={s}", .{model_path});
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
@@ -1941,6 +1945,7 @@ fn createCudaSessionWithRequiredProfile(
     );
 
     if (debug_cuda_session) std.log.info("cuda-session: init cuda compute start path={s}", .{model_path});
+    const device_init_started_ns = platform.time.monotonicNs();
     var cuda_compute = try cuda_compute_mod.CudaCompute.initWithKernelJitForScopeAndLoadContext(
         allocator,
         config,
@@ -1949,6 +1954,7 @@ fn createCudaSessionWithRequiredProfile(
         load_context,
     );
     errdefer cuda_compute.deinit();
+    std.log.info("inference_model_load backend=cuda phase=device_init elapsed_ms={d}", .{(platform.time.monotonicNs() -| device_init_started_ns) / std.time.ns_per_ms});
     if (debug_cuda_session) std.log.info("cuda-session: init cuda compute done path={s}", .{model_path});
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
@@ -2008,6 +2014,7 @@ fn createCudaSessionWithRequiredProfile(
             return err;
         };
     }
+    std.log.info("inference_model_load backend=cuda phase=weight_upload weights={d} elapsed_ms={d}", .{ resident_uploads.items.len, (platform.time.monotonicNs() -| dense_upload_start_ns) / std.time.ns_per_ms });
     if (a4b_inference != null) {
         cuda_compute.noteA4bDenseUpload(
             platform.time.monotonicNs() -| dense_upload_start_ns,

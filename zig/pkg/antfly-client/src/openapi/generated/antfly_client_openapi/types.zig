@@ -41014,6 +41014,8 @@ pub const ModelRef = struct {
     kind: ModelKind,
     /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
     name: []const u8,
+    /// Keep a successfully preloaded model pinned against eviction. Set false to warm the ordinary evictable cache before serving; idle and model-count policy still apply.
+    pin: ?bool = null,
     backend: ?ModelBackend = null,
     format: ?ModelFormat = null,
     quantization: ?ModelQuantization = null,
@@ -41026,6 +41028,7 @@ pub const ModelRef = struct {
     pub const openApiFieldMetadata = .{
         .{ "kind", "kind", false },
         .{ "name", "name", false },
+        .{ "pin", "pin", true },
         .{ "backend", "backend", true },
         .{ "format", "format", true },
         .{ "quantization", "quantization", true },
@@ -41047,6 +41050,10 @@ pub const ModelRef = struct {
         try jw.write(self.kind);
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.pin) |value| {
+            try jw.objectField("pin");
+            try jw.write(value);
+        }
         if (self.backend) |value| {
             try jw.objectField("backend");
             try jw.write(value);

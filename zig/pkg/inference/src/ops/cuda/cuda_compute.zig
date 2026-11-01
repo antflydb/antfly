@@ -2286,7 +2286,7 @@ pub const CudaCompute = struct {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         return self.capability_profile == .lightonocr3 and self.lighton_precision == .bf16_vision and
             !self.resident_training_cache and self.lazy_host_store == null and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
-            self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1 and self.cublaslt != null;
+            @import("lighton_vision_bf16.zig").deviceSupported(self.ctx.info.compute_major) and self.cublaslt != null;
     }
 
     pub fn lightOnVisionBf16ToF32(cb: *const ops.ComputeBackend, input: CT) !?CT {

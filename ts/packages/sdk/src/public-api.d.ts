@@ -30546,6 +30546,11 @@ export interface components {
              * @example antflydb/gemma-e2b
              */
             name: string;
+            /**
+             * @description Keep a successfully preloaded model pinned against eviction. Set false to warm the ordinary evictable cache before serving; idle and model-count policy still apply.
+             * @default true
+             */
+            pin?: boolean;
             backend?: components["schemas"]["ModelBackend"];
             format?: components["schemas"]["ModelFormat"];
             quantization?: components["schemas"]["ModelQuantization"];

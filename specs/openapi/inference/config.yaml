@@ -1335,6 +1335,11 @@ components:
           type: string
           description: Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
           example: antflydb/gemma-e2b
+        pin:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: true
+          description: Keep a successfully preloaded model pinned against eviction. Set false to warm the ordinary evictable cache before serving; idle and model-count policy still apply.
         backend:
           $ref: "#/components/schemas/ModelBackend"
         format:
