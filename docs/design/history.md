@@ -31,6 +31,7 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 
 | Area | Document | Design doc | Summary |
 |------|----------|------------|---------|
+| Compilation | [compile work avoidance](compilation/history/work-avoidance-2026-11-01.md) | [zig/COMPILATION.md](../../zig/COMPILATION.md) | Opaque query callers, concrete value plans, caller-only engine transport, focused builds and emitted-code attribution |
 | Compilation | [query owner redesign](compilation/history/query-owner-redesign-2026-11-01.md) | [zig/COMPILATION.md](../../zig/COMPILATION.md) | Dedicated production query archive, checked DB borrows, cache isolation and release qualification |
 | Compilation | [work reduction](compilation/history/work-reduction-2026-11-01.md) | [zig/COMPILATION.md](../../zig/COMPILATION.md) | Canonical mutation values, concrete request planner, shared common test compilation, and reachable compiler inventory |
 | VOPR | [vopr/status-history.md](vopr/history/status-history.md) | [zig/VOPR.md](../../zig/VOPR.md) | Scenario-version status preamble (v9–v53) and verification-audit narrative |

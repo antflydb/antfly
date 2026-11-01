@@ -131,6 +131,36 @@ large test mergers, external asset loading, or generic-owner refactors should
 be driven by these reports. Externalizing assets would also change standalone
 deployment; no such dependency is introduced by these experiments.
 
+## Focused plan and caller compilation
+
+The [work-avoidance follow-up](../docs/design/compilation/history/work-avoidance-2026-11-01.md)
+adds a separate small build graph, concrete query-window/domain plans and opaque
+compiled query callers. Foreign storage/inference callers use checked caller-only
+transport, so they no longer emit the provider's complete method dispatcher.
+Production ownership remains eight runtime archives plus shared physical owners.
+
+```sh
+cd zig
+python3 tools/run_bounded_zig_build.py -- build --build-file build.focused.zig test
+make watch-plans                         # default: query-paging-test
+make watch-plans WATCH_STEP=aggregation-plan-test
+make watch-linux                         # pinned Linux compiler through Docker
+python3 tools/run_bounded_zig_build.py -- build opaque-query-consumer-compile
+```
+
+The focused graph runs 33 mutation, transform, paging and aggregation tests using
+production implementations and value contracts. The normal unit gate includes
+the two query-plan owners as well (219 compiler jobs in the CPU-only inventory).
+The compiled query regression caller uses only opaque owner capabilities, including
+repository-backed retained continuations after the donor DB has been deleted.
+`local-query-owner-test` and `opaque-query-owner-test` reuse that same artifact.
+
+Native macOS watch remains ordinary on the pinned compiler; Linux supports the
+incremental path. The follow-up records verified edit timings, failing compiler
+experiments, emitted-code checks and the limits of the release measurements.
+The original 137-to-5-second Linux storage-loop observation concerns a different
+workload and is not a matched baseline for these focused planner tests.
+
 ## Main goal
 
 Build the complete Antfly release reliably and quickly in `ReleaseFast` on the
@@ -792,6 +822,31 @@ not split dispatch names while both sides instantiate the same engine.
 Storage and inference experiments should be measured independently before
 combining them. Otherwise a regression in one unit can be hidden by scheduling
 variance in the other.
+
+### Attribute the current largest owners
+
+A native CPU-only profile also placed the API compiler above storage/inference
+in sampled RSS. Measure API separately instead of assuming generated schemas
+or model dispatch dominate. Install and inspect the exact production owners:
+
+```sh
+cd zig
+zig build runtime-archives -Doptimize=fast -Dstrip=true
+# runtime-unit-api_kernel, runtime-unit-storage-engine and
+# runtime-unit-inference-core also expose independent compiler steps.
+cd ..
+python3 scripts/report_zig_archive_work.py \
+  --artifact query=zig/zig-out/lib/libantfly-runtime-local_query.a \
+  --artifact storage=zig/zig-out/lib/libantfly-storage-kernel.a \
+  --forbid 'query=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
+  --forbid 'storage=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
+  --output .benchmark-results/compile-costs/archive-work.json
+```
+
+Text sizes and repeated names identify candidates; they do not measure LLVM
+work or establish that every same-named function is identical. The profile
+workflow retains this report for all production owners. Native CPU observations
+do not lower the separately qualified GPU, Linux or cross-SDK reservations.
 
 ### Artifact and duplication budget
 
