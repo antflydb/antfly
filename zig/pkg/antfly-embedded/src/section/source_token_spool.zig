@@ -359,7 +359,7 @@ pub const Spool = struct {
             defer for (&ranges) |*list| list.deinit(self.a);
             var counts: [16]usize = @splat(0);
             {
-                const buffer_bytes = @min(16 * 1024, @max(16, (headroom / 64) / 16 * 16));
+                const buffer_bytes: usize = @min(16 * 1024, @max(16, (headroom / 64) / 16 * 16));
                 const buffers = try self.a.alloc(u8, 16 * buffer_bytes);
                 defer self.a.free(buffers);
                 var used: [16]usize = @splat(0);
