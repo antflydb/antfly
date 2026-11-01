@@ -9,7 +9,7 @@ approved hosted control module, durable write contract or memory ceiling changes
 
 The authenticated primitive fixture uses two Workers, one SQLite-backed Durable
 Object namespace and one R2 bucket per fresh stack. All operations have fixed
-keys, bounded input and fixed response size; it accepts no arbitrary SQL, URLs,
+keys, bounded input and a fixed 1 KiB response payload with bounded diagnostic metadata; it accepts no arbitrary SQL, URLs,
 object names, memory sizes or credentials. Operations are app echo, service echo,
 owner echo, owner storage GET, owner storage PUT plus sync, R2 GET and conditional
 R2 PUT, including R2 calls from the owner isolate holding the synthetic memory. Successful writes are read back outside their timed population. Owner
@@ -77,13 +77,14 @@ batch-window experiment; they are not the approved hosted `c44896ac8c` control.
 
 ## Queueing change
 
-Mutation groups retain the existing two-millisecond coalescing window. A queued
-group now counts time it already waited behind the previous durable commit,
+Mutation groups retain the existing two-millisecond coalescing window. With
+`MUTATION_ELAPSED_BATCH_WINDOW=true`, an opt-in queued group counts time it already waited behind the previous durable commit,
 so handoff does not add another unconditional timer. The callback stays in
 its submitting RPC context. Queue/byte/record bounds, fairness, keyed receipts
 and durability-before-response remain unchanged. A blocked-commit test proves
 that later groups skip the expired window and no caller is answered early.
-This is a small scheduling improvement, not a twofold latency claim.
+The flag defaults off pending isolated paired evidence. This is a small
+scheduling change, not a twofold latency claim.
 
 ## Reproduction and operation
 
@@ -150,3 +151,11 @@ validated. Response failures, recovered log errors, total platform outcomes and
 native/canonical windows must all be considered. Synthetic linear/retained-byte
 counts exclude JS objects, serialization, compiled code and provider storage
 memory. Passing this fixture does not constitute a memory-error or full-gate pass.
+
+
+The hosted execution captures best-effort sanitized Tail for both Workers and
+rejects observed resource errors. Tail may be incomplete; a clean fixture is
+not a full resource-window pass. Unloaded, offered-load and fresh-owner
+populations remain separate. The response profile validator accepts the
+existing camel-case RPC span labels; invalid/omitted labels remain explicit
+in the dropped count, and rejected profile headers are retained for inspection.

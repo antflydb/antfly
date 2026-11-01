@@ -18,7 +18,7 @@ import {reserveInput} from "./request-pool.mjs";
 // A bounded admission queue. The timer lets concurrently arriving RPCs share
 // one native update; callers are resolved only after its durable commit.
 export class MutationGroups {
-  constructor(commit,{clock=Date.now,monotonic=()=>performance.now(),sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms))}={}) { this.clock=clock;this.monotonic=monotonic;this.sleep=sleep;this.commit=commit;this.queue=[];this.bytes=0;this.pending=0;this.running=false; }
+  constructor(commit,{clock=Date.now,monotonic=()=>performance.now(),sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),reuseElapsedWindow=false}={}) { this.clock=clock;this.monotonic=monotonic;this.sleep=sleep;this.reuseElapsedWindow=reuseElapsedWindow;this.commit=commit;this.queue=[];this.bytes=0;this.pending=0;this.running=false; }
   submit(input) {
     const bytes=new TextEncoder().encode(JSON.stringify(input)).byteLength;
     if(bytes>1024*1024)throw new Error("RequestTooLarge");
@@ -31,7 +31,7 @@ export class MutationGroups {
       ready.then(async owner=>{if(!owner)return;
         // A queued group has already spent its coalescing window waiting for
         // the previous durable commit. Do not add another timer on handoff.
-        const delay=Math.max(0,2-(this.monotonic()-submitted));if(delay)await this.sleep(delay);await this.drain();});
+        const delay=this.reuseElapsedWindow?Math.max(0,2-(this.monotonic()-submitted)):2;if(delay)await this.sleep(delay);await this.drain();});
       this.queue.push({input,bytes,submitted,resolve:value=>{admit(false);resolve(value);},reject:error=>{admit(false);reject(error);},startGroup:()=>admit(true),release,deadline:this.clock()+30000});this.schedule();
     });
   }

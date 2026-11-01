@@ -13,12 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const flags=['RESIDENT_SERVING','RESIDENT_DURABLE_BOOTSTRAP','RESIDENT_COLD_PIPELINE','RESIDENT_READ_COHORTS','RESIDENT_FETCH_COALESCE','NATIVE_WRITE_PLAN','NATIVE_WRITE_READ_AHEAD','NATIVE_READ_AFFINITY','WAL_DOCUMENT_INDEX'];
+const flags=['MUTATION_ELAPSED_BATCH_WINDOW','RESIDENT_SERVING','RESIDENT_DURABLE_BOOTSTRAP','RESIDENT_COLD_PIPELINE','RESIDENT_READ_COHORTS','RESIDENT_FETCH_COALESCE','NATIVE_WRITE_PLAN','NATIVE_WRITE_READ_AHEAD','NATIVE_READ_AFFINITY','WAL_DOCUMENT_INDEX'];
 const counters=['calls','bytes_read','bytes_written','io_waves','wait_union_ms','concurrency_peak','resource_failures','resident_read_cache_hits','operations','transferred_bytes','working_set_peak_bytes'];
 const safeNumbers=value=>Object.fromEntries(counters.filter(k=>Number.isFinite(value?.[k])&&value[k]>=0).map(k=>[k,value[k]]));
 export function phaseProfile(trace,env,{physical,metrics,callers=1,traceIds=[]}={}){
  if(env.QUALIFICATION_PHASE_PROFILE!=='true')return undefined;
- const report=trace.report(),spans=report.spans.filter(s=>/^[a-z][a-z0-9_:.-]{0,63}$/.test(s.name)&&Number.isFinite(s.start_ms)&&Number.isFinite(s.duration_ms)&&s.duration_ms>=0),ids=[...new Set([trace.id,...traceIds])].filter(id=>/^[a-f0-9-]{36}$/.test(id));
+ const report=trace.report(),spans=report.spans.filter(s=>/^[a-zA-Z][a-zA-Z0-9_:.-]{0,63}$/.test(s.name)&&Number.isFinite(s.start_ms)&&Number.isFinite(s.duration_ms)&&s.duration_ms>=0),ids=[...new Set([trace.id,...traceIds])].filter(id=>/^[a-f0-9-]{36}$/.test(id));
  return{schema:1,trace_id:trace.id,scope:trace.scope,clock:'isolate-local-I/O-advanced; zero is not zero CPU',elapsed_ms:report.elapsed_ms,spans:spans.slice(0,64),dropped:report.dropped_spans+(report.spans.length-spans.length)+Math.max(0,spans.length-64),errors:report.errors.length,trace_ids:ids.slice(0,16),callers:Math.max(1,Math.min(16,callers)),physical:safeNumbers(physical),metrics:safeNumbers(metrics),active:Object.fromEntries(flags.map(k=>[k,env[k]==='true']))};
 }
 export function profileResult(result,trace,env,extra){const profile=phaseProfile(trace,env,extra);if(!profile)return result;if(Array.isArray(result.results))return{...result,results:result.results.map(r=>({...r,__antfly_profile:profile}))};return{...result,__antfly_profile:profile};}

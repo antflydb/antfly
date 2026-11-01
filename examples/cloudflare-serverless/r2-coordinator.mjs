@@ -384,7 +384,7 @@ export class R2CommitCoordinator extends DurableObject {
     return result;
   }
   mutateBatch(input) {
-    this.mutationGroups??=new MutationGroups((inputs,deadline,admission)=>this.commitMutations(inputs,deadline,admission));
+    this.mutationGroups??=new MutationGroups((inputs,deadline,admission)=>this.commitMutations(inputs,deadline,admission),{reuseElapsedWindow:this.env.MUTATION_ELAPSED_BATCH_WINDOW==='true'});
     return this.mutationGroups.submit(input);
   }
   async commitMutations(inputs,deadline=Date.now()+30000,admission) {
