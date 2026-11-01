@@ -19875,7 +19875,7 @@ test "httpx inference gateway deployment disable fences public routes but preser
     defer internal.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), internal.status);
     try std.testing.expectEqual(@as(usize, 1), target.calls);
-    try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.forbidden, try server.authorizeInferenceRequest(.{}, .write));
+    try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.public_inference_disabled, try server.authorizeInferenceRequest(.{}, .write));
     try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.allowed, try server.authorizeInferenceRequest(.{}, .read));
     var request = try httpx.Request.init(a, .GET, "/ai/v1/models");
     defer request.deinit();

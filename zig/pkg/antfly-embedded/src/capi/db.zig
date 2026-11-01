@@ -2863,6 +2863,7 @@ pub fn openLiteHandleAllocWithSharedInference(
     }
     if (resolved.externally_locked) {
         backend.native_docstore.?.file.externally_locked = true;
+        backend.native_docstore.?.file.allocator_certificate_on_commit = resolved.profile == .native and resolved.open_mode == .writer;
         backend.native_docstore.?.maintenance_start_suppressed = true;
     }
 
