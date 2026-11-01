@@ -116,6 +116,7 @@ pub const regions = r.regions(&.{
     r.cudaSourceFamily("expert.projection.direct", program.render(@embedFile("native/cuda/expert_projection.cu"), cuda_phases.projection)),
     r.cudaSourceFamily("kv.storage.direct", @embedFile("native/cuda/kv_storage.cu")),
     r.cudaSourceFamily("normalization.direct", @embedFile("native/cuda/normalization_direct.cu")),
+    r.cudaSourceFamily("projection.q4q8.rows", program.render(@embedFile("native/cuda/q4_q8_rows.cu"), cuda_phases.projection)),
     r.cudaSourceFamily("projection.direct", program.render(@embedFile("native/cuda/projection_direct.cu"), cuda_phases.projection)),
     r.cudaSourceFamily("selection.direct", @embedFile("native/cuda/selection.cu")),
     r.cudaSourceFamily("sequence.transforms.direct", @embedFile("native/cuda/sequence_transforms.cu")),

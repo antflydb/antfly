@@ -101,6 +101,8 @@ pub const attention = .{
 };
 
 pub const projection = .{
+    .q4q8_rows_linear = program.render(q4q8_rows, .{ .array_rows = "Rows", .warp_count = "8" }),
+    .q4q8_rows_qkv = program.render(q4q8_rows, .{ .array_rows = "4", .warp_count = "4" }),
     .q4q8_pair_dot_u32_inner = program.render(q4q8_pair_dot, .{ .indent = "                ", .index_cast = "" }),
     .q4q8_pair_dot_u64_inner = program.render(q4q8_pair_dot, .{ .indent = "                ", .index_cast = "(size_t)" }),
     .q4q8_pair_dot_u32_tail = program.render(q4q8_pair_dot, .{ .indent = "                    ", .index_cast = "" }),
@@ -249,6 +251,102 @@ const q4q8_pair_warp =
     \\        if (lane == 0u && warp < {{warps}}) {
     \\            gate_partial[c][warp] = gate_sum;
     \\            up_partial[c][warp] = up_sum;
+    \\        }
+    \\    }
+;
+
+// Preserve the array extents, lane reductions, and full/tail paths of each schedule.
+const q4q8_rows =
+    \\    #pragma unroll
+    \\    for (unsigned int r = 0u; r < rows_per_block; ++r) {
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0u; c < cols; ++c) acc[r][c] = 0.0f;
+    \\    }
+    \\
+    \\    unsigned int iqs = (tid & 1u) * 2u;
+    \\    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
+    \\        float q8_d[{{array_rows}}];
+    \\        int q8_low0[{{array_rows}}];
+    \\        int q8_high0[{{array_rows}}];
+    \\        int q8_low1[{{array_rows}}];
+    \\        int q8_high1[{{array_rows}}];
+    \\        unsigned int q8_base0 = iqs * 4u;
+    \\        unsigned int q8_base1 = q8_base0 + 4u;
+    \\        #pragma unroll
+    \\        for (unsigned int r = 0u; r < rows_per_block; ++r) {
+    \\            unsigned int row = row_base + r;
+    \\            if (row < rows) {
+    \\                const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
+    \\                unsigned short q8_d_h = (unsigned short)q8_bp[0] | ((unsigned short)q8_bp[1] << 8);
+    \\                q8_d[r] = termite_half_to_float(q8_d_h);
+    \\                const signed char* q8_values = (const signed char*)(q8_bp + 4u);
+    \\                q8_low0[r] = termite_load_i8x4_aligned(q8_values + q8_base0);
+    \\                q8_high0[r] = termite_load_i8x4_aligned(q8_values + q8_base0 + 16u);
+    \\                q8_low1[r] = termite_load_i8x4_aligned(q8_values + q8_base1);
+    \\                q8_high1[r] = termite_load_i8x4_aligned(q8_values + q8_base1 + 16u);
+    \\            } else {
+    \\                q8_d[r] = 0.0f;
+    \\                q8_low0[r] = 0;
+    \\                q8_high0[r] = 0;
+    \\                q8_low1[r] = 0;
+    \\                q8_high1[r] = 0;
+    \\            }
+    \\        }
+    \\
+    \\        if (full_tile) {
+    \\            #pragma unroll
+    \\            for (unsigned int c = 0u; c < cols; ++c) {
+    \\                unsigned int col = col_tile + c;
+    \\                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
+    \\                #pragma unroll
+    \\                for (unsigned int r = 0u; r < rows_per_block; ++r) {
+    \\                    if (row_base + r < rows) {
+    \\                        acc[r][c] += termite_q4_0_q8_1_partial_mmvq2(bp, q8_d[r], iqs, q8_low0[r], q8_high0[r], q8_low1[r], q8_high1[r]);
+    \\                    }
+    \\                }
+    \\            }
+    \\        } else {
+    \\            #pragma unroll
+    \\            for (unsigned int c = 0u; c < cols; ++c) {
+    \\                unsigned int col = col_tile + c;
+    \\                if (col < out_dim) {
+    \\                    const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
+    \\                    #pragma unroll
+    \\                    for (unsigned int r = 0u; r < rows_per_block; ++r) {
+    \\                        if (row_base + r < rows) {
+    \\                            acc[r][c] += termite_q4_0_q8_1_partial_mmvq2(bp, q8_d[r], iqs, q8_low0[r], q8_high0[r], q8_low1[r], q8_high1[r]);
+    \\                        }
+    \\                    }
+    \\                }
+    \\            }
+    \\        }
+    \\    }
+    \\
+    \\    #pragma unroll
+    \\    for (unsigned int r = 0u; r < rows_per_block; ++r) {
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0u; c < cols; ++c) {
+    \\            float sum = termite_warp_reduce_sum(acc[r][c]);
+    \\            if (lane == 0u && warp < {{warp_count}}u) warp_partial[r][c][warp] = sum;
+    \\        }
+    \\    }
+    \\    __syncthreads();
+    \\    if (tid == 0u) {
+    \\        #pragma unroll
+    \\        for (unsigned int r = 0u; r < rows_per_block; ++r) {
+    \\            unsigned int row = row_base + r;
+    \\            if (row < rows) {
+    \\                #pragma unroll
+    \\                for (unsigned int c = 0u; c < cols; ++c) {
+    \\                    unsigned int col = col_tile + c;
+    \\                    if (col < out_dim) {
+    \\                        float y = 0.0f;
+    \\                        #pragma unroll
+    \\                        for (unsigned int w = 0u; w < {{warp_count}}u; ++w) y += warp_partial[r][c][w];
+    \\                        dst[row * out_dim + col] = y;
+    \\                    }
+    \\                }
+    \\            }
     \\        }
     \\    }
 ;

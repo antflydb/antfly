@@ -153,3 +153,10 @@ test "Metal attention phases reject unknown references and preserve surrounding 
     defer a.free(expected);
     try std.testing.expectEqualStrings(expected, text);
 }
+
+/// Native format phase; arguments retain the caller's static tile/storage layout.
+pub const flash_value_accumulation = "        for (uint kk8 = 0u; kk8 < {d}u; ++kk8) {{ uint {s} = sphys[kk8 * 8u]; simdgroup_half8x8 mp; simdgroup_load(mp, sp + kk8 * 8u, {d}u); for (uint dt = 0u; dt < 8u; ++dt) {{ uint d8 = dslice + dt * 8u; simdgroup_half8x8 mv; if (kc + kk8 * 8u + 8u <= p.kv_tokens) {{ const device half *vbase = v_half + {s} * p.v_row_stride + kv_head_base + d8; simdgroup_load(mv, vbase, p.v_row_stride); }} else {{ threadgroup half *sv = (threadgroup half *)ss + uint(sgitg) * 64u; for (uint vi = uint(lane); vi < 64u; vi += 32u) {{ uint vr = vi / 8u; uint vc = vi - vr * 8u; uint vphys = sphys[kk8 * 8u + vr]; sv[vi] = vphys != 0xffffffffu ? v_half[vphys * p.v_row_stride + kv_head_base + d8 + vc] : half(0.0f); }} simdgroup_barrier(mem_flags::mem_threadgroup); simdgroup_load(mv, sv, 8u); }} simdgroup_multiply_accumulate(mo[dt], mp, mv, mo[dt]); }} }}\n";
+
+pub const flash_full_output = "    if (q0 + 8u <= p.q_len) {{ for (uint dt = 0u; dt < 8u; ++dt) simdgroup_store(mo[dt], output + q0 * q_stride + h * {d}u + dslice + dt * 8u, q_stride); return; }}\n";
+
+pub const flash_tail_output = "    const uint valid_rows = p.q_len - q0; for (uint owner = 0u; owner < {d}u; ++owner) {{ threadgroup_barrier(mem_flags::mem_threadgroup); if (uint(sgitg) == owner) for (uint dt = 0u; dt < 8u; ++dt) simdgroup_store(mo[dt], so + dt * 8u, 64u); threadgroup_barrier(mem_flags::mem_threadgroup); for (uint i = uint(tid); i < valid_rows * 64u; i += {d}u) {{ uint j = i / 64u; uint d = i - j * 64u; output[(q0 + j) * q_stride + h * {d}u + owner * 64u + d] = so[i]; }} }}\n";

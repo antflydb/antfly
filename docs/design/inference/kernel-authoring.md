@@ -95,6 +95,13 @@ width and schedule contracts when adding an instance. Before removing a
 computed helper fragment, inspect both its generator consumers and references
 in the complete native bundle plus recursively included project headers.
 
+CUDA multi-row Q4/Q8 linear and QKV programs share `cuda_phases` row
+accumulation/publication with explicit operand-array extents and warp counts.
+Keep the named two-row operand schedule separate unless new qualification
+supports changing its register contract. Metal Flash value/output phases retain
+explicit key-tile pitch, head width, output owners and launch stride; their
+score/softmax schedules remain independently admitted.
+
 The portable causal stencil is compiled directly as CUDA and stringified as MSL.
 It is not a runtime interpreter. Protect emitted source from host SDK macros and
 reserved shader identifiers. Separate-product rounding has an explicit CUDA

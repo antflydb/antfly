@@ -28,6 +28,7 @@ pub const paths = [_][]const u8{
     "src/tile/families/native/cuda/kv_storage.cu",
     "src/tile/families/native/cuda/normalization_direct.cu",
     "src/tile/families/native/cuda/projection_direct.cu",
+    "src/tile/families/native/cuda/q4_q8_rows.cu",
     "src/tile/families/native/cuda/selection.cu",
     "src/tile/families/native/cuda/sequence_transforms.cu",
     "src/tile/families/native/cuda/tensor_layout.cu",
