@@ -19,7 +19,8 @@
 Requires an otherwise idle GPU 0. CUDA graph replay and events share one
 explicit stream; each trial executes 100 complete attention/combine operations.
 Five warm device-time trials exclude Python dispatch and CPU oracle work.
-Every path is checked against an independent FP64 oracle, output/scratch
+Every path uses shuffled physical pages and NaN-filled holes, checked against
+an independent FP64 oracle, output/scratch
 canaries and read-only inputs. This is not a full-model throughput result.
 """
 
@@ -92,10 +93,24 @@ try:
                     continue
                 future = 3962 if context in [1914, 2697] else context
                 chunks = math.ceil(future / chunk)
-                capacity = rows * pages * 16
+                blocks = rows * pages
+                capacity = (2 * blocks + 2) * 16
                 q = torch.randn(rows, heads, 256)
                 k = torch.randn(capacity, kh, 256).half()
                 v = torch.randn_like(k)
+                order = torch.randperm(blocks).tolist()
+                tables = [
+                    [2 * x + 1 for x in order[row * pages : (row + 1) * pages]]
+                    for row in range(rows)
+                ]
+                for values in (k, v):
+                    values.reshape(-1, 16, kh, 256)[::2].fill_(float("nan"))
+                    values[2 * blocks * 16 :].fill_(float("nan"))
+                    if context % 16:
+                        for table in tables:
+                            values[
+                                table[-1] * 16 + context % 16 : (table[-1] + 1) * 16
+                            ].fill_(float("nan"))
                 qg, kg, vg = q.cuda(), k.cuda(), v.cuda()
                 output = torch.full((rows * heads * 256 + 16,), 123456.0, device="cuda")
                 partial = torch.full(
@@ -121,9 +136,7 @@ try:
                 )
                 for row in range(rows):
                     p.pages[row] = Page(context, context - 1, pages, row * pages)
-                    p.blocks[row * pages : (row + 1) * pages] = range(
-                        row * pages, (row + 1) * pages
-                    )
+                    p.blocks[row * pages : (row + 1) * pages] = tables[row]
                 args = (c.c_void_p * 1)(c.addressof(p))
                 measurements = {}
                 outputs = {}
@@ -181,24 +194,29 @@ try:
                         assert bool((tensor[-16:] == 123456.0).all())
                 maximum = 0.0
                 for row in range(rows):
-                    keys = k[row * pages * 16 : row * pages * 16 + context].double()
-                    values = v[row * pages * 16 : row * pages * 16 + context].double()
+                    physical = torch.cat(
+                        [
+                            torch.arange(page * 16, (page + 1) * 16)
+                            for page in tables[row]
+                        ]
+                    )[:context]
+                    keys = k[physical].double()
+                    values = v[physical].double()
                     query = q[row].double().reshape(kh, heads // kh, 256)
                     weights = (
                         torch.einsum("tkd,khd->tkh", keys, query).div(16).softmax(dim=0)
                     )
                     expected = torch.einsum("tkh,tkd->khd", weights, values)
                     for actual in outputs.values():
+                        assert bool(torch.isfinite(actual[row]).all())
                         maximum = max(
                             maximum,
                             float((actual[row].double() - expected).abs().max()),
                         )
                 assert maximum < 2e-5, maximum
-                assert (
-                    torch.equal(qg.cpu(), q)
-                    and torch.equal(kg.cpu(), k)
-                    and torch.equal(vg.cpu(), v)
-                )
+                torch.testing.assert_close(qg.cpu(), q, rtol=0, atol=0)
+                torch.testing.assert_close(kg.cpu(), k, rtol=0, atol=0, equal_nan=True)
+                torch.testing.assert_close(vg.cpu(), v, rtol=0, atol=0, equal_nan=True)
                 result = {
                     "heads": heads,
                     "kv_heads": kh,
@@ -209,6 +227,7 @@ try:
                     "max_abs": maximum,
                     "canaries": True,
                     "readonly": True,
+                    "fragmented_pages_and_masked_holes": True,
                     "microseconds": measurements,
                     "grouped_over_ungrouped": measurements["grouped"]
                     / measurements["ungrouped"],
@@ -223,6 +242,7 @@ report = {
     "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
     "scope": "Synthetic attention+combine device time, graph replay, CPU FP64 oracle and output canaries; no full-model throughput claim",
     "torch_version": torch.__version__,
+    "benchmark_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
     "seed": 42,
     "operations_per_graph": 100,
     "trials": 5,
