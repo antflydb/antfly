@@ -31,7 +31,9 @@ class ArchiveWorkTests(unittest.TestCase):
             "a.a[one.o]: ltmp0 t 0 0\na.a[one.o]: l_first t 0 0\na.a[one.o]: l_alias t 0 0\na.a[one.o]: l_next t 30 0\na.a[two.o]: l_other t 0 0\na.a[two.o]: l_end t 10 0\n"
         )
         self.assertTrue(estimated)
-        self.assertEqual(sorted(r["bytes"] for r in rows), [10, 30])
+        self.assertEqual(sorted(r["bytes"] for r in rows), [0, 0, 10, 30])
+        self.assertEqual(sum(r["extent_unknown"] for r in rows), 2)
+        self.assertTrue(any(r["aliases"] for r in rows))
         self.assertTrue(all(r["estimated"] for r in rows))
 
     def test_names_with_spaces_and_undefined_symbols(self):
@@ -49,7 +51,14 @@ class ArchiveWorkTests(unittest.TestCase):
         self.assertEqual(value["units"][0]["categories"]["json_encoding"], 100)
         self.assertEqual(report([("a", a + a, False)])["repeated_named_families"], [])
         self.assertEqual(family("l_foo.apply.123"), "foo.apply#")
+        self.assertEqual(
+            family("local_query_provider.execute"), "local_query_provider.execute"
+        )
         self.assertEqual(category("storage.db.mutation_plan.prepare"), "mutation")
+        self.assertEqual(
+            category("types.openApiParseObject__anon_12"), "generated_contracts"
+        )
+        self.assertEqual(category("jpeg2000.codestream.parseState"), "image_codecs")
 
 
 if __name__ == "__main__":

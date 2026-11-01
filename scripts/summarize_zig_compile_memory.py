@@ -100,7 +100,7 @@ def summarize(text, response_dir=None, capture_dir=None):
             (
                 a
                 for a in arguments
-                if a in ("test", "build-exe", "build-lib", "build-obj")
+                if a in ("test", "test-obj", "build-exe", "build-lib", "build-obj")
             ),
             None,
         )

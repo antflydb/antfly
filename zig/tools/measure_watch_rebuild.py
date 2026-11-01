@@ -50,6 +50,12 @@ def successful_summary(output):
     return True
 
 
+def qualified_summary(output, budget):
+    marker = "ANTFLY_WATCH_BUDGET=" + str(budget)
+    position = output.rfind(marker)
+    return position >= 0 and successful_summary(output[position:])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("ordinary", "incremental"), required=True)
@@ -178,11 +184,9 @@ def main():
                             "",
                             log[phase_start:].decode(errors="replace"),
                         )
-                        marker = "ANTFLY_WATCH_BUDGET=" + (
-                            "100000" if phase == "initial" else "100001"
-                        )
-                        position = output.rfind(marker)
-                        if position >= 0 and successful_summary(output[position:]):
+                        if qualified_summary(
+                            output, 100000 if phase == "initial" else 100001
+                        ):
                             break
                         if process.poll() is not None:
                             raise RuntimeError(

@@ -196,7 +196,7 @@ find_zig_compile_pids() {
     ps -Ao pid=,ppid=,comm=,args= | awk -v root_pid="${root_pid}" '
         {
             parents[$1]=$2
-            if ($0 ~ /zig (build-(exe|lib|obj)|test)( |$)/) candidates[$1]=1
+            if ($0 ~ /zig (build-(exe|lib|obj)|test(-obj)?)( |$)/) candidates[$1]=1
         }
         END {
             for (pid in candidates) {

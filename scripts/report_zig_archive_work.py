@@ -64,26 +64,41 @@ def parse_text_symbols(output):
             if inferred:
                 estimated = True
                 size = extents.get(address, address) - address
-            if size:
-                symbols.append(
-                    dict(object=obj, name=name, bytes=size, estimated=inferred)
+            symbols.append(
+                dict(
+                    object=obj,
+                    name=name,
+                    bytes=size,
+                    estimated=inferred,
+                    extent_unknown=inferred and address not in extents,
+                    aliases=[alias for alias, _ in aliases if alias != name],
                 )
+            )
     return symbols, estimated
 
 
 def family(name):
-    name = re.sub(r"^(?:l_?|_)(?=[A-Za-z])", "", name)
+    name = re.sub(r"^(?:l_|_)(?=[A-Za-z])", "", name)
     # Disambiguators differ across independently compiled objects.
     return re.sub(r"(?:__anon_|\.__struct_|\.)(\d+)(?=\D|$)", "#", name)
 
 
 def category(name):
+    lowered = name.lower()
     if "json.Stringify" in name or "json.stringify" in name:
         return "json_encoding"
     if "json.static" in name or "json.parse" in name or "json.Scanner" in name:
         return "json_decoding"
-    if "openapi" in name:
+    if "openapi" in lowered:
         return "generated_contracts"
+    if any(codec in lowered for codec in ("jpeg", "png.", "webp.", "gif.", "image.")):
+        return "image_codecs"
+    if "pdf." in lowered:
+        return "pdf"
+    if "tls." in lowered:
+        return "tls"
+    if "lake_index" in lowered or "serverless.build." in lowered:
+        return "lake_build"
     if "mutation_" in name:
         return "mutation"
     if "aggregation" in name:
@@ -186,7 +201,10 @@ def main():
                 value["violations"].extend(
                     dict(owner=owner, symbol=symbol["name"])
                     for symbol in symbols
-                    if substring in symbol["name"]
+                    if any(
+                        substring in name
+                        for name in [symbol["name"], *symbol.get("aliases", [])]
+                    )
                 )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(value, indent=2) + "\n")

@@ -24,6 +24,11 @@ from summarize_zig_compile_memory import summarize
 
 class DiagnosticTests(unittest.TestCase):
     def test_exact_command_keeps_arguments_failure_and_compiler_cpu_samples(self):
+        for compiler in ("test", "test-obj"):
+            with self.subTest(compiler=compiler):
+                self.check_compiler_samples(compiler)
+
+    def check_compiler_samples(self, compiler):
         script = Path(__file__).with_name("diagnose-zig-build-memory.sh")
         with tempfile.TemporaryDirectory(prefix="antfly-command-test-") as tmp:
             root = Path(tmp)
@@ -37,7 +42,7 @@ class DiagnosticTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 'if [ "$1" = build ]; then\n'
                 '  printf "%s" "$2" > "$ARGUMENT_FILE"\n'
-                '  "$0" test "@$RESPONSE_FILE" &\n'
+                f'  "$0" {compiler} "@$RESPONSE_FILE" &\n'
                 '  wait "$!"\n'
                 "else\n"
                 "  sleep 1\n"
@@ -92,7 +97,7 @@ class DiagnosticTests(unittest.TestCase):
                 response_dir=root / "logs/command.response-files",
             )
             self.assertGreater(report["units"]["storage_kernel"]["peak_rss_bytes"], 0)
-            self.assertEqual(report["compilations"][0]["kind"], "test")
+            self.assertEqual(report["compilations"][0]["kind"], compiler)
             response.unlink()
             self.assertEqual(
                 summarize(

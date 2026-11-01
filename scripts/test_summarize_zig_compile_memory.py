@@ -26,6 +26,14 @@ class SummaryTests(unittest.TestCase):
         )
         self.assertEqual(report["compilations"][0]["name"], "configurer")
 
+    def test_test_objects_are_attributed_as_compilers(self):
+        report = summarize(
+            "header\nnow\t0\t10\t1024\t1\tzig test-obj --name opaque-query-owner-tests -Ofast -Mroot=caller.zig\t0\n"
+        )
+        self.assertEqual(report["compilations"][0]["kind"], "test-obj")
+        self.assertEqual(report["compilations"][0]["name"], "opaque-query-owner-tests")
+        self.assertEqual(report["compilations"][0]["roots"], ["-Mroot=caller.zig"])
+
     def test_test_compilers_with_same_name_keep_distinct_filters_and_peaks(self):
         report = summarize(
             "header\n"

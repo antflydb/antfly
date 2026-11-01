@@ -15,7 +15,7 @@
 
 import unittest
 
-from measure_watch_rebuild import successful_summary
+from measure_watch_rebuild import qualified_summary, successful_summary
 
 
 class WatchSummaryTests(unittest.TestCase):
@@ -41,6 +41,28 @@ class WatchSummaryTests(unittest.TestCase):
             successful_summary(
                 "Build Summary: 8/8 steps succeeded\nBuild Summary: 2/8 steps succeeded (1 failed)\n"
             )
+
+    def test_cached_old_value_cannot_qualify_an_edit(self):
+        self.assertFalse(
+            qualified_summary(
+                "ANTFLY_WATCH_BUDGET=100000\nBuild Summary: 3/3 steps succeeded\n",
+                100001,
+            )
+        )
+
+    def test_summary_must_follow_the_edited_value(self):
+        self.assertFalse(
+            qualified_summary(
+                "Build Summary: 3/3 steps succeeded\nANTFLY_WATCH_BUDGET=100001\n",
+                100001,
+            )
+        )
+        self.assertTrue(
+            qualified_summary(
+                "ANTFLY_WATCH_BUDGET=100001\nBuild Summary: 3/3 steps succeeded\n",
+                100001,
+            )
+        )
 
 
 if __name__ == "__main__":
