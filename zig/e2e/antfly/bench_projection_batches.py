@@ -40,12 +40,20 @@ def main():
     p.add_argument("--rounds", type=int, default=8)
     p.add_argument(
         "--metadata-shape",
-        choices=("scalar", "nested"),
+        choices=("scalar", "nested", "uncovered"),
         default="scalar",
         help="nested projects an object with arrays in addition to scalar receipt fields",
     )
     p.add_argument("--queries-per-phase", type=int, default=5)
+    p.add_argument(
+        "--select-mode",
+        choices=("conditional", "reference", "plain"),
+        default="conditional",
+    )
+    p.add_argument("--padding-bytes", type=int, default=0)
     args = p.parse_args()
+    if not 0 <= args.padding_bytes <= 16 * 1024 * 1024:
+        p.error("padding bytes must be in 0..16 MiB")
     try:
         validate_rounds(args.rounds, attribution=False)
     except ValueError as error:
@@ -68,6 +76,12 @@ def main():
         }
         for i in range(args.documents)
     }
+    if args.padding_bytes:
+        for document in documents.values():
+            document["padding"] = "p" * args.padding_bytes
+    if args.metadata_shape == "uncovered":
+        for document in documents.values():
+            document["metadata"]["permissions"] = "r" * 8192
     if args.metadata_shape == "nested":
         for i, document in enumerate(documents.values()):
             document["metadata"]["details"] = {
@@ -115,7 +129,7 @@ def main():
                         "query": {"bool": {"filter": {"ids": list(documents)}}},
                         "fields": (
                             ["metadata"]
-                            if args.metadata_shape == "nested"
+                            if args.metadata_shape in ("nested", "uncovered")
                             else ["metadata.revision", "metadata.allowed"]
                         ),
                         "limit": args.documents,
@@ -143,6 +157,22 @@ def main():
                         "select": conditional_select("payload.large"),
                         "params": {"known": known},
                     }
+                    if args.select_mode == "plain":
+                        request = query
+                    elif args.select_mode == "reference":
+                        request["select"]["identity"]["args"][0] = {
+                            "call": "jsonb_extract_path",
+                            "args": [
+                                {
+                                    "call": "jsonb_build_object",
+                                    "args": [
+                                        {"literal": "v"},
+                                        {"field": "payload.large"},
+                                    ],
+                                },
+                                {"literal": "v"},
+                            ],
+                        }
                     read = logical_process_reader(server.proc.pid)
                     for query_id in range(args.queries_per_phase):
                         response, usage = measure(
@@ -159,12 +189,13 @@ def main():
                             assert hit["_source"] == {
                                 "metadata": documents[hit["_id"]]["metadata"]
                             }
-                            values = hit["_computed"]
-                            assert (
-                                values["identity"] == known[hit["_id"]]
-                                and values["changed"] is False
-                                and values["value"] is None
-                            )
+                            if args.select_mode != "plain":
+                                values = hit["_computed"]
+                                assert (
+                                    values["identity"] == known[hit["_id"]]
+                                    and values["changed"] is False
+                                    and values["value"] is None
+                                )
                         digest = hashlib.sha256(
                             json.dumps(
                                 {
@@ -172,7 +203,7 @@ def main():
                                         (
                                             h["_id"],
                                             h["_source"],
-                                            h["_computed"],
+                                            h.get("_computed"),
                                             h.get("_score"),
                                         )
                                         for h in hits
@@ -231,6 +262,8 @@ def main():
         "documents": args.documents,
         "value_bytes": args.value_bytes,
         "metadata_shape": args.metadata_shape,
+        "select_mode": args.select_mode,
+        "padding_bytes": args.padding_bytes,
         "corpus_sha256": corpus.hexdigest(),
         "output_sha256": expected_hash,
         "binaries": {k: file_info(v) for k, v in binaries.items()},

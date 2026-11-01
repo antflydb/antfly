@@ -4336,7 +4336,10 @@ fn encodeQueryEnvelope(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest
         const native = try field_projection.nativeTransport(metadata.allocator(), hits, projection);
         // Prefix small native metadata so its reader never scans payloads to
         // find it. The ordinary result and all source bytes are encoded once.
-        return std.json.Stringify.valueAlloc(alloc, .{ ._native_field_views = native, .responses = responses }, options);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{ ._native_field_views = native, .responses = responses }, options);
+        if (!req.field_projection_native_spans) return encoded;
+        defer alloc.free(encoded);
+        return field_projection.NativeSpans.encode(alloc, encoded, hits);
     }
     return std.json.Stringify.valueAlloc(alloc, .{ .responses = responses }, options);
 }
@@ -4428,6 +4431,23 @@ pub fn encodeQueryResponsesWithDelivery(
     result: db_mod.types.SearchResult,
     delivery: ?@import("query_response.zig").Delivery,
 ) !QueryResponse {
+    return encodeQueryResponsesWithDeliveryImpl(alloc, table_name, req, meta, result, delivery) catch |err| {
+        if (err != error.NativeSpanTooLarge or !req.field_projection_native_spans or delivery != null) return err;
+        var fallback = req;
+        fallback.field_projection_native_spans = false;
+        return encodeQueryResponsesWithDeliveryImpl(alloc, table_name, fallback, meta, result, null);
+    };
+}
+
+fn encodeQueryResponsesWithDeliveryImpl(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    requested: db_mod.types.SearchRequest,
+    meta: QueryResponseMeta,
+    result: db_mod.types.SearchResult,
+    delivery: ?@import("query_response.zig").Delivery,
+) !QueryResponse {
+    var req = requested;
     var delivered: ?usize = null;
     var graph_wire_failure: ?anyerror = null;
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
@@ -4438,6 +4458,10 @@ pub fn encodeQueryResponsesWithDelivery(
     const lease = try prepareFieldProjection(arena, req);
     defer if (lease) |value| value.deinit(arena);
     const projection = if (lease) |value| value.plan else null;
+    if (req.field_projection_native_spans) {
+        const native = try field_projection.nativeTransport(arena, emitted_hits, projection);
+        req.field_projection_native_spans = delivery == null and req.graph_queries.len == 0 and field_projection.NativeSpans.eligible(native, emitted_hits);
+    }
     const typed_delivery = req.graph_queries.len == 0 and (if (delivery) |sink| sink.typed_result != null else false);
     const encoded_sources: []?ant_json.RawObject = if (typed_delivery) try arena.alloc(?ant_json.RawObject, emitted_hits.len) else &.{};
     @memset(encoded_sources, null);
@@ -4628,7 +4652,7 @@ fn toOpenApiHitPreparedSource(alloc: std.mem.Allocator, req: db_mod.types.Search
         // ownership boundaries, but adds no `_computed` to public responses.
         if (plan.bindings.len == 0 and !req.field_projection_transport) return api_hit;
         if (ready_computed) |ready| {
-            api_hit._computed = ready;
+            api_hit._computed = if (req.field_projection_native_spans) null else ready;
             return api_hit;
         }
         const previous = if (hit.computed_json) |bytes| try ant_json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{}) else null;

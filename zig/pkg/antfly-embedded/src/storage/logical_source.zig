@@ -72,7 +72,9 @@ pub const SelectedView = struct {
         return true;
     }
     pub fn raw(self: @This(), path: []const u8) ?[]const u8 {
-        const target = self.directory.resolveExact(path) orelse return null;
+        return self.rawField(self.directory.resolveExact(path) orelse return null);
+    }
+    fn rawField(self: @This(), target: projection.Field) ?[]const u8 {
         for (self.fields, self.values) |field, bytes| {
             if (target.offset < field.offset) continue;
             const delta = std.math.cast(usize, target.offset - field.offset) orelse continue;
@@ -96,6 +98,43 @@ pub const SelectedView = struct {
                 return .{ .digest = field.digest, .encoded_length = bytes.len };
         }
         return null;
+    }
+    /// Restrict borrowed extents before constructing containing JSON. Opaque
+    /// ancestors retain their original array/object shape for the public mask.
+    pub fn masked(self: @This(), a: A, roots: []const []const u8) !?SelectedView {
+        if (!self.serves(roots)) return null;
+        var chosen: [projection.maximum_fields]bool = @splat(false);
+        for (roots) |path| if (self.directory.resolve(path)) |field| {
+            chosen[field.index] = true;
+        };
+        var count: usize = 0;
+        for (self.directory.fields) |field| if (chosen[field.index]) {
+            var parent = field.parent;
+            while (parent != projection.no_parent) : (parent = self.directory.fields[parent].parent) {
+                if (chosen[parent]) {
+                    chosen[field.index] = false;
+                    break;
+                }
+            }
+            if (chosen[field.index]) count += 1;
+        };
+        const fields = try a.alloc(projection.Field, count);
+        errdefer a.free(fields);
+        const values = try a.alloc([]const u8, count);
+        errdefer a.free(values);
+        var slot: usize = 0;
+        for (self.directory.fields) |field| if (chosen[field.index]) {
+            fields[slot] = field;
+            values[slot] = self.rawField(field) orelse return error.InvalidDocumentContentAuthority;
+            slot += 1;
+        };
+        return .{ .directory = self.directory, .fields = fields, .values = values };
+    }
+    pub fn materializeMasked(self: @This(), a: A, roots: []const []const u8) ![]u8 {
+        const view = (try self.masked(a, roots)) orelse return error.InvalidDocumentContentAuthority;
+        defer a.free(view.fields);
+        defer a.free(view.values);
+        return view.materialize(a);
     }
     pub fn materialize(self: @This(), a: A) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(a);
@@ -196,6 +235,16 @@ pub const Selection = struct {
         for (roots) |path| if (directory.resolve(path)) |field| {
             chosen[field.index] = true;
         };
+        return initChosen(a, directory, proof, chosen);
+    }
+    /// Root-name callers already resolved literal dots; retain their semantics.
+    pub fn initFields(a: A, directory: projection.Directory, proof: revision.Content, fields: []const projection.Field) !?Selection {
+        var chosen: [projection.maximum_fields]bool = @splat(false);
+        for (fields) |field| chosen[field.index] = true;
+        return initChosen(a, directory, proof, chosen);
+    }
+    fn initChosen(a: A, directory: projection.Directory, proof: revision.Content, initial: [projection.maximum_fields]bool) !?Selection {
+        var chosen = initial;
         for (directory.fields) |field| if (chosen[field.index]) {
             var parent = field.parent;
             while (parent != projection.no_parent) : (parent = directory.fields[parent].parent) {

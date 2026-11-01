@@ -338,9 +338,66 @@ pub fn nativeTransport(a: A, hits: anytype, plan: ?*const Plan) !NativeTransport
     return .{ .version = 1, .records = records.items };
 }
 
-/// Validate only descriptor gaps and the small completion tail. The ordinary
-/// result parser already checked value syntax; no second payload scan is needed.
-pub fn restoreNativeTransport(a: A, scratch: A, bytes: []const u8, plan: ?*const Plan, hits: anytype) !void {
+/// Version two is a process-local binary frame, never a public/remote body.
+/// Metadata retains the v1 bounded descriptors; raw completed outputs follow
+/// in row order and never enter a JSON scanner at this trusted boundary.
+pub const NativeSpans = struct {
+    pub const magic = "AFNV2\x00\x00\x00";
+    pub const header_bytes = 16;
+    pub const max_bytes = 64 * 1024 * 1024;
+    metadata: []const u8,
+    payload: []const u8,
+    pub fn isFrame(bytes: []const u8) bool {
+        return std.mem.startsWith(u8, bytes, magic);
+    }
+    pub fn open(bytes: []const u8) !NativeSpans {
+        if (bytes.len < header_bytes or bytes.len > max_bytes or !isFrame(bytes)) return error.InvalidQueryResponse;
+        const len = std.math.cast(usize, std.mem.readInt(u64, bytes[8..16], .little)) orelse return error.InvalidQueryResponse;
+        if (len == 0 or len > bytes.len - header_bytes) return error.InvalidQueryResponse;
+        return .{ .metadata = bytes[header_bytes..][0..len], .payload = bytes[header_bytes + len ..] };
+    }
+    pub fn eligible(transport: NativeTransport, hits: anytype) bool {
+        if (transport.records.len == 0) return false;
+        var slot: usize = 0;
+        for (hits, 0..) |hit, i| if (hit.computed_json != null) {
+            if (slot == transport.records.len or transport.records[slot].row != i) return false;
+            slot += 1;
+        };
+        return slot == transport.records.len;
+    }
+    pub fn encode(a: A, metadata: []const u8, hits: anytype) ![]u8 {
+        var total: usize = header_bytes +| metadata.len;
+        for (hits) |hit| if (hit.computed_json) |bytes| {
+            total +|= bytes.len;
+        };
+        if (total > max_bytes) return error.NativeSpanTooLarge;
+        const out = try a.alloc(u8, total);
+        @memcpy(out[0..8], magic);
+        std.mem.writeInt(u64, out[8..16], metadata.len, .little);
+        @memcpy(out[header_bytes..][0..metadata.len], metadata);
+        var pos = header_bytes + metadata.len;
+        for (hits) |hit| if (hit.computed_json) |bytes| {
+            @memcpy(out[pos..][0..bytes.len], bytes);
+            pos += bytes.len;
+        };
+        return out;
+    }
+    pub fn restore(self: NativeSpans, a: A, scratch: A, hits: anytype) !void {
+        const frame = try nativeFrame(scratch, self.metadata);
+        var pos: usize = 0;
+        var previous: ?usize = null;
+        for (frame.records) |record| {
+            if (record.row >= hits.len or (if (previous) |prior| record.row <= prior else false) or record.encoded_bytes == 0 or record.encoded_bytes > self.payload.len -| pos) return error.InvalidQueryResponse;
+            const hit = &hits[record.row];
+            if (hit.computed_json != null or !std.mem.eql(u8, hit.id, record.id)) return error.InvalidQueryResponse;
+            hit.computed_json = try a.dupe(u8, self.payload[pos..][0..record.encoded_bytes]);
+            pos += record.encoded_bytes;
+            previous = record.row;
+        }
+        if (pos != self.payload.len) return error.InvalidQueryResponse;
+    }
+};
+fn nativeFrame(scratch: A, bytes: []const u8) !NativeTransport {
     var scanner = std.json.Scanner.initCompleteInput(scratch, bytes);
     defer scanner.deinit();
     if ((try scanner.next()) != .object_begin) return error.InvalidQueryResponse;
@@ -358,6 +415,14 @@ pub fn restoreNativeTransport(a: A, scratch: A, bytes: []const u8, plan: ?*const
     if (scanner.cursor - begin > native_transport_max_bytes) return error.InvalidQueryResponse;
     const frame = try std.json.parseFromSliceLeaky(NativeTransport, scratch, bytes[begin..scanner.cursor], .{ .allocate = .alloc_if_needed });
     if (frame.version != 1 or frame.records.len > native_transport_max_rows) return error.InvalidQueryResponse;
+    return frame;
+}
+
+/// Validate only descriptor gaps and the small completion tail. The ordinary
+/// result parser already checked value syntax; no second payload scan is needed.
+pub fn restoreNativeTransport(a: A, scratch: A, bytes: []const u8, plan: ?*const Plan, hits: anytype) !void {
+    const metadata = if (NativeSpans.isFrame(bytes)) (try NativeSpans.open(bytes)).metadata else bytes;
+    const frame = try nativeFrame(scratch, metadata);
     if (frame.records.len == 0) return;
     const program = plan orelse return error.InvalidQueryResponse;
     const names = try scratch.alloc([]const u8, program.bindings.len);
@@ -682,7 +747,7 @@ pub const Plan = struct {
             }
             if (bytes > limits.output_bytes) return error.DecisionLimitExceeded;
         }
-        var encoded: std.Io.Writer.Allocating = .init(@import("antfly_platform").allocator.reclaimingScratch(a));
+        var encoded: std.Io.Writer.Allocating = .init(output);
         defer encoded.deinit();
         try encoded.writer.writeByte('{');
         for (self.bindings, 0..) |binding, i| {
@@ -710,7 +775,7 @@ pub const Plan = struct {
         try std.json.Stringify.value(&self.fingerprint, .{}, &encoded.writer);
         try encoded.writer.writeByte('}');
         if (encoded.written().len > limits.output_bytes) return error.DecisionLimitExceeded;
-        return output.dupe(u8, encoded.written());
+        return encoded.toOwnedSlice();
     }
 
     pub fn evaluate(self: *const Plan, a: A, source: Source, previous: ?V, limits: sql.EvalLimits) !V {
@@ -1399,6 +1464,31 @@ test "api query contract native computed views retain tokens and never reconstru
         var rows = [_]Hit{.{ .id = try a.dupe(u8, "row"), .computed_json = try a.dupe(u8, result.bytes) }};
         defer rows[0].deinit(a);
         const packet = try std.json.Stringify.valueAlloc(temp, .{ ._native_field_views = native, .responses = .{} }, .{});
+        try std.testing.expect(NativeSpans.eligible(native, &producer));
+        const span_packet = try NativeSpans.encode(temp, packet, &producer);
+        const spans = try NativeSpans.open(span_packet);
+        var span_rows = [_]Hit{.{ .id = try a.dupe(u8, "row") }};
+        defer span_rows[0].deinit(a);
+        try spans.restore(a, temp, &span_rows);
+        try restoreNativeTransport(a, temp, span_packet, &plan, &span_rows);
+        try std.testing.expectEqualSlices(u8, result.bytes, span_rows[0].computed_json.?);
+        try std.testing.expect(span_rows[0].computed_receipt.?.matches(span_rows[0].computed_json.?, plan.fingerprint));
+        try std.testing.expectError(error.InvalidQueryResponse, NativeSpans.open(span_packet[0..15]));
+        const trailing = try std.mem.concat(temp, u8, &.{ span_packet, "x" });
+        var bad_rows = [_]Hit{.{ .id = try a.dupe(u8, "row") }};
+        defer bad_rows[0].deinit(a);
+        try std.testing.expectError(error.InvalidQueryResponse, (try NativeSpans.open(trailing)).restore(a, temp, &bad_rows));
+        for (0..2) |fail_index| {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+            var target = [_]Hit{.{ .id = @constCast("row") }};
+            if (fail_index == 0) {
+                try std.testing.expectError(error.OutOfMemory, spans.restore(failing.allocator(), temp, &target));
+            } else {
+                try spans.restore(failing.allocator(), temp, &target);
+                failing.allocator().free(target[0].computed_json.?);
+            }
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
         try restoreNativeTransport(a, temp, packet, &plan, &rows);
         const restored: ComputedView = .{ .plan = &plan, .receipt = rows[0].computed_receipt.?, .bytes = rows[0].computed_json.? };
         try std.testing.expectEqual(token.len, restored.proof("value").?.encoded_length);
@@ -1458,6 +1548,7 @@ test "api query contract native capability preserves reserved owner ABI layout a
     try std.testing.expectEqual(@offsetOf(LegacyOptions, "reserved"), @offsetOf(abi.LocalQueryExecutionOptions, "native_field_views"));
     try std.testing.expectEqual(@sizeOf(LegacyResponse), @sizeOf(abi.QueryOwnedResponse));
     try std.testing.expectEqual(@offsetOf(LegacyResponse, "reserved"), @offsetOf(abi.QueryOwnedResponse, "native_field_views"));
+    try std.testing.expectEqual(@offsetOf(LegacyResponse, "reserved") + 1, @offsetOf(abi.QueryOwnedResponse, "buffer_c_allocated"));
     const controls = @import("../storage/query_controls.zig");
     var req: @import("../storage/db/types.zig").SearchRequest = .{ .field_projection_value_views = true };
     const options = controls.executionOptions(req);

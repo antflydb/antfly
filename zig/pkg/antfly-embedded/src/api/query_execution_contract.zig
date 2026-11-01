@@ -5197,6 +5197,22 @@ pub fn parseAcknowledgedNativeSearchResult(alloc: std.mem.Allocator, body: []con
     return parseRemoteSearchResultOwned(alloc, @import("antfly_platform").allocator.reclaimingScratch(alloc), body, null, null, true) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRemoteResponse;
 }
 
+/// Version two requires its own out-of-band acknowledgement. Payload syntax
+/// was established by the immutable producer; only bounded metadata is parsed.
+pub fn parseAcknowledgedNativeSpanSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return parseNativeSpanSearchResult(alloc, body) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRemoteResponse;
+}
+fn parseNativeSpanSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    const Spans = @import("field_projection.zig").NativeSpans;
+    const frame = try Spans.open(body);
+    var result = try parseAcknowledgedNativeSearchResult(alloc, frame.metadata);
+    errdefer result.deinit();
+    var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+    defer scratch.deinit();
+    try frame.restore(alloc, scratch.allocator(), result.hits);
+    return result;
+}
+
 test "api query contract native receipt prefix requires an owner acknowledgement" {
     const a = std.testing.allocator;
     const json = "{\"_native_field_views\":{\"version\":1,\"records\":[]},\"responses\":[{\"took\":0,\"status\":200,\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"a\",\"_score\":1}]}}]}";

@@ -1966,6 +1966,8 @@ pub const SearchRequest = struct {
     field_projection_plan: ?@import("../../api/field_projection.zig").BorrowedPlan = null,
     /// Trusted private worker delivery, never accepted at public ingress.
     field_projection_transport: bool = false,
+    /// Negotiated process-local v2 response, never accepted from public JSON.
+    field_projection_native_spans: bool = false,
     /// Trusted in-process delivery hint; never decoded from public/wire JSON.
     field_projection_value_views: bool = false,
     evaluation_json: []const u8 = "",
@@ -2156,6 +2158,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "field_projection_json",
     "field_projection_plan",
     "field_projection_transport",
+    "field_projection_native_spans",
     "field_projection_value_views",
     "value_search_work",
     "value_search_scope",

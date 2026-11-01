@@ -22,7 +22,7 @@ const error_identity = @import("kernel_error_identity");
 pub const QueryResponse = struct {
     json: []u8,
     identity_read_generation: ?u64,
-    native_field_views: bool = false,
+    native_field_views: u8 = 0,
 };
 
 pub fn executeJsonAlloc(
@@ -49,6 +49,33 @@ pub fn executeJsonAlloc(
         .cancellation_ctx = cancellation_ctx,
         .cancellation_fn = cancellation_fn,
     }, .validate_provider_response, out_failure);
+}
+
+/// Adopt only an explicitly acknowledged process C-allocator buffer. Older
+/// providers and generic allocators retain a copying/destructor adapter.
+pub fn executeJsonCAlloc(
+    db: *anyopaque,
+    table_name: []const u8,
+    request_json: []const u8,
+    dialect: abi.LocalQueryDialect,
+    execution_options: abi.LocalQueryExecutionOptions,
+    execution_deadline_ns: ?u64,
+    cancellation_ctx: ?*anyopaque,
+    cancellation_fn: ?abi.CancellationCheckFn,
+    out_failure: *abi.FailureIdentity,
+) !QueryResponse {
+    return executeImpl(std.heap.c_allocator, .{
+        .dialect = dialect,
+        .kind = .search,
+        .db = db,
+        .table_name = .fromSlice(table_name),
+        .request_json = .fromSlice(request_json),
+        .execution_options = execution_options,
+        .has_execution_deadline = @intFromBool(execution_deadline_ns != null),
+        .execution_deadline_ns = execution_deadline_ns orelse 0,
+        .cancellation_ctx = cancellation_ctx,
+        .cancellation_fn = cancellation_fn,
+    }, .validate_provider_response, out_failure, true);
 }
 
 pub fn executeControlledJsonAlloc(
@@ -82,6 +109,9 @@ fn executeAlloc(
     validation_operation: abi.LocalQueryOperation,
     out_failure: *abi.FailureIdentity,
 ) !QueryResponse {
+    return executeImpl(alloc, request, validation_operation, out_failure, false);
+}
+fn executeImpl(alloc: std.mem.Allocator, request: abi.LocalQueryRequest, validation_operation: abi.LocalQueryOperation, out_failure: *abi.FailureIdentity, take_c_owned: bool) !QueryResponse {
     out_failure.* = .{};
     var provider_response: abi.QueryOwnedResponse = .{};
     defer abi.antfly_local_query_buffer_destroy(&provider_response.buffer);
@@ -92,11 +122,16 @@ fn executeAlloc(
         logProviderFailure("local query", failure);
         return err;
     };
-    if (provider_response.native_field_views > 1 or
-        (provider_response.native_field_views != 0 and (request.execution_options.enabled == 0 or request.execution_options.native_field_views != 1))) return error.InvalidQueryResponse;
+    if (provider_response.buffer_c_allocated > 1 or provider_response.native_field_views > 2 or
+        (provider_response.native_field_views != 0 and (request.execution_options.enabled == 0 or request.execution_options.native_field_views < provider_response.native_field_views))) return error.InvalidQueryResponse;
+    const bytes = if (take_c_owned and provider_response.buffer_c_allocated == 1) adopted: {
+        const bytes = @constCast(provider_response.buffer.slice());
+        provider_response.buffer = .{};
+        break :adopted bytes;
+    } else try alloc.dupe(u8, provider_response.buffer.slice());
     return .{
-        .json = try alloc.dupe(u8, provider_response.buffer.slice()),
-        .native_field_views = provider_response.native_field_views == 1,
+        .json = bytes,
+        .native_field_views = provider_response.native_field_views,
         .identity_read_generation = if (provider_response.has_identity_read_generation != 0)
             provider_response.identity_read_generation
         else

@@ -1753,3 +1753,21 @@ ordinary verification. The bounded witness table expires with the invocation.
 See the [design and qualification](../docs/design/antfly-grep.md#covering-metadata-and-native-field-views-2026-10-31)
 for ownership, compatibility and measured tradeoffs. Benchmark comparisons use
 balanced even AB/BA rounds and summarize independent server runs.
+
+### Native projection span delivery
+
+Synchronous compiled query owners may negotiate private output version two in
+the existing ABI 84 execution-options byte. The acknowledged response contains
+bounded JSON metadata and raw immutable completed outputs. Ordinary/public
+parsers cannot restore these spans or their field witnesses. Older owners
+retain version-zero/one fallback, and oversized/unsupported cohorts use the
+previous representation. See [restricted projection views and native span
+delivery](../docs/design/antfly-grep.md#restricted-projection-views-and-native-span-delivery-2026-11-01)
+for frame bounds, ownership and validation.
+
+Delayed projected document rows consume DPD3 covering values under their live
+directory lease. Primary reads contain only uncovered ranges; logical output
+bytes remain charged even when physical primary reads are eliminated. Public
+masks narrow prepared selections before materializing JSON. Full authenticated
+loans can resolve leaf operands directly, while structured operands preserve
+the shared-root fallback.

@@ -4300,7 +4300,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var cancellation = req.cancellation;
         var execution = @import("antfly_local_sources").storage_local_query_controls.executionOptions(scoped);
         execution.raw_search_result = @intFromBool(raw_search_result);
-        execution.native_field_views = @intFromBool(raw_search_result and scoped.field_projection_value_views);
+        execution.native_field_views = if (raw_search_result and scoped.field_projection_value_views) 2 else 0;
         var response = try lease.owner().queryJsonWithOptions(table_name, request_json, .{
             .execution_deadline_ns = req.execution_deadline_ns,
             .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
@@ -6331,7 +6331,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         // queryGroupLocal instead requests a complete local response.
         var response = try self.executeQuery(alloc, group_id, table_name, req, consistency, true);
         defer response.deinit();
-        var result = if (response.hasNativeFieldViews())
+        var result = if (response.response.native_field_views == 2)
+            try @import("antfly_local_sources").api_local_query_contract.parseAcknowledgedNativeSpanSearchResult(alloc, response.bytes())
+        else if (response.hasNativeFieldViews())
             try @import("antfly_local_sources").api_local_query_contract.parseAcknowledgedNativeSearchResult(alloc, response.bytes())
         else
             try table_reads.parseStorageKernelSearchResult(alloc, response.bytes());

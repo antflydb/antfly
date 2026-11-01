@@ -42,6 +42,7 @@ WORKLOADS = [
     ("crossover_shared_duplicates", 128, True, True, 4),
     ("crossover_distinct_unique", 128, False, False, 4),
     ("large_shared_duplicates", 256, True, True, 4),
+    ("concurrent_shared_duplicates", 256, True, True, 4),
     ("large_distinct_unique", 256, False, False, 4),
     ("large_distinct_duplicates", 256, False, True, 4),
     ("large_distinct_unique_eight", 256, False, False, 8),
@@ -146,6 +147,13 @@ def main():
                         },
                     }
                 )
+            if name == "concurrent_shared_duplicates":
+                # Separate admission groups with equivalent per-row ID filters;
+                # query/ACL work stays independent while codec work can join.
+                for part in references:
+                    part["source"]["filter_query"] = {
+                        "ids": [part["source"]["document_id"]]
+                    }
             if name.endswith("repeated_refs"):
                 # Same row/field, independently checked limits: canonical source
                 # dedup must retain each claim, while storage/output can share.
@@ -255,12 +263,13 @@ def main():
                                             "native_results",
                                             "native_views",
                                             "native_witnesses",
+                                            "flight_waits",
                                         ),
                                         (int(value or 0) for value in match),
                                     )
                                 )
                                 for match in re.findall(
-                                    r"antfly_bench_source_reuse verifications=(\d+) byte_hits=(\d+) proof_hits=(\d+)(?: native_results=(\d+) native_views=(\d+) native_witnesses=(\d+))?",
+                                    r"antfly_bench_source_reuse verifications=(\d+) byte_hits=(\d+) proof_hits=(\d+)(?: native_results=(\d+) native_views=(\d+) native_witnesses=(\d+))?(?: flight_waits=(\d+))?",
                                     server.debug_logs(),
                                 )
                             ]

@@ -41665,7 +41665,7 @@ pub const DB = struct {
                     self.directories_loaded[index] = true;
                 }
             }
-            const Prepared = struct { fields: []projection.FieldValue, ranges: []ranges_mod.Range, values: [][]const u8, hashes: [][32]u8, duplicate: bool = false };
+            const Prepared = struct { fields: []projection.FieldValue, selection: @import("../logical_source.zig").Selection, directory: projection.Directory, values: [][]const u8, read_values: [][]const u8, duplicate: bool = false };
             var prepared: [64]Prepared = undefined;
             var requests: [64]ranges_mod.Request = undefined;
             var request_count: usize = 0;
@@ -41690,34 +41690,31 @@ pub const DB = struct {
                     if (!try projection.isCurrent(a, raw, proof)) self.requestRepair();
                     break;
                 };
-                var selected_bytes: u64 = 0;
+                var roots: [projection.maximum_fields]projection.Field = undefined;
                 var selected_count: usize = 0;
                 for (fields) |name| if (directory.find(name)) |field| {
-                    selected_bytes +|= field.length;
+                    if (selected_count == roots.len) return null;
+                    roots[selected_count] = field;
                     selected_count += 1;
                 };
-                if (selected_bytes >= proof.bytes / 2 or selected_count > ranges_mod.maximum_ranges) break;
-                const ranges = try a.alloc(ranges_mod.Range, selected_count);
-                var slot: usize = 0;
-                for (fields) |name| if (directory.find(name)) |field| {
-                    ranges[slot] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
-                    slot += 1;
-                };
-                const cost = if (scope.supportsSelectedRangeIo()) try ranges_mod.retainedBytes(std.math.cast(usize, proof.bytes) orelse return error.InvalidDocumentContentAuthority, ranges) else if (selected_count == 0) 0 else proof.bytes;
+                const selection = (try @import("../logical_source.zig").Selection.initFields(a, directory, proof, roots[0..selected_count])) orelse break;
+                if (selection.fields.len > ranges_mod.maximum_ranges) break;
+                const ranges = selection.ranges;
+                var selected_bytes: usize = 0;
+                for (selection.fields) |field| selected_bytes +|= std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority;
+                const physical_cost = if (ranges.len == 0) 0 else if (scope.supportsSelectedRangeIo()) try ranges_mod.retainedBytes(std.math.cast(usize, proof.bytes) orelse return error.InvalidDocumentContentAuthority, ranges) else proof.bytes;
+                // Covered values avoid I/O, but still consume the caller's
+                // logical output window. Preserve single-value soft limits.
+                const cost = @max(selected_bytes, physical_cost);
                 if (count != 0 and cost > limit -| retained) break;
                 retained +|= std.math.cast(usize, cost) orelse return error.InvalidDocumentContentAuthority;
-                const output = try a.alloc(projection.FieldValue, selected_count);
-                const values = try a.alloc([]const u8, selected_count);
-                const hashes = try a.alloc([32]u8, selected_count);
-                slot = 0;
-                for (fields) |name| if (directory.find(name)) |field| {
-                    output[slot] = .{ .name = field.name, .value = undefined };
-                    hashes[slot] = field.digest;
-                    slot += 1;
-                };
-                prepared[count] = .{ .fields = output, .ranges = ranges, .values = values, .hashes = hashes };
-                if (selected_count != 0) {
-                    requests[request_count] = .{ .key = physical, .ranges = ranges, .output = values };
+                const output = try a.alloc(projection.FieldValue, selection.fields.len);
+                const values = try a.alloc([]const u8, selection.fields.len);
+                const read_values = if (ranges.len == values.len) values else try a.alloc([]const u8, ranges.len);
+                for (selection.fields, output) |field, *item| item.* = .{ .name = field.name, .value = undefined };
+                prepared[count] = .{ .fields = output, .selection = selection, .directory = directory, .values = values, .read_values = read_values };
+                if (ranges.len != 0) {
+                    requests[request_count] = .{ .key = physical, .ranges = ranges, .output = read_values };
                     request_count += 1;
                 }
             }
@@ -41729,12 +41726,19 @@ pub const DB = struct {
             }.less);
             scope.getRangesMany(requests[0..request_count]) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
             for (prepared[0..count], self.sources[0..count]) |item, *source| {
-                if (!item.duplicate) for (item.values, item.hashes, item.fields) |value, hash, *field| {
-                    var digest: [32]u8 = undefined;
-                    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
-                    if (!std.mem.eql(u8, &digest, &hash)) return error.InvalidDocumentContentAuthority;
-                    field.value = value;
-                };
+                if (!item.duplicate) {
+                    var read_slot: usize = 0;
+                    for (item.selection.fields, item.values, item.fields) |selected, *value, *field| {
+                        if (item.directory.covered(selected)) |covered| value.* = covered else {
+                            value.* = item.read_values[read_slot];
+                            read_slot += 1;
+                        }
+                        var digest: [32]u8 = undefined;
+                        std.crypto.hash.sha2.Sha256.hash(value.*, &digest, .{});
+                        if (!std.mem.eql(u8, &digest, &selected.digest)) return error.InvalidDocumentContentAuthority;
+                        field.value = value.*;
+                    }
+                }
                 source.* = .{ .fields = item.fields };
             }
             self.window.bytes = retained;

@@ -6216,8 +6216,7 @@ pub fn searchStorageKernelQueryJson(
             if (err == error.CatalogGenerationChanged) std.log.warn("local query preparation conflict", .{});
             return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
         };
-        const response = local_query_client.executeJsonAlloc(
-            std.heap.c_allocator,
+        const response = local_query_client.executeJsonCAlloc(
             @ptrCast(&handle.db),
             table_name,
             request_json.bytes(),
@@ -6237,7 +6236,8 @@ pub fn searchStorageKernelQueryJson(
         };
         out_response.* = .{
             .buffer = .{ .ptr = response.json.ptr, .len = @intCast(response.json.len) },
-            .native_field_views = @intFromBool(response.native_field_views),
+            .buffer_c_allocated = 1,
+            .native_field_views = response.native_field_views,
             .identity_read_generation = response.identity_read_generation orelse 0,
             .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
         };
@@ -6286,7 +6286,8 @@ pub fn searchStorageKernelQueryJson(
         return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
     out_response.* = .{
         .buffer = .{ .ptr = buffer.ptr, .len = @intCast(buffer.len) },
-        .native_field_views = @intFromBool(owned.req.field_projection_value_views and owned.req.field_projection_transport),
+        .buffer_c_allocated = 1,
+        .native_field_views = if (std.mem.startsWith(u8, response.json, "AFNV2\x00\x00\x00")) 2 else @intFromBool(owned.req.field_projection_value_views and owned.req.field_projection_transport),
         .identity_read_generation = response.identity_read_generation orelse 0,
         .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
     };

@@ -3524,3 +3524,44 @@ def test_native_source_receipts_reach_provisioned_consumers(tmp_path, num_shards
         assert sum(row["verifications"] for row in sample["counters"]) >= 1, sample
         for key in ("native_results", "native_views", "native_witnesses", "proof_hits"):
             assert sum(row[key] for row in sample["counters"]) >= 1, sample
+
+
+@e2e_resource("antfly_process")
+def test_native_concurrent_source_verification_is_coalesced(tmp_path):
+    """Independent authorized groups share first codec verification only."""
+    import sys
+
+    binary = os.environ.get("ANTFLY_BIN")
+    if not binary:
+        pytest.skip("Set ANTFLY_BIN for concurrent source verification checks")
+    report = tmp_path / "concurrent-verification.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).with_name("bench_media_materialization.py")),
+            binary,
+            "--baseline",
+            binary,
+            "--rounds",
+            "1",
+            "--queries-per-phase",
+            "2",
+            "--workload",
+            "concurrent_shared_duplicates",
+            "--native-source-path",
+            "--profile-source-reuse",
+            "--output",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    data = json.loads(report.read_text())
+    for sample in data["source_reuse_counts"]:
+        assert len(sample["counters"]) == 2, sample
+        for row in sample["counters"]:
+            assert row["verifications"] == 1, row
+            assert row["native_results"] == 4, row
+            assert row["proof_hits"] >= 3, row

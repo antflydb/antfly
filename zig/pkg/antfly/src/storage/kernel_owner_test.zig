@@ -72,6 +72,18 @@ test "storage owner native field receipts survive acknowledged local queries" {
     const object = try view.object(scratch.allocator());
     try std.testing.expectEqual(image.len + "data:image/png;base64,".len, object.object.get("image").?.string.len);
     try std.testing.expectEqualStrings("r1", object.object.get("revision").?.string);
+    // New callers negotiate raw completed outputs across the real archive.
+    execution.native_field_views = 2;
+    var spans = try owner.queryJsonWithOptions("docs", wire, .{ .execution = execution });
+    defer spans.deinit();
+    try std.testing.expectEqual(@as(u8, 2), spans.response.native_field_views);
+    try std.testing.expectError(error.InvalidRemoteResponse, contract.parseStorageKernelSearchResult(a, spans.bytes()));
+    try std.testing.expectError(error.InvalidRemoteResponse, contract.parseAcknowledgedNativeSearchResult(a, spans.bytes()));
+    var span_result = try contract.parseAcknowledgedNativeSpanSearchResult(a, spans.bytes());
+    defer span_result.deinit();
+    try query.restoreNativeProjectionReceipts(a, req, spans.bytes(), span_result.hits);
+    try std.testing.expectEqualSlices(u8, result.hits[0].computed_json.?, span_result.hits[0].computed_json.?);
+    try std.testing.expect(span_result.hits[0].computed_receipt != null);
     // An older caller does not request the reserved capability byte. It gets
     // the established response and cannot reconstruct native witnesses.
     execution.native_field_views = 0;

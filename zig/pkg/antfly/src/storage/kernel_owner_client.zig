@@ -231,7 +231,7 @@ pub const QueryResponse = struct {
         return self.response.buffer.slice();
     }
     pub fn hasNativeFieldViews(self: QueryResponse) bool {
-        return self.response.native_field_views == 1;
+        return self.response.native_field_views >= 1 and self.response.native_field_views <= 2;
     }
 
     pub fn identityReadGeneration(self: QueryResponse) ?u64 {
@@ -743,8 +743,8 @@ pub const Owner = struct {
             }
             return err;
         };
-        if (response.response.native_field_views > 1 or
-            (response.response.native_field_views != 0 and (options.execution.enabled == 0 or options.execution.native_field_views != 1))) return error.InvalidQueryResponse;
+        if (response.response.buffer_c_allocated > 1 or response.response.native_field_views > 2 or
+            (response.response.native_field_views != 0 and (options.execution.enabled == 0 or options.execution.native_field_views < response.response.native_field_views))) return error.InvalidQueryResponse;
         return response;
     }
 

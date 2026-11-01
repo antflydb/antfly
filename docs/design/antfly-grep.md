@@ -3713,3 +3713,343 @@ are mostly near parity; the initially large RSS differences do not recur in
 the independent repeats. This implementation does not establish a general
 query speedup. All intervals above are descriptive, and concurrent unrelated
 compilation remained a timing limitation.
+
+## Restricted projection views and native span delivery (2026-11-01)
+
+Public source masks restrict authenticated prepared views before materializing
+JSON. Selected values needed only by scalar evaluation do not enter the public
+mask's temporary object. This applies when requested metadata is too large for
+covering, and to existing DPD2 directories. Opaque ancestors retain their
+original array positions until the ordinary public mask applies. Masking never
+replaces the whole-root or scalar-selection cache.
+
+Delayed `DocumentRows` projections use the same bounded selection planner as
+scalar reads. Root-name resolution preserves literal dots. Covered values borrow
+from the reader's live directory lease; only uncovered ranges enter primary I/O.
+Mixed selections and duplicate IDs retain exact values and caller order. A
+fully covered read still charges its selected bytes to the logical output
+window: eliminating physical I/O does not waive admission limits.
+
+An authenticated full-value loan can also supply exact leaf tokens from its
+revision-bound directory and directory-bound canonical certificate, without
+constructing a full token index or parsing unrelated roots. Typed leaf values
+are parsed once per row. Programs that also need a structured ancestor retain
+their shared containing-root parse; opaque
+paths and unqualified sources use the existing fallback. Raw structured outputs
+can normalize their exact authenticated token without indexing the whole source.
+This extends the selected-view optimization to large-value fallback without
+adding another scan.
+
+The compiled owner negotiates private result version two through the existing
+ABI 84 execution-options byte. Version zero retains ordinary JSON, version one
+retains the bounded receipt prefix, and version two carries raw completed
+outputs. A caller requests the maximum supported version; older owners may
+acknowledge zero or one. The response acknowledgement remains out of band and
+cannot be established by public or remote JSON.
+
+The version-two frame is an eight-byte `AFNV2` marker with three zero bytes,
+an eight-byte little-endian metadata length, the existing JSON response with
+computed outputs omitted, and the immutable completed outputs in row order.
+The existing prefix describes row IDs, program fingerprints, output lengths,
+member extents, completion tails and field witnesses. Its one-MiB/1,024-row
+bounds still apply. The complete frame is capped at 64 MiB. Unsupported cohorts
+and oversized frames retain the previous representation; ordinary parsers
+reject the frame. No public API, worker protocol or persisted layout changes.
+
+Only an acknowledged in-process consumer can restore raw outputs. It parses the
+small metadata, checks bounds, row order and IDs, owns each completed output,
+and restores the producer's descriptors using the existing gap/tail checks.
+Payload syntax comes from the same immutable native producer; the consumer does
+not scan large computed values again merely to cross this compiled boundary.
+Scalar encoding transfers its completed writer buffer rather than duplicating
+it. The local owner adapter transfers a provider response only after a separate
+reserved ABI byte explicitly acknowledges process C-allocator ownership.
+Older providers and generic allocator callers retain a copying/destructor
+adapter. Response buffer destructors remain responsible for exactly one owner.
+
+Concurrent authorized groups coordinate first codec verification within the
+invocation. Single-group and serial materialization skip flight allocation.
+The bounded flight table owns stable event objects and publishes
+both successful completion and failure. Waiters poll request cancellation and
+the shared deadline. A digest/MIME/length claim selects pending work only:
+after wakeup, each source still passes its native receipt or canonical-byte
+proof, membership, revision, identity, permission and per-reference limits.
+No cross-request cache is introduced, and an unqualified source cannot acquire
+verification authority from another caller's digest claim.
+
+Qualification includes uncovered public masks, authenticated full-leaf reads,
+real compiled-owner version-zero/one/two responses, frame corruption and
+allocation failures, verification-flight success/failure/deadlines, persisted
+covering readers and independently authorized concurrent source groups.
+Benchmark controls distinguish ordinary metadata-only reads, conditional and
+reference evaluation, covered/uncovered metadata, extra unrelated payloads,
+and concurrent duplicate media. Attribution logging remains separate from
+balanced timing. Reports and binaries remain ignored local evidence.
+
+The initial implementation’s optimized query suite passes 226/226 cases, compiled-owner qualification
+passes 56/56, and provisioned-source qualification passes 45/45, without failed
+or leaked cases. Broad Debug qualification passes 90/90 build steps; its
+standard summary reports 694 passes and eight optional skips, with the custom
+query, logical, provider and gateway suites reported separately. The focused
+optimized C API build passes 71/71 steps and 206/206 standard cases, plus the
+actual hydration fixture on both backends. For its 1,048,605-byte source,
+LSM records 3,826 scoped peak bytes and zero primary backing-read bytes; Lite
+records 28,276 scoped peak bytes and 40,960 backing-read bytes. These are scoped
+admission/read counters, not process RSS or an elapsed-time comparison. The
+fixture also checks old snapshots, mixed legacy/current rows, allocation
+failures, duplicate order and the single-value soft byte limit. Formatting,
+benchmark-pairing tests, license headers, Apache boundaries and the storage
+control catalog pass.
+
+The stripped release server and CLI pass 71/71 and 7/7 build steps. Real-server
+indexed/transport integration passes 67 cases with seven optional profiling
+skips, including one- and two-shard native receipts and concurrent source
+verification. Separate concurrent attribution records one verification, three
+receipt hits, four native results/views, twelve witnesses and zero canonical
+byte comparisons per request. Flight waits vary with scheduling (one and zero
+in the two sampled requests); a wait is not required for the single-verification
+invariant. Timing runs do not enable these diagnostic counters.
+
+The first fully qualified candidate is `86e26d2cf3582727af09d327fb892179db542ca0a9b9d5a87cae48602f7794fc`
+(236,035,336 bytes), versus same-merge baseline
+`d0565d4c46344ea19272085b8106e96a2dbe2d1413537e7f3805fcd50a60ab76`
+(236,002,520 bytes): an increase of 32,816 bytes, approximately 0.014%.
+The CLI remains byte-identical at
+`e8f7f1ec76751de7cf1fc9157cc9d50a0d2ce41e795d9dfb32d8c18b28caaf25`
+(7,596,584 bytes). Both servers use the same staged source path, compiler,
+`ReleaseFast`/stripping flags, merge `0e2cf79bc3` and main revision `97945ad58e`;
+the candidate overlays the hash-recorded native/Python changes. The interrupted
+parallel server build was retried successfully with one job, without changing
+production source or compiler flags. Local manifests, qualification logs,
+binaries and reports use the ignored `output/projection-followup/round6-*`
+namespace. The task-local isolated compiler cache is removed after all timing
+and qualification, rather than retained as a second permanent build cache.
+
+Independent repeats of the initial 64-control matrix exposed approximately
+6–7% extra CPU in wide, small-document projection phases. The refinement
+separates raw-token acquisition from typed-reader qualification: raw output
+still requires the directory-bound certificate, but does not request a typed
+leaf identity or containing-root decision. A newly constructed covering view
+also already selects the requested public roots, so it is materialized directly;
+existing larger scalar views still receive the restricted-mask pass. This
+removes redundant per-field lookups and scratch planning without a size cutoff,
+new cache or storage format. The refinement passes the optimized 226-query,
+56-owner and 45-source suites with no failures or leaks. Its final binary and
+whole-server measurements are recorded below.
+
+
+### Final refinement qualification and measurement
+
+The final optimized contracts/server build passes 134/134 steps. Its custom
+suites pass 226 query, 56 compiled-owner and 45 provisioned-source cases, with
+no failures or leaks. Real-server indexed/transport integration again passes
+67 cases with seven optional profiling skips. Concurrent attribution again
+records one verification, three receipt hits, four native results/views and
+zero canonical-byte comparisons per request. These runs use the final server
+`1b9f74ed7c8841a1c47b4f7e9ab38ffb0c7eb2b6e24849c233c8c1edcc2c6b03`
+(236,035,336 bytes). The CLI remains the same qualified `e8f7f1ec7675` binary.
+The baseline remains `d0565d4c4634`, with the same merged main `97945ad58e`,
+source path and `ReleaseFast`/stripping settings. The compiler SHA-256 is
+`1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523`.
+The host became compiler-quiet before the final timing sequence. This remains
+one warm synthetic macOS host, without native Linux or cold-storage parity.
+
+All comparisons use eight alternating rounds and 25 reads per phase, with
+independent server processes and exact output checks. The final same-main
+matrix contains 64 initial phase controls and one extra independent tiny
+legacy-media repeat. The predefined repeat rule is CPU above 5%, or elapsed,
+RSS or footprint above 10%, with the descriptive interval entirely above
+parity. No initial final-candidate case met that rule; the noisy tiny legacy
+case was repeated anyway, and its elapsed cost is reported below. RSS and
+footprint include ingestion and earlier phases, not incremental query memory.
+No provider/model execution occurs in the media timing fixtures: they stop at
+post-materialization validation gates. Attribution logging is disabled for
+timing and checked separately. No end-to-end model latency or billing claim
+follows from these preparation measurements.
+
+Source-phase names have specific meanings. `ordinary` omits `select` and
+includes the payload in `_source`. All select phases mask `_source` to metadata.
+`full` emits the changed payload in `_computed` after an identity miss;
+`conditional` has a known identity and suppresses that payload. The two
+`reference` phases wrap/extract the payload through a JSON object to force
+actual value evaluation: `reference_full` emits the changed payload, while
+`reference` suppresses it after matching the known identity. They are not
+full-public-source scans.
+
+The original 59-control corpus is retained. Added projection controls use eight
+documents: metadata-only reads with 16 KiB/1 MiB payloads, and conditional/reference
+reads with 1 MiB payloads, 2 MiB unrelated padding and 8 KiB uncovered metadata.
+The additional concurrent media case uses identical generated PNG bytes across
+four independently filtered source groups. The committed drivers expose the
+parameters as `--select-mode plain|conditional|reference`,
+`--metadata-shape uncovered`, `--padding-bytes`, and
+`--workload concurrent_shared_duplicates --native-source-path`. Binary/source,
+compiler, corpus hashes and all per-run observations remain in the ignored
+`output/projection-followup/round7-*` manifests/reports; no raw reports or logs
+are committed.
+
+
+The final measurements show approximately 52–90% lower CPU and 31–85% lower
+elapsed time for the larger native-media preparation controls. The representative
+large ASCII changed-value projections use approximately 33% less CPU; their
+forced-value reference counterparts use approximately 14% less. Ordinary reads
+and metadata-only batch controls are generally close to parity. The wide,
+64-document projection phases retain approximately 1–3% higher CPU after the
+refinement, rather than the initial 6–8%. Process RSS/footprint do not establish
+a general memory improvement, despite eliminating specific copies and scoped
+primary-payload reads.
+
+The tiny legacy-media control remains a cost: the independent repeat records
+approximately 0.75 → 0.82 ms median elapsed time (paired ratio +11.0%, descriptive
+interval +6.0 to +15.2%). Its CPU estimate is +9.8% with an interval including
+zero; both the initial and repeat rows are retained. This is a preparation
+fixture, not a live-model request. Against the older different-main baseline,
+the selected-reference CPU estimates are +2.6%, −0.2% and +0.1% for the three
+cases, with other phases reported below; the former 6–9% reference cost does
+not recur in those measurements. Neither the small remaining costs nor the
+host/main differences justify a universal speed or zero-cost claim.
+
+### Final same-main comparison
+
+Eight alternating rounds, 25 reads per phase; four balanced AB/BA blocks. CPU and elapsed changes use independent server-run medians and geometric paired block ratios. Brackets show descriptive block-bootstrap intervals. Warm synthetic shared-host macOS controls; no live model/provider execution. RSS/footprint include prior process state and are not incremental per-query memory.
+
+
+Source controls:
+
+| Workload / phase | CPU change [interval] | Elapsed change [interval] | RSS MiB before → after | Footprint MiB before → after |
+|---|---:|---:|---:|---:|
+| dense64 / ingest | -1.5% [-7.4, +2.4] | -1.5% [-7.3, +1.8] | 161.8 → 161.8 | 128.6 → 128.5 |
+| dense64 / ordinary | +3.3% [-1.6, +9.3] | +3.6% [-3.5, +13.3] | 166.1 → 166.3 | 129.6 → 129.6 |
+| dense64 / reference_full | +1.3% [+0.5, +2.0] | +1.6% [+1.3, +1.9] | 168.7 → 169.0 | 130.1 → 130.3 |
+| dense64 / full | +1.3% [+0.4, +2.3] | +1.0% [+0.3, +1.6] | 169.0 → 169.3 | 130.5 → 130.6 |
+| dense64 / conditional | +1.0% [+0.8, +1.2] | +1.3% [+0.9, +1.8] | 169.0 → 169.2 | 130.3 → 130.5 |
+| dense64 / reference | +2.2% [+1.6, +2.9] | +2.2% [+1.8, +2.6] | 170.9 → 174.7 | 131.4 → 135.1 |
+| eligible / ingest | +1.3% [-1.1, +4.0] | -0.8% [-2.8, +1.9] | 183.5 → 183.0 | 150.3 → 149.9 |
+| eligible / ordinary | +0.2% [-1.7, +2.0] | -0.3% [-2.0, +1.1] | 187.1 → 187.3 | 150.5 → 150.5 |
+| eligible / reference_full | -14.2% [-14.6, -13.7] | -11.0% [-11.8, -9.9] | 192.0 → 191.2 | 153.5 → 152.5 |
+| eligible / full | -32.7% [-35.5, -30.3] | -24.2% [-27.2, -22.2] | 195.3 → 195.0 | 155.8 → 155.4 |
+| eligible / conditional | -0.2% [-4.8, +3.6] | -0.4% [-5.8, +6.9] | 196.2 → 195.1 | 156.7 → 155.5 |
+| eligible / reference | +0.9% [-1.0, +3.0] | +0.6% [-0.7, +2.2] | 196.2 → 195.2 | 156.7 → 155.5 |
+| escaped / ingest | -1.7% [-2.6, -1.1] | -0.7% [-1.5, +0.2] | 198.3 → 198.6 | 165.0 → 165.3 |
+| escaped / ordinary | +0.3% [-0.5, +1.2] | +0.4% [+0.1, +0.8] | 202.8 → 203.2 | 166.2 → 166.3 |
+| escaped / reference_full | -9.7% [-10.2, -9.2] | -8.9% [-9.4, -8.5] | 208.5 → 208.6 | 169.1 → 169.0 |
+| escaped / full | -22.3% [-22.8, -21.5] | -19.5% [-20.0, -19.1] | 209.1 → 209.2 | 169.6 → 169.6 |
+| escaped / conditional | -2.6% [-3.6, -0.9] | -2.2% [-4.7, -0.6] | 209.1 → 209.9 | 169.6 → 170.1 |
+| escaped / reference | -0.7% [-1.5, +0.2] | -0.6% [-1.4, +0.2] | 209.2 → 209.9 | 169.7 → 170.1 |
+| pair-rejected / ingest | +1.7% [-0.9, +4.8] | +0.2% [-3.4, +2.6] | 244.0 → 244.0 | 210.5 → 211.0 |
+| pair-rejected / ordinary | +3.1% [+1.2, +5.5] | +1.8% [+0.5, +3.1] | 321.8 → 320.8 | 284.8 → 284.2 |
+| pair-rejected / reference_full | -13.7% [-14.7, -12.8] | -11.5% [-12.6, -10.6] | 556.1 → 555.8 | 516.8 → 516.5 |
+| pair-rejected / full | -31.3% [-32.8, -29.7] | -24.6% [-26.0, -23.2] | 595.6 → 596.4 | 555.7 → 556.1 |
+| pair-rejected / conditional | -1.5% [-3.1, +0.3] | +0.5% [-1.4, +2.3] | 591.4 → 591.7 | 551.1 → 551.4 |
+| pair-rejected / reference | -0.4% [-1.8, +0.7] | -0.5% [-1.6, +0.2] | 591.6 → 591.8 | 551.3 → 551.5 |
+| sparse64 / ingest | -0.9% [-7.0, +2.8] | -2.2% [-5.6, +1.4] | 161.4 → 162.0 | 128.3 → 128.4 |
+| sparse64 / ordinary | -2.3% [-5.6, +0.5] | -2.1% [-5.9, +1.9] | 165.2 → 164.4 | 128.7 → 127.7 |
+| sparse64 / reference_full | +1.8% [+0.6, +2.9] | +1.2% [+1.0, +1.3] | 168.6 → 168.4 | 130.1 → 129.7 |
+| sparse64 / full | +2.1% [+1.6, +2.6] | +1.9% [+1.2, +2.5] | 168.9 → 168.4 | 130.3 → 129.6 |
+| sparse64 / conditional | +2.7% [+2.3, +2.9] | +2.3% [+1.7, +2.9] | 168.8 → 168.5 | 130.2 → 129.6 |
+| sparse64 / reference | +2.0% [+1.1, +2.9] | +1.6% [+1.2, +2.2] | 174.2 → 174.8 | 134.7 → 135.2 |
+| updates / ingest | +0.9% [+0.1, +1.8] | +0.1% [-1.3, +1.1] | 271.1 → 269.4 | 237.2 → 236.1 |
+| updates / ordinary | -3.0% [-5.7, -0.2] | -2.1% [-4.2, +0.2] | 374.5 → 373.9 | 337.5 → 337.3 |
+| updates / reference_full | -14.3% [-16.0, -11.7] | -11.8% [-13.3, -9.5] | 688.8 → 689.3 | 649.7 → 650.1 |
+| updates / full | -34.1% [-35.0, -32.7] | -26.8% [-27.9, -25.6] | 740.3 → 741.3 | 700.4 → 701.2 |
+| updates / conditional | -0.1% [-6.9, +4.3] | -0.1% [-5.7, +3.7] | 734.6 → 737.7 | 694.4 → 697.4 |
+| updates / reference | -0.4% [-1.9, +1.0] | +0.1% [-1.3, +1.3] | 734.8 → 737.9 | 694.6 → 697.6 |
+| updates / metadata_update | +0.7% [+0.4, +0.9] | -0.7% [-1.6, +0.2] | 745.4 → 760.0 | 704.8 → 719.5 |
+| wide-large / ingest | -0.2% [-1.6, +0.7] | -1.1% [-3.1, +1.0] | 276.3 → 276.2 | 243.1 → 242.9 |
+| wide-large / ordinary | +2.3% [+0.5, +4.1] | +1.5% [+0.6, +2.6] | 370.8 → 377.8 | 334.3 → 341.1 |
+| wide-large / reference_full | -13.2% [-14.1, -12.6] | -11.1% [-11.9, -10.6] | 686.1 → 690.2 | 646.9 → 650.9 |
+| wide-large / full | -33.7% [-33.8, -33.6] | -26.4% [-26.9, -25.8] | 740.1 → 745.8 | 700.2 → 705.9 |
+| wide-large / conditional | -3.8% [-5.6, -1.9] | -4.2% [-6.2, -2.3] | 734.5 → 739.2 | 694.3 → 698.9 |
+| wide-large / reference | +0.0% [-2.3, +2.4] | +0.3% [-2.0, +2.5] | 734.8 → 739.4 | 694.6 → 699.0 |
+| wide-small / ingest | -0.4% [-4.2, +3.6] | -0.0% [-4.9, +6.4] | 152.0 → 152.1 | 119.0 → 119.0 |
+| wide-small / ordinary | +0.5% [-6.4, +7.9] | +0.7% [-3.9, +4.1] | 155.5 → 155.9 | 118.9 → 119.1 |
+| wide-small / reference_full | +1.5% [-0.1, +2.6] | +1.6% [-0.0, +2.8] | 158.6 → 159.1 | 120.1 → 120.3 |
+| wide-small / full | +0.0% [-1.8, +2.0] | -0.1% [-1.7, +2.1] | 159.1 → 159.4 | 120.5 → 120.7 |
+| wide-small / conditional | +1.9% [-0.7, +4.8] | +1.3% [-1.1, +4.2] | 159.7 → 160.0 | 121.0 → 121.2 |
+| wide-small / reference | +1.6% [-0.6, +4.8] | +2.1% [-0.7, +6.8] | 159.8 → 160.0 | 121.2 → 121.2 |
+
+Batches controls:
+
+| Workload / phase | CPU change [interval] | Elapsed change [interval] | RSS MiB before → after | Footprint MiB before → after |
+|---|---:|---:|---:|---:|
+| nested-medium | +0.5% [-0.9, +1.9] | -0.6% [-2.1, +0.9] | 225.9 → 226.3 | 187.2 → 187.5 |
+| plain-large | -1.5% [-9.3, +3.5] | -1.7% [-9.1, +2.9] | 273.8 → 274.0 | 235.5 → 235.6 |
+| plain-small | +3.6% [-1.6, +10.0] | +7.9% [+4.2, +13.7] | 158.5 → 159.8 | 120.2 → 120.5 |
+| scalar-large | +0.0% [-0.8, +1.0] | +0.4% [+0.1, +0.8] | 453.9 → 453.3 | 414.3 → 413.7 |
+| scalar-small | -0.1% [-1.1, +0.9] | -0.3% [-1.8, +1.2] | 164.0 → 164.0 | 125.6 → 125.6 |
+| uncovered-conditional | -0.0% [-2.8, +3.0] | -0.9% [-4.1, +2.3] | 398.2 → 396.2 | 359.5 → 357.7 |
+| uncovered-reference | -1.0% [-1.7, -0.2] | -0.9% [-1.3, -0.6] | 398.6 → 397.0 | 358.9 → 358.3 |
+
+Media controls:
+
+| Workload / phase | CPU change [interval] | Elapsed change [interval] | RSS MiB before → after | Footprint MiB before → after |
+|---|---:|---:|---:|---:|
+| legacy-distinct | +0.3% [-0.3, +1.1] | +0.2% [-1.1, +1.5] | 252.2 → 252.0 | 209.0 → 208.3 |
+| legacy-tiny | +8.1% [-6.0, +20.4] | +5.3% [+1.5, +8.9] | 154.3 → 154.3 | 117.6 → 117.5 |
+| native-concurrent | -79.6% [-80.1, -79.1] | -55.9% [-56.3, -55.1] | 211.2 → 210.6 | 171.6 → 171.0 |
+| native-crossover-distinct | -52.3% [-53.7, -51.0] | -31.0% [-33.8, -27.2] | 187.8 → 187.2 | 148.4 → 147.8 |
+| native-crossover-shared | -77.2% [-77.5, -76.8] | -67.1% [-67.7, -66.6] | 165.0 → 165.4 | 126.2 → 126.4 |
+| native-distinct | -78.8% [-79.6, -78.1] | -64.5% [-65.6, -63.5] | 253.6 → 254.0 | 209.4 → 209.6 |
+| native-shared | -90.0% [-90.2, -89.9] | -84.8% [-85.1, -84.5] | 191.8 → 190.4 | 151.8 → 150.9 |
+| native-tiny | +1.3% [-4.0, +10.3] | -9.5% [-17.8, -3.8] | 154.6 → 154.8 | 117.5 → 117.5 |
+| repeat-legacy-tiny | +9.8% [-0.3, +18.7] | +11.0% [+6.0, +15.2] | 154.8 → 154.3 | 117.7 → 117.4 |
+
+### Isolated refinement comparison
+
+The following 19 phase controls compare the final candidate directly with
+the first fully qualified candidate (`86e26d2cf358`), isolating the two
+small-read refinements. Ordinary paths remain controls; the native shared
+case verifies that the large preparation gain is retained.
+
+| Workload / phase | CPU change [interval] | Elapsed change [interval] |
+|---|---:|---:|
+| focused-dense64 / ingest | +0.2% [-6.7, +6.0] | +1.0% [-4.6, +8.0] |
+| focused-dense64 / ordinary | +0.0% [-1.6, +1.7] | +1.7% [-0.2, +4.9] |
+| focused-dense64 / reference_full | -2.9% [-4.4, -1.4] | -2.7% [-3.7, -1.6] |
+| focused-dense64 / full | -2.7% [-3.0, -2.5] | -2.2% [-2.6, -2.0] |
+| focused-dense64 / conditional | -3.8% [-4.9, -2.6] | -3.2% [-4.9, -1.9] |
+| focused-dense64 / reference | -3.5% [-4.1, -2.9] | -3.5% [-4.3, -2.7] |
+| focused-large / ingest | -0.3% [-4.9, +5.5] | -0.7% [-3.0, +0.8] |
+| focused-large / ordinary | +0.2% [-1.0, +1.4] | -0.9% [-2.3, +0.4] |
+| focused-large / reference_full | -0.2% [-1.0, +1.3] | -0.1% [-1.1, +0.9] |
+| focused-large / full | -2.2% [-5.1, +1.1] | -1.1% [-3.0, +1.3] |
+| focused-large / conditional | +1.9% [-4.2, +8.2] | +1.9% [-3.6, +8.3] |
+| focused-large / reference | +1.1% [-0.4, +2.1] | +1.6% [+0.1, +3.2] |
+| focused-native-shared | -1.7% [-4.3, +0.8] | -2.4% [-4.7, +1.0] |
+| focused-sparse64 / ingest | -4.9% [-9.2, -0.5] | -4.3% [-11.4, +2.3] |
+| focused-sparse64 / ordinary | -1.4% [-5.4, +3.3] | -1.9% [-4.6, +0.1] |
+| focused-sparse64 / reference_full | -5.1% [-6.0, -3.8] | -4.4% [-4.9, -4.0] |
+| focused-sparse64 / full | -5.0% [-5.4, -4.4] | -4.0% [-4.1, -3.9] |
+| focused-sparse64 / conditional | -4.6% [-5.0, -4.1] | -4.3% [-4.7, -3.7] |
+| focused-sparse64 / reference | -4.0% [-4.7, -3.3] | -3.6% [-4.1, -3.2] |
+
+### Comparison with the earlier reference-cost baseline
+
+These 19 phase controls compare the final candidate with preserved
+`a18587e24c36`, the baseline used for the earlier 6–9% reference-cost report.
+That binary uses earlier main `f91c9c0e46`; the final candidate uses main
+`97945ad58e`. This checks current behavior against the earlier executable and
+does not isolate our changes from upstream main changes. Independent repeats
+are included whenever that comparison crosses the same material-cost rule.
+
+| Workload / phase | CPU change [interval] | Elapsed change [interval] |
+|---|---:|---:|
+| original-eligible / ingest | -1.9% [-4.6, +1.0] | +0.7% [-0.6, +2.2] |
+| original-eligible / ordinary | +0.4% [-1.6, +2.4] | -0.4% [-2.0, +1.2] |
+| original-eligible / reference_full | -12.6% [-14.0, -11.2] | -9.7% [-10.9, -8.3] |
+| original-eligible / full | -32.6% [-35.0, -30.8] | -24.0% [-25.5, -22.7] |
+| original-eligible / conditional | -5.6% [-10.1, -1.3] | -1.9% [-7.0, +3.4] |
+| original-eligible / reference | +2.6% [+0.2, +4.8] | +2.3% [+0.6, +3.8] |
+| original-updates / ingest | +0.8% [-0.6, +2.3] | +1.0% [-0.5, +2.5] |
+| original-updates / ordinary | -0.6% [-2.8, +1.8] | -0.5% [-2.2, +1.2] |
+| original-updates / reference_full | -14.1% [-14.3, -13.8] | -12.2% [-12.4, -12.0] |
+| original-updates / full | -34.8% [-35.8, -33.5] | -27.0% [-28.0, -26.1] |
+| original-updates / conditional | +7.1% [-1.0, +21.8] | +6.6% [-0.6, +18.7] |
+| original-updates / reference | +0.1% [-0.5, +0.6] | +0.1% [-0.3, +0.6] |
+| original-updates / metadata_update | -0.1% [-0.7, +0.6] | -0.3% [-1.3, +0.5] |
+| original-wide-large / ingest | -1.3% [-2.1, -0.5] | -0.8% [-1.1, -0.4] |
+| original-wide-large / ordinary | +3.6% [+1.1, +6.0] | +2.4% [+0.9, +4.0] |
+| original-wide-large / reference_full | -13.1% [-15.3, -10.8] | -10.6% [-13.1, -8.0] |
+| original-wide-large / full | -33.6% [-35.2, -32.4] | -26.4% [-28.0, -25.1] |
+| original-wide-large / conditional | -2.3% [-3.5, -1.2] | -0.4% [-2.4, +1.6] |
+| original-wide-large / reference | -0.2% [-1.5, +1.8] | -0.3% [-1.5, +1.6] |

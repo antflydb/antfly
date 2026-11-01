@@ -4516,12 +4516,27 @@ pub const AntflyApiHandler = struct {
         const MediaPayloads = struct {
             const NativeValueProof = @import("antfly_local_sources").api_query_response.ValueProof;
 
+            const Flight = struct {
+                digest: [64]u8,
+                mime: []const u8,
+                bytes: usize,
+                ready: std.Io.Event = .unset,
+                failure: ?anyerror = null,
+            };
+            const FlightLease = struct { flight: *Flight, leader: bool };
+
             allocator: std.mem.Allocator,
             backing: @import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator,
             // Arena objects stay at stable addresses while the pointer table
             // grows as rolling jobs start. Single-group requests retain no
             // fixed 128-arena header array.
             arenas: std.ArrayList(*std.heap.ArenaAllocator) = .empty,
+            io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+            context: ?*httpx.Context = null,
+            deadline: ?u64 = null,
+            flights: std.ArrayList(*Flight) = .empty,
+            coalesce: bool = false,
+            flight_waits: std.atomic.Value(usize) = .init(0),
             codec_mutex: std.atomic.Mutex = .unlocked,
             codecs: std.ArrayList(inference_gateway.source_media.Verified) = .empty,
             proofs: std.ArrayList(struct { value: NativeValueProof, codec_index: usize }) = .empty,
@@ -4540,12 +4555,47 @@ pub const AntflyApiHandler = struct {
                 for (self.proofs.items) |prior| if (prior.value.encoded_length == value.encoded_length and std.mem.eql(u8, &prior.value.digest, &value.digest)) return;
                 if (self.proofs.items.len < 128) try self.proofs.append(self.backing.allocator(), .{ .value = value, .codec_index = index });
             }
+            /// A claim selects pending work only, never authorizes reuse. A
+            /// waiter returns through the ordinary receipt/byte proof path.
+            fn flight(self: *@This(), reference: inference_gateway.source_media.Reference) !?FlightLease {
+                if (reference.sha256.len != 64) return null;
+                while (!self.codec_mutex.tryLock()) std.atomic.spinLoopHint();
+                defer self.codec_mutex.unlock();
+                for (self.flights.items) |item| if (item.bytes == reference.byte_length and std.mem.eql(u8, &item.digest, reference.sha256) and std.mem.eql(u8, item.mime, reference.mime_type)) return .{ .flight = item, .leader = false };
+                if (self.flights.items.len == 128) return null;
+                const a = self.backing.allocator();
+                const item = try a.create(Flight);
+                errdefer a.destroy(item);
+                item.* = .{ .digest = reference.sha256[0..64].*, .mime = reference.mime_type, .bytes = reference.byte_length };
+                try self.flights.append(a, item);
+                return .{ .flight = item, .leader = true };
+            }
+            fn waitFlight(self: *@This(), item: *Flight) !void {
+                if (self.profile) _ = self.flight_waits.fetchAdd(1, .monotonic);
+                while (true) {
+                    if (self.context) |ctx| if (ctx.isCancellationRequested()) return error.Canceled;
+                    const now = @import("antfly_platform").time.monotonicNs();
+                    const remaining = if (self.deadline) |deadline| if (now >= deadline) return error.Timeout else deadline - now else 50 * std.time.ns_per_ms;
+                    item.ready.waitTimeout(self.io, .{ .duration = .{ .raw = .fromNanoseconds(@min(remaining, 50 * std.time.ns_per_ms)), .clock = .awake } }) catch |err| switch (err) {
+                        error.Timeout => continue,
+                        else => return err,
+                    };
+                    if (item.failure) |err| return err;
+                    return;
+                }
+            }
             fn retain(self: *@This(), a: std.mem.Allocator, reference: inference_gateway.source_media.Reference, url: []const u8) !@import("antfly_inference_execution_context").VerifiedMedia {
                 return self.retainWithProof(a, reference, url, null);
             }
             /// Only native producer receipts may supply this witness. Public
             /// JSON, transported results and digest claims use ordinary proof.
             fn retainWithProof(self: *@This(), a: std.mem.Allocator, reference: inference_gateway.source_media.Reference, url: []const u8, proof: ?NativeValueProof) !@import("antfly_inference_execution_context").VerifiedMedia {
+                return self.retainChecked(a, reference, url, proof, true);
+            }
+            fn retainAfterFlight(self: *@This(), a: std.mem.Allocator, reference: inference_gateway.source_media.Reference, url: []const u8, proof: ?NativeValueProof) !@import("antfly_inference_execution_context").VerifiedMedia {
+                return self.retainChecked(a, reference, url, proof, false);
+            }
+            fn retainChecked(self: *@This(), a: std.mem.Allocator, reference: inference_gateway.source_media.Reference, url: []const u8, proof: ?NativeValueProof, coordinate: bool) anyerror!@import("antfly_inference_execution_context").VerifiedMedia {
                 if (proof) |value| {
                     const checked: ?inference_gateway.source_media.Verified = cached: {
                         while (!self.codec_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -4584,6 +4634,25 @@ pub const AntflyApiHandler = struct {
                     }
                     return .{ .url = try std.fmt.allocPrint(a, "antfly-verified:{s}:{s}", .{ checked.mime, checked.digest }), .bytes = checked.data, .mime_type = checked.mime, .logical_url_bytes = url.len, .pixels = checked.pixels };
                 };
+                const pending = if (coordinate and self.coalesce) try self.flight(reference) else null;
+                if (pending) |lease| if (!lease.leader) {
+                    try self.waitFlight(lease.flight);
+                    // The first codec is now available, but this source still
+                    // proves actual byte/receipt equality and all its claims.
+                    return self.retainAfterFlight(a, reference, url, proof);
+                };
+                return self.verifyAndAdopt(a, reference, url, proof, if (pending) |lease| lease.flight else null);
+            }
+            fn verifyAndAdopt(self: *@This(), a: std.mem.Allocator, reference: inference_gateway.source_media.Reference, url: []const u8, proof: ?NativeValueProof, pending: ?*Flight) !@import("antfly_inference_execution_context").VerifiedMedia {
+                // Event publication is the release/acquire edge for failure
+                // and the adopted immutable codec. Every error wakes waiters.
+                defer if (pending) |item| item.ready.set(self.io);
+                return self.verifyCodec(a, reference, url, proof) catch |err| {
+                    if (pending) |item| item.failure = err;
+                    return err;
+                };
+            }
+            fn verifyCodec(self: *@This(), a: std.mem.Allocator, reference: inference_gateway.source_media.Reference, url: []const u8, proof: ?NativeValueProof) !@import("antfly_inference_execution_context").VerifiedMedia {
                 const allocator = self.backing.allocator();
                 if (self.profile) _ = self.verifications.fetchAdd(1, .monotonic);
                 const checked = try inference_gateway.source_media.verifyInfoRetained(a, reference, url, allocator);
@@ -4606,7 +4675,7 @@ pub const AntflyApiHandler = struct {
             }
             fn release(raw: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
-                if (self.profile) std.log.info("antfly_bench_source_reuse verifications={d} byte_hits={d} proof_hits={d} native_results={d} native_views={d} native_witnesses={d}", .{ self.verifications.load(.monotonic), self.byte_hits.load(.monotonic), self.proof_hits.load(.monotonic), self.native_results.load(.monotonic), self.native_views.load(.monotonic), self.native_witnesses.load(.monotonic) });
+                if (self.profile) std.log.info("antfly_bench_source_reuse verifications={d} byte_hits={d} proof_hits={d} native_results={d} native_views={d} native_witnesses={d} flight_waits={d}", .{ self.verifications.load(.monotonic), self.byte_hits.load(.monotonic), self.proof_hits.load(.monotonic), self.native_results.load(.monotonic), self.native_views.load(.monotonic), self.native_witnesses.load(.monotonic), self.flight_waits.load(.monotonic) });
                 for (self.arenas.items) |arena| {
                     arena.deinit();
                     self.backing.allocator().destroy(arena);
@@ -4615,6 +4684,8 @@ pub const AntflyApiHandler = struct {
                 for (self.codecs.items) |codec| self.backing.allocator().free(codec.data);
                 self.codecs.deinit(self.backing.allocator());
                 self.proofs.deinit(self.backing.allocator());
+                for (self.flights.items) |item| self.backing.allocator().destroy(item);
+                self.flights.deinit(self.backing.allocator());
                 const a = self.allocator;
                 a.destroy(self);
             }
@@ -4655,7 +4726,7 @@ pub const AntflyApiHandler = struct {
             // Payload arenas move to the consumer; only parsing scratch is freed
             // at completion. Both retain the original request budget chain.
             const payloads = try a.create(MediaPayloads);
-            payloads.* = .{ .allocator = a, .profile = @import("antfly_platform").env.getenvBool("ANTFLY_BENCH_SOURCE_REUSE"), .backing = .{ .backing = SQLMemoryBudget.reclaimingAllocator(a) }, .codec_limit = @min(codec_limit orelse inference_gateway.source_media.max_typed_codec_bytes, inference_gateway.source_media.max_typed_codec_bytes) };
+            payloads.* = .{ .allocator = a, .io = io, .context = self.ctx, .deadline = deadline, .coalesce = runtime != null and groups.len > 1 and total_bytes >= 64 * 1024, .profile = @import("antfly_platform").env.getenvBool("ANTFLY_BENCH_SOURCE_REUSE"), .backing = .{ .backing = SQLMemoryBudget.reclaimingAllocator(a) }, .codec_limit = @min(codec_limit orelse inference_gateway.source_media.max_typed_codec_bytes, inference_gateway.source_media.max_typed_codec_bytes) };
             errdefer MediaPayloads.release(payloads);
             if (typed) payloads.verified_output = try a.alloc(@import("antfly_inference_execution_context").VerifiedMedia, references.len);
             if (runtime == null or groups.len <= 1 or total_bytes < 64 * 1024) {
@@ -21587,7 +21658,7 @@ test "httpx inference gateway codec equality reuses verification without trustin
     var reference: Source.Reference = .{ .table = "docs", .document_id = "a", .field = "image", .revision_field = "revision", .revision = "r1", .sha256 = &hex, .mime_type = "image/png", .byte_length = bytes.len, .max_pixels = 1 };
     var measured = std.testing.FailingAllocator.init(a, .{});
     const owner = try a.create(Payloads);
-    owner.* = .{ .allocator = a, .backing = .{ .backing = measured.allocator() } };
+    owner.* = .{ .allocator = a, .coalesce = true, .backing = .{ .backing = measured.allocator() } };
     defer Payloads.release(owner);
     const first = try owner.retain(a, reference, url);
     defer a.free(first.url);
@@ -21685,4 +21756,41 @@ test "httpx inference gateway native receipt preparation benchmark" {
             std.debug.print("source_receipt codec_bytes={d} round={d} mode={s} iterations=32 ns={d} handle_allocated_bytes={d} backing_extra_bytes=0\n", .{ codec.len, round, if (use_receipt) "receipt" else "bytes", elapsed, handles.allocated_bytes });
         };
     }
+}
+
+test "httpx inference gateway verification flights publish success failure and deadlines" {
+    const a = std.testing.allocator;
+    const Payloads = AntflyApiHandler.GatewaySources.MediaPayloads;
+    var owner: Payloads = .{ .allocator = a, .backing = .{ .backing = a } };
+    defer {
+        for (owner.flights.items) |item| a.destroy(item);
+        owner.flights.deinit(a);
+    }
+    const reference: inference_gateway.source_media.Reference = .{ .table = "docs", .document_id = "a", .field = "image", .revision_field = "revision", .revision = "r1", .sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .mime_type = "image/png", .byte_length = 128, .max_pixels = 100 };
+    const first = (try owner.flight(reference)).?;
+    try std.testing.expect(first.leader);
+    const second = (try owner.flight(reference)).?;
+    try std.testing.expect(!second.leader);
+    try std.testing.expect(first.flight == second.flight);
+    first.flight.ready.set(owner.io);
+    try owner.waitFlight(second.flight);
+    var other = reference;
+    other.byte_length += 1;
+    const rejected = (try owner.flight(other)).?;
+    rejected.flight.failure = error.InferenceSourceMismatch;
+    rejected.flight.ready.set(owner.io);
+    try std.testing.expectError(error.InferenceSourceMismatch, owner.waitFlight(rejected.flight));
+    other.byte_length += 1;
+    const pending = (try owner.flight(other)).?;
+    owner.deadline = 0;
+    try std.testing.expectError(error.Timeout, owner.waitFlight(pending.flight));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/decisions");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var cancelled = std.atomic.Value(bool).init(true);
+    ctx.cancellation = &cancelled;
+    owner.context = &ctx;
+    owner.deadline = null;
+    try std.testing.expectError(error.Canceled, owner.waitFlight(pending.flight));
 }
