@@ -120,6 +120,12 @@ pub const Spool = struct {
         };
         return self.decodeRecord(record);
     }
+    // Memory-only targets retain the same cursor contract without native run
+    // instrumentation or file layout fields.
+    fn readCalls(run: *Run) usize {
+        if (comptime @hasField(Run, "read_calls")) return run.read_calls;
+        return 0;
+    }
     fn decodeRecord(self: *Spool, record: *const [16]u8) !analysis.Token {
         const id = std.mem.readInt(u32, record[0..4], .little);
         if (id >= self.terms.items.len) return error.InvalidData;
@@ -267,7 +273,7 @@ pub const Spool = struct {
         }
         pub fn deinit(self: *Prepared) void {
             if (self.grouped) |run| {
-                self.spool.grouping_read_calls += run.read_calls;
+                self.spool.grouping_read_calls += readCalls(run);
                 run.deinit();
             }
             self.a.free(self.links);
@@ -351,7 +357,7 @@ pub const Spool = struct {
             }
             const temporary = try Run.createWithResources(self.a, self.spool.io.?, self.spool.directory, self.spool.resources);
             defer {
-                self.spool.grouping_read_calls += temporary.read_calls;
+                self.spool.grouping_read_calls += readCalls(temporary);
                 temporary.deinit();
             }
             temporary.preferSequentialReads();
@@ -374,13 +380,13 @@ pub const Spool = struct {
                     used[bucket] += 16;
                     counts[bucket] += 1;
                     if (used[bucket] == buffer_bytes) {
-                        try ranges[bucket].append(self.a, .{ .offset = temporary.length, .bytes = buffer_bytes });
+                        try ranges[bucket].append(self.a, .{ .offset = temporary.len(), .bytes = buffer_bytes });
                         try temporary.appendSlice(buffer);
                         used[bucket] = 0;
                     }
                 }
                 for (used, 0..) |length, bucket| if (length != 0) {
-                    try ranges[bucket].append(self.a, .{ .offset = temporary.length, .bytes = length });
+                    try ranges[bucket].append(self.a, .{ .offset = temporary.len(), .bytes = length });
                     try temporary.appendSlice(buffers[bucket * buffer_bytes ..][0..length]);
                 };
             }
@@ -510,7 +516,7 @@ test "highlight normalized disk grouping bounds workspace and physical reads for
     try std.testing.expectEqual(@as(usize, total), count);
     // Each source/group/partition lane reads blocks, rather than one page per
     // occurrence. Include the still-open final sorted run in this assertion.
-    const reads = spool.run.?.read_calls + spool.grouping_read_calls + prepared.grouped.?.read_calls;
+    const reads = Spool.readCalls(spool.run.?) + spool.grouping_read_calls + Spool.readCalls(prepared.grouped.?);
     try std.testing.expect(reads < total / 8);
     try std.testing.expect(budget.peak < budget.limit);
     std.debug.print("PARTITIONED_REPLAY records={d} reads={d} peak={d} quota={d}\n", .{ total, reads, budget.peak, budget.limit });
