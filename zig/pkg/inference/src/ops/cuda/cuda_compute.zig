@@ -5385,7 +5385,7 @@ pub const CudaCompute = struct {
             if (self.embedding_gemma2_cudnn) |*cudnn| std.debug.print("FLORENCE2 cuda_attention_cudnn_calls={d}\n", .{cudnn.stats().vision_executes});
         }
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
-            std.debug.print("LIGHTONOCR3 cuda_attention_chunk128_calls={d}\n", .{self.lighton_attention.chunk128_calls});
+            std.debug.print("LIGHTONOCR3 cuda_attention_chunk128_calls={d} cuda_attention_grouped_calls={d} cuda_attention_sms={d}\n", .{ self.lighton_attention.chunk128_calls, self.lighton_attention.grouped_calls, self.lighton_attention.multiprocessors });
         self.lighton_attention.deinit(&self.ctx);
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
             std.debug.print("LIGHTONOCR3 cuda_bucketed_linear_calls={d}\n", .{self.stats.bf16_bucketed_linear_calls});

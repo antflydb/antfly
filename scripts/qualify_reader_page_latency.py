@@ -141,6 +141,16 @@ def main():
     p.add_argument("--fixtures", type=pathlib.Path, required=True)
     p.add_argument("--pages", nargs="+", default=["doj-07-0-p1", "doj-12-1-p1"])
     p.add_argument("--rounds", type=int, default=2)
+    p.add_argument(
+        "--warmup-rounds",
+        type=int,
+        default=0,
+        help="Excluded warm-up cohorts (0–2); correctness checks still apply",
+    )
+    p.add_argument(
+        "--model-revision",
+        help="Pinned checkpoint revision verified by the calling qualification harness",
+    )
     p.add_argument("--concurrency", type=int, default=1)
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument(
@@ -169,6 +179,13 @@ def main():
     )
     p.add_argument("--output", type=pathlib.Path, required=True)
     args = p.parse_args()
+    if not 0 <= args.warmup_rounds <= 2:
+        p.error("qualification is bounded to 0–2 excluded warm-up rounds")
+    if (
+        args.model_revision is not None
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", args.model_revision) is None
+    ):
+        p.error("--model-revision must be a pinned 40- or 64-character lowercase hash")
     if not 1 <= args.rounds <= 4 or not 1 <= args.concurrency <= 16:
         p.error("qualification is bounded to 1–4 rounds and 1–16 concurrent requests")
     if args.require_native_batch and (
@@ -217,6 +234,9 @@ def main():
         )
     receipt = {
         "model": args.model,
+        "model_revision": args.model_revision,
+        "warmup_rounds": args.warmup_rounds,
+        "warmup_observations": [],
         "max_tokens": args.max_tokens,
         "concurrency": args.concurrency,
         "api_shape": args.api_shape,
@@ -291,20 +311,24 @@ def main():
         print(json.dumps(row), flush=True)
         return row
 
-    for round_number in range(args.rounds):
-        start = time.monotonic()
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=args.concurrency
-        ) as pool:
-            rows = list(pool.map(request, payloads))
-        receipt["observations"].append(
-            {
-                "round": round_number,
-                "seconds": round(time.monotonic() - start, 3),
-                "requests": rows,
-            }
-        )
-        args.output.write_text(json.dumps(receipt, indent=2) + "\n")
+    for phase, rounds in (
+        ("warmup_observations", args.warmup_rounds),
+        ("observations", args.rounds),
+    ):
+        for round_number in range(rounds):
+            start = time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=args.concurrency
+            ) as pool:
+                rows = list(pool.map(request, payloads))
+            receipt[phase].append(
+                {
+                    "round": round_number,
+                    "seconds": round(time.monotonic() - start, 3),
+                    "requests": rows,
+                }
+            )
+            args.output.write_text(json.dumps(receipt, indent=2) + "\n")
     passed = all(
         qualified_request(
             row,
@@ -314,6 +338,11 @@ def main():
             else 0,
         )
         for observation in receipt["observations"]
+        for row in observation["requests"]
+    )
+    passed = passed and all(
+        qualified_request(row, require_reference_parity=args.require_reference_parity)
+        for observation in receipt["warmup_observations"]
         for row in observation["requests"]
     )
     receipt["passed"] = passed

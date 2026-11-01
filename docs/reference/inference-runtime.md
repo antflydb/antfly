@@ -96,6 +96,45 @@ output checks remain independent requirements. Native item/epoch counts or
 CUDA graph replay counts alone do not establish multirow execution.
 
 
+For an HTTP-to-HTTP parity comparison, capture each engine in isolation using
+that same client script, verified image hashes, a verified pinned
+`--model-revision`, and identical output allowances. Capture a serial cohort
+with `--concurrency 1`, then the same page distribution with overlapping
+requests (for example, four requests with `--concurrency 4`). Use
+`--warmup-rounds 1 --rounds 2` for each capture: warm-up is excluded from measured
+time but must still return complete, correct responses. Require observed native
+batching on the native concurrent capture. Keep the default profile and any
+experimental profile in separate receipts.
+
+Compare the four hash-only receipts with:
+
+```bash
+python3 scripts/compare_reader_parity.py \
+  --native-serial native-serial.json --native-batch native-batch.json \
+  --reference-serial reference-serial.json --reference-batch reference-batch.json \
+  --output reader-parity.json
+```
+
+The comparator rejects differing reported prompt-token counts for the same
+image, catching template or resolution mismatches before timing comparisons.
+The result separates exact agreement at each serving concurrency, each engine's
+own serial/batch stability, and median warm throughput. Every warm-up and measured duplicate
+and round participates in the exact-output checks. A reference engine's own
+output drift remains a failed stability check even if the engines agree when
+batched. No whitespace normalization or throughput tolerance changes that gate.
+The outer qualification harness must separately record verified checkpoint
+bytes, binaries, configuration, engine versions, GPU identity and exclusive GPU
+ownership; the comparator cannot verify those declarations from output hashes.
+
+Grouped LightOn attention estimates useful chunk work against the device's
+reported SM count. This permits long small cohorts to reuse KV loads across
+query heads while short cohorts retain the ordinary split path. Future reserved
+chunks do not count as active work. Device capacity is queried once at module
+initialization; unknown capacity keeps the ordinary kernel. Existing geometry
+and artifact guards still apply. Benchmark diagnostics report grouped calls and
+SM count; graph replay can reuse those captured launches without additional
+host submission counts.
+
 CUDA model loads log host preparation, device initialization, weight upload and
 total elapsed time. Host preparation may map rather than read all weight bytes:
 subsequent page faults and conversions can appear in the upload phase. These
