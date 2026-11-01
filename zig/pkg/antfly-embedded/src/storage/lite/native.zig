@@ -3593,8 +3593,12 @@ pub const PathWriterLock = struct {
     io_impl: std.Io.Threaded,
     borrowed_io: ?std.Io = null,
     file: std.Io.File,
+    /// Admission owns this scope. Closing/yielding the kernel lease drops all
+    /// idle anchors; escaped readers retain independent marker references.
+    reader_registration_batch: ?ReaderCoordinator.RegistrationBatch = null,
 
     pub fn close(self: *PathWriterLock) void {
+        if (self.reader_registration_batch) |batch| batch.end();
         const io = self.borrowed_io orelse self.io_impl.io();
         self.file.close(io);
         if (self.borrowed_io == null) self.io_impl.deinit();
@@ -20948,4 +20952,38 @@ test "lite reader epoch aliases long filenames retain epoch reuse" {
     const captured = (try reader.getDocumentAlloc(a, "doc")).?;
     defer a.free(captured);
     try std.testing.expectEqualSlices(u8, &value, captured);
+}
+
+test "lite reader registration path lease close retains only escaped snapshot protection" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "lease-registration.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer writer.close();
+        try writer.putDocument("doc", "value");
+    }
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var lease = try lockWriterPathWithIo(a, io, path);
+    var held = true;
+    defer if (held) lease.close();
+    lease.reader_registration_batch = coordinator.beginRegistrationBatch();
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &coordinator });
+    var reader_open = true;
+    defer if (reader_open) reader.close();
+    try std.testing.expect(reader.reader_fence.?.shared_epoch != null);
+    lease.close();
+    held = false;
+    try std.testing.expectEqual(@as(usize, 0), coordinator.registration_batches);
+    const inode = (try reader.file.stat(io)).inode;
+    const frontier = try @import("reader_epochs.zig").scan(a, io, path, reader.header.reader_epoch_namespace, inode);
+    try std.testing.expect(frontier.metadata != null);
+    const binding = reader.header.reader_epoch_namespace;
+    reader.close();
+    reader_open = false;
+    try std.testing.expectEqual(@import("reader_epochs.zig").Frontier{}, try @import("reader_epochs.zig").scan(a, io, path, binding, inode));
 }

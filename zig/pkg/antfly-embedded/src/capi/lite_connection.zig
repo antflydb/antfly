@@ -1022,6 +1022,17 @@ pub const Owner = struct {
         self.wake.set(h.handleLockIo());
     }
 
+    /// Scope registration reuse to admission; closing the path lease also
+    /// releases idle anchors before another process can publish.
+    fn withReadRegistrationBatch(self: *Owner, lease: native.PathWriterLock) native.PathWriterLock {
+        var held = lease;
+        if (self.options.reader_coordinator) |coordinator| {
+            std.debug.assert(held.reader_registration_batch == null);
+            held.reader_registration_batch = coordinator.beginRegistrationBatch();
+        }
+        return held;
+    }
+
     /// Caller holds the owner gate. Captures and validated publications need
     /// turns alongside foreground writers, otherwise a continuously occupied
     /// kernel queue prevents index replay from ever acquiring its lease.
@@ -1029,7 +1040,7 @@ pub const Owner = struct {
     fn acquireMaintenancePathLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         if (self.stopping.load(.acquire)) return error.Canceled;
         const io = h.handleLockIo();
-        if (native.lockWriterPathWithIo(alloc, io, self.path)) |held| return held else |err| {
+        if (native.lockWriterPathWithIo(alloc, io, self.path)) |held| return self.withReadRegistrationBatch(held) else |err| {
             if (err != error.WouldBlock and err != error.FileBusy) return err;
             // A full foreground queue can exceed one second while each caller
             // remains inside its normal admission budget. Give publications
@@ -1046,7 +1057,7 @@ pub const Owner = struct {
             };
             errdefer held.close();
             if (self.stopping.load(.acquire)) return error.Canceled;
-            return held;
+            return self.withReadRegistrationBatch(held);
         }
     }
 
@@ -1861,7 +1872,7 @@ pub const Owner = struct {
         // its connection-local busy policy when another process wins the
         // writer lease during the detached proof. Background turns stay
         // nonblocking and yield to that writer instead of consuming its budget.
-        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked() else try native.lockWriterPathWithIo(alloc, io, self.path);
+        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked() else self.withReadRegistrationBatch(try native.lockWriterPathWithIo(alloc, io, self.path));
         var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         if (self.current) |current| {
@@ -2029,12 +2040,12 @@ pub const Connection = struct {
                 native.lockWriterPathWithIo(alloc, io, self.path)
             else
                 native.lockReaderPathWithIo(alloc, io, self.path);
-            if (lease) |held| return held else |err| {
+            if (lease) |held| return self.owner.withReadRegistrationBatch(held) else |err| {
                 if (err != error.WouldBlock and err != error.FileBusy) return err;
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
                 if (remaining <= 0) return error.FileBusy;
                 if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
-                if (native.waitPathLockWithIo(alloc, self.owner.path_lock_io.io(), self.path, h.liteOpenModeCanWrite(self.options.open_mode), deadline)) |held| return held else |wait_err| switch (wait_err) {
+                if (native.waitPathLockWithIo(alloc, self.owner.path_lock_io.io(), self.path, h.liteOpenModeCanWrite(self.options.open_mode), deadline)) |held| return self.owner.withReadRegistrationBatch(held) else |wait_err| switch (wait_err) {
                     // Sidecar-free read-only snapshots retain their inode
                     // authority. Resource-limited executors retain bounded
                     // polling rather than making the deadline unbounded.
