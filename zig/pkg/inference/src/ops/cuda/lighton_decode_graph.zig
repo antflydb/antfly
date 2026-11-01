@@ -296,3 +296,32 @@ test "LightOn CUDA graph depth bounds every token bank and scheduler column" {
     var tokens = [_]u32{ 0, 1, 2, 3 };
     try std.testing.expectError(error.InvalidPagedKvBatch, restoreTokenColumns(&tokens, &.{ 0, 1, 1, 3 }));
 }
+
+test "LightOn CUDA graph depth restores bounded scheduler permutations" {
+    for (1..12) |requested| for (0..12) |remaining| {
+        const depth = boundedSteps(requested, remaining);
+        if (remaining < 2) {
+            try std.testing.expect(depth == null);
+        } else {
+            try std.testing.expectEqual(@min(std.math.clamp(requested, 2, max_steps), remaining), depth.?);
+        }
+    };
+    for ([_]usize{ 2, 3, 4, 63, 64, 65, 66, 128 }) |rows| for (2..max_steps + 1) |steps| {
+        for ([_]usize{ 0, 1, rows - 1 }) |rotation| {
+            var order: [max_rows]usize = undefined;
+            var tokens: [max_steps * max_rows]u32 = undefined;
+            for (0..rows) |row| order[row] = (rows - 1 - row + rotation) % rows;
+            for (0..steps) |step| for (0..rows) |row| {
+                tokens[step * rows + row] = @intCast(step * max_rows + order[row]);
+            };
+            try restoreTokenColumns(tokens[0 .. steps * rows], order[0..rows]);
+            for (0..steps) |step| for (0..rows) |original| {
+                try std.testing.expectEqual(@as(u32, @intCast(step * max_rows + original)), tokens[step * rows + original]);
+            };
+        }
+        const layout = try MetadataLayout.init(rows, 1024, steps);
+        try std.testing.expect((layout.progress_offset + 4 - layout.bank_offset) / 4 <= max_metadata_read_words);
+        try std.testing.expect(layout.bank_offset + rows * steps * 4 <= layout.positions_offset);
+        try std.testing.expect(layout.positions_offset + rows * 3 * 4 <= layout.progress_offset);
+    };
+}

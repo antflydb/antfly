@@ -13496,7 +13496,7 @@ pub const NativeGenerationPipeline = struct {
         } else try burst.read(output);
     }
 
-    /// Execute only inside the reader epoch's model lane. The two-step graph
+    /// Execute only inside the reader epoch's model lane. The bounded multi-token graph
     /// returns through the existing bounded-burst publication contract.
     fn declineLightOnGraph(self: *NativeGenerationPipeline, reason: u3) ?StepForwardResult {
         self.lighton_graph_declines[reason] += 1;
