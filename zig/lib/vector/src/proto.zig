@@ -140,6 +140,16 @@ pub const RaBitQuantizedVectorSet = struct {
     quantized_dot_products: []f32 = &.{},
     centroid_dot_products: []f32 = &.{},
     centroid_norm: f32 = 0,
+    /// Optional extended (multi-bit) RaBitQ codes over the same residuals
+    /// (`antfly_vector.rabitq_ex`), used to refine 1-bit estimates. Zero
+    /// when absent. Readers that predate these fields skip them and keep
+    /// scoring 1-bit codes.
+    ex_bits: u32 = 0,
+    /// `count * exWordsPerRow(dims)` words; each row is the packed code
+    /// bytes (little-endian), zero padded to whole words.
+    ex_codes: []u64 = &.{},
+    /// Two per row: `rabitq_ex.Codec.Factors{ inv, cos }`.
+    ex_factors: []f32 = &.{},
 
     pub const _pb_field_map = [_]FieldDesc{
         .{ .field_num = 1, .name = "metric", .encoding = .varint },
@@ -150,10 +160,33 @@ pub const RaBitQuantizedVectorSet = struct {
         .{ .field_num = 6, .name = "quantized_dot_products", .encoding = .repeated_fixed32 },
         .{ .field_num = 7, .name = "centroid_dot_products", .encoding = .repeated_fixed32 },
         .{ .field_num = 8, .name = "centroid_norm", .encoding = .fixed32 },
+        .{ .field_num = 9, .name = "ex_bits", .encoding = .varint },
+        .{ .field_num = 10, .name = "ex_codes", .encoding = .repeated_fixed64 },
+        .{ .field_num = 11, .name = "ex_factors", .encoding = .repeated_fixed32 },
     };
 
     pub fn getCount(self: *const RaBitQuantizedVectorSet) usize {
         return self.code_counts.len;
+    }
+
+    /// Words per row of `ex_codes` for `bits` per dimension.
+    pub fn exWordsPerRow(dims: usize, bits: u32) usize {
+        return (dims * bits + 63) / 64;
+    }
+
+    /// Whether the set carries complete multi-bit codes for every row.
+    pub fn hasEx(self: *const RaBitQuantizedVectorSet) bool {
+        if (self.ex_bits == 0) return false;
+        const n = self.getCount();
+        return self.ex_codes.len == n * exWordsPerRow(self.centroid.len, self.ex_bits) and
+            self.ex_factors.len == n * 2;
+    }
+
+    /// Row `i`'s packed multi-bit code bytes (`ceil(dims * ex_bits / 8)`).
+    pub fn exCode(self: *const RaBitQuantizedVectorSet, i: usize) []const u8 {
+        const w = exWordsPerRow(self.centroid.len, self.ex_bits);
+        const bytes = std.mem.sliceAsBytes(self.ex_codes[i * w ..][0..w]);
+        return bytes[0 .. (self.centroid.len * self.ex_bits + 7) / 8];
     }
 
     pub fn encode(self: *const RaBitQuantizedVectorSet, alloc: Allocator) ![]u8 {
@@ -181,6 +214,9 @@ pub const RaBitQuantizedVectorSet = struct {
         result.centroid_distances = try alloc.dupe(f32, self.centroid_distances);
         result.quantized_dot_products = try alloc.dupe(f32, self.quantized_dot_products);
         result.centroid_dot_products = try alloc.dupe(f32, self.centroid_dot_products);
+        result.ex_bits = self.ex_bits;
+        result.ex_codes = try alloc.dupe(u64, self.ex_codes);
+        result.ex_factors = try alloc.dupe(f32, self.ex_factors);
         return result;
     }
 
