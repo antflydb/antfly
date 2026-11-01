@@ -3079,7 +3079,7 @@ fn uriAuthorityLen(rest: []const u8) usize {
     var i: usize = 0;
     while (i < rest.len) : (i += 1) {
         switch (rest[i]) {
-            '/', '?', '#' => return i,
+            '/', '?' => return i,
             else => {},
         }
     }
@@ -3118,7 +3118,8 @@ fn collectUriCredentialsAlloc(
     // The authority may carry no "user[:password]@" prefix at all, but a
     // query-string password can still be present, e.g.
     // `postgresql://localhost/db?password=secret`; `rest[authority_len..]`
-    // is the `/path?query#fragment` tail that follows the authority.
+    // is the `/path?query` tail that follows the authority. libpq has no
+    // fragment component: a literal # remains part of its current field.
     try collectUriQueryCredentialsAlloc(alloc, rest[authority_len..], min_password_len, out);
 }
 
@@ -3224,8 +3225,8 @@ fn couldDecodeToCredentialKeyAlloc(alloc: Allocator, key: []const u8) !bool {
 }
 
 /// Extracts credential values from the query-string portion of a URI-style
-/// DSN (`path_query_fragment` is everything after the authority, i.e.
-/// `/path?query#fragment`, possibly with no query at all). For each
+/// DSN (`path_query` is everything after the authority, i.e.
+/// `/path?query`, possibly with no query at all). For each
 /// credential-bearing key (see `uri_query_credential_keys`) -- decoded
 /// first, the same way libpq's `conninfo_uri_parse_params` decodes the key
 /// before ever comparing it against a known keyword, so a percent-encoded
@@ -3242,14 +3243,13 @@ fn couldDecodeToCredentialKeyAlloc(alloc: Allocator, key: []const u8) !bool {
 /// `collectUriCredentialsAlloc`'s callers.
 fn collectUriQueryCredentialsAlloc(
     alloc: Allocator,
-    path_query_fragment: []const u8,
+    path_query: []const u8,
     min_password_len: usize,
     out: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    const query_start = std.mem.indexOfScalar(u8, path_query_fragment, '?') orelse return;
-    const after_query = path_query_fragment[query_start + 1 ..];
-    const query_end = std.mem.indexOfScalar(u8, after_query, '#') orelse after_query.len;
-    var query = after_query[0..query_end];
+    const query_start = std.mem.indexOfScalar(u8, path_query, '?') orelse return;
+    // libpq does not recognize URI fragments; # is literal credential text.
+    var query = path_query[query_start + 1 ..];
     while (query.len > 0) {
         const amp = std.mem.indexOfScalar(u8, query, '&');
         const pair = if (amp) |idx| query[0..idx] else query;
@@ -3625,16 +3625,26 @@ fn redactConninfoPasswordFieldsAlloc(alloc: Allocator, message: []const u8) ![]u
     errdefer out.deinit(alloc);
     var i: usize = 0;
     while (i < message.len) {
-        const key_len = try matchCredentialKeyLen(alloc, message[i..]) orelse {
+        // Consume each token once. Retrying at every suffix would repeatedly
+        // scan and percent-decode a long malformed key (quadratic work) before
+        // the final output-length cap is applied.
+        const token_len = credentialKeyTokenLen(message[i..]);
+        if (token_len == 0) {
             try out.append(alloc, message[i]);
             i += 1;
+            continue;
+        }
+        const token = message[i .. i + token_len];
+        const key_len = (try matchCredentialKeyLen(alloc, token)) orelse {
+            try out.appendSlice(alloc, token);
+            i += token_len;
             continue;
         };
         var j = i + key_len;
         while (j < message.len and (message[j] == ' ' or message[j] == '\t')) j += 1;
         if (j >= message.len or message[j] != '=') {
-            try out.append(alloc, message[i]);
-            i += 1;
+            try out.appendSlice(alloc, token);
+            i += token_len;
             continue;
         }
         j += 1;
@@ -3901,9 +3911,72 @@ test "postgres libpq connection-error sanitizer handles a real libpq percent-enc
     try std.testing.expect(std.mem.indexOf(u8, sanitized, "supersecret") == null);
 }
 
+test "postgres libpq connection-error sanitizer redacts literal hash characters in credentials" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "postgresql://localhost/db?password=abc#supersecret%zz",
+        "postgresql://localhost/db?%73slpassword=abc#supersecret%zz",
+        "postgresql://u:abc#supersecret%zz@localhost/db",
+    }) |dsn| {
+        const sanitized = try sanitizeConnectionErrorAlloc(alloc, "invalid percent-encoded token: \"abc#supersecret%zz\"", dsn);
+        defer alloc.free(sanitized);
+        try std.testing.expectEqualStrings("invalid percent-encoded token: \"[redacted]\"", sanitized);
+    }
+}
+
+test "postgres libpq connection-error sanitizer handles real libpq credentials containing a hash" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    defer executor.deinit();
+    for ([_][]const u8{
+        "postgresql://localhost/db?password=abc#supersecret%zz",
+        "postgresql://localhost/db?sslpassword=abc#supersecret%zz",
+        "postgresql://u:abc#supersecret%zz@localhost/db",
+    }) |dsn| {
+        const dsn_z = try alloc.dupeSentinel(u8, dsn, 0);
+        defer alloc.free(dsn_z);
+        const conn = executor.pqconnectdb(dsn_z.ptr) orelse return error.TestUnexpectedResult;
+        defer executor.pqfinish(conn);
+        try std.testing.expect(executor.pqstatus(conn) != CONNECTION_OK);
+        const raw = std.mem.trim(u8, std.mem.span(executor.pqerrorMessage(conn)), " \t\r\n");
+        try std.testing.expect(std.mem.indexOf(u8, raw, "supersecret") != null);
+        const sanitized = try sanitizeConnectionErrorAlloc(alloc, raw, dsn);
+        defer alloc.free(sanitized);
+        try std.testing.expect(std.mem.indexOf(u8, sanitized, "supersecret") == null);
+    }
+}
+
+test "postgres libpq connection-error sanitizer bounds allocation work for long malformed keys" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 1024, 8192 }) |len| {
+        const key = try alloc.alloc(u8, len);
+        defer alloc.free(key);
+        @memset(key, 'a');
+        const dsn = try std.fmt.allocPrint(alloc, "postgresql://localhost/db?{s}%zz=x", .{key});
+        defer alloc.free(dsn);
+        const message = try std.fmt.allocPrint(alloc, "invalid percent-encoded token: \"{s}%zz\"", .{key});
+        defer alloc.free(message);
+        // Count cumulative allocation bytes rather than wall-clock time: a
+        // malformed key must not be decoded again at every character offset.
+        var counting = std.testing.FailingAllocator.init(alloc, .{});
+        const sanitized = try sanitizeConnectionErrorAlloc(counting.allocator(), message, dsn);
+        defer counting.allocator().free(sanitized);
+        try std.testing.expect(counting.allocated_bytes <= 64 * message.len);
+        try std.testing.expect(sanitized.len <= max_sanitized_connection_error_len);
+    }
+}
+
 fn sanitizeConnectionErrorAllocationFixture(alloc: Allocator) !void {
     const Case = struct { dsn: []const u8, message: []const u8 };
     const cases = [_]Case{
+        .{
+            .dsn = "postgresql://localhost/db?password=abc#supersecret%zz",
+            .message = "invalid percent-encoded token: \"abc#supersecret%zz\"",
+        },
+        .{
+            .dsn = "postgresql://u:abc#supersecret%zz@localhost/db",
+            .message = "invalid percent-encoded token: \"abc#supersecret%zz\"",
+        },
         .{
             .dsn = "postgres://u:p%zzw0rd@h/db",
             .message = "invalid percent-encoded token: \"p%zzw0rd\"",

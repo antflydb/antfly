@@ -197,9 +197,6 @@ const PlatformTextMergeRuntime = struct {
     active_assistance: usize = 0,
     active_producers: usize = 0,
     active_manual_turns: usize = 0,
-    // Read in `runOnce()` without `lifecycle_mutex` (see the comment there);
-    // every writer below already holds that mutex, so the atomic ordering
-    // only has to satisfy the cross-thread reader.
     desired_running: std.atomic.Value(bool) = .init(false),
     paused: bool = false,
     shutdown: bool = false,
@@ -524,42 +521,13 @@ const PlatformTextMergeRuntime = struct {
 
     pub fn runOnce(self: *TextMergeRuntime) !bool {
         const io = self.io orelse return false;
-        // `pause()` shares `stopLocked()` with `stop()` and so also sets
-        // `shutdown`, but — unlike `stop()` — it leaves `desired_running`
-        // untouched: it exists to keep the automatic worker off an index
-        // during a structural mutation while the caller still intends to
-        // resume it shortly via `resumeAfterPause()`. A deliberate, explicit
-        // turn (for example to keep text merge maintenance live through a
-        // bulk-ingest window) must still be serviceable while merely paused;
-        // only a genuine stop() — which also clears `desired_running` — may
-        // refuse it here. `active_manual_turns` still makes this turn visible
-        // to a concurrent stop()/pause() drain regardless of this check.
-        //
-        // This must NOT take `lifecycle_mutex`: `runAssistedOnce()` falls
-        // back to calling `runOnce()` directly after it has already released
-        // `lifecycle_mutex` (its concurrent dispatch failed), while the
-        // calling producer is still counted in `active_producers`. `stop()`
-        // holds `lifecycle_mutex` for its *entire* body, including the tail
-        // wait for `active_producers`/`active_assistance` to drain. If this
-        // function also took `lifecycle_mutex` here, a `stop()` that wins the
-        // race for the lock between that release and this call would park
-        // waiting on this producer while this producer parks waiting on
-        // `lifecycle_mutex` — deadlock. Reading `desired_running` as a plain
-        // atomic sidesteps that cycle entirely: every writer (`start()`,
-        // `stop()`) stores it with `.release` while already holding
-        // `lifecycle_mutex`, and this load uses `.acquire`, so a `false` seen
-        // here is always ordered after the write that produced it, with no
-        // need to also hold the lock. A load that races *concurrently* with
-        // an in-flight `stop()` is harmless either way: `stop()` always sets
-        // `self.shutdown` under `self.mutex` (via `stopLocked()`) before it
-        // waits on `active_manual_turns`/`active_producers`, so if this call
-        // is let through on a stale (pre-stop) view of `desired_running`, the
-        // `self.shutdown`/`active_manual_turns` bookkeeping below — guarded
-        // by `self.mutex`, not `lifecycle_mutex` — still makes it visible to,
-        // and awaited by, that drain.
-        const terminated = !self.desired_running.load(.acquire);
+        // Pause and stop fence every execution lane before structural callers
+        // move or close inline index state. Check admission and register the
+        // turn under the same mutex that stopLocked uses to close and drain it.
+        // Never acquire lifecycle_mutex here: an assisting producer's fallback
+        // must be able to exit while stop() holds it waiting for producers.
         self.mutex.lockUncancelable(io);
-        if (self.shutdown and terminated) {
+        if (self.shutdown) {
             self.mutex.unlock(io);
             return false;
         }

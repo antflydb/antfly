@@ -126429,6 +126429,14 @@ test "db dense auto bulk replays packed external embedding strings" {
 }
 
 test "db bulk ingest keeps full text merge maintenance live" {
+    try testBulkIngestTextMergeAdmission(false);
+}
+
+test "db text merge structural pause rejects manual turns" {
+    try testBulkIngestTextMergeAdmission(true);
+}
+
+fn testBulkIngestTextMergeAdmission(comptime paused: bool) !void {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -126437,6 +126445,7 @@ test "db bulk ingest keeps full text merge maintenance live" {
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
         .text_merge = .{
             .enabled = true,
             .idle_interval_ms = 10_000,
@@ -126452,9 +126461,12 @@ test "db bulk ingest keeps full text merge maintenance live" {
     });
 
     const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
-    // Keep background execution deterministic; runOnce below proves that the
-    // dense bulk deferral flag no longer suppresses text maintenance.
-    try std.testing.expect(runtime.pause());
+    // Manual owners can drive bulk-ingest maintenance without a background
+    // worker. A structural pause must instead fence even explicit turns.
+    if (paused) {
+        try runtime.start();
+        try std.testing.expect(runtime.pause());
+    }
 
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
@@ -126475,8 +126487,14 @@ test "db bulk ingest keeps full text merge maintenance live" {
     try std.testing.expect(before.pending_segments > 0);
     try std.testing.expect(db.async_context.text_merge_deferred.load(.acquire));
 
-    try std.testing.expect(try runtime.runOnce());
-    try runtime.resumeAfterPause();
+    if (paused) {
+        // Available merge debt must not acquire an inline index pointer after
+        // pause() has returned to a structural mutation caller.
+        try std.testing.expect(!try runtime.runOnce());
+        try runtime.resumeAfterPause();
+    } else {
+        try std.testing.expect(try runtime.runOnce());
+    }
 
     try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
     try std.testing.expect(!db.async_context.text_merge_deferred.load(.acquire));
