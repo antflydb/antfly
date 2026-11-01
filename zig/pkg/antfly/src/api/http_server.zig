@@ -2037,6 +2037,11 @@ pub const StatusSource = struct {
         free_routing_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
+        /// Whether this backend can ever replicate a non-empty
+        /// `replication_sources` definition right now (an HA hot-standby
+        /// primary cannot). `null` means the backend has no such
+        /// restriction — cluster mode and every existing fixture.
+        replication_sources_supported: ?*const fn (ptr: *anyopaque) anyerror!bool = null,
         publish_vector_migration_table: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         begin_vector_migration_command: ?*const fn (ptr: *anyopaque, table_name: []const u8) anyerror!void = null,
         end_vector_migration_command: ?*const fn (ptr: *anyopaque, table_name: []const u8) void = null,
@@ -2212,6 +2217,13 @@ pub const StatusSource = struct {
     pub fn replaceTableDefinition(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const fn_ptr = self.vtable.replace_table_definition orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("replace_table_definition", self.boundary_dispatch, fn_ptr, .{ self.ptr, expected, replacement });
+    }
+
+    /// Defaults to true: only a backend with a real restriction (standalone
+    /// bound to an HA hot-standby primary) sets the vtable capability.
+    pub fn replicationSourcesSupported(self: StatusSource) !bool {
+        const fn_ptr = self.vtable.replication_sources_supported orelse return true;
+        return try BoundaryAbi.call("replication_sources_supported", self.boundary_dispatch, fn_ptr, .{self.ptr});
     }
 
     pub fn lakeIndexLifecycleAuthority(self: *const StatusSource, request: api_operation.RequestContext) ?@import("lake_index_reader_lease.zig").Authority {

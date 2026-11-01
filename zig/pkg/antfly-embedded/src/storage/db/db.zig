@@ -120405,6 +120405,136 @@ test "db manual text producers merge capacity without optional workers" {
     try std.testing.expectEqual(@as(usize, 30), result.hits.len);
 }
 
+test "db text merge stop does not deadlock against a producer's assisted fallback" {
+    // [P1] regression: runAssistedOnce()'s fallback to runOnce() used to take
+    // lifecycle_mutex after already releasing it (its concurrent dispatch had
+    // failed) while the calling producer was still counted in
+    // active_producers. stop() holds lifecycle_mutex for its entire body,
+    // including the tail wait for active_producers to drain, so a stop()
+    // that won the lock in that gap would park waiting on this producer
+    // while the producer parked waiting on the very lock stop() held --
+    // deadlock. This test deterministically lands stop() in that gap via a
+    // test-only hook and asserts both sides still complete.
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("text-merge-stop-race");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .text_merge = .{
+            .enabled = true,
+            .max_pending_segments = 2,
+            .resume_pending_segments = 1,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 5_000,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!runtime.isStarted());
+
+    // Occupy the entire segment admission budget so the producer below must
+    // wait and attempt manual assistance instead of being admitted outright.
+    var held = try runtime.acquireProducerPermit("ft_v1", 2, 0);
+    defer held.release();
+
+    // Force runAssistedOnce()'s concurrent dispatch to behave as though the
+    // executor had no spare concurrency, so the producer below deterministically
+    // takes the fallback path this test targets instead of racing a real
+    // thread pool.
+    text_merge_runtime_mod.test_force_concurrency_unavailable.store(true, .release);
+    text_merge_runtime_mod.test_block_before_fallback_run_once.store(true, .release);
+    text_merge_runtime_mod.test_fallback_run_once_entered.store(false, .release);
+    text_merge_runtime_mod.test_release_before_fallback_run_once.store(false, .release);
+    defer {
+        text_merge_runtime_mod.test_force_concurrency_unavailable.store(false, .release);
+        text_merge_runtime_mod.test_block_before_fallback_run_once.store(false, .release);
+        text_merge_runtime_mod.test_fallback_run_once_entered.store(false, .release);
+        text_merge_runtime_mod.test_release_before_fallback_run_once.store(true, .release);
+    }
+
+    const Producer = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        result: anyerror!text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = undefined,
+        completed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.result = self.runtime.acquireProducerPermit("ft_v1", 1, 0);
+            self.completed.store(true, .release);
+        }
+    };
+    var producer = Producer{ .runtime = runtime };
+    var producer_thread = try std.testing.io.concurrent(Producer.run, .{&producer});
+    var producer_joined = false;
+    defer if (!producer_joined) {
+        text_merge_runtime_mod.test_release_before_fallback_run_once.store(true, .release);
+        producer_thread.await(std.testing.io);
+    };
+
+    // Wait for the producer's assisted fallback to park right after it
+    // released lifecycle_mutex but before it calls runOnce().
+    const fallback_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    while (!text_merge_runtime_mod.test_fallback_run_once_entered.load(.acquire) and
+        monotonicTimeNs() < fallback_deadline)
+    {
+        sleepNs(1 * std.time.ns_per_ms);
+    }
+    if (!text_merge_runtime_mod.test_fallback_run_once_entered.load(.acquire)) return error.TestTimeout;
+
+    const Stop = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        completed: std.atomic.Value(bool) = .init(false),
+        stopped: bool = false,
+
+        fn run(self: *@This()) void {
+            self.stopped = self.runtime.stop();
+            self.completed.store(true, .release);
+        }
+    };
+    var stop = Stop{ .runtime = runtime };
+    var stop_thread = try std.testing.io.concurrent(Stop.run, .{&stop});
+    var stop_joined = false;
+    defer if (!stop_joined) {
+        text_merge_runtime_mod.test_release_before_fallback_run_once.store(true, .release);
+        stop_thread.await(std.testing.io);
+    };
+
+    // Give stop() ample time to win the race for lifecycle_mutex and park
+    // waiting on this still-in-flight producer -- the exact window the [P1]
+    // finding identified. It must not have returned yet.
+    sleepNs(20 * std.time.ns_per_ms);
+    try std.testing.expect(!stop.completed.load(.acquire));
+
+    // Release the producer's parked fallback into runOnce(). Pre-fix this
+    // deadlocks forever against the lifecycle_mutex stop() is holding.
+    text_merge_runtime_mod.test_release_before_fallback_run_once.store(true, .release);
+
+    const join_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    var both_done = false;
+    while (monotonicTimeNs() < join_deadline) {
+        if (producer.completed.load(.acquire) and stop.completed.load(.acquire)) {
+            both_done = true;
+            break;
+        }
+        sleepNs(1 * std.time.ns_per_ms);
+    }
+    if (!both_done) return error.TestTimeout;
+
+    producer_thread.await(std.testing.io);
+    producer_joined = true;
+    stop_thread.await(std.testing.io);
+    stop_joined = true;
+
+    // No future and no assisted merge was ever registered on this runtime.
+    try std.testing.expect(!stop.stopped);
+    try std.testing.expectError(error.TextMergeRuntimeShutdown, producer.result);
+}
+
 test "db text kernel admits natural segments below hard segment limit" {
     const alloc = std.testing.allocator;
 
@@ -126315,6 +126445,14 @@ test "db dense auto bulk replays packed external embedding strings" {
 }
 
 test "db bulk ingest keeps full text merge maintenance live" {
+    try testBulkIngestTextMergeAdmission(false);
+}
+
+test "db text merge structural pause rejects manual turns" {
+    try testBulkIngestTextMergeAdmission(true);
+}
+
+fn testBulkIngestTextMergeAdmission(comptime paused: bool) !void {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -126323,6 +126461,7 @@ test "db bulk ingest keeps full text merge maintenance live" {
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
         .text_merge = .{
             .enabled = true,
             .idle_interval_ms = 10_000,
@@ -126338,9 +126477,12 @@ test "db bulk ingest keeps full text merge maintenance live" {
     });
 
     const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
-    // Keep background execution deterministic; runOnce below proves that the
-    // dense bulk deferral flag no longer suppresses text maintenance.
-    try std.testing.expect(runtime.pause());
+    // Manual owners can drive bulk-ingest maintenance without a background
+    // worker. A structural pause must instead fence even explicit turns.
+    if (paused) {
+        try runtime.start();
+        try std.testing.expect(runtime.pause());
+    }
 
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
@@ -126361,8 +126503,14 @@ test "db bulk ingest keeps full text merge maintenance live" {
     try std.testing.expect(before.pending_segments > 0);
     try std.testing.expect(db.async_context.text_merge_deferred.load(.acquire));
 
-    try std.testing.expect(try runtime.runOnce());
-    try runtime.resumeAfterPause();
+    if (paused) {
+        // Available merge debt must not acquire an inline index pointer after
+        // pause() has returned to a structural mutation caller.
+        try std.testing.expect(!try runtime.runOnce());
+        try runtime.resumeAfterPause();
+    } else {
+        try std.testing.expect(try runtime.runOnce());
+    }
 
     try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
     try std.testing.expect(!db.async_context.text_merge_deferred.load(.acquire));
@@ -138424,7 +138572,13 @@ test "db graph endpoint cleanup pages cancellation stops between commits" {
         }
     };
     var capture = Capture{};
-    try std.testing.expectError(error.EnrichmentWaitCanceled, db.batchInternal(.{ .writes = &.{.{ .key = "unrelated", .value = "{}" }}, .sync_level = .full_index }, null, .{ .committed_batch_effects_observer = .{ .ptr = &capture, .apply = Capture.observe }, .visibility_cancellation = .fromAtomic(&capture.canceled) }));
+    // batchInternal's primary_committed tracking now remaps a post-commit
+    // visibility-layer cancellation (the primary write already landed; only
+    // the graph-endpoint-cleanup effects observer was canceled) to
+    // error.CommitVisibilityNotSatisfied, rather than surfacing the raw
+    // error.EnrichmentWaitCanceled, so a caller never mistakes this for a
+    // reason to replay the whole batch.
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, db.batchInternal(.{ .writes = &.{.{ .key = "unrelated", .value = "{}" }}, .sync_level = .full_index }, null, .{ .committed_batch_effects_observer = .{ .ptr = &capture, .apply = Capture.observe }, .visibility_cancellation = .fromAtomic(&capture.canceled) }));
     try std.testing.expectEqual(@as(usize, 2), capture.calls);
     try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
     const committed_key = try encodeStoreLookupKeyAlloc(&db, alloc, "unrelated");
