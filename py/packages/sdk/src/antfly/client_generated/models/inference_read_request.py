@@ -37,7 +37,10 @@ class InferenceReadRequest:
             - Pix2Struct: "What type of document is this?"
             - Moondream: "Describe this image."
              Example: What type of document is this?.
-        max_tokens (int | Unset): Maximum tokens to generate Default: 256. Example: 256.
+        max_tokens (int | Unset): Maximum output tokens per page. When omitted, the selected reader
+            model supplies its default, bounded by deployment limits. Explicit
+            values override the model default and must fit model and server limits.
+             Example: 256.
     """
 
     model: str
@@ -45,7 +48,7 @@ class InferenceReadRequest:
     documents: list[DocumentSource] | Unset = UNSET
     images: list[InferenceImageURL] | Unset = UNSET
     prompt: str | Unset = UNSET
-    max_tokens: int | Unset = 256
+    max_tokens: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

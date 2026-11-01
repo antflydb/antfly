@@ -52,10 +52,35 @@ are not converted into pixel-coordinate `regions`.
 On Metal, and on CUDA with the LightOn batch profile, `/read` batches pages from
 the same request and from concurrent requests on the GPU.
 
-`/read` accepts up to 8192 output tokens per page and rejects truncated output.
-Use this endpoint for repeated page extraction so the reader can reuse its
-prepared execution state. The default output budget remains 256 tokens;
-request a larger budget explicitly for dense pages.
+When `max_tokens` is omitted, both LightOnOCR-3 models default to 4096 output
+tokens per page. HTTP and embedded reading use the same model-specific budget,
+bounded by `resources.inference.request_limits.max_output_tokens_per_item`.
+
+Set `max_tokens` explicitly to override the default, up to the `/read` ceiling
+of 8192 and the selected model's and deployment's limits. Explicit values above
+those limits are rejected rather than silently clamped. Truncated output is
+still rejected. Use this endpoint for repeated page extraction so the reader
+can reuse its prepared execution state.
+
+For example, a dense page can request `"max_tokens": 8192`. The deployment
+must also allow the output ceiling and provide enough memory for the request.
+The larger budget increases its estimated work; work-unit accounting saturates
+at `resources.inference.admission.max_work_units`, so a large request can occupy
+the full configured capacity without bypassing competing requests. Concurrency,
+memory, image, and input-token limits remain enforced.
+
+The Go `docsaf/reading/antfly` adapter omits `max_tokens` by default, including
+when falling back between models. Set `AntflyConfig.DefaultMaxTokens` for an
+adapter default, or `reading.ReadOptions.MaxTokens` for a per-call override.
+Positive per-call values take precedence over the adapter default.
+
+For document ingestion, the same manual control is available as
+`ocr.reader.max_tokens` alongside the reader provider and model.
+
+Other OCR models retain their own prompt and output-budget rules: Qwen3-VL
+uses its reader profile; encoder-decoder readers use their decoder metadata;
+Moondream retains its caption budget; detection/recognition pipelines have no
+generative output-token default.
 
 ## Read documents during ingestion
 
