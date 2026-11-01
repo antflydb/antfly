@@ -10021,7 +10021,10 @@ test "managed embedder fails fast on a permanent local provider error without re
         .probe_retry_budget_ns = default_probe_retry_budget_ns,
     }));
     try std.testing.expectEqual(@as(usize, 1), local.calls);
-    try std.testing.expect(monotonicNowNs() - started_ns < 100 * std.time.ns_per_ms);
+    // Comfortably below the first backoff step (500ms) so this still
+    // catches an accidental retry sleep without flaking under scheduling
+    // delays on a loaded machine.
+    try std.testing.expect(monotonicNowNs() - started_ns < 400 * std.time.ns_per_ms);
 
     // A named model-not-found failure is just as permanent and must not
     // retry either; the caller turns this into a 404 naming the model.
@@ -10034,7 +10037,7 @@ test "managed embedder fails fast on a permanent local provider error without re
         .probe_retry_budget_ns = default_probe_retry_budget_ns,
     }));
     try std.testing.expectEqual(@as(usize, 1), missing_model.calls);
-    try std.testing.expect(monotonicNowNs() - missing_model_started_ns < 100 * std.time.ns_per_ms);
+    try std.testing.expect(monotonicNowNs() - missing_model_started_ns < 400 * std.time.ns_per_ms);
 }
 
 test "managed embedder gives up with EmbeddingProbeUnavailable once the retry budget is spent" {
@@ -10053,7 +10056,9 @@ test "managed embedder gives up with EmbeddingProbeUnavailable once the retry bu
         .probe_retry_budget_ns = 10 * std.time.ns_per_ms,
     }));
     try std.testing.expectEqual(@as(usize, 1), local.calls);
-    try std.testing.expect(monotonicNowNs() - started_ns < 100 * std.time.ns_per_ms);
+    // Comfortably below the first backoff step (500ms); see the permanent-
+    // failure test above for why this isn't tighter.
+    try std.testing.expect(monotonicNowNs() - started_ns < 400 * std.time.ns_per_ms);
 }
 
 test "managed embedder routes antfly model to local provider" {
