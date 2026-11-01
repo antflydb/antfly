@@ -4207,6 +4207,24 @@ fn scoreNativeLeafScan(
                 distances: [8]f32 = undefined,
                 bounds: [8]f32 = undefined,
                 count: usize = 0,
+                refine: ?quantizer_mod.ExEstimator = null,
+                refine_all: bool = false,
+                refined: u64 = 0,
+                /// Row-aware entry from Snapshot.scoreTo: refines with the
+                /// chunk's extended codes before admission.
+                pub fn writeRow(out: *@This(), set: *const proto.RaBitQuantizedVectorSet, row: usize, id: u64, distance: f32, bound: f32) void {
+                    var d = distance;
+                    var b = bound;
+                    if (out.refine) |*est| {
+                        if (set.hasEx() and set.ex_bits == est.codec.bits and (out.refine_all or d - b <= out.target.admissionCutoff())) {
+                            const e = est.estimate(set, row);
+                            d = e.distance;
+                            b = e.bound;
+                            out.refined += 1;
+                        }
+                    }
+                    out.write(id, d, b);
+                }
                 pub fn write(out: *@This(), id: u64, distance: f32, bound: f32) void {
                     out.ids[out.count] = id;
                     out.distances[out.count] = distance;
@@ -4220,7 +4238,15 @@ fn scoreNativeLeafScan(
                 }
             };
             const start = now();
-            var sink = Sink{ .target = results };
+            var sink = Sink{ .target = results, .refine_all = self.config.quantization_refine == .all };
+            if (self.config.quantization_bits > 1 and rows.runs.len > 0) {
+                const first = rows.runs[0].chunk.view.asProto();
+                if (first.hasEx()) sink.refine = try quantizer_mod.ExEstimator.init(self.alloc, &first, approx_query);
+            }
+            defer if (sink.refine) |*est| {
+                profile.ex_refined_vectors += sink.refined;
+                est.deinit(self.alloc);
+            };
             try rows.scoreTo(&self.quantizer, approx_query, &scratch.estimate, if (req.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null, &sink);
             sink.flush();
             profile.leaf_score_ns += elapsed(start);
@@ -12653,6 +12679,9 @@ fn validateQuantizedSet(self: anytype, qs: *const hbc_runtime.QuantizedSet, expe
             if (self.config.metric != .l2_squared and set.centroid_dot_products.len != expected_count) {
                 return error.Corrupted;
             }
+            // Extended codes are optional (older payloads lack them) but must
+            // be complete when present.
+            if (set.ex_bits != 0 and (set.ex_bits > 8 or !set.hasEx())) return error.Corrupted;
         },
     }
 }
