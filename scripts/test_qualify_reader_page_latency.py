@@ -24,6 +24,7 @@ import unittest
 from qualify_reader_page_latency import (
     image_request_payload,
     normalized_text,
+    qualified_request,
     reference_expectations,
     response_texts_and_statuses,
 )
@@ -96,6 +97,19 @@ class ReaderWireTests(unittest.TestCase):
                 self.assertEqual(texts, ["complete tail words"])
                 self.assertEqual(statuses, [status])
 
+    def test_native_completion_is_canonical_and_missing_status_is_unresolved(self):
+        for status, expected in (
+            ("complete", "completed"),
+            (None, "unresolved"),
+            ("unknown", "unresolved"),
+        ):
+            self.assertEqual(
+                response_texts_and_statuses(
+                    "antfly-reader", {"data": [{"text": "tail", "status": status}]}
+                ),
+                (["tail"], [expected]),
+            )
+
     def test_nontext_chat_result_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "contain text"):
             response_texts_and_statuses(
@@ -147,6 +161,56 @@ class ReaderReferenceTests(unittest.TestCase):
                 self.report["references"][0]["image_index"] = index
                 with self.assertRaisesRegex(ValueError, "invalid image index"):
                     self.load()
+
+
+class NativeBatchEvidenceTests(unittest.TestCase):
+    def row(self, width):
+        execution = {"native_items": 1, "native_batches": 1}
+        if width is not None:
+            execution["max_native_step_items"] = width
+        return {
+            "http_status": 200,
+            "items": 1,
+            "tail_pass": True,
+            "reference_exact": True,
+            "statuses": ["completed"],
+            "execution": execution,
+        }
+
+    def test_serialized_native_singletons_cannot_qualify_as_a_batch(self):
+        # A serialized server may truthfully report native executor use.
+        # Attribution, epoch counts, and text parity do not prove co-execution.
+        for width in (None, 0, 1, True, "4"):
+            with self.subTest(width=width):
+                self.assertFalse(
+                    qualified_request(
+                        self.row(width),
+                        require_reference_parity=True,
+                        min_native_step_items=2,
+                    )
+                )
+        self.assertTrue(
+            qualified_request(
+                self.row(4), require_reference_parity=True, min_native_step_items=4
+            )
+        )
+        self.assertFalse(qualified_request(self.row(2), min_native_step_items=4))
+
+    def test_width_does_not_override_correctness_or_completion(self):
+        for key, value in (
+            ("http_status", 503),
+            ("tail_pass", False),
+            ("reference_exact", False),
+            ("statuses", []),
+            ("statuses", ["truncated"]),
+        ):
+            row = self.row(4)
+            row[key] = value
+            self.assertFalse(
+                qualified_request(
+                    row, require_reference_parity=True, min_native_step_items=2
+                )
+            )
 
 
 if __name__ == "__main__":

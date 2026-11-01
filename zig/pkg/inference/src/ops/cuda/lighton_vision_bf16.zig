@@ -22,10 +22,10 @@ const buffer = @import("buffer.zig");
 const cublas = @import("cublaslt.zig");
 const cudnn = @import("cudnn_sdpa.zig");
 
-/// Generic BF16 tensor-core/cuBLAS/cuDNN execution starts at Ampere.
+/// Generic BF16 execution starts at Ampere; the embedded PTX requires CUDA 13.
 /// Specialized fused GEMMs retain their own narrower device checks.
-pub fn deviceSupported(compute_major: i32) bool {
-    return compute_major >= 8;
+pub fn deviceSupported(device: @import("lighton_device_policy.zig").Device) bool {
+    return device.portableKernels();
 }
 
 pub fn validRowGeometry(rows: usize, batch: usize) bool {
@@ -34,16 +34,24 @@ pub fn validRowGeometry(rows: usize, batch: usize) bool {
 }
 
 test "LightOnOCR3 BF16 vision device contract includes Ampere and Blackwell" {
-    try std.testing.expect(!deviceSupported(7));
-    try std.testing.expect(deviceSupported(8));
-    try std.testing.expect(deviceSupported(9));
-    try std.testing.expect(deviceSupported(12));
+    try std.testing.expect(!deviceSupported(.{ .major = 8, .minor = 0, .driver_version = 12090 }));
+    try std.testing.expect(!deviceSupported(.{ .major = 7, .minor = 0, .driver_version = 13000 }));
+    try std.testing.expect(deviceSupported(.{ .major = 8, .minor = 0, .driver_version = 13000 }));
+    try std.testing.expect(deviceSupported(.{ .major = 9, .minor = 0, .driver_version = 13000 }));
+    try std.testing.expect(deviceSupported(.{ .major = 12, .minor = 0, .driver_version = 13000 }));
     try std.testing.expect(validRowGeometry(7656, 1));
     try std.testing.expect(validRowGeometry(12996 * 4, 4));
     try std.testing.expect(validRowGeometry(65536, 4));
     try std.testing.expect(!validRowGeometry(16385, 1));
     try std.testing.expect(!validRowGeometry(12996 * 8, 8));
     try std.testing.expect(!validRowGeometry(1, 0));
+    // Direct module users must obey the same contract as the selector.
+    var ctx: context.CudaContext = undefined;
+    ctx.info.compute_major = 8;
+    ctx.info.compute_minor = 0;
+    ctx.info.driver_version = 12090;
+    var module = Module{};
+    try std.testing.expectError(error.UnsupportedDevice, module.init(&ctx));
 }
 
 pub const Precision = enum {
@@ -124,6 +132,7 @@ pub const Module = struct {
 
     pub fn init(self: *Module, ctx: *context.CudaContext) !void {
         if (self.module != null) return;
+        if (!deviceSupported(.{ .major = ctx.info.compute_major, .minor = ctx.info.compute_minor, .driver_version = ctx.info.driver_version })) return error.UnsupportedDevice;
         try ctx.makeCurrent();
         var module: driver.CUmodule = null;
         const image = @embedFile("lighton_vision_bf16.ptx") ++ "\x00";

@@ -35,7 +35,12 @@ also enables the continuous OCR scheduler. `max_step_items` bounds physical
 reader rows (up to 16 without an experimental wide profile); its active window
 is bounded to twice that value. Generic text generation retains its own
 qualified two-row ceiling. `off` and `auto` do not opt into the new reader path.
-Existing diagnostic environment overrides remain available.
+Diagnostic `ANTFLY_LIGHTONOCR3_CUDA_BATCH=0` overrides canonical activation;
+`ANTFLY_LIGHTONOCR3_BATCH_ROWS` and `ANTFLY_LIGHTONOCR3_BATCH_WINDOW` override
+their respective defaults, bounded by physical capacity. Setting both to `1`
+provides a singleton rollback. Without an explicit window, canonical mode uses
+twice the resolved row count. Admission, execution, and discovery use the same
+resolved settings.
 `resources.inference.admission.max_concurrent_requests` must allow overlapping
 requests to reach the scheduler. Public `max_items_per_request: 1` does not
 prevent batching independent callers.
@@ -71,14 +76,29 @@ that all pages fit memory simultaneously. For a pool that scales to zero,
 model-count and memory-pressure eviction still apply. Preload the primary model
 before routing to the newly activated pod. Set `inference.preload[].pin: false`
 to warm the evictable cache rather than permanently reserving the model slot;
-the default remains `true` for intentionally resident preloads.
+the default remains `true` for intentionally resident preloads. Explicit
+per-model backend, GLiNER CUDA precision, and A4B load settings survive eviction
+and apply to subsequent automatic cold loads. Pinning only controls residency;
+explicit request placement remains separate.
+
+Reader performance qualification must distinguish native executor attribution
+from observed batching. `execution.max_native_step_items` reports the largest
+successful decoder step that a returned page participated in, including pages
+from other requests. Zero or absent means unobserved; one means singleton.
+`scripts/qualify_reader_page_latency.py --require-native-batch` requires at
+least two observed rows for every request; `--min-native-step-items` can raise
+that target up to the selected concurrency. Exact reference parity and complete
+output checks remain independent requirements. Native item/epoch counts or
+CUDA graph replay counts alone do not establish multirow execution.
+
 
 CUDA model loads log host preparation, device initialization, weight upload and
 total elapsed time. Host preparation may map rather than read all weight bytes:
 subsequent page faults and conversions can appear in the upload phase. These
 are wall-clock timings rather than synchronized GPU profiling spans.
 The optional `ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE=bf16_vision` admits
-Ampere-or-newer devices through generic vendor kernels; F32 remains the default.
+Ampere-or-newer devices with a CUDA 13-or-newer driver through generic vendor
+kernels (the embedded vision artifact uses PTX 9.0); F32 remains the default.
 Architecture-specific fused kernels retain their own guards. Qualify output
 correctness and memory on the target GPU before promotion.
 

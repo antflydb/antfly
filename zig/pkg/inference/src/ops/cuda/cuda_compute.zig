@@ -2286,7 +2286,7 @@ pub const CudaCompute = struct {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         return self.capability_profile == .lightonocr3 and self.lighton_precision == .bf16_vision and
             !self.resident_training_cache and self.lazy_host_store == null and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
-            @import("lighton_vision_bf16.zig").deviceSupported(self.ctx.info.compute_major) and self.cublaslt != null;
+            @import("lighton_vision_bf16.zig").deviceSupported(lightOnDevice(self)) and self.cublaslt != null;
     }
 
     pub fn lightOnVisionBf16ToF32(cb: *const ops.ComputeBackend, input: CT) !?CT {
@@ -36504,4 +36504,34 @@ test "CUDA vision automatic policy consumes resolved settings without a second e
     compute.capability_profile = null;
     try std.testing.expect(!compute.lightOnVisionQkvEnabled());
     try std.testing.expect(!compute.lightOnVisionMlpEnabled());
+}
+
+test "LightOn BF16 vision capability includes the portable artifact driver contract" {
+    var compute: CudaCompute = undefined;
+    compute.capability_profile = .lightonocr3;
+    compute.lighton_precision = .bf16_vision;
+    compute.resident_training_cache = false;
+    compute.lazy_host_store = null;
+    compute.debug_cuda_graph_capture_active = false;
+    compute.ctx.debug_graph_capture_active = false;
+    compute.ctx.info.compute_major = 8;
+    compute.ctx.info.compute_minor = 0;
+    compute.ctx.info.driver_version = 12090;
+    compute.cublaslt = @as(cublaslt_mod.CublasLt, undefined);
+    const Stub = struct {
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .cuda;
+        }
+    };
+    var table: ops.ComputeBackend.VTable = undefined;
+    table.backendKind = Stub.kind;
+    var cb = ops.ComputeBackend{ .ptr = &compute, .vtable = &table };
+    try std.testing.expect(!CudaCompute.lightOnBf16VisionEnabled(&cb));
+    compute.ctx.info.driver_version = 13000;
+    try std.testing.expect(CudaCompute.lightOnBf16VisionEnabled(&cb));
+    compute.ctx.info.compute_major = 7;
+    try std.testing.expect(!CudaCompute.lightOnBf16VisionEnabled(&cb));
+    compute.ctx.info.compute_major = 8;
+    compute.cublaslt = null;
+    try std.testing.expect(!CudaCompute.lightOnBf16VisionEnabled(&cb));
 }

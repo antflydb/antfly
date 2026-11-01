@@ -100,12 +100,38 @@ def response_texts_and_statuses(api_shape, data):
     elif api_shape == "antfly-reader":
         items = data.get("data", [])
         texts = [item.get("text", "") for item in items]
-        statuses = [item.get("status") for item in items]
+        statuses = [
+            "completed"
+            if item.get("status") in ("complete", "completed")
+            else item.get("status")
+            if item.get("status") in ("failed", "truncated")
+            else "unresolved"
+            for item in items
+        ]
     else:
         raise ValueError("unsupported API shape")
     if any(not isinstance(text, str) for text in texts):
         raise ValueError("inference response must contain text")
     return texts, statuses
+
+
+def qualified_request(row, *, require_reference_parity=False, min_native_step_items=0):
+    execution = row.get("execution") or {}
+    width = execution.get("max_native_step_items")
+    observed_batch = (
+        type(execution.get("native_items")) is int
+        and execution["native_items"] == 1
+        and type(width) is int
+        and width >= min_native_step_items
+    )
+    return (
+        row.get("http_status") == 200
+        and row.get("items") == 1
+        and row.get("tail_pass") is True
+        and (not require_reference_parity or row.get("reference_exact") is True)
+        and (min_native_step_items == 0 or observed_batch)
+        and row.get("statuses") == ["completed"]
+    )
 
 
 def main():
@@ -120,7 +146,17 @@ def main():
     p.add_argument(
         "--api-shape", choices=("antfly-reader", "openai-chat"), default="antfly-reader"
     )
-    p.add_argument("--require-native-batch", action="store_true")
+    p.add_argument(
+        "--require-native-batch",
+        action="store_true",
+        help="Require measured multirow decoder execution for every request",
+    )
+    p.add_argument(
+        "--min-native-step-items",
+        type=int,
+        default=2,
+        help="Minimum observed step width when requiring native batching (default: 2)",
+    )
     p.add_argument(
         "--reference-report",
         type=pathlib.Path,
@@ -135,12 +171,17 @@ def main():
     args = p.parse_args()
     if not 1 <= args.rounds <= 4 or not 1 <= args.concurrency <= 16:
         p.error("qualification is bounded to 1–4 rounds and 1–16 concurrent requests")
+    if args.require_native_batch and (
+        args.api_shape != "antfly-reader"
+        or not 2 <= args.min_native_step_items <= args.concurrency
+    ):
+        p.error(
+            "native batching requires the Antfly reader API and 2 <= minimum step width <= concurrency"
+        )
     if not 1 <= len(args.pages) <= 64:
         p.error("qualification is bounded to 1–64 pages per round")
     if args.require_reference_parity and args.reference_report is None:
         p.error("--require-reference-parity requires --reference-report")
-    if args.require_native_batch and args.api_shape != "antfly-reader":
-        p.error("--require-native-batch requires the Antfly reader API")
     references = (
         reference_expectations(args.reference_report) if args.reference_report else None
     )
@@ -179,6 +220,12 @@ def main():
         "max_tokens": args.max_tokens,
         "concurrency": args.concurrency,
         "api_shape": args.api_shape,
+        "requirements": {
+            "exact_reference_parity": args.require_reference_parity,
+            "min_native_step_items": args.min_native_step_items
+            if args.require_native_batch
+            else 0,
+        },
         "benchmark_script_sha256": hashlib.sha256(
             pathlib.Path(__file__).read_bytes()
         ).hexdigest(),
@@ -259,16 +306,12 @@ def main():
         )
         args.output.write_text(json.dumps(receipt, indent=2) + "\n")
     passed = all(
-        row.get("http_status") == 200
-        and row.get("items") == 1
-        and row.get("tail_pass")
-        and (not args.require_reference_parity or row.get("reference_exact") is True)
-        and (
-            not args.require_native_batch
-            or (row.get("execution") or {}).get("native_items", 0) == 1
-        )
-        and not any(
-            s in ("failed", "truncated", "unresolved") for s in row.get("statuses", [])
+        qualified_request(
+            row,
+            require_reference_parity=args.require_reference_parity,
+            min_native_step_items=args.min_native_step_items
+            if args.require_native_batch
+            else 0,
         )
         for observation in receipt["observations"]
         for row in observation["requests"]

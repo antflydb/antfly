@@ -24800,6 +24800,13 @@ export interface components {
             requested_items: number;
             native_batches: number;
             native_items: number;
+            /**
+             * @description Largest successfully executed native decoder step observed by these
+             *     items, including peers from other requests. Zero or absent means
+             *     unobserved, one means singleton execution. This is measured at
+             *     execution, never inferred from native_items or request cardinality.
+             */
+            max_native_step_items?: number;
             serial_items: number;
             /** @description Items rejected before model execution by validation, resolution, or admission. */
             rejected_items: number;

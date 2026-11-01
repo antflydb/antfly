@@ -2801,6 +2801,8 @@ pub const NativeDecodeState = struct {
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     qwen35_linear_cache: ?gpt_arch.Qwen35LinearCache = null,
     batched_decode_steps: usize = 0,
+    /// Largest successfully executed decoder step this sequence participated in.
+    max_native_step_items: usize = 0,
     gemma4_layer_spec_cache: gpt_arch.Gemma4LayerSpecCache = .{},
     deepseek_v4_compressed_cache: ?gpt_arch.DeepSeekV4CompressedCache = null,
     force_full_recompute: bool = false,
@@ -14354,12 +14356,13 @@ pub const NativeGenerationPipeline = struct {
         last_rows_only: bool = false,
 
         fn publish(self: @This(), claimed: []const runtime.scheduler.native_generate.StepItem) void {
-            if (claimed.len > 1) for (claimed) |item| {
+            for (claimed) |item| {
                 if (item.phase == .decode) {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                    work.decode_state.batched_decode_steps += 1;
+                    work.decode_state.max_native_step_items = @max(work.decode_state.max_native_step_items, claimed.len);
+                    if (claimed.len > 1) work.decode_state.batched_decode_steps += 1;
                 }
-            };
+            }
             if (self.packed_greedy_tokens) |tokens| {
                 dispatchPackedGreedyResultsWithLayout(self.vocab_size, claimed, self.logits, tokens, self.prefix_logits_layout);
                 return;
@@ -16004,6 +16007,14 @@ test "Metal greedy step publishes independent page choices without vocabulary ro
     try std.testing.expectEqual(@as(u32, 17), first.greedy_token.?);
     try std.testing.expectEqual(@as(u32, 29), second.greedy_token.?);
     try std.testing.expect(first.logits == null and second.logits == null);
+    try std.testing.expectEqual(@as(usize, 2), state.max_native_step_items);
+    const singleton = NativeGenerationPipeline.SuccessfulStepPublisher{ .vocab_size = 262144, .logits = null, .max_query_seq_len = 1, .greedy_tokens = &.{17} };
+    singleton.publish(items[0..1]);
+    // A singleton tail cannot erase the earlier measured multirow step.
+    try std.testing.expectEqual(@as(usize, 2), state.max_native_step_items);
+    state.max_native_step_items = 0;
+    singleton.publish(items[0..1]);
+    try std.testing.expectEqual(@as(usize, 1), state.max_native_step_items);
 }
 
 test "dispatchStepLogits dupes per-item rows and respects wants_last_logits" {

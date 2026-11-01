@@ -6265,10 +6265,23 @@ pub const Node = struct {
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        if (model.name.len == 0) return error.InvalidGenerationRequest;
         try validateWarmModelCudaPrecision(model);
+        const a4b_request = try validatedWarmModelA4bRequest(model);
+        // Persist selection before any startup acquisition, including prefetch.
+        // Pinning controls residency only; eviction must not change execution.
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
+        defer self.allocator.free(model_path);
+        try self.model_manager.setStartupLoadPolicy(model_path, .{
+            .backend = if (model.cuda_precision != null) .cuda else model.backend,
+            .gliner_cuda_precision = model.cuda_precision,
+            .a4b_request = a4b_request,
+        });
         if (model.startup_strategy == .prefetch)
             return self.prefetchWarmModel(allocator, model);
-        const a4b_request = try validatedWarmModelA4bRequest(model);
         const materialize_optional_sessions = kernelJitMaterializesOptionalSessions(self.config.kernel_jit.mode);
         switch (model.kind) {
             .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend, a4b_request, model.pin),
@@ -7693,6 +7706,7 @@ pub const Node = struct {
         prompt_tokens: usize,
         completion_tokens: usize,
         native_execution_id: u64 = 0,
+        max_native_step_items: usize = 0,
 
         pub fn deinit(self: *Qwen3VlReadResult, allocator: std.mem.Allocator) void {
             allocator.free(self.text);
@@ -7705,6 +7719,7 @@ pub const Node = struct {
         var native_ids = std.AutoHashMapUnmanaged(u64, void).empty;
         defer native_ids.deinit(allocator);
         for (results) |result| {
+            execution.max_native_step_items = @max(execution.max_native_step_items, result.max_native_step_items);
             if (result.native_execution_id != 0) {
                 execution.native_items += 1;
                 try native_ids.put(allocator, result.native_execution_id, {});
@@ -7712,6 +7727,19 @@ pub const Node = struct {
         }
         execution.native_batches = native_ids.count();
         return execution;
+    }
+
+    fn qwenReadExecutionReport(allocator: std.mem.Allocator, results: []const Qwen3VlReadResult) !api.BatchExecutionReport {
+        const observed = try qwenReadExecution(allocator, results);
+        return .{
+            .requested_items = @intCast(observed.requested_items),
+            .native_batches = @intCast(observed.native_batches),
+            .native_items = @intCast(observed.native_items),
+            .max_native_step_items = @intCast(observed.max_native_step_items),
+            .serial_items = @intCast(observed.serial_items),
+            .rejected_items = 0,
+            .fallback_items = 0,
+        };
     }
 
     fn qwen3VlEncodedReadBatchResult(
@@ -8083,11 +8111,28 @@ pub const Node = struct {
         control: InferenceExecutionControl,
     };
 
-    // Execution settings select native OCR scheduling; admission stays separate.
+    // Resolve all presence-aware overrides through the same policy used by
+    // admission, discovery, workers, and epoch execution.
+    fn lightOnReaderPolicy(self: *const Node) @import("reader_batch_policy.zig").Policy {
+        const Policy = @import("reader_batch_policy.zig").Policy;
+        const canonical = self.config.generation_batching.mode == .on;
+        return Policy.resolve(.{
+            .cuda_available = build_options.enable_cuda and qwen35_execution.cudaCoreEnabled(),
+            .cuda_enabled = self.config.generation_batching.enabledForBackend(.cuda),
+            .rows = if (canonical) self.config.generation_batching.max_step_items else effectiveLightOnReadRows(),
+            .row_ceiling = if (canonical) @max(lightOnPhysicalRowCeiling(), 16) else lightOnPhysicalRowCeiling(),
+            .window = effectiveLightOnReadWindow(),
+            .window_ceiling = if (canonical) reader_execution_pool.Pool.max_capacity else effectiveLightOnReadWindowCeiling(),
+            .window_tracks_rows = canonical,
+        }, .{
+            .cuda_enabled = if (platform.env.getenv("ANTFLY_LIGHTONOCR3_CUDA_BATCH") != null) platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_BATCH") else null,
+            .rows = platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_ROWS"),
+            .window = platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_WINDOW"),
+        });
+    }
+
     fn lightOnCudaBatchEnabled(self: *const Node) bool {
-        return cudaLightOnBatchProfileEnabled() or
-            (build_options.enable_cuda and qwen35_execution.cudaCoreEnabled() and
-                self.config.generation_batching.enabledForBackend(.cuda));
+        return self.lightOnReaderPolicy().cuda_enabled;
     }
 
     fn lightOnContinuousEnabled(self: *const Node, backend: backends_mod.BackendType) bool {
@@ -8097,15 +8142,11 @@ pub const Node = struct {
     }
 
     fn lightOnReaderRows(self: *const Node) usize {
-        if (self.config.generation_batching.mode == .on)
-            return std.math.clamp(self.config.generation_batching.max_step_items, 1, @max(lightOnPhysicalRowCeiling(), 16));
-        return effectiveLightOnReadRows();
+        return self.lightOnReaderPolicy().rows;
     }
 
     fn lightOnReaderWindow(self: *const Node) usize {
-        if (self.config.generation_batching.mode == .on)
-            return @min(self.lightOnReaderRows() * 2, reader_execution_pool.Pool.max_capacity);
-        return effectiveLightOnReadWindow();
+        return self.lightOnReaderPolicy().window;
     }
 
     pub fn lightOnOcrPolicy(self: *const Node, physical_rows_limit: usize) runtime.scheduler.native_generate.Policy {
@@ -8617,7 +8658,7 @@ pub const Node = struct {
         // Refill completed slots in the same resident epoch. The simultaneous
         // window and every GPU forward retain their existing independent caps.
         const epoch_page_limit: usize = if (extended_epoch) 256 else 64;
-        var factory = LightOnStreamContext.Factory{ .node = self, .model = model, .cfg = cfg, .limits = limits, .physical_rows_limit = try lightOnCohortRowLimit(self.lightOnReaderRows(), contract.batch.max_items, model.manifest.capabilities), .epoch_page_limit = epoch_page_limit, .decoder_peak = memory.decoder_backend_peak, .features = features, .control = control };
+        var factory = LightOnStreamContext.Factory{ .node = self, .model = model, .cfg = cfg, .limits = limits, .physical_rows_limit = try lightOnCohortRowLimit(self.lightOnReaderRows(), contract.batch.max_items, model.manifest.capabilities), .epoch_page_limit = epoch_page_limit, .cuda_batch_enabled = self.lightOnCudaBatchEnabled(), .decoder_peak = memory.decoder_backend_peak, .features = features, .control = control };
         // Queue before admission and GPU allocation. Only active slots reserve
         // live resources; independently completed pages immediately free slots.
         // Logical occupancy can exceed the physical per-step contract. Every
@@ -8777,7 +8818,7 @@ pub const Node = struct {
         defer result.deinit();
         try control.check();
         if (std.mem.eql(u8, result.finish_reason, "length")) return error.ReadOutputTruncated;
-        return .{ .text = try a.dupe(u8, result.text), .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used, .native_execution_id = if (state.batched_decode_steps > 0) ctx.execution_id else 0 };
+        return .{ .text = try a.dupe(u8, result.text), .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used, .native_execution_id = if (state.batched_decode_steps > 0) ctx.execution_id else 0, .max_native_step_items = state.max_native_step_items };
     }
 
     fn readLightOnContinuousImages(self: *Node, allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel, model_path: []const u8, images: []const []const u8, prompt: []const u8, max_tokens: i32, control: InferenceExecutionControl) ![]Qwen3VlReadResult {
@@ -8819,7 +8860,7 @@ pub const Node = struct {
         var tasks: [reader_execution_pool.Pool.max_capacity]Task = undefined;
         var threads: [reader_execution_pool.Pool.max_capacity]std.Thread = undefined;
         var spawned: usize = 0;
-        const count = lightOnContinuousWorkerCount(images.len);
+        const count = lightOnContinuousWorkerCount(images.len, self.lightOnReaderWindow());
         defer for (threads[0..spawned]) |thread| thread.join();
         for (0..count) |i| {
             tasks[i] = .{ .node = self, .model = model, .model_path = model_path, .images = images, .prompt = prompt, .max_tokens = max_tokens, .control = control, .values = values, .failures = failures, .offset = i, .stride = count, .next_image = &next_image, .static_assignment = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_STATIC_PAGE_ASSIGNMENT") };
@@ -8980,7 +9021,7 @@ pub const Node = struct {
             if (std.mem.eql(u8, result.finish_reason, "length")) return error.ReadOutputTruncated;
             try self.item.control.check();
             try self.payload.control.check();
-            self.item.slot.setValue(Qwen3VlReadResult, .{ .text = try self.item.allocator.dupe(u8, result.text), .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used }, if (self.pipeline.decode_state.?.batched_decode_steps > 0) .native_batch else .serial);
+            self.item.slot.setValue(Qwen3VlReadResult, .{ .text = try self.item.allocator.dupe(u8, result.text), .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used, .max_native_step_items = self.pipeline.decode_state.?.max_native_step_items }, if (self.pipeline.decode_state.?.batched_decode_steps > 0) .native_batch else .serial);
         }
     };
 
@@ -21092,11 +21133,11 @@ pub const Node = struct {
             for (qwen_results, 0..) |result, i| {
                 prompt_tokens = std.math.add(usize, prompt_tokens, result.prompt_tokens) catch std.math.maxInt(usize);
                 completion_tokens = std.math.add(usize, completion_tokens, result.completion_tokens) catch std.math.maxInt(usize);
-                results_out[i] = .{
-                    .text = try alloc.dupe(u8, result.text),
-                    .object = "read",
-                    .index = @intCast(i),
-                };
+                results_out[i] = try toApiReadObject(alloc, .{
+                    .allocator = alloc,
+                    .text = result.text,
+                    .completion = if (result.truncated) .length else .complete,
+                }, i);
                 filled = i + 1;
             }
             return ctx.json(api.ReadResponse{
@@ -21104,10 +21145,7 @@ pub const Node = struct {
                 .data = results_out,
                 .model = body.model,
                 .usage = tokenUsage(prompt_tokens, completion_tokens),
-                .execution = blk: {
-                    const observed = try qwenReadExecution(ctx.allocator, qwen_results);
-                    break :blk .{ .requested_items = @intCast(observed.requested_items), .native_batches = @intCast(observed.native_batches), .native_items = @intCast(observed.native_items), .serial_items = @intCast(observed.serial_items), .rejected_items = 0, .fallback_items = 0 };
-                },
+                .execution = try qwenReadExecutionReport(ctx.allocator, qwen_results),
             });
         }
 
@@ -21263,6 +21301,11 @@ pub const Node = struct {
 
         return .{
             .text = text_copy,
+            .status = switch (result.completion) {
+                .complete => "complete",
+                .length => "truncated",
+                .unresolved => "unresolved",
+            },
             .fields = if (fields_map) |fields| .{ .value = fields } else .absent,
             .regions = regions,
             .object = "read",
@@ -28552,12 +28595,16 @@ fn effectiveLightOnReadWindow() usize {
     // A wider logical window can keep the physical sixteen-row forward full
     // while peers finish vision/prefill or retire. Every page still acquires
     // its own resource lease; this does not increase a forward's row limit.
-    const ceiling: usize = if (cudaLightOnBatchProfileEnabled()) lightOnPhysicalRowCeiling() else if (!metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_WIDE_DECODE")) 16 else if (lightOnPhysicalRowCeiling() == 64 or (lightOnPhysicalRowCeiling() == 32 and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_LOGICAL64"))) @as(usize, 64) else 32;
+    const ceiling = effectiveLightOnReadWindowCeiling();
     return @min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_WINDOW") orelse (if (ceiling > 32) ceiling else if (effectiveLightOnReadRows() > 16) @as(usize, 32) else if (metal_runtime.lightOnThroughputProfileEnabled()) @as(usize, 16) else 8), 1), ceiling);
 }
 
-fn lightOnContinuousWorkerCount(images: usize) usize {
-    return @min(images, effectiveLightOnReadWindow(), reader_execution_pool.Pool.max_capacity);
+fn effectiveLightOnReadWindowCeiling() usize {
+    return if (cudaLightOnBatchProfileEnabled()) lightOnPhysicalRowCeiling() else if (!metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_WIDE_DECODE")) 16 else if (lightOnPhysicalRowCeiling() == 64 or (lightOnPhysicalRowCeiling() == 32 and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_LOGICAL64"))) @as(usize, 64) else 32;
+}
+
+fn lightOnContinuousWorkerCount(images: usize, window: usize) usize {
+    return @min(images, window, reader_execution_pool.Pool.max_capacity);
 }
 
 /// Give concurrent OCR pages time to reach the same cohort before acquiring
@@ -33029,7 +33076,7 @@ test "startup split Whisper backend is reused through canonical request paths" {
         defer node.deinit();
         try node.attachIo(std.testing.io);
         node.model_manager.session_manager.preferred_backends = &.{ .native, .metal };
-        try node.warmTranscriber(allocator, .{ .kind = .transcriber, .name = "owner/tiny", .backend = .native, .pin = pin });
+        try node.warmModel(allocator, .{ .kind = .transcriber, .name = "owner/tiny", .backend = .native, .pin = pin });
         const path = try node.resolveRequestModelPath(allocator, std.testing.io, "owner/tiny", "transcribers");
         defer allocator.free(path);
         const paths = try @import("../pipelines/encoder_decoder.zig").findEncoderDecoderPaths(allocator, path);
@@ -42708,8 +42755,8 @@ test "LightOnOCR3 logical64 isolates physical rows and bounds multi-image worker
     const eligible = metal_runtime.appleSimdgroupDeviceDefault();
     const window: usize = if (eligible) 64 else 32;
     try std.testing.expectEqual(window, effectiveLightOnReadWindow());
-    try std.testing.expectEqual(window, lightOnContinuousWorkerCount(128));
-    try std.testing.expectEqual(@as(usize, 17), lightOnContinuousWorkerCount(17));
+    try std.testing.expectEqual(window, lightOnContinuousWorkerCount(128, window));
+    try std.testing.expectEqual(@as(usize, 17), lightOnContinuousWorkerCount(17, window));
     var node: Node = undefined;
     node.config = .{};
     const policy = node.lightOnOcrPolicy(32);
@@ -47541,4 +47588,63 @@ test "OCR generative profiles resolve page budgets without changing admission un
         try std.testing.expectEqual(@as(usize, 20), Node.estimateGenerateAdmissionUnitsFromShape(0, 1, @intCast(tokens)));
     }
     try std.testing.expectEqual(@as(usize, 1), estimateReadAdmissionUnits(1, 256));
+}
+
+test "reader batching reports observed cross-request step width rather than request count" {
+    const results = [_]Node.Qwen3VlReadResult{.{ .text = @constCast(""), .prompt_tokens = 1, .completion_tokens = 1, .native_execution_id = 42, .max_native_step_items = 4 }};
+    const observed = try Node.qwenReadExecution(std.testing.allocator, &results);
+    try std.testing.expectEqual(@as(usize, 1), observed.requested_items);
+    try std.testing.expectEqual(@as(usize, 1), observed.native_items);
+    try std.testing.expectEqual(@as(usize, 4), observed.max_native_step_items);
+    const wire = try Node.qwenReadExecutionReport(std.testing.allocator, &results);
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, wire, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"max_native_step_items\":4") != null);
+    var singleton = results;
+    singleton[0].native_execution_id = 0;
+    singleton[0].max_native_step_items = 1;
+    const serial = try Node.qwenReadExecution(std.testing.allocator, &singleton);
+    try std.testing.expectEqual(@as(usize, 0), serial.native_items);
+    try std.testing.expectEqual(@as(usize, 1), serial.max_native_step_items);
+}
+
+test "reader batching node honors explicit environment rollback in canonical mode" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const names = [_][:0]const u8{ "ANTFLY_LIGHTONOCR3_CUDA_BATCH", "ANTFLY_LIGHTONOCR3_BATCH_ROWS", "ANTFLY_LIGHTONOCR3_BATCH_WINDOW" };
+    const values = [_][:0]const u8{ "0", "1", "1" };
+    var saved: [names.len]?[:0]u8 = @splat(null);
+    var saved_count: usize = 0;
+    defer for (names[0..saved_count], saved[0..saved_count]) |name, value| {
+        if (value) |old| {
+            _ = Env.setenv(name, old, 1);
+            std.testing.allocator.free(old);
+        } else _ = Env.unsetenv(name);
+    };
+    for (names, 0..) |name, i| {
+        if (platform.env.getenv(name)) |old| saved[i] = try std.testing.allocator.dupeSentinel(u8, old, 0);
+        saved_count += 1;
+    }
+    for (names, values) |name, value| if (Env.setenv(name, value, 1) != 0) return error.EnvironmentMutationFailed;
+    // This policy query must not initialize model managers, routes or drivers.
+    var node: Node = undefined;
+    node.config = .{ .generation_batching = .{ .mode = .on, .max_step_items = 4 } };
+    try std.testing.expect(!node.lightOnCudaBatchEnabled());
+    const policy = node.lightOnOcrPolicy(16);
+    try std.testing.expectEqual(@as(usize, 1), policy.max_step_items);
+    try std.testing.expectEqual(@as(?usize, 1), policy.max_active_requests_for_batching);
+    try std.testing.expectEqual(@as(usize, 1), lightOnContinuousWorkerCount(4, node.lightOnReaderWindow()));
+}
+
+test "reader batching API reports measured completion without inferring it from text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const completions = [_]readers_api.Completion{ .complete, .length, .unresolved };
+    for (completions, [_][]const u8{ "complete", "truncated", "unresolved" }) |completion, expected| {
+        const result = try Node.toApiReadObject(arena.allocator(), .{ .allocator = arena.allocator(), .text = "same text", .completion = completion }, 0);
+        try std.testing.expectEqualStrings(expected, result.status.?);
+    }
 }

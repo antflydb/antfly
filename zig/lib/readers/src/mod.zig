@@ -205,6 +205,9 @@ pub const BatchExecution = struct {
     requested_items: usize = 0,
     native_batches: usize = 0,
     native_items: usize = 0,
+    /// Actual successful decoder-step width, including peers in other requests.
+    /// Zero means unobserved; it must never be inferred from request cardinality.
+    max_native_step_items: usize = 0,
     serial_items: usize = 0,
     fallback_items: usize = 0,
     fallback_reason: ?[]const u8 = null,
@@ -789,6 +792,7 @@ fn batchExecutionFromWire(wire: ?inference_api.BatchExecutionReport, item_count:
         .requested_items = std.math.cast(usize, report.requested_items) orelse return error.InvalidReadExecutionReport,
         .native_batches = std.math.cast(usize, report.native_batches) orelse return error.InvalidReadExecutionReport,
         .native_items = std.math.cast(usize, report.native_items) orelse return error.InvalidReadExecutionReport,
+        .max_native_step_items = std.math.cast(usize, report.max_native_step_items orelse 0) orelse return error.InvalidReadExecutionReport,
         .serial_items = std.math.cast(usize, report.serial_items) orelse return error.InvalidReadExecutionReport,
         .fallback_items = std.math.cast(usize, report.fallback_items) orelse return error.InvalidReadExecutionReport,
         .fallback_reason = if (report.fallback_items > 0) "remote_reader_fallback" else null,
@@ -805,12 +809,14 @@ test "reader wire execution is observed, validated, and backward compatible" {
         .requested_items = 2,
         .native_batches = 1,
         .native_items = 2,
+        .max_native_step_items = 4,
         .serial_items = 0,
         .rejected_items = 0,
         .fallback_items = 0,
     }, 2);
     try std.testing.expectEqual(@as(usize, 2), native.native_items);
     try std.testing.expectEqual(@as(usize, 1), native.native_batches);
+    try std.testing.expectEqual(@as(usize, 4), native.max_native_step_items);
 
     const mixed = try batchExecutionFromWire(.{
         .requested_items = 2,
