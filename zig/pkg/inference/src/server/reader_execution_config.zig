@@ -38,6 +38,9 @@ pub fn Features(comptime Hooks: type) type {
         epoch_auxiliary: bool = false,
         single_frame: bool = false,
         gpu_token_burst: bool = false,
+        // An epoch-owned executor can retain a pure greedy continuation even
+        // when its backend does not select multi-token device bursts.
+        executor_tail: bool = false,
         gpu_token_burst_width: u8 = 2,
         cuda_burst_extra_bytes: usize = 0,
         gpu_greedy_stream: bool = false,
@@ -98,6 +101,7 @@ pub fn Features(comptime Hooks: type) type {
                 .epoch_auxiliary = true,
                 .single_frame = !cuda,
                 .gpu_token_burst = !cuda,
+                .executor_tail = true,
                 .gpu_token_burst_width = 4,
                 .vision_workspace_cache = !cuda,
                 .device_vision_features = cuda,
@@ -334,6 +338,7 @@ test "LightOnOCR3 conservative reader leaves Metal prepared capacity unconfigure
     // Metal accepts only 16, 32 or 64 prepared rows. The default profile
     // must not configure capacity it never uses.
     try std.testing.expectEqual(@as(?usize, null), F.forProfile(.conservative, cfg, 1).preparedRowCapacity());
+    try std.testing.expect(!F.forProfile(.conservative, cfg, 1).executor_tail);
     for ([_]F.Profile{ .metal_lighton08, .metal_lighton4b }) |profile| {
         for ([_]usize{ 0, 1, 16, 17, 33, 64, 999 }) |requested| {
             const rows = F.forProfile(profile, cfg, requested).preparedRowCapacity() orelse return error.TestUnexpectedResult;
@@ -388,6 +393,7 @@ test "LightOnOCR3 selected reader profiles retain admission ownership row caps a
         try std.testing.expectEqual(if (cuda) @as(u8, 128) else 64, selected.scheduling_rows);
         try std.testing.expect(selected.needsAuxiliary());
         try std.testing.expect(selected.packed_mixed and selected.prepared and selected.worker and selected.shared_decoder_scratch);
+        try std.testing.expect(selected.executor_tail);
         try std.testing.expect(!selected.gpu_greedy_stream and !selected.stream_chunks and !selected.prefill_activation_pool and selected.stream_first_layers == 0 and selected.prefill_stream_layers == 0);
         const full = selected.auxiliaryAmounts();
         const partial = F.forProfile(profile, cfg, 48);

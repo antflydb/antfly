@@ -13595,7 +13595,7 @@ pub const NativeGenerationPipeline = struct {
                 mixed.state.qwen35_linear_cache == null) return self.declineLightOnGraph(2);
             const remaining = @min(sequence.max_tokens - sequence.generated, sequence.token_ids.len - sequence.seq_len.*);
             future[i] = try std.math.add(usize, item.total_sequence_len, remaining);
-            if (future[i] > 1024) return self.declineLightOnGraph(3);
+            if (future[i] > @import("../ops/cuda/lighton_attention.zig").max_native_context_tokens) return self.declineLightOnGraph(3);
             if (storage.storage.config.sliding_window_size) |window|
                 if (future[i] > window) return self.declineLightOnGraph(3);
             max_future = @max(max_future, future[i]);
@@ -13644,7 +13644,11 @@ pub const NativeGenerationPipeline = struct {
         }
         // Reserve only the originally authorized remaining generation budget.
         // This adds physical capacity without making a future token visible.
+        // Each captured launch snapshots a bounded flat block table, so long
+        // pages share its capacity instead of each being capped at 64 blocks.
+        var packet_blocks: usize = 0;
         for (items, 0..) |item, i| {
+            if (i % 64 == 0) packet_blocks = 0;
             const state = item.state;
             const sequence = state.sequence_id.?;
             const table = storage.blockTable(sequence) orelse return self.declineLightOnGraph(1);
@@ -13652,7 +13656,10 @@ pub const NativeGenerationPipeline = struct {
             try manager.reserveTokenCapacity(sequence, future[i]);
             try storage.reserveDeviceTokenCapacity(sequence, future[i], future[i]);
             const blocks = try storage.logicalBlocksWithReservations(sequence);
-            if (blocks.len == 0 or blocks.len > 64) return self.declineLightOnGraph(3);
+            const packet_limit = @import("../ops/cuda/lighton_attention.zig").max_blocks;
+            if (blocks.len == 0 or blocks.len > packet_limit - packet_blocks) return self.declineLightOnGraph(3);
+            if (key.len > key.words.len - 3 or blocks.len > key.words.len - key.len - 3) return self.declineLightOnGraph(3);
+            packet_blocks += blocks.len;
             try key.add(sequence);
             try key.add(future[i]);
             try key.add(blocks.len);

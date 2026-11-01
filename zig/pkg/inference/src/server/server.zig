@@ -8759,7 +8759,7 @@ pub const Node = struct {
             .gpu_token_burst_lighton_decode = ctx.features.gpu_token_burst,
             .gpu_token_burst_width = ctx.features.gpu_token_burst_width,
             .gpu_greedy_stream_lighton_decode = ctx.features.gpu_greedy_stream,
-            .executor_sequence_control = if (ctx.features.gpu_token_burst or platform.env.getenvBool("ANTFLY_LIGHTONOCR3_EXECUTOR_TAIL")) control else null,
+            .executor_sequence_control = if (platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_EXECUTOR_TAIL", ctx.features.executor_tail)) control else null,
             .execution_phase_waiters = if (ctx.phase_fair) &ctx.phase_waiters else null,
             .execution_phase_wake = if (ctx.gate_events and ctx.worker != null) &ctx.worker_wake else null,
             .execution_phase_wake_io = if (ctx.gate_events) if (ctx.worker_io) |*owner| owner.io() else null else null,

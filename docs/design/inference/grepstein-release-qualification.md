@@ -125,6 +125,65 @@ kernel comparison but do not qualify the A100 serving deployment or its containe
 libraries. Require the paired released runtime/operator and an A100 canary before
 changing the live shared reader pool.
 
+### Current large-page investigation
+
+The DGX Spark investigation has not yet met the concurrent throughput target.
+With the original LightOn 4B checkpoint, the same two full-page images, greedy
+decoding and a 2,048-token output allowance, the ordinary CUDA defaults before
+enabling owned greedy continuations
+take about 53 seconds for the two pages serially, versus about 57 seconds for
+vLLM. A four-request cohort containing two copies of each page takes about
+47 seconds after extending the batched attention packet beyond its former
+1,024-token context bound. The preceding defaults took about 51 seconds.
+The vLLM four-request diagnostic took about 33 seconds. These are HTTP native
+versus in-process vLLM measurements on an isolated GB10, not Cloud A100 results.
+
+Native outputs are byte-identical to the corresponding vLLM batched outputs.
+The dense page's vLLM serial output differs from its batched output in line
+breaks and a trailing Markdown separator; the strict serial-reference parity
+assertion therefore fails for that batched reference. Reviewing those edits
+does not turn the failed assertion into an automatic correctness pass. Keep
+both reference outputs and the source-image review as qualification evidence.
+
+The long-context attention change passes 64 independent GPU numerical and
+graph-replay oracle cases, including sparse/permuted physical page tables and
+contexts through 8,192 tokens. Full-page throughput remains a separate gate.
+Observed decoder cohorts are nearly full for the available live pages; the
+remaining profile is dominated by matrix operations. Increasing public
+concurrency or temporary-memory ceilings alone is not a demonstrated remedy.
+Experimental precision and fusion profiles remain separate from defaults
+until their complete-page correctness and throughput are qualified.
+With derived immutable fusion weights charged to the device weight budget
+rather than temporary scratch, the experimental fused-projection profile
+completes the four-page cohort in 37.4–37.9 seconds over two rounds. Output
+hashes and complete-tail checks are unchanged. A projection-output BF16 profile
+alone takes 39.6–39.9 seconds. Neither measurement establishes default-policy,
+0.8B, A100, or sustained-service qualification.
+
+Owning the greedy continuation independently of multi-token bursts reduces the
+fused candidate to 35.9–36.0 seconds. Enabling its optional decoder graph gives
+35.5 seconds, with four captures, 766 replays, and no graph admission denials.
+Both rounds preserve all four output hashes. These remain diagnostic candidates,
+not a declaration that the throughput target has been met. Bounded matrix tuning
+and a simple batched matrix-vector prototype did not improve on the selected
+library path and were not promoted.
+
+Canonical reader profiles now authorize the executor-owned continuation without
+requiring a diagnostic environment switch. Its existing pure-greedy, callback,
+progress, cancellation and scheduler-ownership checks remain mandatory. A live
+functional check timed out one request with `504 INFERENCE_TIMEOUT` while its
+peer completed with the expected full output hash; all 38 readiness probes
+succeeded. The same check passed four-page 0.8B batching and 4B eviction/reload.
+Compilation ran concurrently with this functional check, so its timings are
+deliberately excluded from performance qualification.
+
+The long-context packet artifact requires a CUDA 13 driver API. Older drivers
+keep ordinary CUDA attention. Decoder graphs remain opt-in, and graph capture
+declines projection-rounding modes whose arithmetic is not capture-compatible;
+their eager CUDA execution retains the requested precision. Cached immutable
+fusion copies consume the device weight budget, independently of scratch, and
+still require device/combined admission and release on model retirement.
+
 ## Embeddings and extraction
 
 EmbeddingGemma 2's CUDA/BF16 execution recipe has a different `model_identity`

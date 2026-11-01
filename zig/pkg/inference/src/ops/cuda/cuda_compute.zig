@@ -2551,6 +2551,11 @@ pub const CudaCompute = struct {
         if (cb.kind() != .cuda) return false;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         return self.lighton_decode_graph_enabled and self.capability_profile == .lightonocr3 and
+            @import("lighton_attention.zig").packetSupported(self.ctx.info.compute_major, self.ctx.info.driver_version) and
+            // Projection rounding currently declines during capture. Keep the
+            // requested arithmetic on eager CUDA rather than capture a graph
+            // with different precision from its warm/learn passes.
+            !self.lighton_bf16_decode_outputs and !self.lighton_bf16_projection_outputs and
             self.lighton_attention_enabled and self.lighton_batched_kv_write_enabled and self.lighton_recurrent_batch_enabled and
             self.lighton_ffn_block_enabled and self.lighton_ffn_bf16_inputs and !self.lighton_gemm_bucket_rows and
             self.cublaslt != null and self.cublaslt.?.allocator != null and self.cublaslt.?.plan_cache_capacity >= 64 and
@@ -2779,7 +2784,7 @@ pub const CudaCompute = struct {
         }
     };
     pub fn beginLightOnDecodeGraph(cb: *const ops.ComputeBackend, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, vocab: usize, future_tokens: usize, attention_layers: usize, recurrent_layers: usize) !?LightOnGraphClaim {
-        if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or vocab == 0 or future_tokens == 0 or future_tokens > 1024 or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
+        if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or vocab == 0 or future_tokens == 0 or future_tokens > @import("lighton_attention.zig").max_native_context_tokens or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
         if (rows > 64 and rows % 64 == 1) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (rows > 64 and !self.lighton_ragged_recurrent_enabled) return null;
@@ -3300,7 +3305,7 @@ pub const CudaCompute = struct {
             const bytes = try checkedMul(try checkedMul(total_width, hidden), 2);
             var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
             if (self.ctx.video_cache_budget.admission) |policy|
-                lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = bytes }, policy.check_live_memory) catch return null;
+                lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_weight_bytes = bytes }, policy.check_live_memory) catch return null;
             var storage = buffer_mod.DeviceBuffer.alloc(&self.ctx, bytes) catch {
                 if (lease) |*active| active.release();
                 return null;
@@ -4077,7 +4082,7 @@ pub const CudaCompute = struct {
     lighton_recurrent: @import("lighton_recurrent.zig").Module = .{},
     lighton_attention: @import("lighton_attention.zig").Module = .{},
     lighton_attention_enabled: bool = false,
-    lighton_attention_chunk128: bool = false,
+    lighton_attention_chunk128: ?bool = null,
     lighton_batched_kv_write_enabled: bool = false,
     lighton_gemm_bucket_rows: bool = false,
     lighton_bf16_decode_outputs: bool = false,
@@ -5163,9 +5168,9 @@ pub const CudaCompute = struct {
         return .{
             .allocator = allocator,
             .capability_profile = profile,
-            .lighton_attention_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_ATTENTION"),
-            .lighton_attention_chunk128 = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_ATTENTION_CHUNK128"),
-            .lighton_batched_kv_write_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_KV_WRITE"),
+            .lighton_attention_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_ATTENTION", profile == .lightonocr3 and @import("lighton_attention.zig").packetSupported(ctx.info.compute_major, ctx.info.driver_version)),
+            .lighton_attention_chunk128 = if (platform.env.getenv("ANTFLY_CUDA_ENABLE_LIGHTON_ATTENTION_CHUNK128") != null) platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_ATTENTION_CHUNK128") else null,
+            .lighton_batched_kv_write_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_KV_WRITE", profile == .lightonocr3 and @import("lighton_attention.zig").packetSupported(ctx.info.compute_major, ctx.info.driver_version)),
             .lighton_gemm_bucket_rows = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_GEMM_BUCKET_ROWS"),
             .lighton_fused_head_disabled = platform.env.getenvBool("ANTFLY_CUDA_DISABLE_LIGHTON_FUSED_HEAD"),
             .lighton_bf16_decode_outputs = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_DECODE_OUTPUTS"),
@@ -11420,9 +11425,12 @@ fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequ
         try self.lighton_gate_up_leases.ensureUnusedCapacity(self.allocator, 1);
         const half_bytes = try checkedMul(weight_count, 2);
         const bytes = try checkedMul(half_bytes, 2);
+        // These immutable model-lifetime copies are derived weights. Their
+        // device/combined admission remains mandatory, while the scratch
+        // sublimit is reserved for independently admitted working memory.
         var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
         if (self.ctx.video_cache_budget.admission) |policy|
-            lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = bytes }, policy.check_live_memory) catch return null;
+            lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_weight_bytes = bytes }, policy.check_live_memory) catch return null;
         var combined = buffer_mod.DeviceBuffer.alloc(&self.ctx, bytes) catch {
             if (lease) |*active| active.release();
             return null;
@@ -25962,6 +25970,7 @@ fn gqaAttentionMatch(self: *CudaCompute, owner: *CudaKvDeviceStorage, binding: *
 // mutable per-sequence upload table used by the singleton fallback.
 fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention: ops.AttentionContext, views: []const ops.KvBatchView, heads: usize, kv_heads: usize, dim: usize) !?CT {
     if (!self.lighton_attention_enabled or self.capability_profile != .lightonocr3 or
+        !@import("lighton_attention.zig").packetSupported(self.ctx.info.compute_major, self.ctx.info.driver_version) or
         attention.query_sequence_len != 1 or attention.skip_kv_write or
         attention.sliding_window != 0 or attention.attn_or_mask != null or attention.attention_sink.hasMetadata() or
         views.len < 2 or views.len > 64 or dim != 256 or
@@ -25988,7 +25997,7 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
             (view.per_item_kv_position_offset orelse attention.kv_position_offset) != 0) return null;
         const tokens = view.per_item_kv_len orelse attention.kv_sequence_len;
         const total = view.per_item_total_len orelse attention.total_sequence_len;
-        if (tokens == 0 or tokens > 1024 or tokens != total) return null;
+        if (tokens == 0 or tokens != total) return null;
         // The manager view and the physical storage allocator need not issue
         // the same block IDs. Read the authoritative table used by KV writes;
         // copy it now because the storage helper reuses one scratch array.
@@ -25997,15 +26006,13 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
             blocks.len
         else
             std.math.divCeil(usize, tokens, params.page_size) catch return error.InvalidPagedKvState;
-        if (count > 64 or blocks.len < count) return null;
+        if (blocks.len < count) return null;
         for (views[0..i]) |prior| if (prior.kv_cache.sequence_id == view.kv_cache.sequence_id) return error.InvalidPagedKvBatch;
-        params.pages[i].tokens = @intCast(tokens);
-        params.pages[i].query_position = @intCast(total - 1);
-        params.pages[i].block_count = @intCast(count);
-        @memcpy(params.pages[i].blocks[0..count], blocks[0..count]);
+        if (!params.appendPage(i, tokens, total - 1, blocks[0..count])) return null;
         max_tokens = @max(max_tokens, tokens);
     }
-    const chunk_size: usize = if (self.lighton_attention_chunk128) 128 else 32;
+    const chunk128 = module.useChunk128(self.lighton_attention_chunk128, heads);
+    const chunk_size: usize = if (chunk128) 128 else 32;
     const planned_tokens = if (self.lighton_decode_graph.active) self.lighton_decode_graph.future_tokens else max_tokens;
     params.chunks = @intCast((planned_tokens + chunk_size - 1) / chunk_size);
     if (self.lighton_decode_graph.active) {
@@ -26039,14 +26046,14 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         for (views, params.pages[0..views.len], 0..) |view, page, i| {
             const table = storage.blockTable(view.kv_cache.sequence_id) orelse return error.InvalidPagedKvState;
             if ((page.tokens - 1) / params.page_size < table.shared_prefix_blocks) break :direct false;
-            for (page.blocks[0..page.block_count]) |block_id| {
+            for (params.blockIds(page)) |block_id| {
                 if ((@as(usize, block_id) + 1) * params.page_size > existing.capacity_tokens) break :direct false;
             }
-            const tail_block = page.blocks[(page.tokens - 1) / params.page_size];
+            const tail_block = params.blockIds(page)[(page.tokens - 1) / params.page_size];
             // Do not overwrite any block another live page may still read.
             for (params.pages[0..views.len], 0..) |other, j| {
                 if (i == j) continue;
-                for (other.blocks[0..other.block_count]) |block_id| if (block_id == tail_block) break :direct false;
+                for (params.blockIds(other)) |block_id| if (block_id == tail_block) break :direct false;
             }
         }
         for ([_]*const CudaTensor{ qt, kt, vt }) |source| {
@@ -26088,13 +26095,13 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     if (layer.compressed_format != cuda_kv_format_f16 or layer.value_format != cuda_kv_value_format_f16 or
         layer.key_row_bytes != kv_width * 2 or layer.value_row_bytes != kv_width * 2 or
         layer.capacity_tokens > std.math.maxInt(u32) / kv_width) return error.InvalidPagedKvState;
-    for (params.pages[0..views.len]) |page| for (page.blocks[0..page.block_count]) |block_id| {
+    for (params.pages[0..views.len]) |page| for (params.blockIds(page)) |block_id| {
         if ((@as(usize, block_id) + 1) * params.page_size > layer.capacity_tokens) return error.InvalidPagedKvState;
     };
     params.k = layer.k.ptr;
     params.v = layer.v.ptr;
     params.capacity = @intCast(layer.capacity_tokens);
-    try self.lighton_attention.run(&self.ctx, &params, self.lighton_attention_chunk128);
+    try self.lighton_attention.run(&self.ctx, &params, chunk128);
     self.stats.device_kv_batch_steps += 1;
     self.stats.device_kv_batch_items += views.len;
     self.stats.device_kv_successes += 1;
@@ -33165,7 +33172,7 @@ test "LightOnOCR3 CUDA fused BF16 FFN preserves separate projections and admits 
         try compute.ctx.synchronize();
         weights[index] = try cb.getWeight(name);
     }
-    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 13 * 1024 * 1024, .scratch_limit_bytes = 13 * 1024 * 1024 }, .check_live_memory = false };
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 13 * 1024 * 1024, .scratch_limit_bytes = 1024 * 1024 }, .check_live_memory = false };
     {
         const data = try a.alloc(f32, 129 * hidden);
         defer a.free(data);
@@ -33181,9 +33188,10 @@ test "LightOnOCR3 CUDA fused BF16 FFN preserves separate projections and admits 
                 try std.testing.expectEqual(@as(usize, 0), compute.lighton_gate_up_cache.count());
                 compute.kernels.activation_multiply_fused_gate_up_f32 = symbol;
                 try std.testing.expect((try cb.gatedFfnNoBias(&request)) == null);
-                try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+                try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
                 compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 16 * 1024 * 1024;
-                compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 16 * 1024 * 1024;
+                // Immutable pair copies must fit the device envelope, not the
+                // independently bounded activation scratch sublimit.
             }
             const fused = (try cb.gatedFfnNoBias(&request)) orelse return error.UnsupportedOperation;
             defer cb.free(fused);
@@ -33202,7 +33210,8 @@ test "LightOnOCR3 CUDA fused BF16 FFN preserves separate projections and admits 
             const expected = try cb.toFloat32(separate, a);
             defer a.free(expected);
             for (actual, expected) |x, y| try std.testing.expectApproxEqAbs(y, x, 2e-4);
-            try std.testing.expectEqual(@as(usize, pair_bytes), controller.snapshot().backend_scratch_bytes);
+            try std.testing.expectEqual(@as(usize, pair_bytes), controller.snapshot().backend_weight_bytes);
+            try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
             var alternate = request;
             alternate.up_weight = weights[3];
             // Reusing a gate with another up source must reserve a new pair,
@@ -33217,7 +33226,7 @@ test "LightOnOCR3 CUDA fused BF16 FFN preserves separate projections and admits 
     try std.testing.expectEqual(@as(usize, 4), compute.lighton_fused_ffn_calls);
     compute.deinit();
     owned = false;
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
 }
 
 test "LightOnOCR3 CUDA Florence image prompt concat preserves distinct page boundaries and returned lifetime" {
@@ -33977,13 +33986,14 @@ test "LightOnOCR3 CUDA fused recurrent input projections preserve four BF16 GEMM
             const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(hidden) });
             defer cb.free(input);
             if (rows == 1) {
-                const retained = controller.snapshot().backend_scratch_bytes;
+                const retained = controller.snapshot().backend_weight_bytes;
                 compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1, .scratch_limit_bytes = 1 }, .check_live_memory = false };
                 try std.testing.expect(try CudaCompute.lightOnInputProjections(&cb, input, weights, rows, hidden, widths[0], widths[1], widths[2]) == null);
-                try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
+                try std.testing.expectEqual(retained, controller.snapshot().backend_weight_bytes);
                 compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 512 * 1024 * 1024;
-                compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 512 * 1024 * 1024;
+                compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 1024 * 1024;
             }
+            try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
             const outputs = (try CudaCompute.lightOnInputProjections(&cb, input, weights, rows, hidden, widths[0], widths[1], widths[2])).?;
             defer for (outputs) |output| cb.free(output);
             for (outputs, weights, widths) |output, weight, width| {
@@ -34028,10 +34038,10 @@ test "LightOnOCR3 CUDA fused recurrent input projections preserve four BF16 GEMM
     }
     try std.testing.expectEqual(@as(usize, 12), compute.lighton_fused_projection_calls);
     try std.testing.expectEqual(@as(usize, 4), compute.lighton_projection_cache.count());
-    try std.testing.expectEqual(@as(usize, (8224 * 1024 + 12352 * 2560) * 4), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, (8224 * 1024 + 12352 * 2560) * 4), controller.snapshot().backend_weight_bytes);
     compute.deinit();
     owned = false;
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
 }
 
 test "LightOnOCR3 CUDA prefills independent recurrent pages together without mixing state or widening limits" {

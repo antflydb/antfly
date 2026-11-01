@@ -331,8 +331,12 @@ def worker(args):
             assert warmup_parity, "Warmup output differs from serial reference"
             report["warmup_completed"] = len(warmed)
             save()
+        measured_parity = True
         for round_index in range(args.rounds):
-            measure_round(
+            # Retain every requested diagnostic round even when a batch
+            # differs from its serial reference. Qualification still fails
+            # below; no timing sample can turn that mismatch into success.
+            measured_parity &= measure_round(
                 args,
                 conversation,
                 generate,
@@ -346,6 +350,9 @@ def worker(args):
         assert (
             len(media_ids)
             == len(images) + args.warmup_requests + args.requests * args.rounds
+        )
+        assert measured_parity, (
+            "A concurrent page differs from its fresh serial reference"
         )
         report["status"] = "ok"
         report["hardware_after"] = hardware()
@@ -401,9 +408,9 @@ def measure_round(
         ],
     )
     report["results"].append(result)
-    assert parity, "A concurrent page differs from its fresh serial reference"
     save()
     print(json.dumps({k: v for k, v in result.items() if k != "outputs"}), flush=True)
+    return parity
 
 
 def main():
