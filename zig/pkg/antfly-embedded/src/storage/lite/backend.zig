@@ -1251,7 +1251,7 @@ test "lite backend reports native storage status from active checkpoint" {
     try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.replay_layout);
     try std.testing.expectEqualStrings(native_index_layout, status.index_layout);
     try std.testing.expectEqualStrings(native_index_base_path, status.index_namespace.?);
-    try std.testing.expectEqual(@as(u32, 4), status.format_version.?);
+    try std.testing.expectEqual(native.indexed_format_version, status.format_version.?);
     try std.testing.expectEqual(native.default_page_size, status.page_size.?);
     try std.testing.expectEqual(handle.native_docstore.?.file.header.active_checkpoint, status.active_checkpoint.?);
     try std.testing.expectEqual(checkpoint.commit_sequence, status.checkpoint_sequence.?);

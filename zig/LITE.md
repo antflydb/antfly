@@ -1157,16 +1157,18 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-4 files (`AFLITE\x04P`) with packed records and
+Native owners create revision-6 files (`AFLITE\x06P`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
 owners migrate revision 3 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-4 signature before checkpoint selection.
+and older binaries reject the revision-6 signature before checkpoint selection.
+Unreleased revision-4/5 prototypes are rejected rather than mixing their reader
+coordination protocols; revision-3 migration creates a bound revision-6 image.
 
-Revision 4 removes historical record chains. Ordered indexes identify live
+The indexed layout removes historical record chains. Ordered indexes identify live
 records; journaled ownership counters and a hierarchical bitmap replenish free
 pages through incremental retirement. Shared values and packed slots retire
 independently, behind recovery, durability, and reader fences. Page reuse remains
@@ -1176,25 +1178,27 @@ compact generation independently of routine reuse. See the
 storage admission, format encoding, memory costs, and qualification.
 
 Background shrink assessments and generation copies use coordinated snapshots.
-Their fences retain both data and allocator metadata, allowing the same owner
-to consume already-free pages while a scan runs. Other processes still see the
-shared inode lock, and an unrecognized publication prevents its suspension.
-Unpublished standalone images retain whole-inode protection until their roots
-are published.
+Their fences retain both data and allocator metadata. Revision-6 cooperating
+processes publish locked reader epochs in a bounded `.aflite-readers-<path-hash>`
+directory. The header binds a persistent random identity and directory inode;
+the pathname only locates that namespace. Missing or replaced namespaces cannot
+authorize reuse. A namespace guard also protects marker registration against
+scans from another inode generation. Hard-link aliases and other unmatched namespaces retain non-suspendable
+inode protection; their writers cannot promote or reuse pages. Symlinks resolving
+to the original namespace retain coordinated reuse. Private API snapshots and
+generation rewrites bind their destination before publication. A manual filesystem
+move/copy can conservatively disable epoch reuse until a generation rewrite.
+Directory hints of unknown type are validated using descriptor metadata.
 
-Native connection owners publish checked allocator handoff certificates inside
-their existing commits, so another writer can validate the current ownership
-metadata without repeating a graph walk after each peer publication. Both
-recovery slots and the canonical ledger must match; an uncertified writer or
-changed state retains the full-proof path. Allocator-only cleanup also retains
-that path so sealing does not perpetuate retirement work. Clean-close certificates
-remain compatible with older runtimes. Live seals use a cached chunked Merkle
-digest: warm updates hash changed chunks and bounded trie paths, while a cold
-ledger load constructs the cache once. This adds catalog writes without another
-checkpoint publication or durability barrier per transaction. Pending-retirement
-maps periodically rehash after removals during retirement service and journal
-replay, with the sweep amortized over prior removals. This also bounds missing-ID
-lookup work within one long turn, before persistence cleanup runs.
+Native connection owners seal their private allocator root inside existing
+commits, including allocator-only cleanup. A peer validates both recovery slots
+and the canonical ownership digest without a repeated graph walk. An uncertified
+writer or mismatched state retains the full-proof path. Legacy catalog certificates
+remain readable in supported files. Live seals use a cached chunked Merkle digest:
+warm updates hash changed chunks and bounded trie paths, and a cold ledger load
+constructs the cache once. Sealing adds no catalog allocation or durability barrier.
+Pending-retirement maps periodically rehash after removals during retirement
+service and journal replay, amortized over prior removals.
 Contended path leases join a cancelable kernel lock wait using a bounded,
 owner-scoped executor. Missing read-only sidecars and executor exhaustion retain
 short randomized retries, capped at four milliseconds. The configured busy

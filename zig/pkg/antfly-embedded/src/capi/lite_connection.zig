@@ -4393,7 +4393,7 @@ test "capi native allocator proof issue1431 physical maintenance releases detach
                 return;
             };
             defer file.close(h.handleLockIo());
-            const epochs = @import("../storage/lite/reader_epochs.zig").scan(alloc, h.handleLockIo(), store.file.path, (file.stat(h.handleLockIo()) catch |err| {
+            const epochs = @import("../storage/lite/reader_epochs.zig").scan(alloc, h.handleLockIo(), store.file.path, store.file.header.reader_epoch_namespace, (file.stat(h.handleLockIo()) catch |err| {
                 self.failure = err;
                 return;
             }).inode) catch |err| {

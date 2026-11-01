@@ -46,7 +46,7 @@ access. Background derived windows admit at most 64 records or 1 MiB, retaining
 the existing one-oversized-record progress exception. Explicit/foreground drains
 keep their larger amortization bounds. Generated producers and resolvers also keep their source guards. General
 integrity readers retain full allocator metadata
-protection, including recovery slots. Revision-5 cooperating readers publish cross-process epochs. Unregistered readers
+protection, including recovery slots. Revision-6 cooperating readers publish cross-process epochs. Unregistered readers
 retain their ordinary inode locks and conservatively block physical reuse.
 
 Within a process, serving replacements can share a leased immutable source and
@@ -77,13 +77,13 @@ include diagnostic work and rolled-back allocation attempts. Benchmark collectio
 is opt-in with `--allocator-diagnostics` and happens after all timed work; status
 reads can themselves refresh runtimes, so they are not passive idle probes.
 
-The owner creates revision-5 files (`AFLITE\x05P`) by default. Writable revision-3
+The owner creates revision-6 files (`AFLITE\x06P`) by default. Writable revision-3
 owners migrate through an explicitly identified compact image and atomic generation
 adoption. Read-only opens preserve revision 3. Raw native format primitives retain
 their revision-3 default for compatibility; `CreateOptions.indexed_reclamation`
-selects revision 5. Revision-4 prototypes are rejected rather than silently mixing reader protocols;
+selects revision 6. Revision-4 and revision-5 prototypes are rejected rather than silently mixing reader protocols;
 these formats have not shipped. Older binaries reject the new signature. `page_reuse = false`
-opts out of creating/migrating revision 5; an existing revision-5 file still uses
+opts out of creating/migrating revision 6; an existing revision-6 file still uses
 its required ownership machinery.
 
 The implementation uses journaled ownership counters and a hierarchical free-page
@@ -478,7 +478,7 @@ from inheriting an open's deferred scan while retaining validation before reuse.
 Page reuse is the routine mechanism. Optional automatic shrinking retains the
 owner's conservative amplification, absolute-savings, hysteresis, resource,
 cancellation, and publication policy. Explicit vacuum is also available. Shrinking
-rewrites live indexed data into a compact revision-5 generation, bootstraps its
+rewrites live indexed data into a compact revision-6 generation, bootstraps its
 ownership ledger once, streams concurrent changes, and atomically adopts it.
 It therefore returns internal holes and packed-page slack to the filesystem
 independently of routine retirement. This implementation uses generation rewriting
@@ -564,11 +564,22 @@ cancellation from the owner's worker shutdown token.
 
 ### Reuse during detached native turns
 
-Revision-5 readers with a coordinator publish immutable 64-byte epoch markers in
-`<canonical database path>.readers/`. Each marker binds the inode, oldest captured
+Revision-6 files bind reader epochs to a checksummed 32-byte header digest over
+a persistent random namespace identity and its directory inode. The canonical
+pathname locates a bounded `.aflite-readers-<path-hash>` directory beside the
+database; it does not establish authority to reclaim pages. Only private or new
+inodes may initialize or bind a namespace. Missing or replaced namespaces on
+published files refuse promotion and reuse, and readers retain inode locks.
+Cooperating readers publish immutable 64-byte markers in that directory. A 250-byte database filename therefore does not
+make coordination names exceed the filesystem component limit. Each marker binds the inode, oldest captured
 sequence, and data/full-metadata scope with a BLAKE3 checksum. The reader holds a
 shared data-inode lock from capture until its marker is complete and exclusively
-locked, then releases the data lock. The marker lock remains until reader close.
+locked, then releases the data lock. A shared lock on the persistent `identity`
+file covers marker creation through locking and initialization; scans take its
+exclusive lock. This also prevents scans of an older inode generation from
+reaping an unfinished registration for its replacement. The marker lock remains
+until reader close. Only namespace initialization needs durability barriers;
+registration and scans never rewrite the namespace identity.
 
 Every indexed writer acquires the exclusive data-inode lock before scanning the
 reader directory and promoting retirement. This fences the entire scan-to-reuse
@@ -584,14 +595,26 @@ Unlinking a live marker occurs only after its reader has finished. Markers need 
 fsync because readers cannot survive a machine crash. A live malformed marker
 fails closed. Each scan visits at most 4096 entries; excess registrations deny
 reuse conservatively. Work depends on current readers, not retained database size.
-Canonical paths and inode checks separate aliases and replaced generations.
+Symlinks resolve to the bound canonical namespace. Hard links and other
+unmatched paths retain non-suspendable inode fences, and writers through an
+unmatched namespace cannot promote retirement or reuse pages. This remains true
+when a link was created after a reader registered, the original name was removed,
+or its parent directory was recreated. Marker creation, scanning and close use
+captured directory descriptors so parent renames cannot redirect those operations.
+New private snapshots and replacement generations bind their final destination
+before the existing sync/rename barriers; a matching checked allocator seal can
+be retargeted without changing ownership. A manual filesystem move/copy may fall
+back to inode fencing until a private generation rewrite establishes its new
+binding. Known non-file markers are rejected; unknown directory-entry types are
+checked through the opened descriptor's metadata.
 Read-only owners keep their inode authority, including in directories where no
 sidecar can be created; making the directory writable does not switch it mid-read. An
 in-place vacuum refuses any registered reader; online generation replacement can
 retain the old inode through existing descriptor and resource accounting.
 
-The format signature is bumped to revision 5 so a revision-4 writer cannot ignore
-these epoch markers and reuse pages underneath a reader. Legacy same-process
+The format signature is bumped to revision 6 so revision-4/5 writers cannot ignore
+the namespace binding and reuse pages underneath a reader. Revision-4/5 prototypes
+are rejected; supported revision-3 migration builds a new bound generation. Legacy same-process
 inode-fence suspension remains for non-indexed/internal compatibility paths, with
 its existing unrecognized-publication poisoning rules.
 

@@ -15,7 +15,7 @@
 
 //! Native single-file Antfly Lite format primitives.
 //!
-//! This module owns revision-3 compatibility and the revision-5 indexed `.aflite`
+//! This module owns revision-3 compatibility and the revision-6 indexed `.aflite`
 //! format, checkpoint publication, ownership retirement, and physical page reuse.
 
 const std = @import("std");
@@ -937,9 +937,9 @@ pub const WriteOptions = struct {
 
 pub const magic = "AFLITE\x03P";
 const unpacked_v3_magic = "AFLITE\x03N";
-const indexed_v4_magic = "AFLITE\x05P";
+const indexed_magic = "AFLITE\x06P";
 pub const format_version: u32 = 3;
-pub const indexed_format_version: u32 = 5;
+pub const indexed_format_version: u32 = 6;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -1653,6 +1653,7 @@ const version_offset: usize = 8;
 const page_size_offset: usize = 12;
 const header_size_offset: usize = 16;
 const active_checkpoint_offset: usize = 20;
+const reader_epoch_namespace_offset: usize = 24;
 const checkpoint_slots_offset: usize = 64;
 const checkpoint_slots_end: usize = checkpoint_slots_offset + checkpoint_slot_count * checkpoint_slot_size;
 const checkpoint_slot_payload_size: usize = 64;
@@ -3614,6 +3615,7 @@ pub const CreateOptions = struct {
 };
 
 pub const Header = struct {
+    reader_epoch_namespace: [32]u8 = @splat(0),
     indexed_reclamation: bool = false,
     packed_records: bool = true,
     page_size: u32 = default_page_size,
@@ -4431,7 +4433,14 @@ test "lite header fingerprints cache unchanged state and fence every header fiel
             }
         } else {
             file.header = original;
-            if (comptime Field == bool) @field(file.header, field) = !@field(original, field) else @field(file.header, field) += 1;
+            if (comptime Field == bool) {
+                @field(file.header, field) = !@field(original, field);
+            } else if (comptime Field == [32]u8) {
+                file.header.indexed_reclamation = true;
+                const indexed = NativeFile.fingerprintHeader(file.header);
+                @field(file.header, field)[0] ^= 1;
+                try std.testing.expect(!std.mem.eql(u8, &indexed, &file.headerFingerprint()));
+            } else @field(file.header, field) += 1;
             try std.testing.expectEqual(NativeFile.fingerprintHeader(file.header), file.headerFingerprint());
             try std.testing.expect(!std.mem.eql(u8, &expected, &file.headerFingerprint()));
         }
@@ -4678,7 +4687,7 @@ pub const NativeFile = struct {
         };
         if (opts.read_only and !opts.internal_reader and !opts.externally_locked) {
             if (opts.reader_coordinator) |coordinator| result.reader_fence = if (header.indexed_reclamation)
-                try coordinator.registerEpoch(file, path, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint(), true)
+                try coordinator.registerEpoch(file, path, header.reader_epoch_namespace, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint(), true)
             else
                 try coordinator.registerFull(file, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint());
         }
@@ -4777,7 +4786,7 @@ pub const NativeFile = struct {
         var initialized_header: Header = .{};
         if (indexed) {
             // Finish every fallible initialization step on the private inode.
-            var staged = NativeFile{ .allocator = allocator, .io_impl = undefined, .borrowed_io = io, .path = owned_path, .file = file, .header = .{}, .read_only = false, .no_sync = no_sync, .page_cache_enabled = .init(false) };
+            var staged = NativeFile{ .allocator = allocator, .io_impl = undefined, .borrowed_io = io, .path = owned_path, .file = file, .header = .{ .reader_epoch_namespace = try @import("reader_epochs.zig").namespaceForPublicationWithDurability(allocator, io, create_target, no_sync) }, .read_only = false, .no_sync = no_sync, .page_cache_enabled = .init(false) };
             defer staged.invalidateLedger();
             defer staged.page_cache.deinit(allocator);
             try staged.initializeIndexedAllocator();
@@ -5022,7 +5031,7 @@ pub const NativeFile = struct {
         if (coordinated) {
             try reader.file.lock(reader.runtime(), .shared);
             reader.reader_fence = if (self.header.indexed_reclamation)
-                try self.reader_coordinator.?.registerEpoch(reader.file, self.path, inode, reader.metadataReuseFrontier(), self.headerFingerprint(), true)
+                try self.reader_coordinator.?.registerEpoch(reader.file, self.path, self.header.reader_epoch_namespace, inode, reader.metadataReuseFrontier(), self.headerFingerprint(), true)
             else
                 try self.reader_coordinator.?.registerFull(reader.file, inode, reader.metadataReuseFrontier(), self.headerFingerprint());
         }
@@ -5259,9 +5268,9 @@ pub const NativeFile = struct {
         // opened where no sidecar can be installed. Never switch that authority
         // merely because its directory becomes writable during the read.
         if (self.reader_coordinator) |coordinator| self.reader_fence = if (self.header.indexed_reclamation and !owner.read_only)
-            try coordinator.registerEpoch(self.file, self.path, (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false)
+            try coordinator.registerEpoch(self.file, self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false)
         else
-            try coordinator.register(self.file, (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint());
+            try coordinator.registerInodeOnly(self.file, (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint());
     }
     pub fn releaseReaderFence(self: *NativeFile) void {
         if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
@@ -5272,7 +5281,8 @@ pub const NativeFile = struct {
         self.epoch_window = null;
         const lock = try acquireDataRewriteLock(self.runtime(), self.path);
         errdefer lock.file.close(self.runtime());
-        if (self.header.indexed_reclamation) self.epoch_window = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, (try self.file.stat(self.runtime())).inode);
+        if (self.activeCheckpoint().free_map_root_page != 0 and (try lock.file.stat(self.runtime())).inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentSourceChanged;
+        if (self.header.indexed_reclamation) self.epoch_window = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode);
         return lock;
     }
     fn beginReaderWindow(self: *NativeFile) !bool {
@@ -9489,8 +9499,10 @@ pub const NativeFile = struct {
         if (self.read_only) return error.ReadOnly;
         var data_lock = try acquireDataRewriteLock(self.runtimeIo(), self.path);
         defer data_lock.file.close(self.runtimeIo());
-        const epochs = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, (try self.file.stat(self.runtime())).inode);
-        if (epochs.data != null) return error.WouldBlock;
+        if (self.header.indexed_reclamation) {
+            const epochs = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode);
+            if (epochs.data != null) return error.WouldBlock;
+        }
         var image = try self.prepareVacuum(cancel);
         defer image.deinit();
         try self.publishVacuum(&image);
@@ -9713,6 +9725,7 @@ pub const NativeFile = struct {
             .document_index_root_page = document_index_root_page,
         };
         var compact_header = Header{
+            .reader_epoch_namespace = if (indexed) try @import("reader_epochs.zig").namespaceForPublicationWithDurability(self.allocator, io, self.path, self.no_sync) else @splat(0),
             .indexed_reclamation = indexed,
             .page_size = self.header.page_size,
             .active_checkpoint = 0,
@@ -9797,9 +9810,9 @@ pub const NativeFile = struct {
                 try out_file.writePositionalAll(io, buffer[0..len], offset);
                 offset += len;
             }
-            var snapshot_header: [header_size]u8 = undefined;
-            encodeHeader(&snapshot_header, self.header);
-            try out_file.writePositionalAll(io, &snapshot_header, 0);
+            var destination = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(dest_path), .file = out_file, .header = self.header, .no_sync = false, .page_cache_enabled = .init(false) };
+            defer destination.page_cache.deinit(self.allocator);
+            try destination.bindPrivateEpochNamespace(dest_path);
             try out_file.setLength(io, snapshot_size);
             try out_file.sync(io);
         }
@@ -11421,6 +11434,32 @@ pub const NativeFile = struct {
         self.test_fail_generation_directory_sync = true;
     }
 
+    /// Only a fresh/unpublished inode may change its namespace. Preserve a
+    /// valid checked allocator seal: neither ownership nor recovery roots
+    /// changed when this private image acquired its final publication name.
+    fn bindPrivateEpochNamespace(self: *NativeFile, destination_path: []const u8) !void {
+        if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain) return error.InvalidTransactionState;
+        var next = self.header;
+        if (next.indexed_reclamation) {
+            next.reader_epoch_namespace = try @import("reader_epochs.zig").namespaceForPublicationWithDurability(self.allocator, self.runtime(), destination_path, self.no_sync);
+            const checkpoint = self.activeCheckpoint();
+            if (checkpoint.free_map_root_page != 0) {
+                const root = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
+                defer self.allocator.free(root);
+                if (root.len == 192 and std.mem.eql(u8, root[128..160], &self.headerFingerprint())) {
+                    @memcpy(root[128..160], &fingerprintHeader(next));
+                    try self.writePage(checkpoint.free_map_root_page, .free_map, root);
+                }
+            }
+        }
+        var encoded: [header_size]u8 = undefined;
+        encodeHeader(&encoded, next);
+        try self.file.writePositionalAll(self.runtimeIo(), &encoded, 0);
+        self.header = next;
+        self.last_synced_header = null;
+        self.allocator_verification_base = null;
+    }
+
     /// Atomically publishes a fully built Lite generation into this file and
     /// adopts its already-open descriptor. The destination writer lock stays
     /// with `self`; `prepared` receives the retired descriptor and can be
@@ -11429,8 +11468,9 @@ pub const NativeFile = struct {
         if (self.read_only or prepared.read_only) return error.ReadOnly;
         if (std.mem.eql(u8, self.path, prepared.path)) return error.InvalidNativeSnapshotPath;
 
-        try prepared.syncIfRequired();
         const io = self.runtimeIo();
+        try prepared.bindPrivateEpochNamespace(self.path);
+        try prepared.syncIfRequired();
         try renameFilePath(io, prepared.path, self.path);
 
         std.mem.swap(std.Io.File, &self.file, &prepared.file);
@@ -12114,11 +12154,12 @@ pub fn inspectBytes(raw: []const u8) InspectReport {
 
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
-    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) indexed_v4_magic else if (header.packed_records) magic else unpacked_v3_magic);
+    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) indexed_magic else if (header.packed_records) magic else unpacked_v3_magic);
     std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) indexed_format_version else format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
     out[active_checkpoint_offset] = header.active_checkpoint;
+    if (header.indexed_reclamation) @memcpy(out[reader_epoch_namespace_offset..][0..32], &header.reader_epoch_namespace);
 
     for (header.checkpoints, 0..) |slot, index| {
         encodeCheckpointSlot(out[checkpointOffset(index)..][0..checkpoint_slot_size], slot);
@@ -12130,7 +12171,7 @@ pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
 pub fn decodeHeader(raw: []const u8) !Header {
     if (raw.len < header_size) return error.TruncatedNativeHeader;
     const header_raw = raw[0..header_size];
-    const indexed_reclamation = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_v4_magic);
+    const indexed_reclamation = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
     const has_packed_records = indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
     if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v3_magic)) return error.InvalidNativeMagic;
 
@@ -12167,6 +12208,7 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const active_checkpoint = try selectActiveCheckpoint(checkpoints, valid_slots, active_hint);
 
     return .{
+        .reader_epoch_namespace = if (indexed_reclamation) header_raw[reader_epoch_namespace_offset..][0..32].* else @splat(0),
         .packed_records = has_packed_records,
         .indexed_reclamation = indexed_reclamation,
         .page_size = page_size,
@@ -20715,4 +20757,188 @@ test "issue1431 ordinary coordinated reader retains allocator metadata" {
     try std.testing.expect((try writer.allocatorStats()).?.reused_pages >= reused);
     try std.testing.expect((try snapshot.checkAtFileSizeWithCancel(captured_size, null)).valid);
     try std.testing.expect((try writer.check()).valid);
+}
+
+test "lite reader epoch aliases hardlink snapshot preserves original data" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "original.aflite");
+    defer a.free(path);
+    const alias = try testPath(a, tmp, "alias.aflite");
+    defer a.free(alias);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    var value: [8192]u8 = @splat('a');
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    try std.Io.Dir.cwd().hardLink(path, std.Io.Dir.cwd(), alias, io, .{});
+    var reader = try NativeFile.openWithIo(a, io, alias, .{ .read_only = true, .reader_coordinator = &coordinator });
+    defer reader.close();
+    reader.page_cache_enabled.store(false, .monotonic);
+    value[0] = 'b';
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqual(@as(u8, 'a'), captured[0]);
+}
+
+const EpochAliasCase = enum { same_path, symlink_alias, data_alias, late_alias, recreated_parent };
+fn testEpochAliasCase(scenario: EpochAliasCase) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try testPath(a, tmp, "original-parent");
+    defer a.free(parent);
+    try std.Io.Dir.cwd().createDir(io, parent, .fromMode(0o700));
+    const path = try std.fs.path.join(a, &.{ parent, "original.aflite" });
+    defer a.free(path);
+    const alias = try testPath(a, tmp, "alias.aflite");
+    defer a.free(alias);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    var value: [8192]u8 = @splat('a');
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    if (scenario == .data_alias) try std.Io.Dir.cwd().hardLink(path, std.Io.Dir.cwd(), alias, io, .{});
+    if (scenario == .symlink_alias) {
+        const target = try realPathAlloc(a, io, path);
+        defer a.free(target);
+        try std.Io.Dir.cwd().symLink(io, target, alias, .{});
+    }
+    var reader = try NativeFile.openWithIo(a, io, if (scenario == .data_alias or scenario == .symlink_alias) alias else path, .{
+        .read_only = true,
+        .internal_reader = scenario == .data_alias,
+        .reader_coordinator = &coordinator,
+    });
+    defer reader.close();
+    reader.page_cache_enabled.store(false, .monotonic);
+    if (scenario == .data_alias) {
+        try reader.acquireReaderFence(writer.activeCheckpoint().commit_sequence, &writer);
+        try std.testing.expect(reader.reader_fence.?.epoch == null);
+        try std.testing.expect(reader.reader_fence.?.inode_only);
+        // Even the same local coordinator must not temporarily unlock this
+        // alias while an independent writer scans the original namespace.
+        writer.reader_coordinator = &coordinator;
+        try std.testing.expect(try writer.beginReaderWindow());
+        try std.testing.expect(writer.reader_window_lock == null);
+        try std.testing.expect(!reader.reader_fence.?.suspended);
+        writer.endReaderWindow();
+    } else try std.testing.expect(reader.reader_fence.?.epoch != null);
+    const before = (try writer.allocatorStats()).?.reused_pages;
+    value[0] = 'b';
+    if (scenario == .late_alias) {
+        try std.Io.Dir.cwd().hardLink(path, std.Io.Dir.cwd(), alias, io, .{});
+        // A link-count check would now see one link and miss the live reader
+        // which registered before this alias existed.
+        try deleteFilePath(io, path);
+        var peer = try NativeFile.openWithIo(a, io, alias, .{ .externally_locked = true, .no_sync = true });
+        defer peer.close();
+        try std.testing.expectEqual(@as(std.Io.File.NLink, 1), (try peer.file.stat(io)).nlink);
+        for (0..80) |_| try peer.putDocument("doc", &value);
+        try std.testing.expectEqual(@as(u64, 0), (try peer.allocatorStats()).?.reused_pages);
+        try std.testing.expect((try peer.check()).valid);
+    } else {
+        if (scenario == .recreated_parent) {
+            const moved = try testPath(a, tmp, "moved-parent");
+            defer a.free(moved);
+            try renameFilePath(io, parent, moved);
+            try std.Io.Dir.cwd().createDir(io, parent, .fromMode(0o700));
+            const moved_file = try std.fs.path.join(a, &.{ moved, "original.aflite" });
+            defer a.free(moved_file);
+            try std.Io.Dir.cwd().hardLink(moved_file, std.Io.Dir.cwd(), path, io, .{});
+            try deleteFilePath(io, moved_file);
+        }
+        for (0..80) |_| try writer.putDocument("doc", &value);
+        const after = (try writer.allocatorStats()).?.reused_pages;
+        if (scenario == .same_path or scenario == .symlink_alias) try std.testing.expect(after > before) else try std.testing.expectEqual(before, after);
+        try std.testing.expect((try writer.check()).valid);
+    }
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqual(@as(u8, 'a'), captured[0]);
+}
+
+test "lite reader epoch aliases same path retains coordinated reuse" {
+    try testEpochAliasCase(.same_path);
+}
+test "lite reader epoch aliases symlinks retain the canonical namespace" {
+    try testEpochAliasCase(.symlink_alias);
+}
+test "lite reader epoch aliases data fences cannot be suspended" {
+    try testEpochAliasCase(.data_alias);
+}
+test "lite reader epoch aliases created after capture remain safe after unlink" {
+    try testEpochAliasCase(.late_alias);
+}
+test "lite reader epoch aliases recreated parent cannot hide moved epochs" {
+    try testEpochAliasCase(.recreated_parent);
+}
+
+test "lite reader epoch aliases private copies and rewrites bind final namespace" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "source.aflite");
+    defer a.free(path);
+    const copy = try testPath(a, tmp, "copy.aflite");
+    defer a.free(copy);
+    var original = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer original.close();
+    const value: [8192]u8 = @splat('v');
+    original.allocator_certificate_on_commit = true;
+    for (0..80) |_| try original.putDocument("doc", &value);
+    try std.testing.expect(try original.certifyAllocator());
+    _ = try original.copyStableSnapshotToPath(copy, false);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var destination = try NativeFile.openWithIo(a, io, copy, .{ .no_sync = true, .reader_coordinator = &coordinator });
+    defer destination.close();
+    try std.testing.expect(try destination.inheritAllocatorCertificate());
+    var snapshot = try destination.captureFullReadSnapshot();
+    var snapshot_open = true;
+    defer if (snapshot_open) snapshot.close();
+    try std.testing.expect(snapshot.reader_fence.?.epoch != null);
+    const before = (try destination.allocatorStats()).?.reused_pages;
+    for (0..8) |_| try destination.putDocument("new", &value);
+    try std.testing.expect((try destination.allocatorStats()).?.reused_pages > before);
+    snapshot.close();
+    snapshot_open = false;
+    _ = try destination.vacuum();
+    try std.testing.expectEqual(try @import("reader_epochs.zig").namespaceForPublication(a, io, copy), destination.header.reader_epoch_namespace);
+    var rewritten_snapshot = try destination.captureFullReadSnapshot();
+    defer rewritten_snapshot.close();
+    try std.testing.expect(rewritten_snapshot.reader_fence.?.epoch != null);
+    try std.testing.expect((try destination.check()).valid);
+}
+
+test "lite reader epoch aliases long filenames retain epoch reuse" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var name: [250]u8 = @splat('d');
+    @memcpy(name[243..], ".aflite");
+    const path = try testPath(a, tmp, &name);
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    const value: [8192]u8 = @splat('v');
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &coordinator });
+    defer reader.close();
+    try std.testing.expect(reader.reader_fence.?.epoch != null);
+    const before = (try writer.allocatorStats()).?.reused_pages;
+    for (0..8) |_| try writer.putDocument("new", &value);
+    try std.testing.expect((try writer.allocatorStats()).?.reused_pages > before);
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqualSlices(u8, &value, captured);
 }

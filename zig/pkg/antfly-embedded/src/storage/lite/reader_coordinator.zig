@@ -38,6 +38,7 @@ pub const Coordinator = struct {
         /// Full graph scans also retain allocator/recovery metadata pages.
         metadata: bool = false,
         poisoned: bool = false,
+        inode_only: bool = false,
         suspended: bool = false,
         epoch: ?epochs.Lease = null,
     };
@@ -64,26 +65,29 @@ pub const Coordinator = struct {
     /// The descriptor already holds its kernel shared lock. Registration may
     /// wait for a writer, which then treats this unregistered lock as external.
     pub fn register(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
-        return self.registerWithScope(file, inode, sequence, tip, false, null);
+        return self.registerWithScope(file, inode, sequence, tip, false, null, false);
     }
     pub fn registerFull(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
-        return self.registerWithScope(file, inode, sequence, tip, true, null);
+        return self.registerWithScope(file, inode, sequence, tip, true, null, false);
+    }
+    pub fn registerInodeOnly(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
+        return self.registerWithScope(file, inode, sequence, tip, false, null, true);
     }
     /// The caller holds the data inode shared lock through registration.
-    pub fn registerEpoch(self: *Coordinator, file: std.Io.File, path: []const u8, inode: u64, sequence: u64, tip: [32]u8, metadata: bool) !*Fence {
-        const epoch = epochs.register(self.allocator, self.io, path, inode, sequence, metadata) catch |err| switch (err) {
+    pub fn registerEpoch(self: *Coordinator, file: std.Io.File, path: []const u8, binding: [32]u8, inode: u64, sequence: u64, tip: [32]u8, metadata: bool) !*Fence {
+        const epoch = epochs.register(self.allocator, self.io, path, binding, inode, sequence, metadata) catch |err| switch (err) {
             // Immutable read-only snapshots must work without creating any
             // sidecars. Retain their original kernel fence if registration
             // cannot write its directory; every writer still respects it.
-            error.AccessDenied, error.ReadOnlyFileSystem => return self.registerWithScope(file, inode, sequence, tip, metadata, null),
+            error.AccessDenied, error.ReadOnlyFileSystem, error.UnsafeNativeReaderAlias => return self.registerWithScope(file, inode, sequence, tip, metadata, null, true),
             else => return err,
         };
         errdefer epoch.close(self.allocator, self.io);
-        const fence = try self.registerWithScope(file, inode, sequence, tip, metadata, epoch);
+        const fence = try self.registerWithScope(file, inode, sequence, tip, metadata, epoch, false);
         file.unlock(self.io);
         return fence;
     }
-    fn registerWithScope(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, metadata: bool, epoch: ?epochs.Lease) !*Fence {
+    fn registerWithScope(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, metadata: bool, epoch: ?epochs.Lease, inode_only: bool) !*Fence {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const fence = try self.allocator.create(Fence);
@@ -92,7 +96,7 @@ pub const Coordinator = struct {
         // while an external writer promoted retirement. A delayed old reader
         // must never become eligible merely by arriving after that detection.
         const stale = epoch == null and if (self.known) |known| known.inode != inode or !std.mem.eql(u8, &known.tip, &tip) else false;
-        fence.* = .{ .file = file, .inode = inode, .sequence = sequence, .captured_at_ns = std.Io.Clock.awake.now(self.io).nanoseconds, .metadata = metadata, .poisoned = stale, .epoch = epoch };
+        fence.* = .{ .file = file, .inode = inode, .sequence = sequence, .captured_at_ns = std.Io.Clock.awake.now(self.io).nanoseconds, .metadata = metadata, .poisoned = stale, .epoch = epoch, .inode_only = inode_only };
         try self.readers.append(self.allocator, fence);
         _ = self.references.fetchAdd(1, .monotonic);
         if (self.known == null) self.known = .{ .inode = inode, .tip = tip };
@@ -155,7 +159,7 @@ pub const Coordinator = struct {
         for (self.readers.items) |fence| if (fence.inode == inode) {
             frontier.data = @min(frontier.data orelse fence.sequence, fence.sequence);
             if (fence.metadata) frontier.metadata = @min(frontier.metadata orelse fence.sequence, fence.sequence);
-            if (fence.epoch == null) can_suspend = can_suspend and !fence.poisoned;
+            if (fence.epoch == null) can_suspend = can_suspend and !fence.poisoned and !fence.inode_only;
         };
         if (can_suspend and self.windows == 1) for (self.readers.items) |fence| if (fence.inode == inode and fence.epoch == null) {
             fence.file.unlock(self.io);
