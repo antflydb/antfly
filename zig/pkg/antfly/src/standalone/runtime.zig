@@ -3207,14 +3207,18 @@ const LocalStandaloneMetadata = struct {
         }
     }
 
-    /// HA's mirrored primary rejects replication sources outright: CDC needs
-    /// single-writer catalog ownership, which a hot-standby primary does
-    /// not have (see cdcOwned()). Table creation, managed-source
-    /// replacement, and managed-source status all read this same boolean so
-    /// none of them can drift from the others and silently accept a
-    /// configuration that will never replicate.
+    /// CDC needs single-writer catalog ownership: `cdcOwned()` requires
+    /// `standaloneRelationPublicationSupported()`, so sources must be
+    /// rejected under exactly the same condition, not only when a
+    /// whole-instance HA primary is bound. Scoped (per-table/per-shard) HA
+    /// disables coordinated lifecycle work without ever setting
+    /// `hot_standby_catalog_server` — checking only that pointer let such a
+    /// table accept replication sources that could never actually
+    /// replicate. Table creation, managed-source replacement, and
+    /// managed-source status all read this same boolean so none of them
+    /// can drift from the others or from scheduling.
     fn haRejectsReplicationSources(self: *const LocalStandaloneMetadata) bool {
-        return self.hot_standby_catalog_server != null;
+        return !self.standaloneRelationPublicationSupported();
     }
 
     fn deriveCreatedTableRecord(self: *LocalStandaloneMetadata, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !antfly.metadata.TableRecord {
@@ -3777,7 +3781,15 @@ const LocalStandaloneMetadata = struct {
     }
 
     /// One snapshot round then one streaming round, the same sequence and
-    /// coordinators cluster metadata runs from its leader.
+    /// coordinators cluster metadata runs from its leader. The snapshot and
+    /// streaming resume cursors live on `self.cdc` (the scheduler), not on
+    /// a coordinator that only lives for this one call: a fresh coordinator
+    /// per round previously meant a fresh default cursor every round, so a
+    /// source stuck past its own round's quantum could starve every source
+    /// after it in the table/source list indefinitely. Loading and storing
+    /// them around the round (rather than holding the scheduler's mutex for
+    /// the whole round) matches how every other field on `self.cdc` is
+    /// guarded.
     fn runCdcRoundJob(self: *LocalStandaloneMetadata) anyerror!void {
         try cdcPermitCheckpoint(self, .snapshot_step);
         const server = self.data_server orelse return;
@@ -3785,19 +3797,18 @@ const LocalStandaloneMetadata = struct {
         const service = CdcService{ .metadata = self };
         const io = self.backend_runtime.io() orelse std.Options.debug_io;
         const write_source = server.write_source.source();
-        var snapshot = backfill.SnapshotBackfillCoordinator{
+        var cursors = self.cdc.loadCursors();
+        defer self.cdc.storeCursors(cursors.snapshot, cursors.streaming);
+
+        const summary = backfill.runSnapshotRound(self.alloc, service, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = io,
-                .registry = &self.cdc.registry,
-                .write_source = write_source,
-                .secret_store = server.write_source.secret_store,
-                .work_permit = self.cdcWorkPermit(),
-                .destination_authorizer = server.write_source.destination_authorizer,
-            },
-        };
-        const summary = snapshot.runRound(service) catch |err| {
+            .io = io,
+            .registry = &self.cdc.registry,
+            .write_source = write_source,
+            .secret_store = server.write_source.secret_store,
+            .work_permit = self.cdcWorkPermit(),
+            .destination_authorizer = server.write_source.destination_authorizer,
+        }, backfill.default_runtime_quantum_ns, &cursors.snapshot) catch |err| {
             if (!antfly.metadata_service.isExpectedCdcRoundError(err)) return err;
             std.log.warn("standalone cdc snapshot round skipped: {s}", .{@errorName(err)});
             return;
@@ -3806,19 +3817,15 @@ const LocalStandaloneMetadata = struct {
             "standalone cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d} yielded={d} failed={d}",
             .{ summary.tables_considered, summary.sources_considered, summary.sources_started, summary.sources_resumed, summary.sources_completed, summary.sources_yielded, summary.sources_failed },
         );
-        var streaming = backfill.StreamingReplicationCoordinator{
+        const stream_summary = backfill.runStreamingRound(self.alloc, service, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = io,
-                .registry = &self.cdc.registry,
-                .write_source = write_source,
-                .secret_store = server.write_source.secret_store,
-                .work_permit = self.cdcWorkPermit(),
-                .destination_authorizer = server.write_source.destination_authorizer,
-            },
-        };
-        const stream_summary = streaming.runRound(service) catch |err| {
+            .io = io,
+            .registry = &self.cdc.registry,
+            .write_source = write_source,
+            .secret_store = server.write_source.secret_store,
+            .work_permit = self.cdcWorkPermit(),
+            .destination_authorizer = server.write_source.destination_authorizer,
+        }, backfill.default_runtime_quantum_ns, &cursors.streaming) catch |err| {
             if (!antfly.metadata_service.isExpectedCdcRoundError(err)) return err;
             std.log.warn("standalone cdc streaming round skipped: {s}", .{@errorName(err)});
             return;
@@ -16210,4 +16217,22 @@ test "standalone shared document state follows metadata HA replay and fenced own
     };
     metadata.hot_standby_gate = .{ .borrowed = .{ .ptr = &metadata, .check_fn = Denied.check } };
     try std.testing.expectError(error.NotLeader, capability.compareExchange("documents/ha-run", &queued_hash, queued, 1));
+}
+
+test "standalone cdc review rejects replication sources with scoped HA ownership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    metadata.coordinated_lifecycle_allowed = false;
+    metadata.vector_source_storage_allowed = false;
+    const sources = try a.dupe(u8, "[{\"type\":\"postgres\",\"dsn\":\"${secret:pg}\",\"postgres_table\":\"public.tickets\"}]");
+    defer a.free(sources);
+    std.debug.print("review scoped HA cdc_supported={} publication_supported={}\n", .{ try metadata.statusSource().replicationSourcesSupported(), metadata.standaloneRelationPublicationSupported() });
+    try std.testing.expectError(error.HACatalogReplicationSourcesUnsupported, LocalStandaloneMetadata.createTable(&metadata, a, "tickets", .{ .replication_sources_json = sources }));
 }
