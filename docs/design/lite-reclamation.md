@@ -679,3 +679,8 @@ unreserved raw records count as documents; receipts, replay/identity state,
 columnar controls and other reserved internal records count as control documents.
 These categories describe payload ownership, not an estimate of removable
 overhead.
+
+Namespace readiness distinguishes unfinished schema publication from published
+constraints awaiting activation. The former blocks admission. The latter remains
+on the recovery agenda while existing integrity guards permit repairs, including
+parent-table repairs needed to unblock dependent FK validation.

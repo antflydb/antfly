@@ -1183,7 +1183,9 @@ table and index. Recovery acknowledges only terminal work under the path lease,
 and rotates bounded pages so one namespace cannot monopolize a turn. The page
 cursor schedules discovery; it never authorizes access. Every operation checks
 its affected namespaces, and catalog-dependent operations check their schema
-participants, before admission. Read-only handles carry a clean-sweep witness
+participants, before admission. Published constraints may still be validating;
+existing integrity guards permit repairs that unblock that validation. Such work
+keeps its agenda marker until activation settles. Read-only handles carry a clean-sweep witness
 across pages for the same logical metadata generation; data-only commits preserve
 it and new DDL invalidates it. An interrupted namespace check disqualifies the
 sweep from certifying cleanliness, including when its cursor has already advanced.

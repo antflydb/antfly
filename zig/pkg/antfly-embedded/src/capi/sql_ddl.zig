@@ -369,8 +369,16 @@ pub fn requireRecovered(handle: *h.Handle, database: *h.db_mod.DB, name: []const
         drive = root.sql_commit_mutex.tryLock();
         if (drive) root.sql_commit_mutex.unlock(h.handleLockIo());
     }
-    if (!try recoverTable(root, database, name, drive)) return error.SqlDdlPending;
-    if (canRecoverWrite(root))
+    try recoverPublication(root, database, name, drive);
+    // A published validating constraint is not an unfinished publication. Its
+    // integrity guards must remain usable for parent repairs that unblock a
+    // pending FK. Keep activation on the agenda until its worker settles it;
+    // namespace admission must not turn that dependency into a deadlock.
+    const complete = recoverActivation(root, database, name, false) catch |err| switch (err) {
+        error.SqlDdlPending, error.SqlStatementReadUnavailable => false,
+        else => return err,
+    };
+    if (complete and canRecoverWrite(root))
         try acknowledgeAgenda(storage, marker, @import("../storage/lite/native.zig"));
 }
 
@@ -469,14 +477,23 @@ fn canRecoverWrite(handle: *h.Handle) bool {
 }
 
 fn recoverTable(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8, drive: bool) !bool {
-    var adapter = sql.Adapter(h.antfly){ .handle = handle, .db = db, .table_name = name };
+    try recoverPublication(handle, db, name, drive);
+    return recoverActivation(handle, db, name, drive);
+}
+
+fn recoverPublication(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8, drive: bool) !void {
     if (try db.core.getStoreValue(handle.alloc, key)) |bytes| {
         defer handle.alloc.free(bytes);
         if (!drive) return if (canRecoverWrite(handle)) error.SqlDdlPending else error.SqlStatementReadUnavailable;
         const job = try std.json.parseFromSlice(Job, handle.alloc, bytes, .{});
         defer job.deinit();
+        var adapter = sql.Adapter(h.antfly){ .handle = handle, .db = db, .table_name = name };
         try finishJob(&adapter, job.value);
     }
+}
+
+fn recoverActivation(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8, drive: bool) !bool {
+    var adapter = sql.Adapter(h.antfly){ .handle = handle, .db = db, .table_name = name };
     const schema = (try db.getSchemaJson(handle.alloc)) orelse return true;
     defer handle.alloc.free(schema);
     if (!try d.api_relational_integrity_commit.requiresActivation(handle.alloc, schema)) return true;
