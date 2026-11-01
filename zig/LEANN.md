@@ -353,9 +353,12 @@ bounds ×1, 200 queries:
   k, while recall rises (better estimates also steer the walk). Modeled
   CPU embedding time per query (4-way fan-out curve above) drops from
   ~16 s to ~1.1 s at 4 bits.
-- The estimator is scalar today (bit extraction per dimension), so the
-  walk costs ~3x more CPU; a nibble lookup table or SIMD kernel would close
-  most of that.
+- CPU per query (graph walk plus estimates, excluding embedding) on an
+  Apple M4 Max, ReleaseFast, with the byte-parallel SIMD scorer for 2, 4
+  and 8 bits: at ef 1024, 0.89 ms for 1 bit, 1.12 ms for 2 bits and
+  0.76 ms for 4 bits (fewer exact distances outweigh the wider codes). The
+  ~3x CPU in the table above came from the earlier scalar scorer on a
+  4-vCPU sandbox.
 - Rebuilding from the codes alone now matches exact rebuilds: with 4-bit
   codes, recall after the two rebuilds is 0.938 and 0.934 from codes vs.
   0.938 and 0.936 from exact embeddings (2-bit: 0.914 and 0.919 vs. 0.926
