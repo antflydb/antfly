@@ -3207,14 +3207,18 @@ const LocalStandaloneMetadata = struct {
         }
     }
 
-    /// HA's mirrored primary rejects replication sources outright: CDC needs
-    /// single-writer catalog ownership, which a hot-standby primary does
-    /// not have (see cdcOwned()). Table creation, managed-source
-    /// replacement, and managed-source status all read this same boolean so
-    /// none of them can drift from the others and silently accept a
-    /// configuration that will never replicate.
+    /// CDC needs single-writer catalog ownership: `cdcOwned()` requires
+    /// `standaloneRelationPublicationSupported()`, so sources must be
+    /// rejected under exactly the same condition, not only when a
+    /// whole-instance HA primary is bound. Scoped (per-table/per-shard) HA
+    /// disables coordinated lifecycle work without ever setting
+    /// `hot_standby_catalog_server` — checking only that pointer let such a
+    /// table accept replication sources that could never actually
+    /// replicate. Table creation, managed-source replacement, and
+    /// managed-source status all read this same boolean so none of them
+    /// can drift from the others or from scheduling.
     fn haRejectsReplicationSources(self: *const LocalStandaloneMetadata) bool {
-        return self.hot_standby_catalog_server != null;
+        return !self.standaloneRelationPublicationSupported();
     }
 
     fn deriveCreatedTableRecord(self: *LocalStandaloneMetadata, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !antfly.metadata.TableRecord {
@@ -16213,4 +16217,22 @@ test "standalone shared document state follows metadata HA replay and fenced own
     };
     metadata.hot_standby_gate = .{ .borrowed = .{ .ptr = &metadata, .check_fn = Denied.check } };
     try std.testing.expectError(error.NotLeader, capability.compareExchange("documents/ha-run", &queued_hash, queued, 1));
+}
+
+test "standalone cdc review rejects replication sources with scoped HA ownership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    metadata.coordinated_lifecycle_allowed = false;
+    metadata.vector_source_storage_allowed = false;
+    const sources = try a.dupe(u8, "[{\"type\":\"postgres\",\"dsn\":\"${secret:pg}\",\"postgres_table\":\"public.tickets\"}]");
+    defer a.free(sources);
+    std.debug.print("review scoped HA cdc_supported={} publication_supported={}\n", .{ try metadata.statusSource().replicationSourcesSupported(), metadata.standaloneRelationPublicationSupported() });
+    try std.testing.expectError(error.HACatalogReplicationSourcesUnsupported, LocalStandaloneMetadata.createTable(&metadata, a, "tickets", .{ .replication_sources_json = sources }));
 }
