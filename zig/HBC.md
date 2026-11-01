@@ -112,6 +112,26 @@ default) scans all 100k vectors here:
 - At search width 128 (21k vectors scanned) every multi-bit setting reaches
   the 0.379 that routing allows, against 0.335 for 1-bit at heap 80.
 
+On real 768-d text embeddings the gap is much smaller.
+[Qdrant/arxiv-abstracts-instructorxl-embeddings](https://huggingface.co/datasets/Qdrant/arxiv-abstracts-instructorxl-embeddings),
+30k vectors, 50 held-out abstracts as queries, same settings, width 1008:
+
+| Codes | Heap | Recall@10 | Exact reranks/q | ms/query |
+|---|---:|---:|---:|---:|
+| 1-bit | 20 | 0.900 | 19 | 0.53 |
+| 1-bit | 80 | 0.996 | 56 | 0.67 |
+| 2-bit, margin 2 | 80 | 1.000 | 23 | 0.85 |
+| 4-bit, margin 2 | 20 | 0.998 | 6 | 0.81 |
+| 4-bit, margin 2 | 80 | 0.998 | 6 | 0.82 |
+| 8-bit, margin 2 | 80 | 1.000 | 0.6 | 0.77 |
+
+Here 1-bit codes already find nearly every neighbor at the default heap.
+Extended codes mainly cut exact reranks (56 to 6 per query), which matters
+when rerank reads vectors from cold or remote storage rather than the warm
+cache this test uses. NYTimes-256 is a deliberately hard set. A 100k run at
+768-d failed in the 1-bit bulk build with `ResourceBudgetExceeded`, before
+any extended code ran; not yet investigated.
+
 `bench/vectors/rabitq_hbc_sim.zig` reproduces the admission effect outside
 HBC.
 
