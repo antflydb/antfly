@@ -310,6 +310,7 @@ pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
 /// (`SPEAKER_00: ...`) when diarization labelled any segment; otherwise the
 /// plain text. Caller frees the result.
 pub fn speakerAttributedTextAlloc(alloc: Allocator, response: *const Response) ![]u8 {
+    try requireComplete(response.*);
     const segments = response.segments orelse return try alloc.dupe(u8, response.text orelse "");
     var any_speaker = false;
     for (segments) |segment| {
@@ -344,6 +345,26 @@ pub fn speakerAttributedTextAlloc(alloc: Allocator, response: *const Response) !
     return try out.toOwnedSlice(alloc);
 }
 
+/// Text-only consumers cannot retain a completion status. Refuse explicitly
+/// incomplete recognition before it becomes ordinary evidence or template text.
+pub fn requireComplete(response: Response) !void {
+    if (response.status) |status| {
+        if (std.mem.eql(u8, status, "complete")) return;
+        if (std.mem.eql(u8, status, "truncated")) return error.ReadOutputTruncated;
+        if (std.mem.eql(u8, status, "unresolved")) return error.DocumentUnresolved;
+        return error.InvalidInferenceResponse;
+    }
+}
+
+test "audio read plain text consumers refuse incomplete recognition" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.ReadOutputTruncated, speakerAttributedTextAlloc(a, &.{ .text = "partial", .status = "truncated" }));
+    try std.testing.expectError(error.DocumentUnresolved, speakerAttributedTextAlloc(a, &.{ .text = "", .status = "unresolved" }));
+    const silence = try speakerAttributedTextAlloc(a, &.{ .text = "", .status = "complete" });
+    defer a.free(silence);
+    try std.testing.expectEqualStrings("", silence);
+}
+
 test "speaker attributed text joins consecutive phrases of one speaker" {
     const segments = [_]Segment{
         .{ .text = "Hello there.", .speaker = "SPEAKER_00" },
@@ -367,6 +388,7 @@ test "speaker attributed text joins consecutive phrases of one speaker" {
 }
 
 pub fn deinitResponse(alloc: Allocator, response: *Response) void {
+    freeOpt(alloc, response.status);
     freeOpt(alloc, response.text);
     freeOpt(alloc, response.language);
     if (response.segments) |segments| {
@@ -388,11 +410,13 @@ pub fn deinitResponse(alloc: Allocator, response: *Response) void {
 
 fn cloneResponse(alloc: Allocator, value: Response) !Response {
     var result = value;
+    result.status = null;
     result.text = null;
     result.language = null;
     result.segments = null;
     result.speakers = null;
     errdefer deinitResponse(alloc, &result);
+    result.status = try dupOpt(alloc, value.status);
     result.text = try dupOpt(alloc, value.text);
     result.language = try dupOpt(alloc, value.language);
     if (value.segments) |segments| {
@@ -760,17 +784,13 @@ const AntflyTranscriberState = struct {
             break :blk encoded.?;
         };
 
-        const url = try std.fmt.allocPrint(alloc, "{s}/transcribe", .{self.api_url});
+        const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
         defer alloc.free(url);
 
-        const body = try httpx.json.Json.stringify(alloc, inference_api.types.TranscribeRequest{
+        const body = try httpx.json.Json.stringify(alloc, inference_api.types.ReadRequest{
             .model = self.model,
             .audio = audio_field,
-            .language = req.language orelse self.language_code,
-            .timestamps = req.timestamps orelse self.timestamps,
-            // Local and remote execution must honour the same options: the
-            // inference node cannot label speakers it was never asked for.
-            .diarization = req.diarization orelse self.diarization,
+            .audio_options = .{ .language = req.language orelse self.language_code, .timestamps = req.timestamps orelse self.timestamps, .diarization = req.diarization orelse self.diarization },
         });
         defer alloc.free(body);
 
@@ -817,30 +837,161 @@ const AntflyTranscriberState = struct {
             if (resp.status.code == 409 and stale != null and
                 std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
                 return error.InferenceCapabilitiesStale;
-            return error.TranscribeRequestFailed;
+            return audioReadResponseError(alloc, resp.body orelse "");
         }
 
         const payload = resp.body orelse return error.EmptyResponse;
-        var parsed = try std.json.parseFromSlice(inference_api.types.TranscribeResponse, alloc, payload, .{
+        var parsed = try std.json.parseFromSlice(inference_api.types.ReadResponse, alloc, payload, .{
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
 
         const first = if (parsed.value.data.len > 0) parsed.value.data[0] else return error.EmptyResponse;
-        var response = Response{
-            .text = try alloc.dupe(u8, first.text),
-            .duration_ms = first.duration_ms,
-        };
-        errdefer deinitResponse(alloc, &response);
-        response.language = try dupOpt(alloc, first.language);
-        if (first.segments) |api_segments| response.segments = try antflySegmentsAlloc(alloc, api_segments);
-        if (first.speakers) |api_speakers| response.speakers = try antflySpeakersAlloc(alloc, api_speakers);
-        return response;
+        return fromReadObjectAlloc(alloc, first);
     }
 };
 
+fn audioReadResponseError(alloc: Allocator, body: []const u8) anyerror {
+    if (body.len > 4096) return error.TranscribeRequestFailed;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.TranscribeRequestFailed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TranscribeRequestFailed;
+    const failure = parsed.value.object.get("error") orelse return error.TranscribeRequestFailed;
+    const code = if (failure == .string) failure.string else if (failure == .object) blk: {
+        const value = failure.object.get("code") orelse return error.TranscribeRequestFailed;
+        break :blk if (value == .string) value.string else return error.TranscribeRequestFailed;
+    } else return error.TranscribeRequestFailed;
+    if (std.mem.eql(u8, code, "AUDIO_TOO_LONG")) return error.AudioTooLong;
+    if (std.mem.eql(u8, code, "AUDIO_TOO_LARGE")) return error.AudioTooLarge;
+    inline for (.{ error.UnsupportedAudioReadCapability, error.AudioTooLong, error.InvalidTranscriptionLanguage, error.SpeakerModelUnavailable, error.DocumentUnresolved }) |err| {
+        if (std.mem.eql(u8, code, @errorName(err))) return err;
+    }
+    return error.TranscribeRequestFailed;
+}
+
+test "audio read adapter preserves native capability failures" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(error.UnsupportedAudioReadCapability, audioReadResponseError(a, "{\"error\":\"UnsupportedAudioReadCapability\"}"));
+    try std.testing.expectEqual(error.AudioTooLong, audioReadResponseError(a, "{\"error\":{\"code\":\"AudioTooLong\"}}"));
+    try std.testing.expectEqual(error.AudioTooLong, audioReadResponseError(a, "{\"error\":\"AUDIO_TOO_LONG\"}"));
+    try std.testing.expectEqual(error.TranscribeRequestFailed, audioReadResponseError(a, "not JSON"));
+}
+
+/// Validate the features implemented by the selected provider adapter before
+/// downloading media or submitting recognition. Antfly validates its own
+/// selected backend, including every configured fallback.
+pub fn validateReadOptions(cfg: Config, options: inference_api.AudioReadOptions) !void {
+    if (options.language) |language| if (std.mem.trim(u8, language, " \t\r\n").len == 0) return error.InvalidTranscriptionLanguage;
+    if (cfg.provider == .antfly) return;
+    if ((options.diarization orelse false) and cfg.provider != .vertex) return error.UnsupportedAudioReadCapability;
+    if ((options.timestamps orelse false) and cfg.provider == .openai and
+        !std.mem.eql(u8, std.mem.trim(u8, cfg.model orelse "whisper-1", " \t\r\n"), "whisper-1")) return error.UnsupportedAudioReadCapability;
+}
+
+/// A hosted recognizer participates in read through the same STT adapter used
+/// by internal consumers. Keep measured timing and status; unavailable duration
+/// and usage remain explicitly unknown instead of being synthesized.
+pub fn readResponseJsonAlloc(a: Allocator, model: []const u8, cfg: Config, response: Response, options: inference_api.AudioReadOptions) ![]u8 {
+    try validateReadOptions(cfg, options);
+    if (response.duration_ms) |duration| if (duration < 0) return error.InvalidInferenceResponse;
+    const text = response.text orelse "";
+    var segments = std.ArrayList(inference_api.AudioReadSegment).empty;
+    defer segments.deinit(a);
+    var speakers = std.ArrayList([]const u8).empty;
+    defer speakers.deinit(a);
+    const alignment = (options.timestamps orelse false) or (options.diarization orelse false);
+    if (alignment) {
+        const phrases = response.segments orelse if (text.len == 0) &.{} else return error.UnsupportedAudioReadCapability;
+        var cursor: usize = 0;
+        for (phrases) |phrase| {
+            const content = std.mem.trim(u8, phrase.text orelse "", " \t\r\n");
+            if (content.len == 0) continue;
+            const start = phrase.start_ms orelse return error.InvalidInferenceResponse;
+            const end = phrase.end_ms orelse return error.InvalidInferenceResponse;
+            if (start < 0 or end < start) return error.InvalidInferenceResponse;
+            if (response.duration_ms) |duration| if (end > duration) return error.InvalidInferenceResponse;
+            const offset = std.mem.indexOfPos(u8, text, cursor, content) orelse return error.InvalidInferenceResponse;
+            cursor = offset + content.len;
+            const speaker = if (options.diarization orelse false) phrase.speaker orelse return error.UnsupportedAudioReadCapability else null;
+            if (speaker) |label| {
+                var known = false;
+                for (speakers.items) |existing| if (std.mem.eql(u8, existing, label)) {
+                    known = true;
+                    break;
+                };
+                if (!known) try speakers.append(a, label);
+            }
+            try segments.append(a, .{ .text = content, .granularity = "phrase", .text_start = @intCast(offset), .text_end = @intCast(cursor), .start_ms = start, .end_ms = end, .speaker = speaker });
+        }
+        if (text.len > 0 and segments.items.len == 0) return error.UnsupportedAudioReadCapability;
+    }
+    const items = [_]inference_api.ReadObject{.{
+        .object = "read",
+        .index = 0,
+        .source_id = "audio-0",
+        .number = 1,
+        .kind = "audio",
+        .coordinate_space = "none",
+        .origin = "transcription",
+        .text = text,
+        .status = response.status orelse if (text.len == 0) "unresolved" else "complete",
+        .audio = .{
+            .duration_ms = response.duration_ms,
+            .language = options.language orelse response.language,
+            .language_source = if (options.language != null) "forced" else if (response.language != null and (cfg.provider == .openai or cfg.provider == .cloudflare)) "detected" else "unknown",
+            .segments = if (alignment) segments.items else null,
+            .speakers = if (options.diarization orelse false) speakers.items else null,
+        },
+    }};
+    return std.json.Stringify.valueAlloc(a, inference_api.ReadResponse{ .object = "list", .model = model, .data = &items, .usage = null }, .{});
+}
+
+test "audio read hosted adapters preserve temporal evidence and reject unsupported features" {
+    const a = std.testing.allocator;
+    const cfg = Config{ .provider = .openai, .model = "whisper-1" };
+    try validateReadOptions(cfg, .{ .language = "en", .timestamps = true });
+    try std.testing.expectError(error.UnsupportedAudioReadCapability, validateReadOptions(cfg, .{ .diarization = true }));
+    try std.testing.expectError(error.UnsupportedAudioReadCapability, validateReadOptions(.{ .provider = .openai, .model = "gpt-4o-mini-transcribe" }, .{ .timestamps = true }));
+    const json = try readResponseJsonAlloc(a, "transcribers/meeting", cfg, .{
+        .text = "hello",
+        .status = "truncated",
+        .duration_ms = 90000,
+        .segments = &.{.{ .text = "hello", .start_ms = 65000, .end_ms = 66000 }},
+    }, .{ .language = "en", .timestamps = true });
+    defer a.free(json);
+    var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, a, json, .{});
+    defer parsed.deinit();
+    const item = parsed.value.data[0];
+    try std.testing.expectEqualStrings("truncated", item.status.?);
+    try std.testing.expectEqualStrings("forced", item.audio.?.language_source.?);
+    try std.testing.expectEqual(@as(i64, 65000), item.audio.?.segments.?[0].start_ms);
+    try std.testing.expectEqual(@as(i64, 5), item.audio.?.segments.?[0].text_end);
+    try std.testing.expect(parsed.value.usage == null);
+    const unknown = try readResponseJsonAlloc(a, "speech", cfg, .{ .text = "" }, .{});
+    defer a.free(unknown);
+    var empty = try std.json.parseFromSlice(inference_api.ReadResponse, a, unknown, .{});
+    defer empty.deinit();
+    try std.testing.expectEqualStrings("unresolved", empty.value.data[0].status.?);
+    try std.testing.expect(empty.value.data[0].audio.?.duration_ms == null);
+    try std.testing.expectError(error.InvalidInferenceResponse, readResponseJsonAlloc(a, "speech", cfg, .{ .text = "", .duration_ms = -1 }, .{}));
+}
+
+pub fn fromReadObjectAlloc(alloc: Allocator, first: inference_api.types.ReadObject) !Response {
+    const metadata = first.audio;
+    var response = Response{
+        .text = try alloc.dupe(u8, first.text),
+        .duration_ms = if (metadata) |value| value.duration_ms else null,
+    };
+    errdefer deinitResponse(alloc, &response);
+    response.status = try dupOpt(alloc, first.status);
+    response.language = try dupOpt(alloc, if (metadata) |value| value.language else null);
+    if (if (metadata) |value| value.segments else null) |api_segments| response.segments = try antflySegmentsAlloc(alloc, api_segments);
+    if (if (metadata) |value| value.speakers else null) |api_speakers| response.speakers = try antflySpeakersAlloc(alloc, api_speakers);
+    return response;
+}
+
 /// The inference service's timestamped phrases as shared transcript segments.
-fn antflySegmentsAlloc(alloc: Allocator, api_segments: []const inference_api.types.DictationSegment) ![]Segment {
+fn antflySegmentsAlloc(alloc: Allocator, api_segments: []const inference_api.types.AudioReadSegment) ![]Segment {
     const segments = try alloc.alloc(Segment, api_segments.len);
     var filled: usize = 0;
     errdefer {
@@ -851,23 +1002,8 @@ fn antflySegmentsAlloc(alloc: Allocator, api_segments: []const inference_api.typ
         alloc.free(segments);
     }
     for (api_segments, 0..) |api_segment, i| {
-        const words = try alloc.alloc(WordTimestamp, api_segment.words.len);
-        var words_filled: usize = 0;
-        errdefer {
-            for (words[0..words_filled]) |word| {
-                var owned = word;
-                deinitWordTimestamp(alloc, &owned);
-            }
-            alloc.free(words);
-        }
-        for (api_segment.words, 0..) |api_word, j| {
-            words[j] = .{
-                .word = try alloc.dupe(u8, api_word.word),
-                .start_ms = api_word.start_ms,
-                .end_ms = api_word.end_ms,
-            };
-            words_filled += 1;
-        }
+        const words = try alloc.alloc(WordTimestamp, 0);
+        errdefer alloc.free(words);
         segments[i] = .{
             .text = try alloc.dupe(u8, api_segment.text),
             .start_ms = api_segment.start_ms,
@@ -1823,7 +1959,8 @@ fn resolveAudioContentAlloc(alloc: Allocator, url: []const u8, max_download_byte
         const parsed = try scraping.data_uri.parseRequired(url);
         if (!parsed.has_explicit_media_type or
             !(std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "audio/") or
-                std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "video/")))
+                std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "video/") or
+                std.ascii.eqlIgnoreCase(parsed.media_type_essence, "application/octet-stream")))
             return error.InvalidDataUri;
         return try scraping.downloadContentAlloc(alloc, url, &security, null);
     }
@@ -1966,14 +2103,15 @@ test "transcribing runtime loads antfly provider and transcribes data uri input"
             try expectAntflyTranscriberBearer(req);
             const parsed_request = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
             defer parsed_request.deinit();
-            try std.testing.expectEqualStrings("fr", parsed_request.value.object.get("language").?.string);
-            try std.testing.expect(parsed_request.value.object.get("timestamps").?.bool);
-            try std.testing.expect(parsed_request.value.object.get("diarization").?.bool);
+            const options = parsed_request.value.object.get("audio_options").?.object;
+            try std.testing.expectEqualStrings("fr", options.get("language").?.string);
+            try std.testing.expect(options.get("timestamps").?.bool);
+            try std.testing.expect(options.get("diarization").?.bool);
         }
     };
     var server = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/transcribe", .assert_request = Check.request, .respond = .{
-            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"hello from antfly\",\"language\":\"en\"}],\"model\":\"openai/whisper-base\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3}}",
+        .{ .method = .POST, .path = "/read", .assert_request = Check.request, .respond = .{
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"hello from antfly\",\"status\":\"complete\",\"audio\":{\"duration_ms\":0,\"language\":\"en\"}}],\"model\":\"openai/whisper-base\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3}}",
         } },
     });
     defer server.deinit();
@@ -2040,10 +2178,10 @@ test "Antfly transcriber sends negotiated framed audio attachments" {
     const io = io_impl.io();
     var server = try httpx.TestServer.start(allocator, io, &.{.{
         .method = .POST,
-        .path = "/transcribe",
+        .path = "/read",
         .assert_request = expectAntflyTranscriberFramed,
         .respond = .{
-            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"framed\"}],\"model\":\"whisper\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}",
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"framed\",\"status\":\"complete\",\"audio\":{\"duration_ms\":0}}],\"model\":\"whisper\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}",
         },
     }});
     defer server.deinit();
@@ -2303,10 +2441,10 @@ test "remote antfly transcription asks for diarization and keeps the labels" {
     const io = io_impl.io();
     var server = try httpx.TestServer.start(allocator, io, &.{.{
         .method = .POST,
-        .path = "/transcribe",
+        .path = "/read",
         .assert_request = expectAntflyTranscriberDiarization,
         .respond = .{
-            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"hello there\",\"segments\":[{\"text\":\"hello\",\"start_ms\":0,\"end_ms\":500,\"words\":[],\"speaker\":\"SPEAKER_00\"},{\"text\":\"there\",\"start_ms\":500,\"end_ms\":900,\"words\":[],\"speaker\":\"SPEAKER_01\"}],\"speakers\":[\"SPEAKER_00\",\"SPEAKER_01\"]}],\"model\":\"whisper\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}",
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"hello there\",\"status\":\"complete\",\"audio\":{\"duration_ms\":0,\"segments\":[{\"text\":\"hello\",\"start_ms\":0,\"end_ms\":500,\"speaker\":\"SPEAKER_00\",\"text_start\":0,\"text_end\":5},{\"text\":\"there\",\"start_ms\":500,\"end_ms\":900,\"speaker\":\"SPEAKER_01\",\"text_start\":6,\"text_end\":11}],\"speakers\":[\"SPEAKER_00\",\"SPEAKER_01\"]}}],\"model\":\"whisper\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}",
         },
     }});
     defer server.deinit();
@@ -2390,4 +2528,12 @@ test "transcribing named defaults preserve explicit request overrides" {
     try std.testing.expectEqualStrings("de", overridden.language.?);
     try std.testing.expect(!overridden.timestamps.?);
     try std.testing.expect(!overridden.diarization.?);
+}
+
+test "audio read normalized base64 transport obeys source limits and rejects non-audio declarations" {
+    const a = std.testing.allocator;
+    var content = try resolveAudioContentAlloc(a, "data:application/octet-stream;base64,ZmFrZQ==", 4);
+    defer content.deinit(a);
+    try std.testing.expectEqualStrings("fake", content.data);
+    try std.testing.expectError(error.InvalidDataUri, resolveAudioContentAlloc(a, "data:image/png;base64,ZmFrZQ==", 4));
 }

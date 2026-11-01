@@ -915,6 +915,46 @@ class Upstream(BaseHTTPRequestHandler):
             return True
         if path == "/ai/v1/chat/completions":
             return False
+        if path == "/ai/v1/read" and "audio" in request:
+            self.calls.append(path)
+            self.reply(
+                {
+                    "object": "list",
+                    "model": "mock-transcriber",
+                    "data": [
+                        {
+                            "object": "read",
+                            "index": 0,
+                            "source_id": "audio-0",
+                            "kind": "audio",
+                            "coordinate_space": "none",
+                            "origin": "transcription",
+                            "status": "complete",
+                            "text": "hello",
+                            "audio": {
+                                "duration_ms": 1000,
+                                "language": "en",
+                                "language_source": "detected",
+                                "segments": [
+                                    {
+                                        "text": "hello",
+                                        "text_start": 0,
+                                        "text_end": 5,
+                                        "start_ms": 10,
+                                        "end_ms": 20,
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 1,
+                        "total_tokens": 1,
+                    },
+                }
+            )
+            return True
         responses = {
             "/ai/v1/rerank": {
                 "object": "list",
@@ -945,18 +985,6 @@ class Upstream(BaseHTTPRequestHandler):
                 "schema_version": 2,
                 "data": [
                     {"index": 0, "entities": [{"text": "Ada", "start": 0, "end": 3}]}
-                ],
-            },
-            "/ai/v1/transcribe": {
-                "object": "list",
-                "model": "mock-transcriber",
-                "data": [
-                    {
-                        "object": "transcription",
-                        "index": 0,
-                        "text": "hello",
-                        "segments": [{"text": "hello", "start_ms": 10, "end_ms": 20}],
-                    }
                 ],
             },
             "/ai/v1/dictate": {
@@ -3073,7 +3101,7 @@ def main() -> None:
                         ("speech-inherit", "mock-server-key"),
                         ("speech", "speech-bearer-key"),
                     ):
-                        for operation in ("transcribe", "dictate"):
+                        for operation in ("read", "dictate"):
                             invoke(
                                 "/ai/v1/" + operation,
                                 {"model": "transcribers/" + alias, "audio": "aGk="},
@@ -3238,9 +3266,9 @@ def main() -> None:
                     )
                     assert (
                         invoke(
-                            "/ai/v1/transcribe",
+                            "/ai/v1/read",
                             {"model": "transcribers/speech", "audio": "aGk="},
-                        )["data"][0]["segments"][0]["start_ms"]
+                        )["data"][0]["audio"]["segments"][0]["start_ms"]
                         == 10
                     )
                     assert (
@@ -3322,52 +3350,59 @@ def main() -> None:
                     assert Upstream.chat_attempts[before_batch:] == ["mock-busy"], (
                         Upstream.chat_attempts[before_batch:]
                     )
-                    for operation in ("transcribe", "dictate"):
-                        invoke(
-                            "/ai/v1/" + operation,
-                            {"model": "transcribers/speech", "audio": "aGk="},
-                        )
-                        assert Upstream.requests[-1][1] == {
-                            "model": "mock-transcriber",
-                            "audio": "aGk=",
-                            "language": "fr",
-                            "timestamps": True,
-                            "diarization": True,
-                        }, Upstream.requests[-1]
-                        invoke(
-                            "/ai/v1/" + operation,
-                            {
-                                "model": "transcribers/speech",
+                    for operation in ("read", "dictate"):
+
+                        def audio_body(model, **options):
+                            return {
+                                "model": model,
                                 "audio": "aGk=",
-                                "language": None,
-                                "timestamps": None,
-                                "diarization": None,
-                            },
-                        )
-                        assert Upstream.requests[-1][1] == {
-                            "model": "mock-transcriber",
-                            "audio": "aGk=",
-                            "language": "fr",
-                            "timestamps": True,
-                            "diarization": True,
-                        }, Upstream.requests[-1]
+                                **(
+                                    {"audio_options": options}
+                                    if operation == "read"
+                                    else options
+                                ),
+                            }
+
                         invoke(
                             "/ai/v1/" + operation,
-                            {
-                                "model": "transcribers/speech",
-                                "audio": "aGk=",
-                                "language": "de",
-                                "timestamps": False,
-                                "diarization": False,
-                            },
+                            audio_body("transcribers/speech"),
                         )
-                        assert Upstream.requests[-1][1] == {
-                            "model": "mock-transcriber",
-                            "audio": "aGk=",
-                            "language": "de",
-                            "timestamps": False,
-                            "diarization": False,
-                        }, Upstream.requests[-1]
+                        assert Upstream.requests[-1][1] == audio_body(
+                            "mock-transcriber",
+                            language="fr",
+                            timestamps=True,
+                            diarization=True,
+                        ), Upstream.requests[-1]
+                        invoke(
+                            "/ai/v1/" + operation,
+                            audio_body(
+                                "transcribers/speech",
+                                language=None,
+                                timestamps=None,
+                                diarization=None,
+                            ),
+                        )
+                        assert Upstream.requests[-1][1] == audio_body(
+                            "mock-transcriber",
+                            language="fr",
+                            timestamps=True,
+                            diarization=True,
+                        ), Upstream.requests[-1]
+                        invoke(
+                            "/ai/v1/" + operation,
+                            audio_body(
+                                "transcribers/speech",
+                                language="de",
+                                timestamps=False,
+                                diarization=False,
+                            ),
+                        )
+                        assert Upstream.requests[-1][1] == audio_body(
+                            "mock-transcriber",
+                            language="de",
+                            timestamps=False,
+                            diarization=False,
+                        ), Upstream.requests[-1]
                     # Creation latency must not consume the backend's remaining
                     # lifetime before the public handle can be used.
                     for malformed_response in (

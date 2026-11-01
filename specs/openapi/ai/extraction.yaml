@@ -550,6 +550,23 @@ components:
           $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGenerationBatch'
         options:
           $ref: '#/components/schemas/ExtractionOptions'
+    AudioReadOptions:
+      type: object
+      additionalProperties: false
+      description: Recognition options, checked against every selected backend and fallback before inference. Whisper supports all options and pause-aware windowing of long recordings. Gemma supports transcription up to 30 seconds and rejects language, timestamps and diarization requests. No backend is substituted to satisfy an option.
+      properties:
+        language:
+          type: string
+          minLength: 1
+          description: Force recognition in this language (e.g. en). Omitted means detect language where supported; this is not a translation or cleanup request. Gemma does not support language control or detection metadata.
+        timestamps:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Request phrase timestamps in milliseconds relative to the original source recording. Defaults to false. Does not imply word alignment.
+        diarization:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Request speaker labels and temporal segments. Defaults to false. Whisper requires the local speaker embedding model; unavailable models cause an explicit error. Implies timestamp decoding.
     ExtractionRequest:
       type: object
       description: Atomic extraction request. Supply exactly one of inputs, documents or read_artifact. Every input is validated before inference; failures return no partial data.
@@ -558,6 +575,8 @@ components:
       - schema
       x-antfly-exactly-one-of: [inputs, documents, read_artifact]
       properties:
+        audio_options:
+          $ref: '#/components/schemas/AudioReadOptions'
         model:
           type: string
           minLength: 1
@@ -573,7 +592,7 @@ components:
           type: array
           minItems: 1
           maxItems: 64
-          description: Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping.
+          description: Complete PDF/PPTX/image/audio sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping.
           items:
             $ref: '#/components/schemas/DocumentSource'
         inputs:
@@ -1814,12 +1833,22 @@ components:
           - image/png
           - image/jpeg
           - image/webp
+          - audio/wav
+          - audio/mpeg
+          - audio/aac
+          - audio/mp4
+          - audio/ogg
+          - audio/flac
+          - audio/webm
+          - video/mp4
+          - video/quicktime
+          - video/webm
         pages:
           type: array
           minItems: 1
           maxItems: 1024
           uniqueItems: true
-          description: Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+          description: Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. Audio/video recordings are one source unit and do not accept page selection.
           items:
             type: integer
             minimum: 1

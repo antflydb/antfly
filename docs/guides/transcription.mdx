@@ -15,6 +15,89 @@ order: 3
 
 For recordings that also need media embeddings or supervised predictions, use the [resumable media pass](/docs/guides/media-pass). Its named transcription output shares decoded PCM with the other consumers and can feed text chunks with exact phrase clocks. The provider-based transcription workflow below remains available for existing pipelines.
 
+## One reading API for source media
+
+`POST /ai/v1/read` reads images, documents, and audio on both the inference server and the database inference gateway. This is a breaking change: the one-shot `/ai/v1/transcribe` route and its SDK methods have been removed, with no alias. Dictation (`/ai/v1/dictate`) and streaming transcription sessions keep their separate contracts.
+
+For plain recognition, move the same explicit model and audio into a read request:
+
+```json
+{
+  "model": "openai/whisper-small",
+  "audio": "data:audio/wav;base64,..."
+}
+```
+
+Move the old `language`, `timestamps`, and `diarization` fields into `audio_options`:
+
+```json
+{
+  "model": "transcribers/meeting-reader",
+  "audio": "data:audio/mpeg;base64,...",
+  "audio_options": {"language": "en", "timestamps": true, "diarization": true},
+  "retain_artifact": true
+}
+```
+
+For local Whisper, omit `language` for detection; supplying it forces recognition in that language, without translating or cleaning up the transcript. Hosted providers that require a language use their configured or default language and report it as forced. Explicit `false` options override named deployment defaults. `images`, `documents`, and `audio` are mutually exclusive. Framed audio attachments are supported. Video containers are read from their audio track; this operation does not caption frames.
+
+| Backend | Language | Temporal segments | Speakers | Recording duration |
+|---------|----------|-------------------|----------|--------------------|
+| Whisper | Forced or detected | Requested with `timestamps`; also enabled by diarization | Requested with `diarization`, requires the local speaker model | Pause-aware windows over the whole recording, bounded by source, memory, execution and deadline budgets |
+| Gemma 4 audio generator | No language control or detected-language metadata | Unsupported | Unsupported | Up to 30 seconds; larger recordings fail explicitly |
+
+Named hosted ASR providers also use `/read`. Their existing provider adapters retain recognition features such as Vertex diarization and Whisper phrase timestamps. Unsupported feature requests fail before submission. When a hosted provider does not report duration or token usage, those values are explicitly null.
+
+Model discovery exposes `audio_read` capabilities, including `windowing` and `max_duration_ms`. Unsupported options fail with `UnsupportedAudioReadCapability`, including when a configured fallback cannot satisfy the request. Whisper uses its recognition/execution token budgets and rejects explicit `prompt` or `max_tokens`; these generation controls belong to generator readers. A custom Gemma prompt marks the resulting text as interpretation, so literal extraction evidence must not treat it as verbatim recognition.
+
+Every backend returns the ordinary read envelope. Read transcript text from `data[0].text`, completion from `data[0].status`, and audio evidence from `data[0].audio`:
+
+```json
+{
+  "text": "Hello there.",
+  "source_id": "audio-0",
+  "kind": "audio",
+  "coordinate_space": "none",
+  "origin": "transcription",
+  "status": "complete",
+  "audio": {
+    "duration_ms": 1800,
+    "language": "en",
+    "language_source": "forced",
+    "segments": [{"text": "Hello there.", "granularity": "phrase", "text_start": 0, "text_end": 12, "start_ms": 120, "end_ms": 1600, "speaker": "SPEAKER_00"}],
+    "speakers": ["SPEAKER_00"]
+  }
+}
+```
+
+Times are milliseconds relative to the original recording, including after windowing. Text offsets are half-open UTF-8 byte offsets in that read item's text. Segment `granularity` distinguishes recognizer-supplied phrase clocks from coarse recognition-window bounds; neither claims word alignment. An omitted granularity makes no precision claim. Speaker labels apply to the aligned phrase or window; ordinary reading preserves those boundaries instead of splitting text using estimated word times. No temporal alignment or speaker identity is inferred from a generated transcript. An empty result with `status: "complete"` and the `audio_silence` finding records verified silence. Empty unresolved recognition remains `unresolved`, and interrupted output retains `truncated` status.
+
+Whisper and Gemma readers use the document planner for refinement, verification, extraction, retained artifacts and durable jobs. Audio bindings use `"operation": "read", "input": "audio"` in a document definition. Storage directories and named identities (`readers/`, `transcribers/`, `generators/`, and `connections/.../models/...`) remain explicit. Retained and replayed read results keep audio metadata with the source text.
+
+SDK migration examples:
+
+```typescript
+const result = await inference.readAudio(audioBase64, {
+  model: "openai/whisper-small",
+  audio_options: { language: "en", timestamps: true, diarization: true },
+});
+console.log(result.data[0].text, result.data[0].audio?.segments);
+```
+
+```python
+result = client.read({
+    "model": "openai/whisper-small",
+    "audio": audio_base64,
+    "audio_options": {"language": "en", "timestamps": True, "diarization": True},
+})
+```
+
+```go
+enabled := true
+result, err := client.Inference().ReadAudio(ctx, "openai/whisper-small", audioBytes,
+    oapi.InferenceAudioReadOptions{Language: "en", Timestamps: &enabled, Diarization: &enabled})
+```
+
 ## The Result
 
 Each document in the table points at a recording. Antfly transcribes it once, stores the transcript as a durable artifact with per-phrase timing, cuts it into chunks that carry `_start_time_ms` and `_end_time_ms`, and indexes those chunks. A search hit is a passage plus the second it was spoken, so a client can deep-link into the player. The hit below is the first of `responses[0].hits.hits`, trimmed.
@@ -145,7 +228,7 @@ The chunk is cut on a character boundary, so it can start or end mid-word; its t
 
 ### Local Speaker Labels
 
-With `"diarization": true` on the `antfly` provider (or on `/ai/v1/transcribe`), each phrase is labelled `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance, and the response lists the speakers found. The labels come from a speaker verification model run in-process: 3 s windows every 1.5 s over the spoken parts of the recording are embedded with 3D-Speaker's CAM++, the embeddings are clustered by voice similarity, each word takes the speaker of the window nearest to it, and a phrase whose words change speaker is split at the change. So a turn change that Whisper folded into one phrase still comes out as two segments. Pull the model once:
+With `"diarization": true` on the `antfly` provider (or in `/ai/v1/read` audio options), each phrase is labelled `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance, and the response lists the speakers found. The labels come from a speaker verification model run in-process: 3 s windows every 1.5 s over the spoken parts of the recording are embedded with 3D-Speaker's CAM++, the embeddings are clustered by voice similarity, each word takes the speaker of the window nearest to it, and a phrase whose words change speaker is split at the change. So a turn change that Whisper folded into one phrase still comes out as two segments. Pull the model once:
 
 ```bash
 antfly inference pull csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx
@@ -176,6 +259,6 @@ Then prompt it with the outcome, for example "Create an Antfly table for our rec
 
 ## Next Steps
 
-- [Build Voice Dictation](/docs/guides/voice-dictation) for the request-time `/ai/v1/transcribe` and `/ai/v1/dictate` endpoints, including streaming sessions.
+- [Build Voice Dictation](/docs/guides/voice-dictation) for the request-time `/ai/v1/read` and `/ai/v1/dictate` operations, including streaming sessions.
 - [Artifact Indexes](/docs/guides/artifact-indexes) to add chunk embeddings and hybrid search over the transcripts.
 - [Document Engine](/docs/guides/document-engine) for how artifacts, units, and hierarchy queries fit together.

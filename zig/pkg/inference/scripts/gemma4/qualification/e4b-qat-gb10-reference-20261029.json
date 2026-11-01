@@ -1,0 +1,4544 @@
+{
+  "date": "2026-10-29",
+  "passed": false,
+  "production_ready": false,
+  "original_record": "e4b-qat-gb10-20261029.json",
+  "model": {
+    "repo": "google/gemma-4-E4B-it-qat-q4_0-gguf",
+    "revision": "4b4a2c1d584be7264f87aac328a1bc739ce81b6c",
+    "projector": {
+      "rfilename": "gemma-4-E4B-it-mmproj.gguf",
+      "blobId": "e337066d4a2e048189401940d37163aff883c190",
+      "size": 991552256,
+      "lfs": {
+        "sha256": "7498a37cb619e55f2fcf87eb931f56e99389ed6d432e4c5c66110694c0d65578",
+        "size": 991552256,
+        "pointerSize": 134
+      }
+    },
+    "decoder_sha256": "676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee",
+    "projector_sha256": "7498a37cb619e55f2fcf87eb931f56e99389ed6d432e4c5c66110694c0d65578"
+  },
+  "corpus": {
+    "repo": "hf-internal-testing/librispeech_asr_dummy",
+    "revision": "5be91486e11a2d616f4ec5db8d3fd248585ac07a",
+    "file": {
+      "rfilename": "clean/validation-00000-of-00001.parquet",
+      "blobId": "6714a80769ab6bdf3c98fcf709097c62ffbca226",
+      "size": 9192059,
+      "lfs": {
+        "sha256": "4e69a06fa5edc90921e5e7e39a7084881f8b3ed9c805c574f4f39c6fde27c603",
+        "size": 9192059,
+        "pointerSize": 132
+      }
+    }
+  },
+  "hardware": {
+    "gpu": "NVIDIA GB10",
+    "driver": "580.178.04",
+    "otherwise_idle_gpu": true,
+    "note": "CPU compilation ran during portions of the comparison; GPU servers ran sequentially. This is not an L4 measurement."
+  },
+  "pr1156": {
+    "url": "https://github.com/antflydb/antfly/pull/1156",
+    "merge_commit": "2d73e55a71f35fe9cf699736fd8cb2c648ba4b3c",
+    "included_in_baseline": true
+  },
+  "implementation_fixes": [
+    "GGUF audio query scales already contain softplus from conversion; apply it only to original HF weights.",
+    "Map GGUF convolution norm names to the correct pre-convolution and post-depthwise roles while preserving HF names.",
+    "Respect the strict conformer attention distance bound (distance < 12)."
+  ],
+  "accuracy": {
+    "before_native_wer": 0.9043478260869565,
+    "after_native_wer": 0.11739130434782609,
+    "after_native_errors": 135,
+    "reference_wer": 0.0782608695652174,
+    "reference_errors": 90,
+    "reference_words": 1150,
+    "clips": 73,
+    "speakers": [
+      1272
+    ],
+    "audio_seconds": 481.034875,
+    "identical_original_corpus_bytes": true,
+    "thresholds": {
+      "corpus_wer": 0.1,
+      "regression_wer": 0.2,
+      "silence_words": 0
+    },
+    "native_silence_words": 6,
+    "reference_silence_words": 5,
+    "native_reads": [
+      {
+        "id": "1272-128104-0000",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+        "transcript": "Mr. Quilter is the apostle of the middle classes, and we're glad to welcome his gospel.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 17,
+          "wer": 0.17647058823529413
+        },
+        "input_sha256": "4e25e22555cd16e90edb0a3b49fdcf1fe652b2a1250ab643634db33895c75b41",
+        "elapsed_seconds": 4.953632054966874,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0001",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+        "transcript": "Nor is Mr. Quilter's manner less interesting than his matter.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.1
+        },
+        "input_sha256": "46a9d58622b4675b29564da2d9ba73e702241c5fa969f12c387cad4aa984276a",
+        "elapsed_seconds": 3.2875625600572675,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0002",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HE TELLS US THAT AT THIS FESTIVE SEASON OF THE YEAR WITH CHRISTMAS AND ROAST BEEF LOOMING BEFORE US SIMILES DRAWN FROM EATING AND ITS RESULTS OCCUR MOST READILY TO THE MIND",
+        "transcript": "She tells us that at this festive season of the year with Christmas and a roast beef looming before us, similarities drawn from eating and its results occur most readily to the mind.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 32,
+          "wer": 0.09375
+        },
+        "input_sha256": "59bf7bb1129c11734a8dd362ad52b4e10ae31c03f0879fc92f7107ecd513513f",
+        "elapsed_seconds": 6.7804392779944465,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0003",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HE HAS GRAVE DOUBTS WHETHER SIR FREDERICK LEIGHTON'S WORK IS REALLY GREEK AFTER ALL AND CAN DISCOVER IN IT BUT LITTLE OF ROCKY ITHACA",
+        "transcript": "He has grave doubts whether Sir Frederick Layton's work is really Greek after all and can discover in it little of rocky Ithaca.",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 24,
+          "wer": 0.08333333333333333
+        },
+        "input_sha256": "60d72657439cd3092fc2313efe0fabd31f0cd2f28f8ca46a21380c290b2e031d",
+        "elapsed_seconds": 5.239100612001494,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0004",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "LINNELL'S PICTURES ARE A SORT OF UP GUARDS AND AT EM PAINTINGS AND MASON'S EXQUISITE IDYLLS ARE AS NATIONAL AS A JINGO POEM MISTER BIRKET FOSTER'S LANDSCAPES SMILE AT ONE MUCH IN THE SAME WAY THAT MISTER CARKER USED TO FLASH HIS TEETH AND MISTER JOHN COLLIER GIVES HIS SITTER A CHEERFUL SLAP ON THE BACK BEFORE HE SAYS LIKE A SHAMPOOER IN A TURKISH BATH NEXT MAN",
+        "transcript": "Linell's pictures are a sort of upguards and Adam paintings, and Mason's exquisite idols are as national as a jingo poem. Mr. Birket fosters's landscapes smile at one much in the same way that Mr. Carter used to flash his teeth, and Mr. John Collier gives his sitter a cheerful slap on the back before he says, like a shampooer in a turkish bath,",
+        "score": {
+          "errors": 13,
+          "substitutions": 9,
+          "deletions": 4,
+          "insertions": 0,
+          "reference_words": 68,
+          "wer": 0.19117647058823528
+        },
+        "input_sha256": "07244790e9a8300bfcbf12c28ac5230792e75238d03b2ac167a72bf3943c5404",
+        "elapsed_seconds": 16.941961691947654,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0005",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "IT IS OBVIOUSLY UNNECESSARY FOR US TO POINT OUT HOW LUMINOUS THESE CRITICISMS ARE HOW DELICATE IN EXPRESSION",
+        "transcript": "it is obviously unnecessary for us to point out how luminous these criticisms are how delicate in expression",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.0
+        },
+        "input_sha256": "870faa0669d19ca8416b9923cdf722ba9fd6ccce766a50583fa9c0f808b39eba",
+        "elapsed_seconds": 4.5755348219536245,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0006",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "ON THE GENERAL PRINCIPLES OF ART MISTER QUILTER WRITES WITH EQUAL LUCIDITY",
+        "transcript": "On the general principles of art Mr. Quiller writes with equal lucidity",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.16666666666666666
+        },
+        "input_sha256": "12475ade3c01c9f750bfc95e1c5a5dd05afcfe30141a0f5464da59f0c01d26e4",
+        "elapsed_seconds": 3.187899354030378,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0007",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "PAINTING HE TELLS US IS OF A DIFFERENT QUALITY TO MATHEMATICS AND FINISH IN ART IS ADDING MORE FACT",
+        "transcript": "Painting is of a different quality to mathematics, and fine art is adding more facts.",
+        "score": {
+          "errors": 6,
+          "substitutions": 2,
+          "deletions": 4,
+          "insertions": 0,
+          "reference_words": 19,
+          "wer": 0.3157894736842105
+        },
+        "input_sha256": "84998a43cb534e09801f5522b9ed0aa58e88035c9727bc8e4d362a7bc158d0b6",
+        "elapsed_seconds": 4.602929984917864,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0008",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "AS FOR ETCHINGS THEY ARE OF TWO KINDS BRITISH AND FOREIGN",
+        "transcript": "As for etchings, there are of two kinds, British and foreign.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 11,
+          "wer": 0.09090909090909091
+        },
+        "input_sha256": "08a3f099d544fac5df1b6105bfd4952d911995f271b494c9a689c083c39ab855",
+        "elapsed_seconds": 3.0002976140240207,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0009",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HE LAMENTS MOST BITTERLY THE DIVORCE THAT HAS BEEN MADE BETWEEN DECORATIVE ART AND WHAT WE USUALLY CALL PICTURES MAKES THE CUSTOMARY APPEAL TO THE LAST JUDGMENT AND REMINDS US THAT IN THE GREAT DAYS OF ART MICHAEL ANGELO WAS THE FURNISHING UPHOLSTERER",
+        "transcript": "He laments most bitterly the divorce that has been made between decorative art and what we usually call pictures and reminds us that in the great days of art Michelangelo was the furnishing upholsterer.",
+        "score": {
+          "errors": 10,
+          "substitutions": 1,
+          "deletions": 9,
+          "insertions": 0,
+          "reference_words": 43,
+          "wer": 0.23255813953488372
+        },
+        "input_sha256": "2bfbcdfab6024ccd3bfeb4e883cc7f9cc613235e504bfc068fd34069056513b7",
+        "elapsed_seconds": 9.476907831034623,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0010",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "NEAR THE FIRE AND THE ORNAMENTS FRED BROUGHT HOME FROM INDIA ON THE MANTEL BOARD",
+        "transcript": "Near the fire, and the ornaments Fred brought home from India on the mantelboard.",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 15,
+          "wer": 0.13333333333333333
+        },
+        "input_sha256": "2ebbcaa44f14c15fd8afd0e4a71cae494377d30812a0ba05d6be07c55d00bbea",
+        "elapsed_seconds": 3.242916296934709,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0011",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "IN FACT HE IS QUITE SEVERE ON MISTER RUSKIN FOR NOT RECOGNISING THAT A PICTURE SHOULD DENOTE THE FRAILTY OF MAN AND REMARKS WITH PLEASING COURTESY AND FELICITOUS GRACE THAT MANY PHASES OF FEELING",
+        "transcript": "In fact, he is quite severe on Mr. Ruskin for not recognizing that a picture should denote the frailty of man, and remarks with pleasing courtesy and philosopher's grace that many phases of feeling",
+        "score": {
+          "errors": 3,
+          "substitutions": 3,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 34,
+          "wer": 0.08823529411764706
+        },
+        "input_sha256": "d481b97c34ef7c5087dcd53f93d311e050834ba5e4b0f9165f6a8e9e8c7fb245",
+        "elapsed_seconds": 8.143445723922923,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0012",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "ONLY UNFORTUNATELY HIS OWN WORK NEVER DOES GET GOOD",
+        "transcript": "Only unfortunately his own work never does get good.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "222cd90cd9edf086096fb0abba901b772f8ca4e763d5becb803b0a7f9b16ace9",
+        "elapsed_seconds": 2.871997282956727,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0013",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "MISTER QUILTER HAS MISSED HIS CHANCE FOR HE HAS FAILED EVEN TO MAKE HIMSELF THE TUPPER OF PAINTING",
+        "transcript": "Mr Coulter has missed his chance for his failed even to make himself the tupper of painting.",
+        "score": {
+          "errors": 4,
+          "substitutions": 3,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.2222222222222222
+        },
+        "input_sha256": "4e090445122aee10fe3045cf79fb234f5059e6b911c0ffcbedb91e04c20473ae",
+        "elapsed_seconds": 3.8901855259900913,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0014",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "BY HARRY QUILTER M A",
+        "transcript": "By Harry Quilter, MA",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.4
+        },
+        "input_sha256": "5e7e3b96d975c74c952209a4d3a0731ec57019689685e1cf5f3c73a76f6f8a36",
+        "elapsed_seconds": 1.9368386209243909,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0000",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "BECAUSE YOU WERE SLEEPING INSTEAD OF CONQUERING THE LOVELY ROSE PRINCESS HAS BECOME A FIDDLE WITHOUT A BOW WHILE POOR SHAGGY SITS THERE A COOING DOVE",
+        "transcript": "Because you were sleeping in some conquering, the lovely rose princess has become a fiddle without a bow, poor shaggy sits there a cooing dove.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 26,
+          "wer": 0.11538461538461539
+        },
+        "input_sha256": "26cbebbdd8954104c936dc38fbb8a80958f2169ada0fa6fe46a89cfa9e3d824c",
+        "elapsed_seconds": 5.874917992972769,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0001",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HE HAS GONE AND GONE FOR GOOD ANSWERED POLYCHROME WHO HAD MANAGED TO SQUEEZE INTO THE ROOM BESIDE THE DRAGON AND HAD WITNESSED THE OCCURRENCES WITH MUCH INTEREST",
+        "transcript": "He has gone, and gone for good, answered polychrome, who had managed to squeeze into the room beside the dragon and had witnessed the occurrences with much interest.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 28,
+          "wer": 0.0
+        },
+        "input_sha256": "7565c448f1e4cab4eebce19116ad20b22b24a5c38a82a2f98ae19bb068a3aecb",
+        "elapsed_seconds": 6.120230993954465,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0002",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "I HAVE REMAINED A PRISONER ONLY BECAUSE I WISHED TO BE ONE AND WITH THIS HE STEPPED FORWARD AND BURST THE STOUT CHAINS AS EASILY AS IF THEY HAD BEEN THREADS",
+        "transcript": "I have remained a prisoner only because I wished to be one and with this he stepped forward and burst the stout chains as easily as if they had been threads.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 31,
+          "wer": 0.0
+        },
+        "input_sha256": "6fbbe1b5e143f2ac7baa9c62bbf3575d34ab79a79f9fcbaa0cac60c2e08e1703",
+        "elapsed_seconds": 6.438965544919483,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0003",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THE LITTLE GIRL HAD BEEN ASLEEP BUT SHE HEARD THE RAPS AND OPENED THE DOOR",
+        "transcript": "The little girl had been asleep, but she heard the raps and opened the door.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 15,
+          "wer": 0.0
+        },
+        "input_sha256": "80f47603018506ec4a646b68d9f7716b132d8d5ee740dc503ed4f9122cd76243",
+        "elapsed_seconds": 3.4390632210997865,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0004",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THE KING HAS FLED IN DISGRACE AND YOUR FRIENDS ARE ASKING FOR YOU",
+        "transcript": "The king is flooded disgrace and your friends are asking for you.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.23076923076923078
+        },
+        "input_sha256": "919d80690bed932be273b0e6e3512b18a6166ed974400ca7e03903760ef24420",
+        "elapsed_seconds": 3.0263718739151955,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0005",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "I BEGGED RUGGEDO LONG AGO TO SEND HIM AWAY BUT HE WOULD NOT DO SO",
+        "transcript": "I begged Rego to send him away but he would not do so.",
+        "score": {
+          "errors": 3,
+          "substitutions": 1,
+          "deletions": 2,
+          "insertions": 0,
+          "reference_words": 15,
+          "wer": 0.2
+        },
+        "input_sha256": "d3da297f1f6a0f933ce6d778b8dc8fecff4cc7c21616dbd536146e76ebb98fbe",
+        "elapsed_seconds": 3.205115499906242,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0006",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "I ALSO OFFERED TO HELP YOUR BROTHER TO ESCAPE BUT HE WOULD NOT GO",
+        "transcript": "I also offered to help your brother to escape, but he would not go.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 14,
+          "wer": 0.0
+        },
+        "input_sha256": "65ae3678b861333fb9ba2e5d7db9a0f77fe58ad89d4480872eeb62d22e894dd3",
+        "elapsed_seconds": 3.0536785959266126,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0007",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HE EATS AND SLEEPS VERY STEADILY REPLIED THE NEW KING",
+        "transcript": "He eats and sleeps very steadily, replied the new king.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.0
+        },
+        "input_sha256": "1d1b4106711196bcf15091b2df60096dfa234132df32f5d7a57ef4931dfc5d83",
+        "elapsed_seconds": 2.8788597650127485,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0008",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "I HOPE HE DOESN'T WORK TOO HARD SAID SHAGGY",
+        "transcript": "I hope it doesn't work too hard, Shaggy.",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.2222222222222222
+        },
+        "input_sha256": "bc3c6a74fccbe7a7c86f9f59ed4589d8be65dc84d00a3d413b58d4722a341570",
+        "elapsed_seconds": 2.8823870479827747,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0009",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HE DOESN'T WORK AT ALL",
+        "transcript": "He doesn't work at all.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.0
+        },
+        "input_sha256": "d23fc0e9c9ccb35f6ec9223954c921e1c9daa0cc9d8e8ad10b3b9cb4b14b6617",
+        "elapsed_seconds": 1.8717468539252877,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0010",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "IN FACT THERE IS NOTHING HE CAN DO IN THESE DOMINIONS AS WELL AS OUR NOMES WHOSE NUMBERS ARE SO GREAT THAT IT WORRIES US TO KEEP THEM ALL BUSY",
+        "transcript": "In fact, there's nothing he can do in these dominions as well as our gnomes, whose numbers are so great that it worries us to keep them all busy.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 30,
+          "wer": 0.1
+        },
+        "input_sha256": "cec411cc16334eae88f793cf4cc0c2c6f83087c06b4e11a451c329a33b26b884",
+        "elapsed_seconds": 5.438227131962776,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0011",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "NOT EXACTLY RETURNED KALIKO",
+        "transcript": "Not exactly, we've turned calico.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 4,
+          "wer": 0.75
+        },
+        "input_sha256": "765c97d18eb1aa76ab4223359dd403ab8e606d9dc195c0b82f4b6b40b5b91a14",
+        "elapsed_seconds": 2.480863813078031,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0012",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "WHERE IS MY BROTHER NOW",
+        "transcript": "Where is my brother now?",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.0
+        },
+        "input_sha256": "2da8a3d5a915be58a29cae9520c94e96395619f1dd3a0968486c9d5154b77b12",
+        "elapsed_seconds": 1.8715899040689692,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0013",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "INQUIRED SHAGGY IN THE METAL FOREST",
+        "transcript": "Inquired Shaggy in the Metal Forest.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 6,
+          "wer": 0.0
+        },
+        "input_sha256": "52e72bda6f458ffea420adc0044fd93392d16d3f0393f03c71888b773e9ad02c",
+        "elapsed_seconds": 2.6908704579109326,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0014",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "WHERE IS THAT",
+        "transcript": "Where is that?",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 3,
+          "wer": 0.0
+        },
+        "input_sha256": "659d4e11b195fa5e15dcb1fa860d703cbb9e1a57fa307d4ac6a6093435cf49cb",
+        "elapsed_seconds": 1.6689174700295553,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0015",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THE METAL FOREST IS IN THE GREAT DOMED CAVERN THE LARGEST IN ALL OUR DOMINIONS REPLIED KALIKO",
+        "transcript": "The Middle Forest is in the Great Domed Cavern, the largest in all our dominions.",
+        "score": {
+          "errors": 3,
+          "substitutions": 1,
+          "deletions": 2,
+          "insertions": 0,
+          "reference_words": 17,
+          "wer": 0.17647058823529413
+        },
+        "input_sha256": "95eb0d408f2f4275bd44995e2202b1b1377ac00538662d5cae509de32e9d353f",
+        "elapsed_seconds": 4.046262779971585,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0016",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "KALIKO HESITATED",
+        "transcript": "Kaliko hesitated.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 2,
+          "wer": 0.0
+        },
+        "input_sha256": "e4ef839a12f5e01279f449fbec8decd9917a2a01516a8a67635c4cde526caee5",
+        "elapsed_seconds": 1.9168947410071269,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0017",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HOWEVER IF WE LOOK SHARP WE MAY BE ABLE TO DISCOVER ONE OF THESE SECRET WAYS",
+        "transcript": "However, if we look sharp, we may be able to discover one of these secret ways.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 16,
+          "wer": 0.0
+        },
+        "input_sha256": "18bf640efb70a8735f674c4289ab2cc9ee42a529e097dca376d0f69a3907e56f",
+        "elapsed_seconds": 3.903478293097578,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0018",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "OH NO I'M QUITE SURE HE DIDN'T",
+        "transcript": "Oh no, I'm quite sure he didn't.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 7,
+          "wer": 0.0
+        },
+        "input_sha256": "db055fdf17b99b4e68f2e2bdbd01a5a8388321df44e0fcb1600e6b4387466fc3",
+        "elapsed_seconds": 2.256273500039242,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0019",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THAT'S FUNNY REMARKED BETSY THOUGHTFULLY",
+        "transcript": "That's funny, remarked Betsy thoughtfully.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.0
+        },
+        "input_sha256": "c19e0c3de6100627ffbca103dc5d8502dc6d74a3e1f06e00d5e6dc6ffbb25d94",
+        "elapsed_seconds": 2.5910887729842216,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0020",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "I DON'T BELIEVE ANN KNEW ANY MAGIC OR SHE'D HAVE WORKED IT BEFORE",
+        "transcript": "I don't believe any magic or she did worked before.",
+        "score": {
+          "errors": 5,
+          "substitutions": 2,
+          "deletions": 3,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.38461538461538464
+        },
+        "input_sha256": "293af6add35a8f87e03f4ec59ef6e23538293c6fc8be45346dd17f6a69cc7f1f",
+        "elapsed_seconds": 3.0687825459754094,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0021",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "I DO NOT KNOW CONFESSED SHAGGY",
+        "transcript": "I do not know, confess Shaggy.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 6,
+          "wer": 0.16666666666666666
+        },
+        "input_sha256": "cce5a7959d35cd34310e6868853d7d755b5aa13caa9579ddbaf0e5b28ffd29fd",
+        "elapsed_seconds": 2.201002257061191,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0022",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "TRUE AGREED KALIKO",
+        "transcript": "True, agreed, Calico.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 3,
+          "wer": 0.3333333333333333
+        },
+        "input_sha256": "0d3573eac7e74ab8c05a5743b050bd6bda2e6f73629bc7ec338394206a29e7f2",
+        "elapsed_seconds": 2.1762556610628963,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0023",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "KALIKO WENT TO THE BIG GONG AND POUNDED ON IT JUST AS RUGGEDO USED TO DO BUT NO ONE ANSWERED THE SUMMONS",
+        "transcript": "Calico went to the big gong and pounded on it just as Vargador used to do, but no one answered the summons.",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 22,
+          "wer": 0.09090909090909091
+        },
+        "input_sha256": "9d37ebdf780a28eaeebaada1f12bc2b2a2fca2278c09a2652f5e5b7e9420aa04",
+        "elapsed_seconds": 4.437785318004899,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-135031-0024",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HAVING RETURNED TO THE ROYAL CAVERN KALIKO FIRST POUNDED THE GONG AND THEN SAT IN THE THRONE WEARING RUGGEDO'S DISCARDED RUBY CROWN AND HOLDING IN HIS HAND THE SCEPTRE WHICH RUGGEDO HAD SO OFTEN THROWN AT HIS HEAD",
+        "transcript": "Having returned to the Royal Cavern, Calico first pounded the gong and then sat in the throne, wearing Riggedo's discarded ruby crown and holding in his hand the scepter which Riggedo had so often thrown as his head.",
+        "score": {
+          "errors": 5,
+          "substitutions": 5,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 38,
+          "wer": 0.13157894736842105
+        },
+        "input_sha256": "f1359484fb8e3647248cc1f6fd978d331f83fbfe20e173e287110c087c45d967",
+        "elapsed_seconds": 8.588913027080707,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0000",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "A MAN SAID TO THE UNIVERSE SIR I EXIST",
+        "transcript": "A man said to the universe, \"Sir, I exist.\"",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "adb240047a1e0732c96b029b7dbd7c81a17c853cbd30aec0ee0d9c4e59fe720a",
+        "elapsed_seconds": 3.061584967887029,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0001",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "SWEAT COVERED BRION'S BODY TRICKLING INTO THE TIGHT LOINCLOTH THAT WAS THE ONLY GARMENT HE WORE",
+        "transcript": "Sweat-covered Brian's body, trickling into the tight-fitting clothes that was the only garment he wore.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 16,
+          "wer": 0.1875
+        },
+        "input_sha256": "5ec33d1ae2a06430ddd4faa6090673f7dbb09f71405ce401a08301eedb313275",
+        "elapsed_seconds": 3.993346542934887,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0002",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THE CUT ON HIS CHEST STILL DRIPPING BLOOD THE ACHE OF HIS OVERSTRAINED EYES EVEN THE SOARING ARENA AROUND HIM WITH THE THOUSANDS OF SPECTATORS WERE TRIVIALITIES NOT WORTH THINKING ABOUT",
+        "transcript": "The cut on his chest still dripping blood, the ache of his overstrained eyes, the soaring arena around him with thousands of spectators were trivialities not worth thinking about.",
+        "score": {
+          "errors": 2,
+          "substitutions": 0,
+          "deletions": 2,
+          "insertions": 0,
+          "reference_words": 31,
+          "wer": 0.06451612903225806
+        },
+        "input_sha256": "9a490059a63cd2f92fbc8c447135ed87f97ed36ee53714987b01c8ac7c33dec4",
+        "elapsed_seconds": 7.217005296959542,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0003",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HIS INSTANT OF PANIC WAS FOLLOWED BY A SMALL SHARP BLOW HIGH ON HIS CHEST",
+        "transcript": "His instant panic was followed by a small sharp blow high on his chest.",
+        "score": {
+          "errors": 1,
+          "substitutions": 0,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 15,
+          "wer": 0.06666666666666667
+        },
+        "input_sha256": "da658227a61fdfefa7a54ad9bb4614a7da33e335358e5b3620ddcf7c93c3e77f",
+        "elapsed_seconds": 3.196865870966576,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0004",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "ONE MINUTE A VOICE SAID AND THE TIME BUZZER SOUNDED",
+        "transcript": "One minute a voice said and a time buzzer sounded",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.1
+        },
+        "input_sha256": "34c4339d921ca363faa292996ea12864c9bbdb5a69fa40178e41629f069a36e0",
+        "elapsed_seconds": 2.8264700659783557,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0005",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "A MINUTE IS NOT A VERY LARGE MEASURE OF TIME AND HIS BODY NEEDED EVERY FRACTION OF IT",
+        "transcript": "A minute is not a very large measure of time and his body needed every fraction of it.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.0
+        },
+        "input_sha256": "65265556f1956c0f20f5234b6aa2166dfdcde396ffc3cd1287d9e9e64489afbb",
+        "elapsed_seconds": 3.4319897949462757,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0006",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THE BUZZER'S WHIRR TRIGGERED HIS MUSCLES INTO COMPLETE RELAXATION",
+        "transcript": "The buzzers were triggered his muscles into complete relaxation.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.1111111111111111
+        },
+        "input_sha256": "c3e32102b9faeb6dc3ec5203440d4e2a365cc0ea44fa6aeaefe5e3668a9a8585",
+        "elapsed_seconds": 3.145655610016547,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0007",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "ONLY HIS HEART AND LUNGS WORKED ON AT A STRONG MEASURED RATE",
+        "transcript": "Only his heart and lungs worked on at a strong measured rate.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.0
+        },
+        "input_sha256": "1cc95ce7c6be4352b94c10d77a4b0475ccc5ad543b0d3a5f791459963ce4efb1",
+        "elapsed_seconds": 3.1149936659494415,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0008",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HE WAS IN REVERIE SLIDING ALONG THE BORDERS OF CONSCIOUSNESS",
+        "transcript": "He was in a reverie, sliding along the borders of consciousness.",
+        "score": {
+          "errors": 1,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 10,
+          "wer": 0.1
+        },
+        "input_sha256": "1d5eb4bf16f57e21ac034f012f37c9b97a61f8e2552a441352b9d0eab58c48e7",
+        "elapsed_seconds": 3.0877522480441257,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0009",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THE CONTESTANTS IN THE TWENTIES NEEDED UNDISTURBED REST THEREFORE NIGHTS IN THE DORMITORIES WERE AS QUIET AS DEATH",
+        "transcript": "The contestants in the twenties needed undisturbed rest. Therefore, nights in the dormitories were as quiet as death.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.0
+        },
+        "input_sha256": "42cf54411f05e2cd4397d9e7cbfb566c204954e1d6dc3f892b57499433c8e7fd",
+        "elapsed_seconds": 4.665653070900589,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0010",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "PARTICULARLY SO ON THIS LAST NIGHT WHEN ONLY TWO OF THE LITTLE CUBICLES WERE OCCUPIED THE THOUSANDS OF OTHERS STANDING WITH DARK EMPTY DOORS",
+        "transcript": "particularly so on its last night when only two of the little cubicles were occupied the thousands of others standing with dark empty doors",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 24,
+          "wer": 0.041666666666666664
+        },
+        "input_sha256": "b0316adbccaff2af04f6d397c03905f157a6b2418a9b54e88a16d5859b000211",
+        "elapsed_seconds": 5.62277116603218,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0011",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THE OTHER VOICE SNAPPED WITH A HARSH URGENCY CLEARLY USED TO COMMAND",
+        "transcript": "The other voice snapped with a harsh urgency, clearly used to command.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.0
+        },
+        "input_sha256": "49975adce742d343d7755ad7e52f75f93bf28ee6f9f038b4dab9a217336b78f7",
+        "elapsed_seconds": 3.302230827976018,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0012",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "I'M HERE BECAUSE THE MATTER IS OF UTMOST IMPORTANCE AND BRANDD IS THE ONE I MUST SEE NOW STAND ASIDE",
+        "transcript": "I'm here because the matter is of utmost importance and Brand is the one I must see. Now stand aside.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 20,
+          "wer": 0.05
+        },
+        "input_sha256": "3559a8ddb75104a20769c00b17226fb86de0e4329bfca313833eb83c0561efef",
+        "elapsed_seconds": 4.457040217006579,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0013",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THE TWENTIES",
+        "transcript": "The 20s",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 2,
+          "wer": 0.5
+        },
+        "input_sha256": "ff87e7b407cf5355d492e618dbc87e9800a688ccb950ab1ac693d64a1bcfb80f",
+        "elapsed_seconds": 1.6343635990051553,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0014",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HE MUST HAVE DRAWN HIS GUN BECAUSE THE INTRUDER SAID QUICKLY PUT THAT AWAY YOU'RE BEING A FOOL OUT",
+        "transcript": "You must have drawn his gun because the intruder said quickly, \"Put that away, you're being a fool.\"",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 19,
+          "wer": 0.10526315789473684
+        },
+        "input_sha256": "9a2410edf224fc38005243625b49e18fba5b297867171177906f9ed1f808b714",
+        "elapsed_seconds": 4.218732513021678,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0015",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THERE WAS SILENCE THEN AND STILL WONDERING BRION WAS ONCE MORE ASLEEP",
+        "transcript": "There is silence then and still wonderin' Brian was once more asleep.",
+        "score": {
+          "errors": 3,
+          "substitutions": 3,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.25
+        },
+        "input_sha256": "24727264f148b3bbe587338e1456281298e6cbd7a29eff07ab06ea096cbdd174",
+        "elapsed_seconds": 3.2648013619473204,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0016",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "TEN SECONDS",
+        "transcript": "10 seconds",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 2,
+          "wer": 0.5
+        },
+        "input_sha256": "2de6e800e9a973de275a2c57ef2a8ccf0e25655f0158a0a551bdc0e944607ebc",
+        "elapsed_seconds": 1.6715339469956234,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0017",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HE ASKED THE HANDLER WHO WAS KNEADING HIS ACHING MUSCLES",
+        "transcript": "He asked the handler who was needing his aching muscles.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.1
+        },
+        "input_sha256": "54aac47c491c01ca59b3be862b9f53cf4fd93862e1363b02471d910f76e3b4ac",
+        "elapsed_seconds": 2.8057986419880763,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0018",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "A RED HAIRED MOUNTAIN OF A MAN WITH AN APPARENTLY INEXHAUSTIBLE STORE OF ENERGY",
+        "transcript": "A red-haired mountain of a man was an apparently inexhaustible store of energy.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 14,
+          "wer": 0.07142857142857142
+        },
+        "input_sha256": "dcc9cc41630ec440e639cf8349899f6e76000d728659ca42ef7ac0ef003ca201",
+        "elapsed_seconds": 3.4752716440707445,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0019",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THERE COULD BE LITTLE ART IN THIS LAST AND FINAL ROUND OF FENCING",
+        "transcript": "There could be a little art in this last and final round of fencing.",
+        "score": {
+          "errors": 1,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 13,
+          "wer": 0.07692307692307693
+        },
+        "input_sha256": "42735cf9485cd4c93d766d01cddebabed5a21f49e26a9c6dd15f8e5db2f6b5a6",
+        "elapsed_seconds": 3.176170989056118,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0020",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "JUST THRUST AND PARRY AND VICTORY TO THE STRONGER",
+        "transcript": "Just thrust and parry in victory to the stronger.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.1111111111111111
+        },
+        "input_sha256": "3998b463548c90f6686faf96432cc237c96f0bd784d8124a1a3c851fd4451acf",
+        "elapsed_seconds": 2.853985093999654,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0021",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "EVERY MAN WHO ENTERED THE TWENTIES HAD HIS OWN TRAINING TRICKS",
+        "transcript": "Every man who entered the 20s had his own training tricks.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 11,
+          "wer": 0.09090909090909091
+        },
+        "input_sha256": "f40d906923ec180a258635ec7bf5bfdaeac2c1ee3bef24c32ef6361b420d6ea8",
+        "elapsed_seconds": 3.1566333470400423,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0022",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THERE APPEARED TO BE AN IMMEDIATE ASSOCIATION WITH THE DEATH TRAUMA AS IF THE TWO WERE INEXTRICABLY LINKED INTO ONE",
+        "transcript": "There appeared to be an immediate association what's the two were inextricably linked to one.",
+        "score": {
+          "errors": 7,
+          "substitutions": 2,
+          "deletions": 5,
+          "insertions": 0,
+          "reference_words": 20,
+          "wer": 0.35
+        },
+        "input_sha256": "6fca2f211411ffd83f84ccfe38ac1434a83ba02497c68cd1819cb63da57fb3a4",
+        "elapsed_seconds": 4.335369701962918,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0023",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THE STRENGTH THAT ENABLES SOMEONE IN A TRANCE TO HOLD HIS BODY STIFF AND UNSUPPORTED EXCEPT AT TWO POINTS THE HEAD AND HEELS",
+        "transcript": "To strengthen and enable someone in a trance to hold his body stiff and unsupported except at two points the head and heels.",
+        "score": {
+          "errors": 4,
+          "substitutions": 4,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 23,
+          "wer": 0.17391304347826086
+        },
+        "input_sha256": "e4eee59ba1119187a240da9e67bc4f60af77b023b2aac7b33ffe2a6258e8a7f8",
+        "elapsed_seconds": 4.777559695998207,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0024",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THIS IS PHYSICALLY IMPOSSIBLE WHEN CONSCIOUS",
+        "transcript": "This is physically impossible when conscious.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 6,
+          "wer": 0.0
+        },
+        "input_sha256": "84bd6220942701e8973dc0e8a2c8a7ac5f794a15d1a884994e95c5e3b8efa96e",
+        "elapsed_seconds": 2.551866583060473,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0025",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "OTHERS HAD DIED BEFORE DURING THE TWENTIES AND DEATH DURING THE LAST ROUND WAS IN SOME WAYS EASIER THAN DEFEAT",
+        "transcript": "Allers had died before in the 20s and death during the last round was in some ways easier than defeat.",
+        "score": {
+          "errors": 3,
+          "substitutions": 3,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 20,
+          "wer": 0.15
+        },
+        "input_sha256": "b3819f4ebe697500f8fdb302dcf832e73e08c8d8e3abc69e04328f1cdce5dceb",
+        "elapsed_seconds": 4.827215673052706,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0026",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "BREATHING DEEPLY BRION SOFTLY SPOKE THE AUTO HYPNOTIC PHRASES THAT TRIGGERED THE PROCESS",
+        "transcript": "Breathing deeply, Brienne softly spoke the auto hypnotic phrases that triggered the process.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.07692307692307693
+        },
+        "input_sha256": "78bbbfada3676e97548fe946e252cfffc5fba916542d2c6e39d5ecbb8be76710",
+        "elapsed_seconds": 3.6653519009705633,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0027",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "WHEN THE BUZZER SOUNDED HE PULLED HIS FOIL FROM HIS SECOND'S STARTLED GRASP AND RAN FORWARD",
+        "transcript": "When the buzzer sounded, he pulled his foil from his second startled grasp and ran forward.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 16,
+          "wer": 0.0625
+        },
+        "input_sha256": "b676f024fec3c98d3e7783e5bf3846739b47807aa30c1ed0c9066e3988b2dfeb",
+        "elapsed_seconds": 3.7383035849779844,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0028",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "IROLG LOOKED AMAZED AT THE SUDDEN FURY OF THE ATTACK THEN SMILED",
+        "transcript": "I rolled my eyes at the sudden fury of the attack then smiled.",
+        "score": {
+          "errors": 4,
+          "substitutions": 3,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 12,
+          "wer": 0.3333333333333333
+        },
+        "input_sha256": "a6833433f5c62c5ffae8a368811c507dde2401d3ff7e9669a492c150f6afe8d4",
+        "elapsed_seconds": 3.217578919022344,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0029",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "HE THOUGHT IT WAS A LAST BURST OF ENERGY HE KNEW HOW CLOSE THEY BOTH WERE TO EXHAUSTION",
+        "transcript": "He thought it was the last burst of energy. He knew how close they both were to exhaustion.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.05555555555555555
+        },
+        "input_sha256": "8b76b5e12d811444604a97633f4cfeb6e4228273f734d3c14ee0f8aa9c8df860",
+        "elapsed_seconds": 3.9033824120415375,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0030",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "BRION SAW SOMETHING CLOSE TO PANIC ON HIS OPPONENT'S FACE WHEN THE MAN FINALLY RECOGNIZED HIS ERROR",
+        "transcript": "Brian saw something close to panic on his opponent's face when the man finally recognized his error.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 17,
+          "wer": 0.058823529411764705
+        },
+        "input_sha256": "f65aeae1485f33072d636c36ad06ae205627f59619b2113a0c91d91126afed3e",
+        "elapsed_seconds": 3.990925880963914,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0031",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "A WAVE OF DESPAIR ROLLED OUT FROM IROLG BRION SENSED IT AND KNEW THE FIFTH POINT WAS HIS",
+        "transcript": "A wave of despair rolled out from Ireland, and sensed it and knew the fifth point was his.",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.1111111111111111
+        },
+        "input_sha256": "8b2218bd45e5df4d097c0f6a7ca9ac44e3b3f5add0a4d035d3da2f4e3f1e31c6",
+        "elapsed_seconds": 4.012423687032424,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-141231-0032",
+        "group": "corpus",
+        "planner": false,
+        "mime": "audio/flac",
+        "reference": "THEN THE POWERFUL TWIST THAT THRUST IT ASIDE IN AND UNDER THE GUARD",
+        "transcript": "Then the powerful twists that thrust it aside in under the guard.",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.15384615384615385
+        },
+        "input_sha256": "57a830871a87def230b541a41898aca9ef444b2ae420cdc776a4e6debf74d50c",
+        "elapsed_seconds": 2.9856363349827006,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0000-pcm-control",
+        "group": "diagnostic",
+        "planner": false,
+        "mime": "audio/wav",
+        "reference": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+        "transcript": "Mr. Quilter is the apostle of the middle classes, and we're glad to welcome his gospel.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 17,
+          "wer": 0.17647058823529413
+        },
+        "input_sha256": "799f78ed4beb4de7ceae3a809262d4ce242394342ccd1d58cef7d49dbc2def46",
+        "elapsed_seconds": 3.5765425610588863,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "1272-128104-0001-pcm-control",
+        "group": "diagnostic",
+        "planner": false,
+        "mime": "audio/wav",
+        "reference": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+        "transcript": "Nor is Mr. Quilter's manner less interesting than his matter.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.1
+        },
+        "input_sha256": "473b1bb573e8f7cdcd639c6e318036236190107b66bfe6892286121a92d464c1",
+        "elapsed_seconds": 3.2147146050119773,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "english-wav",
+        "group": "regression",
+        "planner": false,
+        "mime": "audio/wav",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d",
+        "elapsed_seconds": 2.2331635700538754,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "english-wav",
+        "group": "regression",
+        "planner": true,
+        "mime": "audio/wav",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d",
+        "elapsed_seconds": 2.193420527037233,
+        "backends": [
+          "cuda"
+        ],
+        "normalized_parity": true
+      },
+      {
+        "id": "spanish-8khz-wav",
+        "group": "regression",
+        "planner": false,
+        "mime": "audio/wav",
+        "reference": "Buenos días. Esta es una prueba de reconocimiento automático del idioma.",
+        "transcript": "Buenos días.",
+        "score": {
+          "errors": 9,
+          "substitutions": 0,
+          "deletions": 9,
+          "insertions": 0,
+          "reference_words": 11,
+          "wer": 0.8181818181818182
+        },
+        "input_sha256": "c656aaeeb98a4239f9f0f6ab05eed6e76424b9b073caa0090ac6ac35d7312b35",
+        "elapsed_seconds": 2.847808793070726,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "spanish-8khz-wav",
+        "group": "regression",
+        "planner": true,
+        "mime": "audio/wav",
+        "reference": "Buenos días. Esta es una prueba de reconocimiento automático del idioma.",
+        "transcript": "Buenos días.",
+        "score": {
+          "errors": 9,
+          "substitutions": 0,
+          "deletions": 9,
+          "insertions": 0,
+          "reference_words": 11,
+          "wer": 0.8181818181818182
+        },
+        "input_sha256": "c656aaeeb98a4239f9f0f6ab05eed6e76424b9b073caa0090ac6ac35d7312b35",
+        "elapsed_seconds": 2.910766361048445,
+        "backends": [
+          "cuda"
+        ],
+        "normalized_parity": true
+      },
+      {
+        "id": "english-stereo-44100",
+        "group": "regression",
+        "planner": false,
+        "mime": "audio/wav",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "5a9190665685ac2c8b2e8e6e04ba52948497be5ba10b09bb150bf8e4498c1a18",
+        "elapsed_seconds": 2.2105277890805155,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "english-stereo-44100",
+        "group": "regression",
+        "planner": true,
+        "mime": "audio/wav",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "5a9190665685ac2c8b2e8e6e04ba52948497be5ba10b09bb150bf8e4498c1a18",
+        "elapsed_seconds": 2.199572916026227,
+        "backends": [
+          "cuda"
+        ],
+        "normalized_parity": true
+      },
+      {
+        "id": "english-mp4-video",
+        "group": "regression",
+        "planner": false,
+        "mime": "video/mp4",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "dd71c2208cdd46de655cb6e9750167e81aae32798b43d978d9b0a53d0e509513",
+        "elapsed_seconds": 2.43939627695363,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "english-mp4-video",
+        "group": "regression",
+        "planner": true,
+        "mime": "video/mp4",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "dd71c2208cdd46de655cb6e9750167e81aae32798b43d978d9b0a53d0e509513",
+        "elapsed_seconds": 2.1815998170059174,
+        "backends": [
+          "cuda"
+        ],
+        "normalized_parity": true
+      },
+      {
+        "id": "english-webm-video",
+        "group": "regression",
+        "planner": false,
+        "mime": "video/webm",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "7ab3286dee64a45ca928d03caf426f935e7c46bb834ae111e8f9c87341f5475c",
+        "elapsed_seconds": 2.1993012549355626,
+        "backends": [
+          "cuda"
+        ]
+      },
+      {
+        "id": "english-webm-video",
+        "group": "regression",
+        "planner": true,
+        "mime": "video/webm",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "7ab3286dee64a45ca928d03caf426f935e7c46bb834ae111e8f9c87341f5475c",
+        "elapsed_seconds": 2.2074430159991607,
+        "backends": [
+          "cuda"
+        ],
+        "normalized_parity": true
+      },
+      {
+        "id": "silence",
+        "group": "regression",
+        "planner": false,
+        "mime": "audio/wav",
+        "reference": "",
+        "transcript": "The cat is on the mat.",
+        "score": {
+          "errors": 6,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 6,
+          "reference_words": 0,
+          "wer": null
+        },
+        "input_sha256": "643f8a8dc8bd9c19225afffad2becfec5426180b3749cb208abdf1a6c8354efc",
+        "elapsed_seconds": 1.4289467970374972,
+        "backends": [
+          "cuda"
+        ]
+      }
+    ],
+    "reference_reads": [
+      {
+        "id": "1272-128104-0000",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+        "transcript": "Mr. Quilter is the apostle of the middle classes and we are glad to welcome his gospel.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 17,
+          "wer": 0.058823529411764705
+        },
+        "input_sha256": "4e25e22555cd16e90edb0a3b49fdcf1fe652b2a1250ab643634db33895c75b41",
+        "elapsed_seconds": 0.6334331349935383,
+        "transport": "original",
+        "reference_transport_sha256": "4e25e22555cd16e90edb0a3b49fdcf1fe652b2a1250ab643634db33895c75b41"
+      },
+      {
+        "id": "1272-128104-0001",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+        "transcript": "Nor is Mr. Quilter's manner less interesting than his matter.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.1
+        },
+        "input_sha256": "46a9d58622b4675b29564da2d9ba73e702241c5fa969f12c387cad4aa984276a",
+        "elapsed_seconds": 0.3493063310161233,
+        "transport": "original",
+        "reference_transport_sha256": "46a9d58622b4675b29564da2d9ba73e702241c5fa969f12c387cad4aa984276a"
+      },
+      {
+        "id": "1272-128104-0002",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HE TELLS US THAT AT THIS FESTIVE SEASON OF THE YEAR WITH CHRISTMAS AND ROAST BEEF LOOMING BEFORE US SIMILES DRAWN FROM EATING AND ITS RESULTS OCCUR MOST READILY TO THE MIND",
+        "transcript": "She tells us that at this festive season of the year with Christmas and roast beef looming before us, similes drawn from eating and its results occur most readily to the mind.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 32,
+          "wer": 0.03125
+        },
+        "input_sha256": "59bf7bb1129c11734a8dd362ad52b4e10ae31c03f0879fc92f7107ecd513513f",
+        "elapsed_seconds": 0.7255973250139505,
+        "transport": "original",
+        "reference_transport_sha256": "59bf7bb1129c11734a8dd362ad52b4e10ae31c03f0879fc92f7107ecd513513f"
+      },
+      {
+        "id": "1272-128104-0003",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HE HAS GRAVE DOUBTS WHETHER SIR FREDERICK LEIGHTON'S WORK IS REALLY GREEK AFTER ALL AND CAN DISCOVER IN IT BUT LITTLE OF ROCKY ITHACA",
+        "transcript": "He has grave doubts whether Sir Frederick Leighton's work is really Greek after all and can discover in it little of rocky Ithaca.",
+        "score": {
+          "errors": 1,
+          "substitutions": 0,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 24,
+          "wer": 0.041666666666666664
+        },
+        "input_sha256": "60d72657439cd3092fc2313efe0fabd31f0cd2f28f8ca46a21380c290b2e031d",
+        "elapsed_seconds": 0.580057663959451,
+        "transport": "original",
+        "reference_transport_sha256": "60d72657439cd3092fc2313efe0fabd31f0cd2f28f8ca46a21380c290b2e031d"
+      },
+      {
+        "id": "1272-128104-0004",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "LINNELL'S PICTURES ARE A SORT OF UP GUARDS AND AT EM PAINTINGS AND MASON'S EXQUISITE IDYLLS ARE AS NATIONAL AS A JINGO POEM MISTER BIRKET FOSTER'S LANDSCAPES SMILE AT ONE MUCH IN THE SAME WAY THAT MISTER CARKER USED TO FLASH HIS TEETH AND MISTER JOHN COLLIER GIVES HIS SITTER A CHEERFUL SLAP ON THE BACK BEFORE HE SAYS LIKE A SHAMPOOER IN A TURKISH BATH NEXT MAN",
+        "transcript": "Linell's pictures are a sort of upgard's and Adam paintings, and Mason's exquisite idols are as national as a jingo poem. Mr. Birkett Foster's landscapes smile at one much in the same way that Mr. Carker used to flash his teeth, and Mr. John Collier gives his sitter a cheerful slap on the back before he says, like a shampoo in a Turkish bath, \"Next man.\"",
+        "score": {
+          "errors": 11,
+          "substitutions": 9,
+          "deletions": 2,
+          "insertions": 0,
+          "reference_words": 68,
+          "wer": 0.16176470588235295
+        },
+        "input_sha256": "07244790e9a8300bfcbf12c28ac5230792e75238d03b2ac167a72bf3943c5404",
+        "elapsed_seconds": 1.797075083013624,
+        "transport": "original",
+        "reference_transport_sha256": "07244790e9a8300bfcbf12c28ac5230792e75238d03b2ac167a72bf3943c5404"
+      },
+      {
+        "id": "1272-128104-0005",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "IT IS OBVIOUSLY UNNECESSARY FOR US TO POINT OUT HOW LUMINOUS THESE CRITICISMS ARE HOW DELICATE IN EXPRESSION",
+        "transcript": "It is obviously unnecessary for us to point out how luminous these criticisms are, how delicate in expression.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.0
+        },
+        "input_sha256": "870faa0669d19ca8416b9923cdf722ba9fd6ccce766a50583fa9c0f808b39eba",
+        "elapsed_seconds": 0.48495398997329175,
+        "transport": "original",
+        "reference_transport_sha256": "870faa0669d19ca8416b9923cdf722ba9fd6ccce766a50583fa9c0f808b39eba"
+      },
+      {
+        "id": "1272-128104-0006",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "ON THE GENERAL PRINCIPLES OF ART MISTER QUILTER WRITES WITH EQUAL LUCIDITY",
+        "transcript": "On the general principles of art Mr. Quiller writes with equal lucidity.",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.16666666666666666
+        },
+        "input_sha256": "12475ade3c01c9f750bfc95e1c5a5dd05afcfe30141a0f5464da59f0c01d26e4",
+        "elapsed_seconds": 0.37782522407360375,
+        "transport": "original",
+        "reference_transport_sha256": "12475ade3c01c9f750bfc95e1c5a5dd05afcfe30141a0f5464da59f0c01d26e4"
+      },
+      {
+        "id": "1272-128104-0007",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "PAINTING HE TELLS US IS OF A DIFFERENT QUALITY TO MATHEMATICS AND FINISH IN ART IS ADDING MORE FACT",
+        "transcript": "Painting he tells us is of a different quality to mathematics and finish in art is adding more fact.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 19,
+          "wer": 0.0
+        },
+        "input_sha256": "84998a43cb534e09801f5522b9ed0aa58e88035c9727bc8e4d362a7bc158d0b6",
+        "elapsed_seconds": 0.4726820989744738,
+        "transport": "original",
+        "reference_transport_sha256": "84998a43cb534e09801f5522b9ed0aa58e88035c9727bc8e4d362a7bc158d0b6"
+      },
+      {
+        "id": "1272-128104-0008",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "AS FOR ETCHINGS THEY ARE OF TWO KINDS BRITISH AND FOREIGN",
+        "transcript": "As for etchings, there are of two kinds, British and foreign.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 11,
+          "wer": 0.09090909090909091
+        },
+        "input_sha256": "08a3f099d544fac5df1b6105bfd4952d911995f271b494c9a689c083c39ab855",
+        "elapsed_seconds": 0.36210735491476953,
+        "transport": "original",
+        "reference_transport_sha256": "08a3f099d544fac5df1b6105bfd4952d911995f271b494c9a689c083c39ab855"
+      },
+      {
+        "id": "1272-128104-0009",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HE LAMENTS MOST BITTERLY THE DIVORCE THAT HAS BEEN MADE BETWEEN DECORATIVE ART AND WHAT WE USUALLY CALL PICTURES MAKES THE CUSTOMARY APPEAL TO THE LAST JUDGMENT AND REMINDS US THAT IN THE GREAT DAYS OF ART MICHAEL ANGELO WAS THE FURNISHING UPHOLSTERER",
+        "transcript": "He laments most bitterly the divorce that has been made between decorative art and what we usually call pictures, makes the customary appeal to the last judgment and reminds us that in the great days of art Michelangelo was the furnishing upholsterer.",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 43,
+          "wer": 0.046511627906976744
+        },
+        "input_sha256": "2bfbcdfab6024ccd3bfeb4e883cc7f9cc613235e504bfc068fd34069056513b7",
+        "elapsed_seconds": 0.9664002119097859,
+        "transport": "original",
+        "reference_transport_sha256": "2bfbcdfab6024ccd3bfeb4e883cc7f9cc613235e504bfc068fd34069056513b7"
+      },
+      {
+        "id": "1272-128104-0010",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "NEAR THE FIRE AND THE ORNAMENTS FRED BROUGHT HOME FROM INDIA ON THE MANTEL BOARD",
+        "transcript": "Near the fire and the ornaments Fred brought home from India on the mantelboard.",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 15,
+          "wer": 0.13333333333333333
+        },
+        "input_sha256": "2ebbcaa44f14c15fd8afd0e4a71cae494377d30812a0ba05d6be07c55d00bbea",
+        "elapsed_seconds": 0.3891827369807288,
+        "transport": "original",
+        "reference_transport_sha256": "2ebbcaa44f14c15fd8afd0e4a71cae494377d30812a0ba05d6be07c55d00bbea"
+      },
+      {
+        "id": "1272-128104-0011",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "IN FACT HE IS QUITE SEVERE ON MISTER RUSKIN FOR NOT RECOGNISING THAT A PICTURE SHOULD DENOTE THE FRAILTY OF MAN AND REMARKS WITH PLEASING COURTESY AND FELICITOUS GRACE THAT MANY PHASES OF FEELING",
+        "transcript": "In fact, he is quite severe on Mr. Ruskin for not recognizing that a picture should denote the frailty of man and remarks with pleasing courtesy and philosophic grace that many phases of feeling",
+        "score": {
+          "errors": 3,
+          "substitutions": 3,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 34,
+          "wer": 0.08823529411764706
+        },
+        "input_sha256": "d481b97c34ef7c5087dcd53f93d311e050834ba5e4b0f9165f6a8e9e8c7fb245",
+        "elapsed_seconds": 0.792650648043491,
+        "transport": "original",
+        "reference_transport_sha256": "d481b97c34ef7c5087dcd53f93d311e050834ba5e4b0f9165f6a8e9e8c7fb245"
+      },
+      {
+        "id": "1272-128104-0012",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "ONLY UNFORTUNATELY HIS OWN WORK NEVER DOES GET GOOD",
+        "transcript": "Only unfortunately his own work never does get good.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "222cd90cd9edf086096fb0abba901b772f8ca4e763d5becb803b0a7f9b16ace9",
+        "elapsed_seconds": 0.297665984951891,
+        "transport": "original",
+        "reference_transport_sha256": "222cd90cd9edf086096fb0abba901b772f8ca4e763d5becb803b0a7f9b16ace9"
+      },
+      {
+        "id": "1272-128104-0013",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "MISTER QUILTER HAS MISSED HIS CHANCE FOR HE HAS FAILED EVEN TO MAKE HIMSELF THE TUPPER OF PAINTING",
+        "transcript": "Mr. Quilter has missed his chance for his failed even to make himself the tupper of painting.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.16666666666666666
+        },
+        "input_sha256": "4e090445122aee10fe3045cf79fb234f5059e6b911c0ffcbedb91e04c20473ae",
+        "elapsed_seconds": 0.4620391280623153,
+        "transport": "original",
+        "reference_transport_sha256": "4e090445122aee10fe3045cf79fb234f5059e6b911c0ffcbedb91e04c20473ae"
+      },
+      {
+        "id": "1272-128104-0014",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "BY HARRY QUILTER M A",
+        "transcript": "by Harry Quilter, M.A.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.0
+        },
+        "input_sha256": "5e7e3b96d975c74c952209a4d3a0731ec57019689685e1cf5f3c73a76f6f8a36",
+        "elapsed_seconds": 0.25543903396464884,
+        "transport": "original",
+        "reference_transport_sha256": "5e7e3b96d975c74c952209a4d3a0731ec57019689685e1cf5f3c73a76f6f8a36"
+      },
+      {
+        "id": "1272-135031-0000",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "BECAUSE YOU WERE SLEEPING INSTEAD OF CONQUERING THE LOVELY ROSE PRINCESS HAS BECOME A FIDDLE WITHOUT A BOW WHILE POOR SHAGGY SITS THERE A COOING DOVE",
+        "transcript": "Because you were sleeping in some conquering, the lovely rose princess has become a fiddle without a bow, or poor shaggy sits there a cooing dove.",
+        "score": {
+          "errors": 3,
+          "substitutions": 3,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 26,
+          "wer": 0.11538461538461539
+        },
+        "input_sha256": "26cbebbdd8954104c936dc38fbb8a80958f2169ada0fa6fe46a89cfa9e3d824c",
+        "elapsed_seconds": 0.6511665949365124,
+        "transport": "original",
+        "reference_transport_sha256": "26cbebbdd8954104c936dc38fbb8a80958f2169ada0fa6fe46a89cfa9e3d824c"
+      },
+      {
+        "id": "1272-135031-0001",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HE HAS GONE AND GONE FOR GOOD ANSWERED POLYCHROME WHO HAD MANAGED TO SQUEEZE INTO THE ROOM BESIDE THE DRAGON AND HAD WITNESSED THE OCCURRENCES WITH MUCH INTEREST",
+        "transcript": "He has gone, and gone for good, answered Polychrome, who had managed to squeeze into the room beside the dragon and had witnessed the occurrences with much interest.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 28,
+          "wer": 0.0
+        },
+        "input_sha256": "7565c448f1e4cab4eebce19116ad20b22b24a5c38a82a2f98ae19bb068a3aecb",
+        "elapsed_seconds": 0.7061954810051247,
+        "transport": "original",
+        "reference_transport_sha256": "7565c448f1e4cab4eebce19116ad20b22b24a5c38a82a2f98ae19bb068a3aecb"
+      },
+      {
+        "id": "1272-135031-0002",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "I HAVE REMAINED A PRISONER ONLY BECAUSE I WISHED TO BE ONE AND WITH THIS HE STEPPED FORWARD AND BURST THE STOUT CHAINS AS EASILY AS IF THEY HAD BEEN THREADS",
+        "transcript": "I have remained the prisoner only because I wished to be one and with this he stepped forward and burst the stout chains as easily as if they had been threads.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 31,
+          "wer": 0.03225806451612903
+        },
+        "input_sha256": "6fbbe1b5e143f2ac7baa9c62bbf3575d34ab79a79f9fcbaa0cac60c2e08e1703",
+        "elapsed_seconds": 0.6802302200812846,
+        "transport": "original",
+        "reference_transport_sha256": "6fbbe1b5e143f2ac7baa9c62bbf3575d34ab79a79f9fcbaa0cac60c2e08e1703"
+      },
+      {
+        "id": "1272-135031-0003",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THE LITTLE GIRL HAD BEEN ASLEEP BUT SHE HEARD THE RAPS AND OPENED THE DOOR",
+        "transcript": "The little girl had been asleep, but she heard the raps and opened the door.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 15,
+          "wer": 0.0
+        },
+        "input_sha256": "80f47603018506ec4a646b68d9f7716b132d8d5ee740dc503ed4f9122cd76243",
+        "elapsed_seconds": 0.4053419000701979,
+        "transport": "original",
+        "reference_transport_sha256": "80f47603018506ec4a646b68d9f7716b132d8d5ee740dc503ed4f9122cd76243"
+      },
+      {
+        "id": "1272-135031-0004",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THE KING HAS FLED IN DISGRACE AND YOUR FRIENDS ARE ASKING FOR YOU",
+        "transcript": "The king is flooded with disgrace and your friends are asking for you.",
+        "score": {
+          "errors": 3,
+          "substitutions": 3,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.23076923076923078
+        },
+        "input_sha256": "919d80690bed932be273b0e6e3512b18a6166ed974400ca7e03903760ef24420",
+        "elapsed_seconds": 0.3301771889673546,
+        "transport": "original",
+        "reference_transport_sha256": "919d80690bed932be273b0e6e3512b18a6166ed974400ca7e03903760ef24420"
+      },
+      {
+        "id": "1272-135031-0005",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "I BEGGED RUGGEDO LONG AGO TO SEND HIM AWAY BUT HE WOULD NOT DO SO",
+        "transcript": "I begged Ruggedo long ago to send him away, but he would not do so.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 15,
+          "wer": 0.0
+        },
+        "input_sha256": "d3da297f1f6a0f933ce6d778b8dc8fecff4cc7c21616dbd536146e76ebb98fbe",
+        "elapsed_seconds": 0.4106355640105903,
+        "transport": "original",
+        "reference_transport_sha256": "d3da297f1f6a0f933ce6d778b8dc8fecff4cc7c21616dbd536146e76ebb98fbe"
+      },
+      {
+        "id": "1272-135031-0006",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "I ALSO OFFERED TO HELP YOUR BROTHER TO ESCAPE BUT HE WOULD NOT GO",
+        "transcript": "I also offered to help your brother to escape, but he would not go.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 14,
+          "wer": 0.0
+        },
+        "input_sha256": "65ae3678b861333fb9ba2e5d7db9a0f77fe58ad89d4480872eeb62d22e894dd3",
+        "elapsed_seconds": 0.3648170200176537,
+        "transport": "original",
+        "reference_transport_sha256": "65ae3678b861333fb9ba2e5d7db9a0f77fe58ad89d4480872eeb62d22e894dd3"
+      },
+      {
+        "id": "1272-135031-0007",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HE EATS AND SLEEPS VERY STEADILY REPLIED THE NEW KING",
+        "transcript": "He eats and sleeps very steadily, replied the new king.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.0
+        },
+        "input_sha256": "1d1b4106711196bcf15091b2df60096dfa234132df32f5d7a57ef4931dfc5d83",
+        "elapsed_seconds": 0.2990983120398596,
+        "transport": "original",
+        "reference_transport_sha256": "1d1b4106711196bcf15091b2df60096dfa234132df32f5d7a57ef4931dfc5d83"
+      },
+      {
+        "id": "1272-135031-0008",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "I HOPE HE DOESN'T WORK TOO HARD SAID SHAGGY",
+        "transcript": "I hope he doesn't work too hard, said Shaggy.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "bc3c6a74fccbe7a7c86f9f59ed4589d8be65dc84d00a3d413b58d4722a341570",
+        "elapsed_seconds": 0.32935421797446907,
+        "transport": "original",
+        "reference_transport_sha256": "bc3c6a74fccbe7a7c86f9f59ed4589d8be65dc84d00a3d413b58d4722a341570"
+      },
+      {
+        "id": "1272-135031-0009",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HE DOESN'T WORK AT ALL",
+        "transcript": "He doesn't work at all.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.0
+        },
+        "input_sha256": "d23fc0e9c9ccb35f6ec9223954c921e1c9daa0cc9d8e8ad10b3b9cb4b14b6617",
+        "elapsed_seconds": 0.2247668270720169,
+        "transport": "original",
+        "reference_transport_sha256": "d23fc0e9c9ccb35f6ec9223954c921e1c9daa0cc9d8e8ad10b3b9cb4b14b6617"
+      },
+      {
+        "id": "1272-135031-0010",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "IN FACT THERE IS NOTHING HE CAN DO IN THESE DOMINIONS AS WELL AS OUR NOMES WHOSE NUMBERS ARE SO GREAT THAT IT WORRIES US TO KEEP THEM ALL BUSY",
+        "transcript": "In fact, there's nothing he can do in these dominions as well as our gnomes, whose numbers are so great that it worries us to keep them all busy.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 30,
+          "wer": 0.1
+        },
+        "input_sha256": "cec411cc16334eae88f793cf4cc0c2c6f83087c06b4e11a451c329a33b26b884",
+        "elapsed_seconds": 0.6910034980392084,
+        "transport": "original",
+        "reference_transport_sha256": "cec411cc16334eae88f793cf4cc0c2c6f83087c06b4e11a451c329a33b26b884"
+      },
+      {
+        "id": "1272-135031-0011",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "NOT EXACTLY RETURNED KALIKO",
+        "transcript": "Not exactly, we've turned calico.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 4,
+          "wer": 0.75
+        },
+        "input_sha256": "765c97d18eb1aa76ab4223359dd403ab8e606d9dc195c0b82f4b6b40b5b91a14",
+        "elapsed_seconds": 0.27207876997999847,
+        "transport": "original",
+        "reference_transport_sha256": "765c97d18eb1aa76ab4223359dd403ab8e606d9dc195c0b82f4b6b40b5b91a14"
+      },
+      {
+        "id": "1272-135031-0012",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "WHERE IS MY BROTHER NOW",
+        "transcript": "Where is my brother now?",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.0
+        },
+        "input_sha256": "2da8a3d5a915be58a29cae9520c94e96395619f1dd3a0968486c9d5154b77b12",
+        "elapsed_seconds": 0.1958221299573779,
+        "transport": "original",
+        "reference_transport_sha256": "2da8a3d5a915be58a29cae9520c94e96395619f1dd3a0968486c9d5154b77b12"
+      },
+      {
+        "id": "1272-135031-0013",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "INQUIRED SHAGGY IN THE METAL FOREST",
+        "transcript": "Inquired Shaggy in the Metal Forest.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 6,
+          "wer": 0.0
+        },
+        "input_sha256": "52e72bda6f458ffea420adc0044fd93392d16d3f0393f03c71888b773e9ad02c",
+        "elapsed_seconds": 0.24920238589402288,
+        "transport": "original",
+        "reference_transport_sha256": "52e72bda6f458ffea420adc0044fd93392d16d3f0393f03c71888b773e9ad02c"
+      },
+      {
+        "id": "1272-135031-0014",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "WHERE IS THAT",
+        "transcript": "Where is that?",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 3,
+          "wer": 0.0
+        },
+        "input_sha256": "659d4e11b195fa5e15dcb1fa860d703cbb9e1a57fa307d4ac6a6093435cf49cb",
+        "elapsed_seconds": 0.16442749404814094,
+        "transport": "original",
+        "reference_transport_sha256": "659d4e11b195fa5e15dcb1fa860d703cbb9e1a57fa307d4ac6a6093435cf49cb"
+      },
+      {
+        "id": "1272-135031-0015",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THE METAL FOREST IS IN THE GREAT DOMED CAVERN THE LARGEST IN ALL OUR DOMINIONS REPLIED KALIKO",
+        "transcript": "The Middle Forest is in the Great Domed Cavern, the largest in all our dominions, replied Calico.",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 17,
+          "wer": 0.11764705882352941
+        },
+        "input_sha256": "95eb0d408f2f4275bd44995e2202b1b1377ac00538662d5cae509de32e9d353f",
+        "elapsed_seconds": 0.4764373899670318,
+        "transport": "original",
+        "reference_transport_sha256": "95eb0d408f2f4275bd44995e2202b1b1377ac00538662d5cae509de32e9d353f"
+      },
+      {
+        "id": "1272-135031-0016",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "KALIKO HESITATED",
+        "transcript": "Kallgo hesitated.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 2,
+          "wer": 0.5
+        },
+        "input_sha256": "e4ef839a12f5e01279f449fbec8decd9917a2a01516a8a67635c4cde526caee5",
+        "elapsed_seconds": 0.18871462205424905,
+        "transport": "original",
+        "reference_transport_sha256": "e4ef839a12f5e01279f449fbec8decd9917a2a01516a8a67635c4cde526caee5"
+      },
+      {
+        "id": "1272-135031-0017",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HOWEVER IF WE LOOK SHARP WE MAY BE ABLE TO DISCOVER ONE OF THESE SECRET WAYS",
+        "transcript": "However, if we look sharp, we may be able to discover one of these secret ways.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 16,
+          "wer": 0.0
+        },
+        "input_sha256": "18bf640efb70a8735f674c4289ab2cc9ee42a529e097dca376d0f69a3907e56f",
+        "elapsed_seconds": 0.41813423694111407,
+        "transport": "original",
+        "reference_transport_sha256": "18bf640efb70a8735f674c4289ab2cc9ee42a529e097dca376d0f69a3907e56f"
+      },
+      {
+        "id": "1272-135031-0018",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "OH NO I'M QUITE SURE HE DIDN'T",
+        "transcript": "Oh no, I'm quite sure he didn't.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 7,
+          "wer": 0.0
+        },
+        "input_sha256": "db055fdf17b99b4e68f2e2bdbd01a5a8388321df44e0fcb1600e6b4387466fc3",
+        "elapsed_seconds": 0.3096325990045443,
+        "transport": "original",
+        "reference_transport_sha256": "db055fdf17b99b4e68f2e2bdbd01a5a8388321df44e0fcb1600e6b4387466fc3"
+      },
+      {
+        "id": "1272-135031-0019",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THAT'S FUNNY REMARKED BETSY THOUGHTFULLY",
+        "transcript": "That's funny, remarked Betsy thoughtfully.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 5,
+          "wer": 0.0
+        },
+        "input_sha256": "c19e0c3de6100627ffbca103dc5d8502dc6d74a3e1f06e00d5e6dc6ffbb25d94",
+        "elapsed_seconds": 0.2511409829603508,
+        "transport": "original",
+        "reference_transport_sha256": "c19e0c3de6100627ffbca103dc5d8502dc6d74a3e1f06e00d5e6dc6ffbb25d94"
+      },
+      {
+        "id": "1272-135031-0020",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "I DON'T BELIEVE ANN KNEW ANY MAGIC OR SHE'D HAVE WORKED IT BEFORE",
+        "transcript": "I don't believe Anne Newny magic or she diverted it before.",
+        "score": {
+          "errors": 6,
+          "substitutions": 4,
+          "deletions": 2,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.46153846153846156
+        },
+        "input_sha256": "293af6add35a8f87e03f4ec59ef6e23538293c6fc8be45346dd17f6a69cc7f1f",
+        "elapsed_seconds": 0.35027034289669245,
+        "transport": "original",
+        "reference_transport_sha256": "293af6add35a8f87e03f4ec59ef6e23538293c6fc8be45346dd17f6a69cc7f1f"
+      },
+      {
+        "id": "1272-135031-0021",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "I DO NOT KNOW CONFESSED SHAGGY",
+        "transcript": "I do not know confess shaggy",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 6,
+          "wer": 0.16666666666666666
+        },
+        "input_sha256": "cce5a7959d35cd34310e6868853d7d755b5aa13caa9579ddbaf0e5b28ffd29fd",
+        "elapsed_seconds": 0.21903982397634536,
+        "transport": "original",
+        "reference_transport_sha256": "cce5a7959d35cd34310e6868853d7d755b5aa13caa9579ddbaf0e5b28ffd29fd"
+      },
+      {
+        "id": "1272-135031-0022",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "TRUE AGREED KALIKO",
+        "transcript": "True, agreed calico.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 3,
+          "wer": 0.3333333333333333
+        },
+        "input_sha256": "0d3573eac7e74ab8c05a5743b050bd6bda2e6f73629bc7ec338394206a29e7f2",
+        "elapsed_seconds": 0.19899980607442558,
+        "transport": "original",
+        "reference_transport_sha256": "0d3573eac7e74ab8c05a5743b050bd6bda2e6f73629bc7ec338394206a29e7f2"
+      },
+      {
+        "id": "1272-135031-0023",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "KALIKO WENT TO THE BIG GONG AND POUNDED ON IT JUST AS RUGGEDO USED TO DO BUT NO ONE ANSWERED THE SUMMONS",
+        "transcript": "Calico went to the big gong and pounded on it just as Regor used to do, but no one answered the summons.",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 22,
+          "wer": 0.09090909090909091
+        },
+        "input_sha256": "9d37ebdf780a28eaeebaada1f12bc2b2a2fca2278c09a2652f5e5b7e9420aa04",
+        "elapsed_seconds": 0.5315919879358262,
+        "transport": "original",
+        "reference_transport_sha256": "9d37ebdf780a28eaeebaada1f12bc2b2a2fca2278c09a2652f5e5b7e9420aa04"
+      },
+      {
+        "id": "1272-135031-0024",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HAVING RETURNED TO THE ROYAL CAVERN KALIKO FIRST POUNDED THE GONG AND THEN SAT IN THE THRONE WEARING RUGGEDO'S DISCARDED RUBY CROWN AND HOLDING IN HIS HAND THE SCEPTRE WHICH RUGGEDO HAD SO OFTEN THROWN AT HIS HEAD",
+        "transcript": "Having returned to the Royal Cavern, Calico first pounded the gong and then sat in the throne, wearing Rugato's discarded ruby crown and holding in his hand the scepter which Rugato had so often thrown as his head.",
+        "score": {
+          "errors": 5,
+          "substitutions": 5,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 38,
+          "wer": 0.13157894736842105
+        },
+        "input_sha256": "f1359484fb8e3647248cc1f6fd978d331f83fbfe20e173e287110c087c45d967",
+        "elapsed_seconds": 0.936129446956329,
+        "transport": "original",
+        "reference_transport_sha256": "f1359484fb8e3647248cc1f6fd978d331f83fbfe20e173e287110c087c45d967"
+      },
+      {
+        "id": "1272-141231-0000",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "A MAN SAID TO THE UNIVERSE SIR I EXIST",
+        "transcript": "A man said to the universe, \"Sir, I exist.\"",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "adb240047a1e0732c96b029b7dbd7c81a17c853cbd30aec0ee0d9c4e59fe720a",
+        "elapsed_seconds": 0.32870380696840584,
+        "transport": "original",
+        "reference_transport_sha256": "adb240047a1e0732c96b029b7dbd7c81a17c853cbd30aec0ee0d9c4e59fe720a"
+      },
+      {
+        "id": "1272-141231-0001",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "SWEAT COVERED BRION'S BODY TRICKLING INTO THE TIGHT LOINCLOTH THAT WAS THE ONLY GARMENT HE WORE",
+        "transcript": "Sweat-covered Brian's body trickling into the tight-lying cloth that was the only garment he wore.",
+        "score": {
+          "errors": 3,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 16,
+          "wer": 0.1875
+        },
+        "input_sha256": "5ec33d1ae2a06430ddd4faa6090673f7dbb09f71405ce401a08301eedb313275",
+        "elapsed_seconds": 0.49073869292624295,
+        "transport": "original",
+        "reference_transport_sha256": "5ec33d1ae2a06430ddd4faa6090673f7dbb09f71405ce401a08301eedb313275"
+      },
+      {
+        "id": "1272-141231-0002",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THE CUT ON HIS CHEST STILL DRIPPING BLOOD THE ACHE OF HIS OVERSTRAINED EYES EVEN THE SOARING ARENA AROUND HIM WITH THE THOUSANDS OF SPECTATORS WERE TRIVIALITIES NOT WORTH THINKING ABOUT",
+        "transcript": "The cut on his chest still dripping blood, the ache of his overstrained eyes, even the soaring arena around him with thousands of spectators were trivialities not worth thinking about.",
+        "score": {
+          "errors": 1,
+          "substitutions": 0,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 31,
+          "wer": 0.03225806451612903
+        },
+        "input_sha256": "9a490059a63cd2f92fbc8c447135ed87f97ed36ee53714987b01c8ac7c33dec4",
+        "elapsed_seconds": 0.7412921759532765,
+        "transport": "original",
+        "reference_transport_sha256": "9a490059a63cd2f92fbc8c447135ed87f97ed36ee53714987b01c8ac7c33dec4"
+      },
+      {
+        "id": "1272-141231-0003",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HIS INSTANT OF PANIC WAS FOLLOWED BY A SMALL SHARP BLOW HIGH ON HIS CHEST",
+        "transcript": "His instant panic was followed by a small sharp blow high on his chest.",
+        "score": {
+          "errors": 1,
+          "substitutions": 0,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 15,
+          "wer": 0.06666666666666667
+        },
+        "input_sha256": "da658227a61fdfefa7a54ad9bb4614a7da33e335358e5b3620ddcf7c93c3e77f",
+        "elapsed_seconds": 0.36600131692830473,
+        "transport": "original",
+        "reference_transport_sha256": "da658227a61fdfefa7a54ad9bb4614a7da33e335358e5b3620ddcf7c93c3e77f"
+      },
+      {
+        "id": "1272-141231-0004",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "ONE MINUTE A VOICE SAID AND THE TIME BUZZER SOUNDED",
+        "transcript": "One minute a voice said and a time buzzer sounded",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.1
+        },
+        "input_sha256": "34c4339d921ca363faa292996ea12864c9bbdb5a69fa40178e41629f069a36e0",
+        "elapsed_seconds": 0.27335895597934723,
+        "transport": "original",
+        "reference_transport_sha256": "34c4339d921ca363faa292996ea12864c9bbdb5a69fa40178e41629f069a36e0"
+      },
+      {
+        "id": "1272-141231-0005",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "A MINUTE IS NOT A VERY LARGE MEASURE OF TIME AND HIS BODY NEEDED EVERY FRACTION OF IT",
+        "transcript": "A minute is not a very large measure of time and his body needed every fraction of it.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.0
+        },
+        "input_sha256": "65265556f1956c0f20f5234b6aa2166dfdcde396ffc3cd1287d9e9e64489afbb",
+        "elapsed_seconds": 0.4186792419059202,
+        "transport": "original",
+        "reference_transport_sha256": "65265556f1956c0f20f5234b6aa2166dfdcde396ffc3cd1287d9e9e64489afbb"
+      },
+      {
+        "id": "1272-141231-0006",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THE BUZZER'S WHIRR TRIGGERED HIS MUSCLES INTO COMPLETE RELAXATION",
+        "transcript": "The buzzers were triggered his muscles into complete relaxation.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.1111111111111111
+        },
+        "input_sha256": "c3e32102b9faeb6dc3ec5203440d4e2a365cc0ea44fa6aeaefe5e3668a9a8585",
+        "elapsed_seconds": 0.29213107691612095,
+        "transport": "original",
+        "reference_transport_sha256": "c3e32102b9faeb6dc3ec5203440d4e2a365cc0ea44fa6aeaefe5e3668a9a8585"
+      },
+      {
+        "id": "1272-141231-0007",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "ONLY HIS HEART AND LUNGS WORKED ON AT A STRONG MEASURED RATE",
+        "transcript": "Only his heart and lungs worked on at a strong measured rate.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.0
+        },
+        "input_sha256": "1cc95ce7c6be4352b94c10d77a4b0475ccc5ad543b0d3a5f791459963ce4efb1",
+        "elapsed_seconds": 0.3195343930274248,
+        "transport": "original",
+        "reference_transport_sha256": "1cc95ce7c6be4352b94c10d77a4b0475ccc5ad543b0d3a5f791459963ce4efb1"
+      },
+      {
+        "id": "1272-141231-0008",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HE WAS IN REVERIE SLIDING ALONG THE BORDERS OF CONSCIOUSNESS",
+        "transcript": "He was in reverie, sliding along the borders of consciousness.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.0
+        },
+        "input_sha256": "1d5eb4bf16f57e21ac034f012f37c9b97a61f8e2552a441352b9d0eab58c48e7",
+        "elapsed_seconds": 0.32122022297699004,
+        "transport": "original",
+        "reference_transport_sha256": "1d5eb4bf16f57e21ac034f012f37c9b97a61f8e2552a441352b9d0eab58c48e7"
+      },
+      {
+        "id": "1272-141231-0009",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THE CONTESTANTS IN THE TWENTIES NEEDED UNDISTURBED REST THEREFORE NIGHTS IN THE DORMITORIES WERE AS QUIET AS DEATH",
+        "transcript": "The contestants in the twenties needed undisturbed rest, therefore nights in the dormitories were as quiet as death.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.0
+        },
+        "input_sha256": "42cf54411f05e2cd4397d9e7cbfb566c204954e1d6dc3f892b57499433c8e7fd",
+        "elapsed_seconds": 0.47369225800503045,
+        "transport": "original",
+        "reference_transport_sha256": "42cf54411f05e2cd4397d9e7cbfb566c204954e1d6dc3f892b57499433c8e7fd"
+      },
+      {
+        "id": "1272-141231-0010",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "PARTICULARLY SO ON THIS LAST NIGHT WHEN ONLY TWO OF THE LITTLE CUBICLES WERE OCCUPIED THE THOUSANDS OF OTHERS STANDING WITH DARK EMPTY DOORS",
+        "transcript": "particularly so on its last night when only two of the little cubicles were occupied the thousands of others standing with dark empty doors",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 24,
+          "wer": 0.041666666666666664
+        },
+        "input_sha256": "b0316adbccaff2af04f6d397c03905f157a6b2418a9b54e88a16d5859b000211",
+        "elapsed_seconds": 0.5563547789352015,
+        "transport": "original",
+        "reference_transport_sha256": "b0316adbccaff2af04f6d397c03905f157a6b2418a9b54e88a16d5859b000211"
+      },
+      {
+        "id": "1272-141231-0011",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THE OTHER VOICE SNAPPED WITH A HARSH URGENCY CLEARLY USED TO COMMAND",
+        "transcript": "The other voice snapped with a harsh urgency, clearly used to command.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.0
+        },
+        "input_sha256": "49975adce742d343d7755ad7e52f75f93bf28ee6f9f038b4dab9a217336b78f7",
+        "elapsed_seconds": 0.34188689396250993,
+        "transport": "original",
+        "reference_transport_sha256": "49975adce742d343d7755ad7e52f75f93bf28ee6f9f038b4dab9a217336b78f7"
+      },
+      {
+        "id": "1272-141231-0012",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "I'M HERE BECAUSE THE MATTER IS OF UTMOST IMPORTANCE AND BRANDD IS THE ONE I MUST SEE NOW STAND ASIDE",
+        "transcript": "I'm here because the matter is of utmost importance and Brand is the one I must see. Now stand aside.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 20,
+          "wer": 0.05
+        },
+        "input_sha256": "3559a8ddb75104a20769c00b17226fb86de0e4329bfca313833eb83c0561efef",
+        "elapsed_seconds": 0.5012476199772209,
+        "transport": "original",
+        "reference_transport_sha256": "3559a8ddb75104a20769c00b17226fb86de0e4329bfca313833eb83c0561efef"
+      },
+      {
+        "id": "1272-141231-0013",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THE TWENTIES",
+        "transcript": "to the 20s",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 2,
+          "wer": 1.0
+        },
+        "input_sha256": "ff87e7b407cf5355d492e618dbc87e9800a688ccb950ab1ac693d64a1bcfb80f",
+        "elapsed_seconds": 0.19902175897732377,
+        "transport": "original",
+        "reference_transport_sha256": "ff87e7b407cf5355d492e618dbc87e9800a688ccb950ab1ac693d64a1bcfb80f"
+      },
+      {
+        "id": "1272-141231-0014",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HE MUST HAVE DRAWN HIS GUN BECAUSE THE INTRUDER SAID QUICKLY PUT THAT AWAY YOU'RE BEING A FOOL OUT",
+        "transcript": "You must have drawn his gun because the intruder said quickly, \"Put that away, you're being a fool.\"",
+        "score": {
+          "errors": 2,
+          "substitutions": 1,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 19,
+          "wer": 0.10526315789473684
+        },
+        "input_sha256": "9a2410edf224fc38005243625b49e18fba5b297867171177906f9ed1f808b714",
+        "elapsed_seconds": 0.49817087198607624,
+        "transport": "original",
+        "reference_transport_sha256": "9a2410edf224fc38005243625b49e18fba5b297867171177906f9ed1f808b714"
+      },
+      {
+        "id": "1272-141231-0015",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THERE WAS SILENCE THEN AND STILL WONDERING BRION WAS ONCE MORE ASLEEP",
+        "transcript": "There is silence then and still wondering Brian was once more asleep.",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 12,
+          "wer": 0.16666666666666666
+        },
+        "input_sha256": "24727264f148b3bbe587338e1456281298e6cbd7a29eff07ab06ea096cbdd174",
+        "elapsed_seconds": 0.3280705639626831,
+        "transport": "original",
+        "reference_transport_sha256": "24727264f148b3bbe587338e1456281298e6cbd7a29eff07ab06ea096cbdd174"
+      },
+      {
+        "id": "1272-141231-0016",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "TEN SECONDS",
+        "transcript": "Ten seconds.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 2,
+          "wer": 0.0
+        },
+        "input_sha256": "2de6e800e9a973de275a2c57ef2a8ccf0e25655f0158a0a551bdc0e944607ebc",
+        "elapsed_seconds": 0.15398640907369554,
+        "transport": "original",
+        "reference_transport_sha256": "2de6e800e9a973de275a2c57ef2a8ccf0e25655f0158a0a551bdc0e944607ebc"
+      },
+      {
+        "id": "1272-141231-0017",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HE ASKED THE HANDLER WHO WAS KNEADING HIS ACHING MUSCLES",
+        "transcript": "He asked the handler who was kneading his aching muscles.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.0
+        },
+        "input_sha256": "54aac47c491c01ca59b3be862b9f53cf4fd93862e1363b02471d910f76e3b4ac",
+        "elapsed_seconds": 0.27879941707942635,
+        "transport": "original",
+        "reference_transport_sha256": "54aac47c491c01ca59b3be862b9f53cf4fd93862e1363b02471d910f76e3b4ac"
+      },
+      {
+        "id": "1272-141231-0018",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "A RED HAIRED MOUNTAIN OF A MAN WITH AN APPARENTLY INEXHAUSTIBLE STORE OF ENERGY",
+        "transcript": "A red-haired mountain of a man was an apparently inexhaustible store of energy.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 14,
+          "wer": 0.07142857142857142
+        },
+        "input_sha256": "dcc9cc41630ec440e639cf8349899f6e76000d728659ca42ef7ac0ef003ca201",
+        "elapsed_seconds": 0.4000066090375185,
+        "transport": "original",
+        "reference_transport_sha256": "dcc9cc41630ec440e639cf8349899f6e76000d728659ca42ef7ac0ef003ca201"
+      },
+      {
+        "id": "1272-141231-0019",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THERE COULD BE LITTLE ART IN THIS LAST AND FINAL ROUND OF FENCING",
+        "transcript": "There could be little art in this last and final round of fencing.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.0
+        },
+        "input_sha256": "42735cf9485cd4c93d766d01cddebabed5a21f49e26a9c6dd15f8e5db2f6b5a6",
+        "elapsed_seconds": 0.33569658000487834,
+        "transport": "original",
+        "reference_transport_sha256": "42735cf9485cd4c93d766d01cddebabed5a21f49e26a9c6dd15f8e5db2f6b5a6"
+      },
+      {
+        "id": "1272-141231-0020",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "JUST THRUST AND PARRY AND VICTORY TO THE STRONGER",
+        "transcript": "Just thrust and parry and victory to the stronger.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "3998b463548c90f6686faf96432cc237c96f0bd784d8124a1a3c851fd4451acf",
+        "elapsed_seconds": 0.286199914989993,
+        "transport": "original",
+        "reference_transport_sha256": "3998b463548c90f6686faf96432cc237c96f0bd784d8124a1a3c851fd4451acf"
+      },
+      {
+        "id": "1272-141231-0021",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "EVERY MAN WHO ENTERED THE TWENTIES HAD HIS OWN TRAINING TRICKS",
+        "transcript": "Every man who entered the twenties had his own training tricks.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 11,
+          "wer": 0.0
+        },
+        "input_sha256": "f40d906923ec180a258635ec7bf5bfdaeac2c1ee3bef24c32ef6361b420d6ea8",
+        "elapsed_seconds": 0.30461162398569286,
+        "transport": "original",
+        "reference_transport_sha256": "f40d906923ec180a258635ec7bf5bfdaeac2c1ee3bef24c32ef6361b420d6ea8"
+      },
+      {
+        "id": "1272-141231-0022",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THERE APPEARED TO BE AN IMMEDIATE ASSOCIATION WITH THE DEATH TRAUMA AS IF THE TWO WERE INEXTRICABLY LINKED INTO ONE",
+        "transcript": "There appeared to be an immediate association with the death trauma as if the two were inextricably linked into one.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 20,
+          "wer": 0.0
+        },
+        "input_sha256": "6fca2f211411ffd83f84ccfe38ac1434a83ba02497c68cd1819cb63da57fb3a4",
+        "elapsed_seconds": 0.46500716102309525,
+        "transport": "original",
+        "reference_transport_sha256": "6fca2f211411ffd83f84ccfe38ac1434a83ba02497c68cd1819cb63da57fb3a4"
+      },
+      {
+        "id": "1272-141231-0023",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THE STRENGTH THAT ENABLES SOMEONE IN A TRANCE TO HOLD HIS BODY STIFF AND UNSUPPORTED EXCEPT AT TWO POINTS THE HEAD AND HEELS",
+        "transcript": "To strengthen and enable someone in a trance to hold his body stiff and unsupported except at two points the head and heels.",
+        "score": {
+          "errors": 4,
+          "substitutions": 4,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 23,
+          "wer": 0.17391304347826086
+        },
+        "input_sha256": "e4eee59ba1119187a240da9e67bc4f60af77b023b2aac7b33ffe2a6258e8a7f8",
+        "elapsed_seconds": 0.5211078329011798,
+        "transport": "original",
+        "reference_transport_sha256": "e4eee59ba1119187a240da9e67bc4f60af77b023b2aac7b33ffe2a6258e8a7f8"
+      },
+      {
+        "id": "1272-141231-0024",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THIS IS PHYSICALLY IMPOSSIBLE WHEN CONSCIOUS",
+        "transcript": "This is physically impossible when conscious.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 6,
+          "wer": 0.0
+        },
+        "input_sha256": "84bd6220942701e8973dc0e8a2c8a7ac5f794a15d1a884994e95c5e3b8efa96e",
+        "elapsed_seconds": 0.22660326503682882,
+        "transport": "original",
+        "reference_transport_sha256": "84bd6220942701e8973dc0e8a2c8a7ac5f794a15d1a884994e95c5e3b8efa96e"
+      },
+      {
+        "id": "1272-141231-0025",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "OTHERS HAD DIED BEFORE DURING THE TWENTIES AND DEATH DURING THE LAST ROUND WAS IN SOME WAYS EASIER THAN DEFEAT",
+        "transcript": "Others had died before during the twenties and death during the last round was in some ways easier than defeat.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 20,
+          "wer": 0.0
+        },
+        "input_sha256": "b3819f4ebe697500f8fdb302dcf832e73e08c8d8e3abc69e04328f1cdce5dceb",
+        "elapsed_seconds": 0.4675438489066437,
+        "transport": "original",
+        "reference_transport_sha256": "b3819f4ebe697500f8fdb302dcf832e73e08c8d8e3abc69e04328f1cdce5dceb"
+      },
+      {
+        "id": "1272-141231-0026",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "BREATHING DEEPLY BRION SOFTLY SPOKE THE AUTO HYPNOTIC PHRASES THAT TRIGGERED THE PROCESS",
+        "transcript": "Breathing deeply, Brienne softly spoke the auto-hypnotic phrases that triggered the process.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.07692307692307693
+        },
+        "input_sha256": "78bbbfada3676e97548fe946e252cfffc5fba916542d2c6e39d5ecbb8be76710",
+        "elapsed_seconds": 0.4439709419384599,
+        "transport": "original",
+        "reference_transport_sha256": "78bbbfada3676e97548fe946e252cfffc5fba916542d2c6e39d5ecbb8be76710"
+      },
+      {
+        "id": "1272-141231-0027",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "WHEN THE BUZZER SOUNDED HE PULLED HIS FOIL FROM HIS SECOND'S STARTLED GRASP AND RAN FORWARD",
+        "transcript": "When the buzzer sounded, he pulled his foil from his second startled grasp and ran forward.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 16,
+          "wer": 0.0625
+        },
+        "input_sha256": "b676f024fec3c98d3e7783e5bf3846739b47807aa30c1ed0c9066e3988b2dfeb",
+        "elapsed_seconds": 0.40760566596873105,
+        "transport": "original",
+        "reference_transport_sha256": "b676f024fec3c98d3e7783e5bf3846739b47807aa30c1ed0c9066e3988b2dfeb"
+      },
+      {
+        "id": "1272-141231-0028",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "IROLG LOOKED AMAZED AT THE SUDDEN FURY OF THE ATTACK THEN SMILED",
+        "transcript": "I rolled my eyes at the sudden fury of the attack, then smiled.",
+        "score": {
+          "errors": 4,
+          "substitutions": 3,
+          "deletions": 0,
+          "insertions": 1,
+          "reference_words": 12,
+          "wer": 0.3333333333333333
+        },
+        "input_sha256": "a6833433f5c62c5ffae8a368811c507dde2401d3ff7e9669a492c150f6afe8d4",
+        "elapsed_seconds": 0.3593096958938986,
+        "transport": "original",
+        "reference_transport_sha256": "a6833433f5c62c5ffae8a368811c507dde2401d3ff7e9669a492c150f6afe8d4"
+      },
+      {
+        "id": "1272-141231-0029",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "HE THOUGHT IT WAS A LAST BURST OF ENERGY HE KNEW HOW CLOSE THEY BOTH WERE TO EXHAUSTION",
+        "transcript": "He thought it was the last burst of energy. He knew how close they both were to exhaustion.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.05555555555555555
+        },
+        "input_sha256": "8b76b5e12d811444604a97633f4cfeb6e4228273f734d3c14ee0f8aa9c8df860",
+        "elapsed_seconds": 0.4392298029270023,
+        "transport": "original",
+        "reference_transport_sha256": "8b76b5e12d811444604a97633f4cfeb6e4228273f734d3c14ee0f8aa9c8df860"
+      },
+      {
+        "id": "1272-141231-0030",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "BRION SAW SOMETHING CLOSE TO PANIC ON HIS OPPONENT'S FACE WHEN THE MAN FINALLY RECOGNIZED HIS ERROR",
+        "transcript": "Priyans saw something close to panic on his opponent's face when the man finally recognized his error.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 17,
+          "wer": 0.058823529411764705
+        },
+        "input_sha256": "f65aeae1485f33072d636c36ad06ae205627f59619b2113a0c91d91126afed3e",
+        "elapsed_seconds": 0.4742464160080999,
+        "transport": "original",
+        "reference_transport_sha256": "f65aeae1485f33072d636c36ad06ae205627f59619b2113a0c91d91126afed3e"
+      },
+      {
+        "id": "1272-141231-0031",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "A WAVE OF DESPAIR ROLLED OUT FROM IROLG BRION SENSED IT AND KNEW THE FIFTH POINT WAS HIS",
+        "transcript": "A wave of despair rolled out from Iroeg, Brian sensed it and knew the fifth point was his.",
+        "score": {
+          "errors": 2,
+          "substitutions": 2,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 18,
+          "wer": 0.1111111111111111
+        },
+        "input_sha256": "8b2218bd45e5df4d097c0f6a7ca9ac44e3b3f5add0a4d035d3da2f4e3f1e31c6",
+        "elapsed_seconds": 0.4758818770060316,
+        "transport": "original",
+        "reference_transport_sha256": "8b2218bd45e5df4d097c0f6a7ca9ac44e3b3f5add0a4d035d3da2f4e3f1e31c6"
+      },
+      {
+        "id": "1272-141231-0032",
+        "group": "corpus",
+        "mime": "audio/flac",
+        "reference": "THEN THE POWERFUL TWIST THAT THRUST IT ASIDE IN AND UNDER THE GUARD",
+        "transcript": "Then the powerful twist that thrust it aside in Under the Guard.",
+        "score": {
+          "errors": 1,
+          "substitutions": 0,
+          "deletions": 1,
+          "insertions": 0,
+          "reference_words": 13,
+          "wer": 0.07692307692307693
+        },
+        "input_sha256": "57a830871a87def230b541a41898aca9ef444b2ae420cdc776a4e6debf74d50c",
+        "elapsed_seconds": 0.32556726899929345,
+        "transport": "original",
+        "reference_transport_sha256": "57a830871a87def230b541a41898aca9ef444b2ae420cdc776a4e6debf74d50c"
+      },
+      {
+        "id": "1272-128104-0000-pcm-control",
+        "group": "diagnostic",
+        "mime": "audio/wav",
+        "reference": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+        "transcript": "Mr. Quilter is the apostle of the middle classes and we are glad to welcome his gospel.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 17,
+          "wer": 0.058823529411764705
+        },
+        "input_sha256": "799f78ed4beb4de7ceae3a809262d4ce242394342ccd1d58cef7d49dbc2def46",
+        "elapsed_seconds": 0.4359232800779864,
+        "transport": "original",
+        "reference_transport_sha256": "799f78ed4beb4de7ceae3a809262d4ce242394342ccd1d58cef7d49dbc2def46"
+      },
+      {
+        "id": "1272-128104-0001-pcm-control",
+        "group": "diagnostic",
+        "mime": "audio/wav",
+        "reference": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+        "transcript": "Nor is Mr. Quilter's manner less interesting than his matter.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 10,
+          "wer": 0.1
+        },
+        "input_sha256": "473b1bb573e8f7cdcd639c6e318036236190107b66bfe6892286121a92d464c1",
+        "elapsed_seconds": 0.35976969392504543,
+        "transport": "original",
+        "reference_transport_sha256": "473b1bb573e8f7cdcd639c6e318036236190107b66bfe6892286121a92d464c1"
+      },
+      {
+        "id": "english-wav",
+        "group": "regression",
+        "mime": "audio/wav",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d",
+        "elapsed_seconds": 0.2641375589882955,
+        "transport": "original",
+        "reference_transport_sha256": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d"
+      },
+      {
+        "id": "spanish-8khz-wav",
+        "group": "regression",
+        "mime": "audio/wav",
+        "reference": "Buenos días. Esta es una prueba de reconocimiento automático del idioma.",
+        "transcript": "Buenos días. Esta es una prueba de reconocimiento automático del habla.",
+        "score": {
+          "errors": 1,
+          "substitutions": 1,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 11,
+          "wer": 0.09090909090909091
+        },
+        "input_sha256": "c656aaeeb98a4239f9f0f6ab05eed6e76424b9b073caa0090ac6ac35d7312b35",
+        "elapsed_seconds": 0.3126249349443242,
+        "transport": "original",
+        "reference_transport_sha256": "c656aaeeb98a4239f9f0f6ab05eed6e76424b9b073caa0090ac6ac35d7312b35"
+      },
+      {
+        "id": "english-stereo-44100",
+        "group": "regression",
+        "mime": "audio/wav",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "5a9190665685ac2c8b2e8e6e04ba52948497be5ba10b09bb150bf8e4498c1a18",
+        "elapsed_seconds": 0.26936733291950077,
+        "transport": "original",
+        "reference_transport_sha256": "5a9190665685ac2c8b2e8e6e04ba52948497be5ba10b09bb150bf8e4498c1a18"
+      },
+      {
+        "id": "english-mp4-video",
+        "group": "regression",
+        "mime": "video/mp4",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "dd71c2208cdd46de655cb6e9750167e81aae32798b43d978d9b0a53d0e509513",
+        "elapsed_seconds": 0.25829098699614406,
+        "transport": "pcm-wav",
+        "reference_transport_sha256": "8b5b0b2ef5eaf27883ee4a414d2db2db0ec584fd9af7b3e87626ab619857b313"
+      },
+      {
+        "id": "english-webm-video",
+        "group": "regression",
+        "mime": "video/webm",
+        "reference": "The quick brown fox jumps over the lazy dog.",
+        "transcript": "The quick brown fox jumps over the lazy dog.",
+        "score": {
+          "errors": 0,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 0,
+          "reference_words": 9,
+          "wer": 0.0
+        },
+        "input_sha256": "9decbbb00e02684d561fc5f24b285a4d72aa475832936583eb2c5227076f6d38",
+        "elapsed_seconds": 0.25969592202454805,
+        "transport": "pcm-wav",
+        "reference_transport_sha256": "02ffcf402d96d83873b88ca4202fe0727e781e4f9da8154af2a54fcb940b45b9"
+      },
+      {
+        "id": "silence",
+        "group": "regression",
+        "mime": "audio/wav",
+        "reference": "",
+        "transcript": "The weather is nice today.",
+        "score": {
+          "errors": 5,
+          "substitutions": 0,
+          "deletions": 0,
+          "insertions": 5,
+          "reference_words": 0,
+          "wer": null
+        },
+        "input_sha256": "643f8a8dc8bd9c19225afffad2becfec5426180b3749cb208abdf1a6c8354efc",
+        "elapsed_seconds": 0.19401102291885763,
+        "transport": "original",
+        "reference_transport_sha256": "643f8a8dc8bd9c19225afffad2becfec5426180b3749cb208abdf1a6c8354efc"
+      }
+    ],
+    "reference_video_note": "Video regressions use explicitly hashed PyAV-decoded PCM controls because this reference setup has no external ffmpeg; these are not same-encoded-container comparisons."
+  },
+  "text_generation": {
+    "method": "Authoritative final SSE usage; decode=(completion_tokens-1)/(terminal_usage_time-first_visible_token_time). One warmup and five greedy 256-token completions, thinking disabled, no draft assistant. The 64-token post-fix smoke is excluded.",
+    "native_default_idle": {
+      "binary_sha256": "0d903c63b3a351bab53eb84b9f4ea285fbed4e5e8900cc873f273c5e0551c0d9",
+      "harness_sha256": "f8d6ff0fdf3bfa9edc7370f3af5c31bb8cc220aa07204e254525d0e7e5d348b9",
+      "gpu_before": {
+        "gpu": "NVIDIA GB10, 580.178.04, 0 %, 33, 5.06 W",
+        "processes": ""
+      },
+      "environment": {},
+      "warmups": 1,
+      "samples": 5,
+      "decode_tokens_per_second": 25.65913273515911,
+      "decode_range": [
+        25.583075468270504,
+        25.67449159845767
+      ],
+      "end_to_end_tokens_per_second": 24.146752084990112,
+      "ttft_seconds": 0.6648311170283705,
+      "text_hashes": [
+        "d8edf0e3a6c3bb166291c873eb54af31676220ea0c6b75a76ee947e571066268"
+      ],
+      "measurements": [
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 10.602399112889543,
+          "ttft_seconds": 0.6698295529931784,
+          "decode_seconds": 9.932522887946106,
+          "decode_tokens_per_second": 25.6732355793977,
+          "end_to_end_tokens_per_second": 24.14547851615733
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 10.598048292915337,
+          "ttft_seconds": 0.6590512829134241,
+          "decode_seconds": 9.93895299511496,
+          "decode_tokens_per_second": 25.656626017381676,
+          "end_to_end_tokens_per_second": 24.155390966762514
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 10.597477860981598,
+          "ttft_seconds": 0.6653927690349519,
+          "decode_seconds": 9.932036980055273,
+          "decode_tokens_per_second": 25.67449159845767,
+          "end_to_end_tokens_per_second": 24.15669118239496
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 10.632403606083244,
+          "ttft_seconds": 0.6648311170283705,
+          "decode_seconds": 9.96752717695199,
+          "decode_tokens_per_second": 25.583075468270504,
+          "end_to_end_tokens_per_second": 24.077340315931167
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 10.601839912007563,
+          "ttft_seconds": 0.6638131800573319,
+          "decode_seconds": 9.93798202893231,
+          "decode_tokens_per_second": 25.65913273515911,
+          "end_to_end_tokens_per_second": 24.146752084990112
+        }
+      ]
+    },
+    "native_graph_requested": {
+      "binary_sha256": "0d903c63b3a351bab53eb84b9f4ea285fbed4e5e8900cc873f273c5e0551c0d9",
+      "harness_sha256": "59af8b0c87c8ab0ad0e2232709e6229ffad35318c3de10f48ca62c3d136b3195",
+      "gpu_before": {
+        "gpu": "NVIDIA GB10, 580.178.04, 0 %, 40, 5.33 W",
+        "processes": ""
+      },
+      "environment": {
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+        "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "auto",
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1"
+      },
+      "warmups": 1,
+      "samples": 5,
+      "decode_tokens_per_second": 26.572702614138365,
+      "decode_range": [
+        26.4897009679375,
+        26.591245624074027
+      ],
+      "end_to_end_tokens_per_second": 24.936819739798143,
+      "ttft_seconds": 0.6678353570168838,
+      "text_hashes": [
+        "d8edf0e3a6c3bb166291c873eb54af31676220ea0c6b75a76ee947e571066268"
+      ],
+      "measurements": [
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 10.270089847967029,
+          "ttft_seconds": 0.6737236969638616,
+          "decode_seconds": 9.596314070979133,
+          "decode_tokens_per_second": 26.572702614138365,
+          "end_to_end_tokens_per_second": 24.926753688593617
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 10.260719269048423,
+          "ttft_seconds": 0.6664971200516447,
+          "decode_seconds": 9.59416933299508,
+          "decode_tokens_per_second": 26.57864283498057,
+          "end_to_end_tokens_per_second": 24.949517990637062
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 10.291963270050474,
+          "ttft_seconds": 0.66553090501111,
+          "decode_seconds": 9.626382732996717,
+          "decode_tokens_per_second": 26.4897009679375,
+          "end_to_end_tokens_per_second": 24.87377707079055
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 10.265944201033562,
+          "ttft_seconds": 0.6678353570168838,
+          "decode_seconds": 9.598066636011936,
+          "decode_tokens_per_second": 26.567850554739877,
+          "end_to_end_tokens_per_second": 24.936819739798143
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 10.258767527062446,
+          "ttft_seconds": 0.6691004229942337,
+          "decode_seconds": 9.589622223982587,
+          "decode_tokens_per_second": 26.591245624074027,
+          "end_to_end_tokens_per_second": 24.954264664315335
+        }
+      ]
+    },
+    "native_portable_matvec_optin": {
+      "binary_sha256": "0d903c63b3a351bab53eb84b9f4ea285fbed4e5e8900cc873f273c5e0551c0d9",
+      "harness_sha256": "2e25518a0114d8d6eb4022383d969e2cfa8ae230dbdfc2f0fbebc997dca817be",
+      "gpu_before": {
+        "gpu": "NVIDIA GB10, 580.178.04, 0 %, 44, 5.52 W",
+        "processes": ""
+      },
+      "environment": {
+        "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "auto",
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+        "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+        "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1"
+      },
+      "warmups": 1,
+      "samples": 5,
+      "decode_tokens_per_second": 33.82136746027363,
+      "decode_range": [
+        33.780526285732556,
+        33.873967599074234
+      ],
+      "end_to_end_tokens_per_second": 31.235342121865468,
+      "ttft_seconds": 0.6589855609927326,
+      "text_hashes": [
+        "6d642fc27c05218e31c7daed2f3e7b662b5a30b96c4119a5a3a9fa1a595544a4"
+      ],
+      "measurements": [
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 8.216254492057487,
+          "ttft_seconds": 0.6689231949858367,
+          "decode_seconds": 7.5472601460060105,
+          "decode_tokens_per_second": 33.78709559056942,
+          "end_to_end_tokens_per_second": 31.157749586197802
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 8.20779718295671,
+          "ttft_seconds": 0.6589855609927326,
+          "decode_seconds": 7.5487278630025685,
+          "decode_tokens_per_second": 33.780526285732556,
+          "end_to_end_tokens_per_second": 31.189854511948433
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 8.195844277972355,
+          "ttft_seconds": 0.6568711909931153,
+          "decode_seconds": 7.538903711014427,
+          "decode_tokens_per_second": 33.82454661510559,
+          "end_to_end_tokens_per_second": 31.235342121865468
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 8.18873007898219,
+          "ttft_seconds": 0.6607135529629886,
+          "decode_seconds": 7.527904703048989,
+          "decode_tokens_per_second": 33.873967599074234,
+          "end_to_end_tokens_per_second": 31.262478739782726
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "seconds": 8.192556980997324,
+          "ttft_seconds": 0.6528827860020101,
+          "decode_seconds": 7.539612355991267,
+          "decode_tokens_per_second": 33.82136746027363,
+          "end_to_end_tokens_per_second": 31.247875430563774
+        }
+      ]
+    },
+    "llama_cpp_no_prompt_cache": {
+      "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+      "harness_sha256": "c3dfc6e65f285dd47f7f5d068fc4b8e0875f2926b73c08f427d9d348fde8b477",
+      "gpu_before": {
+        "gpu": "NVIDIA GB10, 580.178.04, 0 %, 46, 5.77 W",
+        "processes": ""
+      },
+      "environment": {},
+      "warmups": 1,
+      "samples": 5,
+      "decode_tokens_per_second": 65.30566529038096,
+      "decode_range": [
+        65.18543280494052,
+        65.61777488881239
+      ],
+      "end_to_end_tokens_per_second": 64.61792904260327,
+      "ttft_seconds": 0.05747340805828571,
+      "text_hashes": [
+        "13f71438c57efb333bc46021fede7d7a1373a198bb941f92f7708b8f2b78a322"
+      ],
+      "measurements": [
+        {
+          "usage": {
+            "completion_tokens": 256,
+            "prompt_tokens": 46,
+            "total_tokens": 302,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "seconds": 3.951541114016436,
+          "ttft_seconds": 0.06533971196040511,
+          "decode_seconds": 3.886142138042487,
+          "decode_tokens_per_second": 65.61777488881239,
+          "end_to_end_tokens_per_second": 64.78485041999114
+        },
+        {
+          "usage": {
+            "completion_tokens": 256,
+            "prompt_tokens": 46,
+            "total_tokens": 302,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "seconds": 3.9687857939861715,
+          "ttft_seconds": 0.05681682005524635,
+          "decode_seconds": 3.9119169579353184,
+          "decode_tokens_per_second": 65.18543280494052,
+          "end_to_end_tokens_per_second": 64.50335525487722
+        },
+        {
+          "usage": {
+            "completion_tokens": 256,
+            "prompt_tokens": 46,
+            "total_tokens": 302,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "seconds": 3.9583069970831275,
+          "ttft_seconds": 0.057692287024110556,
+          "decode_seconds": 3.9005622629774734,
+          "decode_tokens_per_second": 65.37519024381554,
+          "end_to_end_tokens_per_second": 64.67411451124083
+        },
+        {
+          "usage": {
+            "completion_tokens": 256,
+            "prompt_tokens": 46,
+            "total_tokens": 302,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "seconds": 3.968879734049551,
+          "ttft_seconds": 0.05747340805828571,
+          "decode_seconds": 3.911312070908025,
+          "decode_tokens_per_second": 65.19551377571385,
+          "end_to_end_tokens_per_second": 64.50182851441471
+        },
+        {
+          "usage": {
+            "completion_tokens": 256,
+            "prompt_tokens": 46,
+            "total_tokens": 302,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "seconds": 3.9617487560026348,
+          "ttft_seconds": 0.056982994079589844,
+          "decode_seconds": 3.904714833945036,
+          "decode_tokens_per_second": 65.30566529038096,
+          "end_to_end_tokens_per_second": 64.61792904260327
+        }
+      ]
+    },
+    "reference_prompt_cache_disabled_and_zero_cached_tokens": true,
+    "native_graph_greedy_text_matches_default": true,
+    "native_matvec_greedy_text_matches_default": false,
+    "interpretation": "L4/SM89 tuned-route and capture defaults are not enabled automatically on GB10. Requesting graph replay alone offers little improvement. The matvec candidate changes greedy text and is not promoted. A substantial native GB10 performance gap remains.",
+    "reference_runtime_revision": "0893ec98f5eafad36a43a72cd1c3723d72b0d03a",
+    "reference_server_options": [
+      "-m",
+      "gemma-4-E4B_q4_0-it.gguf",
+      "--mmproj",
+      "gemma-4-E4B-it-mmproj.gguf",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "38921",
+      "-ngl",
+      "99",
+      "-np",
+      "1",
+      "-c",
+      "8192",
+      "-b",
+      "2048",
+      "-ub",
+      "2048",
+      "-ctk",
+      "f32",
+      "-ctv",
+      "f32",
+      "-t",
+      "8",
+      "--reasoning-format",
+      "none",
+      "-lv",
+      "4"
+    ]
+  },
+  "remaining_failures": [
+    "Native clean-corpus WER remains above the predeclared 10% gate, versus 7.83% in the independent reference.",
+    "The Spanish 8 kHz regression is incomplete in the default CUDA frontend path.",
+    "Silence still generates text in both native and independent reference implementations."
+  ],
+  "frontend_diagnostics": {
+    "corrected-host-001": {
+      "environment": {
+        "TERMITE_GEMMA4_AUDIO_HOST_OPS": "all"
+      },
+      "reads": [
+        {
+          "id": "1272-128104-0000",
+          "group": "corpus",
+          "planner": false,
+          "mime": "audio/flac",
+          "reference": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+          "transcript": "Mr. Quilter is the apostle of the middle classes and we're glad to welcome his gospel.",
+          "score": {
+            "errors": 3,
+            "substitutions": 2,
+            "deletions": 1,
+            "insertions": 0,
+            "reference_words": 17,
+            "wer": 0.17647058823529413
+          },
+          "input_sha256": "4e25e22555cd16e90edb0a3b49fdcf1fe652b2a1250ab643634db33895c75b41",
+          "elapsed_seconds": 5.360711904009804,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "1272-128104-0001",
+          "group": "corpus",
+          "planner": false,
+          "mime": "audio/flac",
+          "reference": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+          "transcript": "Nor is Mr. Quilter's manner less interesting than his matter.",
+          "score": {
+            "errors": 1,
+            "substitutions": 1,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 10,
+            "wer": 0.1
+          },
+          "input_sha256": "46a9d58622b4675b29564da2d9ba73e702241c5fa969f12c387cad4aa984276a",
+          "elapsed_seconds": 3.46354779205285,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "1272-128104-0000-pcm-control",
+          "group": "diagnostic",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+          "transcript": "Mr. Quilter is the apostle of the middle classes and we're glad to welcome his gospel.",
+          "score": {
+            "errors": 3,
+            "substitutions": 2,
+            "deletions": 1,
+            "insertions": 0,
+            "reference_words": 17,
+            "wer": 0.17647058823529413
+          },
+          "input_sha256": "799f78ed4beb4de7ceae3a809262d4ce242394342ccd1d58cef7d49dbc2def46",
+          "elapsed_seconds": 3.8063663050998002,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "1272-128104-0001-pcm-control",
+          "group": "diagnostic",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+          "transcript": "Nor is Mr. Quilter's manner less interesting than his matter.",
+          "score": {
+            "errors": 1,
+            "substitutions": 1,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 10,
+            "wer": 0.1
+          },
+          "input_sha256": "473b1bb573e8f7cdcd639c6e318036236190107b66bfe6892286121a92d464c1",
+          "elapsed_seconds": 3.4272019389318302,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "english-wav",
+          "group": "regression",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d",
+          "elapsed_seconds": 2.370929943048395,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "english-wav",
+          "group": "regression",
+          "planner": true,
+          "mime": "audio/wav",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d",
+          "elapsed_seconds": 2.3284673360176384,
+          "backends": [
+            "cuda"
+          ],
+          "normalized_parity": true
+        },
+        {
+          "id": "spanish-8khz-wav",
+          "group": "regression",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "Buenos días. Esta es una prueba de reconocimiento automático del idioma.",
+          "transcript": "Buenos días. Esta es una prueba de reconocimiento automático.",
+          "score": {
+            "errors": 2,
+            "substitutions": 0,
+            "deletions": 2,
+            "insertions": 0,
+            "reference_words": 11,
+            "wer": 0.18181818181818182
+          },
+          "input_sha256": "c656aaeeb98a4239f9f0f6ab05eed6e76424b9b073caa0090ac6ac35d7312b35",
+          "elapsed_seconds": 3.3097256399923936,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "spanish-8khz-wav",
+          "group": "regression",
+          "planner": true,
+          "mime": "audio/wav",
+          "reference": "Buenos días. Esta es una prueba de reconocimiento automático del idioma.",
+          "transcript": "Buenos días. Esta es una prueba de reconocimiento automático.",
+          "score": {
+            "errors": 2,
+            "substitutions": 0,
+            "deletions": 2,
+            "insertions": 0,
+            "reference_words": 11,
+            "wer": 0.18181818181818182
+          },
+          "input_sha256": "c656aaeeb98a4239f9f0f6ab05eed6e76424b9b073caa0090ac6ac35d7312b35",
+          "elapsed_seconds": 3.3896257899468765,
+          "backends": [
+            "cuda"
+          ],
+          "normalized_parity": true
+        },
+        {
+          "id": "english-stereo-44100",
+          "group": "regression",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "5a9190665685ac2c8b2e8e6e04ba52948497be5ba10b09bb150bf8e4498c1a18",
+          "elapsed_seconds": 2.3390297209843993,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "english-stereo-44100",
+          "group": "regression",
+          "planner": true,
+          "mime": "audio/wav",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "5a9190665685ac2c8b2e8e6e04ba52948497be5ba10b09bb150bf8e4498c1a18",
+          "elapsed_seconds": 2.309563089045696,
+          "backends": [
+            "cuda"
+          ],
+          "normalized_parity": true
+        },
+        {
+          "id": "english-mp4-video",
+          "group": "regression",
+          "planner": false,
+          "mime": "video/mp4",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "dd71c2208cdd46de655cb6e9750167e81aae32798b43d978d9b0a53d0e509513",
+          "elapsed_seconds": 2.5875220589805394,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "english-mp4-video",
+          "group": "regression",
+          "planner": true,
+          "mime": "video/mp4",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "dd71c2208cdd46de655cb6e9750167e81aae32798b43d978d9b0a53d0e509513",
+          "elapsed_seconds": 2.3708323360187933,
+          "backends": [
+            "cuda"
+          ],
+          "normalized_parity": true
+        },
+        {
+          "id": "english-webm-video",
+          "group": "regression",
+          "planner": false,
+          "mime": "video/webm",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "c2180474bc984f2f429f56f3c63d8f31fe1c556fce85d58e3e0dfdbdaa106a75",
+          "elapsed_seconds": 2.3666314039146528,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "english-webm-video",
+          "group": "regression",
+          "planner": true,
+          "mime": "video/webm",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "c2180474bc984f2f429f56f3c63d8f31fe1c556fce85d58e3e0dfdbdaa106a75",
+          "elapsed_seconds": 2.337705331039615,
+          "backends": [
+            "cuda"
+          ],
+          "normalized_parity": true
+        },
+        {
+          "id": "silence",
+          "group": "regression",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "",
+          "transcript": "The audio is silent.",
+          "score": {
+            "errors": 4,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 4,
+            "reference_words": 0,
+            "wer": null
+          },
+          "input_sha256": "643f8a8dc8bd9c19225afffad2becfec5426180b3749cb208abdf1a6c8354efc",
+          "elapsed_seconds": 1.4802852229913697,
+          "backends": [
+            "cuda"
+          ]
+        }
+      ]
+    },
+    "corrected-host-features-001": {
+      "environment": {
+        "TERMITE_GEMMA4_AUDIO_HOST_OPS": "features"
+      },
+      "reads": [
+        {
+          "id": "1272-128104-0000",
+          "group": "corpus",
+          "planner": false,
+          "mime": "audio/flac",
+          "reference": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+          "transcript": "Mr. Quilter is the apostle of the middle classes, and we're glad to welcome his gospel.",
+          "score": {
+            "errors": 3,
+            "substitutions": 2,
+            "deletions": 1,
+            "insertions": 0,
+            "reference_words": 17,
+            "wer": 0.17647058823529413
+          },
+          "input_sha256": "4e25e22555cd16e90edb0a3b49fdcf1fe652b2a1250ab643634db33895c75b41",
+          "elapsed_seconds": 4.974188512074761,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "1272-128104-0001",
+          "group": "corpus",
+          "planner": false,
+          "mime": "audio/flac",
+          "reference": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+          "transcript": "Nor is Mr. Quilter's manner less interesting than his matter.",
+          "score": {
+            "errors": 1,
+            "substitutions": 1,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 10,
+            "wer": 0.1
+          },
+          "input_sha256": "46a9d58622b4675b29564da2d9ba73e702241c5fa969f12c387cad4aa984276a",
+          "elapsed_seconds": 3.246290597016923,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "1272-128104-0000-pcm-control",
+          "group": "diagnostic",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+          "transcript": "Mr. Quilter is the apostle of the middle classes, and we're glad to welcome his gospel.",
+          "score": {
+            "errors": 3,
+            "substitutions": 2,
+            "deletions": 1,
+            "insertions": 0,
+            "reference_words": 17,
+            "wer": 0.17647058823529413
+          },
+          "input_sha256": "799f78ed4beb4de7ceae3a809262d4ce242394342ccd1d58cef7d49dbc2def46",
+          "elapsed_seconds": 3.5380488600349054,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "1272-128104-0001-pcm-control",
+          "group": "diagnostic",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+          "transcript": "Nor is Mr. Quilter's manner less interesting than his matter.",
+          "score": {
+            "errors": 1,
+            "substitutions": 1,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 10,
+            "wer": 0.1
+          },
+          "input_sha256": "473b1bb573e8f7cdcd639c6e318036236190107b66bfe6892286121a92d464c1",
+          "elapsed_seconds": 3.194373227073811,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "english-wav",
+          "group": "regression",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d",
+          "elapsed_seconds": 2.1589269730029628,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "english-wav",
+          "group": "regression",
+          "planner": true,
+          "mime": "audio/wav",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d",
+          "elapsed_seconds": 2.1598590300418437,
+          "backends": [
+            "cuda"
+          ],
+          "normalized_parity": true
+        },
+        {
+          "id": "spanish-8khz-wav",
+          "group": "regression",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "Buenos días. Esta es una prueba de reconocimiento automático del idioma.",
+          "transcript": "Buenos días. Esta es una prueba de reconocimiento automático.",
+          "score": {
+            "errors": 2,
+            "substitutions": 0,
+            "deletions": 2,
+            "insertions": 0,
+            "reference_words": 11,
+            "wer": 0.18181818181818182
+          },
+          "input_sha256": "c656aaeeb98a4239f9f0f6ab05eed6e76424b9b073caa0090ac6ac35d7312b35",
+          "elapsed_seconds": 3.1458253470482305,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "spanish-8khz-wav",
+          "group": "regression",
+          "planner": true,
+          "mime": "audio/wav",
+          "reference": "Buenos días. Esta es una prueba de reconocimiento automático del idioma.",
+          "transcript": "Buenos días. Esta es una prueba de reconocimiento automático.",
+          "score": {
+            "errors": 2,
+            "substitutions": 0,
+            "deletions": 2,
+            "insertions": 0,
+            "reference_words": 11,
+            "wer": 0.18181818181818182
+          },
+          "input_sha256": "c656aaeeb98a4239f9f0f6ab05eed6e76424b9b073caa0090ac6ac35d7312b35",
+          "elapsed_seconds": 3.161440266063437,
+          "backends": [
+            "cuda"
+          ],
+          "normalized_parity": true
+        },
+        {
+          "id": "english-stereo-44100",
+          "group": "regression",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "5a9190665685ac2c8b2e8e6e04ba52948497be5ba10b09bb150bf8e4498c1a18",
+          "elapsed_seconds": 2.2163638210622594,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "english-stereo-44100",
+          "group": "regression",
+          "planner": true,
+          "mime": "audio/wav",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "5a9190665685ac2c8b2e8e6e04ba52948497be5ba10b09bb150bf8e4498c1a18",
+          "elapsed_seconds": 2.226114474935457,
+          "backends": [
+            "cuda"
+          ],
+          "normalized_parity": true
+        },
+        {
+          "id": "english-mp4-video",
+          "group": "regression",
+          "planner": false,
+          "mime": "video/mp4",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "dd71c2208cdd46de655cb6e9750167e81aae32798b43d978d9b0a53d0e509513",
+          "elapsed_seconds": 2.475135202985257,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "english-mp4-video",
+          "group": "regression",
+          "planner": true,
+          "mime": "video/mp4",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "dd71c2208cdd46de655cb6e9750167e81aae32798b43d978d9b0a53d0e509513",
+          "elapsed_seconds": 2.142143229022622,
+          "backends": [
+            "cuda"
+          ],
+          "normalized_parity": true
+        },
+        {
+          "id": "english-webm-video",
+          "group": "regression",
+          "planner": false,
+          "mime": "video/webm",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "16c7c3bf41ce9f16f0eccfcecb2ccce348ec17515d4ae89947a51f2d0199506e",
+          "elapsed_seconds": 2.211521749966778,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "english-webm-video",
+          "group": "regression",
+          "planner": true,
+          "mime": "video/webm",
+          "reference": "The quick brown fox jumps over the lazy dog.",
+          "transcript": "The quick brown fox jumps over the lazy dog.",
+          "score": {
+            "errors": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 0,
+            "reference_words": 9,
+            "wer": 0.0
+          },
+          "input_sha256": "16c7c3bf41ce9f16f0eccfcecb2ccce348ec17515d4ae89947a51f2d0199506e",
+          "elapsed_seconds": 2.1861625590827316,
+          "backends": [
+            "cuda"
+          ],
+          "normalized_parity": true
+        },
+        {
+          "id": "silence",
+          "group": "regression",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "",
+          "transcript": "The cat is on the mat.",
+          "score": {
+            "errors": 6,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": 6,
+            "reference_words": 0,
+            "wer": null
+          },
+          "input_sha256": "643f8a8dc8bd9c19225afffad2becfec5426180b3749cb208abdf1a6c8354efc",
+          "elapsed_seconds": 1.4358376059681177,
+          "backends": [
+            "cuda"
+          ]
+        },
+        {
+          "id": "spanish-pcm-16000-control",
+          "group": "diagnostic",
+          "planner": false,
+          "mime": "audio/wav",
+          "reference": "Buenos días. Esta es una prueba de reconocimiento automático del idioma.",
+          "transcript": "Buenos días.",
+          "score": {
+            "errors": 9,
+            "substitutions": 0,
+            "deletions": 9,
+            "insertions": 0,
+            "reference_words": 11,
+            "wer": 0.8181818181818182
+          },
+          "input_sha256": "606ab50d297f4bf21b64420606064e2bad6029c39c147c9bca172758bacea1ea",
+          "elapsed_seconds": 2.8511109779356048,
+          "backends": [
+            "cuda"
+          ]
+        }
+      ]
+    }
+  },
+  "validation": {
+    "unit_tests": {
+      "selected": 162,
+      "passed": 158,
+      "skipped": 4,
+      "python_harness_passed": 5
+    },
+    "native_binary_sha256": "7776777494cc32366d3e326a975b7dc56e80036cf792de7f3f62e409b7e85b1d",
+    "native_harness_sha256": "2e25518a0114d8d6eb4022383d969e2cfa8ae230dbdfc2f0fbebc997dca817be",
+    "native_git_diff_sha256": "727ae861da5377f397578f7ff0f443a6ca9f5f3dc46a4be38972b0f272783c39",
+    "git_commit": "ea7bea940a6a051f0662f87f2a240db2d925726d",
+    "native_observed_backends": [
+      "cuda"
+    ],
+    "planner_normalized_parity": true,
+    "production_128_bin_cuda_frontend": {
+      "passed": 1,
+      "skipped": 0,
+      "max_absolute_error_tolerance": 0.002,
+      "note": "Production-width fused CUDA FFT route versus CPU FFT; native inference binary predates this test-only fixture expansion."
+    },
+    "current_projector_source_sha256": "d7d08186963301225ea5d480138f4e7bf08dac9328088870850edd8d1a3925ed"
+  }
+}

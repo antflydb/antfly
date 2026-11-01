@@ -64,6 +64,8 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         },
         .cuda => &.{
             "src/ops/cuda/kernels.zig",
+            "src/ops/cuda/kernels/rms_q8_1_2560.cuh",
+            "src/ops/cuda/kernels/gemma4_e4b_prefetch.cuh",
             "src/graph/kernel_jit.zig",
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_kernel_cuda_renderer.zig",
@@ -75,9 +77,11 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     run.addArg(b.fmt("{d}", .{qualification.len}));
     for (qualification) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     if (backend == .cuda) {
-        run.addArgs(&.{ "dispatch", "4" });
+        run.addArgs(&.{ "dispatch", "6" });
         for ([_][]const u8{
             "src/ops/cuda/cuda_compute.zig",
+            "src/ops/cuda/kernels/rms_q8_1_2560.cuh",
+            "src/ops/cuda/kernels/gemma4_e4b_prefetch.cuh",
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_matmul.zig",
             "src/gguf/tensor_types.zig",

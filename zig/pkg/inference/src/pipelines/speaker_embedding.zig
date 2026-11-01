@@ -448,6 +448,9 @@ pub fn clusterSpeakers(allocator: std.mem.Allocator, embeddings: []const []const
 }
 
 pub const DiarizeOptions = struct {
+    /// Legacy dictation may split using estimated word spans. Source reading
+    /// keeps the recognizer's actual phrase/window boundaries instead.
+    split_estimated_words: bool = true,
     /// Distance between consecutive window starts. Windows overlap by
     /// `window_seconds - hop_s`, so every instant is covered twice.
     hop_s: f32 = 1.5,
@@ -558,12 +561,7 @@ pub fn diarizeSegmentsAlloc(
     options: DiarizeOptions,
     control: ?InferenceExecutionControl,
 ) ![]long_transcription.Segment {
-    var out = std.ArrayList(long_transcription.Segment).empty;
-    errdefer {
-        for (out.items) |segment| freeSegment(allocator, segment);
-        out.deinit(allocator);
-    }
-    if (segments.len == 0 or samples.len == 0) return out.toOwnedSlice(allocator);
+    if (segments.len == 0 or samples.len == 0) return allocator.alloc(long_transcription.Segment, 0);
 
     var hop: usize = @max(@as(usize, 1), @as(usize, @intFromFloat(@as(f64, options.hop_s) * @as(f64, @floatFromInt(sample_rate)))));
     var windows = try speechWindowsAlloc(allocator, samples.len, segments, hop);
@@ -573,19 +571,7 @@ pub fn diarizeSegmentsAlloc(
         windows = try speechWindowsAlloc(allocator, samples.len, segments, hop);
     }
     defer allocator.free(windows);
-    if (windows.len == 0) {
-        // Nothing to sample: every phrase landed where the clip ends, which
-        // is where the recognizer clamps a timestamp it could not place.
-        // The transcript comes back unattributed rather than guessed at.
-        for (segments) |segment| {
-            const copy = try dupeSegment(allocator, segment, segment.words, segment.start_ms, segment.end_ms);
-            // The list owns the copy only once the append succeeds; until
-            // then this scope does.
-            errdefer freeSegment(allocator, copy);
-            try out.append(allocator, copy);
-        }
-        return out.toOwnedSlice(allocator);
-    }
+    if (windows.len == 0) return labelSegmentsAlloc(allocator, segments, windows, options);
 
     // Embed and cluster the windows.
     const embeddings = try allocator.alloc([]const f32, windows.len);
@@ -609,11 +595,20 @@ pub fn diarizeSegmentsAlloc(
     defer allocator.free(labels);
     for (windows, labels) |*w, label| w.label = label;
 
+    return labelSegmentsAlloc(allocator, segments, windows, options);
+}
+
+fn labelSegmentsAlloc(allocator: std.mem.Allocator, segments: []const long_transcription.Segment, windows: []const Window, options: DiarizeOptions) ![]long_transcription.Segment {
+    var out = std.ArrayList(long_transcription.Segment).empty;
+    errdefer {
+        for (out.items) |segment| freeSegment(allocator, segment);
+        out.deinit(allocator);
+    }
     // Assign words, smooth, split.
     var word_labels = std.ArrayList(?u8).empty;
     defer word_labels.deinit(allocator);
     for (segments) |segment| {
-        if (segment.words.len == 0) {
+        if (windows.len == 0 or !options.split_estimated_words or segment.words.len == 0) {
             const centre = (msToSamples(segment.start_ms) + msToSamples(segment.end_ms)) / 2;
             var copy = try dupeSegment(allocator, segment, segment.words, segment.start_ms, segment.end_ms);
             errdefer freeSegment(allocator, copy);
@@ -647,6 +642,19 @@ pub fn diarizeSegmentsAlloc(
             try out.append(allocator, piece);
             run_start = run_end;
         }
+    }
+    if (!options.split_estimated_words) {
+        // Coarse segments need not select every cluster. Publish only the
+        // speakers actually attributed, numbered by their first appearance.
+        var labels: [256]?u8 = @splat(null);
+        var count: u16 = 0;
+        for (out.items) |*segment| if (segment.speaker_index) |index| {
+            if (labels[index] == null) {
+                labels[index] = @intCast(count);
+                count += 1;
+            }
+            segment.speaker_index = labels[index];
+        };
     }
     return out.toOwnedSlice(allocator);
 }
@@ -682,7 +690,7 @@ fn dupeSegment(
         dst.* = .{ .word = try allocator.dupe(u8, src.word), .start_ms = src.start_ms, .end_ms = src.end_ms };
         filled += 1;
     }
-    return .{ .text = text, .start_ms = start_ms, .end_ms = end_ms, .words = owned_words, .speaker_index = null };
+    return .{ .text = text, .granularity = segment.granularity, .start_ms = start_ms, .end_ms = end_ms, .words = owned_words, .speaker_index = null };
 }
 
 fn freeSegment(allocator: std.mem.Allocator, segment: long_transcription.Segment) void {
@@ -990,4 +998,25 @@ test "model aware media speaker feature workspace reuses constants and matches r
     try std.testing.expect(workspace == embedder.workspace.?);
     try std.testing.expectEqualSlices(f32, first, second);
     try std.testing.expectEqualSlices(f32, reference, &workspace.features);
+}
+
+test "audio read diarization preserves source alignment instead of splitting estimated word times" {
+    const a = std.testing.allocator;
+    const words = [_]long_transcription.Word{
+        .{ .word = @constCast("hello"), .start_ms = 0, .end_ms = 3000 },
+        .{ .word = @constCast("there"), .start_ms = 3000, .end_ms = 6000 },
+    };
+    const segments = [_]long_transcription.Segment{.{ .text = @constCast("hello there"), .granularity = .window, .start_ms = 0, .end_ms = 6000, .words = @constCast(&words) }};
+    const windows = [_]Window{ .{ .start = 0, .label = 2 }, .{ .start = 3 * sample_rate, .label = 7 } };
+    const legacy = try labelSegmentsAlloc(a, &segments, &windows, .{});
+    defer long_transcription.freeSegments(a, legacy);
+    try std.testing.expectEqual(@as(usize, 2), legacy.len);
+    const evidence = try labelSegmentsAlloc(a, &segments, &windows, .{ .split_estimated_words = false });
+    defer long_transcription.freeSegments(a, evidence);
+    try std.testing.expectEqual(@as(usize, 1), evidence.len);
+    try std.testing.expectEqualStrings("hello there", evidence[0].text);
+    try std.testing.expectEqual(@as(u64, 0), evidence[0].start_ms);
+    try std.testing.expectEqual(@as(u64, 6000), evidence[0].end_ms);
+    try std.testing.expect(evidence[0].granularity == .window);
+    try std.testing.expectEqual(@as(?u8, 0), evidence[0].speaker_index);
 }

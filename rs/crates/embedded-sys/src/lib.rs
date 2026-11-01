@@ -1061,11 +1061,6 @@ unsafe extern "C" {
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
-    pub fn antfly_inference_transcribe_json(
-        inference: *mut antfly_inference,
-        request_json: antfly_slice,
-        out: *mut antfly_buffer,
-    ) -> antfly_error_code;
     /// The installed models, as returned by `GET /ai/v1/models`.
     pub fn antfly_inference_list_models_json(
         inference: *mut antfly_inference,

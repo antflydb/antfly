@@ -25,6 +25,7 @@ const capabilities = @import("inference_capabilities.zig");
 
 test {
     _ = @import("inference_gateway.zig");
+    _ = @import("inference_tasks.zig");
     _ = @import("inference_telemetry.zig");
     _ = @import("inference_stream.zig");
 }

@@ -18,6 +18,7 @@
 #include <mma.h>
 #include "../../../graph/templates/cuda_q4_0_bf16_staged.cuh"
 #include "../kernels/embedding_gemma2.cuh"
+#include "../kernels/rms_q8_1_2560.cuh"
 
 using namespace nvcuda;
 
@@ -1470,6 +1471,66 @@ extern "C" __global__ void termite_linear_triple_bias_f32_tile4_r2(
     }
 }
 
+// Keep the original 256-thread reduction tree, but publish its final five
+// levels with warp shuffles instead of block-wide barriers.
+__device__ __forceinline__ float termite_rms_sum_tree_256_f32(float value, float* partial) {
+    const unsigned tid = threadIdx.x;
+    partial[tid] = value;
+    __syncthreads();
+    if (tid < 32u) {
+        const float a = partial[tid] + partial[tid + 128u];
+        const float b = partial[tid + 64u] + partial[tid + 192u];
+        const float c = partial[tid + 32u] + partial[tid + 160u];
+        const float d = partial[tid + 96u] + partial[tid + 224u];
+        float sum = (a + b) + (c + d);
+        for (unsigned offset = 16u; offset != 0u; offset >>= 1u) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+        if (tid == 0u) partial[0] = sum;
+    }
+    __syncthreads();
+    return partial[0];
+}
+
+// E4B's short, single-row norms cannot hide dependent global loads behind
+// other rows. Retain the strided inputs/weights/residuals in registers across
+// the reduction. Each lane accumulates in exactly the original order.
+// Op 0: weighted RMS; 1: weighted RMS + residual; 2: scale after residual.
+template <unsigned Op>
+__device__ __forceinline__ void termite_rms_register_2560_f32(
+    float* dst, const float* input, const float* weight,
+    const float* residual, const float* scalar, float eps
+) {
+    const unsigned tid = threadIdx.x;
+    const unsigned base = blockIdx.x * 2560u;
+    __shared__ float partial[256];
+    float values[10], weights[10], residuals[10];
+#pragma unroll
+    for (unsigned j = 0u; j < 10u; ++j) {
+        const unsigned i = tid + j * 256u;
+        values[j] = input[base + i];
+        weights[j] = weight[i];
+        if (Op != 0u) residuals[j] = residual[base + i];
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (unsigned j = 0u; j < 10u; ++j) sum += values[j] * values[j];
+    const float sumsq = termite_rms_sum_tree_256_f32(sum, partial);
+    // Match the historical runtime-divisor rounding, even though this shape
+    // is specialized: a constant reciprocal multiply is not equivalent.
+    float mean;
+    asm volatile("div.rn.f32 %0, %1, %2;" : "=f"(mean) : "f"(sumsq), "f"(2560.0f));
+    const float scale = rsqrtf(mean + eps);
+    const float output_scale = Op == 2u ? scalar[0] : 1.0f;
+#pragma unroll
+    for (unsigned j = 0u; j < 10u; ++j) {
+        float value = values[j] * scale * weights[j];
+        if (Op != 0u) value += residuals[j];
+        if (Op == 2u) value *= output_scale;
+        dst[base + tid + j * 256u] = value;
+    }
+}
+
 extern "C" __global__ void termite_rms_norm_f32(
     float* dst,
     const float* input,
@@ -1480,6 +1541,10 @@ extern "C" __global__ void termite_rms_norm_f32(
 ) {
     unsigned int row = blockIdx.x;
     if (row >= rows) return;
+    if (dim == 2560u && blockDim.x == 256u) {
+        termite_rms_register_2560_f32<0u>(dst, input, weight, nullptr, nullptr, eps);
+        return;
+    }
     unsigned int tid = threadIdx.x;
     const unsigned int base = row * dim;
     __shared__ float partial[256];
@@ -1545,6 +1610,10 @@ extern "C" __global__ void termite_rms_norm_add_f32(
 ) {
     unsigned int row = blockIdx.x;
     if (row >= rows) return;
+    if (dim == 2560u && blockDim.x == 256u) {
+        termite_rms_register_2560_f32<1u>(dst, input, weight, residual, nullptr, eps);
+        return;
+    }
     unsigned int tid = threadIdx.x;
     const unsigned int base = row * dim;
     __shared__ float partial[256];
@@ -1647,6 +1716,10 @@ extern "C" __global__ void termite_rms_norm_add_output_scale_f32(
 ) {
     unsigned int row = blockIdx.x;
     if (row >= rows) return;
+    if (dim == 2560u && blockDim.x == 256u) {
+        termite_rms_register_2560_f32<2u>(dst, input, weight, residual, scalar, eps);
+        return;
+    }
     unsigned int tid = threadIdx.x;
     const unsigned int base = row * dim;
     __shared__ float partial[256];
@@ -21320,6 +21393,8 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b
         partial_indices[global_tile] = best_index;
     }
 }
+
+#include "../kernels/gemma4_e4b_prefetch.cuh"
 
 extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
     float* dst,

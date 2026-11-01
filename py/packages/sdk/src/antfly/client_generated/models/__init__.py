@@ -61,6 +61,7 @@ from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
 from .artifact_sources_capability_state import ArtifactSourcesCapabilityState
 from .audio_chunk_options import AudioChunkOptions
+from .audio_read_options import AudioReadOptions
 from .auth_subject import AuthSubject
 from .auth_subject_kind import AuthSubjectKind
 from .autocomplete_query import AutocompleteQuery
@@ -951,6 +952,12 @@ from .index_type import IndexType
 from .inference_admission_config import InferenceAdmissionConfig
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
 from .inference_audio_context import InferenceAudioContext
+from .inference_audio_read_capabilities import InferenceAudioReadCapabilities
+from .inference_audio_read_metadata import InferenceAudioReadMetadata
+from .inference_audio_read_metadata_language_source import InferenceAudioReadMetadataLanguageSource
+from .inference_audio_read_options import InferenceAudioReadOptions
+from .inference_audio_read_segment import InferenceAudioReadSegment
+from .inference_audio_read_segment_granularity import InferenceAudioReadSegmentGranularity
 from .inference_backend_runtimes import InferenceBackendRuntimes
 from .inference_batch_execution_report import InferenceBatchExecutionReport
 from .inference_binary_content import InferenceBinaryContent
@@ -1156,11 +1163,6 @@ from .inference_tool_choice_type_0 import InferenceToolChoiceType0
 from .inference_tool_choice_type_1 import InferenceToolChoiceType1
 from .inference_tool_choice_type_1_type import InferenceToolChoiceType1Type
 from .inference_tool_type import InferenceToolType
-from .inference_transcribe_object import InferenceTranscribeObject
-from .inference_transcribe_object_object import InferenceTranscribeObjectObject
-from .inference_transcribe_request import InferenceTranscribeRequest
-from .inference_transcribe_response import InferenceTranscribeResponse
-from .inference_transcribe_response_object import InferenceTranscribeResponseObject
 from .inference_transcription_audio_append import InferenceTranscriptionAudioAppend
 from .inference_transcription_audio_format import InferenceTranscriptionAudioFormat
 from .inference_transcription_event import InferenceTranscriptionEvent
@@ -2591,6 +2593,7 @@ __all__ = (
     "ArtifactRepairReason",
     "ArtifactSourcesCapabilityState",
     "AudioChunkOptions",
+    "AudioReadOptions",
     "AuthSubject",
     "AuthSubjectKind",
     "AutocompleteQuery",
@@ -3473,6 +3476,12 @@ __all__ = (
     "InferenceAdmissionConfig",
     "InferenceAudioChunkConfig",
     "InferenceAudioContext",
+    "InferenceAudioReadCapabilities",
+    "InferenceAudioReadMetadata",
+    "InferenceAudioReadMetadataLanguageSource",
+    "InferenceAudioReadOptions",
+    "InferenceAudioReadSegment",
+    "InferenceAudioReadSegmentGranularity",
     "InferenceBackendRuntimes",
     "InferenceBatchExecutionReport",
     "InferenceBinaryContent",
@@ -3678,11 +3687,6 @@ __all__ = (
     "InferenceToolChoiceType1",
     "InferenceToolChoiceType1Type",
     "InferenceToolType",
-    "InferenceTranscribeObject",
-    "InferenceTranscribeObjectObject",
-    "InferenceTranscribeRequest",
-    "InferenceTranscribeResponse",
-    "InferenceTranscribeResponseObject",
     "InferenceTranscriptionAudioAppend",
     "InferenceTranscriptionAudioFormat",
     "InferenceTranscriptionEvent",

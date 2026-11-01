@@ -72,7 +72,7 @@ fn validateTree(value: V, depth: usize, remaining: *usize) !void {
 fn validateSubmission(operation: Operation, request: V) !void {
     if (request != .object) return error.InvalidInferenceRequest;
     const fields: []const []const u8 = if (operation == .read)
-        &.{ "model", "documents", "images", "prompt", "max_tokens", "retain_artifact" }
+        &.{ "model", "documents", "images", "audio", "prompt", "max_tokens", "retain_artifact" }
     else
         &.{ "model", "schema_version", "schema", "options", "inputs", "documents", "read_artifact" };
     for (request.object.keys()) |key| {
@@ -197,7 +197,7 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
         _ = try connections.inferenceConnectionAdmissionOwner(server.cfg.node_config, server.cfg.local_inference_connection_target, connection, @tagName(operation));
         try request.object.put(a, "model", .{ .string = model });
         if (operation == .read) {
-            if (!request.object.contains("documents") and !request.object.contains("images")) return error.InvalidInferenceRequest;
+            if (!request.object.contains("documents") and !request.object.contains("images") and !request.object.contains("audio")) return error.InvalidInferenceRequest;
             // Normalize ordinary reader image forms into the document source
             // path so every durable read uses the shared checkpoint executor.
             if (request.object.getPtr("images")) |images| {

@@ -29,6 +29,7 @@ const transcription = @import("transcription.zig");
 const whisper_timestamps = @import("whisper_timestamps.zig");
 
 pub const Options = struct {
+    control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     /// Longest window handed to the model. Whisper is trained on 30 s.
     max_window_s: u32 = audio.WHISPER_CHUNK_LENGTH,
     /// Skip windows with no frame above the VAD threshold. Whisper tends to
@@ -56,6 +57,8 @@ pub const Window = struct {
 
 pub const Segment = struct {
     text: []u8,
+    /// A decoded phrase clock or only the bounds of its recognition window.
+    granularity: enum { phrase, window } = .phrase,
     start_ms: u64,
     end_ms: u64,
     /// Word spans estimated inside the phrase; see `whisper_timestamps.splitWords`.
@@ -102,6 +105,9 @@ pub const Result = struct {
     language: ?[]u8,
     duration_ms: u64,
     windows: usize,
+    silent: bool = true,
+    truncated: bool = false,
+    output_tokens: usize = 0,
     /// Summed over decoded windows.
     timing: transcription.Timing = .{},
 
@@ -121,6 +127,7 @@ pub fn planWindows(
     sample_rate: u32,
     options: Options,
 ) ![]Window {
+    if (options.control) |control| try control.check();
     if (sample_rate == 0 or options.max_window_s == 0) return error.UnsupportedAudioFormat;
     var out = std.ArrayListUnmanaged(Window).empty;
     errdefer out.deinit(allocator);
@@ -130,6 +137,7 @@ pub fn planWindows(
         return error.UnsupportedAudioFormat;
     var start: usize = 0;
     while (samples.len - start > max_samples) {
+        if (options.control) |control| try control.check();
         const hard_end = start + max_samples;
         const search_lo = start + (max_samples / 4) * 3;
         var split = vad.quietestSplit(samples, sample_rate, search_lo, hard_end, options.vad);
@@ -168,6 +176,9 @@ pub fn transcribeLong(
     var language: ?[]u8 = null;
     errdefer if (language) |value| allocator.free(value);
     var timing = transcription.Timing{};
+    var silent = true;
+    var truncated = false;
+    var output_tokens: usize = 0;
 
     const initial_tokens: []i32 = if (options.initial_prompt) |prompt|
         try transcriber.encodePromptText(allocator, prompt)
@@ -180,9 +191,13 @@ pub fn transcribeLong(
     defer prefix.deinit(allocator);
 
     for (windows) |window| {
+        if (options.control) |control| try control.check();
         const window_samples = samples[window.start..window.end];
         if (window_samples.len == 0) continue;
         if (options.skip_silent_windows and !vad.hasSpeech(window_samples, sample_rate, options.vad)) continue;
+        // Only the source-sample check establishes verified silence. A model
+        // no-speech prediction over a window with activity is abstention.
+        silent = false;
 
         prefix.clearRetainingCapacity();
         try prefix.appendSlice(allocator, initial_tokens);
@@ -191,6 +206,8 @@ pub fn transcribeLong(
         var result: transcription.TranscribeResult = try transcriber.transcribePcmConditioned(window_samples, sample_rate, prefix.items);
         defer result.deinit();
         timing.add(result.timing);
+        truncated = truncated or result.truncated;
+        output_tokens += result.tokens.len;
         if (language == null) if (result.language) |detected| {
             language = try allocator.dupe(u8, detected);
             // Detect once per clip; later windows keep the same language so a
@@ -207,7 +224,10 @@ pub fn transcribeLong(
             }
         } else {
             const trimmed = std.mem.trim(u8, result.text, " \t\r\n");
-            if (trimmed.len > 0) try segments.append(allocator, try makeSegment(allocator, trimmed, window_start_ms, window_end_ms));
+            if (trimmed.len > 0) {
+                try segments.append(allocator, try makeSegment(allocator, trimmed, window_start_ms, window_end_ms));
+                segments.items[segments.items.len - 1].granularity = .window;
+            }
         }
         if (options.condition_on_previous) {
             allocator.free(previous_tokens);
@@ -215,6 +235,7 @@ pub fn transcribeLong(
         }
     }
 
+    if (options.control) |control| try control.check();
     const text = try joinSegments(allocator, segments.items);
     errdefer allocator.free(text);
     return .{
@@ -224,6 +245,9 @@ pub fn transcribeLong(
         .language = language,
         .duration_ms = vad.samplesToMs(sample_rate, samples.len),
         .windows = windows.len,
+        .silent = silent,
+        .truncated = truncated,
+        .output_tokens = output_tokens,
         .timing = timing,
     };
 }
@@ -247,6 +271,9 @@ const FakeTranscriber = struct {
     calls: usize = 0,
     output_budget: @import("transcription_budget.zig").OutputTokenBudget = .{},
     text: []const u8 = "hello",
+    empty_result: bool = false,
+    silent_result: bool = false,
+    truncated_result: bool = false,
     language: ?[]const u8 = "en",
     /// Prefix length observed on each call, for conditioning assertions.
     prefix_lens: [8]usize = @as([8]usize, @splat(0)),
@@ -279,7 +306,7 @@ const FakeTranscriber = struct {
         // Three text tokens and EOS, just as the real pipeline charges output.
         for (0..4) |_| try self.output_budget.consume();
         const seconds = samples.len / sample_rate;
-        const text = try std.fmt.allocPrint(self.allocator, "{s}{d}({d}s)", .{ self.text, self.calls, seconds });
+        const text = if (self.empty_result) try self.allocator.dupe(u8, "") else try std.fmt.allocPrint(self.allocator, "{s}{d}({d}s)", .{ self.text, self.calls, seconds });
         errdefer self.allocator.free(text);
         const tokens = try self.allocator.alloc(i32, 3);
         errdefer self.allocator.free(tokens);
@@ -297,6 +324,8 @@ const FakeTranscriber = struct {
             .allocator = self.allocator,
             .segments = segments,
             .tokens = tokens,
+            .silent = self.silent_result,
+            .truncated = self.truncated_result,
         };
     }
 };
@@ -384,6 +413,7 @@ test "long transcription stitches timed segments and skips silent windows" {
     try std.testing.expect(result.windows >= 3 and result.windows <= 4);
     try std.testing.expectEqual(result.windows - 1, fake.calls);
     try std.testing.expectEqual(fake.calls, result.segments.len);
+    try std.testing.expect(result.segments[0].granularity == .window);
     try std.testing.expectEqual(@as(u64, 0), result.segments[0].start_ms);
     try std.testing.expect(result.segments[1].start_ms >= 40_000);
     try std.testing.expectEqual(@as(u64, 70_000), result.segments[result.segments.len - 1].end_ms);
@@ -437,6 +467,7 @@ test "long transcription maps timestamped phrases onto the clip timeline" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqual(@as(usize, 4), result.segments.len);
+    try std.testing.expect(result.segments[0].granularity == .phrase);
     try std.testing.expectEqual(@as(u64, 0), result.segments[0].start_ms);
     try std.testing.expectEqual(@as(u64, 1000), result.segments[0].end_ms);
     try std.testing.expectEqualStrings("first phrase", result.segments[0].text);
@@ -480,4 +511,35 @@ test "long transcription shares output ceiling across windows and rejects partia
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), exact.calls);
     try std.testing.expectEqual(@as(?usize, 0), exact.output_budget.remaining);
+}
+
+test "long transcription keeps truncation and distinguishes silent from empty recognition" {
+    const a = std.testing.allocator;
+    const samples = try a.alloc(f32, 65 * 1000);
+    defer a.free(samples);
+    tone(samples, 1000, 0, 65);
+    var partial = FakeTranscriber{ .allocator = a, .truncated_result = true };
+    var truncated = try transcribeLong(a, &partial, samples, 1000, .{});
+    defer truncated.deinit();
+    try std.testing.expect(truncated.truncated and !truncated.silent);
+    try std.testing.expect(partial.calls >= 3);
+    var empty = FakeTranscriber{ .allocator = a, .empty_result = true, .silent_result = true };
+    var unresolved = try transcribeLong(a, &empty, samples, 1000, .{});
+    defer unresolved.deinit();
+    try std.testing.expect(unresolved.text.len == 0 and !unresolved.silent);
+    @memset(samples, 0);
+    var silent = try transcribeLong(a, &empty, samples, 1000, .{});
+    defer silent.deinit();
+    try std.testing.expect(silent.silent and !silent.truncated and silent.text.len == 0);
+}
+
+test "long transcription cancels before scanning silent windows" {
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var fake = FakeTranscriber{ .allocator = std.testing.allocator };
+    try std.testing.expectError(error.Cancelled, transcribeLong(std.testing.allocator, &fake, &.{0}, 1000, .{ .control = .{ .check_fn = Cancel.check } }));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }

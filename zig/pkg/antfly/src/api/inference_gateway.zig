@@ -26,11 +26,11 @@ pub const source_media = @import("inference_source.zig");
 const empty_registry = registry.Registry.init(std.heap.page_allocator);
 const generating = sources.generating_mod;
 
-pub const public_paths: []const []const u8 = &.{ "/ai/v1/models", "/ai/v1/chat/completions", "/ai/v1/embeddings", "/ai/v1/decisions", "/ai/v1/read", "/ai/v1/extract", "/ai/v1/rewrite", "/ai/v1/rerank", "/ai/v1/chunk", "/ai/v1/transcribe", "/ai/v1/dictate", "/ai/v1/synthesize", "/ai/v1/embed", "/ai/v1/generate", "/ai/v1/generate/batch", "/ml/v1/predict", "/ml/v1/predictors", "/ml/v1/models", "/ai/v1/transcription/sessions", "/ai/v1/transcription/sessions/:session_id", "/ai/v1/transcription/sessions/:session_id/audio", "/ai/v1/transcription/sessions/:session_id/events", "/ai/v1/transcription/sessions/:session_id/stream", "/ai/v1/read/jobs", "/ai/v1/read/jobs/:job_id", "/ai/v1/read/jobs/:job_id/result", "/ai/v1/read/jobs/:job_id/events", "/ai/v1/read/jobs/:job_id/resume", "/ai/v1/read/jobs/:job_id/cancel", "/ai/v1/extract/jobs", "/ai/v1/extract/jobs/:job_id", "/ai/v1/extract/jobs/:job_id/result", "/ai/v1/extract/jobs/:job_id/events", "/ai/v1/extract/jobs/:job_id/resume", "/ai/v1/extract/jobs/:job_id/cancel" };
+pub const public_paths: []const []const u8 = &.{ "/ai/v1/models", "/ai/v1/chat/completions", "/ai/v1/embeddings", "/ai/v1/decisions", "/ai/v1/read", "/ai/v1/extract", "/ai/v1/rewrite", "/ai/v1/rerank", "/ai/v1/chunk", "/ai/v1/dictate", "/ai/v1/synthesize", "/ai/v1/embed", "/ai/v1/generate", "/ai/v1/generate/batch", "/ml/v1/predict", "/ml/v1/predictors", "/ml/v1/models", "/ai/v1/transcription/sessions", "/ai/v1/transcription/sessions/:session_id", "/ai/v1/transcription/sessions/:session_id/audio", "/ai/v1/transcription/sessions/:session_id/events", "/ai/v1/transcription/sessions/:session_id/stream", "/ai/v1/read/jobs", "/ai/v1/read/jobs/:job_id", "/ai/v1/read/jobs/:job_id/result", "/ai/v1/read/jobs/:job_id/events", "/ai/v1/read/jobs/:job_id/resume", "/ai/v1/read/jobs/:job_id/cancel", "/ai/v1/extract/jobs", "/ai/v1/extract/jobs/:job_id", "/ai/v1/extract/jobs/:job_id/result", "/ai/v1/extract/jobs/:job_id/events", "/ai/v1/extract/jobs/:job_id/resume", "/ai/v1/extract/jobs/:job_id/cancel" };
 
 pub fn taskForOperation(operation: []const u8) ?gateway.Task {
     const Pair = struct { []const u8, gateway.Task };
-    for ([_]Pair{ .{ "generate", .generate }, .{ "chat/completions", .generate }, .{ "embeddings", .embed }, .{ "embed", .embed }, .{ "decisions", .decide }, .{ "decide", .decide }, .{ "rerank", .rerank }, .{ "chunk", .chunk }, .{ "read", .read }, .{ "extract", .extract }, .{ "rewrite", .rewrite }, .{ "transcribe", .transcribe }, .{ "dictate", .transcribe }, .{ "synthesize", .synthesize }, .{ "predict", .predict } }) |pair| if (std.mem.eql(u8, pair[0], operation)) return pair[1];
+    for ([_]Pair{ .{ "generate", .generate }, .{ "chat/completions", .generate }, .{ "embeddings", .embed }, .{ "embed", .embed }, .{ "decisions", .decide }, .{ "decide", .decide }, .{ "rerank", .rerank }, .{ "chunk", .chunk }, .{ "read", .read }, .{ "extract", .extract }, .{ "rewrite", .rewrite }, .{ "dictate", .transcribe }, .{ "synthesize", .synthesize }, .{ "predict", .predict } }) |pair| if (std.mem.eql(u8, pair[0], operation)) return pair[1];
     return null;
 }
 
@@ -542,7 +542,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             .rewrite => "rewrite",
             .rerank => "rerank",
             .chunk => "chunk",
-            .transcribe => execution_options.operation orelse "transcribe",
+            .transcribe => execution_options.operation orelse "dictate",
             .synthesize => "synthesize",
             .predict => "ml/predict",
         }, encoded, fallback, observation, execution_options);
@@ -569,21 +569,23 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         if (cfg.api_url.len > 0) return forwardEndpoint(server, ctx, cfg.api_url, null, "chunk", encoded, false, observation, execution_options);
         return forward(server, ctx, if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, "chunk", encoded, false, observation, execution_options);
     }
-    if (task == .read) {
-        const cfg = try named.readers.?.getConfig(target.configured.name);
+    const hosted_asr = task == .read and target.configured.task == .transcribe and
+        (try named.transcribers.?.getConfig(target.configured.name)).provider != .antfly;
+    if (task == .read and !hosted_asr) {
+        const cfg = try named.readConfig(target);
         if (cfg.provider == .antfly) {
-            const encoded = try tasks.readingBody(a, cfg, request);
+            const encoded = if (target.configured.task == .transcribe) try tasks.audioReadingBody(a, try named.transcribers.?.getConfig(target.configured.name), request) else try tasks.readingBody(a, cfg, request);
             // Reads are completed JSON results. Keep the full document envelope
             // available to ordinary and batch callers, including artifact handles.
             var read_options = execution_options;
             read_options.response_delivery = .buffered;
-            return forward(server, ctx, try std.fmt.allocPrint(a, "readers/{s}", .{target.configured.name}), "read", encoded, fallback, observation, read_options);
+            return forward(server, ctx, try std.fmt.allocPrint(a, "{s}/{s}", .{ target.configured.task.namespace(), target.configured.name }), "read", encoded, fallback, observation, read_options);
         }
     }
     if (task == .transcribe) {
         const cfg = try named.transcribers.?.getConfig(target.configured.name);
         if (cfg.provider == .antfly) {
-            const operation = execution_options.operation orelse "transcribe";
+            const operation = execution_options.operation orelse "dictate";
             const encoded = try tasks.transcriptionBody(a, cfg, request);
             return forward(server, ctx, try std.fmt.allocPrint(a, "transcribers/{s}", .{target.configured.name}), operation, encoded, false, observation, execution_options);
         }
@@ -746,25 +748,53 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             return ctx.json(.{ .object = "list", .model = model, .data = data });
         },
         .read => {
-            try only(request, &.{ "model", "images", "prompt", "max_tokens" });
-            const images = request.object.get("images") orelse return error.InvalidInferenceRequest;
-            if (images != .array or images.array.items.len == 0) return error.InvalidInferenceRequest;
-            const urls = try a.alloc([]const u8, images.array.items.len);
-            for (images.array.items, urls) |v, *out| out.* = try string(if (v == .object) v.object.get("url") orelse return error.InvalidInferenceRequest else v);
-            var result = try executor.read(a, name, .{
+            try only(request, &.{ "model", "images", "audio", "audio_options", "prompt", "max_tokens", "retain_artifact" });
+            // Generated clients serialize the default false. Hosted adapters
+            // cannot promise a local document artifact when retention is on.
+            if (request.object.get("retain_artifact")) |value| {
+                if (value != .bool) return error.InvalidInferenceRequest;
+                if (value.bool) return error.UnsupportedInferenceFeature;
+            }
+            const audio = if (request.object.get("audio")) |value| try string(value) else null;
+            const images = request.object.get("images");
+            if ((audio != null) == (images != null)) return error.InvalidInferenceRequest;
+            if (audio) |value| if (value.len == 0) return error.InvalidInferenceRequest;
+            const urls = if (images) |value| blk: {
+                if (value != .array or value.array.items.len == 0) return error.InvalidInferenceRequest;
+                const urls = try a.alloc([]const u8, value.array.items.len);
+                for (value.array.items, urls) |v, *out| out.* = try string(if (v == .object) v.object.get("url") orelse return error.InvalidInferenceRequest else v);
+                break :blk urls;
+            } else &.{};
+            var result = try executor.read(a, try target.idAlloc(a), .{
+                .audio = audio,
+                .audio_options = if (request.object.get("audio_options")) |value| (if (value == .null) null else std.json.parseFromValueLeaky(@import("inference_api").AudioReadOptions, a, value, .{}) catch return error.InvalidInferenceRequest) else null,
                 .images = urls,
                 .prompt = if (request.object.get("prompt")) |v| try string(v) else null,
                 .max_tokens = if (request.object.get("max_tokens")) |v| try integer(v) else null,
             });
             defer result.deinit(a);
-            const Item = struct { object: []const u8 = "read", index: usize, text: []const u8, fields: ?Json, regions: ?Json };
-            const data = try a.alloc(Item, result.items.len);
-            for (result.items, data, 0..) |item, *out, i| out.* = .{
-                .index = i,
-                .text = item.text,
-                .fields = if (item.fields_json) |v| try std.json.parseFromSliceLeaky(Json, a, v, .{}) else null,
-                .regions = if (item.regions_json) |v| try std.json.parseFromSliceLeaky(Json, a, v, .{}) else null,
-            };
+            const Item = struct { object: []const u8 = "read", index: usize, text: []const u8, status: []const u8, origin: ?[]const u8, fields: ?Json, regions: ?Json };
+            const data = try a.alloc(Json, result.items.len);
+            for (result.items, data, 0..) |item, *out, i| {
+                // A reading adapter's complete row carries source identity,
+                // temporal evidence and provenance in addition to its text.
+                if (item.document_json) |json| {
+                    out.* = try std.json.parseFromSliceLeaky(Json, a, json, .{});
+                    continue;
+                }
+                out.* = try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, Item{
+                    .index = i,
+                    .text = item.text,
+                    .status = switch (item.completion) {
+                        .complete => "complete",
+                        .length => "truncated",
+                        .unresolved => "unresolved",
+                    },
+                    .origin = if (audio != null) "transcription" else null,
+                    .fields = if (item.fields_json) |v| try std.json.parseFromSliceLeaky(Json, a, v, .{}) else null,
+                    .regions = if (item.regions_json) |v| try std.json.parseFromSliceLeaky(Json, a, v, .{}) else null,
+                }, .{}), .{});
+            }
             return ctx.json(.{ .object = "list", .model = model, .data = data, .usage = result.usage, .execution = result.execution });
         },
         .rerank => {
@@ -810,7 +840,6 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             return ctx.json(.{ .object = "list", .model = model, .data = data });
         },
         .transcribe => {
-            const dictation = std.mem.eql(u8, execution_options.operation orelse "transcribe", "dictate");
             try only(request, &.{ "model", "audio", "language", "diarization", "url", "timestamps" });
             const audio_url = if (request.object.get("url")) |value| try string(value) else try std.fmt.allocPrint(a, "data:audio/wav;base64,{s}", .{try string(request.object.get("audio") orelse return error.InvalidInferenceRequest)});
             const result = executor.transcribe(a, name, .{
@@ -822,11 +851,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 error.UnsupportedTranscriptionOptions => error.UnsupportedInferenceFeature,
                 else => err,
             };
-            var speakers: std.ArrayList([]const u8) = .empty;
-            if (result.speakers) |values| for (values) |speaker| {
-                if (speaker.label orelse speaker.id) |label| try speakers.append(a, label);
-            };
-            if (dictation) return ctx.json(.{
+            return ctx.json(.{
                 .object = "dictation",
                 .id = try std.fmt.allocPrint(a, "dictation-{d}", .{@import("antfly_platform").time.monotonicNs()}),
                 .created = @divTrunc(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s),
@@ -834,7 +859,6 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 .text = result.text orelse "",
                 .transcript = .{ .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments },
             });
-            return ctx.json(.{ .object = "list", .model = model, .data = .{.{ .object = "transcription", .index = @as(usize, 0), .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments, .speakers = if (speakers.items.len > 0) speakers.items else null }} });
         },
         .rewrite => {
             const inputs = request.object.get("inputs") orelse return error.InvalidInferenceRequest;
@@ -1078,11 +1102,16 @@ fn inlineTaskAttachments(a: std.mem.Allocator, task: gateway.Task, request: Json
     switch (task) {
         .generate, .embed, .rerank, .decide => try state.media(&adapted),
         .read => {
-            const images = request.object.get("images") orelse return error.InvalidInferenceRequest;
-            if (images != .array) return error.InvalidInferenceRequest;
-            for (images.array.items) |*image| {
-                const url = if (image.* == .object) image.object.getPtr("url") orelse return error.InvalidInferenceRequest else image;
-                if (try state.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(a, attachment) };
+            if (adapted.object.getPtr("audio")) |audio| {
+                if (request.object.contains("images") or request.object.contains("documents")) return error.InvalidInferenceRequest;
+                if (try state.take(audio.*)) |attachment| audio.* = .{ .string = try payloads.dataUri(a, attachment) };
+            } else {
+                const images = request.object.get("images") orelse return error.InvalidInferenceRequest;
+                if (images != .array) return error.InvalidInferenceRequest;
+                for (images.array.items) |*image| {
+                    const url = if (image.* == .object) image.object.getPtr("url") orelse return error.InvalidInferenceRequest else image;
+                    if (try state.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(a, attachment) };
+                }
             }
         },
         .transcribe => {
@@ -1414,6 +1443,17 @@ pub fn localModels(a: std.mem.Allocator, server: anytype, task: gateway.Task) ![
     const bytes = try list(provider.ptr, a);
     const root = try std.json.parseFromSliceLeaky(Json, a, bytes, .{});
     if (root != .object) return error.ModelInventoryUnavailable;
+    if (task == .read) {
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        for ([_][]const u8{ "readers", "transcribers", "generators" }) |category| if (root.object.get(category)) |group| {
+            if (group != .object) return error.ModelInventoryUnavailable;
+            for (group.object.keys()) |name| try names.put(a, name, {});
+        };
+        const out = try a.alloc([]const u8, names.count());
+        var it = names.keyIterator();
+        for (out) |*name| name.* = (it.next() orelse unreachable).*;
+        return out;
+    }
     const group = root.object.get(task.namespace()) orelse return &.{};
     if (group != .object) return error.ModelInventoryUnavailable;
     return group.object.keys();
@@ -1980,7 +2020,10 @@ test "httpx inference gateway framed typed adapters inline only media references
     const image_part = batch_inputs[1].object.get("input").?.array.items[0].object.get("content").?.array.items[0];
     try std.testing.expectEqualStrings("data:image/png;base64,aW1hZ2U=", image_part.object.get("image_url").?.string);
     const audio = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"transcribers/speech\",\"audio\":\"attachment:0\"}", .{});
-    const adapted_audio = try inlineTaskAttachments(a, .transcribe, audio, &.{.{ .mime_type = "audio/flac", .data = "audio" }});
+    const audio_read = try inlineTaskAttachments(a, .read, audio, &.{.{ .mime_type = "audio/flac", .data = "audio" }});
+    try std.testing.expectEqualStrings("data:audio/flac;base64,YXVkaW8=", audio_read.object.get("audio").?.string);
+    const dictation = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"transcribers/speech\",\"audio\":\"attachment:0\"}", .{});
+    const adapted_audio = try inlineTaskAttachments(a, .transcribe, dictation, &.{.{ .mime_type = "audio/flac", .data = "audio" }});
     try std.testing.expect(!adapted_audio.object.contains("audio"));
     try std.testing.expectEqualStrings("data:audio/flac;base64,YXVkaW8=", adapted_audio.object.get("url").?.string);
     const invalid = try std.json.parseFromSliceLeaky(Json, a, "{\"images\":[{\"url\":\"attachment:1\"}]}", .{});
@@ -2054,4 +2097,13 @@ test "httpx inference gateway timeout outcomes distinguish admission send proof 
         const submitted = failure.get("upstream_submitted").?;
         if (phase == 1) try std.testing.expect(submitted == .null) else try std.testing.expectEqual(phase == 2, submitted.bool);
     }
+}
+
+test "httpx inference gateway exposes one read operation and no one-shot transcribe route" {
+    try std.testing.expectEqual(gateway.Task.read, taskForOperation("read").?);
+    try std.testing.expect(taskForOperation("transcribe") == null);
+    try std.testing.expect(!ownsPath("/ai/v1/transcribe"));
+    try std.testing.expect(ownsPath("/ai/v1/read"));
+    try std.testing.expect(ownsPath("/ai/v1/dictate"));
+    try std.testing.expect(ownsPath("/ai/v1/transcription/sessions"));
 }

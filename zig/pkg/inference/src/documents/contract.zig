@@ -24,10 +24,14 @@ pub const Action = @import("antfly_documents").types.Action;
 pub const Origin = @import("antfly_documents").types.Origin;
 pub const Operation = enum { read, decide, extract };
 pub const Provider = enum { antfly, cloudflare };
+pub const AudioReadOptions = @import("antfly_documents").types.AudioReadOptions;
 pub const Binding = struct {
+    audio_options: AudioReadOptions = .{},
     name: []const u8,
     model: []const u8,
     operation: Operation,
+    /// Source modality consumed by a read binding; other operations consume text.
+    input: enum { image, audio } = .image,
     output_origin: Origin = .transcription,
     provider: Provider = .antfly,
     /// Deployment-owned credential reference, never a credential value.
@@ -178,6 +182,7 @@ pub const Definition = struct {
             return error.InvalidDocumentDefinition;
         try self.budget.validate();
         for (self.models, 0..) |b, i| {
+            if (b.input == .audio and (b.operation != .read or b.provider != .antfly)) return error.DocumentCapabilityMismatch;
             if (b.max_total_tokens != null and b.max_total_tokens.? == 0) return error.InvalidDocumentDefinition;
             if (b.name.len == 0 or b.model.len == 0) return error.InvalidDocumentDefinition;
             if ((b.output_origin != .transcription and b.output_origin != .interpretation) or (b.operation != .read and b.output_origin != .transcription)) return error.InvalidDocumentDefinition;
@@ -198,10 +203,11 @@ pub const Definition = struct {
             _ = try self.binding(r.reader, .read);
             if (!std.math.isFinite(r.min_confidence) or r.min_confidence < 0 or r.min_confidence > 1)
                 return error.InvalidDocumentDefinition;
+            if ((try self.binding(r.reader, .read)).input == .audio and r.table_reader != null) return error.DocumentCapabilityMismatch;
             if (r.router) |name| _ = try self.binding(name, .decide);
             for ([_]?[]const u8{ r.table_reader, r.accurate_reader, r.fallback_reader, r.verification_reader }) |name|
                 if (name) |n| {
-                    _ = try self.binding(n, .read);
+                    if ((try self.binding(n, .read)).input != (try self.binding(r.reader, .read)).input) return error.DocumentCapabilityMismatch;
                 };
         }
         if (self.extract) |e| {
@@ -820,4 +826,15 @@ test "document durable cost replay is concurrent and retains logical and nested 
     scope.limits.max_model_calls = 3;
     denied.limits.max_model_calls = 3;
     try std.testing.expectError(error.DocumentOutputTooLarge, denied.restoreCosts(.{ .output_bytes = 1 }, &.{receipt}));
+}
+
+test "document audio bindings reject incompatible refinement and visual specialists" {
+    const audio = Binding{ .name = "speech", .model = "gemma4", .operation = .read, .input = .audio };
+    const image = Binding{ .name = "ocr", .model = "ocr", .operation = .read };
+    var definition = Definition{ .models = &.{ audio, image }, .read = .{ .reader = "speech", .accurate_reader = "ocr" } };
+    try std.testing.expectError(error.DocumentCapabilityMismatch, definition.validate());
+    definition.read = .{ .reader = "speech", .table_reader = "speech" };
+    try std.testing.expectError(error.DocumentCapabilityMismatch, definition.validate());
+    definition.read = .{ .reader = "speech" };
+    try definition.validate();
 }

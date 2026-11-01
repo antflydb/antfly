@@ -301,7 +301,6 @@ DEFAULT_MODEL_BY_PATH = {
     "/ai/v1/chat/completions": (DEFAULT_GENERATOR_MODEL, "generators"),
     "/ai/v1/extract": (DEFAULT_EXTRACTOR_MODEL, "extractors"),
     "/ai/v1/read": ("antflydb/florence-2-base", "readers"),
-    "/ai/v1/transcribe": ("openai/whisper-tiny", "transcribers"),
     "/ai/v1/dictate": ("openai/whisper-tiny", "transcribers"),
     "/ai/v1/transcription/sessions": ("openai/whisper-tiny", "transcribers"),
 }
@@ -943,7 +942,15 @@ def request_model_name(
     body = payload if isinstance(payload, dict) else {}
     model = body.get("model")
     if isinstance(model, str) and model.strip():
-        return model.strip(), DEFAULT_MODEL_BY_PATH.get(path, (None, None))[1]
+        name = model.strip()
+        if path == "/ai/v1/read" and body.get("audio") is not None:
+            for namespace in ("readers", "transcribers", "generators"):
+                if name.startswith(namespace + "/"):
+                    return name.removeprefix(namespace + "/"), namespace
+            curated = CURATED_BY_NAME.get(name.lower())
+            if curated is not None:
+                return name, curated.task
+        return name, DEFAULT_MODEL_BY_PATH.get(path, (None, None))[1]
     return DEFAULT_MODEL_BY_PATH.get(path, (None, None))
 
 
@@ -972,14 +979,17 @@ def response_indicates_missing_model(response) -> bool:
 def maybe_pull_missing_model(path: str, payload: dict | None, response) -> bool:
     if not inference_download_enabled():
         return False
-    diarization = path == "/ai/v1/transcribe" and bool(
-        payload and payload.get("diarization")
+    body = payload if isinstance(payload, dict) else {}
+    options = body.get("audio_options") or {}
+    diarization = bool(
+        (path == "/ai/v1/read" and isinstance(options, dict) and options.get("diarization"))
+        or (path == "/ai/v1/dictate" and body.get("diarization"))
     )
     missing_speaker = False
     if diarization and response.status_code == 422:
         try:
             missing_speaker = (
-                response.json().get("error") == "SPEAKER_MODEL_UNAVAILABLE"
+                response.json().get("error") in ("SPEAKER_MODEL_UNAVAILABLE", "SpeakerModelUnavailable")
             )
         except ValueError:
             pass

@@ -1466,7 +1466,10 @@ fn appendManifestTasks(
         .classifier => if (!manifest.laya_declared) try appendUniqueOwnedString(allocator, tasks, "classify"),
         .rewriter => try appendUniqueOwnedString(allocator, tasks, "rewrite"),
         .reader => try appendUniqueOwnedString(allocator, tasks, "read"),
-        .transcriber => try appendUniqueOwnedString(allocator, tasks, "transcribe"),
+        .transcriber => {
+            try appendUniqueOwnedString(allocator, tasks, "transcribe");
+            try appendUniqueOwnedString(allocator, tasks, "read");
+        },
     }
 
     try appendSupplementalTasks(allocator, manifest, tasks, qualified_boundary);

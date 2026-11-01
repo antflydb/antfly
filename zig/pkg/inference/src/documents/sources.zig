@@ -18,6 +18,7 @@
 const std = @import("std");
 const pdf = @import("antfly_pdf");
 const image = @import("antfly_image");
+const audio = @import("../pipelines/audio.zig");
 const c = @import("contract.zig");
 const ooxml = @import("antfly_documents").ooxml;
 const slide_parts = @import("antfly_documents").slides;
@@ -35,6 +36,43 @@ fn selectedPage(selection: ?[]const usize, number: usize) bool {
     }.order) != null;
 }
 pub const Slide = struct { path: []const u8, view: ?ooxml.View = null, hidden: bool = false, notes: ?ooxml.View = null, inherited: []const c.InheritedPart = &.{}, theme: @import("antfly_documents").drawingml_theme.Theme = .{}, theme_supported: bool = true };
+/// Audio/video containers are read through their audio track, never as pages.
+pub fn isAudioMediaType(mime: []const u8) bool {
+    const essence = @import("antfly_readers").mediaTypeEssence(mime) catch return false;
+    return audio.detectFormatFromMime(essence) != null;
+}
+/// All audio transports normalize to an ordinary document source. A supplied
+/// MIME declaration is validated independently of model/backend selection.
+pub fn audioInput(a: A, value: []const u8) !Input {
+    const uri = @import("antfly_scraping").data_uri;
+    const url = try @import("antfly_readers").audioSourceUrl(a, value);
+    var mime: []const u8 = "";
+    if (try uri.parse(url)) |parsed| {
+        const declared = parsed.effectiveMediaTypeEssence();
+        if (!std.mem.eql(u8, declared, "application/octet-stream")) {
+            if (!isAudioMediaType(declared)) return error.UnsupportedInferenceMimeType;
+            mime = declared;
+        }
+        _ = try parsed.decodedSize();
+    }
+    return .{ .id = "audio-0", .url = url, .media_type = mime };
+}
+
+pub fn audioMime(bytes: []const u8) ![]const u8 {
+    return switch (audio.detectFormat(bytes) orelse return error.UnsupportedDocumentFormat) {
+        .wav => "audio/wav",
+        .mp3 => "audio/mpeg",
+        .aac => "audio/aac",
+        .mp4 => "audio/mp4",
+        .ogg => "audio/ogg",
+        .opus => "audio/opus",
+        .flac => "audio/flac",
+        .aiff => "audio/aiff",
+        .caf => "audio/x-caf",
+        .au => "audio/basic",
+        .webm => "audio/webm",
+    };
+}
 pub const Source = struct {
     input: Input,
     fingerprint: [64]u8,
@@ -43,13 +81,13 @@ pub const Source = struct {
     // Source-owned immutable fork metadata is reused across bounded page calls.
     render_template: ?pdf.reader.RenderForkTemplate = null,
     max_regions: usize = (c.Limits{}).max_regions,
-    parsed: union(enum) { pdf: pdf.reader.Reader, image: void, slides: struct { archive: ooxml.Archive, slides: []const Slide, size: ?drawingml.Size, inheritance: slide_parts.Cache } },
+    parsed: union(enum) { pdf: pdf.reader.Reader, image: void, audio: void, slides: struct { archive: ooxml.Archive, slides: []const Slide, size: ?drawingml.Size, inheritance: slide_parts.Cache } },
     pub fn init(a: A, input: Input, bytes: []const u8, limits: c.Limits, control: c.Control) !Source {
         try control.check();
         if (input.id.len == 0 or input.id.len > 256 or bytes.len > limits.max_source_bytes) return error.InvalidDocumentSource;
         const essence = @import("antfly_readers").mediaTypeEssence(input.media_type) catch return error.InvalidDocumentSource;
         var normalized = input;
-        normalized.media_type = if (std.ascii.eqlIgnoreCase(essence, "application/pdf")) "application/pdf" else if (std.ascii.eqlIgnoreCase(essence, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) "application/vnd.openxmlformats-officedocument.presentationml.presentation" else if (image.inferenceFormatForMimeEssence(essence)) |format| image.inferenceMimeEssenceForFormat(format).? else return error.UnsupportedDocumentFormat;
+        normalized.media_type = if (std.ascii.eqlIgnoreCase(essence, "application/pdf")) "application/pdf" else if (std.ascii.eqlIgnoreCase(essence, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) "application/vnd.openxmlformats-officedocument.presentationml.presentation" else if (isAudioMediaType(essence)) essence else if (image.inferenceFormatForMimeEssence(essence)) |format| image.inferenceMimeEssenceForFormat(format).? else return error.UnsupportedDocumentFormat;
         if (input.quadrilateral != null and !std.mem.startsWith(u8, normalized.media_type, "image/")) return error.InvalidDocumentQuadrilateral;
         const selection: ?[]const usize = if (input.pages) |pages| blk: {
             if (pages.len == 0) return error.InvalidDocumentSelection;
@@ -141,6 +179,12 @@ pub const Source = struct {
             }
             if (slides.items.len == 0) return error.InvalidDocumentSource;
             result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .{ .slides = .{ .archive = archive, .slides = try slides.toOwnedSlice(a), .size = slide_size, .inheritance = inheritance } } };
+        } else if (isAudioMediaType(normalized.media_type)) {
+            if (input.pages != null or input.include_notes or input.include_hidden) return error.InvalidDocumentSelection;
+            const expected = audio.detectFormatFromMime(normalized.media_type).?;
+            if (audio.detectFormat(bytes) != expected) return error.DocumentMediaTypeMismatch;
+            if (!audio.canDecodeFormat(expected)) return error.UnsupportedDocumentFormat;
+            result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .audio };
         } else if (std.mem.startsWith(u8, normalized.media_type, "image/")) {
             const expected = image.inferenceFormatForMimeEssence(normalized.media_type) orelse return error.UnsupportedDocumentFormat;
             if (image.detectFormat(bytes) != expected) return error.DocumentMediaTypeMismatch;
@@ -167,7 +211,7 @@ pub const Source = struct {
         return switch (self.parsed) {
             .pdf => |*p| try p.pageCount(),
             .slides => |s| s.slides.len,
-            .image => 1,
+            .image, .audio => 1,
         };
     }
     pub fn selected(self: Source, number: usize) bool {
@@ -223,6 +267,10 @@ pub const Source = struct {
                 // Notes retain their own checked view, separately from visible OCR.
                 if (slide.notes) |notes| page.notes = try notes.text(a);
             },
+            .audio => {
+                page.kind = .audio;
+                page.coordinate_space = .none;
+            },
             .image => {},
         }
         try @import("representation.zig").validatePage(page, limit);
@@ -232,6 +280,7 @@ pub const Source = struct {
         errdefer run.abandonPixels();
         try run.control.check();
         switch (self.parsed) {
+            .audio => return error.DocumentCapabilityMismatch,
             .pdf => |*p| {
                 const request = pdf.PageRenderRequest{ .page_number = number, .max_pixels = run.limits.max_pixels, .max_dimension = @min(run.limits.max_dimension, 4096), .max_output_bytes = run.limits.max_source_bytes };
                 const plan = try pdf.prepareParsedPageRenderPlan(p, request);
@@ -730,4 +779,27 @@ test "document failed rendering abandons pixel grant liveness without refunding 
     try std.testing.expectEqual(@as(u64, 2), record.used.pixels);
     try std.testing.expectEqual(@as(usize, 0), record.pending.len);
     try std.testing.expectEqual(@as(u64, 2), record.uncertain.pixels);
+}
+
+test "document audio source keeps recording identity without fabricated page geometry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try audio.wav.encodeMono(a, &.{ 0, 0 }, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    const input: Input = .{ .id = "recording", .url = "fixture", .media_type = "audio/wav" };
+    var source = try Source.init(a, input, bytes, .{}, .{});
+    defer source.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try source.pageCount());
+    const unit = try source.analyze(a, 1, .{});
+    try std.testing.expectEqualStrings("recording", unit.source_id);
+    try std.testing.expectEqual(.audio, unit.kind);
+    try std.testing.expectEqual(.none, unit.coordinate_space);
+    try std.testing.expect(unit.regions.len == 0 and unit.raster_to_source == null);
+    var selected = input;
+    selected.pages = &.{1};
+    try std.testing.expectError(error.InvalidDocumentSelection, Source.init(a, selected, bytes, .{}, .{}));
+    try std.testing.expectError(error.DocumentMediaTypeMismatch, Source.init(a, input, @import("antfly_documents").fixtures.get("one-pixel.png"), .{}, .{}));
+    var run = c.Run{ .limits = .{} };
+    defer run.deinit();
+    try std.testing.expectError(error.DocumentCapabilityMismatch, source.render(a, 1, &run));
 }

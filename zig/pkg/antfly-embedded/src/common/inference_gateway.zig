@@ -245,6 +245,27 @@ pub const View = struct {
         return declared;
     }
 
+    /// Configuration namespace is identity, not the public operation. Read can
+    /// execute a reader, an ASR binding or a multimodal generator binding.
+    pub fn readConfig(self: View, target: Target) !readers.Config {
+        if (target != .configured) return error.ModelNotFound;
+        const selected = target.configured;
+        switch (selected.task) {
+            .read => return self.readers.?.getConfig(selected.name),
+            .transcribe => {
+                const cfg = try self.transcribers.?.getConfig(selected.name);
+                if (cfg.provider != .antfly) return error.UnsupportedAudioReadCapability;
+                return .{ .provider = .antfly, .model = cfg.model, .base_url = cfg.base_url, .url = cfg.url, .api_url = cfg.api_url, .api_key = cfg.api_key, .bearer_token = cfg.bearer_token, .capability_token = cfg.capability_token, .capability_revision = cfg.capability_revision };
+            },
+            .generate => {
+                const cfg = try self.providers.getGeneratorConfig(selected.name);
+                if (cfg.provider != .antfly) return error.UnsupportedAudioReadCapability;
+                return .{ .provider = .antfly, .model = cfg.model, .api_url = if (cfg.url.len > 0) cfg.url else null, .api_key = cfg.api_key };
+            },
+            else => return error.ModelTaskMismatch,
+        }
+    }
+
     pub fn contains(self: View, task: Task, name: []const u8) bool {
         return switch (task) {
             .generate => self.providers.generator_configs.contains(name),
@@ -287,10 +308,21 @@ pub const View = struct {
         inline for (std.meta.tags(Task)) |candidate| {
             const prefix = candidate.namespace();
             if (std.mem.startsWith(u8, id, prefix) and id.len > prefix.len and id[prefix.len] == '/') {
-                if (candidate != task) return error.ModelTaskMismatch;
+                if (candidate != task and !(task == .read and (candidate == .transcribe or candidate == .generate))) return error.ModelTaskMismatch;
                 const name = id[prefix.len + 1 ..];
-                if (!self.contains(task, name)) return error.ModelNotFound;
-                return .{ .configured = .{ .task = task, .name = name } };
+                if (!self.contains(candidate, name)) return error.ModelNotFound;
+                return .{ .configured = .{ .task = candidate, .name = name } };
+            }
+        }
+        if (task == .read) {
+            var selected: ?Task = null;
+            for ([_]Task{ .read, .transcribe, .generate }) |candidate| if (self.contains(candidate, id)) {
+                if (selected != null) return error.AmbiguousModelIdentity;
+                selected = candidate;
+            };
+            if (selected) |candidate| {
+                for (raw_models) |model| if (std.mem.eql(u8, model, id)) return error.AmbiguousModelIdentity;
+                return .{ .configured = .{ .task = candidate, .name = id } };
             }
         }
         const configured = self.contains(task, id);
@@ -386,6 +418,29 @@ test "provider registry gateway resolves explicit task identities and preserves 
     const catalog = try view.catalog(a);
     defer a.free(catalog);
     try std.testing.expectEqual(@as(usize, 1), catalog.len);
+}
+
+test "provider registry gateway read resolves ASR and generator bindings without hiding collisions" {
+    const a = std.testing.allocator;
+    var registry = providers.Registry.init(a);
+    defer registry.deinit();
+    var reading = readers.Registry.init(a);
+    defer reading.deinit();
+    var asr = transcribing.Registry.init(a);
+    defer asr.deinit();
+    try asr.registerConfig("speech", .{ .provider = .antfly, .model = "whisper", .timestamps = true });
+    try registry.registerGeneratorConfig("multimodal", .{ .provider = .antfly, .model = "gemma4", .url = "" });
+    const view = View{ .providers = &registry, .readers = &reading, .transcribers = &asr };
+    const speech = try view.resolve(.read, "transcribers/speech", &.{});
+    try std.testing.expectEqual(Task.transcribe, speech.configured.task);
+    try std.testing.expectEqualStrings("whisper", (try view.readConfig(speech)).model.?);
+    const generator = try view.resolve(.read, "generators/multimodal", &.{});
+    try std.testing.expectEqualStrings("gemma4", (try view.readConfig(generator)).model.?);
+    try std.testing.expectEqual(Task.transcribe, (try view.resolve(.read, "speech", &.{})).configured.task);
+    try std.testing.expectError(error.AmbiguousModelIdentity, view.resolve(.read, "speech", &.{"speech"}));
+    try reading.registerConfig("speech", .{ .provider = .antfly, .model = "ocr" });
+    try std.testing.expectError(error.AmbiguousModelIdentity, view.resolve(.read, "speech", &.{}));
+    try std.testing.expectEqual(Task.read, (try view.resolve(.read, "readers/speech", &.{})).configured.task);
 }
 
 test "provider registry gateway requires known adapter support and bounded precommit attempts" {

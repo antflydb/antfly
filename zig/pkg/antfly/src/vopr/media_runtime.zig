@@ -30,29 +30,29 @@ const synthesizing = @import("antfly_synthesizing");
 const FixtureAllocator = std.heap.SafeAllocator;
 
 const valid_transcript =
-    "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"vopr transcript\",\"language\":\"en\"}],\"model\":\"vopr-stt\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}";
+    "{\"object\":\"list\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"vopr transcript\",\"status\":\"complete\",\"audio\":{\"language\":\"en\",\"duration_ms\":1000}}],\"model\":\"vopr-stt\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}";
 
 const stt_success_routes = [_]httpx.TestRoute{
-    .{ .method = .POST, .path = "/transcribe", .respond = .{ .body = valid_transcript } },
+    .{ .method = .POST, .path = "/read", .respond = .{ .body = valid_transcript } },
 };
 const tts_success_routes = [_]httpx.TestRoute{
     .{ .method = .POST, .path = "/audio/speech", .respond = .{ .body = "VOPR-AUDIO", .content_type = "audio/mpeg" } },
 };
 const malformed_routes = [_]httpx.TestRoute{
-    .{ .method = .POST, .path = "/transcribe", .respond = .{ .body = "{not-json" } },
+    .{ .method = .POST, .path = "/read", .respond = .{ .body = "{not-json" } },
 };
 const partial_routes = [_]httpx.TestRoute{
     .{ .method = .POST, .path = "/audio/speech", .respond = .{ .body = "VOPR-AUDIO", .content_type = "audio/mpeg", .truncate_body_at = 3 } },
 };
 const timeout_routes = [_]httpx.TestRoute{
-    .{ .method = .POST, .path = "/transcribe", .respond = .{ .body = valid_transcript, .delay_ns = 50 * std.time.ns_per_ms } },
+    .{ .method = .POST, .path = "/read", .respond = .{ .body = valid_transcript, .delay_ns = 50 * std.time.ns_per_ms } },
 };
 const retry_routes = [_]httpx.TestRoute{
     .{ .method = .POST, .path = "/audio/speech", .max_uses = 1, .respond = .{ .status = 503, .body = "retry" } },
     .{ .method = .POST, .path = "/audio/speech", .respond = .{ .body = "VOPR-AUDIO", .content_type = "audio/mpeg" } },
 };
 const delayed_routes = [_]httpx.TestRoute{
-    .{ .method = .POST, .path = "/transcribe", .respond = .{ .body = valid_transcript, .delay_ns = 50 * std.time.ns_per_ms } },
+    .{ .method = .POST, .path = "/read", .respond = .{ .body = valid_transcript, .delay_ns = 50 * std.time.ns_per_ms } },
 };
 
 pub const Scenario = struct {

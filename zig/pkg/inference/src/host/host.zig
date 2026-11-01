@@ -2019,7 +2019,7 @@ test "document execution manifests retain raw duplex body mode" {
 }
 
 test "route templates match registered path-parameter patterns" {
-    try std.testing.expect(routeTemplateMatches("/transcribe", "/transcribe"));
+    try std.testing.expect(routeTemplateMatches("/read", "/read"));
     try std.testing.expect(routeTemplateMatches("/transcription/sessions/{session_id}/audio", "/transcription/sessions/:session_id/audio"));
     try std.testing.expect(!routeTemplateMatches("/transcription/sessions/{session_id}", "/transcription/sessions/:other"));
     try std.testing.expect(!routeTemplateMatches("/transcription/sessions/{session_id}", "/transcription/sessions"));
@@ -3042,7 +3042,7 @@ fn localModelCapabilitiesInScope(
         .rewrite => "rewriters",
         .transcribe => "transcribers",
     };
-    const model_path = try node.resolveModelPath(io, if (model.len > 0) model else null, scope);
+    const model_path = if (task == .read and scope_override == null) try node.resolveReadModelPath(io, if (model.len > 0) model else null) else try node.resolveModelPath(io, if (model.len > 0) model else null, scope);
     defer node.allocator.free(model_path);
     var manifest = try inference.models.manifest.loadFromDir(node.allocator, model_path);
     defer manifest.deinit();
@@ -3057,7 +3057,10 @@ fn localModelCapabilitiesInScope(
     // Older manifests may omit explicit inputs. Use resolved architecture
     // metadata, never the user-provided model name, for compatibility.
     if (@as(u8, @bitCast(modalities)) == 0) switch (task) {
-        .read => modalities.image = true,
+        .read => {
+            modalities.image = manifest.model_type != .transcriber;
+            modalities.audio = manifest.model_type == .transcriber or (manifest.audio_model_path != null or manifest.audio_projection_path != null);
+        },
         .generate => {
             modalities.text = true;
             modalities.image = manifest.gguf_projector_path != null;

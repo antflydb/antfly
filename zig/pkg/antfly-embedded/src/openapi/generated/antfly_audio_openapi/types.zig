@@ -621,8 +621,9 @@ pub const STTRequest = struct {
     }
 };
 
-/// Response from speech transcription.
+/// Response from speech recognition used by internal providers and streaming workflows.
 pub const STTResponse = struct {
+    status: ?[]const u8 = null,
     /// Full transcribed text.
     text: ?[]const u8 = null,
     /// Detected or specified language code.
@@ -634,6 +635,7 @@ pub const STTResponse = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "status", "status", true },
         .{ "text", "text", true },
         .{ "language", "language", true },
         .{ "duration_ms", "duration_ms", true },
@@ -651,6 +653,10 @@ pub const STTResponse = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
         if (self.text) |value| {
             try jw.objectField("text");
             try jw.write(value);

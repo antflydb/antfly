@@ -887,6 +887,29 @@ python3 zig/pkg/inference/scripts/gemma4/gemma4_cuda_l4_release_gate.py \
   --enforce-performance --min-comparable-ratio 0.70 --verify-artifacts
 ```
 
+## Gemma 4 E4B QAT on GB10
+
+The opt-in [GB10 text profile](scripts/gemma4/gemma4_e4b_qat_gb10.env)
+enables exact L2-prefetch kernels and an owned RMS/Q8 activation mirror.
+The [qualification report](scripts/gemma4/qualification/e4b-qat-gb10-text-20261031.md)
+records matched GGUF/F16-KV comparisons against llama.cpp and vLLM, raw timing
+samples, context capacities, model/backend versions, and output checks.
+
+The qualified configuration uses one stream, warm resident models and 2048
+reserved tokens on NVIDIA GB10. Sustained decoding is faster across the three
+measured workloads; first-token latency still trails llama.cpp, and short
+requests can remain slower end to end. This is a text-performance profile;
+audio/image quality and other devices require separate qualification. Existing
+admission limits still apply, including the BF16 prefill mirrors' memory cost.
+
+## Preparing an A100 host
+
+Use the [A100 preparation guide](scripts/gemma4/a100_cuda.md) for the Linux
+x86-64 build, native SM80 fatbin and conservative launch wrapper. This keeps
+GB10-only prefetch and required SM89 attention profiles out of the A100 path.
+CPU dispatch checks and artifact inspection are not A100 runtime or performance
+qualification; run the documented smoke checks on the destination GPU.
+
 ## Gemma 4 E2B SM89 optimization status
 
 The locked CUDA tuning workload is Gemma 4 E2B QAT on an NVIDIA L4: eight

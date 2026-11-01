@@ -12911,7 +12911,7 @@ paths:
           description: Requires the connection capability `models.<operation>`.
           schema:
             type: string
-            enum: [embed, generate, rerank, chunk, extract, rewrite, read, transcribe]
+            enum: [embed, generate, rerank, chunk, extract, rewrite, read, dictate]
       requestBody:
         required: true
         content:

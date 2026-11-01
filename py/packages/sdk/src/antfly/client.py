@@ -1003,7 +1003,7 @@ class AntflyClient:
                 raise AntflyException(f"decision returned invalid JSON: {exc}") from exc
 
     def read(self, request: InferenceReadRequest | Mapping[str, Any]) -> InferenceReadResponse:
-        """Read images or complete documents with a registered reader/composite."""
+        """Read images, complete documents, or audio with a capable model."""
         body = request.to_dict() if isinstance(request, InferenceReadRequest) else dict(request)
         with self._client.get_httpx_client().stream(
             "POST", "/ai/v1/read", json=body, headers={"Accept": "application/json"}

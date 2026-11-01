@@ -112,7 +112,6 @@ handlers:
 | `antfly_inference_decide_json` | `POST /decisions` |
 | `antfly_inference_extract_json` | `POST /extract` |
 | `antfly_inference_read_json` | `POST /read` (OCR) |
-| `antfly_inference_transcribe_json` | `POST /transcribe` |
 | `antfly_inference_list_models_json` | `GET /models` |
 
 For decision question types, answer semantics, and SQL providers, see the

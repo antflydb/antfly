@@ -125,6 +125,9 @@ pub const UninterruptibleGuard = struct {
 /// monotonic clock domain. The legacy check hook is retained so existing
 /// callers can migrate without weakening cancellation coverage.
 pub const InferenceExecutionControl = struct {
+    /// The HTTP route owns a request slot; audio leaves reserve only work units.
+    /// Internal execution policy, never decoded from a public request.
+    http_request_admitted: bool = false,
     document_store: @import("antfly_runtime_abi").document_abi.View = .{},
     document_session: ?*@import("antfly_document_runs").Session = null,
     document_dispatch_meter: ?*@import("antfly_document_runs").DispatchMeter = null,

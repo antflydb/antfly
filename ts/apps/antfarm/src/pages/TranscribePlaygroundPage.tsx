@@ -24,6 +24,7 @@ import {
   Spinner,
   Switch,
 } from "@antfly/design-system";
+import type { components } from "@antfly/sdk";
 import {
   AudioLines,
   Check,
@@ -86,10 +87,6 @@ interface ChunkResponse {
   model: string;
 }
 
-interface TranscriptionResponse {
-  data: Array<{ text?: string }>;
-}
-
 interface GenerationResponse {
   choices?: Array<{ message?: { content?: string } }>;
 }
@@ -130,7 +127,7 @@ function selectPlaceholder(loaded: boolean, count: number, typeName: string): st
 
 const TranscribePlaygroundPage: React.FC = () => {
   const { inferenceUrl } = useApiConfig();
-  const requestEndpoint = inferenceUrl("transcribe");
+  const requestEndpoint = inferenceUrl("read");
   const chunkEndpoint = inferenceUrl("chunk");
   const generationEndpoint = inferenceUrl("generate");
   const { models: connectedTranscribers, loading: transcribersLoading } =
@@ -399,19 +396,27 @@ const TranscribePlaygroundPage: React.FC = () => {
       updateSegment(index, { status: "transcribing" });
 
       if (signal.aborted) return;
-      const result = await fetchInferenceJson<TranscriptionResponse>(requestEndpoint, {
+      const result = await fetchInferenceJson<components["schemas"]["InferenceReadResponse"]>(requestEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           audio: audioBase64,
           model: transcriberModel,
-          language: lang.trim() || undefined,
+          audio_options: { language: lang.trim() || undefined },
         }),
         signal,
       });
       if (signal.aborted) return;
 
-      const rawText = (result.data[0]?.text || "").trim();
+      const item = result.data[0];
+      const rawText = (item?.text || "").trim();
+      if (item?.status === "truncated" || item?.status === "unresolved") {
+        const message = item.status === "truncated"
+          ? "Transcript is incomplete: the reader reached its output limit."
+          : "The reader could not recognize this audio.";
+        updateSegment(index, { rawText, status: "done", error: message });
+        throw new Error(message);
+      }
 
       if (generatorModel && rawText) {
         updateSegment(index, { rawText, status: "cleaning" });

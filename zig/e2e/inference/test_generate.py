@@ -18,7 +18,9 @@
 Matches Go antfly's generator_test.go patterns.
 """
 
+import base64
 import json
+from pathlib import Path
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -949,3 +951,36 @@ def test_concurrent_requests_throughput(api):
     print(f"  Concurrent: {conc_elapsed:.2f}s ({conc_elapsed / num_requests:.2f}s/req)")
     if seq_elapsed > 0:
         print(f"  Speedup: {seq_elapsed / conc_elapsed:.2f}x")
+
+
+@pytest.mark.multimodal
+@pytest.mark.slow
+@pytest.mark.parametrize("data_uri", [False, True])
+def test_gemma4_read_transcribes_speech(api, data_uri):
+    if not run_multimodal_generator_tests():
+        pytest.skip("Set RUN_MULTIMODAL_GENERATOR_TESTS=1 for Gemma 4 audio reads")
+    model = _first_multimodal_generator_model(api)
+    if "gemma4" not in model.lower().replace("-", ""):
+        pytest.skip("Audio reading requires an audio-capable Gemma 4 generator")
+    fixture = Path(__file__).with_name("testdata") / "whisper_quality.wav"
+    encoded = base64.b64encode(fixture.read_bytes()).decode()
+    response = api.post(
+        "/read",
+        json={
+            "model": model,
+            "audio": f"data:audio/wav;base64,{encoded}" if data_uri else encoded,
+            "max_tokens": 256,
+        },
+        timeout=FIRST_USE_REQUEST_TIMEOUT,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body["data"]) == 1
+    result = body["data"][0]
+    assert result["origin"] == "transcription"
+    assert result["status"] == "complete"
+    transcript = result["text"].casefold()
+    for word in ("quick", "brown", "fox", "lazy", "dog"):
+        assert word in transcript, transcript
+    assert body["usage"]["prompt_tokens"] > 0
+    assert body["usage"]["completion_tokens"] > 0

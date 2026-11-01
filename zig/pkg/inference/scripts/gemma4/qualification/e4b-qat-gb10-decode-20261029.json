@@ -1,0 +1,3763 @@
+{
+  "date": "2026-10-29",
+  "scope": "GB10 E4B QAT decode kernel validation; transcription qualification is separate",
+  "git_commit": "ea7bea940a6a051f0662f87f2a240db2d925726d",
+  "uncommitted_changes": true,
+  "device": {
+    "name": "NVIDIA GB10",
+    "compute_capability": "12.1",
+    "driver": "580.178.04"
+  },
+  "model": {
+    "id": "google/gemma-4-E4B-it-qat-q4_0-gguf",
+    "decoder_sha256": "676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee"
+  },
+  "attention": {
+    "route": "termite_gqa_attention_decode_f16_warp_stage1_f32 + termite_gqa_attention_decode_turboquant_split_stage2_f32",
+    "automatic_default": false,
+    "selection": "explicit opt-in, SM89 or SM121, heads=8, KV heads=2, head_dim=256/512, F16 K/V",
+    "oracle": "independent CPU paged attention, absolute tolerance 5e-4; output canaries and immutable input checks",
+    "patterns": [
+      "random",
+      "near-tie",
+      "cancellation"
+    ],
+    "page_orders": [
+      "identity-null",
+      "fixed",
+      "reversed",
+      "permuted"
+    ],
+    "eager": {
+      "pass": true,
+      "cases": 408,
+      "max_abs": 7.584691e-06,
+      "shapes": [
+        {
+          "shape": "hd256-kv1",
+          "cases": 12,
+          "max_abs": 0.0,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv17",
+          "cases": 12,
+          "max_abs": 1.937151e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv63",
+          "cases": 12,
+          "max_abs": 1.937151e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv64",
+          "cases": 12,
+          "max_abs": 1.937151e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv65",
+          "cases": 12,
+          "max_abs": 1.937151e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv127",
+          "cases": 12,
+          "max_abs": 2.9802322e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv128",
+          "cases": 12,
+          "max_abs": 3.054738e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv129",
+          "cases": 12,
+          "max_abs": 2.9802322e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv255",
+          "cases": 12,
+          "max_abs": 5.289912e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv256",
+          "cases": 12,
+          "max_abs": 5.2154064e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv511",
+          "cases": 12,
+          "max_abs": 3.054738e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv512",
+          "cases": 12,
+          "max_abs": 3.2037497e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv513",
+          "cases": 12,
+          "max_abs": 3.1292439e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv1024",
+          "cases": 12,
+          "max_abs": 3.2782555e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv4096",
+          "cases": 12,
+          "max_abs": 3.2037497e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv4096-q16",
+          "cases": 12,
+          "max_abs": 1.937151e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv16384",
+          "cases": 12,
+          "max_abs": 3.2037497e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv1",
+          "cases": 12,
+          "max_abs": 0.0,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv17",
+          "cases": 12,
+          "max_abs": 1.4901161e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv63",
+          "cases": 12,
+          "max_abs": 1.6391277e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv64",
+          "cases": 12,
+          "max_abs": 1.6391277e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv65",
+          "cases": 12,
+          "max_abs": 1.6391277e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv127",
+          "cases": 12,
+          "max_abs": 2.3841858e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv128",
+          "cases": 12,
+          "max_abs": 2.3841858e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv129",
+          "cases": 12,
+          "max_abs": 2.3841858e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv255",
+          "cases": 12,
+          "max_abs": 2.2351742e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv256",
+          "cases": 12,
+          "max_abs": 2.0861626e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv511",
+          "cases": 12,
+          "max_abs": 7.1525574e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv512",
+          "cases": 12,
+          "max_abs": 7.1525574e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv513",
+          "cases": 12,
+          "max_abs": 7.1525574e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv1024",
+          "cases": 12,
+          "max_abs": 1.2516975e-06,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv4096",
+          "cases": 12,
+          "max_abs": 1.5646219e-06,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv4096-q16",
+          "cases": 12,
+          "max_abs": 1.4901161e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv16384",
+          "cases": 12,
+          "max_abs": 7.584691e-06,
+          "pass": true
+        }
+      ]
+    },
+    "persistent_graph": {
+      "pass": true,
+      "cases": 408,
+      "replays_per_case": 2,
+      "sequence": "same captured host arguments replayed first with device scalars for one token, then requested history; compare both to CPU",
+      "max_abs": 7.584691e-06,
+      "shapes": [
+        {
+          "shape": "hd256-kv1",
+          "cases": 12,
+          "max_abs": 0.0,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv17",
+          "cases": 12,
+          "max_abs": 1.937151e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv63",
+          "cases": 12,
+          "max_abs": 1.937151e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv64",
+          "cases": 12,
+          "max_abs": 1.937151e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv65",
+          "cases": 12,
+          "max_abs": 1.937151e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv127",
+          "cases": 12,
+          "max_abs": 2.9802322e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv128",
+          "cases": 12,
+          "max_abs": 3.054738e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv129",
+          "cases": 12,
+          "max_abs": 2.9802322e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv255",
+          "cases": 12,
+          "max_abs": 5.289912e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv256",
+          "cases": 12,
+          "max_abs": 5.2154064e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv511",
+          "cases": 12,
+          "max_abs": 3.054738e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv512",
+          "cases": 12,
+          "max_abs": 3.2037497e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv513",
+          "cases": 12,
+          "max_abs": 3.1292439e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv1024",
+          "cases": 12,
+          "max_abs": 3.2782555e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv4096",
+          "cases": 12,
+          "max_abs": 3.2037497e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv4096-q16",
+          "cases": 12,
+          "max_abs": 1.937151e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd256-kv16384",
+          "cases": 12,
+          "max_abs": 3.2037497e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv1",
+          "cases": 12,
+          "max_abs": 0.0,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv17",
+          "cases": 12,
+          "max_abs": 1.4901161e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv63",
+          "cases": 12,
+          "max_abs": 1.6391277e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv64",
+          "cases": 12,
+          "max_abs": 1.6391277e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv65",
+          "cases": 12,
+          "max_abs": 1.6391277e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv127",
+          "cases": 12,
+          "max_abs": 2.3841858e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv128",
+          "cases": 12,
+          "max_abs": 2.3841858e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv129",
+          "cases": 12,
+          "max_abs": 2.3841858e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv255",
+          "cases": 12,
+          "max_abs": 2.2351742e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv256",
+          "cases": 12,
+          "max_abs": 2.0861626e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv511",
+          "cases": 12,
+          "max_abs": 7.1525574e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv512",
+          "cases": 12,
+          "max_abs": 7.1525574e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv513",
+          "cases": 12,
+          "max_abs": 7.1525574e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv1024",
+          "cases": 12,
+          "max_abs": 1.2516975e-06,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv4096",
+          "cases": 12,
+          "max_abs": 1.5646219e-06,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv4096-q16",
+          "cases": 12,
+          "max_abs": 1.4901161e-07,
+          "pass": true
+        },
+        {
+          "shape": "hd512-kv16384",
+          "cases": 12,
+          "max_abs": 7.584691e-06,
+          "pass": true
+        }
+      ]
+    },
+    "scratch_regression": {
+      "passed": 1,
+      "command": "zig build test-inference-unit -Dcuda=true -Dtest-filter='split attention plans logical context'",
+      "coverage": "warmup logical length 46 and capture length 49 use identical reserved 544-token capacity: 8 local chunks and 5 global chunks"
+    }
+  },
+  "normalization": {
+    "pass": true,
+    "cases": 81,
+    "oracle": "bitwise comparison of actual regenerated fatbin against saved original fatbin",
+    "compiler": "CUDA 13.2.86",
+    "artifact_scope": {
+      "old_kernel_count": 448,
+      "new_kernel_count": 448,
+      "changed": [
+        "termite_rms_norm_f32",
+        "termite_rms_norm_add_f32",
+        "termite_rms_norm_add_output_scale_f32"
+      ]
+    },
+    "results": [
+      {
+        "dim": 1,
+        "rows": 1,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1,
+        "rows": 1,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1,
+        "rows": 1,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1,
+        "rows": 3,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1,
+        "rows": 3,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1,
+        "rows": 3,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1,
+        "rows": 47,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1,
+        "rows": 47,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1,
+        "rows": 47,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 13,
+        "rows": 1,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 13,
+        "rows": 1,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 13,
+        "rows": 1,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 13,
+        "rows": 3,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 13,
+        "rows": 3,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 13,
+        "rows": 3,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 13,
+        "rows": 47,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 13,
+        "rows": 47,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 13,
+        "rows": 47,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 128,
+        "rows": 1,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 128,
+        "rows": 1,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 128,
+        "rows": 1,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 128,
+        "rows": 3,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 128,
+        "rows": 3,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 128,
+        "rows": 3,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 128,
+        "rows": 47,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 128,
+        "rows": 47,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 128,
+        "rows": 47,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 256,
+        "rows": 1,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 256,
+        "rows": 1,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 256,
+        "rows": 1,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 256,
+        "rows": 3,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 256,
+        "rows": 3,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 256,
+        "rows": 3,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 256,
+        "rows": 47,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 256,
+        "rows": 47,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 256,
+        "rows": 47,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 512,
+        "rows": 1,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 512,
+        "rows": 1,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 512,
+        "rows": 1,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 512,
+        "rows": 3,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 512,
+        "rows": 3,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 512,
+        "rows": 3,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 512,
+        "rows": 47,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 512,
+        "rows": 47,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 512,
+        "rows": 47,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1536,
+        "rows": 1,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1536,
+        "rows": 1,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1536,
+        "rows": 1,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1536,
+        "rows": 3,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1536,
+        "rows": 3,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1536,
+        "rows": 3,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1536,
+        "rows": 47,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1536,
+        "rows": 47,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 1536,
+        "rows": 47,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 2560,
+        "rows": 1,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 2560,
+        "rows": 1,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 2560,
+        "rows": 1,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 2560,
+        "rows": 3,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 2560,
+        "rows": 3,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 2560,
+        "rows": 3,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 2560,
+        "rows": 47,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 2560,
+        "rows": 47,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 2560,
+        "rows": 47,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 3840,
+        "rows": 1,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 3840,
+        "rows": 1,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 3840,
+        "rows": 1,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 3840,
+        "rows": 3,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 3840,
+        "rows": 3,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 3840,
+        "rows": 3,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 3840,
+        "rows": 47,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 3840,
+        "rows": 47,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 3840,
+        "rows": 47,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 4096,
+        "rows": 1,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 4096,
+        "rows": 1,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 4096,
+        "rows": 1,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 4096,
+        "rows": 3,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 4096,
+        "rows": 3,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 4096,
+        "rows": 3,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 4096,
+        "rows": 47,
+        "op": 0,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 4096,
+        "rows": 47,
+        "op": 1,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      },
+      {
+        "dim": 4096,
+        "rows": 47,
+        "op": 2,
+        "bitwise_mismatches": 0,
+        "max_abs": 0.0
+      }
+    ],
+    "gpu_smoke": {
+      "passed": 14,
+      "failed": 0,
+      "command": "ANTFLY_TEST_CUDA_GPU=1 zig build test-cuda-paged-attention-diff-tool -Dcuda=true -Doptimize=ReleaseFast",
+      "coverage": "focused attention harness unit tests and production CUDA dense primitives; E4B RMS width 2560, 3 rows, all three operations, separate and in-place outputs checked against f64 CPU oracle"
+    }
+  },
+  "performance": {
+    "previous_best_native": {
+      "artifact": ".benchmark-results/gemma4-e4b-decode/prework-tiled-f16-001/report.json",
+      "binary_sha256": "89f90ece18677f756a5ca45d48403af0adc8fd41639db7102e38449f1a04a024",
+      "environment": {
+        "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+        "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+        "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+        "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+        "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+        "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+        "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-fast",
+        "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+        "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+        "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+        "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+        "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "required-tiled64",
+        "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1"
+      },
+      "request_options": {
+        "cache_dtype": "f16",
+        "prompt_cache": false
+      },
+      "summary": {
+        "decode_tokens_per_second": 55.73917704091527,
+        "end_to_end_tokens_per_second": 48.85826604034075,
+        "ttft_seconds": 0.6605650950223207,
+        "text_hashes": [
+          "96e3eefdf570963228e88b2bbf400d17880319768324b3248e832a7c3a594517"
+        ],
+        "deterministic_text": true
+      },
+      "samples": [
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "ttft_seconds": 0.6991952699609101,
+          "decode_tokens_per_second": 55.529295872368955,
+          "end_to_end_tokens_per_second": 48.38022976549942,
+          "warmup": true
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "ttft_seconds": 0.6650395320029929,
+          "decode_tokens_per_second": 55.73917704091527,
+          "end_to_end_tokens_per_second": 48.85527735830718,
+          "warmup": false
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "ttft_seconds": 0.6597680910490453,
+          "decode_tokens_per_second": 55.80699342996735,
+          "end_to_end_tokens_per_second": 48.95653340026423,
+          "warmup": false
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "ttft_seconds": 0.6603395600104704,
+          "decode_tokens_per_second": 55.68592395990676,
+          "end_to_end_tokens_per_second": 48.85826604034075,
+          "warmup": false
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "ttft_seconds": 0.6605650950223207,
+          "decode_tokens_per_second": 55.60915429854111,
+          "end_to_end_tokens_per_second": 48.797320992636365,
+          "warmup": false
+        },
+        {
+          "usage": {
+            "prompt_tokens": 46,
+            "completion_tokens": 256,
+            "total_tokens": 302
+          },
+          "ttft_seconds": 0.6640761480666697,
+          "decode_tokens_per_second": 55.83105022416576,
+          "end_to_end_tokens_per_second": 48.93458216046741,
+          "warmup": false
+        }
+      ],
+      "gpu_before": {
+        "gpu": "NVIDIA GB10, 580.178.04, 0 %, 40, 5.27 W",
+        "processes": ""
+      },
+      "gpu_after": {
+        "gpu": "NVIDIA GB10, 580.178.04, 96 %, 51, 33.74 W",
+        "processes": "857436, [No data], 5169 MiB"
+      }
+    },
+    "matched_llama_f16": {
+      "artifact": ".benchmark-results/gemma4-e4b-decode/llama-f16-matched-001/report.json",
+      "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+      "environment": {},
+      "request_options": {
+        "cache_prompt": false
+      },
+      "summary": {
+        "decode_tokens_per_second": 68.2307008075008,
+        "end_to_end_tokens_per_second": 67.45171410312292,
+        "ttft_seconds": 0.05570608901325613,
+        "text_hashes": [
+          "13f71438c57efb333bc46021fede7d7a1373a198bb941f92f7708b8f2b78a322"
+        ],
+        "deterministic_text": true
+      },
+      "samples": [
+        {
+          "usage": {
+            "completion_tokens": 256,
+            "prompt_tokens": 46,
+            "total_tokens": 302,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "ttft_seconds": 0.12289299094118178,
+          "decode_tokens_per_second": 68.242304200094,
+          "end_to_end_tokens_per_second": 66.3265742724524,
+          "warmup": true
+        },
+        {
+          "usage": {
+            "completion_tokens": 256,
+            "prompt_tokens": 46,
+            "total_tokens": 302,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "ttft_seconds": 0.057931422954425216,
+          "decode_tokens_per_second": 68.2307008075008,
+          "end_to_end_tokens_per_second": 67.45171410312292,
+          "warmup": false
+        },
+        {
+          "usage": {
+            "completion_tokens": 256,
+            "prompt_tokens": 46,
+            "total_tokens": 302,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "ttft_seconds": 0.05570608901325613,
+          "decode_tokens_per_second": 68.23704654774895,
+          "end_to_end_tokens_per_second": 67.49750824217261,
+          "warmup": false
+        },
+        {
+          "usage": {
+            "completion_tokens": 256,
+            "prompt_tokens": 46,
+            "total_tokens": 302,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "ttft_seconds": 0.05470727803185582,
+          "decode_tokens_per_second": 67.6027989605869,
+          "end_to_end_tokens_per_second": 66.89668537929117,
+          "warmup": false
+        },
+        {
+          "usage": {
+            "completion_tokens": 256,
+            "prompt_tokens": 46,
+            "total_tokens": 302,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "ttft_seconds": 0.055981960031203926,
+          "decode_tokens_per_second": 68.27280220707708,
+          "end_to_end_tokens_per_second": 67.52741540065635,
+          "warmup": false
+        },
+        {
+          "usage": {
+            "completion_tokens": 256,
+            "prompt_tokens": 46,
+            "total_tokens": 302,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "ttft_seconds": 0.05411969590932131,
+          "decode_tokens_per_second": 67.996417130943,
+          "end_to_end_tokens_per_second": 67.29098409337897,
+          "warmup": false
+        }
+      ],
+      "gpu_before": {
+        "gpu": "NVIDIA GB10, 580.178.04, 0 %, 45, 5.63 W",
+        "processes": ""
+      },
+      "gpu_after": {
+        "gpu": "NVIDIA GB10, 580.178.04, 0 %, 52, 27.64 W",
+        "processes": ""
+      }
+    },
+    "flash_end_to_end": "Required Flash prefill and persistent decode graph replay pass functional validation and the audited matched API comparison. See matched_comparison_flash_prefill and long_context_prefill for the uncontended results.",
+    "contended_attempt": "tiled-rms-f16-001 stopped without samples when OCR and GLiNER GPU jobs resumed; excluded from throughput comparison",
+    "functional_diagnostics": [
+      {
+        "artifact": ".benchmark-results/gemma4-e4b-decode/warp-rms-replay-functional-001",
+        "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+        "environment": {
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+          "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+          "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+          "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+          "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1",
+          "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+          "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+          "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-fast",
+          "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+          "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+          "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+          "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+          "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1"
+        },
+        "summary": {
+          "decode_tokens_per_second": 62.97465557718651,
+          "end_to_end_tokens_per_second": 36.65537229110227,
+          "ttft_seconds": 0.7456095835077576,
+          "text_hashes": [
+            "92d65e4298de9a80d7968ab75bfa6c051d48df5663d044f580d422bf0bd03dc1"
+          ],
+          "deterministic_text": true
+        },
+        "completion_tokens": [
+          64,
+          64,
+          64
+        ],
+        "gpu_before": {
+          "gpu": "NVIDIA GB10, 580.178.04, 0 %, 45, 11.98 W",
+          "processes": "923576, /srv/antfly/antfly-circus/bin/antfly-detached-d5e630c1d9-dirty-261029-linux-arm64-native, 4190 MiB"
+        },
+        "gpu_after": {
+          "gpu": "NVIDIA GB10, 580.178.04, 96 %, 52, 47.48 W",
+          "processes": "923576, /srv/antfly/antfly-circus/bin/antfly-detached-d5e630c1d9-dirty-261029-linux-arm64-native, 4190 MiB\n933189, [No data], 5183 MiB\n933172, /home/tim/antfly/.worktrees/qualify-gliner2-cuda-finetuning/.benchmark-results/gliner2-cuda-finetuning/gliner25-oracle-venv/bin/python, 1071 MiB\n933215, /home/tim/antfly/.worktrees/qualify-gliner2-cuda-finetuning/zig-out/bin/antfly-inference-gliner25-cuda-training-bench, 1260 MiB"
+        },
+        "flash_active": true,
+        "persistent_replay_trace_count": 0,
+        "capture_allocation_rejection": false
+      },
+      {
+        "artifact": ".benchmark-results/gemma4-e4b-decode/warp-rms-replay-trace-001",
+        "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+        "environment": {
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+          "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_TRACE": "1",
+          "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+          "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+          "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1",
+          "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+          "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+          "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-fast",
+          "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+          "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+          "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+          "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+          "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1"
+        },
+        "summary": {
+          "decode_tokens_per_second": 67.01763379238271,
+          "end_to_end_tokens_per_second": 56.3294838637287,
+          "ttft_seconds": 0.739661114057526,
+          "text_hashes": [
+            "422fbd2025c83773f47b3aca417b8375e087d301f3e36fd11ce52ded5537718c"
+          ],
+          "deterministic_text": true
+        },
+        "completion_tokens": [
+          256
+        ],
+        "gpu_before": {
+          "gpu": "NVIDIA GB10, 580.178.04, 0 %, 47, 12.13 W",
+          "processes": "923576, /srv/antfly/antfly-circus/bin/antfly-detached-d5e630c1d9-dirty-261029-linux-arm64-native, 5150 MiB"
+        },
+        "gpu_after": {
+          "gpu": "NVIDIA GB10, 580.178.04, 96 %, 53, 37.42 W",
+          "processes": "923576, /srv/antfly/antfly-circus/bin/antfly-detached-d5e630c1d9-dirty-261029-linux-arm64-native, 5150 MiB\n933820, [No data], 5183 MiB"
+        },
+        "flash_active": true,
+        "persistent_replay_trace_count": 0,
+        "capture_allocation_rejection": false
+      },
+      {
+        "artifact": ".benchmark-results/gemma4-e4b-decode/warp-rms-replay-proven-001",
+        "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+        "environment": {
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+          "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+          "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+          "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+          "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1",
+          "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+          "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+          "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-fast",
+          "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+          "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+          "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+          "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+          "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+          "ANTFLY_INFERENCE_CUDA_GRAPH_CAPTURE_PROBE_TRACE": "1"
+        },
+        "summary": {
+          "decode_tokens_per_second": 43.03419215642942,
+          "end_to_end_tokens_per_second": 11.103901594313449,
+          "ttft_seconds": 1.0923206269508228,
+          "text_hashes": [
+            "936b22836e1521abf533f06517b35930d9b742c4413bd139c1bdb6ff4ad16c6b"
+          ],
+          "deterministic_text": true
+        },
+        "completion_tokens": [
+          16
+        ],
+        "gpu_before": {
+          "gpu": "NVIDIA GB10, 580.178.04, 96 %, 53, 29.96 W",
+          "processes": "923576, /srv/antfly/antfly-circus/bin/antfly-detached-d5e630c1d9-dirty-261029-linux-arm64-native, 6674 MiB"
+        },
+        "gpu_after": {
+          "gpu": "NVIDIA GB10, 580.178.04, 96 %, 60, 59.33 W",
+          "processes": "923576, /srv/antfly/antfly-circus/bin/antfly-detached-d5e630c1d9-dirty-261029-linux-arm64-native, 6674 MiB\n934626, [No data], 5183 MiB"
+        },
+        "flash_active": true,
+        "persistent_replay_trace_count": 11,
+        "capture_allocation_rejection": false
+      },
+      {
+        "artifact": ".benchmark-results/gemma4-e4b-decode/warp-rms-long-functional-001",
+        "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+        "environment": {
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+          "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+          "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+          "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "2048",
+          "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1",
+          "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+          "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+          "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-fast",
+          "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+          "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+          "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+          "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+          "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+          "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+          "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1"
+        },
+        "summary": {
+          "decode_tokens_per_second": 38.138196443953476,
+          "end_to_end_tokens_per_second": 9.599258165918101,
+          "ttft_seconds": 20.05056834447896,
+          "text_hashes": [
+            "591dd7c51a7625729fc1b7bb3a368f6d6381e9d835691ce97ecd837107ca31ce"
+          ],
+          "deterministic_text": true
+        },
+        "prompt_tokens": [
+          866,
+          866
+        ],
+        "completion_tokens": [
+          256,
+          256
+        ],
+        "gpu_before": {
+          "gpu": "NVIDIA GB10, 580.178.04, 94 %, 61, 39.16 W",
+          "processes": "923576, /srv/antfly/antfly-circus/bin/antfly-detached-d5e630c1d9-dirty-261029-linux-arm64-native, 6674 MiB"
+        },
+        "gpu_after": {
+          "gpu": "NVIDIA GB10, 580.178.04, 96 %, 62, 35.72 W",
+          "processes": "923576, /srv/antfly/antfly-circus/bin/antfly-detached-d5e630c1d9-dirty-261029-linux-arm64-native, 6674 MiB\n935128, [No data], 5467 MiB"
+        },
+        "flash_active": true,
+        "capture_allocation_rejection": false
+      }
+    ],
+    "provisional_native_256_tokens_per_second": 67.01763379238271,
+    "provisional_native_timing_caveat": "Historical diagnostic timings above include competing workloads; use matched_comparison_flash_prefill and long_context_prefill for the audited five-sample results.",
+    "long_context_caveat": "866-token prompt plus 256-token completions: deterministic across two runs, 36.89 and 39.39 decode tok/s with active shared GPU workloads. These are functional diagnostics, not a matched engine speed comparison.",
+    "open_gate": "All implemented-scope correctness gates pass, including the final production-binary transcription/planner run after both allocator fixes. Audited decode is 65-66 tokens/s versus 67-68 in llama.cpp; 4,298-token first-token latency is 1.049s versus 0.988s. Native remains slower on these measurements. The audio fixtures cover one clean speaker and synthetic transport regressions, not general production ASR robustness.",
+    "matched_comparison_before_bf16_prefill": {
+      "status": "passed",
+      "pairs": [
+        {
+          "prompt": "short",
+          "runs": [
+            {
+              "engine": "native",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-005/short-native",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 64.55657882186794,
+                "end_to_end_tokens_per_second": 55.54315040003261,
+                "ttft_seconds": 0.6599966150242835,
+                "text_hashes": [
+                  "422fbd2025c83773f47b3aca417b8375e087d301f3e36fd11ce52ded5537718c"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 26,
+                "owned_pids": [
+                  1018931,
+                  1018932
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+              "environment": {
+                "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-fast",
+                "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+                "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+                "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+              },
+              "request_options": {
+                "cache_dtype": "f16",
+                "prompt_cache": false
+              }
+            },
+            {
+              "engine": "llama",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-005/short-llama",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 68.68130745114006,
+                "end_to_end_tokens_per_second": 67.93261293434968,
+                "ttft_seconds": 0.054745573084801435,
+                "text_hashes": [
+                  "13f71438c57efb333bc46021fede7d7a1373a198bb941f92f7708b8f2b78a322"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 22,
+                "owned_pids": [
+                  1019167
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+              "environment": {},
+              "request_options": {
+                "cache_prompt": false
+              }
+            }
+          ],
+          "prompt_tokens": 46,
+          "native_over_llama": 0.9399439413379478
+        },
+        {
+          "prompt": "systems",
+          "runs": [
+            {
+              "engine": "llama",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-005/systems-llama",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 68.35290944298511,
+                "end_to_end_tokens_per_second": 67.53520248843446,
+                "ttft_seconds": 0.054871796048246324,
+                "text_hashes": [
+                  "c61834ea162c8cba57f8af98d1e9d4f6d537409865992edd056630a20ac6cdd7"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 22,
+                "owned_pids": [
+                  1019458
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+              "environment": {},
+              "request_options": {
+                "cache_prompt": false
+              }
+            },
+            {
+              "engine": "native",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-005/systems-native",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 64.47045863186473,
+                "end_to_end_tokens_per_second": 54.818294169561156,
+                "ttft_seconds": 0.7058966880431399,
+                "text_hashes": [
+                  "744a59a8d4771d599b0108435a439bbdd1b95c8eacff7f8d37880abfcae8661b"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 26,
+                "owned_pids": [
+                  1019691,
+                  1019692
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+              "environment": {
+                "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-fast",
+                "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+                "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+                "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+              },
+              "request_options": {
+                "cache_dtype": "f16",
+                "prompt_cache": false
+              }
+            }
+          ],
+          "prompt_tokens": 49,
+          "native_over_llama": 0.9431999187341275
+        },
+        {
+          "prompt": "long",
+          "runs": [
+            {
+              "engine": "native",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-005/long-native",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 64.19937891188276,
+                "end_to_end_tokens_per_second": 17.019749523640364,
+                "ttft_seconds": 11.051472355029546,
+                "text_hashes": [
+                  "591dd7c51a7625729fc1b7bb3a368f6d6381e9d835691ce97ecd837107ca31ce"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 75,
+                "owned_pids": [
+                  1019990,
+                  1019991
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+              "environment": {
+                "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-fast",
+                "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+                "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+                "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+              },
+              "request_options": {
+                "cache_dtype": "f16",
+                "prompt_cache": false
+              }
+            },
+            {
+              "engine": "llama",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-005/long-llama",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 66.77178794479936,
+                "end_to_end_tokens_per_second": 63.525055761642854,
+                "ttft_seconds": 0.21084020100533962,
+                "text_hashes": [
+                  "42fa13b33d0f048755cf8783323cbcd6b7fcd03f86e5b147c329556fa418af60"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 23,
+                "owned_pids": [
+                  1020731
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+              "environment": {},
+              "request_options": {
+                "cache_prompt": false
+              }
+            }
+          ],
+          "prompt_tokens": 866,
+          "native_over_llama": 0.9614746120765372
+        }
+      ],
+      "method": "same GGUF, F16 K/V, greedy 256 tokens, 1 warmup + 5 samples, prompt cache disabled; timestamped per-process GPU audit",
+      "scope": "strict GPU isolation passed on all six runs; Q4 prefill is slow; replaced by subsequent BF16+MMA candidate qualification"
+    },
+    "matched_comparison_bf16_prefill": {
+      "status": "passed",
+      "pairs": [
+        {
+          "prompt": "short",
+          "runs": [
+            {
+              "engine": "native",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-006/short-native",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 65.82402868503969,
+                "end_to_end_tokens_per_second": 64.40566923513211,
+                "ttft_seconds": 0.10047891596332192,
+                "text_hashes": [
+                  "744a2c30768fec1700691b18e26ee78fb86cebc128a2571489d91416f3fb3d67"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 22,
+                "owned_pids": [
+                  1026051,
+                  1026052
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/zig/pkg/inference/zig-out/bin/antfly-inference-http-server",
+                "run",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "53733",
+                "--models-dir",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models",
+                "--preload-model",
+                "generator:cuda:google/gemma-4-E4B-it-qat-q4_0-gguf",
+                "--max-work-units",
+                "256",
+                "--max-concurrent-requests",
+                "2"
+              ],
+              "environment": {
+                "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "mma",
+                "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+                "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "1",
+                "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
+                "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16": "1",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+                "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+              },
+              "request_options": {
+                "cache_dtype": "f16",
+                "prompt_cache": false
+              }
+            },
+            {
+              "engine": "llama",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-006/short-llama",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 68.69094288898563,
+                "end_to_end_tokens_per_second": 67.8640257283366,
+                "ttft_seconds": 0.05330943898297846,
+                "text_hashes": [
+                  "13f71438c57efb333bc46021fede7d7a1373a198bb941f92f7708b8f2b78a322"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 22,
+                "owned_pids": [
+                  1026287
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/llama.cpp/build/bin/llama-server",
+                "-m",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models/generators/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "39329",
+                "-ngl",
+                "99",
+                "-np",
+                "1",
+                "-c",
+                "8192",
+                "-b",
+                "2048",
+                "-ub",
+                "2048",
+                "-ctk",
+                "f16",
+                "-ctv",
+                "f16",
+                "-t",
+                "8",
+                "--reasoning-format",
+                "none"
+              ],
+              "environment": {},
+              "request_options": {
+                "cache_prompt": false
+              }
+            }
+          ],
+          "prompt_tokens": 46,
+          "native_over_llama": 0.9582635776512883
+        },
+        {
+          "prompt": "systems",
+          "runs": [
+            {
+              "engine": "llama",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-006/systems-llama",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 67.87324165307297,
+                "end_to_end_tokens_per_second": 67.15536628754874,
+                "ttft_seconds": 0.055367564084008336,
+                "text_hashes": [
+                  "c61834ea162c8cba57f8af98d1e9d4f6d537409865992edd056630a20ac6cdd7"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 22,
+                "owned_pids": [
+                  1026559
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/llama.cpp/build/bin/llama-server",
+                "-m",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models/generators/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "56631",
+                "-ngl",
+                "99",
+                "-np",
+                "1",
+                "-c",
+                "8192",
+                "-b",
+                "2048",
+                "-ub",
+                "2048",
+                "-ctk",
+                "f16",
+                "-ctv",
+                "f16",
+                "-t",
+                "8",
+                "--reasoning-format",
+                "none"
+              ],
+              "environment": {},
+              "request_options": {
+                "cache_prompt": false
+              }
+            },
+            {
+              "engine": "native",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-006/systems-native",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 65.95079535346761,
+                "end_to_end_tokens_per_second": 64.50129168754981,
+                "ttft_seconds": 0.10239239491056651,
+                "text_hashes": [
+                  "bff7aeec1d721ccfa9646d6323e6e2b920cc5ccffd941ac42d0b7f65fdf6de5a"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 22,
+                "owned_pids": [
+                  1026776,
+                  1026777
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/zig/pkg/inference/zig-out/bin/antfly-inference-http-server",
+                "run",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "53979",
+                "--models-dir",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models",
+                "--preload-model",
+                "generator:cuda:google/gemma-4-E4B-it-qat-q4_0-gguf",
+                "--max-work-units",
+                "256",
+                "--max-concurrent-requests",
+                "2"
+              ],
+              "environment": {
+                "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "mma",
+                "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+                "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "1",
+                "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
+                "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16": "1",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+                "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+              },
+              "request_options": {
+                "cache_dtype": "f16",
+                "prompt_cache": false
+              }
+            }
+          ],
+          "prompt_tokens": 49,
+          "native_over_llama": 0.9716759321820558
+        },
+        {
+          "prompt": "long",
+          "runs": [
+            {
+              "engine": "native",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-006/long-native",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 65.5781336981897,
+                "end_to_end_tokens_per_second": 61.166386804223585,
+                "ttft_seconds": 0.29738700797315687,
+                "text_hashes": [
+                  "591dd7c51a7625729fc1b7bb3a368f6d6381e9d835691ce97ecd837107ca31ce"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 23,
+                "owned_pids": [
+                  1027026,
+                  1027027
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/zig/pkg/inference/zig-out/bin/antfly-inference-http-server",
+                "run",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "41529",
+                "--models-dir",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models",
+                "--preload-model",
+                "generator:cuda:google/gemma-4-E4B-it-qat-q4_0-gguf",
+                "--max-work-units",
+                "256",
+                "--max-concurrent-requests",
+                "2"
+              ],
+              "environment": {
+                "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "mma",
+                "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+                "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "1",
+                "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
+                "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16": "1",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+                "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+              },
+              "request_options": {
+                "cache_dtype": "f16",
+                "prompt_cache": false
+              }
+            },
+            {
+              "engine": "llama",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-006/long-llama",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 66.23873751115212,
+                "end_to_end_tokens_per_second": 63.02670767071237,
+                "ttft_seconds": 0.21197777101770043,
+                "text_hashes": [
+                  "42fa13b33d0f048755cf8783323cbcd6b7fcd03f86e5b147c329556fa418af60"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 24,
+                "owned_pids": [
+                  1027253
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/llama.cpp/build/bin/llama-server",
+                "-m",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models/generators/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "38975",
+                "-ngl",
+                "99",
+                "-np",
+                "1",
+                "-c",
+                "8192",
+                "-b",
+                "2048",
+                "-ub",
+                "2048",
+                "-ctk",
+                "f16",
+                "-ctv",
+                "f16",
+                "-t",
+                "8",
+                "--reasoning-format",
+                "none"
+              ],
+              "environment": {},
+              "request_options": {
+                "cache_prompt": false
+              }
+            }
+          ],
+          "prompt_tokens": 866,
+          "native_over_llama": 0.990026926270278
+        }
+      ],
+      "method": "same GGUF, F16 K/V, greedy 256 tokens, 1 warmup + 5 samples, prompt cache disabled; timestamped per-process GPU audit"
+    },
+    "current_measured_profile": "gemma4_e4b_qat_gb10.env: hybrid BF16 prefill weight mirrors, required E4B Flash prefill, F16 KV, opt-in E4B Flash-style split decode and persistent graph replay",
+    "matched_comparison_flash_prefill": {
+      "status": "passed",
+      "pairs": [
+        {
+          "prompt": "short",
+          "runs": [
+            {
+              "engine": "native",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-007/short-native",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 65.63477413004146,
+                "end_to_end_tokens_per_second": 64.18723747671598,
+                "ttft_seconds": 0.09933073201682419,
+                "text_hashes": [
+                  "09bf8c75e39a10793bb69c3a5760b678ce245cbfa0c79c4c2fd354e24d3a97ff"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 23,
+                "owned_pids": [
+                  1092276,
+                  1092277
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "cb46379a81686388f0cec83a6153241e8ac960b788cb895774bd52a0bc53961e",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/zig/pkg/inference/zig-out/bin/antfly-inference-http-server",
+                "run",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "36503",
+                "--models-dir",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models",
+                "--preload-model",
+                "generator:cuda:google/gemma-4-E4B-it-qat-q4_0-gguf",
+                "--max-work-units",
+                "256",
+                "--max-concurrent-requests",
+                "2"
+              ],
+              "environment": {
+                "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-flash-f16-sm89",
+                "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+                "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "1",
+                "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
+                "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16": "1",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+                "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+              },
+              "request_options": {
+                "cache_dtype": "f16",
+                "prompt_cache": false
+              }
+            },
+            {
+              "engine": "llama",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-007/short-llama",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 67.19821098013637,
+                "end_to_end_tokens_per_second": 66.49977631747016,
+                "ttft_seconds": 0.054897205089218915,
+                "text_hashes": [
+                  "13f71438c57efb333bc46021fede7d7a1373a198bb941f92f7708b8f2b78a322"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 22,
+                "owned_pids": [
+                  1092575
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/llama.cpp/build/bin/llama-server",
+                "-m",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models/generators/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "54917",
+                "-ngl",
+                "99",
+                "-np",
+                "1",
+                "-c",
+                "8192",
+                "-b",
+                "2048",
+                "-ub",
+                "2048",
+                "-ctk",
+                "f16",
+                "-ctv",
+                "f16",
+                "-t",
+                "8",
+                "--reasoning-format",
+                "none"
+              ],
+              "environment": {},
+              "request_options": {
+                "cache_prompt": false
+              }
+            }
+          ],
+          "prompt_tokens": 46,
+          "native_over_llama": 0.9767339512869315
+        },
+        {
+          "prompt": "systems",
+          "runs": [
+            {
+              "engine": "llama",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-007/systems-llama",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 67.86587137550617,
+                "end_to_end_tokens_per_second": 67.12561618203273,
+                "ttft_seconds": 0.05508075898978859,
+                "text_hashes": [
+                  "c61834ea162c8cba57f8af98d1e9d4f6d537409865992edd056630a20ac6cdd7"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 22,
+                "owned_pids": [
+                  1092815
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/llama.cpp/build/bin/llama-server",
+                "-m",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models/generators/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "52993",
+                "-ngl",
+                "99",
+                "-np",
+                "1",
+                "-c",
+                "8192",
+                "-b",
+                "2048",
+                "-ub",
+                "2048",
+                "-ctk",
+                "f16",
+                "-ctv",
+                "f16",
+                "-t",
+                "8",
+                "--reasoning-format",
+                "none"
+              ],
+              "environment": {},
+              "request_options": {
+                "cache_prompt": false
+              }
+            },
+            {
+              "engine": "native",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-007/systems-native",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 65.72942551345913,
+                "end_to_end_tokens_per_second": 64.34163484254242,
+                "ttft_seconds": 0.09740724298171699,
+                "text_hashes": [
+                  "2208342c8c5b151c18cb74014cd757027c5c74743a56227a47efdae243f6e4d0"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 22,
+                "owned_pids": [
+                  1093044,
+                  1093045
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "cb46379a81686388f0cec83a6153241e8ac960b788cb895774bd52a0bc53961e",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/zig/pkg/inference/zig-out/bin/antfly-inference-http-server",
+                "run",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "48633",
+                "--models-dir",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models",
+                "--preload-model",
+                "generator:cuda:google/gemma-4-E4B-it-qat-q4_0-gguf",
+                "--max-work-units",
+                "256",
+                "--max-concurrent-requests",
+                "2"
+              ],
+              "environment": {
+                "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-flash-f16-sm89",
+                "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+                "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "1",
+                "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
+                "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16": "1",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+                "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+              },
+              "request_options": {
+                "cache_dtype": "f16",
+                "prompt_cache": false
+              }
+            }
+          ],
+          "prompt_tokens": 49,
+          "native_over_llama": 0.9685195840155658
+        },
+        {
+          "prompt": "long",
+          "runs": [
+            {
+              "engine": "native",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-007/long-native",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 64.95469268147781,
+                "end_to_end_tokens_per_second": 61.53579473007571,
+                "ttft_seconds": 0.23265962407458574,
+                "text_hashes": [
+                  "bfb9f496ac41a406e1c4ee7cbc8ffd850ab12306227132616dbf826242e007d2"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 23,
+                "owned_pids": [
+                  1093311,
+                  1093312
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "cb46379a81686388f0cec83a6153241e8ac960b788cb895774bd52a0bc53961e",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/zig/pkg/inference/zig-out/bin/antfly-inference-http-server",
+                "run",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "53697",
+                "--models-dir",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models",
+                "--preload-model",
+                "generator:cuda:google/gemma-4-E4B-it-qat-q4_0-gguf",
+                "--max-work-units",
+                "256",
+                "--max-concurrent-requests",
+                "2"
+              ],
+              "environment": {
+                "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-flash-f16-sm89",
+                "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+                "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "1",
+                "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
+                "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16": "1",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+                "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+              },
+              "request_options": {
+                "cache_dtype": "f16",
+                "prompt_cache": false
+              }
+            },
+            {
+              "engine": "llama",
+              "directory": ".benchmark-results/gemma4-e4b-decode/matched-comparison-007/long-llama",
+              "returncode": 0,
+              "summary": {
+                "decode_tokens_per_second": 67.08889833974325,
+                "end_to_end_tokens_per_second": 63.785167092280986,
+                "ttft_seconds": 0.2093717190437019,
+                "text_hashes": [
+                  "42fa13b33d0f048755cf8783323cbcd6b7fcd03f86e5b147c329556fa418af60"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  256,
+                  256,
+                  256,
+                  256,
+                  256
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 23,
+                "owned_pids": [
+                  1093582
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/llama.cpp/build/bin/llama-server",
+                "-m",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models/generators/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "39851",
+                "-ngl",
+                "99",
+                "-np",
+                "1",
+                "-c",
+                "8192",
+                "-b",
+                "2048",
+                "-ub",
+                "2048",
+                "-ctk",
+                "f16",
+                "-ctv",
+                "f16",
+                "-t",
+                "8",
+                "--reasoning-format",
+                "none"
+              ],
+              "environment": {},
+              "request_options": {
+                "cache_prompt": false
+              }
+            }
+          ],
+          "prompt_tokens": 866,
+          "native_over_llama": 0.968188393145798
+        }
+      ],
+      "method": "same GGUF, F16 K/V, greedy 256 tokens, 1 warmup + 5 samples, prompt cache disabled; timestamped per-process GPU audit"
+    },
+    "long_context_prefill": {
+      "status": "passed",
+      "pairs": [
+        {
+          "prompt_file": ".benchmark-results/gemma4-e4b-decode/prefill-long-context-002/prompt-2.txt",
+          "runs": [
+            {
+              "engine": "native",
+              "returncode": 0,
+              "directory": ".benchmark-results/gemma4-e4b-decode/prefill-long-context-002/2-native",
+              "summary": {
+                "decode_tokens_per_second": 63.247522466673054,
+                "end_to_end_tokens_per_second": 34.17257504207582,
+                "ttft_seconds": 0.4465336080174893,
+                "text_hashes": [
+                  "a8ce2f848e1e1412cd96494379c733629e208967e241ff1e2698ad3ead8517a1"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  32,
+                  32,
+                  32,
+                  32,
+                  32
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 7,
+                "owned_pids": [
+                  1094643,
+                  1094644
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "prompt_tokens": 1724,
+              "binary_sha256": "cb46379a81686388f0cec83a6153241e8ac960b788cb895774bd52a0bc53961e",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/zig/pkg/inference/zig-out/bin/antfly-inference-http-server",
+                "run",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "55883",
+                "--models-dir",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models",
+                "--preload-model",
+                "generator:cuda:google/gemma-4-E4B-it-qat-q4_0-gguf",
+                "--max-work-units",
+                "256",
+                "--max-concurrent-requests",
+                "2"
+              ],
+              "environment": {
+                "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "8192",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-flash-f16-sm89",
+                "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+                "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "1",
+                "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
+                "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16": "1",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+                "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+              },
+              "request_options": {
+                "cache_dtype": "f16",
+                "prompt_cache": false
+              }
+            },
+            {
+              "engine": "llama",
+              "returncode": 0,
+              "directory": ".benchmark-results/gemma4-e4b-decode/prefill-long-context-002/2-llama",
+              "summary": {
+                "decode_tokens_per_second": 65.37003515052527,
+                "end_to_end_tokens_per_second": 37.038138790960666,
+                "ttft_seconds": 0.39045459392946213,
+                "text_hashes": [
+                  "a8ce2f848e1e1412cd96494379c733629e208967e241ff1e2698ad3ead8517a1"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  32,
+                  32,
+                  32,
+                  32,
+                  32
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 8,
+                "owned_pids": [
+                  1094760
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "prompt_tokens": 1724,
+              "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/llama.cpp/build/bin/llama-server",
+                "-m",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models/generators/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "48819",
+                "-ngl",
+                "99",
+                "-np",
+                "1",
+                "-c",
+                "8192",
+                "-b",
+                "2048",
+                "-ub",
+                "2048",
+                "-ctk",
+                "f16",
+                "-ctv",
+                "f16",
+                "-t",
+                "8",
+                "--reasoning-format",
+                "none"
+              ],
+              "environment": {},
+              "request_options": {
+                "cache_prompt": false
+              }
+            }
+          ]
+        },
+        {
+          "prompt_file": ".benchmark-results/gemma4-e4b-decode/prefill-long-context-002/prompt-5.txt",
+          "runs": [
+            {
+              "engine": "native",
+              "returncode": 0,
+              "directory": ".benchmark-results/gemma4-e4b-decode/prefill-long-context-002/5-native",
+              "summary": {
+                "decode_tokens_per_second": 62.01135092131373,
+                "end_to_end_tokens_per_second": 20.658704058129302,
+                "ttft_seconds": 1.0490264159161597,
+                "text_hashes": [
+                  "a8ce2f848e1e1412cd96494379c733629e208967e241ff1e2698ad3ead8517a1"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  32,
+                  32,
+                  32,
+                  32,
+                  32
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 10,
+                "owned_pids": [
+                  1094885,
+                  1094886
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "prompt_tokens": 4298,
+              "binary_sha256": "cb46379a81686388f0cec83a6153241e8ac960b788cb895774bd52a0bc53961e",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/zig/pkg/inference/zig-out/bin/antfly-inference-http-server",
+                "run",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "56417",
+                "--models-dir",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models",
+                "--preload-model",
+                "generator:cuda:google/gemma-4-E4B-it-qat-q4_0-gguf",
+                "--max-work-units",
+                "256",
+                "--max-concurrent-requests",
+                "2"
+              ],
+              "environment": {
+                "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+                "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "8192",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+                "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+                "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-flash-f16-sm89",
+                "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+                "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+                "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+                "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+                "ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "1",
+                "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
+                "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16": "1",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+                "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+                "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+                "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+              },
+              "request_options": {
+                "cache_dtype": "f16",
+                "prompt_cache": false
+              }
+            },
+            {
+              "engine": "llama",
+              "returncode": 0,
+              "directory": ".benchmark-results/gemma4-e4b-decode/prefill-long-context-002/5-llama",
+              "summary": {
+                "decode_tokens_per_second": 62.90392218463508,
+                "end_to_end_tokens_per_second": 21.602253987982195,
+                "ttft_seconds": 0.9884580220095813,
+                "text_hashes": [
+                  "a8ce2f848e1e1412cd96494379c733629e208967e241ff1e2698ad3ead8517a1"
+                ],
+                "deterministic_text": true,
+                "completion_tokens": [
+                  32,
+                  32,
+                  32,
+                  32,
+                  32
+                ]
+              },
+              "gpu_activity": {
+                "observed_seconds": 11,
+                "owned_pids": [
+                  1095017
+                ],
+                "competing_activity": [],
+                "unknown_external_activity": [],
+                "quiet": true,
+                "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+              },
+              "prompt_tokens": 4298,
+              "binary_sha256": "6b25f199155cb27c56cc145ce455251e0a891d7ab9d6b3206b95b66f1cda89bc",
+              "harness_sha256": "98b9accd016ef2e8c19e34be8df172cbc8b4bb06a32bd0fa0e82f38cba94ff87",
+              "command": [
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/llama.cpp/build/bin/llama-server",
+                "-m",
+                "/home/tim/antfly/.worktrees/feat-read-gemma2-media/.benchmark-results/gemma4-e4b-transcription/models/generators/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "33991",
+                "-ngl",
+                "99",
+                "-np",
+                "1",
+                "-c",
+                "8192",
+                "-b",
+                "2048",
+                "-ub",
+                "2048",
+                "-ctk",
+                "f16",
+                "-ctv",
+                "f16",
+                "-t",
+                "8",
+                "--reasoning-format",
+                "none"
+              ],
+              "environment": {},
+              "request_options": {
+                "cache_prompt": false
+              }
+            }
+          ]
+        }
+      ],
+      "method": "same QAT GGUF, F16 KV, 1 warmup + 5 samples, 32 completion tokens; disabled prompt caching, audited quiet GPU, TTFT includes prompt processing and first-token overhead"
+    }
+  },
+  "source_sha256": {
+    "zig/pkg/inference/src/ops/cuda/kernels.zig": "f802b9f60b9395e50a447b9639aba18bb257a7c36802b27fc628c7d557a6e1d9",
+    "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "51d3c4c62480b38bb624000e31653efaf397c24b27313eb72555abf639fbc2ce",
+    "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu": "8d55e1617be49913e5ee00d928a2a5be82b2a875440a2e045d4992a0d59a8ddf",
+    "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.ptx": "870ba8532339cbef6ed98e47d900ff437b5e21beebecd4a0810de1fbc9a475cf",
+    "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.fatbin": "b76173e99b3736a75a0bfe2a325390cfcc4d26d688657f9e2363d41818585b63",
+    "zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels_sm89.cubin": "be5e4fcd643feda4c371c19342ae29d7b8e7b2327d2b5a762ec9adff7dac1232",
+    "zig/pkg/inference/src/quant_kernel_cuda_paged_attention_diff.zig": "d64271a7791291cf08533f8c93ab3ecac9c74e90b856876f9f6bd9fdd3571468",
+    "zig/pkg/inference/src/architectures/session_factory.zig": "52ab04bb76f82ee4fed1a1e274fdd9a6b31e836488c816fc2184fecb525c322c",
+    "zig/pkg/inference/src/server/server.zig": "d694b5dc1d0af1806024f72b8ba4a6b16d6f0bc96e40a1eae1634ff948102c5d",
+    "zig/pkg/inference/scripts/gemma4/gemma4_e4b_qat_gb10.env": "53c928d05c222e9591b5131a7edb8461fcc18bcf3dcccd461562afebe5d265a8",
+    "zig/pkg/inference/src/architectures/gemma4_projector.zig": "ea827136d52448a1af40293ea3a9d19f9b809a4120cf3b23d5a812281ecb94ff",
+    "zig/pkg/inference/src/quant_kernel_cuda_flash_prefill_prototype.zig": "e99b13d886ce0c571cb58de7a14ee181c11584dc243260e32f86cacf1f79944b",
+    "zig/pkg/inference/scripts/gemma4/qualify_transcription.py": "bda15f1a4b3731abb033fdb2fad251fdccb3dea88d6a955325109cbf313aaf64",
+    "zig/pkg/inference/src/documents/service.zig": "eb06141149c925452bc0f4db4cd5bf80529d73abd1a087edd8f210a51c530356",
+    "zig/pkg/inference/src/backends/metal_kv_storage.zig": "cf66452dcb869971976d609427a57cde2cff2ee244e2fa7c27c8bc63d5275ba4"
+  },
+  "validation_tests": {
+    "harness_and_gpu_primitives": {
+      "passed": 14,
+      "failed": 0
+    },
+    "dispatch_bounds": {
+      "passed": 2,
+      "failed": 0
+    },
+    "scratch_capacity": {
+      "passed": 1,
+      "failed": 0
+    },
+    "python_stream_and_scoring": {
+      "passed": 6,
+      "failed": 0
+    },
+    "read_audio_documents": {
+      "passed": 304,
+      "skipped": 29,
+      "failed": 0,
+      "note": "Broader read/document suite after restoring Qwen measured aggregate usage; final duration and dispatch changes have an additional targeted pass."
+    },
+    "final_kv_audio_prefill_targets": {
+      "passed": 18,
+      "failed": 0,
+      "skipped": 0
+    },
+    "prefill_oracle_harness": {
+      "passed": 11,
+      "failed": 0
+    },
+    "sdks": {
+      "go": "go test ./... passed with Go 1.27.1",
+      "python": {
+        "passed": 773
+      },
+      "typescript": "SDK typecheck passed",
+      "rust": "cargo test -p antfly-sdk: 25 passed with Rust 1.91.1, worktree-local toolchain and rs/target"
+    },
+    "gateway": {
+      "passed": 67,
+      "failed": 0,
+      "leaked": 0
+    },
+    "durable_document_jobs": {
+      "passed": 4,
+      "failed": 0,
+      "leaked": 0,
+      "overlaps_gateway_tests": true
+    },
+    "audio_allocator_targets": {
+      "passed": 16,
+      "failed": 0
+    },
+    "allocation_owner_regressions": {
+      "passed": 2,
+      "failed": 0,
+      "scope": "CUDA hook owner and document transient-work reclamation; Metal analogue added but not run on Metal hardware"
+    }
+  },
+  "build": {
+    "http_server": "ReleaseFast, CUDA fatbin, stripped; rebuilt successfully with document work-memory and CUDA KV-hook allocation-ownership fixes.",
+    "cache_cleanup": "Final make gc completed successfully after production qualification; removed 0.0G, 3167.6G free.",
+    "binary_sha256": "8f2ad201d3f6b530fa0bde225b49db940b4de84087ff2aff342073689e05ba11"
+  },
+  "audio_encoder_official_reference": {
+    "runtime": "transformers 5.22.0 / torch 2.10.0 CPU",
+    "scope": "same GGUF projector weights restored to HF names, inverted converted softplus query scales, identical 16 kHz PCM",
+    "result": {
+      "audio_layer_5": {
+        "cosine": 0.9999999999279049,
+        "relative_l2": 1.2008004309396718e-05,
+        "max_abs": 0.003143310546875
+      },
+      "audio_layer_10": {
+        "cosine": 0.999999999898108,
+        "relative_l2": 1.4280494253017153e-05,
+        "max_abs": 0.00473785400390625
+      },
+      "audio_layer_6": {
+        "cosine": 0.999999999960906,
+        "relative_l2": 8.842682260212164e-06,
+        "max_abs": 0.0023336410522460938
+      },
+      "audio_0_self_attn": {
+        "cosine": 0.9999999999315995,
+        "relative_l2": 1.1696244982762874e-05,
+        "max_abs": 0.0017304420471191406
+      },
+      "audio_0_feed_forward1": {
+        "cosine": 0.9999999993810675,
+        "relative_l2": 3.520422974842172e-05,
+        "max_abs": 0.0025501251220703125
+      },
+      "audio_layer_0": {
+        "cosine": 0.9999999998773703,
+        "relative_l2": 1.566152126284786e-05,
+        "max_abs": 0.0022146999835968018
+      },
+      "audio_layer_9": {
+        "cosine": 0.9999999998840137,
+        "relative_l2": 1.5230763889664965e-05,
+        "max_abs": 0.0042858123779296875
+      },
+      "audio_layer_8": {
+        "cosine": 0.999999999930958,
+        "relative_l2": 1.1751989090205567e-05,
+        "max_abs": 0.00377655029296875
+      },
+      "audio_layer_2": {
+        "cosine": 0.9999999999595166,
+        "relative_l2": 8.998242831457873e-06,
+        "max_abs": 0.0011658668518066406
+      },
+      "audio_layer_7": {
+        "cosine": 0.9999999999724815,
+        "relative_l2": 7.418660619641586e-06,
+        "max_abs": 0.0020236968994140625
+      },
+      "audio_output": {
+        "cosine": 0.9999999997635276,
+        "relative_l2": 2.174723169216053e-05,
+        "max_abs": 0.001964569091796875
+      },
+      "audio_projected": {
+        "cosine": 0.9999999997885993,
+        "relative_l2": 2.056213810117843e-05,
+        "max_abs": 0.0010762214660644531
+      },
+      "audio_layer_11": {
+        "cosine": 0.9999999997540041,
+        "relative_l2": 2.218085356744309e-05,
+        "max_abs": 0.002556324005126953
+      },
+      "audio_subsample": {
+        "cosine": 0.9999999993985219,
+        "relative_l2": 3.4695586337091454e-05,
+        "max_abs": 0.001525580883026123
+      },
+      "audio_layer_3": {
+        "cosine": 0.9999999999559055,
+        "relative_l2": 9.391943712410001e-06,
+        "max_abs": 0.0016298294067382812
+      },
+      "audio_0_lconv1d": {
+        "cosine": 0.9999999997165235,
+        "relative_l2": 2.38203713940074e-05,
+        "max_abs": 0.0026702880859375
+      },
+      "audio_layer_4": {
+        "cosine": 0.999999999919458,
+        "relative_l2": 1.2691914753911998e-05,
+        "max_abs": 0.0025091171264648438
+      },
+      "audio_features": {
+        "cosine": 0.9999999996907064,
+        "relative_l2": 2.4872027334937524e-05,
+        "max_abs": 0.0013942718505859375
+      },
+      "audio_0_feed_forward2": {
+        "cosine": 0.9999999996101306,
+        "relative_l2": 2.7927634402624934e-05,
+        "max_abs": 0.0040740966796875
+      },
+      "audio_layer_1": {
+        "cosine": 0.9999999999522764,
+        "relative_l2": 9.772809370789501e-06,
+        "max_abs": 0.0019221901893615723
+      }
+    },
+    "note": "Native log(mel + floor) matches the official HF frontend. The pinned llama.cpp frontend uses log(max(mel, floor)); its differing embeddings are not evidence that native should change its floor formula.",
+    "source": "https://github.com/huggingface/transformers/blob/v5.22.0/src/transformers/models/gemma4/feature_extraction_gemma4.py"
+  },
+  "kv_policy": {
+    "default": "F16 for Gemma 4 CUDA text and audio; native CPU stays F32. Explicit generate cache_dtype remains available. Older Gemma CUDA models retain F32.",
+    "reason": "F16 enables the optimized resident paged attention path. Polar4 degraded Spanish transcription; F32 did not improve the five-clip KV probe transcripts.",
+    "targeted_tests": {
+      "passed": 12,
+      "failed": 0
+    },
+    "comparison": {
+      "method": "same binary/model/optimized profile; explicit F16 versus F32 KV, 256 tokens, 1 warmup + 5 samples, audited quiet GPU",
+      "runs": [
+        {
+          "cache_dtype": "f16",
+          "returncode": 0,
+          "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+          "environment": {
+            "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+            "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+            "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+            "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+            "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+            "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+            "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+            "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "mma",
+            "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+            "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+            "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+            "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+            "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "1",
+            "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
+            "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16": "1",
+            "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+            "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+            "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+            "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+            "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+          },
+          "request_options": {
+            "cache_dtype": "f16",
+            "prompt_cache": false
+          },
+          "summary": {
+            "decode_tokens_per_second": 65.47745464323849,
+            "end_to_end_tokens_per_second": 64.08481737723557,
+            "ttft_seconds": 0.10060080501716584,
+            "text_hashes": [
+              "744a2c30768fec1700691b18e26ee78fb86cebc128a2571489d91416f3fb3d67"
+            ],
+            "deterministic_text": true,
+            "completion_tokens": [
+              256,
+              256,
+              256,
+              256,
+              256
+            ]
+          },
+          "gpu_activity": {
+            "observed_seconds": 22,
+            "owned_pids": [
+              1030756,
+              1030757
+            ],
+            "competing_activity": [],
+            "unknown_external_activity": [],
+            "quiet": true,
+            "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+          }
+        },
+        {
+          "cache_dtype": "f32",
+          "returncode": 0,
+          "binary_sha256": "ca2759b7591a42938b06d1e84c37fb69bc6e9757061f0c8c30ca526e0e8533eb",
+          "environment": {
+            "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY": "required",
+            "ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY": "1",
+            "ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC": "1",
+            "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS": "1",
+            "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": "544",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8": "1",
+            "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
+            "ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING": "1",
+            "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "mma",
+            "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+            "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN": "1",
+            "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS": "0",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN": "1",
+            "ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS": "1",
+            "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK": "1",
+            "ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL": "1",
+            "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR": "1",
+            "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16": "1",
+            "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
+            "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER": "serial",
+            "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "1",
+            "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK": "64",
+            "ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT": "1"
+          },
+          "request_options": {
+            "cache_dtype": "f32",
+            "prompt_cache": false
+          },
+          "summary": {
+            "decode_tokens_per_second": 37.57965319221226,
+            "end_to_end_tokens_per_second": 36.6732403712992,
+            "ttft_seconds": 0.20462392398621887,
+            "text_hashes": [
+              "d0ecfa25ef74cb0b5baa87d01836ddeee653b1dd8cf3f882e5a2cdfc67ed2824"
+            ],
+            "deterministic_text": true,
+            "completion_tokens": [
+              256,
+              256,
+              256,
+              256,
+              256
+            ]
+          },
+          "gpu_activity": {
+            "observed_seconds": 36,
+            "owned_pids": [
+              1030945,
+              1030946
+            ],
+            "competing_activity": [],
+            "unknown_external_activity": [],
+            "quiet": true,
+            "scope": "measured samples plus a conservative one-second margin; graphics processes excluded"
+          }
+        }
+      ]
+    },
+    "short_clip_accuracy_diagnostic": {
+      "corpus_clips": 73,
+      "audio_seconds": 481.034875,
+      "corpus_errors": 96,
+      "reference_words": 1150,
+      "corpus_wer": 0.08347826086956522,
+      "spanish_8khz_wer": 0.18181818181818182,
+      "silent_audio_generated_words": 0,
+      "direct_planner_normalized_parity": true,
+      "qualification": false,
+      "reason": "This is the first rebuilt F16-default binary. The diagnostic deferred the known GGUF duration-policy failure; the final binary must pass the full harness including duration rejection."
+    }
+  },
+  "prefill_template_probe": {
+    "status": "passed",
+    "scope": "Historical standalone E4B kernel compiled from the production template for SM121; superseded by the actual production-fatbin oracle in prefill and audited API dispatch/performance checks.",
+    "cases": 270,
+    "query_prefix_pairs": [
+      [
+        2,
+        0
+      ],
+      [
+        17,
+        0
+      ],
+      [
+        63,
+        0
+      ],
+      [
+        64,
+        0
+      ],
+      [
+        65,
+        0
+      ],
+      [
+        511,
+        0
+      ],
+      [
+        512,
+        0
+      ],
+      [
+        513,
+        0
+      ],
+      [
+        1024,
+        0
+      ],
+      [
+        2048,
+        0
+      ],
+      [
+        4096,
+        0
+      ],
+      [
+        8192,
+        0
+      ],
+      [
+        3,
+        511
+      ],
+      [
+        65,
+        4096
+      ],
+      [
+        2,
+        32766
+      ]
+    ],
+    "head_dims": [
+      256,
+      512
+    ],
+    "page_layouts": [
+      "identity-null",
+      "explicit-reversed",
+      "explicit-permuted"
+    ],
+    "patterns": [
+      "random",
+      "near-tie",
+      "cancellation"
+    ],
+    "max_abs": 0.0001245737075806,
+    "max_normalized_rms": 0.0004109623564801,
+    "max_cpu_oracle_abs": 4.619359970093e-07,
+    "all_guards_unchanged_and_deterministic": true,
+    "gates": {
+      "require_bitwise_candidate": false,
+      "max_abs": 0.005,
+      "max_rms_normalized": 0.001,
+      "cpu_sample_max_abs": 0.0005,
+      "max_timing_cv": 0.1
+    },
+    "artifacts": {
+      "candidate_sha256": "7118ad68d51aa3c1b5c1ac14fc1b2a27dd2882efcfbb4b875fb499a7e2c0ebba",
+      "baseline_sha256": "7118ad68d51aa3c1b5c1ac14fc1b2a27dd2882efcfbb4b875fb499a7e2c0ebba"
+    },
+    "compute_capability": "12.1",
+    "legacy_raw_harness_architecture_label": "sm_89; actual recorded compute_capability is 12.1. The harness now formats the architecture label from the device.",
+    "method": "Candidate and GPU scalar oracle receive identical guarded buffers. Scalar reference is checked against sampled CPU rows; outputs and input immutability are checked across all cases."
+  },
+  "prefill": {
+    "status": "passed",
+    "scope": "actual production fatbin E4B symbols, independent GPU scalar + sampled CPU oracle; direct launch (API routing checked separately)",
+    "cases": 270,
+    "query_prefix_pairs": [
+      [
+        2,
+        0
+      ],
+      [
+        17,
+        0
+      ],
+      [
+        63,
+        0
+      ],
+      [
+        64,
+        0
+      ],
+      [
+        65,
+        0
+      ],
+      [
+        511,
+        0
+      ],
+      [
+        512,
+        0
+      ],
+      [
+        513,
+        0
+      ],
+      [
+        1024,
+        0
+      ],
+      [
+        2048,
+        0
+      ],
+      [
+        4096,
+        0
+      ],
+      [
+        8192,
+        0
+      ],
+      [
+        3,
+        511
+      ],
+      [
+        65,
+        4096
+      ],
+      [
+        2,
+        32766
+      ]
+    ],
+    "head_dims": [
+      256,
+      512
+    ],
+    "page_layouts": [
+      "identity-null",
+      "explicit-reversed",
+      "explicit-permuted"
+    ],
+    "patterns": [
+      "random",
+      "near-tie",
+      "cancellation"
+    ],
+    "max_abs": 0.0001245737075806,
+    "max_normalized_rms": 0.0004109623564801,
+    "max_cpu_oracle_abs": 4.619359970093e-07,
+    "all_guards_unchanged_and_deterministic": true,
+    "gates": {
+      "require_bitwise_candidate": false,
+      "max_abs": 0.005,
+      "max_rms_normalized": 0.001,
+      "cpu_sample_max_abs": 0.0005,
+      "max_timing_cv": 0.1
+    },
+    "artifacts": {
+      "candidate_sha256": "b76173e99b3736a75a0bfe2a325390cfcc4d26d688657f9e2363d41818585b63",
+      "baseline_sha256": "7118ad68d51aa3c1b5c1ac14fc1b2a27dd2882efcfbb4b875fb499a7e2c0ebba"
+    },
+    "compute_capability": "12.1",
+    "architecture": "sm_121",
+    "production_e4b_candidate": true,
+    "method": "Actual checked-in fatbin symbols receive guarded buffers; independent GPU scalar oracle is cross-checked against sampled CPU rows. API traces independently confirm the required Flash route is active for both local and global attention."
+  },
+  "allocator_ownership": {
+    "failure": "A CUDA KV hook was allocated through the shared model allocator but destroyed through the caller allocator supplied by KvStorageRuntime. The admitted document allocator interpreted the foreign allocation as its own header, corrupting heap metadata.",
+    "fix": "CUDA and Metal hooks now destroy all owned state with their creation allocator. Audio physical calls use the reclaiming document work allocator and copy the finished text into the page arena.",
+    "regression": "Separate bounded owner and request allocators verify that CUDA hook teardown releases its owner allocation without charging/freeing the request allocator.",
+    "reproducer": "Valgrind located the foreign-allocator free; correcting the callback allocator in the original binary cleared the reproducer. The rebuilt production binary now passes the complete 73-clip corpus and all direct/planned transport, silence, and duration checks.",
+    "final_qualification": "e4b-qat-gb10-production-20261029.json",
+    "metal_hardware_tested": false
+  }
+}
