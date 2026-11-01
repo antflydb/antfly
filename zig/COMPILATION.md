@@ -38,6 +38,12 @@ profiles still need their own release measurements.
 
 ## Compile-cost experiments
 
+The follow-up [operation-owner experiments](../docs/design/compilation/history/operation-owner-probes-2026-11-01.md)
+exercise independent index lifecycle and fused CPU archives, consumer/provider
+cache isolation, a request-only transform plan, shared algebraic validation,
+and additive borrowed document batches. Production archive composition and
+default transports remain unchanged; these results are not a release baseline.
+
 The opt-in **Profile Zig compile costs** workflow measures `memory-test`,
 `unit-storage-compile`, or `antfly` on a heavy Linux runner. It retains the exact
 commit/toolchain/CPU profile, build summary, compiler RSS and CPU samples,
