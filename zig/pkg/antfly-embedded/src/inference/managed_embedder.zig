@@ -5305,8 +5305,22 @@ fn probeEmbeddingDimensionsRetryingTransient(
             // to the probe's own retryable unavailability.
             if (entry.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             // A budget of 0 disables retrying, period: surface this (only)
-            // attempt's transient failure now, with no backoff.
-            if (budget_ns == 0) return error.EmbeddingProbeUnavailable;
+            // attempt's transient failure now, with no backoff. But
+            // disabling retries must never mask the caller's own deadline:
+            // in this branch `deadline_ns` above is exactly
+            // `entry.deadline_ns` whenever the caller set one (see
+            // `embeddingOperationDeadline`), so it is always the binding
+            // deadline here. Recheck it the same way the retry loop below
+            // does via `out_of_time_err` before surfacing
+            // `EmbeddingProbeUnavailable`, so a caller timeout spent during
+            // this one attempt is reported as their own `error.Timeout`,
+            // never as retryable probe unavailability.
+            if (budget_ns == 0) {
+                if (entry.deadline_ns) |caller_deadline| {
+                    if (err == error.Timeout or monotonicNowNs() >= caller_deadline) return error.Timeout;
+                }
+                return error.EmbeddingProbeUnavailable;
+            }
             const now_ns = monotonicNowNs();
             if (now_ns >= deadline_ns) return out_of_time_err;
             const remaining_ns = deadline_ns - now_ns;
@@ -10167,6 +10181,80 @@ test "managed embedder dimension probe with a zero retry budget fails fast after
     // Comfortably below the first backoff step (500ms); see the permanent-
     // failure test below for why this isn't tighter.
     try std.testing.expect(monotonicNowNs() - started_ns < 400 * std.time.ns_per_ms);
+}
+
+test "managed embedder dimension probe with a zero retry budget reports the caller's timeout instead of EmbeddingProbeUnavailable" {
+    // Regression test for the zero-budget path masking a caller timeout as
+    // probe unavailability: disabling retries must still recheck the
+    // caller's own deadline before applying the "no budget left" return.
+    // Here the single attempt itself runs long enough (simulated via the
+    // logical test clock, so this stays fast) to carry the caller's
+    // deadline into the past before it reports a transient failure; that
+    // must surface as `error.Timeout`, never the retryable
+    // `EmbeddingProbeUnavailable`.
+    TestClock.offset_ns.store(0, .monotonic);
+    defer TestClock.offset_ns.store(0, .monotonic);
+
+    const ClockAdvancingLocal = struct {
+        calls: usize = 0,
+
+        fn dense(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // Simulate the attempt's own execution time carrying the clock
+            // past the caller's deadline before the transient failure is
+            // reported.
+            _ = TestClock.offset_ns.fetchAdd(500 * std.time.ns_per_ms, .monotonic);
+            return error.ResourceTemporarilyUnavailable;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+    var local = ClockAdvancingLocal{};
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.Timeout, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = ClockAdvancingLocal.dense, .embed_sparse_texts = ClockAdvancingLocal.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 0,
+        .deadline_ns = monotonicNowNs() + 100 * std.time.ns_per_ms,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+}
+
+test "managed embedder dimension probe with a zero retry budget surfaces cancellation during the attempt" {
+    // Mirrors the deadline regression above for cancellation: a budget of
+    // zero must still report the caller's own cancellation, flipped true
+    // only during the single attempt, as `error.Cancelled` rather than
+    // folding it into the probe's own retryable unavailability.
+    const CancelingLocal = struct {
+        calls: usize = 0,
+        cancel_flag: *std.atomic.Value(bool),
+
+        fn dense(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.cancel_flag.store(true, .monotonic);
+            return error.ResourceTemporarilyUnavailable;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+    var canceled = std.atomic.Value(bool).init(false);
+    var local = CancelingLocal{ .cancel_flag = &canceled };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.Cancelled, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = CancelingLocal.dense, .embed_sparse_texts = CancelingLocal.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 0,
+        .cancellation = CancellationToken.fromAtomic(&canceled),
+    }));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
 }
 
 test "managed embedder fails fast on a permanent local provider error without retrying" {
