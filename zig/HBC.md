@@ -74,35 +74,46 @@ dimension, so their distance estimates and error bounds are much tighter.
 - **Rotation:** extended codes assume randomly rotated vectors, so bits above
   1 turn on `use_random_ortho_trans`; opening such an index without rotation
   fails.
-- **Cost:** about `dims * bits / 8 + 8` extra bytes per vector, plus the
-  extended scorer's CPU for refined candidates (byte-parallel SIMD for 2, 4
-  and 8 bits; 3, 5, 6, 7 use a scalar path).
+- **Cost:** about `dims * bits / 8 + 8` extra bytes per vector, longer
+  builds (about 2x at 4 bits), and the extended scorer's CPU for refined
+  candidates (byte-parallel SIMD for 2, 4 and 8 bits; 3, 5, 6, 7 use a
+  scalar path). Per-leaf query preparation uses a stack buffer.
 - **Not covered:** segment sections (`RBIQ`) and serverless vector segments
   keep 1-bit codes; their quantizers have no config path yet.
 
-Measured on the real index (`hbc_adapter.zig` test "hbc multi-bit
-quantization measurement on a dataset", NYTimes-256 cosine, 20k vectors,
-100 queries, leaf 168, branching 168, epsilon 7, boundary rerank, search
-width 128, rotation on; Debug build, so no timings):
+Measured on the real index with the opt-in `hbc_adapter.zig` test "hbc
+multi-bit quantization measurement on a dataset" (`ANTFLY_HBC_BENCH_DATA`).
+Setup: NYTimes-256 cosine, 100k vectors, 200 queries, leaf 168, branching
+168, epsilon 7, boundary rerank, rotation on. ReleaseFast on an Apple M4 Max,
+single-threaded queries, warm caches. Search width 1008 (the index manager
+default) scans all 100k vectors here:
 
-| Bits | Refine | Recall@10, heap 20 | Recall@10, heap 80 | Rescored/q (heap 80) | Exact reranks/q (heap 80) |
-|---:|---|---:|---:|---:|---:|
-| 1 | n/a | 0.424 | 0.620 | 0 | 79.3 |
-| 2 | near_cutoff, margin 1 | 0.722 | 0.906 | 4,654 | 74.1 |
-| 4 | near_cutoff, margin 1 | 0.898 | 0.946 | 1,940 | 26.4 |
-| 4 | near_cutoff, margin 2 | 0.972 | 1.000 | 6,873 | 28.7 |
-| 4 | all | 0.975 | 1.000 | 20,000 | 28.9 |
+| Codes | Heap (k * rerank_factor) | Recall@10 | Rescored/q | Exact reranks/q | ms/query |
+|---|---:|---:|---:|---:|---:|
+| 1-bit (default) | 20 | 0.559 | 0 | 19 | 1.52 |
+| 1-bit | 80 | 0.719 | 0 | 76 | 2.29 |
+| 1-bit | 320 | 0.834 | 0 | 274 | 4.13 |
+| 2-bit, margin 2 | 80 | 0.937 | 37,533 | 64 | 3.58 |
+| 3-bit, margin 2 | 80 | 0.996 | 24,544 | 46 | 7.20 |
+| 4-bit, margin 1 | 80 | 0.975 | 3,883 | 21 | 1.57 |
+| 4-bit, margin 2 | 20 | 0.987 | 10,204 | 13 | 1.99 |
+| 4-bit, margin 2 | 80 | 0.999 | 19,137 | 22 | 2.21 |
+| 4-bit, all | 80 | 0.999 | 100,000 | 23 | 4.05 |
+| 8-bit, margin 2 | 80 | 0.996 | 8,393 | 1.5 | 2.06 |
 
-With 1-bit codes, exact-reranking every admitted candidate
-(`rerank_policy: always`) gives the same 0.620 as boundary rerank: the loss
-is entirely at the 1-bit admission cut, before rerank sees anything. Every
-true neighbor that makes it into the heap is already found.
+- 4 bits with the default margin reaches 0.999 recall in the same time 1-bit
+  needs for 0.719. Quadrupling the 1-bit heap only reaches 0.834 at almost
+  twice the time.
+- With 1-bit codes the loss is at admission: `rerank_policy: always` gives
+  the same recall as boundary rerank (measured at 20k: 0.620 both ways).
+- 3 bits uses the scalar scorer and is slower than 4. 8 bits makes rerank
+  nearly free but builds take 105 s against 9.5 s for 4 bits and 5.2 s for
+  1 bit, because code search sweeps 127 levels per dimension.
+- At search width 128 (21k vectors scanned) every multi-bit setting reaches
+  the 0.379 that routing allows, against 0.335 for 1-bit at heap 80.
 
-4 bits with margin 2 matches rescoring everything while rescoring a third
-of the scanned vectors, and cuts exact reranks to about a third. 2 bits
-fixes most of the admission loss but not the rerank volume.
-`bench/vectors/rabitq_hbc_sim.zig` reproduces the admission effect at 100k
-outside HBC.
+`bench/vectors/rabitq_hbc_sim.zig` reproduces the admission effect outside
+HBC.
 
 ## Dense Artifact Vectors
 

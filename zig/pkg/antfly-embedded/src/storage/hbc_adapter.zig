@@ -35607,7 +35607,9 @@ test "hbc multi-bit codes refine leaf admission and survive reopen" {
 // index manager's production defaults and compares quantization settings.
 test "hbc multi-bit quantization measurement on a dataset" {
     const prefix = platform.env.getenv("ANTFLY_HBC_BENCH_DATA") orelse return error.SkipZigTest;
-    const alloc = std.heap.page_allocator;
+    // A production-like allocator: page_allocator would turn every small
+    // allocation into a system call and distort timings.
+    const alloc = std.heap.smp_allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
@@ -35669,12 +35671,12 @@ test "hbc multi-bit quantization measurement on a dataset" {
     const Variant = struct { bits: u8, refine: @FieldType(HBCConfig, "quantization_refine") = .near_cutoff, margin: f32 = 2, policy: @FieldType(HBCConfig, "rerank_policy") = .boundary };
     const variants = [_]Variant{
         .{ .bits = 1 },
-        .{ .bits = 1, .policy = .always },
-        .{ .bits = 2, .margin = 1 },
+        .{ .bits = 2 },
+        .{ .bits = 3 },
         .{ .bits = 4, .margin = 1 },
         .{ .bits = 4 },
-        .{ .bits = 4, .policy = .always },
         .{ .bits = 4, .refine = .all },
+        .{ .bits = 8 },
     };
     std.debug.print("\nHBC rows={d} dims={d} queries={d} (leaf 168, branching 168, epsilon 7, boundary rerank, rotation on)\n", .{ data.rows, d, queries.rows });
     std.debug.print("{s:>4} {s:>12} {s:>6} {s:>8} {s:>6} {s:>8} {s:>9} {s:>10} {s:>10} {s:>10} {s:>9}\n", .{ "bits", "refine", "margin", "rerank", "width", "factor", "recall@10", "scored/q", "refined/q", "reranked/q", "ms/q" });
@@ -35699,13 +35701,22 @@ test "hbc multi-bit quantization measurement on a dataset" {
             .max_cached_vectors = 200_000,
         });
         defer idx.close();
+        const build_start = platform_time.monotonicNs();
         try idx.bulkBuildWithMetadata(items);
-        for ([_]u32{128}) |width| {
-            for ([_]usize{ 2, 8 }) |factor| {
+        std.debug.print("  build bits={d}: {d:.1}s\n", .{ variant.bits, @as(f64, @floatFromInt(platform_time.monotonicNs() - build_start)) / 1e9 });
+        // Warm caches so timings measure search, not first-touch loads.
+        for (0..@min(queries.rows, 20)) |qi| {
+            var warm = try idx.searchWithRequest(.{ .query = queries.data[qi * d ..][0..d], .k = k, .load_metadata = false });
+            warm.deinit();
+        }
+        for ([_]u32{ 128, 1008 }) |width| {
+            for ([_]usize{ 2, 8, 32 }) |factor| {
                 var hits: usize = 0;
                 var scored: u64 = 0;
                 var refined: u64 = 0;
                 var reranked: u64 = 0;
+                var leaf_ns: u64 = 0;
+                var rerank_ns: u64 = 0;
                 const t0 = platform_time.monotonicNs();
                 for (0..queries.rows) |qi| {
                     var profiled = try idx.searchProfiledRequest(.{ .query = queries.data[qi * d ..][0..d], .k = k, .search_width = width, .rerank_factor = factor, .load_metadata = false });
@@ -35713,13 +35724,15 @@ test "hbc multi-bit quantization measurement on a dataset" {
                     scored += profiled.profile.approx_vectors_scored;
                     refined += profiled.profile.ex_refined_vectors;
                     reranked += profiled.profile.reranked_vectors;
+                    leaf_ns += profiled.profile.leaf_score_ns;
+                    rerank_ns += profiled.profile.rerank_ns;
                     const gt = truth[qi * k ..][0..k];
                     for (profiled.results.getHits()) |h| {
                         if (std.mem.indexOfScalar(u64, gt, h.vector_id) != null) hits += 1;
                     }
                 }
                 const nq: f64 = @floatFromInt(queries.rows);
-                std.debug.print("{d:>4} {s:>12} {d:>6.1} {s:>8} {d:>6} {d:>8} {d:>9.3} {d:>10.0} {d:>10.0} {d:>10.1} {d:>9.2}\n", .{
+                std.debug.print("{d:>4} {s:>12} {d:>6.1} {s:>8} {d:>6} {d:>8} {d:>9.3} {d:>10.0} {d:>10.0} {d:>10.1} {d:>9.2} leaf={d:.2}ms rerank={d:.2}ms\n", .{
                     variant.bits,
                     @tagName(variant.refine),
                     variant.margin,
@@ -35731,6 +35744,8 @@ test "hbc multi-bit quantization measurement on a dataset" {
                     @as(f64, @floatFromInt(refined)) / nq,
                     @as(f64, @floatFromInt(reranked)) / nq,
                     @as(f64, @floatFromInt(platform_time.monotonicNs() - t0)) / 1e6 / nq,
+                    @as(f64, @floatFromInt(leaf_ns)) / 1e6 / nq,
+                    @as(f64, @floatFromInt(rerank_ns)) / 1e6 / nq,
                 });
             }
         }

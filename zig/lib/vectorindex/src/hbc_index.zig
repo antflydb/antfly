@@ -3964,7 +3964,26 @@ const SubgroupScoreSink = struct {
 /// all of them, or only those whose 1-bit lower bound could still enter the
 /// candidate heap (`types.QuantizationRefine`).
 const ExRefine = struct {
+    /// Per-leaf query preparation is two dims-length float arrays; callers
+    /// back it with a stack buffer so scoring a leaf never hits the heap.
+    const stack_bytes = 32 * 1024;
+
+    /// Stack-backed allocation for one leaf's preparation, or the index
+    /// allocator when dims are too large for the buffer.
+    const Stack = struct {
+        buf: [stack_bytes]u8 align(16) = undefined,
+        fba: std.heap.FixedBufferAllocator = undefined,
+
+        fn get(self: *Stack, fallback: Allocator, dims: usize) Allocator {
+            // Unit query plus phase-split query, both dims-length f32.
+            if (dims * 8 + 64 > stack_bytes) return fallback;
+            self.fba = std.heap.FixedBufferAllocator.init(&self.buf);
+            return self.fba.allocator();
+        }
+    };
+
     est: quantizer_mod.ExEstimator,
+    alloc: Allocator,
     set: *const proto.RaBitQuantizedVectorSet,
     all: bool,
     margin: f32 = 2,
@@ -3972,18 +3991,19 @@ const ExRefine = struct {
 
     /// Returns null when the index is 1-bit or the set has no extended codes
     /// (older payloads keep scoring 1-bit).
-    fn init(self: anytype, set: *const proto.RaBitQuantizedVectorSet, approx_query: []const f32) !?ExRefine {
+    fn init(self: anytype, alloc: Allocator, set: *const proto.RaBitQuantizedVectorSet, approx_query: []const f32) !?ExRefine {
         if (self.config.quantization_bits <= 1 or !set.hasEx()) return null;
         return .{
-            .est = try quantizer_mod.ExEstimator.init(self.alloc, set, approx_query),
+            .est = try quantizer_mod.ExEstimator.init(alloc, set, approx_query),
+            .alloc = alloc,
             .set = set,
             .all = self.config.quantization_refine == .all,
             .margin = self.config.quantization_refine_margin,
         };
     }
 
-    fn deinit(self: *ExRefine, alloc: Allocator) void {
-        self.est.deinit(alloc);
+    fn deinit(self: *ExRefine) void {
+        self.est.deinit(self.alloc);
     }
 
     fn apply(self: *ExRefine, results: *const search_results.ApproxSearchResults, index: usize, distance: *f32, bound: *f32) void {
@@ -4242,13 +4262,15 @@ fn scoreNativeLeafScan(
             };
             const start = now();
             var sink = Sink{ .target = results, .refine_all = self.config.quantization_refine == .all, .refine_margin = self.config.quantization_refine_margin };
+            var ex_stack: ExRefine.Stack = .{};
+            const ex_alloc = ex_stack.get(self.alloc, self.config.dims);
             if (self.config.quantization_bits > 1 and rows.runs.len > 0) {
                 const first = rows.runs[0].chunk.view.asProto();
-                if (first.hasEx()) sink.refine = try quantizer_mod.ExEstimator.init(self.alloc, &first, approx_query);
+                if (first.hasEx()) sink.refine = try quantizer_mod.ExEstimator.init(ex_alloc, &first, approx_query);
             }
             defer if (sink.refine) |*est| {
                 profile.ex_refined_vectors += sink.refined;
-                est.deinit(self.alloc);
+                est.deinit(ex_alloc);
             };
             try rows.scoreTo(&self.quantizer, approx_query, &scratch.estimate, if (req.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null, &sink);
             sink.flush();
@@ -4418,10 +4440,11 @@ fn scoreLeafMemberIds(
     const original_positions: []const usize = if (direct_native_scoring) &.{} else scratch.positions[0..filtered_count];
     if (direct_no_copy) {
         try validateQuantizedSet(self, native_quantized.?, member_ids.len);
-        var refine = try ExRefine.init(self, &native_quantized.?.rabit, approx_query);
+        var ex_stack: ExRefine.Stack = .{};
+        var refine = try ExRefine.init(self, ex_stack.get(self.alloc, self.config.dims), &native_quantized.?.rabit, approx_query);
         defer if (refine) |*r| {
             profile.ex_refined_vectors += r.refined;
-            r.deinit(self.alloc);
+            r.deinit();
         };
         var sink = NoCopyCandidateScoreSink{ .results = results, .ids = member_ids, .refine = if (refine) |*r| r else null };
         try self.quantizer.estimateDistancesTo(
@@ -4456,10 +4479,11 @@ fn scoreLeafMemberIds(
             if (direct_native_scoring) {
                 const count = member_ids.len;
                 try validateQuantizedSet(self, native_quantized.?, count);
-                var refine = try ExRefine.init(self, &native_quantized.?.rabit, approx_query);
+                var ex_stack: ExRefine.Stack = .{};
+                var refine = try ExRefine.init(self, ex_stack.get(self.alloc, self.config.dims), &native_quantized.?.rabit, approx_query);
                 defer if (refine) |*r| {
                     profile.ex_refined_vectors += r.refined;
-                    r.deinit(self.alloc);
+                    r.deinit();
                 };
                 var sink = NativeCandidateScoreSink{ .results = results, .ids = member_ids, .plane = projection_plane, .dims = dims, .refine = if (refine) |*r| r else null };
                 try self.quantizer.estimateDistancesTo(
@@ -4569,11 +4593,12 @@ fn scoreLeafMemberIds(
             const error_bounds = scratch.error_bounds[0..count];
             try self.estimateQuantizedDistances(quantized_set, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
             if (std.meta.activeTag(quantized_set.*) == .rabit) {
-                if (try ExRefine.init(self, &quantized_set.rabit, approx_query)) |refine_init| {
+                var ex_stack: ExRefine.Stack = .{};
+                if (try ExRefine.init(self, ex_stack.get(self.alloc, self.config.dims), &quantized_set.rabit, approx_query)) |refine_init| {
                     // The heap does not change during this pass, so the cutoff
                     // is conservative: it can only refine more, never less.
                     var refine = refine_init;
-                    defer refine.deinit(self.alloc);
+                    defer refine.deinit();
                     if (direct_native_scoring) {
                         for (0..count) |i| refine.apply(results, i, &distances[i], &error_bounds[i]);
                     } else {
