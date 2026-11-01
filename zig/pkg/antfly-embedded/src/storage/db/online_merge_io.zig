@@ -127,7 +127,7 @@ fn rewriteTailJson(db: *DB, alloc: Allocator, scope: source.Scope, after: u64, o
 }
 
 fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancellation: types.CancellationToken) ![]u8 {
-    _ = try db.advanceArtifactFootprintPage();
+    try advanceArtifactFootprintBounded(db);
     db.core.lockApplyShared();
     defer db.core.unlockApplyShared();
     var txn = try db.core.store.beginReadTxn();
@@ -737,7 +737,7 @@ fn sourceStatusJson(db: *DB, alloc: Allocator, scope: source.Scope, cancellation
     // They do not invalidate the already-certified absence of unsupported
     // families. Do not run unrelated maintenance through a prepared source pin.
     if (preliminary == null or preliminary.?.phase == .released)
-        _ = try db.advanceArtifactFootprintPage();
+        try advanceArtifactFootprintBounded(db);
     // Published certificates are replicated ledger state, not local sidecar
     // availability. Normal tail/status polling performs no filesystem work.
     const certificate = if (preliminary != null and preliminary.?.published_certificate != null)
@@ -888,8 +888,27 @@ fn rowDerivedTransferIndexesAssumeApply(db: *DB, alloc: Allocator, coordinated: 
     return true;
 }
 
+/// advanceArtifactFootprintPage scans one deadline-bound physical-key page
+/// (see its doc comment): a deliberately short slice so a huge old root never
+/// blocks a caller. Ordinary scheduler contention can cut that slice short
+/// after only a handful of keys, even over a trivially small keyspace, which
+/// would otherwise surface the footprint's unresolved-family refusal
+/// (StorageReadTemporarilyUnavailable, itself a legitimate transient signal
+/// per repair_failure's classifier) to the very first caller unlucky enough
+/// to observe one stalled slice. Repeat bounded slices, capped at the same
+/// transient-retry budget repair passes use, so routine contention converges
+/// inline; a genuinely large backlog still returns unresolved after the
+/// bound, exactly as a single slice would have.
+fn advanceArtifactFootprintBounded(db: *DB) !void {
+    var attempt: u32 = 0;
+    while (!try db.advanceArtifactFootprintPage()) {
+        attempt += 1;
+        if (attempt >= @import("repair_failure.zig").repair_transient_max_attempts) return;
+    }
+}
+
 pub fn requireRowDerivedIndexes(db: *DB, alloc: Allocator) !void {
-    _ = try db.advanceArtifactFootprintPage();
+    try advanceArtifactFootprintBounded(db);
     db.core.lockApplyShared();
     defer db.core.unlockApplyShared();
     if (!try rowDerivedIndexesAssumeApply(db, alloc)) return error.TableTopologyProtocolUpgradeRequired;
