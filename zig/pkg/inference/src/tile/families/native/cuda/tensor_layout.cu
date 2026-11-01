@@ -632,7 +632,4 @@ extern "C" __global__ void termite_split_last_dim3_f32(
     unsigned int row = idx / dim;
     unsigned int col = idx - row * dim;
     unsigned int src = row * dim * 3u + col;
-    first[idx] = input[src];
-    second[idx] = input[src + dim];
-    third[idx] = input[src + dim * 2u];
-}
+{{interleaved_three_stores}}}

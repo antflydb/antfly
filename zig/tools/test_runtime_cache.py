@@ -1740,6 +1740,7 @@ class RuntimeCacheTest(unittest.TestCase):
                 if backend == "cuda":
                     native_templates.append(self.own("zig/pkg/inference/src/ops/cuda/embedding_gemma2.zig"))
                 native_templates.append(self.own("zig/pkg/inference/src/tile/whisper_logits.zig"))
+                native_templates.append(self.own("zig/lib/tile/src/native_math.zig"))
                 if backend == "metal":
                     native_templates.append(self.own("zig/pkg/inference/src/ops/metal/generated/tile_whisper_logits_partials.msl.h"))
                 first = self.build(
@@ -1786,7 +1787,6 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/kernel_descriptor.zig",
                     "src/graph/kernel_source_owner.zig",
                     "src/ops/kernel_geometry.zig",
-                    "src/ops/kernel_math.zig",
                     "src/ops/kernel_reduction.zig",
                     "src/ops/gpu/depthwise_program.h",
                     "src/ops/gpu/masked_pool_program.h",
@@ -1809,7 +1809,6 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/kernel_descriptor.zig",
                     "src/graph/kernel_source_owner.zig",
                     "src/ops/kernel_geometry.zig",
-                    "src/ops/kernel_math.zig",
                     "src/ops/kernel_reduction.zig",
                     "src/ops/gpu/depthwise_program.h",
                     "src/ops/gpu/masked_pool_program.h",
@@ -1909,8 +1908,9 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/cuda/kernels/relative_attention_training.cuh",
                 ]
                 qualifier += sorted(
-                    str((Path(directory) / name).relative_to(self.root / "zig/pkg/inference"))
-                    for directory, _, names in os.walk(self.root / "zig/pkg/inference/src/tile", followlinks=True)
+                    os.path.relpath(Path(directory) / name, self.root / "zig/pkg/inference")
+                    for source_root in (self.root / "zig/lib/tile/src", self.root / "zig/pkg/inference/src/tile")
+                    for directory, _, names in os.walk(source_root, followlinks=True)
                     for name in names
                     if name.endswith((".zig", ".cu", ".metal", ".m")) and name != "source_inputs.zig"
                 )

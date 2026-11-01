@@ -15,36 +15,20 @@
 
 //! Qualified native program instances and specialization exports.
 
-pub const source_0 =
-    \\extern "C" __global__ void termite_rms_norm_f32(ANTFLY_CUDA_RMS_NORM_PARAMS) {
-    \\    termite_rms_norm_impl<true, false, false, 0>(dst, nullptr, input, weight, nullptr, nullptr, rows, dim, eps);
-    \\}
-    \\
-    \\extern "C" __global__ void termite_rms_norm_f32_bf16(ANTFLY_CUDA_RMS_NORM_F32_BF16_PARAMS) {
-    \\    termite_rms_norm_impl<true, false, true, 0>(dst, dst_bf16, input, weight, nullptr, nullptr, rows, dim, eps);
-    \\}
-    \\
-    \\extern "C" __global__ void termite_rms_norm_add_f32(ANTFLY_CUDA_RMS_NORM_ADD_PARAMS) {
-    \\    termite_rms_norm_impl<true, true, false, 0>(dst, nullptr, input, weight, residual, nullptr, rows, dim, eps);
-    \\}
-    \\
-    \\extern "C" __global__ void termite_rms_norm_add_f32_bf16(ANTFLY_CUDA_RMS_NORM_ADD_F32_BF16_PARAMS) {
-    \\    termite_rms_norm_impl<true, true, true, 0>(dst, dst_bf16, input, weight, residual, nullptr, rows, dim, eps);
-    \\}
-    \\
-    \\extern "C" __global__ void termite_rms_norm_add_mul_scalar_f32(ANTFLY_CUDA_RMS_NORM_ADD_MUL_SCALAR_PARAMS) {
-    \\    termite_rms_norm_impl<true, true, false, 1>(dst, nullptr, input, weight, residual, scalar, rows, dim, eps);
-    \\}
-    \\
-    \\extern "C" __global__ void termite_rms_norm_add_output_scale_f32(ANTFLY_CUDA_RMS_NORM_ADD_MUL_SCALAR_PARAMS) {
-    \\    termite_rms_norm_impl<true, true, false, 2>(dst, nullptr, input, weight, residual, scalar, rows, dim, eps);
-    \\}
-    \\
-    \\extern "C" __global__ void termite_rms_norm_bare_f32(ANTFLY_CUDA_RMS_NORM_BARE_PARAMS) {
-    \\    termite_rms_norm_impl<false, false, false, 0>(dst, nullptr, input, nullptr, nullptr, nullptr, rows, dim, eps);
-    \\}
-    \\
-;
+const program = @import("../../native_program.zig");
+const norm = @import("antfly_tile").native_normalization;
+fn rms(comptime e: norm.RmsExport) []const u8 {
+    return norm.cudaRms(e, "termite_rms_norm_impl") ++ "\n";
+}
+pub const source_0 = program.join(&.{
+    rms(.{ .name = "termite_rms_norm_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_PARAMS" }),
+    rms(.{ .name = "termite_rms_norm_f32_bf16", .params_macro = "ANTFLY_CUDA_RMS_NORM_F32_BF16_PARAMS", .bf16 = true }),
+    rms(.{ .name = "termite_rms_norm_add_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_ADD_PARAMS", .residual = true }),
+    rms(.{ .name = "termite_rms_norm_add_f32_bf16", .params_macro = "ANTFLY_CUDA_RMS_NORM_ADD_F32_BF16_PARAMS", .residual = true, .bf16 = true }),
+    rms(.{ .name = "termite_rms_norm_add_mul_scalar_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_ADD_MUL_SCALAR_PARAMS", .residual = true, .scale = .before_residual }),
+    rms(.{ .name = "termite_rms_norm_add_output_scale_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_ADD_MUL_SCALAR_PARAMS", .residual = true, .scale = .output }),
+    rms(.{ .name = "termite_rms_norm_bare_f32", .params_macro = "ANTFLY_CUDA_RMS_NORM_BARE_PARAMS", .weighted = false }),
+});
 
 pub const source_1 =
     \\extern "C" __global__ void termite_gemma4_a4b_rms_norm_triple_f32(ANTFLY_CUDA_GEMMA4_A4B_RMS_NORM_TRIPLE_PARAMS) {

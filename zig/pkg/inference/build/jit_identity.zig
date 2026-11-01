@@ -84,7 +84,6 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/kernel_descriptor.zig",
         "src/graph/kernel_source_owner.zig",
         "src/ops/kernel_geometry.zig",
-        "src/ops/kernel_math.zig",
         "src/ops/kernel_reduction.zig",
         "src/ops/gpu/depthwise_program.h",
         "src/ops/gpu/masked_pool_program.h",

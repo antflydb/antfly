@@ -1458,9 +1458,10 @@ fn checkPinnedTrainingActivation(comptime kind: enum { gelu, silu, sigmoid }, ex
     defer device.deinit();
     try std.testing.expect(device.backend.training_math == null);
     try device.backend.enableResidentTrainingMath();
-    const loaded = device.backend.training_math.?.module;
+    const loaded = device.backend.training_math.?.program.module;
+    try std.testing.expect(loaded != null);
     try device.backend.enableResidentTrainingMath();
-    try std.testing.expectEqual(loaded, device.backend.training_math.?.module);
+    try std.testing.expectEqual(loaded, device.backend.training_math.?.program.module);
     const cb = device.backend.computeBackend();
     const count = if (kind == .gelu) 1025 else 2049; // Partial block and both activation tails.
     var values: [count]f32 = undefined;

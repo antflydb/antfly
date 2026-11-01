@@ -29,7 +29,7 @@ spec.loader.exec_module(accounting)
 class SourceAccountingTest(unittest.TestCase):
     def test_shared_test_helpers_do_not_count_as_production_source(self):
         helper = "zig/pkg/inference/src/ops/testing/reference.zig"
-        production = "zig/pkg/inference/src/ops/kernel_math.zig"
+        production = "zig/lib/tile/src/native_math.zig"
         before = b"pub fn baseline() void {}\n"
         after = "pub fn replacement() void {}\npub fn extra() void {}\n"
         with tempfile.TemporaryDirectory() as directory:

@@ -154,7 +154,7 @@ fn structDecl(comptime l: L, comptime name: []const u8, comptime fields: []const
 pub fn epilogueHelpers(comptime e: fexpr.FExpr, comptime lang: Lang) []const u8 {
     const l: L = .{ .lang = lang };
     var s: []const u8 = "";
-    if (e.uses(.silu)) s = s ++ l.func() ++ " float antfly_tile_silu(float x) { return x / (1.0f + " ++ l.exp() ++ "(-x)); }\n";
+    if (e.uses(.silu)) s = s ++ l.func() ++ " float antfly_tile_silu(float x) { return " ++ fexpr.acc.siluOf().renderNative(.{ .exp = l.exp() }, .{ .value = "x", .bias = "", .gate = "", .residual = "" }, null) ++ "; }\n";
     if (e.uses(.round_f16)) s = s ++ l.pick(
         "inline float antfly_tile_round_f16(float x) { return float(half(x)); }\n",
         "#include <cuda_fp16.h>\nstatic __device__ __forceinline__ float antfly_tile_round_f16(float x) { return __half2float(__float2half_rn(x)); }\n",
@@ -518,4 +518,15 @@ pub fn renderModule(comptime kernels: type, comptime lang: Lang, comptime title:
         }
         return std.mem.trimEnd(u8, s, "\n") ++ "\n";
     }
+}
+
+/// Compatibility adapters for existing native schedules. Binding positions and
+/// attributes are data; the schedule's body remains target-owned.
+pub const NativeBuffer = struct { name: []const u8, writable: bool = false, element: []const u8 = "float" };
+pub fn nativeMetalExport(comptime name: []const u8, comptime buffers: []const NativeBuffer, comptime params_type: []const u8, comptime attributes: []const []const u8, comptime body: []const u8) []const u8 {
+    const l: L = .{ .lang = .metal };
+    var args: []const []const u8 = &.{};
+    for (buffers, 0..) |buffer, slot| args = args ++ .{if (buffer.writable) fmt("device {s} *{s} [[buffer({d})]]", .{ buffer.element, buffer.name, slot }) else l.in(buffer.element, buffer.name, slot)};
+    args = args ++ .{l.params(params_type, buffers.len)};
+    return l.kernel(name, 0, args, attributes) ++ body ++ "}\n";
 }

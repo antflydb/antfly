@@ -17,6 +17,8 @@
 //! Two passes per row (mean, then centered variance) on every backend.
 
 const std = @import("std");
+const fexpr = @import("fexpr.zig");
+const native_math = @import("native_math.zig");
 const parallel = @import("parallel.zig");
 
 pub const LayerNorm = struct {
@@ -84,7 +86,7 @@ fn row(comptime ln: LayerNorm, a: Args, r: usize) void {
     c = 0;
     while (c < full) : (c += lanes) {
         const d = (@as(V, x[c..][0..lanes].*) - @as(V, @splat(mean))) * @as(V, @splat(inv));
-        out[c..][0..lanes].* = @mulAdd(V, d, a.gamma[c..][0..lanes].*, a.beta[c..][0..lanes].*);
+        out[c..][0..lanes].* = (comptime fexpr.acc.mulAdd(.bias, .residual)).evaluate(struct {}, fexpr.Inputs(V){ .value = d, .bias = a.gamma[c..][0..lanes].*, .residual = a.beta[c..][0..lanes].*, .gate = @splat(0) });
     }
     while (c < a.dim) : (c += 1) out[c] = (x[c] - mean) * inv * a.gamma[c] + a.beta[c];
 }
@@ -115,14 +117,14 @@ pub fn runRms(comptime width: comptime_int, comptime residual_scaled: bool, a: R
         while (c + width <= a.dim) : (c += width) {
             const v: Vec = x[c..][0..width].*;
             const w: Vec = a.gamma[c..][0..width].*;
-            const normalized = (v * @as(Vec, @splat(inv))) * w;
+            const normalized = (comptime native_math.rms(.scale_then_weight)).evaluate(struct {}, fexpr.Inputs(Vec){ .value = v, .gate = @splat(inv), .bias = w, .residual = @splat(0) });
             out[c..][0..width].* = if (residual_scaled)
                 (@as(Vec, a.residual.?[r * a.dim + c ..][0..width].*) + normalized * @as(Vec, @splat(a.norm_scale))) * @as(Vec, @splat(a.output_scale))
             else
                 normalized;
         }
         while (c < a.dim) : (c += 1) {
-            const normalized = (x[c] * inv) * a.gamma[c];
+            const normalized = (comptime native_math.rms(.scale_then_weight)).evaluate(struct {}, fexpr.Inputs(f32){ .value = x[c], .gate = inv, .bias = a.gamma[c], .residual = 0 });
             out[c] = if (residual_scaled) (a.residual.?[r * a.dim + c] + normalized * a.norm_scale) * a.output_scale else normalized;
         }
     }

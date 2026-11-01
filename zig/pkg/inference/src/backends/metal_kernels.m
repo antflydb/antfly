@@ -6343,6 +6343,7 @@ TERMITE_METAL_ABI_DECLARE_TAGGED(conv2d_f32)
     "            }\n" \
     "        }\n" \
     "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           // tile-codegen:begin projection.epilogue family (do not edit; run: zig build tile-kernel-codegen -- --write)
 // Exact gate_up publish phase; original arrays, nesting and barriers stay native.
 #define TERMITE_MSL_BF16_GATE_UP_PUBLISH \
     "    TERMITE_FOR_UNROLL(uint r=0;r<2u;r++)TERMITE_FOR_UNROLL(uint c=0;c<2u;c++){\n" \
@@ -6357,6 +6358,7 @@ TERMITE_METAL_ABI_DECLARE_TAGGED(conv2d_f32)
     "            float y=termite_silu(gate);out[row*p.out_dim+col]=y*up;\n" \
     "        }\n" \
     "    }\n"
+           // tile-codegen:end projection.epilogue family
 // Exact linear mma phase; original arrays, nesting and barriers stay native.
 #define TERMITE_MSL_BF16_LINEAR_MMA \
     "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" \
@@ -9885,6 +9887,7 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            // tile-codegen:end projection.direct.9 family
            "// Preserve the prequantized pair schedule: the generic traversal regresses 6\u201314%.\n"
+           // tile-codegen:begin normalization.epilogue.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "template<uint Mode> inline float termite_layer_norm_load(device const float *input, device const float *other, device const float *bias, uint index, uint column) {\n"
            "    if (Mode == 2u) return input[index] + bias[column] + other[index];\n"
            "    if (Mode == 1u) return input[index] + other[index];\n"
@@ -9907,8 +9910,9 @@ static NSString *termite_metal_shader_source(void) {
            "        variance /= float(p.hidden_size);\n"
            "    }\n"
            "    float inv_std = rsqrt(variance + p.eps);\n"
-           "    for (uint i = first; i < p.hidden_size; i += step) { float v = SaveSum ? sum_out[row_base + i] : termite_layer_norm_load<Mode>(input, other, bias, row_base + i, i); output[row_base + i] = ((v - mean) * inv_std) * gamma[i] + beta[i]; }\n"
+           "    for (uint i = first; i < p.hidden_size; i += step) { float v = SaveSum ? sum_out[row_base + i] : termite_layer_norm_load<Mode>(input, other, bias, row_base + i, i); output[row_base + i] = (v - mean) * inv_std * gamma[i] + beta[i]; }\n"
            "}\n"
+           // tile-codegen:end normalization.epilogue.0 family
            // tile-codegen:begin layer_norm.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_layer_norm_1x(device const float *input [[buffer(0)]], device const float *gamma [[buffer(1)]], device const float *beta [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_layer_norm_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    termite_layer_norm_family<0u, false, false>(input, input, input, gamma, beta, output, output, p, nullptr, gid, 0u, 1u);\n"
@@ -10002,6 +10006,7 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            // tile-codegen:end rms_norm.0 family
            "// Statistics and epilogues have separate static owners; reduction trees stay exact.\n"
+           // tile-codegen:begin normalization.epilogue.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "template<typename Input, bool Precomputed>\n"
            "__attribute__((always_inline)) inline float antfly_rms_tree_inverse(device const Input*input,uint base,uint hidden,float eps,threadgroup float*shmem,uint tid,uint tpg,device const float*sumsq,uint partial_base) {\n"
            "    float mean_square = 0.0f;\n"
@@ -10015,6 +10020,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float inv_rms = antfly_rms_tree_inverse<Input, Precomputed>(input, base, hidden, eps, shmem, tid, tpg, sumsq, partial_base);\n"
            "    for (uint i = tid; i < hidden; i += tpg) { if (ExpressionEpilogue) { if (Scale) output[base + i] = (float(input[base + i]) * inv_rms * weight[i] + residual[base + i]) * scale; else output[base + i] = float(input[base + i]) * inv_rms * weight[i] + residual[base + i]; } else { float value = float(input[base + i]) * inv_rms * weight[i]; if (Add) value = value + residual[base + i]; if (Scale) value = value * scale; output[base + i] = value; } }\n"
            "}\n"
+           // tile-codegen:end normalization.epilogue.1 family
 
            // tile-codegen:begin rms_norm.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_rms_norm_1x_reduce(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_layer_norm_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]]) {\n"
@@ -10090,6 +10096,7 @@ static NSString *termite_metal_shader_source(void) {
            "    mean_square = simd_sum(shmem[simd_lane]);\n"
            "    return rsqrt(mean_square / float(dim) + eps);\n"
            "}\n"
+           // tile-codegen:begin normalization.epilogue.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "template<bool Clamp> inline void termite_rms_norm_simd4_impl(\n"
            "    device const float *input, device const float *weight, device float *output,\n"
            "    uint rows, uint dim, float eps, uint flags, float lo, float hi,\n"
@@ -10108,6 +10115,7 @@ static NSString *termite_metal_shader_source(void) {
            "        output[i] = y.x; output[i + 1u] = y.y; output[i + 2u] = y.z; output[i + 3u] = y.w;\n"
            "    }\n"
            "}\n"
+           // tile-codegen:end normalization.epilogue.2 family
            // tile-codegen:begin rms_norm.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_apply_rms_norm_rows_simd4_reduce(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_row_norm_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint simd_group [[simdgroup_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    termite_rms_norm_simd4_impl<false>(input, weight, output, p.rows, p.hidden_size, p.eps, 0u, 0.0f, 0.0f, shmem, tid, tpg, simd_group, simd_lane, row);\n"

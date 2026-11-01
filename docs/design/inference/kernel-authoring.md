@@ -41,6 +41,18 @@ and `encoder_fused_programs.cuh`, rather than a particular model's name.
 
 ## Names and compatibility
 
+Use `antfly_tile.fexpr` for arithmetic shared between CPU and native programs;
+`native_math` defines activation and affine profiles on that same tree. Keep
+target approximations in the supplied math/source policy and use an explicit
+FMA or F16/BF16 node where the original schedule requires one. Native templates
+accept typed `fexpr.Emission` bindings, so adopting the IR does not require
+changing a tuned reduction, MMA loop, barrier or scratch lifetime.
+
+Use `native_normalization` for compatible export adapters. Select the original
+statistics algorithm and affine association explicitly; a centered variance
+pass, raw-moment tree and Welford recurrence are not interchangeable. A family
+may share its exports and epilogue while retaining each reduction schedule.
+
 Use operation, storage and schedule names for new helpers, entrypoints and source
 owners. For example, `antfly_qkv_rope_two_axis_bf16` describes its contract;
 a model-prefixed copy would hide that reuse opportunity. Keep shape variants

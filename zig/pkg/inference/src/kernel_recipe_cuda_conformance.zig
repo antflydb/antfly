@@ -19,7 +19,7 @@ const std = @import("std");
 const quant = @import("graph/quant_recipe.zig");
 const reference = @import("gguf/testing/quant_reference.zig");
 const blocks = @import("graph/testing/quant_blocks.zig");
-const math = @import("ops/kernel_math.zig");
+const math = @import("antfly_tile").native_math;
 const reduction = @import("ops/kernel_reduction.zig");
 
 pub fn main(init: std.process.Init) !void {

@@ -23,7 +23,7 @@
 
 const std = @import("std");
 const kernel_reduction = @import("../ops/kernel_reduction.zig");
-const kernel_math = @import("../ops/kernel_math.zig");
+const kernel_math = @import("antfly_tile").native_math;
 const quant_recipe = @import("quant_recipe.zig");
 const quant_matmul = @import("quant_matmul.zig");
 const quant_kernel_op = @import("quant_kernel_op.zig");

@@ -38,7 +38,7 @@ const Epilogue = compiler.Epilogue;
 const KernelSchedule = compiler.KernelSchedule;
 const ReductionKind = compiler.ReductionKind;
 const OpKind = quant_kernel_op.OpKind;
-const kernel_math = @import("../ops/kernel_math.zig");
+const kernel_math = @import("antfly_tile").native_math;
 const quant_recipe = @import("quant_recipe.zig");
 
 pub const MicrokernelKind = quant_kernel_op.MicrokernelKind;

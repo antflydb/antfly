@@ -174,3 +174,21 @@ pub fn prepareCopy(comptime c: Copy, src: Rows, src_len: usize, dst: Rows, dst_l
     if (groups > std.math.maxInt(u32)) return error.InvalidLayout;
     return .{ .params = .{ .rows = dst.rows, .cols = dst.cols, .src_offset = src.offset, .src_row_stride = src.row_stride, .src_col_stride = src.col_stride, .dst_offset = dst.offset, .dst_row_stride = dst.row_stride, .dst_col_stride = dst.col_stride }, .groups = groups };
 }
+
+pub const InterleavedRows = struct {
+    parts: u32,
+    pub fn view(comptime split: InterleavedRows, rows: usize, dim: usize, part: usize) error{InvalidLayout}!Rows {
+        if (split.parts == 0) @compileError("interleaved layout needs at least one part");
+        if (part >= split.parts) return error.InvalidLayout;
+        return .{ .rows = rows, .cols = dim, .row_stride = std.math.mul(usize, dim, split.parts) catch return error.InvalidLayout, .offset = std.math.mul(usize, dim, part) catch return error.InvalidLayout };
+    }
+    pub fn nativeStores(comptime split: InterleavedRows, comptime outputs: []const []const u8, comptime input: []const u8, comptime index: []const u8, comptime base: []const u8, comptime dim: []const u8) []const u8 {
+        if (outputs.len != split.parts) @compileError("split output count must match physical parts");
+        var text: []const u8 = "";
+        for (outputs, 0..) |out, part| {
+            const offset = if (part == 0) "" else if (part == 1) " + " ++ dim else std.fmt.comptimePrint(" + {s} * {d}u", .{ dim, part });
+            text = text ++ "    " ++ out ++ "[" ++ index ++ "] = " ++ input ++ "[" ++ base ++ offset ++ "];\n";
+        }
+        return text;
+    }
+};

@@ -1575,6 +1575,7 @@ pub fn build(b: *std.Build) void {
     clipclap_bench_exe.root_module.addImport("build_options", build_options_mod);
     clipclap_bench_exe.root_module.addImport("antfly_platform", configured_platform_mod);
     clipclap_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    clipclap_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     if (enable_system_blas) {
         configureSystemBlas(b, clipclap_bench_exe.root_module, target, blas_root);
     }
@@ -1600,6 +1601,7 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| gliner2_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     gliner2_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    gliner2_e2e_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     gliner2_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     gliner2_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     gliner2_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1627,6 +1629,7 @@ pub fn build(b: *std.Build) void {
     clipclap_native_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| clipclap_native_bench_exe.root_module.addImport("pjrt", pjrt);
     clipclap_native_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    clipclap_native_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     clipclap_native_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     clipclap_native_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     clipclap_native_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1654,6 +1657,7 @@ pub fn build(b: *std.Build) void {
     clipclap_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| clipclap_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     clipclap_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    clipclap_e2e_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     clipclap_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     clipclap_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     clipclap_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1689,6 +1693,7 @@ pub fn build(b: *std.Build) void {
     qwen3_embedding_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| qwen3_embedding_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1716,6 +1721,7 @@ pub fn build(b: *std.Build) void {
     nomic_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| nomic_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     nomic_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    nomic_e2e_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     nomic_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     nomic_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     nomic_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1743,6 +1749,7 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| reranker_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     reranker_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    reranker_e2e_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     reranker_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     reranker_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     reranker_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1769,6 +1776,7 @@ pub fn build(b: *std.Build) void {
     unified_execution_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| unified_execution_bench_exe.root_module.addImport("pjrt", pjrt);
     unified_execution_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    unified_execution_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     unified_execution_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     unified_execution_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     unified_execution_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1793,6 +1801,7 @@ pub fn build(b: *std.Build) void {
         .name = "antfly-quant-recipe-fixtures",
         .root_module = b.createModule(.{ .root_source_file = b.path("src/quant_recipe_conformance.zig"), .target = b.graph.host, .optimize = .ReleaseFast }),
     });
+    quant_recipe_fixtures.root_module.addImport("antfly_tile", host_tile_mod);
     const emit_quant_recipe_fixtures = b.addRunArtifact(quant_recipe_fixtures);
     const quant_recipe_cpp = emit_quant_recipe_fixtures.addOutputFileArg("quant_recipes.cpp");
     const quant_recipe_host_check = b.addExecutable(.{
@@ -1806,6 +1815,7 @@ pub fn build(b: *std.Build) void {
         .name = "antfly-kernel-recipe-cuda-fixtures",
         .root_module = b.createModule(.{ .root_source_file = b.path("src/kernel_recipe_cuda_conformance.zig"), .target = b.graph.host, .optimize = .ReleaseFast }),
     });
+    recipe_cuda_fixtures.root_module.addImport("antfly_tile", host_tile_mod);
     const emit_recipe_cuda = b.addRunArtifact(recipe_cuda_fixtures);
     const recipe_cuda_source = emit_recipe_cuda.addOutputFileArg("kernel_recipes.cu");
     const recipe_cuda_source_step = b.step("kernel-recipe-cuda-source", "Generate model-free NVIDIA device conformance source");
@@ -1839,6 +1849,7 @@ pub fn build(b: *std.Build) void {
     unified_fixtures_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| unified_fixtures_bench_exe.root_module.addImport("pjrt", pjrt);
     unified_fixtures_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    unified_fixtures_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     unified_fixtures_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     unified_fixtures_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     unified_fixtures_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1970,6 +1981,7 @@ pub fn build(b: *std.Build) void {
     wasm_compute_tests.root_module.addImport("inference_tokenizer", inference_tokenizer_mod);
     wasm_compute_tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     wasm_compute_tests.root_module.addImport("inference_linalg", inference_linalg_mod);
+    wasm_compute_tests.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     wasm_compute_tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     wasm_compute_tests.root_module.addImport("antfly_jsonschema", antfly_jsonschema_mod);
     wasm_compute_tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);
@@ -2026,6 +2038,7 @@ pub fn build(b: *std.Build) void {
     web_projector_tests.root_module.addImport("inference_tokenizer", inference_tokenizer_mod);
     web_projector_tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     web_projector_tests.root_module.addImport("inference_linalg", inference_linalg_mod);
+    web_projector_tests.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     web_projector_tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     web_projector_tests.root_module.addImport("antfly_jsonschema", antfly_jsonschema_mod);
     web_projector_tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);

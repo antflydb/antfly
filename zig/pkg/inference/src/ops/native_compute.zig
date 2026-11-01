@@ -36499,7 +36499,7 @@ fn splitLastDim3Op(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror
         output.* = try self.makeOwnedBuf(values);
         initialized += 1;
         output.* = try self.withLogicalShape(output.*, &shape);
-        if (total != 0) try @import("antfly_tile").layout.copyRows(f32, data, .{ .rows = rows, .cols = dim, .row_stride = dim * 3, .offset = part * dim }, values, .{ .rows = rows, .cols = dim, .row_stride = dim });
+        if (total != 0) try @import("antfly_tile").layout.copyRows(f32, data, try (@import("antfly_tile").layout.InterleavedRows{ .parts = 3 }).view(rows, dim, part), values, .{ .rows = rows, .cols = dim, .row_stride = dim });
     }
 
     return .{

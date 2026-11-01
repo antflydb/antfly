@@ -17,7 +17,7 @@
 // Uses Zig's @Vector for vectorized operations on supported platforms.
 
 const std = @import("std");
-const kernel_math = @import("../ops/kernel_math.zig");
+const kernel_math = @import("antfly_tile").native_math;
 const linalg_primitives = @import("inference_linalg").primitives;
 
 // Comptime-selected SIMD width and vectorized exp helper, sourced from

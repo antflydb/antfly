@@ -17,7 +17,8 @@
 
 const program = @import("../../native_program.zig");
 
-pub const source_0 = "\t           \"kernel void termite_apply_rms_norm_1x(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_layer_norm_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\\n\"\n           \"    if (gid != 0) return;\\n\"\n           \"    if (p.hidden_size == 0) return;\\n\"\n           \"    float mean_square = 0.0f;\\n\"\n           \"    for (uint i = 0; i < p.hidden_size; ++i) { float x = input[i]; mean_square += x * x; }\\n\"\n           \"    mean_square /= float(p.hidden_size);\\n\"\n           \"    float inv_rms = rsqrt(mean_square + p.eps);\\n\"\n           \"    for (uint i = 0; i < p.hidden_size; ++i) output[i] = input[i] * inv_rms * weight[i];\\n\"\n           \"}\\n\"\n";
+const norm = @import("antfly_tile").native_normalization;
+pub const source_0 = "\t" ++ program.metal(norm.metalSerialRms("termite_apply_rms_norm_1x", false, "termite_metal_apply_layer_norm_params"));
 
 pub const source_1 =
     program.join(&.{
@@ -36,17 +37,8 @@ pub const source_1 =
         \\
         \\
         ,
+        program.metal(norm.metalSerialRms("termite_apply_rms_norm_rows", true, "termite_metal_apply_row_norm_params")),
         program.metal(
-            \\kernel void termite_apply_rms_norm_rows(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_row_norm_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
-            \\    if (gid >= p.rows) return;
-            \\    if (p.hidden_size == 0) return;
-            \\    uint row_base = gid * p.hidden_size;
-            \\    float mean_square = 0.0f;
-            \\    for (uint i = 0; i < p.hidden_size; ++i) { float x = input[row_base + i]; mean_square += x * x; }
-            \\    mean_square /= float(p.hidden_size);
-            \\    float inv_rms = rsqrt(mean_square + p.eps);
-            \\    for (uint i = 0; i < p.hidden_size; ++i) output[row_base + i] = input[row_base + i] * inv_rms * weight[i];
-            \\}
             \\kernel void termite_apply_rms_norm_rows_reduce(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_row_norm_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
             \\    if (row >= p.rows) return; termite_rms_norm_tree<false, false>(input, weight, input, output, shmem, row * p.hidden_size, p.hidden_size, p.eps, 1.0f, tid, tpg);
             \\}

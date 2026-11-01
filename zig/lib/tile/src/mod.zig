@@ -29,3 +29,5 @@ pub const gpu_model = @import("gpu_model.zig");
 pub const scoring = @import("scoring.zig");
 pub const rows = @import("rows.zig");
 pub const conformance = @import("conformance.zig");
+pub const native_math = @import("native_math.zig");
+pub const native_normalization = @import("native_normalization.zig");

@@ -25,6 +25,7 @@ Primitives:
 | `attention.zig` | `Attention` | flash-style online softmax; self, causal (KV cache) and cross attention |
 | `layout.zig` | `Im2col`, `Embed` | typed strided copy/gather/split/packing; conv unrolling; token + position gather |
 | `fexpr.zig`, `vmath.zig` | epilogues, math | `exp`/`erf`/GELU polynomials shared by all backends |
+| `native_math.zig`, `native_normalization.zig` | native numerical profiles and exports | common expression trees with explicit activation association, affine order and statistics algorithms |
 
 `gpu_model.zig` renders the model primitives and documents their GPU launch
 contract (binding order, params struct, grid, threads).
@@ -43,6 +44,19 @@ Native GEMMs can consume named operands through `FExpr.renderInputs` and
 `evalVecInputs`, or the existing `renderWith`/`evalVecWith` adapters while retaining their tuned tensor-core/SIMD loops and math.
 The portable GPU GEMM remains a conformance/prototype schedule; production
 GEMMs are not switched to it by these contracts.
+
+`FExpr` is also the native activation recipe representation. Its single
+scalar/SIMD evaluator and source renderer preserve tree association, explicit
+FMA and storage rounding. `native_math` supplies the existing target math
+profiles, including the two cubic GELU orders and guarded projection GELU.
+Typed `fexpr.Emission` template bindings insert those expressions into tuned
+CUDA/Metal epilogues without moving barriers, scratch publication or rounding.
+
+Normalization exports select their statistics algorithm explicitly: centered
+two-pass, raw-moment tree, uncentered RMS and Welford are distinct contracts.
+Serial and tree schedules stay separate; RMS weight/inverse association is
+also a static policy. `layout.InterleavedRows` describes both CPU split views
+and native split stores, while exported historical symbols retain their ABI.
 
 `layout.Rows` specifies element offsets and strides. CPU copy/gather validates
 all geometry and indices before storing; GPU callers use `prepareCopy` to validate the same

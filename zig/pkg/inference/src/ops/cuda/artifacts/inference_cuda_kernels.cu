@@ -1277,6 +1277,7 @@ extern "C" __global__ void termite_add_bias_relu_rows_f32(
 }
 // tile-codegen:end elementwise.direct.8 family
 
+// tile-codegen:begin projection.epilogue family (do not edit; run: zig build tile-kernel-codegen -- --write)
 template <unsigned int ROWS_PER_BLOCK, unsigned int COLS, unsigned int MODE>
 __device__ void termite_linear_bias_f32_tile_rows_cols(
     float* dst,
@@ -1340,6 +1341,7 @@ __device__ void termite_linear_bias_f32_tile_rows_cols(
         }
     }
 }
+// tile-codegen:end projection.epilogue family
 
 // tile-codegen:begin quant_cuda.linear_f32_tile.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_linear_bias_f32_tile4_r2(
@@ -1493,6 +1495,7 @@ extern "C" __global__ void termite_linear_triple_bias_f32_tile4_r2(ANTFLY_CUDA_L
 
 // One RMS reduction schedule; epilogues specialize before device code generation.
 // ScaleStage: 0=none, 1=scale normalized value before residual, 2=scale final sum.
+// tile-codegen:begin normalization.epilogue family (do not edit; run: zig build tile-kernel-codegen -- --write)
 template<bool Weighted, bool Residual, bool Bf16, int ScaleStage>
 __device__ __forceinline__ void termite_rms_norm_impl(
     float* dst, unsigned short* dst_bf16, const float* input,
@@ -1519,6 +1522,7 @@ __device__ __forceinline__ void termite_rms_norm_impl(
         if (Bf16) dst_bf16[idx] = termite_f32_to_bf16(value);
     }
 }
+// tile-codegen:end normalization.epilogue family
 
 // tile-codegen:begin rms_norm.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_rms_norm_f32(ANTFLY_CUDA_RMS_NORM_PARAMS) {
@@ -1548,6 +1552,7 @@ extern "C" __global__ void termite_rms_norm_add_output_scale_f32(ANTFLY_CUDA_RMS
 extern "C" __global__ void termite_rms_norm_bare_f32(ANTFLY_CUDA_RMS_NORM_BARE_PARAMS) {
     termite_rms_norm_impl<false, false, false, 0>(dst, nullptr, input, nullptr, nullptr, nullptr, rows, dim, eps);
 }
+
 // tile-codegen:end rms_norm.0 family
 
 // Gemma 4 A4B branches three RMSNorms from the same attention residual. Share

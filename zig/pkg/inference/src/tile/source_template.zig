@@ -48,7 +48,8 @@ pub fn render(comptime tmpl: []const u8, comptime ctx: anytype) []const u8 {
                 '/' => @compileError("unmatched {{" ++ tag ++ "}}"),
                 else => {
                     if (!@hasField(@TypeOf(ctx), tag)) @compileError("template field missing: " ++ tag);
-                    out = out ++ @field(ctx, tag);
+                    const value = @field(ctx, tag);
+                    out = out ++ if (@typeInfo(@TypeOf(value)) == .@"struct" and @hasDecl(@TypeOf(value), "render")) value.render() else value;
                 },
             }
         }

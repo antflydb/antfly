@@ -160,3 +160,43 @@ test "GEMM gate/up input and residual are independent in the CPU lowering" {
     core.gemm.run(g, args);
     for (got, ref) |a, b| try std.testing.expectApproxEqAbs(b, a, 0.008);
 }
+
+test {
+    _ = @import("native_math.zig");
+}
+
+test "normalization profiles preserve affine association, explicit FMA and algorithm ownership" {
+    const f = core.fexpr;
+    const input: f.Inputs(f32) = .{ .value = 1e20, .gate = 1e20, .bias = 1e-20, .residual = 0 };
+    try std.testing.expect(std.math.isInf((comptime core.native_math.rms(.scale_then_weight)).evaluate(struct {}, input)));
+    try std.testing.expect(std.math.isFinite((comptime core.native_math.rms(.weighted_inverse)).evaluate(struct {}, input)));
+    const fused = comptime f.acc.mulAdd(.bias, .residual);
+    const operands: f.Inputs(f32) = .{ .value = 1.0000001, .bias = 0.9999999, .residual = -1, .gate = 0 };
+    try std.testing.expectEqual(@as(u32, @bitCast(@mulAdd(f32, operands.value, operands.bias, operands.residual))), @as(u32, @bitCast(fused.evaluate(struct {}, operands))));
+    const serial = comptime core.native_normalization.metalLayer(.{ .name = "serial", .statistics = .centered_two_pass }, "Params", "family");
+    const rows = comptime core.native_normalization.metalLayer(.{ .name = "rows", .statistics = .raw_moments_tree }, "Params", "family");
+    try std.testing.expect(std.mem.indexOf(u8, serial, "family<0u, false, false>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rows, "family<0u, false, true>") != null);
+    const split: core.layout.InterleavedRows = .{ .parts = 3 };
+    try std.testing.expectEqual(@as(usize, 21), (try split.view(2, 7, 1)).row_stride);
+    try std.testing.expectEqual(@as(usize, 7), (try split.view(2, 7, 1)).offset);
+    try std.testing.expectError(error.InvalidLayout, split.view(2, 7, 3));
+}
+
+test "native literal emission preserves negative zero" {
+    const e = comptime core.fexpr.lit(-0.0);
+    const source = comptime e.renderNative(.{}, .{ .value = "", .bias = "", .gate = "", .residual = "" }, null);
+    try std.testing.expectEqualStrings("-0.0f", source);
+}
+
+test "native unary emission separates nested minus tokens" {
+    const e = comptime core.fexpr.acc.negated().negated();
+    try std.testing.expectEqualStrings("-(-x)", comptime e.renderNative(.{}, .{ .value = "x", .bias = "", .gate = "", .residual = "" }, null));
+}
+
+test "default vector math evaluates primitive tanh" {
+    const input: @Vector(4, f32) = .{ -3, -0.0, 0.25, 5 };
+    const e = comptime core.fexpr.acc.tanhOf();
+    const result = e.evalVec(4, input, @splat(0), @splat(0));
+    inline for (0..4) |i| try std.testing.expectEqual(@as(u32, @bitCast(std.math.tanh(input[i]))), @as(u32, @bitCast(result[i])));
+}
