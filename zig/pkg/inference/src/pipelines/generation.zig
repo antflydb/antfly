@@ -14078,8 +14078,11 @@ pub const NativeGenerationPipeline = struct {
             self.gpt_config.hasQwen35VisionArchitectureContract() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PACKED_MIXED") and
             platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128"))
             return self.forwardPackedScheduledQwenStep(claimed);
+        // Canonical reader epochs own the CUDA execution lifetime too. Requiring
+        // the diagnostic flag here silently downloaded full vocabulary logits
+        // instead of selecting greedy tokens on the device for those epochs.
         const cuda_lighton = self.cb.kind() == .cuda and self.graph_cache == null and self.compiled_partition_backend == null and self.gpt_config.hasQwen35VisionArchitectureContract() and
-            platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_BATCH") and @import("../architectures/qwen35_execution.zig").cudaCoreEnabled();
+            (self.lighton_cuda_execution_id != 0 or platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_BATCH")) and @import("../architectures/qwen35_execution.zig").cudaCoreEnabled();
         const prepared_decode = self.gpt_config.hasQwen35VisionArchitectureContract() and claimed.len <= 64 and
             platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_DECODE_WORKSPACE", self.prepared_lighton_decode or cuda_lighton) and blk: {
             for (claimed) |item| if (item.phase != .decode or item.query_sequence_len != 1) break :blk false;
