@@ -1,0 +1,89 @@
+name: Independent Cloudflare measurements
+on:
+  workflow_call:
+    inputs:
+      pr_number: {type: string, default: ''}
+      head_sha: {type: string, default: ''}
+      base_sha: {type: string, default: ''}
+      check_id: {type: string, default: ''}
+      comment_id: {type: string, default: ''}
+    secrets:
+      ANTFLY_BASELINE_API_TOKEN: {required: false}
+      ANTFLY_CANDIDATE_API_TOKEN: {required: false}
+      ANTFLY_OBSERVER_API_TOKEN: {required: false}
+  workflow_dispatch:
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+  actions: read
+jobs:
+  admission:
+    uses: ./.github/workflows/pr-ci-admission.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+      suite: cloudflare
+  measure:
+    needs: admission
+    if: ${{ !cancelled() && success() && needs.admission.result == 'success' && github.run_attempt == 1 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: cloudflare-independent-measurement
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: examples/cloudflare-serverless
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+      - name: Validate public plan
+        id: plan
+        env:
+          ANTFLY_HTTP_TRIAL_PLAN: ${{ vars.ANTFLY_HTTP_TRIAL_PLAN }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.head_sha || github.sha }}
+        run: node qualification/ci-independent-http-plan.mjs
+      - name: Reject previously claimed execution
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CLAIM_NAME: independent-http-claim-${{ steps.plan.outputs.execution_id }}
+        with:
+          script: |
+            const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              name: process.env.CLAIM_NAME, per_page: 100
+            });
+            if (artifacts.some(a => a.name === process.env.CLAIM_NAME))
+              throw new Error('Execution already claimed; provision a fresh plan.');
+      - name: Persist claim before any workload I/O
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: independent-http-claim-${{ steps.plan.outputs.execution_id }}
+          path: examples/cloudflare-serverless/dist/independent-ci/claim.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Measure and reconcile canonical service evidence
+        env:
+          ANTFLY_BASELINE_API_TOKEN: ${{ secrets.ANTFLY_BASELINE_API_TOKEN }}
+          ANTFLY_CANDIDATE_API_TOKEN: ${{ secrets.ANTFLY_CANDIDATE_API_TOKEN }}
+          ANTFLY_OBSERVER_API_TOKEN: ${{ secrets.ANTFLY_OBSERVER_API_TOKEN }}
+        run: node qualification/independent-http-trial.mjs --plan=dist/independent-ci/plan.json --out=dist/independent-ci/result
+      - name: Retain incomplete and failed measurements
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: independent-http-results-${{ github.run_id }}
+          path: examples/cloudflare-serverless/dist/independent-ci/
+          if-no-files-found: warn
+          retention-days: 14

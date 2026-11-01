@@ -28,7 +28,8 @@ function critical(v){
  if(!v||typeof v!=='object')return true;
  if(v.event==='antfly.io_settled'||v.io_lifecycle_id!=null||v.io_draining===true)return true;
  for(const[k,x]of Object.entries(v)){
-  if((k==='error'||k==='failure_code')&&x!=null)return true;
+  if((['error','failure_code','error_message','resource_limit'].includes(k))&&x!=null)return true;
+  if(k==='errors'&&Array.isArray(x)&&x.length)return true;
   if((k==='resource_failures'||k==='edge_cache_resource_errors')&&typeof x==='number'&&x>0)return true;
   if((k==='outcome'||k==='operation_outcome')&&x==='error')return true;
   if(x&&typeof x==='object'&&criticalNested(x))return true;

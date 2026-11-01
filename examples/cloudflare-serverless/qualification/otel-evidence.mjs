@@ -15,6 +15,7 @@
 
 // OTLP/JSON boundary. Preserve provider identities, never arbitrary attributes,
 // headers, URLs, exception messages, or log bodies. Unknown data cannot qualify.
+import{resourceLogFailure}from'./resource-events.mjs';
 import{parseDiagnosticJson}from'./diagnostic-memory.mjs';
 import{requestAttemptUuid,portableAttemptIdentity}from'./attempt-token.mjs';
 import {resourceFailureCode} from '../performance.mjs';
@@ -112,7 +113,7 @@ export function attributeOtelInvocations(rows){
 export function reconcileOtel(rows, expected, {version} = {}) {
  const attributed=attributeOtelInvocations(rows);rows=attributed.rows;const failures=[...attributed.failures],terminals=rows.filter(r=>r.terminal),ids=new Map();
  for(const row of terminals){if(!row.invocation_id_sha256||!row.trace_id_sha256||!row.span_id_sha256)failures.push('ProviderIdentityMissing');else {const prior=ids.get(row.invocation_id_sha256);if(prior&&JSON.stringify(prior)!==JSON.stringify(row))failures.push('ProviderIdentityConflict');ids.set(row.invocation_id_sha256,row);}if(!row.version_id)failures.push('ProviderVersionMissing');if(row.handler==='unknown'||!row.outcome||row.start==null||row.end==null||row.end<row.start||row.dropped||row.warning||!Number.isFinite(row.event?.cpuTime)||row.event.cpuTime<0||!Number.isFinite(row.event?.wallTime)||row.event.wallTime<0)failures.push('TerminalMetadataIncomplete');if(row.outcome&&row.outcome!=='ok')failures.push('InvocationFailed');}
- for(const row of rows){for(const log of row.event?.logs??[])for(const message of log.message??[]){let value;try{value=JSON.parse(message);}catch{value=null;}if(value?.failure_code&&resourceFailureCode(value.failure_code))failures.push('ResourceFailureObserved');}for(const exception of row.event?.exceptions??[])if(resourceFailureCode(exception.message))failures.push('ResourceFailureObserved');if(row.dropped||row.warning&&(row.terminal||row.warning_type!=='span_not_ended'))failures.push('TelemetryDroppedOrWarning');}
+ for(const row of rows){for(const log of row.event?.logs??[])for(const message of log.message??[]){let value;try{value=JSON.parse(message);}catch{value=null;}if(resourceLogFailure(value))failures.push('ResourceFailureObserved');}for(const exception of row.event?.exceptions??[])if(resourceFailureCode(exception.message))failures.push('ResourceFailureObserved');if(row.dropped||row.warning&&(row.terminal||row.warning_type!=='span_not_ended'))failures.push('TelemetryDroppedOrWarning');}
  const unique=[...ids.values()];
  if(version&&unique.some(row=>row.version_id!==version))failures.push('ProviderVersionMismatch');
  for(const pair of expected)for(const[kind,id,phase]of[['fetch',pair.id,'late'],['rpc',pair.rpc,'complete']]){

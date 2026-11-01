@@ -13,34 +13,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import{attemptParameter,versionIdentity}from'./attempt-token.mjs';
 const tenants=new Set(['a','b','c','d']),ops=new Set(['lookup','mutate','count','status','publish']);
 const visibility=v=>typeof v==='string'&&/^[a-f0-9]{82}$/.test(v);
 export function validatePlan(plan){
  if(!plan||!['baseline','candidate'].includes(plan.side)||!/^[-a-z0-9]{1,64}$/.test(plan.id??'')||!/^[a-f0-9-]{36}$/.test(plan.version??'')||!Array.isArray(plan.steps)||plan.steps.length<1||plan.steps.length>16)throw Error('InvalidTrialPlan');
+ const documents=plan.documents??64;if(![64,128,512].includes(documents))throw Error('InvalidTrialPlan');
  const rounds=plan.rounds??1;if(!Number.isInteger(rounds)||rounds<1||rounds>8)throw Error('InvalidTrialPlan');
- for(const s of plan.steps){if(!tenants.has(s.tenant)||!ops.has(s.op)||s.op==='lookup'&&(!Number.isInteger(s.id)||s.id<0||s.id>=64||!visibility(s.visibility))||s.op==='mutate'&&(!Number.isSafeInteger(s.sequence)||s.sequence<0||s.sequence+rounds-1>1000000)||s.op==='count'&&!visibility(s.visibility)||s.revision!=null&&(!Number.isSafeInteger(s.revision)||s.revision<0||s.revision>1000000))throw Error('InvalidTrialStep');}
+ if(new Set(plan.steps.filter(s=>s.attempt_id).map(s=>s.attempt_id)).size!==plan.steps.filter(s=>s.attempt_id).length)throw Error('InvalidTrialStep');
+ for(const s of plan.steps){if(s.attempt_id!=null&&(!versionIdentity(s.attempt_id)||rounds!==1))throw Error('InvalidTrialStep');if(!tenants.has(s.tenant)||!ops.has(s.op)||s.op==='lookup'&&(!Number.isInteger(s.id)||s.id<0||s.id>=documents||!visibility(s.visibility))||s.op==='mutate'&&(!Number.isSafeInteger(s.sequence)||s.sequence<0||s.sequence+rounds-1>1000000)||s.op==='count'&&!visibility(s.visibility)||s.revision!=null&&(!Number.isSafeInteger(s.revision)||s.revision<0||s.revision>1000000))throw Error('InvalidTrialStep');}
  return plan;
 }
 export function documentBody(tenant,id,revision){return JSON.stringify({tenant,i:id,payload:'x'.repeat(1024),...(revision==null?{}:{revision})});}
-export async function runPlan(plan,{origin,token,fetch:send=fetch,clock=()=>performance.now()}={}){
+export async function runPlan(plan,{origin,token,fetch:send=fetch,onResponse,clock=()=>performance.now(),kind='Cloudflare-to-public-Worker HTTP; excludes internet-client transit',clockDescription='I/O-advanced Worker wall clock around awaited HTTP'}={}){
  validatePlan(plan);const url=new URL(origin);if(url.protocol!=='https:'||!/^antfly-1278-cold-[a-z0-9]+-[a-f0-9]{4}\.[a-z0-9-]+\.workers\.dev$/.test(url.hostname)||url.pathname!=='/'||url.search||url.hash||url.port||url.username||url.password||!/^[a-f0-9]{64}$/.test(token??''))throw Error('InvalidTrialDestination');
  const samples=await Promise.all(plan.steps.map(async(s,index)=>{
-  const started=clock(),sample={attempt_id:crypto.randomUUID(),index,tenant:s.tenant,op:s.op,id:s.id,sequence:s.sequence,outcome:'error'};
+  const started=clock(),sample={attempt_id:s.attempt_id??crypto.randomUUID(),index,tenant:s.tenant,op:s.op,id:s.id,sequence:s.sequence,outcome:'error'};
   const input=s.op==='lookup'?{op:'lookup',doc_id:'doc/'+s.id,required_visibility:s.visibility,fresh:true}:s.op==='mutate'?{op:'mutate',operation_id:'paired/'+plan.id+'/'+s.tenant+'/'+s.sequence,mutations:[{kind:'upsert',doc_id:'doc/0',body:documentBody(s.tenant,0,s.sequence)}]}:s.op==='count'?{op:'count',required_visibility:s.visibility}:{op:s.op};
   try{
-   const response=await send(new URL('/api?__antfly_qualification_attempt='+sample.attempt_id.replaceAll('-',''),origin),{method:'POST',redirect:'manual',cache:'no-store',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json','X-Antfly-Tenant':s.tenant},body:JSON.stringify(input),signal:AbortSignal.timeout(60000)});sample.status=response.status;sample.version=response.headers.get('X-Antfly-Version');sample.trace_id=response.headers.get('X-Antfly-Trace-Id');sample.colo=/\b([A-Z]{3})$/.exec(response.headers.get('CF-Ray')??'')?.[1]??null;
+   const response=await send(new URL('/api?__antfly_qualification_attempt='+attemptParameter(sample.attempt_id),origin),{method:'POST',redirect:'manual',cache:'no-store',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json','X-Antfly-Tenant':s.tenant},body:JSON.stringify(input),signal:AbortSignal.timeout(60000)});await onResponse?.(sample.attempt_id,response);sample.status=response.status;sample.version=response.headers.get('X-Antfly-Version');sample.trace_id=response.headers.get('X-Antfly-Trace-Id');sample.colo=/\b([A-Z]{3})$/.exec(response.headers.get('CF-Ray')??'')?.[1]??null;
    if(response.status>=300&&response.status<400){await response.body?.cancel();throw Error('TrialRedirectRejected');}
    const value=await response.json();sample.ms=Math.max(0,clock()-started);
    if(!response.ok){sample.error=/\b(SQLITE_NOMEM|OutOfMemory|MemoryLimitExceeded|CPULimitExceeded|CoordinatorRecovering|CoordinatorCommitBusy|DeadlineExceeded|ManifestReadLeaseExpired)\b/.exec(String(value.error??''))?.[1]??'HTTP'+response.status;return sample;}
    if(sample.version!==plan.version)throw Error('TrialVersionMismatch');
    if(s.op==='lookup'){if(value.body!==documentBody(s.tenant,s.id,s.revision))throw Error('TrialBodyMismatch');if(!visibility(value.visibility)||value.visibility.slice(0,66)!==s.visibility.slice(0,66)||BigInt('0x'+value.visibility.slice(-16))<BigInt('0x'+s.visibility.slice(-16)))throw Error('TrialFenceMismatch');}
    if(s.op==='mutate'&&(value.committed!==true||!visibility(value.visibility)))throw Error('TrialDurabilityMismatch');
-   if(s.op==='mutate'){const expected=plan.steps.find(p=>p.tenant===s.tenant&&p.op==='lookup')?.visibility;if(expected&&value.visibility.slice(0,66)!==expected.slice(0,66))throw Error('TrialFenceMismatch');}
-   if(s.op==='count'&&value.count!=='64')throw Error('TrialCountMismatch');
+   if(s.op==='mutate'){const expected=plan.steps.find(p=>p.tenant===s.tenant&&p.op==='lookup')?.visibility??s.visibility;if(expected&&value.visibility.slice(0,66)!==expected.slice(0,66))throw Error('TrialFenceMismatch');}
+   if(s.op==='count'&&value.count!==String(plan.documents??64))throw Error('TrialCountMismatch');
    if(visibility(value.visibility))sample.visibility=value.visibility;if(s.op==='publish')sample.has_more=value.has_more===true;sample.outcome='ok';
   }catch(error){sample.ms=Math.max(0,clock()-started);sample.error=/^(Trial\w+|TimeoutError|AbortError)$/.test(error.message??'')?error.message:['TimeoutError','AbortError'].includes(error.name)?error.name:'TrialTransportError';}
   return sample;
- }));return{qualification:false,kind:'Cloudflare-to-public-Worker HTTP; excludes internet-client transit',clock:'I/O-advanced Worker wall clock around awaited HTTP',side:plan.side,id:plan.id,samples,passed:samples.every(s=>s.outcome==='ok')};
+ }));return{qualification:false,kind,clock:clockDescription,side:plan.side,id:plan.id,samples,passed:samples.every(s=>s.outcome==='ok')};
 }
 export async function runRounds(plan,options){
  validatePlan(plan);const rounds=plan.rounds??1;if(!Number.isInteger(rounds)||rounds<1||rounds>8)throw Error('InvalidTrialPlan');const fences=new Map(),samples=[];
@@ -49,7 +52,7 @@ export async function runRounds(plan,options){
   for(const sample of result.samples){try{options?.onSample?.({...sample,round});}catch{}samples.push({...sample,round});if(sample.op==='mutate'&&sample.outcome==='ok'){const prior=fences.get(sample.tenant);if(!prior||BigInt('0x'+sample.visibility.slice(-16))>BigInt('0x'+prior.slice(-16)))fences.set(sample.tenant,sample.visibility);}}
   if(!result.passed)return{...result,rounds_completed:round+1,samples};
  }
- return{qualification:false,kind:'Cloudflare-to-public-Worker HTTP; excludes internet-client transit',clock:'I/O-advanced Worker wall clock around awaited HTTP',side:plan.side,id:plan.id,rounds_completed:rounds,samples,passed:true};
+ return{qualification:false,kind:options?.kind??'Cloudflare-to-public-Worker HTTP; excludes internet-client transit',clock:options?.clockDescription??'I/O-advanced Worker wall clock around awaited HTTP',side:plan.side,id:plan.id,rounds_completed:rounds,samples,passed:true};
 }
 let active=false;
 export default{async fetch(request,env){

@@ -24,6 +24,7 @@ import{createHash}from'node:crypto';
 import{sanitizeTailEvent}from'./metrics-tail.mjs';
 import{assertGateRun}from'./gate-scope.mjs';
 import{resourceFailureCode}from'../performance.mjs';
+import{resourceLogFailure}from'./resource-events.mjs';
 const roles=['app','writer','reader','builder'];
 export class DiagnosticCoverage{
  constructor(runs){this.ioLifecycles=new WeakMap();this.streams=runs.flatMap(run=>roles.map(role=>({run:run.id,role,connected:false,active_connections:0,replica_disconnects:0,gap:false,events:0,resource_failures:0,gap_reasons:{}})));}
@@ -36,7 +37,7 @@ export class DiagnosticCoverage{
   if(['exceededMemory','exceededCpu'].includes(event.outcome))row.resource_failures++;
   for(const error of event.exceptions??[])if(resourceFailureCode(error.message))row.resource_failures++;
   for(const log of event.logs??[])for(const message of log.message??[]){let value;try{value=JSON.parse(message);}catch{continue;}
-   if(resourceFailureCode(value.failure_code)||resourceFailureCode(value.error)||value.physical?.resource_failures>0||value.physical?.edge_cache_resource_errors>0)row.resource_failures++;
+   if(resourceLogFailure(value))row.resource_failures++;
    // Completion must match the same physical lifetime, role and execution.
    // Retain completed IDs to tolerate duplicate tail replicas and reordering.
    if(value.io_draining===true||value.event==='antfly.io_settled'||value.io_lifecycle_id){

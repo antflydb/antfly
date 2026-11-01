@@ -481,3 +481,13 @@ improves 4.8–6.6× and mixed reads/writes 2.3–3.0×/2.3–2.7×. Warm gain i
 and one mixed candidate p95 is 1,594 ms. The full gate and historical memory
 failure therefore remain open. The linked record contains every paired result,
 coverage limits, preserved evidence and verified test-resource retirement.
+
+
+The exact gate misses in that small trial are reverse mixed read p95
+**1,594 ms > 1,000 ms**, and reverse warm-read regression **510 ms > 483 ms**.
+Cold p95 1,424–1,721 ms meets the original 5,000 ms absolute gate bound; the
+unmet 10× cold goal is separate. Write p95 meets 3,000 ms in both orders.
+See [independent offered-load qualification](cloudflare-independent-http.md) for
+the implemented external runner, complete eight-service evidence and recovered
+memory-error retention. Those changes improve measurement and failure detection;
+new hosted measurements and the historical memory root cause remain open.

@@ -18,7 +18,7 @@ import{DiagnosticCoverage}from'./live-diagnostics.mjs';
 import{collectCanonicalWindows,readCanonicalSnapshot,partitionCanonicalTimeframe}from'./canonical-window-client.mjs';
 const sha=b=>createHash('sha256').update(b).digest('hex');
 export async function observerCall(observer,path,body={}, {fetch:request=fetch,signal}={}){
- const useReader=observer.reader_origin&&(path==='/health'||/\/(?:page|inventory|objects|layout|window|window-inventory|window-objects|witnesses|rejections)$/.test(path)),token=(await readFile(observer.token_file,'utf8')).trim(),origin=new URL(useReader?observer.reader_origin:observer.origin),owner=useReader?observer.reader_id:observer.id;if(origin.protocol!=='https:'||!origin.hostname.startsWith(owner+'.')||!origin.hostname.endsWith('.workers.dev'))throw Error('ObserverOriginInvalid');
+ const useReader=observer.reader_origin&&(path==='/health'||/\/(?:page|inventory|objects|layout|window|window-inventory|window-objects|witnesses|rejections)$/.test(path)),token=typeof observer.credential==='function'?await observer.credential():(await readFile(observer.token_file,'utf8')).trim(),origin=new URL(useReader?observer.reader_origin:observer.origin),owner=useReader?observer.reader_id:observer.id;if(origin.protocol!=='https:'||!origin.hostname.startsWith(owner+'.')||!origin.hostname.endsWith('.workers.dev'))throw Error('ObserverOriginInvalid');
  const external=signal??observer.capture_signal;external?.throwIfAborted();
  const deadline=Date.now()+30000,readOnly=path==='/health'||/\/(?:page|inventory|objects|layout|window|window-inventory|window-objects|witnesses|rejections)$/.test(path);
  for(let attempt=0;;attempt++)try{

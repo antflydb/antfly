@@ -16,7 +16,7 @@
 import{readFile,writeFile,mkdir,appendFile,readdir,unlink,rm}from'node:fs/promises';
 import{resolve,join}from'node:path';import{createHash,randomBytes}from'node:crypto';
 import{spawn,execFileSync}from'node:child_process';import assert from'node:assert/strict';
-import{tailFrames}from'./metrics-tail.mjs';
+import{tailFrames}from'./metrics-tail.mjs';import{verifyObservationRun}from'./observation-runs.mjs';
 const[action,path]=process.argv.slice(2),root=process.cwd(),cli=resolve('node_modules/wrangler/bin/wrangler.js'),roles=['writer','reader','builder','app'];
 const save=run=>writeFile(join(run.dir,'run.json'),JSON.stringify(run,null,2));
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
@@ -50,7 +50,7 @@ const run=JSON.parse(await readFile(resolve(path)));if(run.schema!==1||run.kind!
 assert.equal(run.token_file,join(run.dir,'api-token'));assert.deepEqual(run.services.map(s=>s.role),roles);if(run.deleted&&action!=='cleanup')throw Error('PilotAlreadyDeleted');
 for(const s of run.services){assert.equal(s.name,run.id+(s.role==='app'?'':'-'+s.role));assert.equal(s.config,join(run.dir,s.role+'.json'));const config=JSON.parse(await readFile(s.config));assert.equal(config.name,s.name);assert.equal(config.account_id,run.account);assert.equal(config.r2_buckets[0].bucket_name,run.id);assert.equal(config.queues,undefined);assert.equal(config.triggers,undefined);}
 const app=run.services.find(s=>s.role==='app');
-async function verify(){for(const s of run.services){assert.equal(hash(await readFile(s.config)),run.seal[s.role].config,'PilotConfigChanged');for(const[name,expected]of Object.entries(run.seal[s.role].files))assert.equal(hash(await readFile(join(run.dir,'bundle-'+s.role,name))),expected,'PilotBundleChanged');}}
+async function verify(){assert.deepEqual(await verifyObservationRun(run),[],'PilotBundleOrRuntimeChanged');}
 async function deploy(s){const output=await command(run,['deploy','--no-bundle','--config',s.config]),version=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];if(!version)throw Error('PilotVersionMissing');run.versions??={};run.versions[s.role]=version;if(s.role==='app'){run.origin=/https:\/\/[^\s]+\.workers\.dev/.exec(output)?.[0];if(!run.origin||!new URL(run.origin).hostname.startsWith(run.id+'.'))throw Error('PilotOriginMismatch');}await save(run);}
 async function call(input,pathname='/api',tenant='a'){
  const token=(await readFile(run.token_file,'utf8')).trim(),started=performance.now();let response;try{response=await fetch(new URL(pathname,run.origin),{method:'POST',headers:{Authorization:'Bearer '+token,'X-Antfly-Tenant':tenant},body:JSON.stringify(input),signal:AbortSignal.timeout(60000)});}catch(error){await appendFile(join(run.dir,'requests.jsonl'),JSON.stringify({at:new Date().toISOString(),tenant,op:input.op??pathname,status:null,ms:performance.now()-started,error:error.name??'Error'})+'\n');throw error;}const value=await response.json();const sample={status:response.status,ms:performance.now()-started,trace_id:response.headers.get('X-Antfly-Trace-Id'),version:response.headers.get('X-Antfly-Version'),value};

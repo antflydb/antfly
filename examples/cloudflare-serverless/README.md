@@ -850,3 +850,11 @@ HTTP driver. Its timings exclude the local host and external client transit;
 these are separate from the full gate. The driver rejects redirects, pins
 versions, retains every failed member, advances fences only after durable ACKs,
 and runs all rounds remotely. Native serving/control source remains unchanged.
+
+
+For independent offered-load measurements, use the Node runner and eight-service
+canonical export described in [the independent measurement design](../../docs/design/cloudflare-independent-http.md).
+Its GitHub-hosted workflow uses disposable application/observer credentials;
+account authorization remains local. Client success alone cannot close missing
+service/resource or provider delivery windows. Local checks do not establish a
+hosted gate pass.

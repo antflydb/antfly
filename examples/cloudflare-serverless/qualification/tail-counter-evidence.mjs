@@ -17,7 +17,7 @@ import{minuteOf,windowPrefix}from'./canonical-windows.mjs';
 import{DiagnosticCoverage}from'./live-diagnostics.mjs';
 const uuid=v=>typeof v==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(v);
 const sha=v=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v);
-const worker=v=>typeof v==='string'&&/^antfly-1278-(?:telemetry-[a-z0-9]+-source|g-[a-z0-9]+-[1-3]-[bc](?:-(?:writer|reader|builder))?)$/.test(v);
+const worker=v=>typeof v==='string'&&/^antfly-1278-(?:telemetry-[a-z0-9]+-source|cold-[a-z0-9]+-[a-f0-9]{4}(?:-(?:writer|reader|builder))?|g-[a-z0-9]+-[1-3]-[bc](?:-(?:writer|reader|builder))?)$/.test(v);
 // Exact terminal-delivery counts from an unfiltered provider Tail subscription.
 // Delivery IDs are NOT invocation IDs and no sampling interval is invented.
 // Empty populations require named, version-matched witnesses on both sides.

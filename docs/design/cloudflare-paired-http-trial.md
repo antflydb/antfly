@@ -156,10 +156,13 @@ compiled code and platform/SQLite memory. No independent total-isolate-memory
 measurement or full-scale soak is supplied. Historical `SQLITE_NOMEM` remains
 open despite this successful small run.
 
-**The full gate does not pass.** Warm gain is not stable, cold is below the
-tenfold relative target, the reverse mixed candidate read p95 exceeds the
-1,000 ms target, and the original large-corpus/error-window/independent-coverage
-requirements are unrun. Do not lower thresholds or infer a universal speedup.
+**The full gate does not pass.** The reverse mixed candidate read p95 is
+1,594 ms, exceeding the actual 1,000 ms gate bound. Reverse warm reads regress
+from control 483 ms to candidate 510 ms. The original gate policy requires
+read/write/cold p95 at most 1,000/3,000/5,000 ms plus paired non-regression:
+these small cold populations meet the 5,000 ms absolute bound. The tenfold
+cold and twofold warm/burst goals are design goals, not original gate limits.
+The original large-corpus/error-window/independent-coverage requirements are unrun. Do not lower thresholds or infer a universal speedup.
 The next performance work should attribute owner/network and R2 dependency
 waiting separately, replace the driver bottleneck with a genuinely independent offered-
 load client, improve complete service/resource export, and repeat both
@@ -190,3 +193,13 @@ redirect rejection, body/fence/version checks, sibling resource failures without
 retries, round-to-round fence progression, bounded streamed input, and sanitized
 per-attempt/resource diagnostics. Native modules and production serving source
 are unchanged by this follow-up.
+
+
+## Independent offered load and complete service evidence
+
+The [independent measurement design](cloudflare-independent-http.md) replaces
+this diagnostic driver's connection bottleneck with an external Node client and
+connects both sealed stacks' eight services to the canonical export receiver and
+independent provider Tail counters. It preserves original runtime/module pins,
+resource budgets and gate thresholds. This is implemented and locally tested;
+it is not a new hosted result or a claim that these latency misses are fixed.

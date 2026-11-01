@@ -134,3 +134,7 @@ test('a resource failure in a pipelined proof page remains visible and all other
  env.LOGS.get=async(key,...args)=>{active++;try{await new Promise(ok=>setTimeout(ok,1));if(!failed&&key.endsWith('extra-035.json')){failed=true;throw Error('SQLITE_NOMEM');}return await get(key,...args);}finally{active--;}};
  await assert.rejects(captures(env,async()=>{}),/ObserverResourceFailure:SQLITE_NOMEM/);assert.equal(active,0);const{diagnosticReadResponses}=await import('../qualification/diagnostic-memory.mjs');assert.equal(diagnosticReadResponses.report().active,0);assert.equal(diagnosticReadResponses.report().pending,0);
 });
+
+test('canonical compaction retains recovered memory failures and unknown error arrays',async()=>{
+ const{compactEvent}=await import('../qualification/canonical-windows.mjs');for(const value of[{event:'antfly.durable_storage_error',error_message:'SQLITE_NOMEM'},{event:'antfly.trace',errors:[{resource_limit:'memory'}]},{event:'antfly.trace',errors:[{remote:true}]}]){const event={outcome:'ok',logs:[{message:[JSON.stringify(value)]}]};assert.deepEqual(compactEvent(event).logs,event.logs);}
+});

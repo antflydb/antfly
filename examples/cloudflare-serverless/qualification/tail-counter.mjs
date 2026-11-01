@@ -21,7 +21,7 @@ import{attemptParameter,requestAttemptUuid,portableAttemptIdentity,versionIdenti
 import {sanitizeTailEvent} from './metrics-tail.mjs';
 const uuid=v=>typeof v==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(v);
 export async function prepareTailDelivery(events,env){
- if(!uuid(env.CAPTURE_ID)||!/^antfly-1278-(?:telemetry-[a-z0-9]+-source|g-[a-z0-9]+-[1-3]-[bc](?:-(?:writer|reader|builder))?)$/.test(env.SOURCE_WORKER??''))throw Error('CounterScopeInvalid');
+ if(!uuid(env.CAPTURE_ID)||!(/^antfly-1278-(?:telemetry-[a-z0-9]+-source|g-[a-z0-9]+-[1-3]-[bc](?:-(?:writer|reader|builder))?)$/.test(env.SOURCE_WORKER??'')||env.SOURCE_LAYOUT==='cold-pair-v1'&&/^antfly-1278-cold-[a-z0-9]+-[a-f0-9]{4}(?:-(?:writer|reader|builder))?$/.test(env.SOURCE_WORKER??'')))throw Error('CounterScopeInvalid');
  if(!Array.isArray(events)||events.length>1000)throw Error('CounterDeliveryBudgetExceeded');
  const records=[],witnesses=[];let foreign=0;
  for(const item of events){

@@ -22,6 +22,10 @@ import{prepareTailDelivery,publishTailDelivery,counterWitness}from'./tail-counte
 const uuid=v=>typeof v==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v);
 export function observerScopes(env){
  const scopes=JSON.parse(env.SOURCE_SCOPES??'null');if(!Array.isArray(scopes)||scopes.length!==8||new Set(scopes.map(s=>s.source)).size!==8||new Set(scopes.map(s=>s.capture_id)).size!==8)throw Error('ObserverScopeInvalid');
+ if(env.SOURCE_LAYOUT==='cold-pair-v1'){
+  const runs=new Set();for(const[i,s]of scopes.entries()){const m=/^(antfly-1278-cold-[a-z0-9]+-[a-f0-9]{4})(?:-(writer|reader|builder))?$/.exec(s.source??'');if(!m||s.run!==m[1]||s.role!==(m[2]??'app')||!uuid(s.capture_id)||s.binding!=='PRODUCER_'+i)throw Error('ObserverScopeInvalid');runs.add(s.run);}if(runs.size!==2||[...runs].some(run=>!['app','writer','reader','builder'].every(role=>scopes.some(s=>s.run===run&&s.role===role))))throw Error('ObserverScopeInvalid');return scopes;
+ }
+ if(env.SOURCE_LAYOUT!=null)throw Error('ObserverScopeInvalid');
  const pairs=new Set();for(const [i,s]of scopes.entries()){const m=/^(antfly-1278-g-[a-z0-9]+-[1-3])-[bc](?:-(writer|reader|builder))?$/.exec(s.source??'');if(!m||!uuid(s.capture_id)||s.binding!=='PRODUCER_'+i)throw Error('ObserverScopeInvalid');pairs.add(m[1]);}
  if(pairs.size!==1||!['b','c'].every(side=>['','-writer','-reader','-builder'].every(role=>scopes.some(s=>s.source===[...pairs][0]+'-'+side+role))))throw Error('ObserverScopeInvalid');return scopes;
 }
