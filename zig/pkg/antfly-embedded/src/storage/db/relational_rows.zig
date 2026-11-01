@@ -54,6 +54,7 @@ pub const RowFilter = struct {
     }
 };
 pub const Request = struct {
+    cypher_projection_json: []const u8 = "",
     cypher_presence_fields: []const []const u8 = &.{},
     reverse: bool = false,
     include_primary_digest: bool = false,
@@ -132,6 +133,7 @@ pub const Page = struct {
 };
 
 pub const Reader = struct {
+    cypher_projection: []const @import("cypher").read_fields.Projection = &.{},
     cypher_presence_fields: []const []const u8 = &.{},
     row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
     alloc: Allocator,
@@ -461,6 +463,7 @@ pub const Reader = struct {
             .owned_upper = owned_upper,
             .fields = fields,
             .cypher_presence_fields = try clonePresence(owned, request.cypher_presence_fields),
+            .cypher_projection = try @import("query/cypher_projection.zig").decode(owned, request.cypher_projection_json),
             .now_ns = now_ns,
             .authenticated = authenticated,
             .include_primary_digest = request.include_primary_digest,
@@ -1034,8 +1037,8 @@ pub const Reader = struct {
                         }
                         const typed_projection = if (typed_output and !native) try row.projectSqlTypedAlloc(page, projection) else null;
                         const typed = if (typed_projection) |projected| projected.value else null;
-                        const json = if (typed_output) "" else if (self.cypher_presence_fields.len == 0) try row.projectAlloc(temporary, projection) else projected: {
-                            var context: @import("query/streamed_projection.zig").Context = .{ .scratch = temporary, .value = .{ .row = .{ .plan = .{ .base = projection, .arena = .init(temporary) }, .row = row } } };
+                        const json = if (typed_output) "" else if (self.cypher_presence_fields.len == 0 and self.cypher_projection.len == 0) try row.projectAlloc(temporary, projection) else projected: {
+                            var context: @import("query/streamed_projection.zig").Context = .{ .scratch = temporary, .property_projection = self.cypher_projection, .value = .{ .row = .{ .plan = .{ .base = projection, .arena = .init(temporary) }, .row = row } } };
                             const value = (try context.borrow().countProjection(temporary, self.cypher_presence_fields)) orelse return error.InvalidRelationalRowsRequest;
                             break :projected try std.json.Stringify.valueAlloc(temporary, value, .{});
                         };

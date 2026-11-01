@@ -2115,7 +2115,13 @@ def test_authenticated_cypher_relationship_demand_skips_unused_metadata():
                         "target": "b",
                         "edge_type": "link",
                         "edge_id": str(i),
-                        "metadata_json": json.dumps({"rank": i, "body": body}),
+                        "metadata_json": json.dumps(
+                            {
+                                "rank": i,
+                                "body": body,
+                                "payload": {"rank": i, "body": body, "nil": None},
+                            }
+                        ),
                     }
                     for i in range(16)
                 ],
@@ -2128,7 +2134,7 @@ def test_authenticated_cypher_relationship_demand_skips_unused_metadata():
                 call(
                     f"/graphs/{name}/query",
                     {
-                        "query": "MATCH(a:D {id:'a'}),(b:D {id:'b'}) CREATE(a)-[r:R {rank:99,body:$body}]->(b) RETURN 1",
+                        "query": "MATCH(a:D {id:'a'}),(b:D {id:'b'}) CREATE(a)-[r:R {rank:99,body:$body,payload:{rank:99,body:$body}}]->(b) RETURN 1",
                         "parameters": {"body": body},
                         "write_request_id": uuid.uuid4().hex,
                     },
@@ -2139,6 +2145,12 @@ def test_authenticated_cypher_relationship_demand_skips_unused_metadata():
                 ("count(r)", expected_count),
                 ("count(r.body)", expected_count),
                 ("sum(r.rank)", expected_sum),
+                ("sum(r.payload.rank)", expected_sum),
+                ("count(r.payload.body)", expected_count),
+                (
+                    "sum(CASE WHEN r.payload.body IS NOT NULL THEN 1 ELSE 0 END)",
+                    expected_count,
+                ),
                 ("sum(CASE WHEN r.body IS NOT NULL THEN 1 ELSE 0 END)", expected_count),
             ):
                 result = call(
@@ -2172,6 +2184,10 @@ def test_authenticated_cypher_relationship_demand_skips_unused_metadata():
             )
             properties = complete["rows"][0][0]["value"]["properties"]["value"]
             assert properties["body"] == {"type": "string", "value": body}, complete
+            assert properties["payload"]["value"]["body"] == {
+                "type": "string",
+                "value": body,
+            }, complete
         denied = session.post(
             base + f"/graphs/{name}/query",
             json={"query": prefix + "count(*)", "limits": {"explored_edges": 16}},
@@ -2183,4 +2199,265 @@ def test_authenticated_cypher_relationship_demand_skips_unused_metadata():
         ), denied.text
     finally:
         session.close()
+        server.stop()
+
+
+@pytest.mark.parametrize("relational", [False, True], ids=["document", "relational"])
+def test_authenticated_cypher_nested_and_table_demand(relational, monkeypatch):
+    """Nested cells and full entities from another table must not widen reads."""
+    write_config = conftest._write_remote_content_e2e_config
+
+    def with_graph_work_budget(*args, **kwargs):
+        path = write_config(*args, **kwargs)
+        config = json.loads(path.read_text())
+        config.setdefault("resources", {}).setdefault("query", {}).setdefault(
+            "request_limits", {}
+        )["graph"] = {"max_intermediate_states": 1000000}
+        path.write_text(json.dumps(config))
+        return path
+
+    monkeypatch.setattr(
+        conftest, "_write_remote_content_e2e_config", with_graph_work_budget
+    )
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port(), pgwire=True)
+    admin = requests.Session()
+    admin.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+    reader = requests.Session()
+    name = "cypher_paths_" + uuid.uuid4().hex
+    categories = name + "_categories"
+    reader.auth = (name + "_reader", uuid.uuid4().hex)
+    base = server.api_url.rstrip("/")
+    wide = "x" * (2 << 20)
+
+    def call(path, body, *, session=admin, method="POST"):
+        response = session.request(
+            method,
+            (server.url if path.startswith("/auth/") else base) + path,
+            json=body,
+            timeout=45,
+        )
+        assert response.status_code in (200, 201, 202), (
+            response.status_code,
+            response.text,
+            server.log_path.read_text()[-5000:],
+        )
+        return response.json()
+
+    def query(statement, memory=1 << 20, session=admin, work=1000):
+        result = call(
+            f"/graphs/{name}/query",
+            {
+                "query": statement,
+                "limits": {"memory_bytes": memory, "intermediate_states": work},
+            },
+            session=session,
+        )
+        assert result["stats"]["memory_bytes"] < memory, result
+        return result
+
+    def integer(value):
+        return {"type": "integer", "value": str(value)}
+
+    try:
+        if relational:
+            call(
+                "/sql",
+                {
+                    "statement": f"CREATE TABLE {name} (id TEXT, tenant TEXT, score BIGINT, body TEXT, payload JSONB)"
+                },
+            )
+        else:
+            call(f"/tables/{name}", {"num_shards": 1})
+        call(f"/tables/{categories}", {"num_shards": 1})
+        documents = {
+            "d1": {
+                "id": "d1",
+                "tenant": "acme",
+                "score": 7,
+                "body": wide,
+                "payload": {"rank": 7, "body": wide, "nil": None},
+            },
+            "d2": {"id": "d2", "tenant": "other", "score": 0, "payload": None},
+            "d3": {"id": "d3", "tenant": "acme", "score": 0},
+            "d6": {
+                "id": "d6",
+                "tenant": "other",
+                "score": 99,
+                "payload": {"rank": 99, "body": "hidden"},
+            },
+        }
+        call(
+            f"/tables/{name}/batch", {"inserts": documents, "sync_level": "full_index"}
+        )
+        call(
+            f"/tables/{categories}/batch",
+            {"inserts": {"c1": {"id": "c1"}}, "sync_level": "full_index"},
+        )
+        call(
+            f"/graphs/{name}",
+            {
+                "labels": [
+                    {"name": "D", "table": name},
+                    {"name": "Wide", "table": name, "where": {"body": "unmatched"}},
+                    {"name": "C", "table": categories},
+                ],
+                "relationships": [],
+            },
+        )
+        call(
+            f"/auth/v1/users/{reader.auth[0]}",
+            {
+                "password": reader.auth[1],
+                "initial_policies": [
+                    {"resource_type": "graph", "resource": name, "type": "read"},
+                    {"resource_type": "table", "resource": name, "type": "read"},
+                    {"resource_type": "table", "resource": categories, "type": "read"},
+                ],
+            },
+        )
+        call(
+            f"/auth/v1/users/{reader.auth[0]}/row-filters/{name}",
+            {"term": {"tenant": "acme"}},
+            method="PUT",
+        )
+        for session, expected_sum, expected_present in (
+            (admin, 106, 2),
+            (reader, 7, 1),
+        ):
+            for statement, expected in (
+                ("MATCH(d:D) RETURN sum(d.payload.rank)", expected_sum),
+                ("MATCH(d:D) OPTIONAL MATCH(d:C) RETURN sum(d.score)", expected_sum),
+                ("MATCH(d:D) RETURN count(d.payload.body)", expected_present),
+                (
+                    "MATCH(d:D) RETURN sum(CASE WHEN d.payload.body IS NOT NULL THEN 1 ELSE 0 END)",
+                    expected_present,
+                ),
+                ("MATCH(d:D) WITH d AS x RETURN sum(x.payload.rank)", expected_sum),
+            ):
+                result = query(statement, session=session)
+                assert result["rows"] == [[integer(expected)]], result
+                print(
+                    json.dumps(
+                        {
+                            "path_storage": "relational" if relational else "document",
+                            "filtered": session is reader,
+                            "query": statement,
+                            "stats": result["stats"],
+                        },
+                        sort_keys=True,
+                    )
+                )
+            for returned in ("c", "labels(c)"):
+                result = query(
+                    f"MATCH(d:D),(c:C) RETURN {returned},sum(d.score)", session=session
+                )
+                assert result["rows"][0][1] == integer(expected_sum), result
+                if returned == "c":
+                    assert (
+                        result["rows"][0][0]["value"]["properties"]["value"]["id"][
+                            "value"
+                        ]
+                        == "c1"
+                    ), result
+                else:
+                    assert result["rows"][0][0] == {
+                        "type": "list",
+                        "value": [{"type": "string", "value": "C"}],
+                    }, result
+                print(
+                    json.dumps(
+                        {
+                            "table_storage": "relational" if relational else "document",
+                            "filtered": session is reader,
+                            "returned": returned,
+                            "stats": result["stats"],
+                        },
+                        sort_keys=True,
+                    )
+                )
+        result = query(
+            "MATCH(d:D) RETURN d.id,d.payload.rank,d.payload.body IS NOT NULL,d.payload IS NULL ORDER BY d.id"
+        )
+        expected = [
+            ("d1", 7, True, False),
+            ("d2", None, False, True),
+            ("d3", None, False, True),
+            ("d6", 99, True, False),
+        ]
+        assert result["rows"] == [
+            [
+                {"type": "string", "value": key},
+                integer(rank) if rank is not None else {"type": "null", "value": None},
+                {"type": "boolean", "value": present},
+                {"type": "boolean", "value": nil},
+            ]
+            for key, rank, present, nil in expected
+        ], result
+        # A complete ancestor observer must override its partial descendants.
+        result = query(
+            "MATCH(d:D) WHERE antfly.documentKey(d)='d1' RETURN d.payload,d.payload.rank",
+            64 << 20,
+            work=1000000,
+        )
+        assert result["rows"][0][0]["value"]["body"] == {
+            "type": "string",
+            "value": wide,
+        }, result
+        assert result["rows"][0][1] == integer(7), result
+        # Aliases on the same physical table still share a complete identity view.
+        result = query(
+            "MATCH(d:D),(x:D) WHERE antfly.documentKey(d)='d6' AND antfly.documentKey(x)='d6' RETURN x,d.payload.rank",
+        )
+        properties = result["rows"][0][0]["value"]["properties"]["value"]
+        assert properties["id"]["value"] == "d6", result
+        assert properties["tenant"]["value"] == "other", result
+        assert properties["score"] == integer(99), result
+        assert properties["payload"]["value"]["body"]["value"] == "hidden", result
+        assert result["rows"][0][1] == integer(99), result
+        # Non-map ancestors preserve Cypher's property-access type error, while
+        # presence and complete-value observers retain their ordinary behavior.
+        call(
+            f"/tables/{name}/batch",
+            {
+                "inserts": {
+                    "d4": {"id": "d4", "tenant": "other", "score": 0, "payload": 42},
+                    "d5": {"id": "d5", "tenant": "other", "score": 0, "payload": [{}]},
+                },
+                "sync_level": "full_index",
+            },
+        )
+        for key in ("d4", "d5"):
+            invalid = admin.post(
+                base + f"/graphs/{name}/query",
+                json={
+                    "query": f"MATCH(d:D) WHERE antfly.documentKey(d)='{key}' RETURN d.payload.rank",
+                    "limits": {"memory_bytes": 1 << 20},
+                },
+                timeout=45,
+            )
+            assert (
+                invalid.status_code == 400
+                and invalid.json().get("code") == "CypherTypeMismatch"
+            ), invalid.text
+        result = query(
+            "MATCH(d:D) WHERE antfly.documentKey(d) IN ['d4','d5'] RETURN d.id,d.payload,d.payload IS NULL ORDER BY d.id"
+        )
+        assert result["rows"] == [
+            [
+                {"type": "string", "value": "d4"},
+                integer(42),
+                {"type": "boolean", "value": False},
+            ],
+            [
+                {"type": "string", "value": "d5"},
+                {"type": "list", "value": [{"type": "map", "value": {}}]},
+                {"type": "boolean", "value": False},
+            ],
+        ], result
+    finally:
+        reader.close()
+        admin.close()
         server.stop()

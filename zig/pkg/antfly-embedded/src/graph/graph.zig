@@ -8583,7 +8583,7 @@ pub const GraphIndex = struct {
         defer a.free(copy.winner_hex);
         return copy.clone(a);
     }
-    fn appendCypherWinner(a: Allocator, field_mapping: bool, read: *backend_erased.ReadTxn, output: *std.ArrayListUnmanaged(Edge), state: CypherEdgeScanCursor, owner: []const u8, winner: []const u8, owned_bytes: *usize, max_bytes: usize, input_bytes: *usize, max_input_bytes: usize, projection: anytype) !bool {
+    fn appendCypherWinner(a: Allocator, field_mapping: bool, read: *backend_erased.ReadTxn, output: *std.ArrayListUnmanaged(Edge), state: CypherEdgeScanCursor, owner: []const u8, winner: []const u8, owned_bytes: *usize, max_bytes: usize, input_bytes: *usize, projection: anytype) !bool {
         if (winner.len == 0) return true;
         const value = try read.get(winner);
         if (value.len < 8) return error.InvalidGraphEdgeValue;
@@ -8592,7 +8592,7 @@ pub const GraphIndex = struct {
         const producer = if (edge.edge_id.len != 0) edge.owner_document else if (state.has_artifacts or !std.mem.eql(u8, owner, edge.source)) owner else "";
         const field_derived = field_mapping and std.mem.eql(u8, owner, edge.source) and (state.phase == .field or !state.has_artifacts);
         const selected: Edge = .{ .field_derived = field_derived, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = producer, .artifact_derived = !field_derived and (if (edge.edge_id.len != 0) state.winner_rank != 0 and state.winner_rank != std.math.maxInt(u64) else state.has_artifacts), .metadata = decoded.metadata, .weight = decoded.weight, .created_at = decoded.created_at, .updated_at = decoded.updated_at, .winner_rank = state.winner_rank };
-        appendCypherEdge(a, output, selected, owned_bytes, max_bytes, input_bytes, max_input_bytes, projection) catch |err| {
+        appendCypherEdge(a, output, selected, owned_bytes, max_bytes, input_bytes, projection) catch |err| {
             if (err == error.GraphExploredEdgeBytesBudgetExceeded and output.items.len != 0) return false;
             return err;
         };
@@ -8669,7 +8669,7 @@ pub const GraphIndex = struct {
         var input_metadata_bytes: usize = 0;
         var finished = false;
         const read = &context.reads.incoming.?;
-        page: while (scanned < limits.max_scanned_rows and output.items.len < limits.max_edges) {
+        page: while (scanned < limits.max_scanned_rows and output.items.len < limits.max_edges and (output.items.len == 0 or input_metadata_bytes < limits.max_input_metadata_bytes)) {
             if (state.edge == null) {
                 var physical = try self.getEdgesByTypesPageInRead(temporary, key, edge_types, direction, state.physical, .{ .max_edges = 1, .max_owned_bytes = limits.max_owned_bytes, .max_scanned_rows = limits.max_scanned_rows - scanned, .peer_key = limits.peer_key }, now_ns, null, &context.reads, false);
                 defer physical.deinit(temporary);
@@ -8707,7 +8707,7 @@ pub const GraphIndex = struct {
                 const decoded = try decodeEdgeValue(try read.get(physical_key));
                 if (!self.edgeExpiredAt(decoded, now_ns)) {
                     const selected: Edge = .{ .field_derived = field_mapping, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = edge.owner_document, .weight = decoded.weight, .created_at = decoded.created_at, .updated_at = decoded.updated_at, .metadata = decoded.metadata };
-                    appendCypherEdge(a, &output, selected, &owned_bytes, limits.max_owned_bytes, &input_metadata_bytes, limits.max_input_metadata_bytes, projection) catch |err| {
+                    appendCypherEdge(a, &output, selected, &owned_bytes, limits.max_owned_bytes, &input_metadata_bytes, projection) catch |err| {
                         if (err == error.GraphExploredEdgeBytesBudgetExceeded and output.items.len != 0) break :page;
                         return err;
                     };
@@ -8748,11 +8748,11 @@ pub const GraphIndex = struct {
                     var component = try decodeGraphKeyComponent(temporary, entry.key[prefix.len..owner_end]);
                     defer component.deinit(temporary);
                     if (has_owner and !std.mem.eql(u8, owner.items, component.bytes)) {
-                        if (!try appendCypherWinner(a, field_mapping, read, &output, state, owner.items, winner.items, &owned_bytes, limits.max_owned_bytes, &input_metadata_bytes, limits.max_input_metadata_bytes, projection)) break :page;
+                        if (!try appendCypherWinner(a, field_mapping, read, &output, state, owner.items, winner.items, &owned_bytes, limits.max_owned_bytes, &input_metadata_bytes, projection)) break :page;
                         has_owner = false;
                         winner.clearRetainingCapacity();
                         state.winner_rank = std.math.maxInt(u64);
-                        if (output.items.len == limits.max_edges) break :page;
+                        if (output.items.len == limits.max_edges or input_metadata_bytes >= limits.max_input_metadata_bytes) break :page;
                     }
                     if (!has_owner) {
                         owner.clearRetainingCapacity();
@@ -8778,7 +8778,7 @@ pub const GraphIndex = struct {
                 resume_key.clearRetainingCapacity();
                 continue;
             }
-            if (has_owner and !try appendCypherWinner(a, field_mapping, read, &output, state, owner.items, winner.items, &owned_bytes, limits.max_owned_bytes, &input_metadata_bytes, limits.max_input_metadata_bytes, projection)) break;
+            if (has_owner and !try appendCypherWinner(a, field_mapping, read, &output, state, owner.items, winner.items, &owned_bytes, limits.max_owned_bytes, &input_metadata_bytes, projection)) break;
             has_owner = false;
             resume_key.clearRetainingCapacity();
             winner.clearRetainingCapacity();
@@ -8805,8 +8805,7 @@ pub const GraphIndex = struct {
             return edge.metadata;
         }
     };
-    fn appendCypherEdge(alloc: Allocator, output: *std.ArrayListUnmanaged(Edge), input: Edge, owned_bytes: *usize, max_bytes: usize, input_bytes: *usize, max_input_bytes: usize, projection: anytype) !void {
-        if (output.items.len != 0 and input.metadata.len > max_input_bytes -| input_bytes.*) return error.GraphExploredEdgeBytesBudgetExceeded;
+    fn appendCypherEdge(alloc: Allocator, output: *std.ArrayListUnmanaged(Edge), input: Edge, owned_bytes: *usize, max_bytes: usize, input_bytes: *usize, projection: anytype) !void {
         input_bytes.* +|= input.metadata.len;
         var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer scratch.deinit();
@@ -40409,6 +40408,7 @@ test "graph bounded adjacency pages project borrowed winner metadata before owni
         pages += 1;
         try std.testing.expect(pages <= 17);
         try std.testing.expect(next.edges.len <= 1);
+        try std.testing.expect(next.scanned_rows >= next.edges.len);
         for (next.edges) |edge| {
             try std.testing.expect(!seen.contains(edge.edge_id));
             try seen.put(try a.dupe(u8, edge.edge_id), {});

@@ -41,6 +41,7 @@ pub const BorrowedSpanProjection = struct {
     fields: []const []const u8,
     include_all_fields: bool,
     pub fn matches(self: @This(), opts: types.LookupOptions) bool {
+        if (!std.mem.eql(u8, self.plan.projection_json, opts.cypher_projection_json)) return false;
         for (self.plan.presence, 0..) |name, i| if (i >= opts.cypher_presence_fields.len or !std.mem.eql(u8, name, opts.cypher_presence_fields[i])) return false;
         return self.fields.ptr == opts.fields.ptr and self.fields.len == opts.fields.len and self.include_all_fields == opts.include_all_fields and self.plan.presence.len == opts.cypher_presence_fields.len;
     }
@@ -54,6 +55,8 @@ pub const SpanProjectionPlan = struct {
     include_all: bool,
     passthrough: bool,
     presence: []const []const u8 = &.{},
+    projection_json: []const u8 = "",
+    property_projection: []const @import("cypher").read_fields.Projection = &.{},
 
     pub fn init(alloc: Allocator, opts: types.LookupOptions) !?@This() {
         if (!spanProjectionSupported(opts.fields)) return null;
@@ -100,6 +103,8 @@ pub const SpanProjectionPlan = struct {
             .include_all = include_all or (!has_positive and has_negative),
             .passthrough = opts.fields.len == 0 and opts.include_all_fields,
             .presence = presence,
+            .projection_json = try a.dupe(u8, opts.cypher_projection_json),
+            .property_projection = try @import("query/cypher_projection.zig").decode(a, opts.cypher_projection_json),
         };
     }
     pub fn deinit(self: *@This()) void {
@@ -193,7 +198,7 @@ fn writePassthroughFields(alloc: Allocator, writer: *std.Io.Writer, raw: []const
     return true;
 }
 fn lookupJsonDestination(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool, writer: ?*std.Io.Writer, complete_object: bool, omissions: []const Omission) !types.LookupResult {
-    if (plan.presence.len != 0) {
+    if (plan.presence.len != 0 or plan.property_projection.len != 0) {
         const fields = try alloc.alloc([]const u8, plan.paths.len);
         defer alloc.free(fields);
         for (plan.paths, fields) |path, *name| {
@@ -202,7 +207,7 @@ fn lookupJsonDestination(alloc: Allocator, output: Allocator, raw: []const u8, p
         }
         var projection_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer projection_arena.deinit();
-        const projected = try @import("query/cypher_projection.zig").record(projection_arena.allocator(), raw, fields, plan.presence);
+        const projected = try @import("query/cypher_projection.zig").record(projection_arena.allocator(), raw, fields, plan.presence, plan.property_projection);
         if (writer) |sink| {
             if (complete_object) try std.json.Stringify.value(projected, .{}, sink) else {
                 var iterator = projected.object.iterator();

@@ -41764,6 +41764,7 @@ pub const DB = struct {
             .upper = upper,
             .fields = parsed.value.fields,
             .cypher_presence_fields = parsed.value.cypher_presence_fields,
+            .cypher_projection_json = parsed.value.cypher_projection_json,
             .conditions = conditions,
             .primary_lower = if (from_key.len != 0) .{ .key = from_key, .inclusive = opts.inclusive_from } else null,
             .primary_upper = if (to_key.len != 0) .{ .key = to_key, .inclusive = !opts.exclusive_to } else null,
@@ -41934,7 +41935,7 @@ pub const DB = struct {
         if (columnar_progress.delivered != 0) fallback_opts.inclusive_from = false;
 
         var stream_plan = if (visitor.borrow_documents and opts.include_documents and !projection_plan.special.all_artifacts and !projection_plan.special.all_chunks and !projection_plan.special.all_embeddings)
-            try @import("document_query.zig").SpanProjectionPlan.init(alloc, .{ .fields = opts.fields, .include_all_fields = opts.include_all_fields, .cypher_presence_fields = opts.cypher_presence_fields })
+            try @import("document_query.zig").SpanProjectionPlan.init(alloc, .{ .fields = opts.fields, .include_all_fields = opts.include_all_fields, .cypher_presence_fields = opts.cypher_presence_fields, .cypher_projection_json = opts.cypher_projection_json })
         else
             null;
         defer if (stream_plan) |*plan| plan.deinit();
@@ -42204,12 +42205,14 @@ pub const DB = struct {
                             try projectLookupStoredBytesTxn(state.projection_context, state.alloc, raw_key, logical_value.?, .{
                                 .fields = state.opts.fields,
                                 .cypher_presence_fields = state.opts.cypher_presence_fields,
+                                .cypher_projection_json = state.opts.cypher_projection_json,
                                 .include_all_fields = state.opts.include_all_fields,
                             })
                     else
                         try projectLookupStoredBytesTxn(state.projection_context, state.alloc, raw_key, logical_value.?, .{
                             .fields = state.opts.fields,
                             .cypher_presence_fields = state.opts.cypher_presence_fields,
+                            .cypher_projection_json = state.opts.cypher_projection_json,
                             .include_all_fields = state.opts.include_all_fields,
                         })
                 else

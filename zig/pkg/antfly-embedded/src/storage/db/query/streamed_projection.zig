@@ -20,6 +20,7 @@ const codec = @import("../algebraic/relational_row_codec.zig");
 const document = @import("../document_query.zig");
 const native_writer = @import("../../native_writer.zig");
 pub const Context = struct {
+    property_projection: []const @import("cypher").read_fields.Projection = &.{},
     scratch: std.mem.Allocator,
     value: union(enum) {
         row: struct { plan: Plan, row: codec.OrdinalRowView },
@@ -63,7 +64,10 @@ pub const Context = struct {
                 try view.prepareProjectionWithOptions(v.plan.selector, .all, .object_only, .{ .defer_fanout = true });
                 for (v.plan.paths) |path| {
                     const name = path.parts[0];
-                    if (try view.field(&view.root, name)) |node| try result.put(a, name, try rawValue(a, node.raw, isPresence(presence, name)));
+                    if (try view.field(&view.root, name)) |node| try result.put(a, name, if (@import("cypher_projection.zig").find(v.plan.property_projection, name)) |item|
+                        try @import("cypher_projection.zig").rawValue(a, node.raw, item)
+                    else
+                        try rawValue(a, node.raw, isPresence(presence, name)));
                 }
             },
             .row => |v| {
@@ -73,7 +77,10 @@ pub const Context = struct {
                     const column = v.row.table_schema.relational_columns[ordinal];
                     const cell = (try v.row.findCell(ordinal)) orelse continue;
                     const value: std.json.Value = if (cell.is_null) .null else if (cell.is_json)
-                        try rawValue(a, cell.value.bytes_val, isPresence(presence, column.name))
+                        if (@import("cypher_projection.zig").find(self.property_projection, column.name)) |item|
+                            try @import("cypher_projection.zig").rawValue(a, cell.value.bytes_val, item)
+                        else
+                            try rawValue(a, cell.value.bytes_val, isPresence(presence, column.name))
                     else if (isPresence(presence, column.name) and (column.column_type == .string or column.column_type == .blob or column.column_type == .geoshape))
                         .{ .bool = true }
                     else

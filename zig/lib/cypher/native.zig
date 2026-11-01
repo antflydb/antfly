@@ -138,19 +138,27 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         fn setReadDemand(ptr: *anyopaque, demand: ?root.read_fields.Demand) void {
             cast(ptr).read_demand = demand;
         }
-        fn observedGraph(self: *Self, a: A) !root.catalog.Graph {
+        fn observedGraph(self: *Self, a: A, table: []const u8) !root.catalog.Graph {
             var graph = self.graph.?;
             if (self.authority.project_stored == null) return graph;
             const demand = self.read_demand orelse return graph;
-            const names = demand.labels orelse return graph;
-            const labels = try a.alloc(root.catalog.Label, names.len);
-            for (names, labels) |name, *label| label.* = graph.label(name) orelse return error.CypherInvalidBackendPage;
-            graph.labels = labels;
+            const selected_labels = if (demand.table(table)) |item| item.labels else demand.labels;
+            var labels: std.ArrayList(root.catalog.Label) = .empty;
+            for (graph.labels) |label| {
+                if (!std.mem.eql(u8, table, label.table)) continue;
+                if (selected_labels) |names| {
+                    for (names) |name| {
+                        if (std.mem.eql(u8, label.name, name)) break;
+                    } else continue;
+                }
+                try labels.append(a, label);
+            }
+            graph.labels = labels.items;
             return graph;
         }
-        fn nodeDemand(self: *Self) ?root.read_fields.Entity {
+        fn nodeDemand(self: *Self, table: []const u8) ?root.read_fields.Entity {
             if (self.authority.project_stored == null or !self.authority.storage_projection) return null;
-            return if (self.read_demand) |demand| demand.nodes else null;
+            return if (self.read_demand) |demand| if (demand.table(table)) |item| item.nodes else demand.nodes else null;
         }
         fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
             cast(ptr).read_fields = fields;
@@ -164,12 +172,12 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             return db.core.relational_indexes.acquire();
         }
         const ScanOptions = if (@hasDecl(DB, "cypherDocumentScanOptions")) @typeInfo(@typeInfo(@TypeOf(DB.cypherDocumentScanOptions)).@"fn".return_type.?).error_union.payload else void;
-        fn scanOptions(self: *Self, a: A, db: *DB, input: ScanOptions) !ScanOptions {
-            return self.scanOptionsInGraph(a, db, input, try self.observedGraph(a));
+        fn scanOptions(self: *Self, a: A, db: *DB, table: []const u8, input: ScanOptions) !ScanOptions {
+            return self.scanOptionsInGraph(a, db, table, input, try self.observedGraph(a, table));
         }
-        fn scanOptionsInGraph(self: *Self, a: A, db: *DB, input: ScanOptions, graph: root.catalog.Graph) !ScanOptions {
+        fn scanOptionsInGraph(self: *Self, a: A, db: *DB, table: []const u8, input: ScanOptions, graph: root.catalog.Graph) !ScanOptions {
             var opts = try db.cypherDocumentScanOptions(a, input);
-            const node_demand = self.nodeDemand();
+            const node_demand = self.nodeDemand(table);
             const requested = if (node_demand) |demand| demand.fields else self.read_fields;
             if (requested) |required| if (opts.relational_query) |*query| {
                 var fields: std.ArrayList([]const u8) = .empty;
@@ -180,7 +188,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     }
                 };
                 query.fields = fields.items;
-                if (node_demand) |demand| query.cypher_presence_fields = demand.presence;
+                if (node_demand) |demand| {
+                    query.cypher_presence_fields = demand.presence;
+                    query.cypher_projection_json = if (demand.projection.len == 0) "" else try std.json.Stringify.valueAlloc(a, demand.projection, .{});
+                }
             } else if (self.authority.storage_projection) {
                 var fields: std.StringHashMapUnmanaged(void) = .empty;
                 for (required) |field| try fields.put(a, field, {});
@@ -197,7 +208,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 for (names) |*name| name.* = iterator.next().?.*;
                 opts.fields = names;
                 opts.include_all_fields = false;
-                if (node_demand) |demand| opts.cypher_presence_fields = demand.presence;
+                if (node_demand) |demand| {
+                    opts.cypher_presence_fields = demand.presence;
+                    opts.cypher_projection_json = if (demand.projection.len == 0) "" else try std.json.Stringify.valueAlloc(a, demand.projection, .{});
+                }
             };
             return opts;
         }
@@ -284,7 +298,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             self.graph = graph;
         }
         pub fn node(self: *Self, a: A, table: []const u8, key: []const u8, json: []const u8) !?*const v.Node {
-            const fields = (if (self.nodeDemand()) |demand| demand.fields else self.read_fields) orelse return self.fullNode(a, table, key, json);
+            const fields = (if (self.nodeDemand(table)) |demand| demand.fields else self.read_fields) orelse return self.fullNode(a, table, key, json);
             // Membership and policies inspect complete documents. Decode them
             // in reclaimable scratch, then retain only the authorized projection.
             var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
@@ -310,7 +324,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             return self.projectNodeValue(a, table, key, input, false);
         }
         fn projectNodeValue(self: *Self, a: A, table: []const u8, key: []const u8, input: std.json.Value, stored: bool) !?*const v.Node {
-            return self.projectNodeValueInGraph(a, table, key, input, stored, try self.observedGraph(a));
+            return self.projectNodeValueInGraph(a, table, key, input, stored, try self.observedGraph(a, table));
         }
         fn projectNodeValueInGraph(self: *Self, a: A, table: []const u8, key: []const u8, input: std.json.Value, stored: bool, graph: root.catalog.Graph) !?*const v.Node {
             const value = try v.Value.fromJson(a, input);
@@ -333,7 +347,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const db = try self.selected(table);
             const authorization = try self.readAuthorization(temporary, table);
             var found = if (comptime @hasDecl(DB, "cypherDocumentScanOptions"))
-                try db.scan(temporary, cursor orelse "", "", try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument }))
+                try db.scan(temporary, cursor orelse "", "", try self.scanOptions(temporary, db, table, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument }))
             else
                 try db.scan(temporary, cursor orelse "", "", .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument });
             defer found.deinit(temporary);
@@ -509,7 +523,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             // Only certified owner projections may consume visibility at the
             // original scan. Opaque providers retain their per-node callback.
             fold.stored = self.authority.project_stored != null;
-            var opts = try self.scanOptionsInGraph(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .filter_query_json = if (fold.stored) authorization.filter_query_json else "", .include_documents = true, .limit = @intCast(input.max_examined + 1) }, membership_graph);
+            var opts = try self.scanOptionsInGraph(temporary, db, table, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .filter_query_json = if (fold.stored) authorization.filter_query_json else "", .include_documents = true, .limit = @intCast(input.max_examined + 1) }, membership_graph);
             if (opts.relational_query) |*query| {
                 const filters = try fold.evaluator.?.filters();
                 // Share the complete sparse/composite candidate planner, but
@@ -760,7 +774,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     }
                 }
                 const authorization = try self.readAuthorization(temporary, table);
-                var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(@min(limit, 1024)) });
+                var opts = try self.scanOptions(temporary, db, table, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(@min(limit, 1024)) });
                 if (opts.relational_query == null) return null;
                 // The explicit index supplies order; compatible predicates
                 // supply exact seek bounds through the native condition planner.
@@ -920,7 +934,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const cursor = if (encoded) |json| try std.json.parseFromSliceLeaky(PropertyCursor, temporary, json, .{}) else PropertyCursor{};
             if (cursor.primary) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             const authorization = try self.readAuthorization(temporary, table);
-            var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(limit) });
+            var opts = try self.scanOptions(temporary, db, table, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(limit) });
             if (opts.relational_query == null) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             var schema = acquireSchema(db) orelse return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             defer schema.release();
@@ -1169,7 +1183,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 return .{ .items = &.{} };
             };
             const authority = try self.readAuthorization(temporary, table);
-            var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authority.deadline_ns, .row_policy_principal_proof = authority.proof, .row_policy_database = authority.database, .include_documents = true, .limit = @intCast(if (visitor != null) @min(limit, 4096) else limit) });
+            var opts = try self.scanOptions(temporary, db, table, .{ .execution_deadline_ns = authority.deadline_ns, .row_policy_principal_proof = authority.proof, .row_policy_database = authority.database, .include_documents = true, .limit = @intCast(if (visitor != null) @min(limit, 4096) else limit) });
             if (visitor != null and self.authority.project_stored != null) opts.filter_query_json = authority.filter_query_json;
             if (opts.relational_query == null) return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
             var schema = acquireSchema(db) orelse return if (index_only or probe) null else try propertyFallback(ptr, a, table, cursor, limit);
@@ -1603,7 +1617,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 if (count == 0) continue;
                 try checkpoint(ptr);
                 const authorization = try self.readAuthorization(temporary, table.name);
-                const opts = try self.scanOptions(temporary, table.db, .{ .include_documents = true, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns });
+                const opts = try self.scanOptions(temporary, table.db, table.name, .{ .include_documents = true, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns });
                 const documents = try table.db.getCypherDocuments(temporary, keys[0..count], opts, self.ttl_now_ns);
                 defer {
                     for (documents) |*document| if (document.*) |*value| value.deinit(temporary);
@@ -1629,11 +1643,11 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const db = try self.selected(identity.table);
             const authorization = try self.readAuthorization(temporary, identity.table);
             const result = if (comptime @hasDecl(DB, "cypherDocumentScanOptions")) projected: {
-                if (self.read_fields != null or self.nodeDemand() != null) {
-                    const opts = try self.scanOptions(temporary, db, .{ .inclusive_from = true, .include_documents = true, .limit = 1, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns });
+                if (self.read_fields != null or self.nodeDemand(identity.table) != null) {
+                    const opts = try self.scanOptions(temporary, db, identity.table, .{ .inclusive_from = true, .include_documents = true, .limit = 1, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns });
                     if (opts.relational_query == null) {
                         if (opts.include_all_fields) break :projected try self.getFull(a, temporary, db, identity, authorization);
-                        var document = (try db.getDocument(temporary, identity.key, .{ .fields = opts.fields, .cypher_presence_fields = opts.cypher_presence_fields, .include_all_fields = false, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns })) orelse break :projected null;
+                        var document = (try db.getDocument(temporary, identity.key, .{ .fields = opts.fields, .cypher_presence_fields = opts.cypher_presence_fields, .cypher_projection_json = opts.cypher_projection_json, .include_all_fields = false, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns })) orelse break :projected null;
                         defer document.deinit(temporary);
                         break :projected try self.node(a, identity.table, identity.key, document.json);
                     }
@@ -1683,6 +1697,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 try std.json.Stringify.valueAlloc(temporary, .{
                     .fields = self.read_demand.?.relationships.fields.?,
                     .presence = self.read_demand.?.relationships.presence,
+                    .projection = self.read_demand.?.relationships.projection,
                     .source = source_table,
                     .target = target_table,
                     .source_storage = self.storageTableName(source_table),

@@ -5280,3 +5280,37 @@ Verification covers 543 Cypher core tests, five authenticated performance
 campaigns, the portable embedded host, borrowed projection and allocation-failure
 tests, adjacency owner/TTL/continuation tests, and the independent runtime scan
 sink error-domain tests. The merged Go SDK passes `go test ./...`.
+
+### Table-scoped property paths
+
+The demand certificate now partitions node requirements by physical table.
+A single lexical pass tracks the possible tables of each entity binding through
+patterns, forwarded aliases, unions, and nested scopes. Requirements combine
+across every binding that may name an identity in the same table. An entity or
+`labels()` observer on another table no longer widens those reads. Unknown
+bindings retain all possible tables, and opaque adapters keep the conservative
+statement-wide field hint. Complete catalog authorization and the retained graph
+are unchanged; table membership views remain invocation-local.
+
+Static property chains now produce a tree of literal field names. Each leaf
+requires either its complete value or presence; internal nodes require only
+selected children. A complete ancestor observer overrides every partial child.
+Missing and null ancestors retain null semantics, and non-map ancestors retain
+their nullness and property-access type errors. Presence observers
+on partially consumed ancestors retain complete domain/depth validation without
+materializing their payloads. Dynamic indexing and other complete-value
+consumers retain the entire relevant ancestor.
+
+The tree travels with the private owner demand certificate. Storage reader
+inputs carry its encoded form, parsed and owned once per prepared span plan or
+relational reader. Document spans and JSON relational cells reconstruct only
+selected paths before ownership and transport. Native relationship metadata and
+exact private mutation envelopes use the same tree before adjacency page
+allocation. These are private execution views; public result and parameter
+contracts remain unchanged.
+
+Selected metadata input bytes now stop a page after emission, allowing one
+record to cross the soft quantum. This avoids charging a winner's scan in one
+page and emitting it without scan credit in the next. Owned-byte and physical
+scan limits remain independent. Continuation regressions force one wide input
+per page and require scan accounting to cover every returned edge.

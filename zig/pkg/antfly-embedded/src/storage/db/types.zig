@@ -1426,6 +1426,7 @@ pub const Query = union(enum) {
 pub const LookupOptions = struct {
     /// Private compiler-certified nullness projection; authorization uses original rows.
     cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
     /// Private read-index preparation for a later fenced graph snapshot.
     /// Public lookup decoders never populate this maintenance-only flag.
     cypher_prepare: bool = false,
@@ -1546,6 +1547,7 @@ pub const RelationalRowQuery = struct {
     /// the query so every owner uses the same requested page envelope.
     /// Private compiler-certified nullness projection; authorization uses original rows.
     cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
     page_bytes: usize = 16 * 1024 * 1024,
     fields: []const []const u8,
     index: ?[]const u8 = null,
@@ -1564,6 +1566,7 @@ pub const RelationalRowQuery = struct {
 pub const ScanOptions = struct {
     /// Private compiler-certified nullness projection; authorization uses original rows.
     cypher_presence_fields: []const []const u8 = &.{},
+    cypher_projection_json: []const u8 = "",
     /// Retain the full document only for a version-fenced SQL mutation.
     sql_document_preimage: bool = false,
     /// Collect durable logical range guards only for explicitly guarded SQL.
