@@ -93,14 +93,14 @@ pub fn Features(comptime Hooks: type) type {
                 .prepared_rows = if (rows > 64) 128 else if (rows > 32) 64 else if (rows > 16) 32 else 16,
                 .scheduling_rows = @intCast(rows),
                 .cpu_preprocess = true,
-                .vision_batch_items = if (cuda and !large) 8 else 1,
+                .vision_batch_items = 1,
                 .vision_frame_blocks = if (cuda) 1 else if (large) 3 else 4,
                 .prefill_decode_streak = 0,
                 .activation_pool = !cuda,
                 .worker = true,
                 .epoch_auxiliary = true,
                 .single_frame = !cuda,
-                .gpu_token_burst = !cuda,
+                .gpu_token_burst = true,
                 .executor_tail = true,
                 .gpu_token_burst_width = 4,
                 .vision_workspace_cache = !cuda,
@@ -222,7 +222,7 @@ pub fn Features(comptime Hooks: type) type {
                 // whole scratch budget for one full-size page. Wider vision
                 // batches remain an explicit, separately qualified override.
                 result.vision_batch_items = 1;
-                result = result.withCudaTokenBurstOverride(platform.env.getenvBool("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"), platform.env.getenv("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"));
+                result = result.withCudaTokenBurstOverride(platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST", result.gpu_token_burst), platform.env.getenv("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"));
                 result = result.withDecodeStreakOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_DECODE_STREAK"));
                 result = result.withQueuedPhasePriorityOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_QUEUED_PHASE_PRIORITY"));
                 result = result.withPreparedPrefillChunkOverride(platform.env.getenv("ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS"));
@@ -472,12 +472,16 @@ test "LightOnOCR3 CUDA prefill fairness limit preserves selected defaults and op
 test "LightOnOCR3 CUDA token chaining opt in shares bounded admission configuration" {
     const F = Features(struct {});
     const selected = F.forProfile(.cuda_lighton4b, .{}, 128);
-    try std.testing.expectEqualDeep(selected, selected.withCudaTokenBurstOverride(false, null));
+    const disabled = selected.withCudaTokenBurstOverride(false, null);
+    try std.testing.expect(selected.gpu_token_burst);
+    try std.testing.expect(!disabled.gpu_token_burst);
+    try std.testing.expect(disabled.executor_tail);
+    try std.testing.expectEqualDeep(selected, disabled.withCudaTokenBurstOverride(true, null));
     const burst = selected.withCudaTokenBurstOverride(true, "8");
     try std.testing.expect(burst.gpu_token_burst);
     try std.testing.expectEqual(@as(u8, 8), burst.gpu_token_burst_width);
-    try std.testing.expect(burst.auxiliaryAmounts().backend_scratch_bytes > selected.auxiliaryAmounts().backend_scratch_bytes);
-    try std.testing.expect(burst.auxiliaryAmounts().host_scratch_bytes > selected.auxiliaryAmounts().host_scratch_bytes);
+    try std.testing.expect(burst.auxiliaryAmounts().backend_scratch_bytes > disabled.auxiliaryAmounts().backend_scratch_bytes);
+    try std.testing.expect(burst.auxiliaryAmounts().host_scratch_bytes > disabled.auxiliaryAmounts().host_scratch_bytes);
     for ([_][]const u8{ "", "-1", "1", "9", "256", "junk" }) |text| try std.testing.expectEqualDeep(selected.withCudaTokenBurstOverride(true, null), selected.withCudaTokenBurstOverride(true, text));
     const fallback = F.forProfile(.conservative, .{}, 1);
     try std.testing.expectEqualDeep(fallback, fallback.withCudaTokenBurstOverride(true, "8"));

@@ -58,8 +58,9 @@ def main():
     )
     parser.add_argument(
         "--decode-graph",
-        action="store_true",
-        help="Experimental two-token native decoder graph within an owned LightOn reader epoch.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override automatic two-token decoder graph selection within an owned LightOn reader epoch.",
     )
     argv = sys.argv[1:]
     delimiter = argv.index("--") if "--" in argv else len(argv)
@@ -69,13 +70,14 @@ def main():
         args.bf16_prefill_ffn or args.bf16_recurrent_prefill
     ) and args.profile == "florence":
         parser.error("BF16 prefill options apply only to the LightOn models")
-    if args.decode_graph and args.profile == "florence":
+    if args.decode_graph is not None and args.profile == "florence":
         parser.error("Decoder graphs apply only to LightOn models")
     defaults = profile_environment(data["profiles"], args.profile)
     if args.profile != "florence":
-        defaults["ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH"] = (
-            "1" if args.decode_graph else "0"
-        )
+        if args.decode_graph is not None:
+            defaults["ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH"] = (
+                "1" if args.decode_graph else "0"
+            )
         defaults["ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN"] = (
             "1" if args.bf16_prefill_ffn else "0"
         )
@@ -86,8 +88,17 @@ def main():
     env = os.environ.copy()
     for key, value in defaults.items():
         env.setdefault(key, value)
+    # Explicit CLI choice wins over inherited environment; absent CLI leaves
+    # both the environment and the runtime's capability-based default intact.
+    if args.decode_graph is not None:
+        env["ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH"] = (
+            "1" if args.decode_graph else "0"
+        )
     if args.print_env:
-        print(json.dumps({key: env[key] for key in sorted(defaults)}, indent=2))
+        keys = set(defaults)
+        if "ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH" in env:
+            keys.add("ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH")
+        print(json.dumps({key: env[key] for key in sorted(keys)}, indent=2))
         return
     if not command:
         parser.error("supply a command after --, or use --print-env")
