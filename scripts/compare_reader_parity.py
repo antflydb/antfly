@@ -78,6 +78,7 @@ def checked_receipt(report, *, native, concurrency):
     if not 2 <= len(rounds) <= 4:
         raise ValueError("capture needs 2–4 warm measured rounds")
     samples = defaultdict(set)
+    prompt_tokens = defaultdict(set)
     cohorts = []
     shape = None
     for measured, observation in [(False, o) for o in warmup] + [
@@ -99,6 +100,12 @@ def checked_receipt(report, *, native, concurrency):
                 raise ValueError("capture contains an incomplete or invalid response")
             current_shape.append(digest)
             samples[digest].add(text)
+            tokens = (row.get("usage") or {}).get("prompt_tokens")
+            if type(tokens) is not int or tokens <= 0:
+                raise ValueError(
+                    "capture must report a positive prompt-token count per image"
+                )
+            prompt_tokens[digest].add(tokens)
             if measured:
                 if native and concurrency > 1:
                     execution = row.get("execution") or {}
@@ -125,6 +132,7 @@ def checked_receipt(report, *, native, concurrency):
         "max_tokens": report["max_tokens"],
         "shape": shape,
         "samples": dict(samples),
+        "prompt_tokens": dict(prompt_tokens),
         "seconds": elapsed,
         "pages_per_second": len(shape) / elapsed,
         "rounds": len(rounds),
@@ -160,6 +168,10 @@ def compare(native_serial, native_batch, reference_serial, reference_batch):
         raise ValueError(
             "serial and concurrent cohorts have different page distributions"
         )
+    if any(c["prompt_tokens"] != ns["prompt_tokens"] for c in captures) or any(
+        len(tokens) != 1 for tokens in ns["prompt_tokens"].values()
+    ):
+        raise ValueError("captures disagree on per-image prompt-token counts")
     correctness = {
         "serial_exact": exact_outputs(ns["samples"], rs["samples"]),
         "concurrent_exact": exact_outputs(nb["samples"], rb["samples"]),

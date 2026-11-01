@@ -31,6 +31,7 @@ def capture(native, concurrency, seconds=10):
             "image_sha256": digest,
             "text_sha256": ("3" if digest.startswith("1") else "4") * 64,
             "execution": {"native_items": 1, "max_native_step_items": concurrency},
+            "usage": {"prompt_tokens": 1914},
         }
         for digest in pages
     ]
@@ -97,6 +98,16 @@ class ReaderParityTests(unittest.TestCase):
         self.captures[1]["warmup_rounds"] = 2
         self.captures[1]["warmup_observations"] *= 2
         with self.assertRaisesRegex(ValueError, "warmup_rounds"):
+            self.result()
+
+    def test_prompt_token_mismatch_or_missing_counter_is_rejected(self):
+        self.captures[3]["observations"][1]["requests"][0]["usage"]["prompt_tokens"] = (
+            1915
+        )
+        with self.assertRaisesRegex(ValueError, "prompt-token"):
+            self.result()
+        self.captures[3]["observations"][1]["requests"][0].pop("usage")
+        with self.assertRaisesRegex(ValueError, "prompt-token"):
             self.result()
 
     def test_speed_alone_cannot_qualify(self):

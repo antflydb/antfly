@@ -111,6 +111,8 @@ python3 scripts/compare_reader_parity.py \
   --output reader-parity.json
 ```
 
+The comparator rejects differing reported prompt-token counts for the same
+image, catching template or resolution mismatches before timing comparisons.
 The result separates exact agreement at each serving concurrency, each engine's
 own serial/batch stability, and median warm throughput. Every warm-up and measured duplicate
 and round participates in the exact-output checks. A reference engine's own
