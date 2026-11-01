@@ -38,7 +38,7 @@ test "lake streaming source capture probe" {
     }
     const input = generated.items;
     const legacy = std.c.getenv("ANTFLY_MATERIALIZED_CAPTURE") != null;
-    var budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 256 << 20 };
+    var budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = if (std.c.getenv("ANTFLY_CAPTURE_QUOTA")) |value| try std.fmt.parseInt(usize, std.mem.span(value), 10) else 256 << 20 };
     defer std.debug.assert(budget.live == 0);
     const Capture = local.section_source_capture.Capture;
     const analyzer = if (std.c.getenv("ANTFLY_CAPTURE_ENGLISH") != null) &local.search_analysis.default_analyzer else &local.search_analysis.simple_analyzer;

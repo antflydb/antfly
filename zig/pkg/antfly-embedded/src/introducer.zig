@@ -5652,3 +5652,39 @@ test "highlight streaming indexing preserves native postings source positions an
         try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     };
 }
+
+test "highlight compact alias indexing fits a bounded working set with one analysis" {
+    const a = std.testing.allocator;
+    const pattern = "Running dogs café ";
+    const repeats = 65536;
+    const text = try a.alloc(u8, pattern.len * repeats);
+    defer a.free(text);
+    for (0..repeats) |i| @memcpy(text[i * pattern.len ..][0..pattern.len], pattern);
+    var source: std.json.ObjectMap = .empty;
+    defer source.deinit(a);
+    try source.put(a, "body", .{ .string = text });
+    var budget: @import("sql/memory_budget.zig") = .{ .backing = a, .limit = 64 << 20 };
+    defer std.debug.assert(budget.live == 0);
+    var profile: BuildTextProfile = .{};
+    const bytes = try buildSegmentFromTextWithAnalysisOptions(budget.allocator(), &.{.{
+        .id = "row",
+        .stored_data = "{}",
+        .stored_source = .{ .object = source },
+        .text_fields = &.{
+            .{ .field_name = "body", .source_field = "body", .text = text },
+            .{ .field_name = "_all", .source_field = "body", .text = text },
+            .{ .field_name = "_all", .source_field = "tail", .text = "extra" },
+        },
+    }}, &analysis_mod.default_analyzer, .{}, .{ .store_source_columns = true, .profile = &profile, .postings_run_io = std.testing.io });
+    defer budget.allocator().free(bytes);
+    try std.testing.expectEqual(@as(u64, 1), profile.shared_analysis_runs);
+    try std.testing.expectEqual(@as(u64, 1), profile.shared_analysis_reuses);
+    try std.testing.expectEqual(@as(u64, repeats * 6 + 1), profile.token_count);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const result = try writer.snapshot().search(a, "_all", &.{"run"}, 10);
+    defer a.free(result.hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    std.debug.print("ALIAS_INDEX_BUDGET input={d} tokens={d} peak={d} quota={d} analyses={d} reuses={d}\n", .{ text.len, profile.token_count, budget.peak, budget.limit, profile.shared_analysis_runs, profile.shared_analysis_reuses });
+}
