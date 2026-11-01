@@ -112,8 +112,6 @@ pub const CacheEntry = struct {
     graph: Graph,
     /// Allocator for cached resources when the graph itself is borrowed.
     resource_allocator: ?std.mem.Allocator = null,
-    /// Monotonic counter — higher = more recently used.
-    last_used: u64,
     /// Cached weight tensors for parameter nodes. Populated on first
     /// execution so that subsequent interpreter runs skip getWeight()
     /// entirely by passing these as runtime_inputs.
@@ -137,7 +135,7 @@ pub const CacheEntry = struct {
     compiled_model_executor: ?CompiledModelExecutor = null,
     compiled_model_runtime: ?model_runtime.ModelRuntime = null,
 
-    fn resourceAllocator(self: *const CacheEntry) std.mem.Allocator {
+    pub fn resourceAllocator(self: *const CacheEntry) std.mem.Allocator {
         return self.resource_allocator orelse self.graph.allocator;
     }
 
@@ -237,10 +235,11 @@ pub const max_entries: usize = 32;
 
 /// LRU cache of traced computation graphs.
 pub const GraphCache = struct {
-    entries: std.ArrayListUnmanaged(*CacheEntry),
+    specializations: @import("../execution/specialization_cache.zig").Cache(CacheKey, *CacheEntry, entryKey, CacheKey.eql),
     allocator: std.mem.Allocator,
-    /// Monotonic use counter for LRU eviction.
-    use_counter: u64,
+    /// Physical resources belong to a backend instance, not just its kind.
+    /// The backend must outlive these bindings (including final retirement).
+    prepared_backend: ?ComputeBackend = null,
     /// Session-level whole-model runtime state. Unlike CacheEntry executors,
     /// this survives across graph shapes so prefill and decode can share
     /// runtime-owned KV/cache state when a backend supports it.
@@ -250,40 +249,39 @@ pub const GraphCache = struct {
 
     pub fn init(allocator: std.mem.Allocator) GraphCache {
         return .{
-            .entries = .empty,
+            .specializations = .init(max_entries),
             .allocator = allocator,
-            .use_counter = 0,
         };
     }
 
     pub fn deinit(self: *GraphCache) void {
-        self.freeSessionCompiledModelRuntime();
-        for (self.entries.items) |entry| {
-            entry.freeCompiledModelExecutor();
-            entry.freeCompiledPartitions();
-            entry.resetSingleDeviceExecutable();
-            entry.freeAnalysis();
-            entry.graph.deinit();
-            self.allocator.destroy(entry);
-            // Note: weight CTs require a ComputeBackend to free.
-            // Use deinitWithBackend() to properly release weight caches.
-        }
-        self.entries.deinit(self.allocator);
+        self.clear();
+        self.specializations.deinit(self.allocator);
     }
 
-    /// Deinit with proper weight cache cleanup.
+    /// Compatibility for callers whose older cache has not selected a context.
     pub fn deinitWithBackend(self: *GraphCache, cb: *const ComputeBackend) void {
-        self.freeSessionCompiledModelRuntime();
-        for (self.entries.items) |entry| {
-            entry.freeCompiledModelExecutor();
-            entry.freeCompiledPartitions();
-            entry.resetSingleDeviceExecutable();
-            entry.freeWeights(cb);
-            entry.freeAnalysis();
-            entry.graph.deinit();
-            self.allocator.destroy(entry);
+        if (self.prepared_backend == null) self.prepared_backend = cb.*;
+        self.deinit();
+    }
+
+    /// Preserve semantic graphs/analysis, but retire every device-bound owner
+    /// before changing contexts. Even two backends of the same kind may have
+    /// disjoint tensor namespaces, streams and capture lifetimes.
+    pub fn selectBackend(self: *GraphCache, cb: *const ComputeBackend) void {
+        if (self.prepared_backend) |previous| {
+            if (previous.ptr == cb.ptr and previous.vtable == cb.vtable) return;
+            self.freeSessionCompiledModelRuntime();
+            for (self.specializations.entries.items) |entry| retirePrepared(entry, &previous);
         }
-        self.entries.deinit(self.allocator);
+        self.prepared_backend = cb.*;
+    }
+
+    fn retirePrepared(entry: *CacheEntry, cb: ?*const ComputeBackend) void {
+        entry.freeCompiledModelExecutor();
+        entry.freeCompiledPartitions();
+        entry.resetSingleDeviceExecutable();
+        if (cb) |backend| entry.freeWeights(backend);
     }
 
     fn freeSessionCompiledModelRuntime(self: *GraphCache) void {
@@ -337,27 +335,15 @@ pub const GraphCache = struct {
 
     /// Look up a cached graph by key. Returns null on cache miss.
     pub fn get(self: *GraphCache, key: CacheKey) ?*const Graph {
-        for (self.entries.items) |entry| {
-            if (CacheKey.eql(entry.key, key)) {
-                self.use_counter += 1;
-                entry.last_used = self.use_counter;
-                return &entry.graph;
-            }
-        }
-        return null;
+        return if (self.getEntry(key)) |entry| &entry.graph else null;
     }
 
-    /// Look up a cached entry by key. Returns the full mutable entry
-    /// so callers can access/populate the weight cache.
     pub fn getEntry(self: *GraphCache, key: CacheKey) ?*CacheEntry {
-        for (self.entries.items) |entry| {
-            if (CacheKey.eql(entry.key, key)) {
-                self.use_counter += 1;
-                entry.last_used = self.use_counter;
-                return entry;
-            }
-        }
-        return null;
+        return self.specializations.get(key);
+    }
+
+    fn entryKey(entry: *CacheEntry) CacheKey {
+        return entry.key;
     }
 
     /// Insert a graph into the cache. If the cache is full, evicts the
@@ -368,68 +354,43 @@ pub const GraphCache = struct {
 
     /// Insert with optional backend for proper weight cache eviction.
     pub fn putWithBackend(self: *GraphCache, key: CacheKey, graph: Graph, cb: ?*const ComputeBackend) !void {
-        // Check for duplicate key (replace existing)
-        for (self.entries.items) |entry| {
-            if (CacheKey.eql(entry.key, key)) {
-                entry.freeCompiledPartitions();
-                entry.freeCompiledModelExecutor();
-                entry.resetSingleDeviceExecutable();
-                if (cb) |backend| entry.freeWeights(backend);
-                entry.freeAnalysis();
-                entry.graph.deinit();
-                entry.graph = graph;
-                self.use_counter += 1;
-                entry.last_used = self.use_counter;
-                return;
-            }
+        if (cb) |backend| self.selectBackend(backend);
+        const owner: ?*const ComputeBackend = if (self.prepared_backend) |*backend| backend else null;
+        if (self.specializations.get(key)) |entry| {
+            retireEntryContents(entry, owner);
+            entry.graph = graph;
+            return;
         }
-
-        // Prepare the new stable owner before replacing an existing entry.
         const inserted = try self.allocator.create(CacheEntry);
         errdefer self.allocator.destroy(inserted);
-        try self.entries.ensureUnusedCapacity(self.allocator, 1);
-        // Evict LRU if at capacity
-        if (self.entries.items.len >= max_entries) {
-            var lru_idx: usize = 0;
-            var lru_time: u64 = std.math.maxInt(u64);
-            for (self.entries.items, 0..) |entry, idx| {
-                if (entry.last_used < lru_time) {
-                    lru_time = entry.last_used;
-                    lru_idx = idx;
-                }
-            }
-            self.entries.items[lru_idx].freeCompiledPartitions();
-            self.entries.items[lru_idx].freeCompiledModelExecutor();
-            self.entries.items[lru_idx].resetSingleDeviceExecutable();
-            if (cb) |backend| self.entries.items[lru_idx].freeWeights(backend);
-            self.entries.items[lru_idx].freeAnalysis();
-            self.entries.items[lru_idx].graph.deinit();
-            self.allocator.destroy(self.entries.swapRemove(lru_idx));
+        try self.specializations.reserve(self.allocator);
+        inserted.* = .{ .key = key, .graph = graph };
+        if (self.specializations.insert(inserted)) |victim| {
+            retireEntryContents(victim, owner);
+            self.allocator.destroy(victim);
         }
+    }
 
-        self.use_counter += 1;
-        inserted.* = .{ .key = key, .graph = graph, .last_used = self.use_counter };
-        self.entries.appendAssumeCapacity(inserted);
+    fn retireEntryContents(entry: *CacheEntry, cb: ?*const ComputeBackend) void {
+        retirePrepared(entry, cb);
+        entry.freeAnalysis();
+        entry.graph.deinit();
     }
 
     /// Number of cached entries.
     pub fn count(self: *const GraphCache) usize {
-        return self.entries.items.len;
+        return self.specializations.entries.items.len;
     }
 
     /// Remove all cached entries and free their graphs.
     pub fn clear(self: *GraphCache) void {
         self.freeSessionCompiledModelRuntime();
-        for (self.entries.items) |entry| {
-            entry.freeCompiledModelExecutor();
-            entry.freeCompiledPartitions();
-            entry.resetSingleDeviceExecutable();
-            entry.freeAnalysis();
-            entry.graph.deinit();
+        const owner: ?*const ComputeBackend = if (self.prepared_backend) |*backend| backend else null;
+        for (self.specializations.entries.items) |entry| {
+            retireEntryContents(entry, owner);
             self.allocator.destroy(entry);
         }
-        self.entries.clearRetainingCapacity();
-        self.use_counter = 0;
+        self.specializations.clear();
     }
 };
 
@@ -721,7 +682,6 @@ test "freeCompiledModelExecutor deinitializes runtime before executor" {
     var entry = CacheEntry{
         .key = .{ .config_hash = 2, .batch = 1, .seq_len = 1, .attention_mode = .paged_decode },
         .graph = g,
-        .last_used = 0,
         .compiled_model_backend = .pjrt,
         .compiled_model_status = .ready,
         .compiled_model_executor = .{
@@ -795,7 +755,6 @@ test "freeCompiledPartitions calls executor deinit" {
     var entry = CacheEntry{
         .key = .{ .config_hash = 1, .batch = 1, .seq_len = 1, .attention_mode = .paged_decode },
         .graph = g,
-        .last_used = 0,
         .compiled_partitions_backend = .metal,
         .compiled_partitions_status = .ready,
         .compiled_partitions = try makeMockCompiledPartitions(allocator, &ctxs),
@@ -839,7 +798,7 @@ test "LRU eviction calls freeCompiledPartitions" {
     }
 
     // Attach compiled partitions to the LRU entry (config_hash=0, which was
-    // inserted first and never touched again → lowest last_used).
+    // inserted first and never touched again → oldest handle).
     const lru_entry = cache.getEntry(.{
         .config_hash = 0,
         .batch = 1,
@@ -857,7 +816,7 @@ test "LRU eviction calls freeCompiledPartitions" {
     lru_entry.compiled_partitions_status = .ready;
 
     // Now the LRU entry is config_hash=0 (even though we just touched it via
-    // getEntry, its last_used is now the highest). To make it the true LRU
+    // getEntry, its handle is now the newest). To make it the true LRU
     // again, touch all other entries.
     for (1..max_entries) |i| {
         _ = cache.get(.{
@@ -961,7 +920,6 @@ test "selectCompiledPartitionsBackend resets mismatched backend caches" {
     var entry = CacheEntry{
         .key = .{ .config_hash = 7, .batch = 1, .seq_len = 1, .attention_mode = .paged_decode },
         .graph = g,
-        .last_used = 0,
         .compiled_partitions_backend = .pjrt,
         .compiled_partitions_status = .ready,
         .compiled_partitions = try makeMockCompiledPartitions(allocator, &ctxs),
@@ -1020,4 +978,46 @@ test "GraphCache stable entry insertion and replacement clean up every allocatio
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "GraphCache switches same-kind contexts without reusing device bindings" {
+    const Mock = struct {
+        frees: usize = 0,
+        fn free(raw: *anyopaque, tensor: CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(tensor == raw);
+            self.frees += 1;
+        }
+    };
+    var vt = @import("../ops/native_compute.zig").vtable_impl;
+    vt.freeTensor = Mock.free;
+    var first = Mock{};
+    var second = Mock{};
+    const first_cb = ComputeBackend{ .ptr = &first, .vtable = &vt };
+    const second_cb = ComputeBackend{ .ptr = &second, .vtable = &vt };
+    var cache = GraphCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const key = CacheKey{ .config_hash = 1, .batch = 1, .seq_len = 1, .attention_mode = .paged_decode };
+    var graph = Graph.init(std.testing.allocator);
+    var builder = Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{1}));
+    try graph.markOutput(x);
+    try cache.putWithBackend(key, graph, &first_cb);
+    const entry = cache.getEntry(key).?;
+    entry.weight_inputs = try entry.resourceAllocator().alloc(RuntimeInput, 1);
+    entry.weight_inputs.?[0] = .{ .node_id = x, .value = &first };
+    entry.cached_analysis = try CachedAnalysis.compute(entry.resourceAllocator(), &entry.graph);
+    const analysis_ptr = entry.cached_analysis.?.reachable.ptr;
+    cache.selectBackend(&first_cb);
+    try std.testing.expectEqual(@as(usize, 0), first.frees);
+    cache.selectBackend(&second_cb);
+    try std.testing.expectEqual(@as(usize, 1), first.frees);
+    try std.testing.expectEqual(@as(usize, 0), second.frees);
+    try std.testing.expect(entry == cache.getEntry(key).?);
+    try std.testing.expect(entry.weight_inputs == null);
+    try std.testing.expect(entry.cached_analysis.?.reachable.ptr == analysis_ptr);
+    entry.weight_inputs = try entry.resourceAllocator().alloc(RuntimeInput, 1);
+    entry.weight_inputs.?[0] = .{ .node_id = x, .value = &second };
+    cache.clear();
+    try std.testing.expectEqual(@as(usize, 1), second.frees);
 }

@@ -160,16 +160,17 @@ pub fn graphForwardAll(
 ) ![]f32 {
     const allocator = pipeline.allocator;
     const attn_mode = cacheAttentionMode(decode_context);
+    const cache_before = cache.specializations.stats;
     const entry = try ensureGraphEntry(pipeline, cache, input_ids, batch, seq_len, decode_context);
     const graph = &entry.graph;
 
     if (entry.weight_inputs == null) {
         const params = graph.parameters.items;
-        const wc = try allocator.alloc(interpreter.RuntimeInput, params.len);
+        const wc = try entry.resourceAllocator().alloc(interpreter.RuntimeInput, params.len);
         var initialized: usize = 0;
         errdefer {
             for (wc[0..initialized]) |input| pipeline.cb.free(input.value);
-            allocator.free(wc);
+            entry.resourceAllocator().free(wc);
         }
 
         for (params, 0..) |param_id, idx| {
@@ -187,7 +188,7 @@ pub fn graphForwardAll(
         entry.weight_inputs = wc;
     }
     if (entry.cached_analysis == null) {
-        entry.cached_analysis = try interpreter.CachedAnalysis.compute(allocator, graph);
+        entry.cached_analysis = try interpreter.CachedAnalysis.compute(entry.resourceAllocator(), graph);
     }
 
     const exec_options = interpreter.ExecuteOptions{
@@ -230,7 +231,9 @@ pub fn graphForwardAll(
         }
     }
 
-    return try executeSingleDeviceGraphExecutor(pipeline, allocator, entry, graph, exec_options);
+    const output = try executeSingleDeviceGraphExecutor(pipeline, allocator, entry, graph, exec_options);
+    if (entry.single_device_executable) |prepared| prepared.diagnostics.recordSpecializations(cache.specializations.stats.since(cache_before));
+    return output;
 }
 
 fn executeSingleDeviceGraphExecutor(
@@ -383,6 +386,7 @@ pub fn ensureGraphEntry(
     decode_context: *const gpt_arch.DecodeContext,
 ) !*cache_mod.CacheEntry {
     const allocator = pipeline.allocator;
+    cache.selectBackend(pipeline.cb);
     const key = graphCacheKey(pipeline, batch, decode_context);
 
     if (cache.get(key) == null) {

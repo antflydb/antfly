@@ -18,7 +18,8 @@
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
 pub const ExecutionStats = @import("stats.zig").ExecutionStats;
-pub const Snapshot = struct { execution: ExecutionStats = .{}, provider: ops.NativeQuantTimingStats = .{} };
+pub const Specializations = @import("specialization_cache.zig").Stats;
+pub const Snapshot = struct { specializations: ?Specializations = null, execution: ExecutionStats = .{}, provider: ops.NativeQuantTimingStats = .{}, runtime: ops.RuntimeTelemetry = .{} };
 pub const Diagnostics = struct {
     enabled: std.atomic.Value(bool) = .init(false),
     mutex: std.atomic.Mutex = .unlocked,
@@ -45,8 +46,21 @@ pub const Diagnostics = struct {
         defer self.mutex.unlock();
         if (self.isEnabled()) self.last = value;
     }
-    pub fn record(self: *Diagnostics, stats: ExecutionStats, backend: *const ops.ComputeBackend) void {
+    pub fn recordSpecializations(self: *Diagnostics, stats: Specializations) void {
         if (!self.isEnabled()) return;
-        self.publish(.{ .execution = stats, .provider = backend.debugTimingSnapshot().provider });
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.isEnabled()) if (self.last) |*last| {
+            last.specializations = stats;
+        };
+    }
+    pub fn begin(self: *const Diagnostics, backend: *const ops.ComputeBackend) ?ops.RuntimeTelemetry {
+        if (!self.isEnabled()) return null;
+        return backend.debugTimingSnapshot().runtime;
+    }
+    pub fn record(self: *Diagnostics, stats: ExecutionStats, backend: *const ops.ComputeBackend, before: ?ops.RuntimeTelemetry) void {
+        if (!self.isEnabled()) return;
+        const after = backend.debugTimingSnapshot();
+        self.publish(.{ .execution = stats, .provider = after.provider, .runtime = if (before) |start| after.runtime.since(start) else .{} });
     }
 };

@@ -86,14 +86,21 @@ pub const ImportedOnnxSession = struct {
     specialization_mutex: std.atomic.Mutex = .unlocked,
     execution_count: std.atomic.Value(u64) = .init(0),
     last_batch: std.atomic.Value(u64) = .init(0),
-    specialization_builds: u64 = 0,
-    specialization_hits: u64 = 0,
-    specializations: std.ArrayListUnmanaged(Specialization) = .empty,
-    const Specialization = struct { shapes: []i64, session: *ImportedOnnxSession };
+    specializations: @import("../execution/specialization_cache.zig").Cache([]const i64, Specialization, Specialization.keyOf, Specialization.equal) = .init(max_specializations),
+    const Specialization = struct {
+        shapes: []i64,
+        session: *ImportedOnnxSession,
+        fn keyOf(self: @This()) []const i64 {
+            return self.shapes;
+        }
+        fn equal(a: []const i64, b: []const i64) bool {
+            return std.mem.eql(i64, a, b);
+        }
+    };
     const max_specializations = 4;
 
     pub fn deinit(self: *ImportedOnnxSession) void {
-        for (self.specializations.items) |entry| {
+        for (self.specializations.entries.items) |entry| {
             self.allocator.free(entry.shapes);
             entry.session.deinit();
         }
@@ -646,9 +653,9 @@ pub fn executionStats(session: Session) ?ExecutionStats {
         .strategy = self.requested_strategy,
         .executions = self.execution_count.load(.monotonic),
         .last_batch = self.last_batch.load(.monotonic),
-        .cached_plans = self.specializations.items.len,
-        .plan_builds = self.specialization_builds,
-        .plan_hits = self.specialization_hits,
+        .cached_plans = self.specializations.entries.items.len,
+        .plan_builds = self.specializations.stats.builds,
+        .plan_hits = self.specializations.stats.hits,
         .shared_initializers = self.static_runtime_inputs.len,
     };
 }
@@ -776,14 +783,7 @@ fn specializeForInputs(self: *ImportedOnnxSession, inputs: []const Tensor) !*Imp
             try key.append(self.allocator, actual);
         }
     }
-    for (self.specializations.items, 0..) |entry, i| {
-        if (!std.mem.eql(i64, entry.shapes, key.items)) continue;
-        // Move a hit to the MRU end without reallocating or copying tensors.
-        self.specialization_hits += 1;
-        const hit = self.specializations.orderedRemove(i);
-        self.specializations.appendAssumeCapacity(hit);
-        return hit.session;
-    }
+    if (self.specializations.get(key.items)) |entry| return entry.session;
     const session = try createSessionWithOptions(self.allocator, self.source_path.?, self.shared_backend_ctx.backendType(), .{
         .graph_runtime_strategy = self.requested_strategy,
         .shared_backend_ctx = self.shared_backend_ctx,
@@ -795,14 +795,11 @@ fn specializeForInputs(self: *ImportedOnnxSession, inputs: []const Tensor) !*Imp
     errdefer specialized.deinit();
     const owned_key = try self.allocator.dupe(i64, key.items);
     errdefer self.allocator.free(owned_key);
-    try self.specializations.ensureUnusedCapacity(self.allocator, 1);
-    if (self.specializations.items.len == ImportedOnnxSession.max_specializations) {
-        const oldest = self.specializations.orderedRemove(0);
+    try self.specializations.reserve(self.allocator);
+    if (self.specializations.insert(.{ .shapes = owned_key, .session = specialized })) |oldest| {
         oldest.session.deinit();
         self.allocator.free(oldest.shapes);
     }
-    self.specialization_builds += 1;
-    self.specializations.appendAssumeCapacity(.{ .shapes = owned_key, .session = specialized });
     return specialized;
 }
 
@@ -863,11 +860,16 @@ fn runWithOutputs(
                 initialized += 1;
             }
         }
+        const cache_before = self.specializations.stats;
         const specialized = try specializeForInputs(self, host_inputs orelse metadata.?);
         const collect_diagnostics = self.executable.diagnostics.isEnabled();
         specialized.executable.diagnostics.configure(collect_diagnostics);
         defer if (collect_diagnostics) {
-            if (specialized.executable.diagnostics.snapshot()) |snapshot| self.executable.diagnostics.publish(snapshot);
+            if (specialized.executable.diagnostics.snapshot()) |snapshot| {
+                var measured = snapshot;
+                measured.specializations = self.specializations.stats.since(cache_before);
+                self.executable.diagnostics.publish(measured);
+            }
         };
         if (resident) {
             var outputs = try runWithOutputs(specialized, host_inputs, resident_inputs, allocator, control, true);
@@ -877,6 +879,7 @@ fn runWithOutputs(
             return outputs;
         } else return runWithOutputs(specialized, host_inputs, resident_inputs, allocator, control, false);
     }
+    const diagnostics_before = self.executable.diagnostics.begin(&self.cb);
     const input_len = if (host_inputs) |inputs| inputs.len else if (resident_inputs) |inputs| inputs.len else 0;
     if (input_len != self.input_info.len) return error.InputArityMismatch;
 
@@ -929,7 +932,7 @@ fn runWithOutputs(
 
     if (!resident) {
         const outputs = try exportOutputs(self, &exec_result, allocator, control);
-        self.executable.diagnostics.record(exec_result.stats, &self.cb);
+        self.executable.diagnostics.record(exec_result.stats, &self.cb, diagnostics_before);
         exec_result.deinit(&self.executable.runtime);
         for (dynamic_inputs[0..imported_count]) |ri| {
             if (resident_inputs == null) self.cb.free(ri.value);
@@ -1405,7 +1408,6 @@ fn shapeSliceFromOwnedShape(allocator: std.mem.Allocator, shape: Shape) ![]i64 {
     for (0..rank) |i| dims[i] = shape.dim(@intCast(i));
     return dims;
 }
-
 
 fn dtypeFromShape(shape: Shape) DType {
     return switch (shape.dtype) {
@@ -2859,6 +2861,7 @@ fn expectShapeCacheReuse(kind: BackendType) !void {
     defer session.close();
     const parent: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
     try std.testing.expect(parent.source_path != null);
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
     // A new shape must keep working even after an atomic model replacement.
     // The cache owns a compact immutable graph, not a path to reload later.
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = "replaced model" });
@@ -2879,8 +2882,12 @@ fn expectShapeCacheReuse(kind: BackendType) !void {
             allocator.free(outputs);
         }
         for (outputs[0].asFloat32()) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(iteration)) + 2, value);
-        try std.testing.expect(parent.specializations.items.len <= ImportedOnnxSession.max_specializations);
-        const child = parent.specializations.items[parent.specializations.items.len - 1].session;
+        const measured_cache = session.executionDiagnostics().?.specializations.?;
+        try std.testing.expectEqual(@as(u64, if (iteration == 2 or iteration == 6) 0 else 1), measured_cache.builds);
+        try std.testing.expectEqual(@as(u64, if (iteration == 2 or iteration == 6) 1 else 0), measured_cache.hits);
+        try std.testing.expectEqual(@as(u64, if (iteration == 5) 1 else 0), measured_cache.evictions);
+        try std.testing.expect(parent.specializations.entries.items.len <= ImportedOnnxSession.max_specializations);
+        const child = parent.specializations.entries.items[parent.specializations.entries.items.len - 1].session;
         try std.testing.expectEqual(parent.shared_backend_ctx, child.shared_backend_ctx);
         try std.testing.expectEqual(@as(usize, 1), child.static_runtime_inputs.len);
         const fallback = if (kind == .native) &child.cb else &child.executable.runtime.fallback_native.?.backend;
@@ -3038,7 +3045,10 @@ test "imported onnx session preserves exported contractions and reports warm phy
             }
             try std.testing.expectEqual(@as(usize, 3), outputs.len);
             for (outputs) |tensor| try std.testing.expectEqualSlices(f32, &.{ -2, 4, 6, 1, -2, 10, 15, -2 }, tensor.asFloat32());
-            const stats = session.executionDiagnostics().?.execution;
+            const diagnostics = session.executionDiagnostics().?;
+            try std.testing.expect(diagnostics.specializations == null);
+            try std.testing.expectEqual(@as(?u64, 0), diagnostics.runtime.counters.graph_submissions);
+            const stats = diagnostics.execution;
             try std.testing.expect(stats.assigned_kernel_dispatches > 0);
             if (iteration != 0) {
                 try std.testing.expectEqual(@as(u64, 0), stats.physical_storage_allocations);

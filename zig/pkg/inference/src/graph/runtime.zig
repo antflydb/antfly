@@ -420,7 +420,6 @@ pub const Runtime = struct {
             },
             .graph = graph.*,
             .resource_allocator = self.allocator,
-            .last_used = 0,
         };
     }
 

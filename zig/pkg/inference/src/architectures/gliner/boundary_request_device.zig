@@ -148,7 +148,7 @@ pub fn plan(config: *const model.Config, prepared: *const processor.PreparedBatc
 }
 
 fn checkBackend(cb: *const ops.ComputeBackend) !void {
-    if ((cb.kind() != .metal and cb.kind() != .cuda) or cb.vtable.glinerBoundaryDevice == null or cb.vtable.glinerBoundaryDownload == null)
+    if ((cb.kind() != .metal and cb.kind() != .cuda) or cb.vtable.regions.relative_boundary.device == null or cb.vtable.regions.relative_boundary.download == null)
         return error.UnsupportedGlinerBoundaryDevice;
     if (cb.decoderRuntimeHasActiveFrame()) return error.GlinerBoundaryExternalFrame;
     try cb.checkExecutionControl();

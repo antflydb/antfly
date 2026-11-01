@@ -1599,7 +1599,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// scopes are borrowed, and unsupported backends retain their normal path.
     pub fn beginOcrEncoderScope(cb: *const ops.ComputeBackend, stage: OcrEncoderStage) !bool {
         if (comptime !build_options.enable_metal) return false;
-        if (cb.vtable.decoderRuntimeBeginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp or
+        if (cb.vtable.regions.decoder.beginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp or
             cb.kind() != .metal or !metal_runtime_mod.appleSimdgroupDeviceDefault() or
             !getenvBool("ANTFLY_OCR_ENCODER_SCOPES")) return false;
         const owned = try cb.decoderRuntimeBeginPlannedComputeScope();
@@ -1612,7 +1612,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     pub fn ocrEncoderScopeOpens(cb: *const ops.ComputeBackend) [3]u64 {
         if (comptime !build_options.enable_metal) return @splat(0);
-        if (cb.vtable.decoderRuntimeBeginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp or
+        if (cb.vtable.regions.decoder.beginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp or
             cb.kind() != .metal) return @splat(0);
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         return self.ocr_encoder_scope_opens;
@@ -1673,7 +1673,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// retain these two packing banks across frames. clearVisionWorkspace in
     /// deinit releases them before the caller retires that admission lease.
     pub fn setLightOnVisionWorkspaceCache(cb: *const ops.ComputeBackend, enabled: bool) !void {
-        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) {
+        if (cb.kind() != .metal or cb.vtable.regions.decoder.argmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) {
             if (enabled) return error.UnsupportedVisionWorkspaceCache;
             return;
         }
@@ -1683,7 +1683,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn lightOnVisionWorkspaceStats(cb: *const ops.ComputeBackend) [3]u64 {
-        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
+        if (cb.kind() != .metal or cb.vtable.regions.decoder.argmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         var stats: [3]u64 = @splat(0);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_vision_workspace_stats(self.provider_impl.raw_decode_runtime, &stats);
@@ -1692,7 +1692,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn lightOnLargeVisionPackStats(cb: *const ops.ComputeBackend) [2]u64 {
-        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
+        if (cb.kind() != .metal or cb.vtable.regions.decoder.argmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         var stats: [2]u64 = @splat(0);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_large_vision_pack_stats(self.provider_impl.raw_decode_runtime, &stats);
@@ -1701,14 +1701,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn lightOnRecurrentGroupRows(cb: *const ops.ComputeBackend) usize {
-        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return 16;
+        if (cb.kind() != .metal or cb.vtable.regions.decoder.argmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return 16;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         if (!self.lighton_shared_core_weights_enabled) return 16;
         return metal_runtime_mod.termite_metal_decode_runtime_lighton_recurrent_group_rows(self.provider_impl.raw_decode_runtime);
     }
 
     pub fn lightOnShortPrefillStats(cb: *const ops.ComputeBackend) [2]u64 {
-        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
+        if (cb.kind() != .metal or cb.vtable.regions.decoder.argmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         var stats: [2]u64 = @splat(0);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_short_prefill_stats(self.provider_impl.raw_decode_runtime, &stats);
@@ -1717,7 +1717,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn lightOnWideRecurrentStats(cb: *const ops.ComputeBackend) [3]u64 {
-        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
+        if (cb.kind() != .metal or cb.vtable.regions.decoder.argmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         var stats: [3]u64 = @splat(0);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_recurrent_stats(self.provider_impl.raw_decode_runtime, &stats);
@@ -1730,7 +1730,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn lightOnBatchedArgmaxStats(cb: *const ops.ComputeBackend) [2]u64 {
-        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
+        if (cb.kind() != .metal or cb.vtable.regions.decoder.argmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         var stats: [2]u64 = @splat(0);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_batch_argmax_stats(self.provider_impl.raw_decode_runtime, &stats);
@@ -1845,7 +1845,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// The epoch has already admitted two complete prefill working sets.
     /// Warm one full synchronous prompt before lending any later prefix.
     pub fn setLightOnPrefillStreamLayers(cb: *const ops.ComputeBackend, layers: u8) !void {
-        if (cb.kind() != .metal or cb.vtable.decoderRuntimeBeginFrame != &decoderRuntimeBeginFrameOp) {
+        if (cb.kind() != .metal or cb.vtable.regions.decoder.beginFrame != &decoderRuntimeBeginFrameOp) {
             if (layers != 0) return error.UnsupportedPrefillStream;
             return;
         }
@@ -1862,13 +1862,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn lightOnPrefillStreamLayers(cb: *const ops.ComputeBackend) u8 {
-        if (cb.kind() != .metal or cb.vtable.decoderRuntimeBeginFrame != &decoderRuntimeBeginFrameOp) return 0;
+        if (cb.kind() != .metal or cb.vtable.regions.decoder.beginFrame != &decoderRuntimeBeginFrameOp) return 0;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         return if (self.lighton_prefill_stream_ready) self.lighton_prefill_stream_layers else 0;
     }
 
     pub fn noteLightOnPrefillComplete(cb: *const ops.ComputeBackend) void {
-        if (cb.kind() != .metal or cb.vtable.decoderRuntimeBeginFrame != &decoderRuntimeBeginFrameOp) return;
+        if (cb.kind() != .metal or cb.vtable.regions.decoder.beginFrame != &decoderRuntimeBeginFrameOp) return;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         // This is called only after the complete owned prompt frame drains.
         self.lighton_prefill_stream_ready = true;
@@ -1902,8 +1902,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// The caller still owns tail submission, cancellation and token readback.
     pub fn setLightOnGpuGreedyStream(cb: *const ops.ComputeBackend, enabled: bool) !void {
         if (cb.kind() != .metal or
-            cb.vtable.decoderRuntimeBeginFrame != &decoderRuntimeBeginFrameOp or
-            cb.vtable.decoderRuntimeBeginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp)
+            cb.vtable.regions.decoder.beginFrame != &decoderRuntimeBeginFrameOp or
+            cb.vtable.regions.decoder.beginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp)
         {
             if (enabled) return error.UnsupportedGpuGreedyStream;
             return;
@@ -1951,8 +1951,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     pub fn lightOnGpuGreedyStreamEnabled(cb: *const ops.ComputeBackend) bool {
         if (cb.kind() != .metal or
-            cb.vtable.decoderRuntimeBeginFrame != &decoderRuntimeBeginFrameOp or
-            cb.vtable.decoderRuntimeBeginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp)
+            cb.vtable.regions.decoder.beginFrame != &decoderRuntimeBeginFrameOp or
+            cb.vtable.regions.decoder.beginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp)
             return false;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         return self.lighton_gpu_greedy_stream;
@@ -34379,7 +34379,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             provider_stats.a4b_moe_mapped_layer0_prewarm_nanos = self.a4b_mapped_layer0_prewarm_nanos;
         }
         self.populateMemoryDebugStats(&provider_stats);
+        const memory = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
         return .{
+            .runtime = .{ .counters = .{ .frame_submissions = memory.frame_submit_count }, .memory = .{ .scope = .backend_runtime_buffers, .live_bytes = memory.total_bytes } },
             .native_quant_null = false,
             .provider = provider_stats,
             .quant = .{},
@@ -36472,6 +36474,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.relativePositionBias = relativePositionBiasOp;
         // Replace the target table as a unit; native tensor/storage callbacks
         // cannot be inherited into Metal's representation.
+        vt.regions = .{};
         vt.kernels = &kernel_backend_impl;
         vt.hostFloat32Read = null;
         vt.hostFloat32Write = null;
@@ -36496,13 +36499,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.embeddingLookupTensor = embeddingLookupTensorOp;
         vt.convertDType = convertDTypeOp;
         vt.cumulativeSum = cumulativeSumOp;
-        vt.glinerBoundaryDevice = glinerBoundaryDeviceOp;
-        vt.glinerBoundaryPackedQkv = glinerBoundaryPackedQkvOp;
-        vt.glinerBoundaryFusedFfnAvailable = glinerBoundaryFusedFfnAvailableOp;
-        vt.glinerBoundaryFusedFfn = glinerBoundaryFusedFfnOp;
-        vt.glinerBoundaryScope = glinerBoundaryScopeOp;
-        vt.glinerBoundaryResidentPreparation = glinerBoundaryResidentPreparationOp;
-        vt.glinerBoundaryDownload = glinerBoundaryDownloadOp;
+        vt.regions.relative_boundary.device = glinerBoundaryDeviceOp;
+        vt.regions.relative_boundary.packedQkv = glinerBoundaryPackedQkvOp;
+        vt.regions.relative_boundary.fusedFfnAvailable = glinerBoundaryFusedFfnAvailableOp;
+        vt.regions.relative_boundary.fusedFfn = glinerBoundaryFusedFfnOp;
+        vt.regions.relative_boundary.scope = glinerBoundaryScopeOp;
+        vt.regions.relative_boundary.residentPreparation = glinerBoundaryResidentPreparationOp;
+        vt.regions.relative_boundary.download = glinerBoundaryDownloadOp;
         vt.toFloat32 = toFloat32Op;
         vt.exportTensorData = exportTensorDataOp;
         vt.cloneTensorShape = cloneTensorShapeOp;
@@ -36526,7 +36529,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.residentTrainingEndBatch = residentTrainingEndBatchOp;
         vt.trainingSumSquaresManyF32 = trainingSumSquaresManyF32Op;
         vt.argmaxLastRow = argmaxLastRowOp;
-        vt.gemma4MtpMaskedSelectFromHidden = gemma4MtpMaskedSelectFromHiddenOp;
+        vt.regions.speculative.maskedSelectFromHidden = gemma4MtpMaskedSelectFromHiddenOp;
         vt.linearNoBiasArgmaxLastRow = linearNoBiasArgmaxLastRowOp;
         vt.argmaxRows = argmaxRowsOp;
         vt.argmaxRowsSuppress = argmaxRowsSuppressOp;
@@ -36567,9 +36570,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.segmentAttentionGrouped = segmentAttentionGroupedOp;
         vt.maskedMeanRows = maskedMeanRowsOp;
         vt.maskedMeanNormalizedRows = maskedMeanNormalizedRowsOp;
-        vt.scaledDotProductAttentionQwen3VlVision = scaledDotProductAttentionQwen3VlVisionOp;
-        vt.scaledDotProductAttentionGemma4Vision = scaledDotProductAttentionGemma4VisionOp;
-        vt.scaledDotProductAttentionEmbeddingGemma2Vision = scaledDotProductAttentionEmbeddingGemma2VisionOp;
+        vt.regions.vision.unmaskedTensorCore = scaledDotProductAttentionQwen3VlVisionOp;
+        vt.regions.vision.unmaskedWarpReduced = scaledDotProductAttentionGemma4VisionOp;
+        vt.regions.vision.unmaskedRetrieval = scaledDotProductAttentionEmbeddingGemma2VisionOp;
         vt.scaledDotProductAttentionFull = scaledDotProductAttentionFullOp;
         vt.maskedBceWithLogitsLoss = maskedBceWithLogitsLossOp;
         vt.maskedBceWithLogitsBackward = maskedBceWithLogitsBackwardOp;
@@ -36581,10 +36584,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.disentangledRelativeAttentionBackward = disentangledRelativeAttentionBackwardOp;
         // Dedicated replay training needs resident kernels. Inheriting the
         // native hooks would cast this Metal context to NativeCompute.
-        vt.debertaTrainingAttentionV1 = debertaTrainingAttentionV1Op;
-        vt.debertaTrainingAttentionBackwardV1 = debertaTrainingAttentionBackwardV1Op;
-        vt.modernBertTrainingAttentionV1 = modernBertTrainingAttentionV1Op;
-        vt.modernBertTrainingAttentionBackwardV1 = modernBertTrainingAttentionBackwardV1Op;
+        vt.regions.relative_encoder.trainingAttention = debertaTrainingAttentionV1Op;
+        vt.regions.relative_encoder.trainingAttentionBackward = debertaTrainingAttentionBackwardV1Op;
+        vt.regions.window_attention.trainingForward = modernBertTrainingAttentionV1Op;
+        vt.regions.window_attention.trainingBackward = modernBertTrainingAttentionBackwardV1Op;
         // Device kernels without active dropout, host bridge otherwise; see
         // segmentTrainingAttentionV1Op.
         vt.segmentTrainingAttentionV1 = segmentTrainingAttentionV1Op;
@@ -36616,11 +36619,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.concatRows2D = concatRows2DOp;
         vt.sliceRows2D = sliceRows2DOp;
         vt.embeddingLookup = embeddingLookupOp;
-        vt.debertaEmbeddings = debertaEmbeddingsOp;
+        vt.regions.relative_encoder.embeddings = debertaEmbeddingsOp;
         vt.takeRows = takeRowsOp;
-        vt.glinerWordEmbeddings = glinerWordEmbeddingsOp;
+        vt.regions.sequence_projection.firstWordRows = glinerWordEmbeddingsOp;
         vt.preferEagerQuantMirrors = preferEagerQuantMirrorsOp;
-        vt.glinerLabelGruCombined = glinerLabelGruCombinedOp;
+        vt.regions.sequence_projection.gruSummary = glinerLabelGruCombinedOp;
         vt.gelu = geluOp;
         vt.geluExact = geluExactOp;
         vt.packedGegluExact = packedGegluExactOp;
@@ -36644,8 +36647,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.depthwiseCausalConv1dSegmented = audioTapeDepthwiseCausalConv1dSegmented;
         vt.flattenChannelsTimeFreq = flattenChannelsTimeFreqOp;
         vt.channelLayerNormRelu = channelLayerNormReluOp;
-        vt.gemma4AudioLocalAttention = audioTapeGemma4AudioLocalAttention;
-        vt.gemma4AudioPackedAttention = audioTapeGemma4AudioLocalAttention;
+        vt.regions.audio_attention.localRelative = audioTapeGemma4AudioLocalAttention;
+        vt.regions.audio_attention.packedLocalRelative = audioTapeGemma4AudioLocalAttention;
         vt.rmsNormAddTensor = rmsNormAddTensorOp;
         vt.rmsNormResidual = audioTapeRmsNormResidual;
         vt.modelScalarBounds = modelScalarBoundsOp;
@@ -36700,13 +36703,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.addLayerNormSum = addLayerNormSumOp;
         vt.ensureDeviceResident = ensureDeviceResidentOp;
         vt.conv1dIm2col = conv1dIm2colOp;
-        vt.whisperLogitsStatsEncode = whisperLogitsStatsEncodeOp;
-        vt.whisperLogitsStatsRead = whisperLogitsStatsReadOp;
-        vt.whisperGrammarWrite = whisperGrammarWriteOp;
+        vt.regions.token_selection.encodeLogitsStats = whisperLogitsStatsEncodeOp;
+        vt.regions.token_selection.readLogitsStats = whisperLogitsStatsReadOp;
+        vt.regions.token_selection.writeGrammar = whisperGrammarWriteOp;
         vt.embeddingLookupDeviceToken = embeddingLookupDeviceTokenOp;
-        vt.decoderRuntimeSetWhisperPipelinedFrames = decoderRuntimeSetWhisperPipelinedFramesOp;
-        vt.decoderRuntimeSubmitFrame = decoderRuntimeSubmitFrameOp;
-        vt.decoderRuntimeWaitSubmittedFrame = decoderRuntimeWaitSubmittedFrameOp;
+        vt.regions.decoder.setPipelinedFrames = decoderRuntimeSetWhisperPipelinedFramesOp;
+        vt.regions.decoder.submitFrame = decoderRuntimeSubmitFrameOp;
+        vt.regions.decoder.waitSubmittedFrame = decoderRuntimeWaitSubmittedFrameOp;
         vt.linear = linearOp;
         vt.denseMlp2 = denseMlp2Op;
         vt.denseFfnLayerNorm = denseFfnLayerNormOp;
@@ -36719,8 +36722,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.loraLinearBackwardB = loraLinearBackwardBOp;
         vt.linearNoBiasGrouped = linearNoBiasGroupedOp;
         vt.linearNoBiasArgmaxRowsSuppress = linearNoBiasArgmaxRowsSuppressOp;
-        vt.decoderRuntimeArgmaxRowsSuppress = decoderRuntimeArgmaxRowsSuppressOp;
-        vt.gemma4MtpVerifyCommit = gemma4MtpVerifyCommitOp;
+        vt.regions.decoder.argmaxRowsSuppress = decoderRuntimeArgmaxRowsSuppressOp;
+        vt.regions.speculative.verifyCommit = gemma4MtpVerifyCommitOp;
         vt.linearNoBiasPair = linearNoBiasPairOp;
         vt.mulMatId = mulMatIdOp;
         vt.moeLinearNoBias = mulMatIdOp;
@@ -36766,73 +36769,73 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.debugTimingSnapshot = debugTimingSnapshotOp;
         vt.directFamilyTimingSnapshot = directFamilyTimingSnapshotOp;
         vt.resetDebugTimingStats = resetDebugTimingStatsOp;
-        vt.decoderRuntimePrepareOrReuseFamily = decoderRuntimePrepareOrReuseFamilyOp;
-        vt.decoderRuntimePrepareOrReuseTextPrefill = decoderRuntimePrepareOrReuseTextPrefillOp;
-        vt.decoderRuntimeReady = decoderRuntimeReadyOp;
-        vt.decoderRuntimeAbsoluteEmbeddingsPrepared = decoderRuntimeAbsoluteEmbeddingsPreparedOp;
-        vt.decoderRuntimePrepareGreedy = decoderRuntimePrepareGreedyOp;
-        vt.decoderRuntimeResetState = decoderRuntimeResetStateOp;
-        vt.decoderRuntimeDecode = decoderRuntimeDecodeOp;
-        vt.decoderRuntimePlanPrefillFrame = decoderRuntimePlanPrefillFrameOp;
-        vt.decoderRuntimeExecuteGraphCommandPlanFrame = decoderRuntimeExecuteGraphCommandPlanFrameOp;
-        vt.debertaRelativeEmbeddings = debertaRelativeEmbeddingsOp;
-        vt.debertaEncoderPlanFrame = debertaEncoderPlanFrameOp;
-        vt.debertaEncoderLayer = debertaEncoderLayerOp;
-        vt.nomicBertEncoderLayer = nomicBertEncoderLayerOp;
-        vt.nomicBertPoolNormalize = nomicBertPoolNormalizeOp;
-        vt.decoderRuntimeBeginFrame = decoderRuntimeBeginFrameOp;
-        vt.decoderRuntimeSetActiveFrameRegime = decoderRuntimeSetActiveFrameRegimeOp;
-        vt.decoderRuntimePushComputeRegion = decoderRuntimePushComputeRegionOp;
-        vt.decoderRuntimePopComputeRegion = decoderRuntimePopComputeRegionOp;
-        vt.decoderRuntimePushPlannedComputeBarrierSuppression = decoderRuntimePushPlannedComputeBarrierSuppressionOp;
-        vt.decoderRuntimePopPlannedComputeBarrierSuppression = decoderRuntimePopPlannedComputeBarrierSuppressionOp;
-        vt.decoderRuntimeHasActiveFrame = decoderRuntimeHasActiveFrameOp;
-        vt.decoderRuntimeHasSubmittedFrame = decoderRuntimeHasSubmittedFrameOp;
-        vt.decoderRuntimeBeginMoeCheckpoint = decoderRuntimeBeginMoeCheckpointOp;
-        vt.decoderRuntimeFinishMoeCheckpoint = decoderRuntimeFinishMoeCheckpointOp;
-        vt.decoderRuntimeSetMoeReplayMode = decoderRuntimeSetMoeReplayModeOp;
-        vt.decoderRuntimeSubmitAndWaitFrame = decoderRuntimeSubmitAndWaitFrameOp;
-        vt.decoderRuntimeFlushActiveFrame = decoderRuntimeFlushActiveFrameOp;
-        vt.decoderRuntimeCancelFrame = decoderRuntimeCancelFrameOp;
-        vt.decoderRuntimePrepareAbsoluteEmbeddings = decoderRuntimePrepareAbsoluteEmbeddingsOp;
-        vt.decoderRuntimeEmbedAbsolutePosition = decoderRuntimeEmbedAbsolutePositionOp;
-        vt.decoderRuntimePrepareLayerNorm = decoderRuntimePrepareLayerNormOp;
-        vt.decoderRuntimeLayerNormSlotPrepared = decoderRuntimeLayerNormSlotPreparedOp;
-        vt.decoderRuntimeEnsureLayerNormSlot = decoderRuntimeEnsureLayerNormSlotOp;
-        vt.decoderRuntimeApplyLayerNorm = decoderRuntimeApplyLayerNormOp;
-        vt.decoderRuntimePrepareRmsNorm = decoderRuntimePrepareRmsNormOp;
-        vt.decoderRuntimeEnsureRmsNormSlot = decoderRuntimeEnsureRmsNormSlotOp;
-        vt.decoderRuntimeApplyRmsNorm = decoderRuntimeApplyRmsNormOp;
-        vt.decoderRuntimePrepareLinear = decoderRuntimePrepareLinearOp;
-        vt.decoderRuntimeLinearSlotPrepared = decoderRuntimeLinearSlotPreparedOp;
-        vt.decoderRuntimeEnsureLinearSlot = decoderRuntimeEnsureLinearSlotOp;
-        vt.decoderRuntimeApplyLinear = decoderRuntimeApplyLinearOp;
-        vt.decoderRuntimeApplyLinearLayerNorm = decoderRuntimeApplyLinearLayerNormOp;
-        vt.decoderRuntimeApplyFfnLayerNorm = decoderRuntimeApplyFfnLayerNormOp;
-        vt.decoderRuntimeApplyLayerNormLinearArgmax = decoderRuntimeApplyLayerNormLinearArgmaxOp;
-        vt.decoderRuntimeApplyLayerNormLinear = decoderRuntimeApplyLayerNormLinearOp;
-        vt.decoderRuntimeApplyLayerNormLinearSample = decoderRuntimeApplyLayerNormLinearSampleOp;
-        vt.decoderRuntimeApplyRmsNormLinearArgmax = decoderRuntimeApplyRmsNormLinearArgmaxOp;
-        vt.decoderRuntimeApplyRmsNormLinear = decoderRuntimeApplyRmsNormLinearOp;
-        vt.decoderRuntimeApplyRmsNormLinearSample = decoderRuntimeApplyRmsNormLinearSampleOp;
-        vt.decoderRuntimeSampleResidentLogits = decoderRuntimeSampleResidentLogitsOp;
-        vt.decoderRuntimeResidentLogitsSamplingSupported = decoderRuntimeResidentLogitsSamplingSupportedOp;
-        vt.decoderRuntimeApplyLinearArgmax = decoderRuntimeApplyLinearArgmaxOp;
-        vt.decoderRuntimeApplyLinearPair = decoderRuntimeApplyLinearPairOp;
-        vt.decoderRuntimeApplyLinearQkv = decoderRuntimeApplyLinearQkvOp;
-        vt.decoderRuntimeApplyLinearQkvInto = decoderRuntimeApplyLinearQkvIntoOp;
-        vt.decoderRuntimeApplyLinearInto = decoderRuntimeApplyLinearIntoOp;
-        vt.decoderRuntimeBeginPlannedComputeScope = decoderRuntimeBeginPlannedComputeScopeOp;
-        vt.decoderRuntimeEndPlannedComputeScope = decoderRuntimeEndPlannedComputeScopeOp;
-        vt.decoderRuntimeApplyActivation = decoderRuntimeApplyActivationOp;
-        vt.decoderRuntimeApplyGeluBackward = decoderRuntimeApplyGeluBackwardOp;
-        vt.decoderRuntimeFfnGeluBackwardChain = decoderRuntimeFfnGeluBackwardChainOp;
-        vt.decoderRuntimeFfnGeluBackwardOutput = decoderRuntimeFfnGeluBackwardOutputOp;
-        vt.decoderRuntimeApplyAdd = decoderRuntimeApplyAddOp;
-        vt.decoderRuntimeApplyAddScale = decoderRuntimeApplyAddScaleOp;
-        vt.decoderRuntimeApplyScaledAddScale = decoderRuntimeApplyScaledAddScaleOp;
-        vt.decoderRuntimeApplyMultiplyAdd = decoderRuntimeApplyMultiplyAddOp;
-        vt.decoderRuntimeApplyMultiplyAdd2 = decoderRuntimeApplyMultiplyAdd2Op;
+        vt.regions.decoder.prepareOrReuseFamily = decoderRuntimePrepareOrReuseFamilyOp;
+        vt.regions.decoder.prepareOrReuseTextPrefill = decoderRuntimePrepareOrReuseTextPrefillOp;
+        vt.regions.decoder.ready = decoderRuntimeReadyOp;
+        vt.regions.decoder.absoluteEmbeddingsPrepared = decoderRuntimeAbsoluteEmbeddingsPreparedOp;
+        vt.regions.decoder.prepareGreedy = decoderRuntimePrepareGreedyOp;
+        vt.regions.decoder.resetState = decoderRuntimeResetStateOp;
+        vt.regions.decoder.decode = decoderRuntimeDecodeOp;
+        vt.regions.decoder.planPrefillFrame = decoderRuntimePlanPrefillFrameOp;
+        vt.regions.decoder.executeGraphCommandPlanFrame = decoderRuntimeExecuteGraphCommandPlanFrameOp;
+        vt.regions.relative_encoder.relativeEmbeddings = debertaRelativeEmbeddingsOp;
+        vt.regions.relative_encoder.planFrame = debertaEncoderPlanFrameOp;
+        vt.regions.relative_encoder.layer = debertaEncoderLayerOp;
+        vt.regions.sequence_encoder.rotaryLayer = nomicBertEncoderLayerOp;
+        vt.regions.sequence_encoder.poolNormalize = nomicBertPoolNormalizeOp;
+        vt.regions.decoder.beginFrame = decoderRuntimeBeginFrameOp;
+        vt.regions.decoder.setActiveFrameRegime = decoderRuntimeSetActiveFrameRegimeOp;
+        vt.regions.decoder.pushComputeRegion = decoderRuntimePushComputeRegionOp;
+        vt.regions.decoder.popComputeRegion = decoderRuntimePopComputeRegionOp;
+        vt.regions.decoder.pushPlannedComputeBarrierSuppression = decoderRuntimePushPlannedComputeBarrierSuppressionOp;
+        vt.regions.decoder.popPlannedComputeBarrierSuppression = decoderRuntimePopPlannedComputeBarrierSuppressionOp;
+        vt.regions.decoder.hasActiveFrame = decoderRuntimeHasActiveFrameOp;
+        vt.regions.decoder.hasSubmittedFrame = decoderRuntimeHasSubmittedFrameOp;
+        vt.regions.decoder.beginMoeCheckpoint = decoderRuntimeBeginMoeCheckpointOp;
+        vt.regions.decoder.finishMoeCheckpoint = decoderRuntimeFinishMoeCheckpointOp;
+        vt.regions.decoder.setMoeReplayMode = decoderRuntimeSetMoeReplayModeOp;
+        vt.regions.decoder.submitAndWaitFrame = decoderRuntimeSubmitAndWaitFrameOp;
+        vt.regions.decoder.flushActiveFrame = decoderRuntimeFlushActiveFrameOp;
+        vt.regions.decoder.cancelFrame = decoderRuntimeCancelFrameOp;
+        vt.regions.decoder.prepareAbsoluteEmbeddings = decoderRuntimePrepareAbsoluteEmbeddingsOp;
+        vt.regions.decoder.embedAbsolutePosition = decoderRuntimeEmbedAbsolutePositionOp;
+        vt.regions.decoder.prepareLayerNorm = decoderRuntimePrepareLayerNormOp;
+        vt.regions.decoder.layerNormSlotPrepared = decoderRuntimeLayerNormSlotPreparedOp;
+        vt.regions.decoder.ensureLayerNormSlot = decoderRuntimeEnsureLayerNormSlotOp;
+        vt.regions.decoder.applyLayerNorm = decoderRuntimeApplyLayerNormOp;
+        vt.regions.decoder.prepareRmsNorm = decoderRuntimePrepareRmsNormOp;
+        vt.regions.decoder.ensureRmsNormSlot = decoderRuntimeEnsureRmsNormSlotOp;
+        vt.regions.decoder.applyRmsNorm = decoderRuntimeApplyRmsNormOp;
+        vt.regions.decoder.prepareLinear = decoderRuntimePrepareLinearOp;
+        vt.regions.decoder.linearSlotPrepared = decoderRuntimeLinearSlotPreparedOp;
+        vt.regions.decoder.ensureLinearSlot = decoderRuntimeEnsureLinearSlotOp;
+        vt.regions.decoder.applyLinear = decoderRuntimeApplyLinearOp;
+        vt.regions.decoder.applyLinearLayerNorm = decoderRuntimeApplyLinearLayerNormOp;
+        vt.regions.decoder.applyFfnLayerNorm = decoderRuntimeApplyFfnLayerNormOp;
+        vt.regions.decoder.applyLayerNormLinearArgmax = decoderRuntimeApplyLayerNormLinearArgmaxOp;
+        vt.regions.decoder.applyLayerNormLinear = decoderRuntimeApplyLayerNormLinearOp;
+        vt.regions.decoder.applyLayerNormLinearSample = decoderRuntimeApplyLayerNormLinearSampleOp;
+        vt.regions.decoder.applyRmsNormLinearArgmax = decoderRuntimeApplyRmsNormLinearArgmaxOp;
+        vt.regions.decoder.applyRmsNormLinear = decoderRuntimeApplyRmsNormLinearOp;
+        vt.regions.decoder.applyRmsNormLinearSample = decoderRuntimeApplyRmsNormLinearSampleOp;
+        vt.regions.decoder.sampleResidentLogits = decoderRuntimeSampleResidentLogitsOp;
+        vt.regions.decoder.residentLogitsSamplingSupported = decoderRuntimeResidentLogitsSamplingSupportedOp;
+        vt.regions.decoder.applyLinearArgmax = decoderRuntimeApplyLinearArgmaxOp;
+        vt.regions.decoder.applyLinearPair = decoderRuntimeApplyLinearPairOp;
+        vt.regions.decoder.applyLinearQkv = decoderRuntimeApplyLinearQkvOp;
+        vt.regions.decoder.applyLinearQkvInto = decoderRuntimeApplyLinearQkvIntoOp;
+        vt.regions.decoder.applyLinearInto = decoderRuntimeApplyLinearIntoOp;
+        vt.regions.decoder.beginPlannedComputeScope = decoderRuntimeBeginPlannedComputeScopeOp;
+        vt.regions.decoder.endPlannedComputeScope = decoderRuntimeEndPlannedComputeScopeOp;
+        vt.regions.decoder.applyActivation = decoderRuntimeApplyActivationOp;
+        vt.regions.decoder.applyGeluBackward = decoderRuntimeApplyGeluBackwardOp;
+        vt.regions.decoder.ffnGeluBackwardChain = decoderRuntimeFfnGeluBackwardChainOp;
+        vt.regions.decoder.ffnGeluBackwardOutput = decoderRuntimeFfnGeluBackwardOutputOp;
+        vt.regions.decoder.applyAdd = decoderRuntimeApplyAddOp;
+        vt.regions.decoder.applyAddScale = decoderRuntimeApplyAddScaleOp;
+        vt.regions.decoder.applyScaledAddScale = decoderRuntimeApplyScaledAddScaleOp;
+        vt.regions.decoder.applyMultiplyAdd = decoderRuntimeApplyMultiplyAddOp;
+        vt.regions.decoder.applyMultiplyAdd2 = decoderRuntimeApplyMultiplyAdd2Op;
         break :blk vt;
     };
 } else struct {
@@ -45282,9 +45285,9 @@ test "strict GLiNER boundary scope controls retire owned work without a GPU" {
     defer native_backend.deinit();
     var fixture = Fixture{ .native_cb = native_backend.computeBackend() };
     var vtable = fixture.native_cb.vtable.*;
-    vtable.glinerBoundaryScope = Fixture.control;
-    vtable.glinerBoundaryDevice = Fixture.dispatch;
-    vtable.glinerBoundaryResidentPreparation = Fixture.prepare;
+    vtable.regions.relative_boundary.scope = Fixture.control;
+    vtable.regions.relative_boundary.device = Fixture.dispatch;
+    vtable.regions.relative_boundary.residentPreparation = Fixture.prepare;
     vtable.freeTensor = Fixture.free;
     const cb = ops.ComputeBackend{ .ptr = &fixture, .vtable = &vtable, .execution_control = .{ .ptr = &fixture, .check_fn = Fixture.check } };
     const limits = ops.gliner_boundary_device.ScopeLimits{ .max_pending_device_bytes = 64, .max_dispatches = 8 };
@@ -45868,7 +45871,7 @@ test "strict GLiNER fused FFN workspace denial cancels ownership and final downl
         }
     };
     var unavailable_vtable = cb.vtable.*;
-    unavailable_vtable.glinerBoundaryFusedFfnAvailable = Availability.unavailable;
+    unavailable_vtable.regions.relative_boundary.fusedFfnAvailable = Availability.unavailable;
     var unavailable_cb = cb;
     unavailable_cb.vtable = &unavailable_vtable;
     const unavailable_math = try boundary_math.Context.create(a, &unavailable_cb, .{ .max_device_bytes = 1024 }, null);
@@ -48060,7 +48063,7 @@ test "embeddinggemma2 Metal packed audio attention preserves clamps and segmente
         params.packed_qkv = true;
         params.packed_clamp_flags = 63;
         params.packed_bounds = bounds;
-        const result = (try cb.vtable.gemma4AudioPackedAttention.?(cb.ptr, packed_source, packed_source, packed_source, rel, sc, valid, params)).?;
+        const result = (try cb.vtable.regions.audio_attention.packedLocalRelative.?(cb.ptr, packed_source, packed_source, packed_source, rel, sc, valid, params)).?;
         defer cb.free(result);
         const expected = try cb.toFloat32(old, a);
         defer a.free(expected);
@@ -49943,7 +49946,7 @@ test "LightOnOCR3 encoder scope counters reject borrowed backend wrappers" {
         }
     };
     var table = MetalCompute.vtable_impl;
-    table.decoderRuntimeBeginPlannedComputeScope = &Borrowed.begin;
+    table.regions.decoder.beginPlannedComputeScope = &Borrowed.begin;
     const cb = ops.ComputeBackend{ .ptr = probe, .vtable = &table };
     try std.testing.expectError(error.UnsupportedGpuGreedyStream, MetalCompute.setLightOnGpuGreedyStream(&cb, true));
     try std.testing.expect(!MetalCompute.lightOnGpuGreedyStreamEnabled(&cb));

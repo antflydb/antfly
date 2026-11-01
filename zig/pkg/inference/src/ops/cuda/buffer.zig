@@ -102,6 +102,7 @@ pub const DeviceBuffer = struct {
             std.log.err("CUDA cuMemAlloc failed: bytes={d} error={s} ({s})", .{ len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
             return error.CudaDriverError;
         }
+        ctx.device_allocations.allocated(len);
         return .{ .ptr = ptr, .len = len, .allocation_bytes = len };
     }
 
@@ -114,7 +115,7 @@ pub const DeviceBuffer = struct {
             ctx.makeCurrent() catch {};
             const result = ctx.driver.fns.cuMemFree(self.ptr);
             if (result == driver_mod.CUDA_SUCCESS) {
-                ctx.device_allocations.release(self.allocation_bytes);
+                ctx.device_allocations.freed(self.allocation_bytes);
             } else {
                 // Keep the failed free charged; it cannot authorize a later
                 // allocation. Context teardown remains the final cleanup.

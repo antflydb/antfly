@@ -87,9 +87,12 @@ Issue [#1166](https://github.com/antflydb/antfly/issues/1166) also requests a
 complete migration of execution policy. Shared kernel ownership and the common
 preparation API do not by themselves complete these remaining requirements:
 
-- Imported ONNX retains its own four-entry specialization LRU alongside the
-  architecture runtime cache. Shared preparation and initializer leases are in
-  place; specialization policy and eviction ownership are not fully unified.
+- Imported ONNX and architecture graphs share the bounded specialization owner
+  in `execution/specialization_cache.zig`, with stable executable handles,
+  allocation-before-eviction admission and explicit retirement. Their limits
+  remain workload-specific. Traced resources are scoped to the exact backend
+  context; switching contexts retires device bindings while preserving semantic
+  graphs and analysis. ONNX initializers retain their shared immutable context.
 - Assigned outputs/workspace cover admitted native/CUDA descriptors, while Metal
   consumes its existing physical allocation plan. Compatibility allocation paths
   remain, and CUDA decode capture still uses its learned allocation arena.
@@ -97,16 +100,26 @@ preparation API do not by themselves complete these remaining requirements:
 - `model_definition.zig`, `compute_context.zig`, prepared executables and model
   candidates separate important responsibilities. The session factory, model
   manager and generation pipeline still contain model-specific loading and
-  physical execution decisions. Optional model-specific hooks also remain in
-  the generic compute vtable; their migration to extension interfaces is open.
+  physical execution decisions. Optional specialized hooks now use typed
+  operation regions (decoder, replay, relative/window attention, encoder,
+  projection, vision/audio, speculative verification and token selection).
+  Historical public method names are compatibility adapters; new implementations
+  extend operation descriptors/regions, preserving each admitted native schedule.
 - Resident stage contracts, exact typed transfers and strict readback auditing
   are implemented. Migrating every task to resident stage chaining and moving
   all KV/recurrent execution choices behind runtime owners remains incremental.
-- Existing format and backend tests do not constitute one equivalent-model
-  ONNX/safetensors/GGUF comparison with explicit quantization accounting.
-  Execution/provider diagnostics also remain separate; one uniform report of
-  every backend's launches, synchronization, peak memory and cache decisions is
-  not complete.
+- `execution/testing/model_formats.zig` compares deterministic one-layer BERT
+  and sliding-window decoder graphs loaded through real ONNX, safetensors and
+  GGUF parsers. Deliberately lossy Q8_0 weights use an independently rounded CPU
+  reference, with a `2e-4` execution tolerance. Decoder K/V stays resident across
+  four transitions; held earlier outputs detect frame overwrites. Immutable
+  matrix packing is warmed before strict readback checks. This matrix validates
+  format equivalence; it does not benchmark packed quantized serving kernels.
+- Execution diagnostics include per-invocation context counter deltas and
+  specialization decisions, alongside dispatch/transfer/reuse statistics and
+  explicitly scoped memory gauges. Unmeasured values are null, and lifetime
+  high-water memory is not presented as an invocation peak. Complete Metal
+  launch/synchronization and persistent/transient peak accounting remains open.
 
 The issue checklist records implementation and evidence separately from remaining
 migration. Compatibility paths stay until their replacements satisfy correctness,

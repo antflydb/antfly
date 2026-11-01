@@ -16468,7 +16468,7 @@ test "scheduled prefill frame resets decoder runtime after hit miss and error" {
 
     var probe = Probe{};
     var vtable: ops.ComputeBackend.VTable = undefined;
-    vtable.decoderRuntimeResetState = Probe.reset;
+    vtable.regions.decoder.resetState = Probe.reset;
     const cb = ComputeBackend{ .ptr = @ptrCast(&probe), .vtable = &vtable };
 
     var hit = Attempt{ .outcome = .hit };
@@ -16964,7 +16964,7 @@ test "prepared tail MTP capture applies the final RMS norm contract" {
     const post_norm: ops.CT = @ptrCast(&post_norm_storage);
     var probe = Probe{ .output = post_norm };
     var vtable: ops.ComputeBackend.VTable = undefined;
-    vtable.decoderRuntimeApplyRmsNorm = Probe.applyRmsNorm;
+    vtable.regions.decoder.applyRmsNorm = Probe.applyRmsNorm;
     const cb = ComputeBackend{ .ptr = @ptrCast(&probe), .vtable = &vtable };
 
     try std.testing.expect((try NativeGenerationPipeline.capturePreparedTailPostNormHidden(
@@ -18368,7 +18368,7 @@ test "graph forward executes the decoder once on cache miss and hit" {
         const actual = try pipeline.graphForward(&cache, &.{ 0, 1 }, 1, 2, &context);
         defer a.free(actual);
         try std.testing.expectEqual(iteration + 1, Probe.calls);
-        const current = cache.entries.items[0].single_device_executable.?;
+        const current = cache.specializations.entries.items[0].single_device_executable.?;
         if (prepared) |previous| {
             try std.testing.expectEqual(previous, current);
             const stats = current.diagnostics.snapshot().?.execution;

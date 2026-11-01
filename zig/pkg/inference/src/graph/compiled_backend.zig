@@ -113,6 +113,7 @@ pub const Definition = struct {
 
     pub fn candidate(self: Definition, allocator: std.mem.Allocator, cache: *cache_mod.GraphCache, context: AttachContext, mode: CompileMode) !?@import("../execution/model_candidate.zig").Candidate {
         const resolve = self.resolve_model_runtime orelse return null;
+        cache.selectBackend(context.cb);
         const runtime = (try resolve(allocator, cache, context, mode)) orelse return null;
         return .{ .runtime = runtime };
     }
@@ -426,7 +427,6 @@ fn testCacheEntry(key_seed: u64) cache_mod.CacheEntry {
             .attention_mode = .paged_prefill,
         },
         .graph = undefined,
-        .last_used = 0,
     };
 }
 

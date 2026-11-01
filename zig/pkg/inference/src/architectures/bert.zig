@@ -862,8 +862,8 @@ const MetalEncoderPreparedProbe = struct {
 
     const vtable = blk: {
         var vt = native_compute_mod.vtable_impl;
-        vt.decoderRuntimeLinearSlotPrepared = linearPrepared;
-        vt.decoderRuntimeLayerNormSlotPrepared = layerNormPrepared;
+        vt.regions.decoder.linearSlotPrepared = linearPrepared;
+        vt.regions.decoder.layerNormSlotPrepared = layerNormPrepared;
         break :blk vt;
     };
 };
@@ -895,7 +895,7 @@ const EmbeddingLayerNormResidentProbe = struct {
         var vt = native_compute_mod.vtable_impl;
         vt.getWeight = getWeight;
         vt.acquireWeight = getWeight;
-        vt.decoderRuntimeApplyLayerNorm = applyLayerNorm;
+        vt.regions.decoder.applyLayerNorm = applyLayerNorm;
         break :blk vt;
     };
 };

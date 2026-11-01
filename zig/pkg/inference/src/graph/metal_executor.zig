@@ -3033,7 +3033,7 @@ test "sampled pipeline cancels invalid draws before submitting the next frame" {
     var probe = Probe{};
     // The control path touches only this callback, never a tensor operation.
     var vtable: ops.ComputeBackend.VTable = undefined;
-    vtable.decoderRuntimeDecode = Probe.decode;
+    vtable.regions.decoder.decode = Probe.decode;
     const cb = ops.ComputeBackend{ .ptr = &probe, .vtable = &vtable };
     const vocab_size: usize = 262144;
     for ([_]i64{ -1, vocab_size, std.math.maxInt(u32) }) |invalid| {

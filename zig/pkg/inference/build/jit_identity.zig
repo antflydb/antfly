@@ -81,6 +81,8 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     };
     const tile_inputs = @import("../src/tile/source_inputs.zig").paths;
     const contracts = [_][]const u8{
+        "src/ops/ops.zig",
+        "src/execution/runtime_telemetry.zig",
         "src/ops/kernel_descriptor.zig",
         "src/graph/kernel_source_owner.zig",
         "src/ops/kernel_geometry.zig",
@@ -113,6 +115,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/cuda/bf16_fusions.zig",
         "src/ops/cuda/vision_fusions.zig",
         "src/ops/cuda/buffer.zig",
+        "src/ops/cuda/allocation_budget.zig",
         "src/ops/cuda/buffer_cache.zig",
         "src/ops/cuda/cublaslt.zig",
         "src/ops/cuda/cudnn_sdpa.zig",

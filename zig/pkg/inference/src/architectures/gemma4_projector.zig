@@ -3740,7 +3740,7 @@ fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
     const clipped = if (specs[0].clipsInput()) try clampScalarCt(cb, a, input, rows, width, specs[0].input_min, specs[0].input_max) else input;
     defer if (clipped != input) cb.free(clipped);
     const packed_rows = (try cb.linearPackedNamed(clipped, &.{ names[0], names[1], names[2] }, &.{ width, width, width }, rows, width)) orelse return null;
-    if (cb.vtable.gemma4AudioPackedAttention != null and !audioHostOps().attention and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV")) return .{ .interleaved = .{ .tensor = packed_rows, .specs = specs } };
+    if (cb.vtable.regions.audio_attention.packedLocalRelative != null and !audioHostOps().attention and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV")) return .{ .interleaved = .{ .tensor = packed_rows, .specs = specs } };
     defer cb.free(packed_rows);
     return .{ .separate = try splitAudioQkv(cb, a, packed_rows, rows, width, specs) };
 }
@@ -3800,7 +3800,7 @@ fn audioSelfAttention(
                     }
                 }
                 const validity = if (params.segmented) inputs.segment_valid.? else inputs.valid_ct;
-                if (try cb.vtable.gemma4AudioPackedAttention.?(cb.ptr, interleaved.tensor, interleaved.tensor, interleaved.tensor, rel, inputs.scales[layer], validity, params)) |result| {
+                if (try cb.vtable.regions.audio_attention.packedLocalRelative.?(cb.ptr, interleaved.tensor, interleaved.tensor, interleaved.tensor, rel, inputs.scales[layer], validity, params)) |result| {
                     defer cb.free(result);
                     audioProfileMark(.attn_kernel);
                     return linearNoBiasMaybeClipped(cb, allocator, store, result, try fmt(&buf, "a.blk.{d}.attn_out", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);

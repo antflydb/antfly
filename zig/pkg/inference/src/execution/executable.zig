@@ -31,12 +31,13 @@ pub const Executable = struct {
     runtime: runtime_module.Runtime,
 
     pub fn run(self: *Executable, allocator: std.mem.Allocator, options: interpreter.ExecuteOptions) !runtime_module.Result {
+        const before = self.diagnostics.begin(self.runtime.default_backend);
         var prepared_options = options;
         prepared_options.cached_analysis = self.analysis;
         if (self.runtime.default_backend.kind() == .metal) prepared_options.planned_device_execution = true;
         if (self.diagnostics.isEnabled()) prepared_options.collect_partition_stats = true;
         const result = try self.runtime.execute(allocator, self.graph, prepared_options);
-        self.diagnostics.record(result.stats, self.runtime.default_backend);
+        self.diagnostics.record(result.stats, self.runtime.default_backend, before);
         return result;
     }
 
@@ -754,4 +755,29 @@ fn testPreparedRopePositions(comptime kind: @import("../backends/backends.zig").
         const frozen = executable.runtime.physical_pool.?.kernels[program.id_map[rotated]].?.descriptor.operation.rope;
         try std.testing.expectEqual(@as(usize, 3), frozen.position_offset);
     }
+}
+
+test "equivalent BERT ONNX safetensors GGUF and Q8 snapshots share CPU preparation" {
+    try @import("testing/model_formats.zig").run(.native);
+}
+test "equivalent BERT ONNX safetensors GGUF and Q8 snapshots share Metal preparation" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    try @import("testing/model_formats.zig").run(.metal);
+}
+test "equivalent BERT ONNX safetensors GGUF and Q8 snapshots share CUDA preparation" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    try @import("testing/model_formats.zig").run(.cuda);
+}
+
+test "equivalent stateful decoder ONNX safetensors GGUF and Q8 snapshots share CPU preparation" {
+    try @import("testing/model_formats.zig").runDecoder(.native);
+}
+test "equivalent stateful decoder ONNX safetensors GGUF and Q8 snapshots share Metal preparation" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    try @import("testing/model_formats.zig").runDecoder(.metal);
+}
+test "equivalent stateful decoder ONNX safetensors GGUF and Q8 snapshots share CUDA preparation" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    try @import("testing/model_formats.zig").runDecoder(.cuda);
 }

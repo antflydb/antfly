@@ -44,6 +44,7 @@ pub const DeviceInfo = struct {
 
 pub const RuntimeStats = struct {
     kernel_launches: usize = 0,
+    graph_submissions: usize = 0,
     stream_syncs: usize = 0,
 };
 
@@ -301,6 +302,7 @@ pub const CudaContext = struct {
         try self.makeCurrent();
         try self.driver.check(self.driver.fns.cuGraphLaunch(exec, self.stream));
         self.noteKernelLaunch();
+        self.stats.graph_submissions += 1;
     }
 
     /// Return the driver's authoritative stream-capture state when the

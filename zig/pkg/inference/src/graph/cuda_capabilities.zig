@@ -46,6 +46,8 @@ pub fn supports(op: ml.graph.OpCode) bool {
         .transpose,
         .broadcast_in_dim,
         .dot_general,
+        .slice,
+        .concat_prim,
         .fused_layer_norm,
         .fused_rms_norm,
         .fused_softmax,
@@ -80,7 +82,7 @@ fn dense(query: partition.CapabilityQuery, node_id: ml.graph.NodeId) bool {
         // is likewise normalized by transfer; explicit strided inputs retain
         // the stride check below. Walk reshape chains without recursive stack.
         switch (query.graph.node(id).op) {
-            .transpose, .broadcast_in_dim => return true,
+            .transpose, .broadcast_in_dim, .slice, .concat_prim => return true,
             .reshape => {
                 id = query.graph.node(id).inputs[0];
                 continue;
@@ -131,6 +133,24 @@ pub fn decide(query: partition.CapabilityQuery) partition.CapabilityDecision {
         },
         .transpose, .broadcast_in_dim => {
             if (@import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) == null) return reject(.unsupported_op);
+        },
+        .concat_prim => |attrs| {
+            if (node.num_inputs != 2) return reject(.unsupported_op);
+            const lhs = query.graph.node(node.inputs[0]).output_shape;
+            const rhs = query.graph.node(node.inputs[1]).output_shape;
+            var dims: [ml.graph.shape.max_rank]i64 = undefined;
+            _ = primitive_plans.ConcatAxis.init(lhs.dims[0..lhs.rank()], rhs.dims[0..rhs.rank()], attrs.axis, &dims) catch return reject(.unsupported_op);
+            if (node.output_shape.rank() != lhs.rank() or !std.mem.eql(i64, node.output_shape.dims[0..node.output_shape.rank()], dims[0..lhs.rank()])) return reject(.unsupported_op);
+        },
+        .slice => |attrs| {
+            if (node.num_inputs != 1 or attrs.runtime_starts or attrs.runtime_limits) return reject(.unsupported_op);
+            const input = query.graph.node(node.inputs[0]).output_shape;
+            if (input.rank() == 0 or attrs.num_axes != input.rank() or node.output_shape.rank() != input.rank()) return reject(.unsupported_op);
+            for (0..input.rank()) |axis| {
+                if (attrs.strides[axis] <= 0 or attrs.strides[axis] > std.math.maxInt(u32)) return reject(.unsupported_op);
+                const geometry = primitive_plans.SliceAxis.init(true, input.dims[axis], attrs.starts[axis], attrs.limits[axis], attrs.strides[axis], false) catch return reject(.unsupported_op);
+                if (geometry.size != node.output_shape.dims[axis]) return reject(.unsupported_op);
+            }
         },
         .dot_general => |attrs| {
             if (node.num_inputs != 2 or attrs.num_contracting != 1) return reject(.unsupported_op);
@@ -210,4 +230,38 @@ test "CUDA graph legality validates complete arithmetic and layout signatures" {
     try std.testing.expect(decide(query).can_execute);
     graph.nodeMut(sum).output_shape = ml.graph.Shape.init(.f32, &.{ 4, 2 });
     try std.testing.expect(!decide(query).can_execute);
+}
+
+test "CUDA graph legality admits materialized static slices and concat with exact dimensions" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 4, 2 }));
+    const y = try b.parameter("y", ml.graph.Shape.init(.f32, &.{ 4, 1 }));
+    const joined = try b.concat(x, y, 1);
+    const sliced = try b.sliceLastDim(joined, 1, 3);
+    var concat_query = partition.CapabilityQuery{ .graph = &graph, .node_id = joined, .op = graph.node(joined).op };
+    try std.testing.expect(decide(concat_query).can_execute);
+    var query = partition.CapabilityQuery{ .graph = &graph, .node_id = sliced, .op = graph.node(sliced).op };
+    try std.testing.expect(decide(query).can_execute);
+    // Logical strided-view inference does not describe CUDA's materialized
+    // output. Its downstream consumers see the dense buffer the kernel wrote.
+    var descriptors: [4]?contracts.TensorDesc = @splat(null);
+    descriptors[sliced] = contracts.TensorDesc.view(graph.node(sliced).output_shape, joined, contracts.TensorStrides.init(&.{ 3, 1 }), .cuda, 0);
+    query.tensor_descs = &descriptors;
+    try std.testing.expect(decide(query).can_execute);
+    query.op.slice.strides[1] = 0;
+    try std.testing.expect(!decide(query).can_execute);
+    query.op = graph.node(sliced).op;
+    query.op.slice.runtime_starts = true;
+    try std.testing.expect(!decide(query).can_execute);
+    query.op = graph.node(sliced).op;
+    graph.nodeMut(sliced).output_shape.dims[1] = 1;
+    try std.testing.expect(!decide(query).can_execute);
+    graph.nodeMut(sliced).output_shape.dims[1] = 2;
+    concat_query.op.concat_prim.axis = 2;
+    try std.testing.expect(!decide(concat_query).can_execute);
+    graph.nodeMut(y).output_shape.dims[0] = 3;
+    try std.testing.expect(!decide(.{ .graph = &graph, .node_id = joined, .op = graph.node(joined).op }).can_execute);
 }

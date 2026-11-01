@@ -14047,12 +14047,12 @@ fn tryExecuteMetalCommand(
         .conv_general => |attrs| try executeRuntimeConvGeneral(graph, cb, values, inputs, attrs),
         .fused_conv1d => |attrs| try executeRuntimeConv1d(graph, cb, values, inputs, attrs),
         .fused_conv2d => |attrs| try executeRuntimeConv2d(graph, cb, values, inputs, attrs),
-        .fused_linear => |attrs| try executeRuntimeLinear(cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, true, op_plan),
+        .fused_linear => |attrs| try executeRuntimeLinear(graph, cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, true, op_plan),
         .fused_linear_no_bias => |attrs| blk: {
             if (attrs.num_projections != 0) {
                 break :blk try executeRuntimeLinearNoBiasGrouped(cb, values, inputs, attrs);
             }
-            break :blk try executeRuntimeLinear(cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, false, op_plan);
+            break :blk try executeRuntimeLinear(graph, cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, false, op_plan);
         },
         .fused_linear_no_bias_pair => |attrs| try executeRuntimeLinearNoBiasPair(cb, values, inputs, attrs, exec_state),
         .fused_to_float32 => blk: {
@@ -14645,7 +14645,22 @@ fn executeRuntimeSlice(
     };
 }
 
+fn parameterBackedMatrix(graph: *const Graph, node_id: NodeId) bool {
+    var id = node_id;
+    var remaining = graph.nodeCount();
+    while (remaining != 0) : (remaining -= 1) {
+        const node = graph.node(id);
+        switch (node.op) {
+            .parameter, .constant => return true,
+            .reshape, .transpose => id = node.inputs[0],
+            else => return false,
+        }
+    }
+    return false;
+}
+
 fn executeRuntimeLinear(
+    graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
     inputs: []const NodeId,
@@ -14657,6 +14672,26 @@ fn executeRuntimeLinear(
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     const weight = valueFor(values, inputs[1]) orelse return null;
+    // A fused linear is algebraically a matrix product; its RHS need not be
+    // an immutable checkpoint. Computed operands (notably K/V) must remain live
+    // device operands, never private packed weights keyed by buffer identity.
+    if (!parameterBackedMatrix(graph, inputs[1]) and !weightRequiresPlannedLinear(cb, weight)) {
+        const lhs_shape = [_]i64{ @intCast(rows), @intCast(in_dim) };
+        const rhs_shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
+        const output = try cb.primDotGeneral(input, weight, &lhs_shape, &rhs_shape, &.{1}, &.{1}, &.{}, &.{});
+        if (!has_bias) {
+            errdefer cb.free(output);
+            return try promoteMetalOutputIfNeeded(cb, output);
+        }
+        defer cb.free(output);
+        const bias = valueFor(values, inputs[2]) orelse return null;
+        const shape = [_]i64{ @intCast(rows), @intCast(out_dim) };
+        const expanded = try cb.primBroadcastInDim(bias, &shape, &.{1}, &.{@intCast(out_dim)});
+        defer cb.free(expanded);
+        const biased = try cb.add(output, expanded);
+        errdefer cb.free(biased);
+        return try promoteMetalOutputIfNeeded(cb, biased);
+    }
     try validatePlannedLinearOp(cb, weight, rows, in_dim, out_dim, op_plan);
     if (has_bias) {
         const bias = valueFor(values, inputs[2]) orelse return null;
@@ -14756,7 +14791,7 @@ fn executeRuntimeDotGeneral(
         const in_dim = positiveI64ToUsize(lhs_shape[1]) orelse return null;
         const out_dim = positiveI64ToUsize(rhs_shape[0]) orelse return null;
         if (rhs_shape[1] == lhs_shape[1]) {
-            return executeRuntimeLinear(cb, values, inputs, rows, in_dim, out_dim, false, op_plan);
+            return executeRuntimeLinear(graph, cb, values, inputs, rows, in_dim, out_dim, false, op_plan);
         }
     }
     const output = cb.primDotGeneral(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch) catch |err| switch (err) {

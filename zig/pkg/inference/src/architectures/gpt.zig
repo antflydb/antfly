@@ -13807,13 +13807,13 @@ const DenseQwen3PrefillProbe = struct {
         table.embeddingLookup = embedding;
         table.takeRows = takeRows;
         table.linearNoBias = linear;
-        table.decoderRuntimePrepareOrReuseTextPrefill = prepare;
-        table.decoderRuntimePlanPrefillFrame = plan;
-        table.decoderRuntimeEnsureLinearSlot = prepareHead;
-        table.decoderRuntimeBeginFrame = begin;
-        table.decoderRuntimeExecuteGraphCommandPlanFrame = execute;
-        table.decoderRuntimeSubmitAndWaitFrame = submit;
-        table.decoderRuntimeCancelFrame = cancel;
+        table.regions.decoder.prepareOrReuseTextPrefill = prepare;
+        table.regions.decoder.planPrefillFrame = plan;
+        table.regions.decoder.ensureLinearSlot = prepareHead;
+        table.regions.decoder.beginFrame = begin;
+        table.regions.decoder.executeGraphCommandPlanFrame = execute;
+        table.regions.decoder.submitAndWaitFrame = submit;
+        table.regions.decoder.cancelFrame = cancel;
         return table;
     }
     const config: Config = .{
@@ -13851,7 +13851,7 @@ test "Qwen3 prepared prefill retains tensors through compact batched tail comple
 test "Qwen3 prepared prefill compact head supports a backend without optional slot preparation" {
     var probe = DenseQwen3PrefillProbe{};
     var table = DenseQwen3PrefillProbe.vtable();
-    table.decoderRuntimeEnsureLinearSlot = null;
+    table.regions.decoder.ensureLinearSlot = null;
     const cb = ComputeBackend{ .ptr = &probe, .vtable = &table };
     const result = (try tryDenseQwen3Prefill(&cb, std.testing.allocator, DenseQwen3PrefillProbe.config, &DenseQwen3PrefillProbe.ids, &DenseQwen3PrefillProbe.mask, 2, 3, .{
         .output_rows = &.{ 1, 3 },

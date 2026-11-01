@@ -7448,10 +7448,10 @@ test "Gemma4 MTP input frame transfers and cancels only owned frames" {
         }
     };
     var table = @import("../ops/native_compute.zig").vtable_impl;
-    table.decoderRuntimeBeginFrame = Probe.begin;
-    table.decoderRuntimeHasActiveFrame = Probe.hasActive;
-    table.decoderRuntimeSetActiveFrameRegime = Probe.regime;
-    table.decoderRuntimeCancelFrame = Probe.cancel;
+    table.regions.decoder.beginFrame = Probe.begin;
+    table.regions.decoder.hasActiveFrame = Probe.hasActive;
+    table.regions.decoder.setActiveFrameRegime = Probe.regime;
+    table.regions.decoder.cancelFrame = Probe.cancel;
     var probe = Probe{};
     const cb: ops.ComputeBackend = .{ .ptr = &probe, .vtable = &table };
     var frame = try MtpVerifyInputFrame.begin(&cb);

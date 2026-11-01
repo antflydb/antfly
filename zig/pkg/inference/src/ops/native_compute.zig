@@ -4595,17 +4595,29 @@ pub const vtable_impl = ComputeBackend.VTable{
     .whereSelectConsumeTrue = &whereSelectConsumeTrueOp,
     .whereSelectConsumeFalse = &whereSelectConsumeFalseOp,
     .scaledDotProductAttention = &sdpaOp,
-    .scaledDotProductAttentionEmbeddingGemma2Vision = &embeddingGemma2VisionAttentionOp,
+    .regions = .{
+        .window_attention = .{
+            .trainingForward = &modernBertTrainingAttentionV1Op,
+            .trainingBackward = &modernBertTrainingAttentionBackwardV1Op,
+        },
+
+        .vision = .{
+            .unmaskedRetrieval = &embeddingGemma2VisionAttentionOp,
+        },
+        .relative_encoder = .{
+            .trainingAttention = &debertaTrainingAttentionV1Op,
+            .trainingAttentionBackward = &debertaTrainingAttentionBackwardV1Op,
+        },
+        .audio_attention = .{
+            .localRelative = &gemma4AudioLocalAttentionOp,
+        },
+    },
     .causalSelfAttention = &causalSelfAttentionOp,
     .crossAttention = &crossAttentionOp,
     .relativePositionBias = &relativePositionBiasOp,
     .disentangledRelativeAttention = &disentangledRelativeAttentionOp,
     .disentangledRelativeAttentionWithControl = &disentangledRelativeAttentionWithControlOp,
     .disentangledRelativeAttentionBackward = &disentangledRelativeAttentionBackwardOp,
-    .debertaTrainingAttentionV1 = &debertaTrainingAttentionV1Op,
-    .debertaTrainingAttentionBackwardV1 = &debertaTrainingAttentionBackwardV1Op,
-    .modernBertTrainingAttentionV1 = &modernBertTrainingAttentionV1Op,
-    .modernBertTrainingAttentionBackwardV1 = &modernBertTrainingAttentionBackwardV1Op,
     .segmentTrainingAttentionV1 = &segmentTrainingAttentionV1Op,
     .segmentTrainingAttentionBackwardV1 = &segmentTrainingAttentionBackwardV1Op,
     .windowedSelfAttention = &windowedSelfAttentionOp,
@@ -4614,7 +4626,6 @@ pub const vtable_impl = ComputeBackend.VTable{
     .multiply = &multiplyOp,
     .conv1d = &conv1dOp,
     .conv2d = &conv2dOp,
-    .gemma4AudioLocalAttention = &gemma4AudioLocalAttentionOp,
     .convTranspose = &convTransposeOp,
     .averagePool = &averagePoolOp,
 
