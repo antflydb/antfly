@@ -156,6 +156,13 @@ pub const Spool = struct {
         fn deinit(self: *RawCursor) void {
             self.a.free(self.buffer);
         }
+        fn reposition(self: *RawCursor, source: RecordSource) void {
+            self.source = source;
+            self.range_index = 0;
+            self.range_position = 0;
+            self.block = &.{};
+            self.at = 0;
+        }
         fn nextBlock(self: *RawCursor) !?[]const u8 {
             while (true) {
                 const range = if (self.source.ranges.len != 0) blk: {
@@ -222,6 +229,10 @@ pub const Spool = struct {
         disjoint: bool,
         grouped: ?*Run = null,
         view: ?View = null,
+        group_reader: ?RawCursor = null,
+        group_position: usize = 0,
+        group_reader_valid: bool = true,
+        group_active: bool = false,
         fn init(spool: *Spool, allocator: A) !Prepared {
             const a = @import("../sql/memory_budget.zig").reclaimingAllocator(allocator);
             const groups = try a.alloc(Group, spool.terms.items.len);
@@ -275,6 +286,11 @@ pub const Spool = struct {
             return self;
         }
         pub fn deinit(self: *Prepared) void {
+            std.debug.assert(!self.group_active);
+            if (self.group_reader) |*reader| {
+                self.spool.group_buffer_allocations += reader.buffer_allocations;
+                reader.deinit();
+            }
             if (self.grouped) |run| {
                 self.spool.grouping_read_calls += readCalls(run);
                 run.deinit();
@@ -283,29 +299,69 @@ pub const Spool = struct {
             self.a.free(self.ranks);
             self.a.free(self.groups);
         }
+        /// Disk groups borrow one owner-scoped cursor. Only one group lease
+        /// can be active; returned tokens borrow interned terms, never buffer
+        /// bytes. Closing a partial group permits a later explicit seek.
         pub const GroupCursor = struct {
             spool: *Spool,
             remaining: u32,
             at: u32,
             links: []const u32,
-            raw: ?RawCursor = null,
+            owner: ?*Prepared = null,
+            raw: ?*RawCursor = null,
             pub fn deinit(self: *GroupCursor) void {
-                if (self.raw) |*raw| {
-                    self.spool.group_buffer_allocations += raw.buffer_allocations;
-                    raw.deinit();
+                if (self.owner) |owner| {
+                    std.debug.assert(owner.group_active);
+                    owner.group_active = false;
                 }
+                self.owner = null;
+                self.raw = null;
+                self.remaining = 0;
             }
             pub fn next(self: *GroupCursor) !?analysis.Token {
                 if (self.remaining == 0) return null;
-                self.remaining -= 1;
-                if (self.raw) |*raw| return try self.spool.decodeRecord((try raw.next()) orelse return error.InvalidData);
+                if (self.owner) |owner| {
+                    if (!owner.group_reader_valid) return error.InvalidData;
+                    const record = (self.raw.?.next() catch |err| {
+                        owner.group_reader_valid = false;
+                        return err;
+                    }) orelse {
+                        owner.group_reader_valid = false;
+                        return error.InvalidData;
+                    };
+                    const token = self.spool.decodeRecord(record) catch |err| {
+                        owner.group_reader_valid = false;
+                        return err;
+                    };
+                    self.remaining -= 1;
+                    owner.group_position += 1;
+                    return token;
+                }
                 const token = try self.spool.read(self.at);
                 self.at = self.links[self.at];
+                self.remaining -= 1;
                 return token;
             }
         };
-        pub fn groupCursor(self: *Prepared, a: A, group: Group) !GroupCursor {
-            return .{ .spool = self.spool, .remaining = group.count, .at = group.first, .links = self.links, .raw = if (self.view) |view| RawCursor.init(a, .{ .view = view, .count = group.count, .begin = @as(usize, group.first) * 16 }) else null };
+        pub fn groupCursor(self: *Prepared, _: A, group: Group) !GroupCursor {
+            if (self.view) |view| {
+                if (self.group_active) return error.InvalidArgument;
+                if (group.first > self.count or group.count == 0 or group.count > self.count - group.first) return error.InvalidData;
+                const source: RecordSource = .{ .view = view, .count = self.count - group.first, .begin = @as(usize, group.first) * 16 };
+                if (self.group_reader == null) {
+                    // The owner, rather than an individual borrower's scratch
+                    // region, owns the buffer through final preparation close.
+                    self.group_reader = RawCursor.init(self.a, source);
+                    self.group_position = group.first;
+                } else if (!self.group_reader_valid or self.group_position != group.first) {
+                    self.group_reader.?.reposition(source);
+                    self.group_position = group.first;
+                    self.group_reader_valid = true;
+                }
+                self.group_active = true;
+                return .{ .spool = self.spool, .remaining = group.count, .at = group.first, .links = self.links, .owner = self, .raw = &self.group_reader.? };
+            }
+            return .{ .spool = self.spool, .remaining = group.count, .at = group.first, .links = self.links };
         }
         pub fn prepareSource(_: *Prepared) void {}
         pub const SourceCursor = struct {
@@ -524,6 +580,95 @@ test "highlight normalized disk grouping bounds workspace and physical reads for
     // occurrence. Include the still-open final sorted run in this assertion.
     const reads = Spool.readCalls(spool.run.?) + spool.grouping_read_calls + Spool.readCalls(prepared.grouped.?);
     try std.testing.expect(reads < total / 8);
+    try std.testing.expectEqual(@as(usize, 1), prepared.group_reader.?.buffer_allocations);
     try std.testing.expect(budget.peak < budget.limit);
     std.debug.print("PARTITIONED_REPLAY records={d} reads={d} peak={d} quota={d}\n", .{ total, reads, budget.peak, budget.limit });
+}
+
+test "highlight normalized group reader reuses one bounded buffer across partial leases and backward seeks under faults" {
+    const Check = struct {
+        fn run(a: A) !void {
+            var spool = Spool.init(a, std.testing.io, ".", null);
+            defer spool.deinit();
+            spool.max_memory_bytes = 16;
+            spool.group_memory_records = 4;
+            for (0..132) |i| {
+                var word: [32]u8 = undefined;
+                const text = try std.fmt.bufPrint(&word, "word{d}", .{i % 65});
+                try spool.append(.{ .term = text, .start_byte = @intCast(i * 8), .end_byte = @intCast(i * 8 + 4), .position = @intCast(i) });
+            }
+            var prepared = try (try spool.input()).prepareOffsets(a);
+            var open = true;
+            defer if (open) prepared.deinit();
+            {
+                var first = try prepared.groupCursor(a, prepared.groups[0]);
+                defer first.deinit();
+                try std.testing.expect((try first.next()) != null);
+                try std.testing.expectError(error.InvalidArgument, prepared.groupCursor(a, prepared.groups[1]));
+                // Leave a partial group. Its unread records are not a hidden
+                // requirement on the next borrower or final owner teardown.
+            }
+            const original_buffer = prepared.group_reader.?.buffer.ptr;
+            for (0..prepared.groups.len) |n| {
+                const group = prepared.groups[(n * 17) % prepared.groups.len];
+                var cursor = try prepared.groupCursor(a, group);
+                defer cursor.deinit();
+                var count: usize = 0;
+                while (try cursor.next()) |token| : (count += 1) {
+                    try std.testing.expectEqualStrings(group.term, token.term);
+                    try std.testing.expectEqual(@as(u32, @intCast(token.position * 8)), token.start_byte);
+                }
+                try std.testing.expectEqual(@as(usize, group.count), count);
+                try std.testing.expectEqual(original_buffer, prepared.group_reader.?.buffer.ptr);
+            }
+            try std.testing.expectEqual(@as(usize, 1), prepared.group_reader.?.buffer_allocations);
+            prepared.deinit();
+            open = false;
+            try std.testing.expectEqual(@as(usize, 1), spool.group_buffer_allocations);
+        }
+    };
+    try Check.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Check.run, .{});
+}
+
+test "highlight normalized group reader resets a failed read before a new lease without dropping records" {
+    const a = std.testing.allocator;
+    var spool = Spool.init(a, std.testing.io, ".", null);
+    defer spool.deinit();
+    spool.max_memory_bytes = 16;
+    for (0..5001) |i| try spool.append(.{ .term = if (i == 5000) "z" else "alpha", .start_byte = @intCast(i * 8), .end_byte = @intCast(i * 8 + 4), .position = @intCast(i) });
+    var prepared = try (try spool.input()).prepareOffsets(a);
+    defer prepared.deinit();
+    const Probe = struct {
+        view: View,
+        reads: usize = 0,
+        fn close(_: *anyopaque) void {}
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            if (self.reads == 2) return error.InjectedReadFailure;
+            try self.view.readInto(offset, output);
+        }
+    };
+    var probe: Probe = .{ .view = prepared.view.? };
+    prepared.view = try View.init(.{ .ranges = .{ .ptr = &probe, .length = probe.view.length, .read_into = Probe.read, .close = Probe.close } }, 0, probe.view.length);
+    {
+        var cursor = try prepared.groupCursor(a, prepared.groups[0]);
+        defer cursor.deinit();
+        for (0..4096) |i| try std.testing.expectEqual(@as(u32, @intCast(i)), (try cursor.next()).?.position);
+        try std.testing.expectError(error.InjectedReadFailure, cursor.next());
+        try std.testing.expectError(error.InvalidData, cursor.next());
+    }
+    const buffer = prepared.group_reader.?.buffer.ptr;
+    var count: usize = 0;
+    for (prepared.groups) |group| {
+        var cursor = try prepared.groupCursor(a, group);
+        defer cursor.deinit();
+        while (try cursor.next()) |token| : (count += 1) try std.testing.expectEqual(@as(u32, @intCast(count)), token.position);
+    }
+    try std.testing.expectEqual(@as(usize, 5001), count);
+    try std.testing.expectEqual(buffer, prepared.group_reader.?.buffer.ptr);
+    try std.testing.expectEqual(@as(usize, 1), prepared.group_reader.?.buffer_allocations);
+    try std.testing.expectEqual(@as(usize, 4), probe.reads);
 }
