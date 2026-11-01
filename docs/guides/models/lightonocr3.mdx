@@ -63,10 +63,11 @@ still rejected. Use this endpoint for repeated page extraction so the reader
 can reuse its prepared execution state.
 
 For example, a dense page can request `"max_tokens": 8192`. The deployment
-must also supply enough `resources.inference.admission.max_work_units` and
-memory. A single image at 4096 output tokens needs at least 20 work units; at
-8192 it needs at least 36. Additional media or prompt work can increase this
-requirement. Concurrency, memory, image, and input-token limits remain enforced.
+must also allow the output ceiling and provide enough memory for the request.
+The larger budget increases its estimated work; work-unit accounting saturates
+at `resources.inference.admission.max_work_units`, so a large request can occupy
+the full configured capacity without bypassing competing requests. Concurrency,
+memory, image, and input-token limits remain enforced.
 
 The Go `docsaf/reading/antfly` adapter omits `max_tokens` by default, including
 when falling back between models. Set `AntflyConfig.DefaultMaxTokens` for an

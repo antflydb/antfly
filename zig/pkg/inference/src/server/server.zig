@@ -33197,20 +33197,23 @@ test "/read recognizes a Qwen3-VL generator bundle before reader model loading" 
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     try std.testing.expectError(error.Timeout, node.readEncodedImagesReportedDirectWithContext(allocator, "owner/qwen", encoded, 0, .{}));
 
-    // A model's omitted 4096-token page budget must be admitted consistently
-    // through HTTP, URL, and resident encoded routes, before model execution.
+    // A model's omitted page budget must expand consistently through HTTP,
+    // URL and encoded routes. A request may occupy the entire work capacity,
+    // but expansion must not overbook a competing request's existing units.
     var constrained = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 8, .max_work_units = 16 });
     defer constrained.deinit();
+    try constrained.acquireAdmissionUnits(1);
+    defer constrained.releaseAdmissionUnits(1);
     var constrained_ctx = httpx.Context.init(allocator, std.testing.io, &request);
     defer constrained_ctx.deinit();
     var constrained_response = try constrained.readImages(&constrained_ctx);
     defer constrained_response.deinit();
     try std.testing.expectEqual(@as(u16, 503), constrained_response.status.code);
-    try std.testing.expectEqual(@as(usize, 0), constrained.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 1), constrained.inference_admission.inFlightUnits());
     try std.testing.expectError(error.QueueFull, constrained.readImagesDirect(allocator, "owner/qwen", .{ .images = &.{"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"} }));
-    try std.testing.expectEqual(@as(usize, 0), constrained.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 1), constrained.inference_admission.inFlightUnits());
     try std.testing.expectError(error.QueueFull, constrained.readEncodedImagesReportedDirect(allocator, "owner/qwen", encoded));
-    try std.testing.expectEqual(@as(usize, 0), constrained.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 1), constrained.inference_admission.inFlightUnits());
 }
 
 test "Qwen3-VL encoded read results own page identities and report serial execution" {
