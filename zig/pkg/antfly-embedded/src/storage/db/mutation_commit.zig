@@ -3075,6 +3075,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
             local_coverage_guard.release();
+            if (opts.primary_committed) |committed| committed.* = true;
             if (graph_publication) |*lease| lease.release();
             if (!transaction_applied.applied) {
                 // Recovery may have committed this participant before the

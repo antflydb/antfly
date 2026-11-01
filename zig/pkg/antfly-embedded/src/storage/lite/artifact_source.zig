@@ -27,6 +27,64 @@ const Allocator = std.mem.Allocator;
 const key_prefix = native.NativeFile.artifact_lease_key_prefix;
 const marker_prefix = ".aflite-lease-";
 
+const ArtifactIdentity = struct {
+    path: []const u8,
+    key: []const u8,
+    inode: u64,
+    root: u64,
+    length: u64,
+    inline_bytes: []const u8,
+    pub fn hash(_: @This(), key: ArtifactIdentity) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(key.path);
+        h.update(key.key);
+        h.update(std.mem.asBytes(&key.inode));
+        h.update(std.mem.asBytes(&key.root));
+        h.update(std.mem.asBytes(&key.length));
+        h.update(key.inline_bytes);
+        return h.final();
+    }
+    pub fn eql(_: @This(), a: ArtifactIdentity, b: ArtifactIdentity) bool {
+        return a.inode == b.inode and a.root == b.root and a.length == b.length and std.mem.eql(u8, a.path, b.path) and std.mem.eql(u8, a.key, b.key) and std.mem.eql(u8, a.inline_bytes, b.inline_bytes);
+    }
+};
+
+// Weak entries: only open Sources own references. An existing durable alias
+// keeps its immutable value alive, making root identity safe against page ABA.
+// Never share inode-fenced readers: that would extend a coarse reuse fence.
+var source_pool_mutex: std.atomic.Mutex = .unlocked;
+var source_pool: std.HashMapUnmanaged(ArtifactIdentity, *State, ArtifactIdentity, 80) = .empty;
+var source_pool_removals: usize = 0;
+
+fn removePooled(identity: ArtifactIdentity) void {
+    if (!source_pool.removeContext(identity, identity)) return;
+    source_pool_removals += 1;
+    // WAL/value versions churn while unchanged segments remain open. Keep
+    // absent lookups independent of the historical number of closed sources.
+    if (source_pool_removals >= @max(@as(usize, 64), source_pool.capacity() / 16)) {
+        source_pool.rehash(identity);
+        source_pool_removals = 0;
+    }
+}
+
+fn hasPooledSources() bool {
+    @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
+    defer source_pool_mutex.unlock();
+    return source_pool.count() != 0;
+}
+
+fn retainPooled(identity: ArtifactIdentity) ?*State {
+    @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
+    defer source_pool_mutex.unlock();
+    const state = source_pool.getContext(identity, identity) orelse return null;
+    @import("antfly_platform").sync.lockYielding(&state.lifetime_mutex);
+    defer state.lifetime_mutex.unlock();
+    if (state.resources_closed.load(.monotonic)) return null;
+    state.source_references += 1;
+    state.shared = true;
+    return state;
+}
+
 pub const Registry = struct {
     allocator: Allocator,
     io_impl: std.Io.Threaded,
@@ -162,7 +220,7 @@ pub const Registry = struct {
         while (it) |state| : (it = state.next) {
             if (state.generation != generation) continue;
             @import("antfly_platform").sync.lockYielding(&state.lifetime_mutex);
-            if (state.idle_expiry and state.active_uses == 0) state.closeResources();
+            if (!state.shared and state.idle_expiry and state.active_uses == 0) state.closeResources();
             state.lifetime_mutex.unlock();
         }
     }
@@ -230,24 +288,47 @@ pub const Registry = struct {
         return std.Io.Dir.cwd().createFile(runtime, path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
     }
 
+    fn findPooled(self: *Registry, owner: *docs.Store, key: []const u8) !?*State {
+        if (!owner.artifactPoolLookupAllowed()) return null;
+        // The pin lasts only for lookup. A hit already owns a durable value
+        // lease. Do not recursively acquire generation_lock around beginRead.
+        var pin = try owner.beginRead();
+        defer pin.abort();
+        const file = try pin.readFile();
+        var value = try file.openIndexValue(self.allocator, key, pin.checkpoint);
+        defer value.deinit(self.allocator);
+        const identity: ArtifactIdentity = .{ .path = self.path, .key = key, .inode = (try file.file.stat(file.runtime())).inode, .root = value.root, .length = value.length, .inline_bytes = value.inline_bytes };
+        return retainPooled(identity);
+    }
+
     pub fn open(self: *Registry, key: []const u8) !Source {
         const owner = self.beginCallback() orelse return error.ReadOnly;
         defer self.endCallback();
         // Capturing a root and opening its inode must straddle no adoption.
         const owner_io = owner.file.runtime();
-        owner.generation_lock.lockSharedUncancelable(owner_io);
-        defer owner.generation_lock.unlockShared(owner_io);
         const runtime = self.io();
         const a = self.allocator;
+        if (hasPooledSources()) {
+            // An optional lookup must not refuse a source which the normal
+            // publication path can open (including newly staged artifacts).
+            if (self.findPooled(owner, key) catch null) |existing| {
+                owner.recordArtifactSourceOpen(true);
+                return existing.source();
+            }
+        }
+        owner.generation_lock.lockSharedUncancelable(owner_io);
+        defer owner.generation_lock.unlockShared(owner_io);
         const state = try a.create(State);
         errdefer a.destroy(state);
+        const artifact_key = try a.dupe(u8, key);
+        errdefer a.free(artifact_key);
         var random: [16]u8 = undefined;
         try runtime.randomSecure(&random);
-        const identity = try std.fmt.allocPrint(a, "{x}", .{random});
-        defer a.free(identity);
-        const lease_key = try std.mem.concat(a, u8, &.{ key_prefix, identity });
+        const lease_identity = try std.fmt.allocPrint(a, "{x}", .{random});
+        defer a.free(lease_identity);
+        const lease_key = try std.mem.concat(a, u8, &.{ key_prefix, lease_identity });
         errdefer a.free(lease_key);
-        const marker_name = try std.mem.concat(a, u8, &.{ marker_prefix, identity });
+        const marker_name = try std.mem.concat(a, u8, &.{ marker_prefix, lease_identity });
         defer a.free(marker_name);
         const marker_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path) orelse ".", marker_name });
         errdefer a.free(marker_path);
@@ -262,6 +343,7 @@ pub const Registry = struct {
         // publish a lease and external writers must not reuse their pages.
         var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !reader_fenced, .reader_coordinator = owner.file.reader_coordinator, .no_sync = true });
         errdefer reader.close();
+        if (!reader_fenced) reader.reader_coordinator = null;
         reader.page_cache_enabled.store(false, .monotonic);
         var capture = Capture{ .allocator = a, .key = key, .lease_key = lease_key };
         errdefer capture.value.deinit(a);
@@ -269,6 +351,7 @@ pub const Registry = struct {
             capture.checkpoint = reader.activeCheckpoint();
             capture.value = try reader.openIndexValue(a, key, capture.checkpoint);
         } else try owner.submitArtifactLeaseMutation(&capture, Capture.apply);
+        const captured_inode = (try reader.file.stat(reader.runtime())).inode;
         state.* = .{
             .registry = self,
             .reader = reader,
@@ -278,6 +361,8 @@ pub const Registry = struct {
             .lease_key = lease_key,
             .marker_path = marker_path,
             .marker = marker,
+            .resource_manager = owner.resource_manager,
+            .artifact_key = artifact_key,
         };
         state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visitUncached, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
         self.mutex.lockUncancelable(runtime);
@@ -285,7 +370,23 @@ pub const Registry = struct {
         self.first = state;
         _ = self.references.fetchAdd(1, .monotonic);
         self.mutex.unlock(runtime);
-        return .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.read, .visit_range = State.visit, .checksum = State.checksum, .read_authenticated = State.authenticate, .close = State.close, .retained_bytes = State.retainedBytes, .resource_manager = owner.resource_manager, .acquire_use = State.acquireUse, .release_use = State.releaseUse, .enable_idle_expiry = State.enableIdleExpiry } };
+        if (marker != null and owner.artifactPoolLookupAllowed()) {
+            const identity: ArtifactIdentity = .{ .path = self.path, .key = artifact_key, .inode = captured_inode, .root = state.value.root, .length = state.value.length, .inline_bytes = state.value.inline_bytes };
+            @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
+            // A closed old source can remain referenced by a weak LSM cache.
+            // Replace its map key too, before its final close frees the bytes.
+            removePooled(identity);
+            source_pool.putContext(std.heap.page_allocator, identity, state, identity) catch {
+                // Pooling is optional; the newly opened lease remains valid.
+                source_pool_mutex.unlock();
+                owner.recordArtifactSourceOpen(false);
+                return state.source();
+            };
+            state.pool_identity = identity;
+            source_pool_mutex.unlock();
+        }
+        owner.recordArtifactSourceOpen(false);
+        return state.source();
     }
 };
 
@@ -308,16 +409,9 @@ const Capture = struct {
     }
 };
 
-const Remove = struct {
-    key: []const u8,
-    fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
-        const self: *Remove = @ptrCast(@alignCast(ptr));
-        try file.putCatalogBatch(&.{.{ .key = self.key, .is_delete = true }});
-    }
-};
-
 const State = struct {
     registry: *Registry,
+    artifact_key: []u8,
     reader: native.NativeFile,
     value: native.NativeFile.IndexValue,
     checkpoint: native.CheckpointSlot,
@@ -334,6 +428,14 @@ const State = struct {
     idle_expiry: bool = false,
     retired: bool = false,
     resources_closed: std.atomic.Value(bool) = .init(false),
+    source_references: usize = 1, // source_pool_mutex
+    shared: bool = false, // lifetime_mutex
+    pool_identity: ?ArtifactIdentity = null,
+    resource_manager: ?*@import("../resource_manager.zig").ResourceManager = null,
+
+    fn source(self: *State) Source {
+        return .{ .ranges = .{ .ptr = self, .length = self.value.length, .read_into = read, .visit_range = visit, .checksum = checksum, .read_authenticated = authenticate, .close = close, .retained_bytes = retainedBytes, .resource_manager = self.resource_manager, .acquire_use = acquireUse, .release_use = releaseUse, .enable_idle_expiry = enableIdleExpiry } };
+    }
 
     fn closeResources(self: *State) void {
         if (self.resources_closed.load(.monotonic)) return;
@@ -354,7 +456,7 @@ const State = struct {
         @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
         defer self.lifetime_mutex.unlock();
         self.retired = true;
-        if (self.idle_expiry and self.active_uses == 0) self.closeResources();
+        if (!self.shared and self.idle_expiry and self.active_uses == 0) self.closeResources();
     }
 
     fn acquireUse(ptr: *anyopaque) bool {
@@ -371,7 +473,7 @@ const State = struct {
         @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
         std.debug.assert(self.active_uses > 0);
         self.active_uses -= 1;
-        const expire = self.active_uses == 0 and self.idle_expiry and self.retired;
+        const expire = !self.shared and self.active_uses == 0 and self.idle_expiry and self.retired;
         if (expire) self.closeResources();
         self.lifetime_mutex.unlock();
         if (expire) self.registry.releaseClosedClaim(self);
@@ -381,7 +483,7 @@ const State = struct {
         const self: *State = @ptrCast(@alignCast(ptr));
         @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
         self.idle_expiry = true;
-        const expire = self.active_uses == 0 and self.retired;
+        const expire = !self.shared and self.active_uses == 0 and self.retired;
         if (expire) self.closeResources();
         self.lifetime_mutex.unlock();
         if (expire) self.registry.releaseClosedClaim(self);
@@ -434,23 +536,33 @@ const State = struct {
 
     fn close(ptr: *anyopaque) void {
         const self: *State = @ptrCast(@alignCast(ptr));
+        @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
+        self.source_references -= 1;
+        if (self.source_references != 0) {
+            source_pool_mutex.unlock();
+            return;
+        }
+        if (self.pool_identity) |identity| {
+            if (source_pool.getContext(identity, identity) == self) removePooled(identity);
+        }
+        if (source_pool.count() == 0) {
+            source_pool.deinit(std.heap.page_allocator);
+            source_pool = .empty;
+            source_pool_removals = 0;
+        }
+        source_pool_mutex.unlock();
         const registry = self.registry;
         const runtime = registry.io();
         @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
-        const remove_alias = !self.resources_closed.load(.monotonic) and self.marker != null;
-        self.lifetime_mutex.unlock();
-        // Snapshot under the lifetime lock, but never enter the publication
-        // lane while holding it (publication may retire this same state).
-        if (remove_alias) if (registry.beginCallback()) |owner| {
-            defer registry.endCallback();
-            var remove = Remove{ .key = self.lease_key };
-            // On failure the marker will disappear and bounded orphan
-            // service can retry. A failed release never frees live pages.
-            owner.submitArtifactLeaseMutation(&remove, Remove.apply) catch {};
-        };
-        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
         self.closeResources();
         self.lifetime_mutex.unlock();
+        // Closing a runtime can already hold its owner's admission gate.
+        // Never acquire a writer/proof lane here: dropping the locked marker
+        // makes the alias eligible for the existing bounded orphan collector.
+        if (registry.beginCallback()) |owner| {
+            defer registry.endCallback();
+            owner.maintenance_wake.set(owner.file.runtime());
+        }
         registry.mutex.lockUncancelable(runtime);
         var link = &registry.first;
         while (link.* != self) link = &link.*.?.next;
@@ -469,6 +581,7 @@ const State = struct {
         registry.mutex.unlock(runtime);
         self.value.deinit(registry.allocator);
         registry.allocator.free(self.lease_key);
+        registry.allocator.free(self.artifact_key);
         registry.allocator.free(self.marker_path);
         registry.allocator.destroy(self);
         registry.release();
