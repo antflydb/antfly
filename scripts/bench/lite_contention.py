@@ -726,8 +726,9 @@ def native_cases(args):
                             "_verify",
                             library,
                             str(database),
-                            json.dumps(expected),
+                            "-",
                         ],
+                        input=json.dumps(expected),
                         capture_output=True,
                         check=False,
                         text=True,
@@ -836,6 +837,10 @@ if __name__ == "__main__":
             bool(int(sys.argv[6])) if len(sys.argv) > 6 else False,
         )
     elif len(sys.argv) > 1 and sys.argv[1] == "_verify":
-        verify(sys.argv[2], Path(sys.argv[3]), json.loads(sys.argv[4]))
+        verify(
+            sys.argv[2],
+            Path(sys.argv[3]),
+            json.loads(sys.stdin.read() if sys.argv[4] == "-" else sys.argv[4]),
+        )
     else:
         main()
