@@ -51761,10 +51761,14 @@ components:
           example: What type of document is this?
         max_tokens:
           type: integer
-          description: Maximum tokens to generate
+          description: >
+            Maximum output tokens per page. When omitted, the selected reader
+
+            model supplies its default, bounded by deployment limits. Explicit
+
+            values override the model default and must fit model and server limits.
           minimum: 1
           maximum: 8192
-          default: 256
           example: 256
     InferenceTextRegion:
       type: object

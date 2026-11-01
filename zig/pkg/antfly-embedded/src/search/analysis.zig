@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Control = @import("antfly_cancellation").CancellationToken;
 const stopwords_mod = @import("stopwords.zig");
 const stemmers_mod = @import("stemmers.zig");
 pub const Language = stopwords_mod.Language;
@@ -72,6 +73,11 @@ fn tokenSlice(tok: Token, start: usize, end: usize) Token {
 // Character Filters
 // ============================================================================
 
+inline fn byteCheckpoint(control: Control, offset: usize, next: *usize) !void {
+    if (offset < next.*) return;
+    try control.check();
+    next.* = offset +| 4096;
+}
 pub const CharFilter = enum {
     html_strip,
     ascii_fold,
@@ -79,21 +85,24 @@ pub const CharFilter = enum {
 
     /// Apply character filter, returning a new allocation. Caller owns result.
     pub fn apply(self: CharFilter, alloc: Allocator, text: []const u8) ![]u8 {
+        return self.applyControlled(alloc, text, .none);
+    }
+    fn applyControlled(self: CharFilter, alloc: Allocator, text: []const u8, control: Control) ![]u8 {
         return switch (self) {
-            .html_strip => applyHtmlStrip(alloc, text),
-            .ascii_fold => applyAsciiFold(alloc, text),
-            .zero_width_non_joiner => applyZwnj(alloc, text),
+            .html_strip => applyHtmlStripControlled(alloc, text, control),
+            .ascii_fold => applyAsciiFoldControlled(alloc, text, control),
+            .zero_width_non_joiner => applyZwnjControlled(alloc, text, control),
         };
     }
 
-    fn applyMapped(self: CharFilter, alloc: Allocator, input: MappedText) !MappedText {
-        const output = try self.apply(alloc, input.text);
+    fn applyMapped(self: CharFilter, alloc: Allocator, input: MappedText, control: Control) !MappedText {
+        const output = try self.applyControlled(alloc, input.text, control);
         errdefer alloc.free(output);
         const starts = try alloc.alloc(u32, output.len);
         errdefer alloc.free(starts);
         const ends = try alloc.alloc(u32, output.len);
         errdefer alloc.free(ends);
-        var mapping = OffsetWriter{ .input = input, .starts = starts, .ends = ends };
+        var mapping = OffsetWriter{ .input = input, .starts = starts, .ends = ends, .control = control };
         switch (self) {
             .html_strip => try mapHtmlStripOffsets(alloc, &mapping, output),
             .ascii_fold => try mapAsciiFoldOffsets(&mapping, output),
@@ -109,7 +118,7 @@ const MappedText = struct {
     starts: []u32,
     ends: []u32,
 
-    fn identity(alloc: Allocator, text: []const u8) !MappedText {
+    fn identity(alloc: Allocator, text: []const u8, control: Control) !MappedText {
         const owned = try alloc.dupe(u8, text);
         errdefer alloc.free(owned);
         const starts = try alloc.alloc(u32, text.len);
@@ -117,6 +126,7 @@ const MappedText = struct {
         const ends = try alloc.alloc(u32, text.len);
         errdefer alloc.free(ends);
         for (starts, ends, 0..) |*start, *end, i| {
+            if (i % 4096 == 0) try control.check();
             start.* = @intCast(i);
             end.* = @intCast(i + 1);
         }
@@ -135,10 +145,12 @@ const OffsetWriter = struct {
     starts: []u32,
     ends: []u32,
     cursor: usize = 0,
+    control: Control = .none,
 
     fn copy(self: *OffsetWriter, start: usize, end: usize) !void {
         if (start > end or end > self.input.text.len or self.cursor > self.starts.len or end - start > self.starts.len - self.cursor) return error.InvalidData;
         for (start..end) |i| {
+            if (i % 4096 == 0) try self.control.check();
             self.starts[self.cursor] = self.input.starts[i];
             self.ends[self.cursor] = self.input.ends[i];
             self.cursor += 1;
@@ -158,11 +170,15 @@ const OffsetWriter = struct {
 fn mapHtmlStripOffsets(alloc: Allocator, mapping: *OffsetWriter, output: []const u8) !void {
     const text = mapping.input.text;
     var i: usize = 0;
+    var next_checkpoint: usize = 0;
     while (i < text.len) {
+        try byteCheckpoint(mapping.control, i, &next_checkpoint);
         if (text[i] == '<') {
             const start = i;
             i += 1;
-            while (i < text.len and text[i] != '>') : (i += 1) {}
+            while (i < text.len and text[i] != '>') : (i += 1) {
+                try byteCheckpoint(mapping.control, i, &next_checkpoint);
+            }
             if (i < text.len) i += 1;
             if (mapping.cursor > 0 and output[mapping.cursor - 1] != ' ') try mapping.replace(start, i, 1);
         } else if (text[i] == '&') {
@@ -173,6 +189,7 @@ fn mapHtmlStripOffsets(alloc: Allocator, mapping: *OffsetWriter, output: []const
                 const hex = i < text.len and (text[i] == 'x' or text[i] == 'X');
                 if (hex) i += 1;
                 while (i < text.len and text[i] != ';') : (i += 1) {
+                    try byteCheckpoint(mapping.control, i, &next_checkpoint);
                     const c = text[i];
                     if (hex) {
                         if (!std.ascii.isHex(c)) break;
@@ -184,7 +201,7 @@ fn mapHtmlStripOffsets(alloc: Allocator, mapping: *OffsetWriter, output: []const
                 while (i < text.len and text[i] != ';' and i - name_start < 10) : (i += 1) {}
                 if (i < text.len and text[i] == ';') i += 1;
             }
-            const replacement = try applyHtmlStrip(alloc, text[start..i]);
+            const replacement = try applyHtmlStripControlled(alloc, text[start..i], mapping.control);
             defer alloc.free(replacement);
             if (std.mem.eql(u8, replacement, text[start..i])) {
                 try mapping.copy(start, i);
@@ -201,7 +218,9 @@ fn mapHtmlStripOffsets(alloc: Allocator, mapping: *OffsetWriter, output: []const
 fn mapAsciiFoldOffsets(mapping: *OffsetWriter, output: []const u8) !void {
     const text = mapping.input.text;
     var i: usize = 0;
+    var next_checkpoint: usize = 0;
     while (i < text.len) {
+        try byteCheckpoint(mapping.control, i, &next_checkpoint);
         if (i + 1 < text.len and (text[i] == 0xC3 or text[i] == 0xC4 or text[i] == 0xC5) and
             mapping.cursor < output.len and output[mapping.cursor] < 0x80)
         {
@@ -217,7 +236,9 @@ fn mapAsciiFoldOffsets(mapping: *OffsetWriter, output: []const u8) !void {
 fn mapZwnjOffsets(mapping: *OffsetWriter) !void {
     const text = mapping.input.text;
     var i: usize = 0;
+    var next_checkpoint: usize = 0;
     while (i < text.len) {
+        try byteCheckpoint(mapping.control, i, &next_checkpoint);
         if (i + 2 < text.len and text[i] == 0xE2 and text[i + 1] == 0x80 and
             (text[i + 2] == 0x8C or text[i + 2] == 0x8B or text[i + 2] == 0x8D))
         {
@@ -234,11 +255,16 @@ fn mapZwnjOffsets(mapping: *OffsetWriter) !void {
 }
 
 fn applyHtmlStrip(alloc: Allocator, text: []const u8) ![]u8 {
+    return applyHtmlStripControlled(alloc, text, .none);
+}
+fn applyHtmlStripControlled(alloc: Allocator, text: []const u8, control: Control) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
 
     var i: usize = 0;
+    var next_checkpoint: usize = 0;
     while (i < text.len) {
+        try byteCheckpoint(control, i, &next_checkpoint);
         // SIMD scan for '<' or '&' in 16-byte chunks
         const remaining = text.len - i;
         if (remaining >= 16) {
@@ -268,7 +294,9 @@ fn applyHtmlStrip(alloc: Allocator, text: []const u8) ![]u8 {
         if (text[i] == '<') {
             // Skip tag content
             i += 1;
-            while (i < text.len and text[i] != '>') : (i += 1) {}
+            while (i < text.len and text[i] != '>') : (i += 1) {
+                try byteCheckpoint(control, i, &next_checkpoint);
+            }
             if (i < text.len) i += 1; // skip '>'
             // Replace tag with space to avoid merging words
             if (out.items.len > 0 and out.items[out.items.len - 1] != ' ') {
@@ -286,6 +314,7 @@ fn applyHtmlStrip(alloc: Allocator, text: []const u8) ![]u8 {
                     i += 1;
                     var val: u32 = 0;
                     while (i < text.len and text[i] != ';') : (i += 1) {
+                        try byteCheckpoint(control, i, &next_checkpoint);
                         const c = text[i];
                         if (c >= '0' and c <= '9') {
                             val = val * 16 + (c - '0');
@@ -306,6 +335,7 @@ fn applyHtmlStrip(alloc: Allocator, text: []const u8) ![]u8 {
                     // Decimal
                     var val: u32 = 0;
                     while (i < text.len and text[i] != ';') : (i += 1) {
+                        try byteCheckpoint(control, i, &next_checkpoint);
                         const c = text[i];
                         if (c >= '0' and c <= '9') {
                             val = val * 10 + (c - '0');
@@ -424,12 +454,17 @@ const ascii_fold_c3: [64]u8 = blk: {
 };
 
 fn applyAsciiFold(alloc: Allocator, text: []const u8) ![]u8 {
+    return applyAsciiFoldControlled(alloc, text, .none);
+}
+fn applyAsciiFoldControlled(alloc: Allocator, text: []const u8, control: Control) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.ensureTotalCapacity(alloc, text.len);
 
     var i: usize = 0;
+    var next_checkpoint: usize = 0;
     while (i < text.len) {
+        try byteCheckpoint(control, i, &next_checkpoint);
         const b = text[i];
         if (b < 0x80) {
             try out.append(alloc, b);
@@ -490,12 +525,17 @@ fn applyAsciiFold(alloc: Allocator, text: []const u8) ![]u8 {
 }
 
 fn applyZwnj(alloc: Allocator, text: []const u8) ![]u8 {
+    return applyZwnjControlled(alloc, text, .none);
+}
+fn applyZwnjControlled(alloc: Allocator, text: []const u8, control: Control) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.ensureTotalCapacity(alloc, text.len);
 
     var i: usize = 0;
+    var next_checkpoint: usize = 0;
     while (i < text.len) {
+        try byteCheckpoint(control, i, &next_checkpoint);
         if (i + 2 < text.len and text[i] == 0xE2 and text[i + 1] == 0x80) {
             const third = text[i + 2];
             if (third == 0x8C or // U+200C ZWNJ
@@ -547,9 +587,13 @@ pub const Tokenizer = union(enum) {
 
     /// Tokenize text into tokens. Caller owns the returned slice and token terms.
     pub fn tokenize(self: Tokenizer, alloc: Allocator, text: []const u8) ![]Token {
+        return self.tokenizeControlled(alloc, text, .none);
+    }
+    pub fn tokenizeControlled(self: Tokenizer, alloc: Allocator, text: []const u8, control: Control) ![]Token {
+        try control.check();
         return switch (self) {
-            .unicode_words => tokenizeUnicodeWords(alloc, text),
-            .whitespace => tokenizeWhitespace(alloc, text),
+            .unicode_words => tokenizeUnicodeWordsControlled(alloc, text, control),
+            .whitespace => tokenizeWhitespaceControlled(alloc, text, control),
             .keyword => tokenizeKeyword(alloc, text),
             .character => tokenizeCharacter(alloc, text),
             .ngram => |cfg| tokenizeNgram(alloc, text, cfg),
@@ -559,25 +603,25 @@ pub const Tokenizer = union(enum) {
 };
 
 fn tokenizeUnicodeWords(alloc: Allocator, text: []const u8) ![]Token {
+    return tokenizeUnicodeWordsControlled(alloc, text, .none);
+}
+fn tokenizeUnicodeWordsControlled(alloc: Allocator, text: []const u8, control: Control) ![]Token {
     var tokens = std.ArrayListUnmanaged(Token).empty;
     defer tokens.deinit(alloc);
 
     var pos: u32 = 0;
     var position: u32 = 0;
     const len: u32 = @intCast(text.len);
+    var checkpoint: usize = 0;
 
     while (pos < len) {
         // Skip non-alphanumeric
-        while (pos < len and !isAlphanumeric(text[pos])) {
-            pos += utf8ByteLen(text[pos]);
-        }
+        pos = try advanceRun(text, pos, false, false, control, &checkpoint);
         if (pos >= len) break;
 
         const start = pos;
         // Consume alphanumeric run
-        while (pos < len and isAlphanumeric(text[pos])) {
-            pos += utf8ByteLen(text[pos]);
-        }
+        pos = try advanceRun(text, pos, true, false, control, &checkpoint);
 
         const term = try alloc.dupe(u8, text[start..pos]);
         try tokens.append(alloc, .{
@@ -593,19 +637,23 @@ fn tokenizeUnicodeWords(alloc: Allocator, text: []const u8) ![]Token {
 }
 
 fn tokenizeWhitespace(alloc: Allocator, text: []const u8) ![]Token {
+    return tokenizeWhitespaceControlled(alloc, text, .none);
+}
+fn tokenizeWhitespaceControlled(alloc: Allocator, text: []const u8, control: Control) ![]Token {
     var tokens = std.ArrayListUnmanaged(Token).empty;
     defer tokens.deinit(alloc);
 
     var pos: u32 = 0;
     var position: u32 = 0;
     const len: u32 = @intCast(text.len);
+    var checkpoint: usize = 0;
 
     while (pos < len) {
-        while (pos < len and isWhitespace(text[pos])) : (pos += 1) {}
+        pos = try advanceRun(text, pos, true, true, control, &checkpoint);
         if (pos >= len) break;
 
         const start = pos;
-        while (pos < len and !isWhitespace(text[pos])) : (pos += 1) {}
+        pos = try advanceRun(text, pos, false, true, control, &checkpoint);
 
         const term = try alloc.dupe(u8, text[start..pos]);
         try tokens.append(alloc, .{
@@ -716,6 +764,21 @@ fn tokenizeEdgeNgram(alloc: Allocator, text: []const u8, cfg: EdgeNgramConfig) !
     return try tokens.toOwnedSlice(alloc);
 }
 
+/// Byte-bounded checkpoints, including runs which produce no allocations.
+/// The inner scan has the original branch/copy cost; control runs per 4 KiB.
+inline fn advanceRun(text: []const u8, start: u32, wanted: bool, whitespace: bool, control: Control, checkpoint: *usize) !u32 {
+    var pos = start;
+    while (pos < text.len) {
+        try byteCheckpoint(control, pos, checkpoint);
+        const end = @min(text.len, checkpoint.*);
+        while (pos < end and (if (whitespace) isWhitespace(text[pos]) else isAlphanumeric(text[pos])) == wanted) {
+            pos += if (whitespace) 1 else utf8ByteLen(text[pos]);
+        }
+        if (pos < end) break;
+    }
+    return pos;
+}
+
 fn isAlphanumeric(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c >= 0x80;
 }
@@ -782,10 +845,14 @@ pub const TokenFilter = union(enum) {
     /// Apply this filter to tokens, potentially removing or modifying them.
     /// Caller owns all memory. Returned slice may differ from input.
     pub fn apply(self: TokenFilter, alloc: Allocator, tokens: []Token) ![]Token {
+        return self.applyControlled(alloc, tokens, .none);
+    }
+    fn applyControlled(self: TokenFilter, alloc: Allocator, tokens: []Token, control: Control) ![]Token {
+        try control.check();
         return switch (self) {
-            .lowercase => applyLowercase(alloc, tokens),
+            .lowercase => applyLowercaseControlled(alloc, tokens, control),
             .stop_words => applyStopWords(alloc, tokens),
-            .stemmer => applyStemmer(alloc, tokens),
+            .stemmer => applyStemmerLangControlled(alloc, tokens, .english, control),
             .ngram => |cfg| applyNgramFilter(alloc, tokens, cfg),
             .edge_ngram => |cfg| applyEdgeNgramFilter(alloc, tokens, cfg),
             .shingle => |cfg| applyShingle(alloc, tokens, cfg),
@@ -798,21 +865,27 @@ pub const TokenFilter = union(enum) {
             .elision => applyElision(alloc, tokens),
             .apostrophe => applyApostrophe(alloc, tokens),
             .stop_words_lang => |lang| applyStopWordsLang(alloc, tokens, lang),
-            .stemmer_lang => |lang| applyStemmerLang(alloc, tokens, lang),
+            .stemmer_lang => |lang| applyStemmerLangControlled(alloc, tokens, lang, control),
         };
     }
 };
 
 fn applyLowercase(alloc: Allocator, tokens: []Token) ![]Token {
+    return applyLowercaseControlled(alloc, tokens, .none);
+}
+fn applyLowercaseControlled(alloc: Allocator, tokens: []Token, control: Control) ![]Token {
     for (tokens) |*tok| {
-        if (!containsAsciiUpper(tok.term)) continue;
+        if (!try containsAsciiUpperControlled(tok.term, control)) continue;
         const lowered = try alloc.alloc(u8, tok.term.len);
+        errdefer alloc.free(lowered);
+        var next_checkpoint: usize = 0;
         const len = tok.term.len;
         var i: usize = 0;
 
         // SIMD: process 16 bytes at a time
         const simd_len = len - (len % 16);
         while (i < simd_len) : (i += 16) {
+            try byteCheckpoint(control, i, &next_checkpoint);
             const V = @Vector(16, u8);
             const v: V = tok.term[i..][0..16].*;
             const a_vec: V = @splat('A');
@@ -837,9 +910,14 @@ fn applyLowercase(alloc: Allocator, tokens: []Token) ![]Token {
 }
 
 fn containsAsciiUpper(s: []const u8) bool {
+    return containsAsciiUpperControlled(s, .none) catch unreachable;
+}
+fn containsAsciiUpperControlled(s: []const u8, control: Control) !bool {
+    var next_checkpoint: usize = 0;
     var i: usize = 0;
     const simd_len = s.len - (s.len % 16);
     while (i < simd_len) : (i += 16) {
+        try byteCheckpoint(control, i, &next_checkpoint);
         const V = @Vector(16, u8);
         const v: V = s[i..][0..16].*;
         const a_vec: V = @splat('A');
@@ -1197,8 +1275,12 @@ fn applyStopWordsLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Toke
 }
 
 fn applyStemmerLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Token {
+    return applyStemmerLangControlled(alloc, tokens, lang, .none);
+}
+fn applyStemmerLangControlled(alloc: Allocator, tokens: []Token, lang: Language, control: Control) ![]Token {
     for (tokens) |*tok| {
-        const stemmed = try stemmers_mod.stem(alloc, tok.term, lang);
+        try control.check();
+        const stemmed = if (lang == .english) try porter2StemControlled(alloc, tok.term, control) else try stemmers_mod.stem(alloc, tok.term, lang);
         if (stemmed.ptr != tok.term.ptr) {
             if (tok.source_offsets != null and !std.mem.eql(u8, tok.term, stemmed)) {
                 const mapped = try alloc.alloc(Token.SourceOffset, stemmed.len);
@@ -1219,6 +1301,9 @@ fn applyStemmerLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Token 
 /// Stem a word using the Porter2 algorithm. Returns a new allocation if
 /// the word was modified, otherwise returns the original slice.
 pub fn porter2Stem(alloc: Allocator, word: []const u8) ![]const u8 {
+    return try porter2StemControlled(alloc, word, .none);
+}
+fn porter2StemControlled(alloc: Allocator, word: []const u8, control: Control) ![]const u8 {
     if (word.len <= 2) return word;
     if (!porter2MayChange(word)) return word;
 
@@ -1240,25 +1325,25 @@ pub fn porter2Stem(alloc: Allocator, word: []const u8) ![]const u8 {
     len = step0(buf, len);
 
     // Step 1a: sses→ss, ied/ies→i/ie, ss→ss, us→us, s→(remove if preceded by vowel)
-    len = step1a(buf, len);
+    len = (try step1aControlled(buf, len, control));
 
     // Step 1b: eed/eedly→ee (if in R1), ed/edly/ing/ingly→(remove if contains vowel)
-    len = step1b(buf, len);
+    len = (try step1bControlled(buf, len, control));
 
     // Step 1c: y/Y → i (if preceded by non-vowel and len > 2)
     len = step1c(buf, len);
 
     // Step 2: suffix replacements in R1
-    len = step2(buf, len);
+    len = (try step2Controlled(buf, len, control));
 
     // Step 3: suffix replacements in R1
-    len = step3(buf, len);
+    len = (try step3Controlled(buf, len, control));
 
     // Step 4: suffix deletions in R2
-    len = step4(buf, len);
+    len = (try step4Controlled(buf, len, control));
 
     // Step 5: final e/l cleanup
-    len = step5(buf, len);
+    len = (try step5Controlled(buf, len, control));
 
     if (len == word.len and std.mem.eql(u8, buf[0..len], word)) {
         return word;
@@ -1284,7 +1369,11 @@ pub fn isVowel(c: u8) bool {
 }
 
 pub fn containsVowel(word: []const u8) bool {
-    for (word) |c| {
+    return containsVowelControlled(word, .none) catch unreachable;
+}
+fn containsVowelControlled(word: []const u8, control: Control) !bool {
+    for (word, 0..) |c, i| {
+        if (i % 4096 == 0) try control.check();
         if (isVowel(c)) return true;
     }
     return false;
@@ -1292,20 +1381,31 @@ pub fn containsVowel(word: []const u8) bool {
 
 /// R1 is the region after the first non-vowel after a vowel.
 pub fn r1(word: []const u8) usize {
+    return r1Controlled(word, .none) catch unreachable;
+}
+fn r1Controlled(word: []const u8, control: Control) !usize {
     var i: usize = 0;
+    var next_checkpoint: usize = 0;
     // Find first vowel
-    while (i < word.len and !isVowel(word[i])) : (i += 1) {}
+    while (i < word.len and !isVowel(word[i])) : (i += 1) {
+        try byteCheckpoint(control, i, &next_checkpoint);
+    }
     // Find non-vowel after vowel
-    while (i < word.len and isVowel(word[i])) : (i += 1) {}
+    while (i < word.len and isVowel(word[i])) : (i += 1) {
+        try byteCheckpoint(control, i, &next_checkpoint);
+    }
     if (i < word.len) return i + 1;
     return word.len;
 }
 
 /// R2 is the region after the first non-vowel after a vowel in R1.
 pub fn r2(word: []const u8) usize {
-    const r1_start = r1(word);
+    return r2Controlled(word, .none) catch unreachable;
+}
+fn r2Controlled(word: []const u8, control: Control) !usize {
+    const r1_start = (try r1Controlled(word, control));
     if (r1_start >= word.len) return word.len;
-    const r2_in_r1 = r1(word[r1_start..]);
+    const r2_in_r1 = (try r1Controlled(word[r1_start..], control));
     return r1_start + r2_in_r1;
 }
 
@@ -1322,6 +1422,9 @@ fn step0(buf: []u8, len: usize) usize {
 }
 
 fn step1a(buf: []u8, len: usize) usize {
+    return step1aControlled(buf, len, .none) catch unreachable;
+}
+fn step1aControlled(buf: []u8, len: usize, control: Control) !usize {
     if (endsWith(buf, len, "sses")) return len - 2;
     if (endsWith(buf, len, "ied") or endsWith(buf, len, "ies")) {
         return if (len > 4) len - 2 else len - 1;
@@ -1329,13 +1432,16 @@ fn step1a(buf: []u8, len: usize) usize {
     if (endsWith(buf, len, "ss") or endsWith(buf, len, "us")) return len;
     if (len > 1 and buf[len - 1] == 's') {
         // Remove s if preceded by a vowel (not immediately before)
-        if (containsVowel(buf[0 .. len - 2])) return len - 1;
+        if (try containsVowelControlled(buf[0 .. len - 2], control)) return len - 1;
     }
     return len;
 }
 
 fn step1b(buf: []u8, len: usize) usize {
-    const r1_pos = r1(buf[0..len]);
+    return step1bControlled(buf, len, .none) catch unreachable;
+}
+fn step1bControlled(buf: []u8, len: usize, control: Control) !usize {
+    const r1_pos = (try r1Controlled(buf[0..len], control));
     if (endsWith(buf, len, "eedly")) {
         if (len - 5 >= r1_pos) return len - 3; // → ee
         return len;
@@ -1349,16 +1455,16 @@ fn step1b(buf: []u8, len: usize) usize {
     var modified = false;
     if (endsWith(buf, len, "ingly")) {
         new_len = len - 5;
-        modified = containsVowel(buf[0..new_len]);
+        modified = (try containsVowelControlled(buf[0..new_len], control));
     } else if (endsWith(buf, len, "edly")) {
         new_len = len - 4;
-        modified = containsVowel(buf[0..new_len]);
+        modified = (try containsVowelControlled(buf[0..new_len], control));
     } else if (endsWith(buf, len, "ing")) {
         new_len = len - 3;
-        modified = containsVowel(buf[0..new_len]);
+        modified = (try containsVowelControlled(buf[0..new_len], control));
     } else if (endsWith(buf, len, "ed")) {
         new_len = len - 2;
-        modified = containsVowel(buf[0..new_len]);
+        modified = (try containsVowelControlled(buf[0..new_len], control));
     }
 
     if (!modified) return len;
@@ -1372,7 +1478,7 @@ fn step1b(buf: []u8, len: usize) usize {
         const c = buf[new_len - 1];
         if (c != 'l' and c != 's' and c != 'z') return new_len - 1;
     }
-    if (isShortWord(buf[0..new_len])) {
+    if ((try isShortWordControlled(buf[0..new_len], control))) {
         buf[new_len] = 'e';
         return new_len + 1;
     }
@@ -1398,7 +1504,10 @@ fn isShortSyllable(word: []const u8, i: usize) bool {
 }
 
 fn isShortWord(word: []const u8) bool {
-    const r1_pos = r1(word);
+    return isShortWordControlled(word, .none) catch unreachable;
+}
+fn isShortWordControlled(word: []const u8, control: Control) !bool {
+    const r1_pos = (try r1Controlled(word, control));
     if (r1_pos < word.len) return false;
     if (word.len >= 3) return isShortSyllable(word, word.len - 3);
     if (word.len == 2) return isShortSyllable(word, 0);
@@ -1433,7 +1542,10 @@ const step2_table = [_]SuffixRule{
 };
 
 fn step2(buf: []u8, len: usize) usize {
-    const r1_pos = r1(buf[0..len]);
+    return step2Controlled(buf, len, .none) catch unreachable;
+}
+fn step2Controlled(buf: []u8, len: usize, control: Control) !usize {
+    const r1_pos = (try r1Controlled(buf[0..len], control));
     // Special case: li preceded by valid li-ending
     if (endsWith(buf, len, "li") and len >= 3) {
         const c = buf[len - 3];
@@ -1467,10 +1579,13 @@ const step3_table = [_]SuffixRule{
 };
 
 fn step3(buf: []u8, len: usize) usize {
-    const r1_pos = r1(buf[0..len]);
+    return step3Controlled(buf, len, .none) catch unreachable;
+}
+fn step3Controlled(buf: []u8, len: usize, control: Control) !usize {
+    const r1_pos = (try r1Controlled(buf[0..len], control));
     // Special: ative → (delete if in R2)
     if (endsWith(buf, len, "ative")) {
-        const r2_pos = r2(buf[0..len]);
+        const r2_pos = (try r2Controlled(buf[0..len], control));
         if (len - 5 >= r2_pos) return len - 5;
         return len;
     }
@@ -1494,7 +1609,10 @@ const step4_suffixes = [_][]const u8{
 };
 
 fn step4(buf: []u8, len: usize) usize {
-    const r2_pos = r2(buf[0..len]);
+    return step4Controlled(buf, len, .none) catch unreachable;
+}
+fn step4Controlled(buf: []u8, len: usize, control: Control) !usize {
+    const r2_pos = (try r2Controlled(buf[0..len], control));
     for (&step4_suffixes) |suffix| {
         if (endsWith(buf, len, suffix)) {
             const new_len = len - suffix.len;
@@ -1515,15 +1633,18 @@ fn step4(buf: []u8, len: usize) usize {
 }
 
 fn step5(buf: []u8, len: usize) usize {
+    return step5Controlled(buf, len, .none) catch unreachable;
+}
+fn step5Controlled(buf: []u8, len: usize, control: Control) !usize {
     if (len == 0) return len;
     if (buf[len - 1] == 'e') {
-        const r2_pos = r2(buf[0..len]);
+        const r2_pos = (try r2Controlled(buf[0..len], control));
         if (len - 1 >= r2_pos) return len - 1;
-        const r1_pos = r1(buf[0..len]);
+        const r1_pos = (try r1Controlled(buf[0..len], control));
         if (len - 1 >= r1_pos and (len < 3 or !isShortSyllable(buf[0..len], len - 3))) return len - 1;
     }
     if (buf[len - 1] == 'l' and len >= 2 and buf[len - 2] == 'l') {
-        const r2_pos = r2(buf[0..len]);
+        const r2_pos = (try r2Controlled(buf[0..len], control));
         if (len - 1 >= r2_pos) return len - 1;
     }
     return len;
@@ -1643,6 +1764,12 @@ pub const Analyzer = struct {
     tokenizer: Tokenizer,
     filters: []const TokenFilter,
 
+    /// Configuration remains serializable and immutable. Execution authority
+    /// exists only in this borrowed, call-scoped wrapper.
+    pub fn withControl(self: Analyzer, control: Control) ControlledAnalyzer {
+        return .{ .analyzer = self, .control = control };
+    }
+
     /// Recognize the complete pipeline, not its name or a partial prefix.
     /// Custom analyzers retain the ordinary owned-token implementation.
     pub fn tokenStream(self: *const Analyzer, text: []const u8) ?TokenStream {
@@ -1651,24 +1778,40 @@ pub const Analyzer = struct {
         return .{ .substring = SubstringStream.init(text) };
     }
 
+    /// Original-offset streaming for nonexpanding, token-local pipelines.
+    /// Unsupported character filters and expanding/stateful filters retain the
+    /// authoritative full analyzer. Each returned term lives until next().
+    pub fn sourceStream(self: *const Analyzer, a: Allocator, text: []const u8) ?SourceStream {
+        if (text.len > std.math.maxInt(u32)) return null;
+        if (self.char_filters.len != 0 or (self.tokenizer != .unicode_words and self.tokenizer != .whitespace)) return null;
+        for (self.filters) |filter| switch (filter) {
+            .lowercase, .stop_words, .stemmer, .stop_words_lang, .stemmer_lang, .length, .truncate, .reverse => {},
+            else => return null,
+        };
+        return .{ .analyzer = self.*, .text = text, .arena = .init(@import("../sql/memory_budget.zig").reclaimingAllocator(a)) };
+    }
+
     /// Analyze text into tokens. Caller owns the returned slice and all token terms.
     pub fn analyze(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
-        if (self.isDefaultEnglishNoCharFilters()) return analyzeDefaultEnglish(alloc, text);
+        return self.analyzeControlled(alloc, text, .none);
+    }
+    fn analyzeControlled(self: *const Analyzer, alloc: Allocator, text: []const u8, control: Control) ![]Token {
+        if (self.isDefaultEnglishNoCharFilters()) return analyzeDefaultEnglish(alloc, text, control);
 
         // Apply character filters
         var processed: []const u8 = text;
         var owned = false;
         for (self.char_filters) |cf| {
-            const result = try cf.apply(alloc, processed);
+            const result = try cf.applyControlled(alloc, processed, control);
             if (owned) alloc.free(@constCast(processed));
             processed = result;
             owned = true;
         }
         defer if (owned) alloc.free(@constCast(processed));
 
-        var tokens = try self.tokenizer.tokenize(alloc, processed);
+        var tokens = try self.tokenizer.tokenizeControlled(alloc, processed, control);
         for (self.filters) |filter| {
-            tokens = try filter.apply(alloc, tokens);
+            tokens = try filter.applyControlled(alloc, tokens, control);
         }
         return tokens;
     }
@@ -1677,24 +1820,27 @@ pub const Analyzer = struct {
     /// bytes. Character filters may remove or replace bytes, so their token
     /// offsets cannot be used directly to highlight the stored value.
     pub fn analyzeWithSourceOffsets(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
+        return self.analyzeWithSourceOffsetsControlled(alloc, text, .none);
+    }
+    fn analyzeWithSourceOffsetsControlled(self: *const Analyzer, alloc: Allocator, text: []const u8, control: Control) ![]Token {
         // Slicing a transformed token needs byte provenance, not arithmetic
         // on its surface start. Keep this scratch work out of normal indexing.
         for (self.filters) |filter| switch (filter) {
-            .suffix, .ngram, .edge_ngram, .camel_case => return self.analyzeWithMappedTokenOffsets(alloc, text),
+            .suffix, .ngram, .edge_ngram, .camel_case => return self.analyzeWithMappedTokenOffsets(alloc, text, control),
             else => {},
         };
-        if (self.char_filters.len == 0) return self.analyze(alloc, text);
+        if (self.char_filters.len == 0) return self.analyzeControlled(alloc, text, control);
 
-        var mapped = try MappedText.identity(alloc, text);
+        var mapped = try MappedText.identity(alloc, text, control);
         defer mapped.deinit(alloc);
         for (self.char_filters) |filter| {
-            const next = try filter.applyMapped(alloc, mapped);
+            const next = try filter.applyMapped(alloc, mapped, control);
             mapped.deinit(alloc);
             mapped = next;
         }
 
-        var tokens = try self.tokenizer.tokenize(alloc, mapped.text);
-        for (self.filters) |filter| tokens = try filter.apply(alloc, tokens);
+        var tokens = try self.tokenizer.tokenizeControlled(alloc, mapped.text, control);
+        for (self.filters) |filter| tokens = try filter.applyControlled(alloc, tokens, control);
         for (tokens) |*token| {
             if (token.start_byte >= token.end_byte or token.end_byte > mapped.text.len) continue;
             token.start_byte = mapped.starts[token.start_byte];
@@ -1703,13 +1849,13 @@ pub const Analyzer = struct {
         return tokens;
     }
 
-    fn analyzeWithMappedTokenOffsets(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
+    fn analyzeWithMappedTokenOffsets(self: *const Analyzer, alloc: Allocator, text: []const u8, control: Control) ![]Token {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const arena = scratch.allocator();
-        var mapped = try MappedText.identity(arena, text);
-        for (self.char_filters) |filter| mapped = try filter.applyMapped(arena, mapped);
-        var tokens = try self.tokenizer.tokenize(arena, mapped.text);
+        var mapped = try MappedText.identity(arena, text, control);
+        for (self.char_filters) |filter| mapped = try filter.applyMapped(arena, mapped, control);
+        var tokens = try self.tokenizer.tokenizeControlled(arena, mapped.text, control);
         for (tokens) |*tok| {
             const offsets = try arena.alloc(Token.SourceOffset, tok.term.len);
             const start = if (self.tokenizer == .edge_ngram and self.tokenizer.edge_ngram.side == .back)
@@ -1721,7 +1867,7 @@ pub const Analyzer = struct {
             }
             tok.source_offsets = offsets;
         }
-        for (self.filters) |filter| tokens = try filter.apply(arena, tokens);
+        for (self.filters) |filter| tokens = try filter.applyControlled(arena, tokens, control);
         const result = try alloc.alloc(Token, tokens.len);
         var initialized: usize = 0;
         errdefer {
@@ -1759,7 +1905,89 @@ pub const Analyzer = struct {
     }
 };
 
-fn analyzeDefaultEnglish(alloc: Allocator, text: []const u8) ![]Token {
+pub const ControlledAnalyzer = struct {
+    analyzer: Analyzer,
+    control: Control,
+    pub fn analyze(self: *const ControlledAnalyzer, alloc: Allocator, text: []const u8) ![]Token {
+        return self.analyzer.analyzeControlled(alloc, text, self.control);
+    }
+    pub fn analyzeWithSourceOffsets(self: *const ControlledAnalyzer, alloc: Allocator, text: []const u8) ![]Token {
+        return self.analyzer.analyzeWithSourceOffsetsControlled(alloc, text, self.control);
+    }
+};
+
+pub const SourceStream = struct {
+    analyzer: Analyzer,
+    text: []const u8,
+    arena: std.heap.ArenaAllocator,
+    cursor: u32 = 0,
+    position: u32 = 0,
+    checkpoint: usize = 0,
+    scratch_tokens: u8 = 0,
+    control: Control = .none,
+    pub fn deinit(self: *SourceStream) void {
+        self.arena.deinit();
+    }
+    pub fn next(self: *SourceStream) !?Token {
+        try self.control.check();
+        while (self.cursor < self.text.len) {
+            // Returned terms expire at next(), but retaining a bounded microbatch
+            // avoids arena-reset machinery on every short token. Oversized
+            // tokens retire before the next one, under the same allocator quota.
+            if (self.scratch_tokens == 64 or self.arena.queryCapacity() >= 64 * 1024) {
+                if (!self.arena.reset(.{ .retain_with_limit = 64 * 1024 })) return error.OutOfMemory;
+                self.scratch_tokens = 0;
+            }
+            self.scratch_tokens += 1;
+            const a = self.arena.allocator();
+            const whitespace = self.analyzer.tokenizer == .whitespace;
+            self.cursor = try advanceRun(self.text, self.cursor, whitespace, whitespace, self.control, &self.checkpoint);
+            if (self.cursor >= self.text.len) return null;
+            const start = self.cursor;
+            self.cursor = try advanceRun(self.text, self.cursor, !whitespace, whitespace, self.control, &self.checkpoint);
+            const raw = self.text[start..self.cursor];
+            if (self.analyzer.filters.len == 0 or
+                (self.analyzer.filters.len == 1 and self.analyzer.filters[0] == .lowercase))
+            {
+                var stack: [256]u8 = undefined;
+                var heap: ?[]u8 = null;
+                const normalized = if (self.analyzer.filters.len == 0) raw else try lowercaseScratch(a, raw, &stack, &heap, self.control);
+                // Unchanged terms can borrow immutable source text; normalized
+                // stack bytes need only one token-local copy.
+                const term = if (normalized.ptr == raw.ptr or heap != null) normalized else try a.dupe(u8, normalized);
+                const token: Token = .{ .term = term, .position = self.position, .start_byte = start, .end_byte = self.cursor };
+                self.position = try std.math.add(u32, self.position, 1);
+                return token;
+            }
+            if (self.analyzer.isDefaultEnglishNoCharFilters()) {
+                var stack: [256]u8 = undefined;
+                var heap: ?[]u8 = null;
+                const normalized = try lowercaseScratch(a, raw, &stack, &heap, self.control);
+                if (stopwords_mod.getStopWords(.english).has(normalized)) continue;
+                const owned = try a.dupe(u8, normalized);
+                const term = try porter2StemControlled(a, owned, self.control);
+                const token: Token = .{ .term = term, .position = self.position, .start_byte = start, .end_byte = self.cursor };
+                self.position = try std.math.add(u32, self.position, 1);
+                return token;
+            }
+            var tokens = try a.alloc(Token, 1);
+            tokens[0] = .{ .term = try a.dupe(u8, raw), .position = self.position, .start_byte = start, .end_byte = self.cursor };
+            for (self.analyzer.filters) |filter| {
+                tokens = try filter.applyControlled(a, tokens, self.control);
+                if (tokens.len == 0) break;
+            }
+            if (tokens.len == 0) continue;
+            std.debug.assert(tokens.len == 1);
+            var token = tokens[0];
+            token.position = self.position;
+            self.position = try std.math.add(u32, self.position, 1);
+            return token;
+        }
+        return null;
+    }
+};
+
+fn analyzeDefaultEnglish(alloc: Allocator, text: []const u8, control: Control) ![]Token {
     const stops = stopwords_mod.getStopWords(.english);
     var tokens = std.ArrayListUnmanaged(Token).empty;
     defer tokens.deinit(alloc);
@@ -1768,29 +1996,26 @@ fn analyzeDefaultEnglish(alloc: Allocator, text: []const u8) ![]Token {
     var pos: u32 = 0;
     var position: u32 = 0;
     const len: u32 = @intCast(text.len);
+    var checkpoint: usize = 0;
 
     while (pos < len) {
-        while (pos < len and !isAlphanumeric(text[pos])) {
-            pos += utf8ByteLen(text[pos]);
-        }
+        pos = try advanceRun(text, pos, false, false, control, &checkpoint);
         if (pos >= len) break;
 
         const start = pos;
-        while (pos < len and isAlphanumeric(text[pos])) {
-            pos += utf8ByteLen(text[pos]);
-        }
+        pos = try advanceRun(text, pos, true, false, control, &checkpoint);
 
         const raw = text[start..pos];
         var stack_lower: [256]u8 = undefined;
         var heap_lower: ?[]u8 = null;
-        const normalized = try lowercaseScratch(alloc, raw, &stack_lower, &heap_lower);
+        const normalized = try lowercaseScratch(alloc, raw, &stack_lower, &heap_lower, control);
         defer if (heap_lower) |owned| alloc.free(owned);
 
         if (stops.has(normalized)) continue;
 
         var owned_term = try alloc.dupe(u8, normalized);
         errdefer alloc.free(owned_term);
-        const stemmed = try porter2Stem(alloc, owned_term);
+        const stemmed = try porter2StemControlled(alloc, owned_term, control);
         if (stemmed.ptr != owned_term.ptr) {
             alloc.free(owned_term);
             owned_term = @constCast(stemmed);
@@ -1813,14 +2038,16 @@ fn lowercaseScratch(
     text: []const u8,
     stack: *[256]u8,
     heap: *?[]u8,
+    control: Control,
 ) ![]const u8 {
-    if (!containsAsciiUpper(text)) return text;
+    if (!try containsAsciiUpperControlled(text, control)) return text;
     const out: []u8 = if (text.len <= stack.len) stack[0..text.len] else blk: {
         const owned = try alloc.alloc(u8, text.len);
         heap.* = owned;
         break :blk owned;
     };
     for (text, 0..) |c, i| {
+        if (i % 4096 == 0) try control.check();
         out[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
     }
     return out;
@@ -2637,4 +2864,68 @@ test "logical query substring stream agrees with owned token pipeline" {
     try std.testing.expect(default_analyzer.tokenStream("abc") == null);
     const custom = Analyzer{ .tokenizer = .unicode_words, .filters = &.{ .lowercase, .{ .suffix = .{ .min = 1, .max = 32 } } } };
     try std.testing.expect(custom.tokenStream("abc") == null);
+}
+
+test "highlight byte checkpoints amortize short token runs across one scan" {
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, 6 * 1024);
+    defer a.free(text);
+    for (0..1024) |i| @memcpy(text[i * 6 ..][0..6], "alpha ");
+    const Count = struct {
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) !void {
+            @as(*@This(), @ptrCast(@alignCast(@constCast(ptr)))).calls += 1;
+        }
+    };
+    var count: Count = .{};
+    const controlled = default_analyzer.withControl(.{ .ptr = &count, .check_fn = Count.check });
+    const tokens = try controlled.analyze(a, text);
+    defer Analyzer.freeTokens(a, tokens);
+    try std.testing.expectEqual(@as(usize, 1024), tokens.len);
+    try std.testing.expectEqual(@as(usize, 2), count.calls);
+    for ([_]Tokenizer{ .unicode_words, .whitespace }) |tokenizer| {
+        count.calls = 0;
+        const words = try tokenizer.tokenizeControlled(a, text, .{ .ptr = &count, .check_fn = Count.check });
+        defer Analyzer.freeTokens(a, words);
+        try std.testing.expectEqual(@as(usize, 1024), words.len);
+        try std.testing.expect(count.calls <= 3);
+    }
+}
+
+test "highlight source token streams match original offsets filters and allocation faults" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            const custom: Analyzer = .{ .tokenizer = .whitespace, .filters = &.{ .lowercase, .{ .length = .{ .min = 2, .max = 64 } }, .{ .truncate = .{ .max_len = 5 } }, .reverse } };
+            const text = "The RUNNING foxes café München needle a q the NEEDLES!";
+            for ([_]*const Analyzer{ &simple_analyzer, &default_analyzer, &german_analyzer, &custom }) |analyzer| {
+                var reference = std.heap.ArenaAllocator.init(a);
+                defer reference.deinit();
+                const expected = try analyzer.analyzeWithSourceOffsets(reference.allocator(), text);
+                var stream = analyzer.sourceStream(a, text).?;
+                defer stream.deinit();
+                for (expected) |token| {
+                    const actual = (try stream.next()).?;
+                    try std.testing.expectEqualStrings(token.term, actual.term);
+                    try std.testing.expectEqual(token.position, actual.position);
+                    try std.testing.expectEqual(token.start_byte, actual.start_byte);
+                    try std.testing.expectEqual(token.end_byte, actual.end_byte);
+                }
+                try std.testing.expect(try stream.next() == null);
+            }
+        }
+    };
+    try Check.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try std.testing.expect(html_analyzer.sourceStream(std.testing.allocator, "<p>x</p>") == null);
+    try std.testing.expect(substring_analyzer.sourceStream(std.testing.allocator, "word") == null);
+    const Cancel = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    var marker: u8 = 0;
+    var stream = simple_analyzer.sourceStream(std.testing.allocator, "words").?;
+    defer stream.deinit();
+    stream.control = .{ .ptr = &marker, .check_fn = Cancel.check };
+    try std.testing.expectError(error.Canceled, stream.next());
 }

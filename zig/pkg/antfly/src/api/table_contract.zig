@@ -2501,7 +2501,8 @@ test "external lake public compatibility normalization preserves exact schema li
         }
     };
     try Check.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Check.run, .{});
     try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(std.testing.allocator,
         \\{"indexes":{"text":{"type":"full_text","store_source":true,"_index_incarnation":7}}}
     ));

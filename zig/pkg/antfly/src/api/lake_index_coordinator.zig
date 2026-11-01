@@ -85,6 +85,7 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     var heartbeat_active = true;
     defer if (heartbeat_active) heartbeat.cancel(io);
     var working = try limits.WorkingSetAllocator.init(a, options.build_limits);
+    defer working.deinit();
     const build_alloc = working.allocator();
     var artifact_reads = @import("lake_index_artifact_recovery.zig").Reads.init(store.artifactStore());
     var handle = artifact_reads.store();
@@ -109,7 +110,7 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
         // Optional prefetch may have declined an earlier allocation. That
         // historical quota flag cannot replace an explicit source, integrity,
         // cancellation or lease error from the required construction path.
-        const working_limit = build_error == error.OutOfMemory and working.limit_exceeded;
+        const working_limit = build_error == error.OutOfMemory and working.limitExceeded();
         const failed_bytes = try catalog.encode(a, try admitted.value.fail(admitted.value.pending.?.token, if (working_limit) "LakeSidecarBuildLimitExceeded" else @errorName(build_error), retry_at));
         defer a.free(failed_bytes);
         try lease.replaceCatalog(failed_bytes);
@@ -730,10 +731,13 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         const final_entries = try final_reader.nextEntries(oa, 16);
         try std.testing.expectEqual(@as(usize, 2), final_entries.len);
         for (final_entries) |entry| {
-            const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, artifacts, entry.cover.?.block, .none, null);
-            defer a.free(bytes);
-            const block = try local.sql_spill.decodeColumnarBlockInArena(oa, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
-            const value = try block.cell(entry.cover.?.row, 0);
+            const columns = @import("lake_index_cover_columns.zig");
+            const cover = entry.cover.?;
+            var reads: u64 = 16 * 1024 * 1024;
+            var loaded = try columns.load(a, artifacts, cover.block, cover.striped, &.{0}, final_root.cover.len, .none, null, 16 * 1024 * 1024, &reads, null);
+            defer loaded.deinit();
+            try loaded.verify(final_root.domain, cover.row, entry.key[entry.key.len - 16 ..][0..16].*, columns.witness(final_root.domain, entry.key));
+            const value = try loaded.block.cell(cover.row, 0);
             try std.testing.expect(!value.sql_null);
             try std.testing.expectEqualStrings("indexed value", value.value.string);
         }

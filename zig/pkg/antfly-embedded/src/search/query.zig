@@ -241,6 +241,50 @@ pub const PredicateProbePlan = struct {
         };
         return self;
     }
+    /// Conservative segment-local ceiling, without opening postings. Finite
+    /// required selections remain useful even when term membership is lazy.
+    pub fn candidateUpperBound(self: *const PredicateProbePlan, offset: u32, count: u32) !usize {
+        return self.nodeUpperBound(0, offset, count);
+    }
+    fn nodeUpperBound(self: *const PredicateProbePlan, index: u8, offset: u32, count: u32) anyerror!usize {
+        try self.control.check();
+        return switch (self.nodes[index]) {
+            .constant => |value| if (value) count else 0,
+            .term => count,
+            .doc_num => |filter| blk: {
+                if (filter.producer != null) break :blk count;
+                const end = @as(u64, offset) + count;
+                if (filter.bitmap) |bitmap| break :blk bitmap.rangeCardinality(offset, end);
+                var total: usize = 0;
+                // Duplicates may overestimate, but can never exclude a match.
+                for (filter.doc_nums) |doc| if (doc >= offset and doc < end) {
+                    total += 1;
+                };
+                break :blk @min(count, total);
+            },
+            .boolean => |b| blk: {
+                try b.control.check();
+                if (b.must == 0 and b.should == 0) break :blk 0;
+                var upper: usize = count;
+                var at: usize = b.start;
+                for (0..b.must) |_| {
+                    upper = @min(upper, try self.nodeUpperBound(self.children[at], offset, count));
+                    at += 1;
+                }
+                const required = if (b.must == 0 and b.minimum == 0) 1 else b.minimum;
+                if (b.should != 0 and required != 0) {
+                    if (required > b.should) break :blk 0;
+                    // Each matching row consumes at least `required` child
+                    // memberships. Do not cap the sum before dividing.
+                    var sum: u64 = 0;
+                    for (0..b.should) |i| sum += try self.nodeUpperBound(self.children[at + i], offset, count);
+                    upper = @min(upper, sum / required);
+                }
+                // Exclusions cannot increase the result cardinality.
+                break :blk upper;
+            },
+        };
+    }
     fn append(self: *@This(), filter: Filter, depth: usize) anyerror!u8 {
         if (depth == 32 or self.node_count == self.nodes.len) return error.UnsupportedPredicateProbe;
         const index: u8 = @intCast(self.node_count);
@@ -5232,6 +5276,24 @@ test "logical value borrowed sparse complement counts exceptions and clips delet
     steps = 0;
     try testing.expectEqual(@as(usize, 123), try program.cardinality(127, &deleted));
     try testing.expectEqual(@as(usize, 0), steps);
+}
+
+test "producer top k finite Boolean ceilings preserve segment offsets and minimum should match" {
+    const finite: Filter = .{ .doc_num = .{ .doc_nums = &.{ 1, 100, 103, 103, 200 } } };
+    const required = (try PredicateProbePlan.compile(.{ .bool_filter = .{ .must = &.{ finite, .{ .term = .{ .field = "body", .term = "star" } } }, .should = &.{}, .must_not = &.{finite} } })).?;
+    try testing.expectEqual(@as(usize, 3), try required.candidateUpperBound(100, 10));
+    try testing.expectEqual(@as(usize, 0), try required.candidateUpperBound(110, 10));
+    // Two match-all children and minimum=2 still permit the entire segment.
+    // Capping their sum to count before division would incorrectly halve it.
+    const both = (try PredicateProbePlan.compile(.{ .bool_filter = .{ .must = &.{}, .should = &.{ .match_all, .match_all }, .must_not = &.{}, .min_should_match = 2 } })).?;
+    try testing.expectEqual(@as(usize, 10), try both.candidateUpperBound(100, 10));
+    const either = (try PredicateProbePlan.compile(.{ .bool_filter = .{ .must = &.{}, .should = &.{ finite, finite }, .must_not = &.{}, .min_should_match = 2 } })).?;
+    try testing.expectEqual(@as(usize, 3), try either.candidateUpperBound(100, 10));
+    var bitmap = roaring.RoaringBitmap.init(testing.allocator);
+    defer bitmap.deinit();
+    for ([_]u32{ 99, 100, 109, 110 }) |doc| try bitmap.add(doc);
+    const mapped = (try PredicateProbePlan.compile(.{ .doc_num = .{ .doc_nums = &.{}, .bitmap = &bitmap } })).?;
+    try testing.expectEqual(@as(usize, 2), try mapped.candidateUpperBound(100, 10));
 }
 
 test "producer top k probes exact metadata without materializing a segment" {

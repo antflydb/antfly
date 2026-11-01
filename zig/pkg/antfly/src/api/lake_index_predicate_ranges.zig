@@ -35,26 +35,31 @@ fn unknown(a: A) ![]u8 {
     return bytes;
 }
 pub fn reduce(a: A, entries: []const tree.Entry, height: u8) ![]u8 {
-    var result: ?Bounds = null;
+    const Views = struct { lower: tree.KeyView, upper: tree.KeyView };
+    var result: ?Views = null;
     for (entries) |entry| {
-        const bounds: Bounds = if (height == 0) leaf: {
-            if (entry.key.len < 32 or !std.mem.eql(u8, entry.key[0..16], entry.key[entry.key.len - 16 ..])) return error.InvalidNativeLakeRowIndex;
-            break :leaf .{ .lower = entry.key[16..], .upper = entry.key[16..] };
-        } else if (entry.aggregate.len == 0) return unknown(a) else (try decode(entry.aggregate)) orelse return unknown(a);
+        const bounds: Views = if (height == 0) leaf: {
+            const key = entry.keyView();
+            if (key.len() < 32 or key.slice(0, 16).order(key.slice(key.len() - 16, key.len())) != .eq) return error.InvalidNativeLakeRowIndex;
+            break :leaf .{ .lower = key.slice(16, key.len()), .upper = key.slice(16, key.len()) };
+        } else branch: {
+            if (entry.aggregate.len == 0) return unknown(a);
+            const value = (try decode(entry.aggregate)) orelse return unknown(a);
+            break :branch .{ .lower = .from(value.lower), .upper = .from(value.upper) };
+        };
         if (result) |*value| {
-            if (std.mem.order(u8, bounds.lower, value.lower) == .lt) value.lower = bounds.lower;
-            if (std.mem.order(u8, bounds.upper, value.upper) == .gt) value.upper = bounds.upper;
+            if (bounds.lower.order(value.lower) == .lt) value.lower = bounds.lower;
+            if (bounds.upper.order(value.upper) == .gt) value.upper = bounds.upper;
         } else result = bounds;
     }
     const value = result orelse return error.InvalidNativeLakeRowIndex;
-    // Long logical keys must not enlarge the authenticated page reduction.
-    // A lower prefix is <= its full key; the successor of an upper prefix is
-    // > every key starting with that prefix. No successor means unknown.
     const prefix_bytes = (tree.max_aggregate_bytes - 12) / 2;
-    const lower = value.lower[0..@min(prefix_bytes, value.lower.len)];
+    var lower_buffer: [prefix_bytes]u8 = undefined;
+    const lower = lower_buffer[0..@min(prefix_bytes, value.lower.len())];
+    value.lower.copyRange(0, lower);
     var upper_buffer: [prefix_bytes]u8 = undefined;
-    const upper: []const u8 = if (value.upper.len <= prefix_bytes) value.upper else block: {
-        @memcpy(&upper_buffer, value.upper[0..prefix_bytes]);
+    value.upper.copyRange(0, upper_buffer[0..@min(prefix_bytes, value.upper.len())]);
+    const upper: []const u8 = if (value.upper.len() <= prefix_bytes) upper_buffer[0..value.upper.len()] else block: {
         var length = upper_buffer.len;
         while (length != 0 and upper_buffer[length - 1] == 255) length -= 1;
         if (length == 0) return unknown(a);

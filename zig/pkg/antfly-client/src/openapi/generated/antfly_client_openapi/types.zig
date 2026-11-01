@@ -32234,7 +32234,7 @@ pub const InferenceReadRequest = struct {
     images: ?[]const InferenceImageURL = null,
     /// Optional task prompt for document understanding models. - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
     prompt: ?[]const u8 = null,
-    /// Maximum tokens to generate
+    /// Maximum output tokens per page. When omitted, the selected reader model supplies its default, bounded by deployment limits. Explicit values override the model default and must fit model and server limits.
     max_tokens: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
