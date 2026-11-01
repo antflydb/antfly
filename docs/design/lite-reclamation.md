@@ -46,7 +46,7 @@ access. Background derived windows admit at most 64 records or 1 MiB, retaining
 the existing one-oversized-record progress exception. Explicit/foreground drains
 keep their larger amortization bounds. Generated producers and resolvers also keep their source guards. General
 integrity readers retain full allocator metadata
-protection, including recovery slots. Revision-6 cooperating readers publish cross-process epochs. Unregistered readers
+protection, including recovery slots. Revision-7 cooperating readers publish cross-process epochs. Unregistered readers
 retain their ordinary inode locks and conservatively block physical reuse.
 
 Within a process, serving replacements can share a leased immutable source and
@@ -77,14 +77,52 @@ include diagnostic work and rolled-back allocation attempts. Benchmark collectio
 is opt-in with `--allocator-diagnostics` and happens after all timed work; status
 reads can themselves refresh runtimes, so they are not passive idle probes.
 
-The owner creates revision-6 files (`AFLITE\x06P`) by default. Writable revision-3
+The owner creates revision-7 files (`AFLITE\x07P`) by default. Writable revision-3
 owners migrate through an explicitly identified compact image and atomic generation
 adoption. Read-only opens preserve revision 3. Raw native format primitives retain
 their revision-3 default for compatibility; `CreateOptions.indexed_reclamation`
-selects revision 6. Revision-4 and revision-5 prototypes are rejected rather than silently mixing reader protocols;
+selects revision 7. Revision-4, revision-5 and revision-6 prototypes are rejected rather than silently mixing reader protocols;
 these formats have not shipped. Older binaries reject the new signature. `page_reuse = false`
-opts out of creating/migrating revision 6; an existing revision-6 file still uses
+opts out of creating/migrating revision 7; an existing revision-7 file still uses
 its required ownership machinery.
+
+Each revision-7 recovery slot has three opaque 128-bit logical identities:
+primary data, runtime metadata, and index inputs. The 72-byte root slot remains
+at its original offset; its checksum also covers the corresponding 48-byte
+identity extension after the two root slots. Publication writes the extension
+and root slot before the existing sync/selector barriers. A torn extension
+invalidates that slot and leaves the other recovery slot available. Revision-3
+encoding and checksums remain unchanged. Fresh identities avoid ABA after a
+rollback, while allocator service and pure artifact-lease transactions preserve
+logical identity.
+
+The owner may adopt an allocator-only checkpoint after its previous physical
+checkpoint leaves the recovery slots. It retains compiled serving inputs but
+rebases mutable allocator state separately. A pending adoption cannot hit an
+allocator cache solely by root page number. Bounded journal rebases outside a
+retained checkpoint require a matching current checked seal and canonical digest;
+failed ancestry falls back to an independent load. Explicit integrity checks also
+load the on-disk ledger independently of cached traversal inventories.
+
+The native writer projects schema, activation, SQL DDL and FK publication changes
+into a per-namespace recovery agenda in the same transaction. Ordinary SQL commit
+decisions retain their separate root journal and recovery guard; row commits do
+not create DDL agenda work.
+Recovery reads at most eight namespace keys per turn and opens only those runtimes.
+A database-wide FK coordinator settles before any rotated page can return. Under
+the path lease, recovery acknowledges only completed work, then checks the current
+queue before declaring the generation clean. Cursor continuation survives wrapper
+refresh. Revision-3 conversion bootstraps the projection before publication.
+
+Replay sizing belongs to the same persistent namespace scheduling owner as group
+continuation. Independent kind lanes double cheap full windows and halve expensive
+or failed windows, within hard record/byte limits. The elapsed sizing target is
+25 ms; individual records and provider calls remain cooperative. Blocked reuse
+with a depleted free pool lowers retention caps. Retirement service adapts from
+128 through 512 work pages per publication, and the owner applies that bound to
+replacement and detached stores. Diagnostics expose the selected namespace's
+feedback and retirement budget. Qualification must still establish an active-write
+plateau and eventual index catch-up, rather than relying on idle shrink alone.
 
 The implementation uses journaled ownership counters and a hierarchical free-page
 bitmap. This replaces the proposed free-extent tree: dense counters also represent
@@ -478,7 +516,7 @@ from inheriting an open's deferred scan while retaining validation before reuse.
 Page reuse is the routine mechanism. Optional automatic shrinking retains the
 owner's conservative amplification, absolute-savings, hysteresis, resource,
 cancellation, and publication policy. Explicit vacuum is also available. Shrinking
-rewrites live indexed data into a compact revision-6 generation, bootstraps its
+rewrites live indexed data into a compact revision-7 generation, bootstraps its
 ownership ledger once, streams concurrent changes, and atomically adopts it.
 It therefore returns internal holes and packed-page slack to the filesystem
 independently of routine retirement. This implementation uses generation rewriting
@@ -564,7 +602,7 @@ cancellation from the owner's worker shutdown token.
 
 ### Reuse during detached native turns
 
-Revision-6 files bind reader epochs to a checksummed 32-byte header digest over
+Revision-7 files bind reader epochs to a checksummed 32-byte header digest over
 a persistent random namespace identity and its directory inode. The canonical
 pathname locates a bounded `.aflite-readers-<path-hash>` directory beside the
 database; it does not establish authority to reclaim pages. Only private or new
@@ -612,9 +650,9 @@ sidecar can be created; making the directory writable does not switch it mid-rea
 in-place vacuum refuses any registered reader; online generation replacement can
 retain the old inode through existing descriptor and resource accounting.
 
-The format signature is bumped to revision 6 so revision-4/5 writers cannot ignore
-the namespace binding and reuse pages underneath a reader. Revision-4/5 prototypes
-are rejected; supported revision-3 migration builds a new bound generation. Legacy same-process
+Revision 7 retains the namespace binding and adds logical checkpoint identities
+and an atomic recovery agenda. Revision-4/5/6 prototypes are rejected so older
+writers cannot publish changes without maintaining these contracts; supported revision-3 migration builds a new bound generation. Legacy same-process
 inode-fence suspension remains for non-indexed/internal compatibility paths, with
 its existing unrecognized-publication poisoning rules.
 
@@ -623,3 +661,21 @@ physical-page reader. It verifies each loaded bundle and each requested record
 without reconstructing a synthetic checksummed page per inline record. The
 reachable-root and ownership-count checks remain unchanged, including both
 recovery checkpoints and the cancellation fence.
+
+Recovery agenda discovery is capped at eight namespaces per turn. Admission
+independently checks each affected namespace, including schema participants of
+catalog-dependent operations; cursor progress cannot bypass unfinished DDL.
+Read-only clean sweeps accumulate across pages of one logical metadata generation,
+including across foreign data-only checkpoints. New metadata invalidates that
+witness. Every interrupted namespace check disqualifies its sweep; cursor
+progress cannot certify an unchecked namespace. Snapshot recovery only inspects
+its captured cut and cannot publish repairs. Replacement compaction images
+receive fresh primary, metadata and index identities before allocator sealing;
+publication-sequence normalization retains those identities.
+
+Logical-byte accounting strips the physical namespace wrapper before applying
+the shared internal-key classifier. Authored primary/relational rows and
+unreserved raw records count as documents; receipts, replay/identity state,
+columnar controls and other reserved internal records count as control documents.
+These categories describe payload ownership, not an estimate of removable
+overhead.

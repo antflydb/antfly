@@ -1,0 +1,121 @@
+{
+  "status": "Review fixes implemented; final correctness gates and combined performance qualification in progress",
+  "source_parent_commit": "dff38d144c45c36cd90391d949c5b5f722ed5cfa",
+  "importer": {
+    "sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+    "build": "original Rust Debug executable, unchanged; externally owned retry changes excluded"
+  },
+  "implementation": [
+    "Revision-7 checksummed logical checkpoint identities retain unchanged runtime metadata beyond physical recovery slots.",
+    "Native schema/activation/DDL/FK writes atomically project per-namespace durable recovery markers. Discovery rotates at most eight namespaces per turn; independent admission fences check affected namespaces and dependency catalogs. Read-only clean sweeps persist across pages for one logical metadata generation. Ordinary SQL decisions retain their dedicated root journal and recovery guard.",
+    "Per-kind replay feedback survives runtime replacement, targets a 25 ms quantum and responds to blocked reuse; retirement work stays bounded at 128..512 pages.",
+    "Allocator cache adoption cannot match by reused physical root ID; unretained ancestry requires the current seal/digest or an independent load.",
+    "Explicit integrity checks load on-disk allocator state independently of transient cached traversal inventories.",
+    "Database-wide compaction drains named-table indexes as well as the default namespace.",
+    "Integrity accounting classifies physical namespace wrappers structurally, then uses shared internal-key families for receipts, replay/identity state, columnar controls and other internal records. Authored primary/relational rows and unreserved raw records remain documents; typed SDKs expose optional fields.",
+    "Compaction establishes fresh primary, metadata and index identities before allocator sealing. An interrupted read-only namespace check invalidates clean-sweep eligibility while retaining fair cursor progress."
+  ],
+  "compatibility": {
+    "indexed_format": 7,
+    "unreleased_prototypes_rejected": [
+      4,
+      5,
+      6
+    ],
+    "legacy_revision_3": "read support and atomic writable conversion retained",
+    "c_abi_version": 3,
+    "exports": 134
+  },
+  "debug_artifact": {
+    "sha256": "59c792b3ec2ee31e6bb7b6fb9acc1520bf663807586feabfeb49d1a03a0e7e99",
+    "os": "macOS 26.6.2",
+    "zig": "0.17.0",
+    "mode": "Debug",
+    "source_note": "Initial implementation artifact; the final corrected artifact and combined qualification results will replace this entry."
+  },
+  "validation": {
+    "native_full": {
+      "source": "dc183d7e68",
+      "passed": 702,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaks": 0
+    },
+    "focused_native_capi": {
+      "passed": 64,
+      "skipped": 1,
+      "failed": 0,
+      "leaks": 0
+    },
+    "allocator_adoption": "logical-generation, torn-extension and actual root-page-reuse checks passed, including continued writes/reclamation and reopen",
+    "python_sql_catalog_concurrency": {
+      "passed": 205,
+      "failed": 0,
+      "descriptor_soft_limit": 4096
+    },
+    "go": "Cgo native TestLiteCAPI, bundled-header parity and error-code metadata tests passed",
+    "rust": "7 pure tests passed; typed binding compiled",
+    "typescript": "embedded typecheck passed",
+    "abi": "C smoke and 134-export consumer executable/shared-library linkage passed",
+    "full_capi_contract_gate": "At dc183d7e68: 287 passed, 3 skipped, zero failures/leaks. Rerunning after replacement-lineage and interrupted-sweep corrections.",
+    "warm_recovery_regressions": {
+      "passed": 3,
+      "failed": 0,
+      "leaks": 0,
+      "covers": [
+        "Clean recovery memo survives runtime replacement",
+        "Ordinary row writes do not queue DDL work",
+        "Plain lease/shadow bookkeeping retains the serving runtime; changed inputs fence it"
+      ]
+    },
+    "review_regressions": {
+      "recovery_passed": 5,
+      "accounting_passed": 1,
+      "failed": 0,
+      "leaks": 0,
+      "covers": [
+        "Affected namespaces beyond the bounded discovery page remain fenced over 20 attempts",
+        "Root C API admission consistently refuses unfinished DDL",
+        "Read-only sweeps become clean with exactly eight and nine markers",
+        "Foreign data-only commits preserve the clean witness; new DDL invalidates it",
+        "Transaction receipts, columnar controls, binary replay/identity state and derived rows classify as controls in root and named namespaces; authored rows remain documents"
+      ],
+      "full_gates": "C API and native passed at dc183d7e68; rerunning with three additional replacement/interruption regressions, then rebuilt-library ABI and SDK checks."
+    },
+    "replacement_interruption_regressions": {
+      "status": "Both connection reproductions passed in the local C API suite (205 passed, 3 skipped, zero failures/leaks); remaining C API group, native image regression and full rebuilt-library gates running.",
+      "covers": [
+        "Independent logical identities on consecutive compaction images, retained across allocator-only sequence normalization and authenticated reopen",
+        "A cached clean metadata witness cannot hide unfinished DDL after a peer compacts again",
+        "A real allocation failure after cursor advancement cannot certify an unchecked namespace on later admissions"
+      ]
+    }
+  },
+  "descriptor_limit_control": {
+    "default_soft_limit": 256,
+    "candidate": "1 backup failure, 204 passes; ProcessFdQuotaExceeded",
+    "unchanged_baseline": "same backup failure, 203 passes, new compaction test deselected",
+    "sampled_before_test_descriptor_range": [
+      12,
+      13
+    ],
+    "candidate_sampled_peak_with_4096_limit": 399,
+    "interpretation": "Both controls reproduce the low-limit failure; sampled inter-test counts stay stable. Gate rerun passes with sufficient descriptor budget."
+  },
+  "remaining": [
+    "Matched same-host Debug comparisons with original importer and both exact #1436 / branch-base controls",
+    "Full 15-thread frozen imports and aggregate content/accounting comparison",
+    "Original importer three-writer/one-reader contention with original timeout/retry behavior",
+    "Ten-minute eight-writer indexed churn: active-write plateau, acknowledged values, integrity, catch-up, canary search and reopen",
+    "Matched optimized native measurements",
+    "Full C API/native/SDK gates after review fixes"
+  ],
+  "measurement_rules": [
+    "Keep original importer and frozen inputs identical.",
+    "Record native-library hashes, build mode, host load, CPU and memory.",
+    "Run matched timing comparisons without concurrent active builds.",
+    "Logical live_bytes count key/value payload and exclude physical headers/digests.",
+    "Compare equivalent index catch-up/merge states before attributing payload differences.",
+    "Publish aggregates only; private inputs and raw logs remain ignored."
+  ]
+}

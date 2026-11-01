@@ -1168,7 +1168,7 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
 
     // Public query resolution uses the stored ANN index and custom scorer
     // vector field, but must not publish a query document or any derived work.
-    const sequence = handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    const checkpoint = handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint();
     var query_result: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&query_result);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice(
@@ -1184,7 +1184,11 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     try std.testing.expectEqualStrings("entities", resolved[0].object.get("doc_ref").?.object.get("table").?.string);
     try std.testing.expectEqualStrings("match", resolved[0].object.get("decision").?.string);
     try std.testing.expectEqual(@as(i64, 1), query_resolution.get("skipped_mentions").?.integer);
-    try std.testing.expectEqual(sequence, handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    // Admission may acknowledge terminal recovery markers in metadata. That
+    // physical checkpoint must not be confused with authored query/derived work.
+    const after_query = handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint();
+    try std.testing.expectEqualSlices(u8, &checkpoint.logical.primary, &after_query.logical.primary);
+    try std.testing.expectEqualSlices(u8, &checkpoint.logical.indexes, &after_query.logical.indexes);
     // A copy-only artifact cannot silently masquerade as a text extractor.
     var invalid_result: h.capi.Buffer = .{};
     try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"A reviewer\"}"), &invalid_result));
