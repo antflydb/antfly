@@ -1856,7 +1856,10 @@ test "external lake logical fragments retain boundaries and isolate append remov
 }
 
 test "external lake logical fragments split oversized radix leaves without physical reads" {
-    const a = std.testing.allocator;
+    // Preserve checked ownership without unwinding every successful allocation.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const a = fixture_allocator.allocator();
     var directory = try local.common_test_directory.TestDirectory.init("logical-fragment-split");
     defer directory.cleanup();
     var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());

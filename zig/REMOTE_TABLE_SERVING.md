@@ -1545,9 +1545,13 @@ reversal remain independent; equal primary prefixes must remain live.
 
 The shared probe/read/memory limits still bound this optional attempt. An
 unfinished boundary or exhausted membership budget falls back to exact native
-windows. Profiles retain child decoration counters, ordered reference visits and
-elapsed preparation/execution time from the abandoned attempt. Successful pages
-report `ordered_lake_index`; a declined global attempt reports
+windows. After consuming and declining an ordered prefix, the operation retains
+text-candidate preference through window planning and the final collector. The
+collector must not reopen that prefix with a fresh allowance; this decision also
+applies when profiling is disabled. Physical rows without text ordinals still
+consume the probe allowance. Profiles retain child decoration counters, ordered
+reference visits and elapsed preparation/execution time from the abandoned
+attempt. Successful pages report `ordered_lake_index`; a declined global attempt reports
 `ordered_lake_index_then_text_windows` alongside the final collector reason.
 Attempt elapsed time replaces its nested child timers before adding fallback
 collector time, so counters survive without double-counting elapsed execution.
@@ -1992,8 +1996,8 @@ exact source spans, prefix boundaries, partial-output cancellation, allocation
 failures, analyzer aliases and private-file ownership. Real Parquet and Iceberg
 E2E coverage includes a large vocabulary with rare exact, prefix, wildcard and
 fuzzy matches after restart with the original source objects unavailable.
-Performance observations belong in `bench/lake/`; their binary/input identities,
-query shapes, execution order and environment qualify any timing claim.
+Performance reports belong in ignored `.benchmark-results/lake/`; their
+binary/input identities, query shapes, execution order and environment qualify any timing claim.
 
 ### Dense occurrence streams, Unicode metadata and equivalent bindings
 
@@ -2094,7 +2098,7 @@ encoded. Final response-size limits are unchanged.
 Native oracles compare streaming/pruned fragments with the full selector across
 fragment counts, widths, UTF-8 boundaries and overlapping spans, and cover exact
 large integers, nulls, heterogeneous widening, allocation failures and cleanup.
-Real Parquet/Iceberg restart tests and `bench/lake/typed_results.py` exercise
+Real Parquet/Iceberg restart tests and [historical typed-result comparison](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/typed_results.py) exercise
 public delivery. Keep candidate/block-work and retained-byte measurements
 separate from local Debug timing and provider qualification.
 
@@ -2714,7 +2718,7 @@ or an addition policy duplicated in a second reducer.
 
 
 The measured comparison is recorded in
-[private-metadata-reduction-v1-observation.json](bench/lake/private-metadata-reduction-v1-observation.json).
+[private-metadata-reduction-v1-observation.json](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/private-metadata-reduction-v1-observation.json).
 Three alternating pairs of real local Parquet publications verify every row and
 all ten columns outside the timed interval. At 8,192 rows, median publication
 falls from 6,349.022 to 5,581.567 ms (12.1%); all three candidates are faster. At
@@ -2763,7 +2767,7 @@ allocator and quotas. The ordinary borrowed-batch write path remains available.
 Runtime ABI 81, reader protocol 97 and persisted formats are unchanged.
 
 
-The [ordered-map and typed-merge observation](bench/lake/ordered-identity-and-typed-merges-v1-observation.json)
+The [ordered-map and typed-merge observation](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/ordered-identity-and-typed-merges-v1-observation.json)
 qualifies runtime `4fb464d08b12f1aaf1d570ebf7d00698d285ecde` against the
 post-main-merge baseline `bbbede9c8de3250f7e0f9eb9499c7c8891496e2f`.
 Three alternating complete real-Parquet publication pairs reduce median latency
@@ -2817,11 +2821,11 @@ Runtime ABI 82 fences the changed cache state; reader protocol 97 is unchanged.
 Native probes have supported build targets, including all generated product and
 platform dependencies. `zig build lake-native-bench-build -Doptimize=fast` builds
 all three probes without referring to disposable cache-generated files. See the
-[benchmark instructions](bench/lake/README.md#quota-governed-residency-and-streamed-capture)
+[benchmark instructions](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/README.md#quota-governed-residency-and-streamed-capture)
 for controls, exact timer boundaries and measured tradeoffs.
 
 
-The [governed-residency and capture observation](bench/lake/governed-residency-and-streamed-capture-v1-observation.json)
+The [governed-residency and capture observation](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/governed-residency-and-streamed-capture-v1-observation.json)
 qualifies this runtime with 592 native checks and 50 real Parquet/Iceberg E2E
 cases. Three alternating optimized native pairs at 65,536 rows show 16.3–18.0%
 lower full-sort CPU and 88.5–89.0% fewer physical read bytes against the same
@@ -2866,7 +2870,7 @@ repeated and diverse vocabularies. It is not an unconditional ingestion speedup.
 Runtime ABI 83 fences the new state; reader protocol 97 is unchanged.
 
 
-The [incremental-retention and alias-replay observation](bench/lake/incremental-retention-and-alias-replay-v1-observation.json)
+The [incremental-retention and alias-replay observation](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/incremental-retention-and-alias-replay-v1-observation.json)
 qualifies runtime `3d058bc003189c73b49f190fdf17ecea423d67ac`, with main
 `97945ad58e8194815ad377a0ba853a4583d83ec4`. Three alternating optimized native
 pairs at 262,144 rows reduce median full-sort CPU by 59.5% uncompressed and
@@ -2912,7 +2916,7 @@ original spool and interned terms. Runtime ABI 84 fences the new state; reader
 protocol 97 and persisted encodings are unchanged.
 
 
-The [partitioned normalized replay observation](bench/lake/partitioned-normalized-replay-v1-observation.json)
+The [partitioned normalized replay observation](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/partitioned-normalized-replay-v1-observation.json)
 qualifies runtime `3efae3aac45cdf8a8aa2783a04381ca08bbfbe7a` against the frozen
 pre-fix probe on the same main. Three alternating pairs show 75.7–78.8% lower
 CPU for diverse disk-backed capture across simple/English analysis and one/two
@@ -2959,7 +2963,7 @@ remain unchanged. Runtime ABI 85 fences the owner/lease state; reader protocol
 97 is unchanged. Capture timing and complete native segment-build timing are
 measured separately; neither alone establishes HTTP publication or cloud latency.
 
-The [shared-reader qualification](bench/lake/shared-normalized-reader-v1-observation.json)
+The [shared-reader qualification](https://github.com/antflydb/antfly/blob/c2d0572d52f6dfceb108c8ae59b517c131bed62f/zig/bench/lake/shared-normalized-reader-v1-observation.json)
 records a same-main, identical-harness comparison: disk diverse capture uses
 3.3–16.9% less median CPU and complete native-index construction uses 5.2–10.8%
 less for diverse aliases. Allocation count falls from 4,096 buffers to one,

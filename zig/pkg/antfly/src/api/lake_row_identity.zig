@@ -953,7 +953,10 @@ const TestRows = struct {
 };
 
 test "external lake logical row maps spill verify value equivalence and flatten arbitrary rewrites" {
-    const a = std.testing.allocator;
+    // Preserve checked ownership without unwinding every successful allocation.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const a = fixture_allocator.allocator();
     var memory: local.sql_memory_budget = .{ .backing = a, .limit = 4 * 1024 * 1024 };
     const ma = memory.allocator();
     var marker: u8 = 0;

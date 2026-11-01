@@ -145,8 +145,11 @@ pub fn clip(raw: *anyopaque, first: Id, last: Id) !?struct { first: Id, last: Id
 }
 
 test "external lake global frontier spilled pack proofs seek beyond flat admission limits" {
+    // Preserve checked ownership without unwinding every successful allocation.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
     const self = try std.heap.page_allocator.create(Self);
-    self.* = .{ .budget = .{ .backing = std.testing.allocator, .limit = 4 * 1024 * 1024 }, .token = .none };
+    self.* = .{ .budget = .{ .backing = fixture_allocator.allocator(), .limit = 4 * 1024 * 1024 }, .token = .none };
     self.manager = .{ .alloc = self.budget.allocator(), .io = std.testing.io, .context = self, .checkpoint = check };
     defer self.deinit();
     var sort = local.sql_spill.Sort.init(self.budget.allocator(), &self.manager, &.{.{}}, 16 * 1024);

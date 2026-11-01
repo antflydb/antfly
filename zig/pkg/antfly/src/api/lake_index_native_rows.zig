@@ -486,7 +486,10 @@ fn check(raw: *anyopaque) !void {
 }
 
 test "external lake native ordered indexes spill real Parquet and seek exact expression keys" {
-    const a = std.testing.allocator;
+    // Preserve checked ownership without unwinding every successful allocation.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const a = fixture_allocator.allocator();
     var directory = try local.common_test_directory.TestDirectory.init("native-row-index-parquet");
     defer directory.cleanup();
     var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
