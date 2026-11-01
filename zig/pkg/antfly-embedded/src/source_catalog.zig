@@ -561,6 +561,7 @@ pub const storage_lite_docstore = @import("storage/lite/docstore.zig");
 pub const storage_lite_index_storage = @import("storage/lite/index_storage.zig");
 pub const storage_lite_mod = @import("storage/lite/mod.zig");
 pub const storage_lite_native = @import("storage/lite/native.zig");
+pub const storage_lite_reader_epochs = @import("storage/lite/reader_epochs.zig");
 pub const storage_lite_ledger_digest = @import("storage/lite/ledger_digest.zig");
 pub const storage_lite_path_lock_wait = @import("storage/lite/path_lock_wait.zig");
 pub const storage_lite_paths = @import("storage/lite/paths.zig");
