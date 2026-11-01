@@ -2603,11 +2603,13 @@ test "segmentAttentionHost cancellation drains running parallel heads before scr
         io: std.Io,
         entered: std.Io.Event = .unset,
         release: std.Io.Event = .unset,
+        started: std.atomic.Value(usize) = .init(0),
         finished: std.atomic.Value(usize) = .init(0),
     };
     const BlockingGemm = struct {
         var lifecycle: *Lifecycle = undefined;
         pub fn sgemmTransBSync(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32) void {
+            _ = lifecycle.started.fetchAdd(1, .acq_rel);
             lifecycle.entered.set(lifecycle.io);
             // Model an already-running BLAS call, which cannot be interrupted.
             lifecycle.release.waitUncancelable(lifecycle.io);
@@ -2649,9 +2651,14 @@ test "segmentAttentionHost cancellation drains running parallel heads before scr
     const result = request.cancel(io);
     pending = false;
     try std.testing.expectError(error.Canceled, result);
-    try std.testing.expectEqual(@as(usize, 4), lifecycle.finished.load(.acquire));
+    // Cancellation may prevent queued heads from starting. The lifecycle
+    // contract is that every already-running BLAS call has finished before
+    // scratch is released, independent of the executor's available slots.
+    const started = lifecycle.started.load(.acquire);
+    try std.testing.expect(started > 0 and started <= 4);
+    try std.testing.expectEqual(started, lifecycle.finished.load(.acquire));
     try Case.run(io);
-    try std.testing.expectEqual(@as(usize, 8), lifecycle.finished.load(.acquire));
+    try std.testing.expectEqual(started + 4, lifecycle.finished.load(.acquire));
 }
 
 test "segmentAttentionHost matches dense masked softmax with ranges, window, and fewer queries" {

@@ -309,7 +309,17 @@ pub fn sigmoid(data: []f32) void {
 
 /// SiLU/Swish activation: x * sigmoid(x) = x / (1 + exp(-x))
 pub fn silu(data: []f32) void {
-    applyActivation(.silu, data);
+    const expression = comptime @import("antfly_tile").fexpr.acc.siluOf();
+    const Math = struct {
+        pub fn exp(comptime _: comptime_int, x: F32xN) F32xN {
+            return expVec(x);
+        }
+    };
+    var i: usize = 0;
+    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
+        data[i..][0..VEC_LEN].* = expression.evalVecWith(VEC_LEN, Math, data[i..][0..VEC_LEN].*, @splat(0), @splat(0));
+    }
+    while (i < data.len) : (i += 1) data[i] = kernel_math.evaluate(comptime kernel_math.activation(.silu, .left_associated), kernel_math.ScalarMath, data[i]);
 }
 
 pub fn clampSilu(output: []f32, input: []const f32, min_value: ?f32, max_value: ?f32) void {
@@ -338,45 +348,12 @@ pub fn quickGelu(data: []f32) void {
 
 /// RMS normalization: x * rsqrt(mean(x^2) + eps) * weight. No bias, no mean subtraction.
 pub fn rmsNorm(data: []f32, weight: []const f32, dim: usize, eps: f32) void {
-    const batch = data.len / dim;
-    for (0..batch) |b| {
-        const row = data[b * dim .. (b + 1) * dim];
-
-        const sum_sq = vectorDotSelf(row);
-        const rms = @sqrt(sum_sq / @as(f32, @floatFromInt(dim)) + eps);
-        const inv_rms = 1.0 / rms;
-
-        const scale: F32xN = @splat(inv_rms);
-        var i: usize = 0;
-        while (i + VEC_LEN <= dim) : (i += VEC_LEN) {
-            const v: F32xN = row[i..][0..VEC_LEN].*;
-            const w: F32xN = weight[i..][0..VEC_LEN].*;
-            row[i..][0..VEC_LEN].* = v * scale * w;
-        }
-        while (i < dim) : (i += 1) {
-            row[i] = row[i] * inv_rms * weight[i];
-        }
-    }
+    @import("antfly_tile").norm.runRms(VEC_LEN, false, .{ .x = data, .gamma = weight, .out = data, .dim = dim, .eps = eps });
 }
 
-/// Fused post-norm residual epilogue. Keep the reduction and multiplication
-/// order identical to rmsNorm, followed by separate scale/add/scale passes.
+/// Fused post-norm residual with the same strict arithmetic and reduction order.
 pub fn rmsNormResidual(output: []f32, input: []const f32, weight: []const f32, residual: []const f32, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) void {
-    @setFloatMode(.strict);
-    for (0..input.len / dim) |r| {
-        const row = input[r * dim ..][0..dim];
-        const inv: F32xN = @splat(1.0 / @sqrt(vectorDotSelf(row) / @as(f32, @floatFromInt(dim)) + eps));
-        const ns: F32xN = @splat(norm_scale);
-        const os: F32xN = @splat(output_scale);
-        var i: usize = 0;
-        while (i + VEC_LEN <= dim) : (i += VEC_LEN) {
-            const v: F32xN = row[i..][0..VEC_LEN].*;
-            const w: F32xN = weight[i..][0..VEC_LEN].*;
-            const res: F32xN = residual[r * dim + i ..][0..VEC_LEN].*;
-            output[r * dim + i ..][0..VEC_LEN].* = (res + ((v * inv) * w) * ns) * os;
-        }
-        while (i < dim) : (i += 1) output[r * dim + i] = (residual[r * dim + i] + ((row[i] * inv[0]) * weight[i]) * norm_scale) * output_scale;
-    }
+    @import("antfly_tile").norm.runRms(VEC_LEN, true, .{ .x = input, .gamma = weight, .out = output, .residual = residual, .dim = dim, .eps = eps, .norm_scale = norm_scale, .output_scale = output_scale });
 }
 
 /// Softmax over the last dimension. data is [batch, dim], applied per row.
@@ -536,21 +513,6 @@ pub fn logSoftmaxInPlace(data: []f32, dim: usize) void {
 }
 
 // --- Vectorized helpers ---
-
-
-fn vectorDotSelf(data: []const f32) f32 {
-    var acc: F32xN = @splat(0.0);
-    var i: usize = 0;
-    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        acc += v * v;
-    }
-    var sum = @reduce(.Add, acc);
-    while (i < data.len) : (i += 1) {
-        sum += data[i] * data[i];
-    }
-    return sum;
-}
 
 fn vectorMax(data: []const f32) f32 {
     if (data.len == 0) return -std.math.inf(f32);

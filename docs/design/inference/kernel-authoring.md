@@ -139,7 +139,7 @@ regression tests remain with their current owners.
 
 ## Tile descriptions and native ownership
 
-The portable Tile IR in `src/tile/` is a prototype with CPU vector lowering,
+The portable Tile IR in `zig/lib/tile/src/` is a shared library with CPU vector lowering,
 Metal/CUDA emitters and scalar references. Its model descriptions are adapters;
 they do not replace the qualified native schedules by default. The optional
 Whisper logits hook is qualified separately from the production library.

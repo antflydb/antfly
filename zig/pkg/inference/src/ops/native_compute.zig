@@ -36499,10 +36499,7 @@ fn splitLastDim3Op(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror
         output.* = try self.makeOwnedBuf(values);
         initialized += 1;
         output.* = try self.withLogicalShape(output.*, &shape);
-        for (0..rows) |row| {
-            const src = row * dim * 3 + part * dim;
-            @memcpy(values[row * dim ..][0..dim], data[src..][0..dim]);
-        }
+        if (total != 0) try @import("antfly_tile").layout.copyRows(f32, data, .{ .rows = rows, .cols = dim, .row_stride = dim * 3, .offset = part * dim }, values, .{ .rows = rows, .cols = dim, .row_stride = dim });
     }
 
     return .{
@@ -36510,6 +36507,23 @@ fn splitLastDim3Op(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror
         .second = outputs[1],
         .third = outputs[2],
     };
+}
+
+test "native splitLastDim3 preserves zero row and zero width outputs" {
+    const a = std.testing.allocator;
+    var weights = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    var empty: [0]f32 = .{};
+    const input = try compute.makeBuf(&empty, false);
+    defer freeTensor(&compute, input);
+    for ([_][2]usize{ .{ 0, 3 }, .{ 2, 0 } }) |shape| {
+        const parts = try splitLastDim3Op(&compute, input, shape[0], shape[1]);
+        for ([_]CT{ parts.first, parts.second, parts.third }) |part| {
+            defer freeTensor(&compute, part);
+            try std.testing.expectEqual(@as(usize, 0), getData(part).len);
+        }
+    }
 }
 
 fn takeRowsOp(ctx: *anyopaque, request: *const ops.TakeRowsRequest) anyerror!?CT {
@@ -36532,9 +36546,7 @@ fn takeRowsOp(ctx: *anyopaque, request: *const ops.TakeRowsRequest) anyerror!?CT
     const output = try self.allocator.alloc(f32, count);
     const tensor = try self.makeOwnedBuf(output);
     errdefer freeTensor(ctx, tensor);
-    for (request.row_ids, 0..) |row, index| {
-        @memcpy(output[index * request.dim ..][0..request.dim], data[@as(usize, row) * request.dim ..][0..request.dim]);
-    }
+    try @import("antfly_tile").layout.gatherRows(f32, data, .{ .rows = total_rows, .cols = request.dim, .row_stride = request.dim }, request.row_ids, output, .{ .rows = request.rows, .cols = request.dim, .row_stride = request.dim });
     return try self.withLogicalShape(tensor, &shape);
 }
 
@@ -36847,26 +36859,29 @@ fn argmaxRowsSuppressOp(
     errdefer allocator.free(tokens);
     for (tokens, 0..) |*token, row_idx| {
         const row = data[(row_start + row_idx) * dim ..][0..dim];
-        var best_idx: u32 = 0;
-        var best_val: f32 = -std.math.inf(f32);
-        var found = false;
-        for (row, 0..) |value, idx| {
-            if (found and !(value > best_val)) continue;
-            var suppressed = false;
-            for (suppress_token_ids) |raw| {
-                if (raw >= 0 and @as(usize, @intCast(raw)) == idx) {
-                    suppressed = true;
-                    break;
-                }
-            }
-            if (suppressed) continue;
-            found = true;
-            best_val = value;
-            best_idx = @intCast(idx);
-        }
-        token.* = best_idx;
+        token.* = @import("antfly_tile").rows.argmaxSuppressed(row, suppress_token_ids).index;
     }
     return tokens;
+}
+
+test "native row suppression preserves row offsets, first allowed NaNs and empty selections" {
+    const a = std.testing.allocator;
+    var weights = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    var values = [_]f32{ 9, 9, 9, std.math.nan(f32), 1, 2, 1, std.math.nan(f32), 3 };
+    const input = try compute.makeBuf(&values, false);
+    defer freeTensor(&compute, input);
+    const cases = [_]struct { suppressed: []const i32, expected: [2]u32 }{
+        .{ .suppressed = &.{}, .expected = .{ 0, 2 } },
+        .{ .suppressed = &.{ -1, 0, 99 }, .expected = .{ 2, 1 } },
+        .{ .suppressed = &.{ 0, 1, 2 }, .expected = .{ 0, 0 } },
+    };
+    for (cases) |case| {
+        const tokens = (try argmaxRowsSuppressOp(&compute, input, 1, 2, 3, case.suppressed, a)).?;
+        defer a.free(tokens);
+        try std.testing.expectEqualSlices(u32, &case.expected, tokens);
+    }
 }
 
 test "linear q8_0 kernel computes direct matmul" {

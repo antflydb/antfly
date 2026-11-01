@@ -21,14 +21,15 @@
 //! model kernels (not checked in) for scripts/tile/run_whisper_opencl.py.
 
 const std = @import("std");
-const gpu = @import("gpu.zig");
+const gpu = @import("antfly_tile").gpu;
 const whisper = @import("whisper_logits.zig");
-const gpu_model = @import("gpu_model.zig");
+const gpu_model = @import("antfly_tile").gpu_model;
 const whisper_model = @import("whisper_model.zig");
 
 const File = struct { path: []const u8, data: []const u8 };
 
 pub const files = [_]File{
+    .{ .path = "../../lib/vectorindex/src/kmeans_distance.msl.h", .data = gpu.sourceMacro("ANTFLY_TILE_DISTANCE_MSL", @import("antfly_tile").scoring.metal_distance) },
     .{ .path = "src/ops/metal/generated/tile_whisper_logits_partials.metal", .data = gpu.renderMetal(whisper.kernel) },
     .{ .path = "src/ops/metal/generated/tile_whisper_logits_partials.msl.h", .data = gpu.renderMetalHeader(whisper.kernel, "antfly_tile_whisper_logits_partials_msl") },
     .{ .path = "src/ops/cuda/generated/tile_whisper_logits.cu", .data = gpu.renderCuda(whisper.kernel) },
@@ -70,13 +71,26 @@ pub fn main(init: std.process.Init) !void {
             const data = try @import("inventory.zig").render(allocator, &regions, &.{});
             try cwd.writeFile(io, .{ .sub_path = args[i], .data = data });
             return;
+        } else if (std.mem.eql(u8, arg, "--emit-portable") and i + 1 < args.len) {
+            i += 1;
+            const Programs = @import("antfly_tile").conformance.Programs;
+            const data = if (std.mem.endsWith(u8, args[i], ".metal"))
+                comptime gpu_model.renderModule(Programs, .metal, "portable conformance")
+            else if (std.mem.endsWith(u8, args[i], ".cu"))
+                comptime gpu_model.renderModule(Programs, .cuda, "portable conformance")
+            else if (std.mem.endsWith(u8, args[i], ".cl"))
+                comptime gpu_model.renderModule(Programs, .opencl, "portable conformance")
+            else
+                return error.InvalidArguments;
+            try cwd.writeFile(io, .{ .sub_path = args[i], .data = data });
+            return;
         } else if (std.mem.eql(u8, arg, "--emit-opencl") and i + 1 < args.len) {
             i += 1;
             try cwd.writeFile(io, .{ .sub_path = args[i], .data = opencl_source });
             std.debug.print("wrote {s}\n", .{args[i]});
             return;
         } else if (!std.mem.eql(u8, arg, "--check")) {
-            std.debug.print("usage: tile-kernel-codegen [--check|--write|--inventory <path>|--dump-regions <dir>|--emit-opencl <path>]\n", .{});
+            std.debug.print("usage: tile-kernel-codegen [--check|--write|--inventory <path>|--dump-regions <dir>|--emit-opencl <path>|--emit-portable <path.metal|cu|cl>]\n", .{});
             return error.InvalidArguments;
         }
     }
@@ -100,6 +114,19 @@ pub fn main(init: std.process.Init) !void {
             return error.ModelSpecificNativeOwner;
         }
         try inputs.append(allocator, try std.fmt.allocPrint(allocator, "src/tile/{s}", .{entry.path}));
+    }
+    var shared_directory = try cwd.openDir(io, "../../lib/tile/src", .{ .iterate = true });
+    defer shared_directory.close(io);
+    var shared_walker = try shared_directory.walk(allocator);
+    defer shared_walker.deinit();
+    while (try shared_walker.next(io)) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.path, ".zig")) {
+            if (!@import("region.zig").operationFamilyName(std.fs.path.stem(entry.basename))) {
+                std.debug.print("shared Tile source owner must use an operation/layout name: {s}\n", .{entry.path});
+                return error.ModelSpecificNativeOwner;
+            }
+            try inputs.append(allocator, try std.fmt.allocPrint(allocator, "../../lib/tile/src/{s}", .{entry.path}));
+        }
     }
     std.mem.sort([]const u8, inputs.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {

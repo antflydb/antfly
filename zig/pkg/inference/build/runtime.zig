@@ -54,6 +54,7 @@ pub const Paths = struct {
 };
 
 pub const SharedModules = struct {
+    tile: ?*std.Build.Module = null,
     build_info_mod: *std.Build.Module,
     build_info_object: *std.Build.Step.Compile,
     tokenizer_mod: *std.Build.Module,
@@ -145,6 +146,7 @@ pub const Graph = struct {
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
     inference_linalg_mod: *std.Build.Module,
+    tile_mod: *std.Build.Module,
     inference_fixed_tokenizer_data_mod: *std.Build.Module,
     inference_audio_mod: *std.Build.Module,
     inference_chunker_mod: *std.Build.Module,
@@ -375,12 +377,19 @@ pub fn create(config: Config) Graph {
         b.modules.put(b.allocator, "sentencepiece_proto", sentencepiece_proto_mod) catch @panic("OOM");
     }
 
+    const tile_mod = shared.tile orelse b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/tile/src/mod.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const inference_linalg_mod = addOrCreateModule(b, config.register_public_modules, "inference_linalg", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/linalg/src/mod.zig")),
         .target = target,
         .optimize = optimize,
     });
 
+    inference_linalg_mod.addImport("antfly_tile", tile_mod);
     addX86Kernels(
         b,
         inference_linalg_mod,
@@ -453,6 +462,7 @@ pub fn create(config: Config) Graph {
         .inference_tokenizer_mod = inference_tokenizer_mod,
         .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
         .inference_linalg_mod = inference_linalg_mod,
+        .tile_mod = tile_mod,
         .inference_fixed_tokenizer_data_mod = inference_fixed_tokenizer_data_mod,
         .jsonschema_mod = jsonschema_mod,
         .scraping_mod = scraping_mod,
@@ -539,6 +549,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("ml_tabular", ml_tabular_mod);
     if (pjrt_mod) |pjrt| inference_internal_mod.addImport("pjrt", pjrt);
     inference_internal_mod.addImport("inference_linalg", inference_linalg_mod);
+    inference_internal_mod.addImport("antfly_tile", tile_mod);
     inference_internal_mod.addImport("protobuf", protobuf_mod);
     inference_internal_mod.addImport("antfly_platform", platform_mod);
     inference_internal_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
@@ -592,6 +603,7 @@ pub fn create(config: Config) Graph {
         .inference_tokenizer_mod = inference_tokenizer_mod,
         .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
         .inference_linalg_mod = inference_linalg_mod,
+        .tile_mod = tile_mod,
         .inference_fixed_tokenizer_data_mod = inference_fixed_tokenizer_data_mod,
         .inference_audio_mod = inference_audio_mod,
         .inference_chunker_mod = inference_chunker_mod,
@@ -665,6 +677,7 @@ const InferenceRootImports = struct {
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
     inference_linalg_mod: *std.Build.Module,
+    tile_mod: *std.Build.Module,
     inference_fixed_tokenizer_data_mod: *std.Build.Module,
     jsonschema_mod: *std.Build.Module,
     scraping_mod: *std.Build.Module,
@@ -694,6 +707,7 @@ pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRoot
     module.addImport("inference_tokenizer", imports.inference_tokenizer_mod);
     module.addImport("inference_hf_tokenizer", imports.inference_hf_tokenizer_mod);
     module.addImport("inference_linalg", imports.inference_linalg_mod);
+    module.addImport("antfly_tile", imports.tile_mod);
     module.addImport("inference_fixed_tokenizer_data", imports.inference_fixed_tokenizer_data_mod);
     module.addImport("antfly_jsonschema", imports.jsonschema_mod);
     module.addImport("antfly_scraping", imports.scraping_mod);

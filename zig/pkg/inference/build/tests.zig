@@ -89,6 +89,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
     tests.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    tests.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     tests.root_module.addImport("inference_fixed_tokenizer_data", ctx.graph.inference_fixed_tokenizer_data_mod);
     tests.root_module.addImport("antfly_jsonschema", ctx.graph.jsonschema_mod);
     tests.root_module.addImport("antfly_scraping", ctx.graph.scraping_mod);
@@ -392,6 +393,7 @@ fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
     tests.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    tests.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     tests.root_module.addImport("ml", ml);
     const run = ctx.addRunArtifact(tests);
     ctx.step("test-gliner25-fuzz", "Run bounded GLiNER2.5 parser, schema and document property tests").dependOn(&run.step);

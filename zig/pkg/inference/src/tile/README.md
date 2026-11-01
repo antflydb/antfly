@@ -1,4 +1,4 @@
-# Tile kernels (prototype)
+# Tile kernels
 
 Describe each kernel once as comptime Zig data and lower it to every backend:
 
@@ -10,19 +10,57 @@ Describe each kernel once as comptime Zig data and lower it to every backend:
 | OpenCL | test dialect of the GPU templates, run on the CPU with PoCL | written on demand, not checked in |
 | Oracle | scalar, f64 accumulation | tests only |
 
+The standard-library-only portable core lives in `zig/lib/tile/src/` and is
+imported as `antfly_tile` by inference and vector search. Model adapters and
+native schedule generators remain here. File names in this table refer to
+the shared core.
+
 Primitives:
 
 | File | Primitive | Notes |
 | --- | --- | --- |
 | `tile.zig`, `cpu.zig`, `gpu.zig` | `RowReduce` | per-element masks, argmax / log-sum-exp channels (logits post-processing) |
-| `gemm.zig` | `Gemm` | `x · wᵀ` with an `FExpr` epilogue: bias, GELU, residual, scaling fuse into the store |
-| `norm.zig` | `LayerNorm` | two-pass mean / variance per row |
+| `gemm.zig` | `Gemm` | `x · wᵀ` with an `FExpr` epilogue: bias, GELU/SiLU, gating, residual, explicit F16/BF16 rounding fuse into the store |
+| `norm.zig` | `LayerNorm`, RMSNorm | separate centered and uncentered reductions; strict fused residual schedule |
 | `attention.zig` | `Attention` | flash-style online softmax; self, causal (KV cache) and cross attention |
-| `layout.zig` | `Im2col`, `Embed` | conv-as-GEMM unrolling; token + position gather |
+| `layout.zig` | `Im2col`, `Embed` | typed strided copy/gather/split/packing; conv unrolling; token + position gather |
 | `fexpr.zig`, `vmath.zig` | epilogues, math | `exp`/`erf`/GELU polynomials shared by all backends |
 
 `gpu_model.zig` renders the model primitives and documents their GPU launch
 contract (binding order, params struct, grid, threads).
+
+## Shared operation contracts
+
+CPU inference uses the shared ordered suppression, SiLU expression, RMS and
+residual-RMS schedules, typed row gather/split, and masked pooling. Vector
+search uses the unchanged four-accumulator dot schedule; Metal k-means embeds
+the generated distance helper. Its direct squared-difference L2 and scalar
+accumulation order remain distinct from the SIMD dot schedule.
+
+Epilogues can place explicit F16/BF16 rounding between bias, activation,
+gating and residual stages. Gate/up and skip residual are separate operands.
+Native GEMMs can consume named operands through `FExpr.renderInputs` and
+`evalVecInputs`, or the existing `renderWith`/`evalVecWith` adapters while retaining their tuned tensor-core/SIMD loops and math.
+The portable GPU GEMM remains a conformance/prototype schedule; production
+GEMMs are not switched to it by these contracts.
+
+`layout.Rows` specifies element offsets and strides. CPU copy/gather validates
+all geometry and indices before storing; GPU callers use `prepareCopy` to validate the same
+views, ids, flattened count and launch geometry before launch. Source/destination must not overlap. GPU copy
+params contain eight 64-bit fields in declaration order, with an optional
+u32 row-id buffer. RMS uses `antfly_tile_norm_params` with rows/dim and one
+threadgroup per row; masked mean uses the same params and one thread per
+column, with a positive i32 token mask. Empty masked selections return zero.
+
+```sh
+zig build test-tile-kernels test-linalg check-kernel-ownership
+zig build tile-kernel-codegen -- --emit-portable /tmp/tile-contracts.metal
+# From zig/pkg/inference, compile the retained hardware checker:
+TMPDIR=/private/tmp clang -O3 -fobjc-arc -framework Foundation -framework Metal \
+  -framework MetalPerformanceShaders scripts/check_metal_tile_programs.m -o /tmp/tile-check
+/tmp/tile-check --portable /tmp/tile-contracts.metal
+# .cu and .cl extensions select CUDA and OpenCL conformance programs.
+```
 
 ## Whisper end to end
 

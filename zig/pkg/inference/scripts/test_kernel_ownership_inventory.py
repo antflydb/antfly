@@ -70,6 +70,17 @@ class OwnershipInventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate native ownership"):
             ownership.verify(self.root, duplicate)
 
+    def test_shared_generated_owner_is_tracked_without_allowing_arbitrary_siblings(self):
+        header = self.root / "zig/lib/vectorindex/src/kmeans_distance.msl.h"
+        header.parent.mkdir(parents=True)
+        header.write_bytes(b"shared distance")
+        name = "../../lib/vectorindex/src/kmeans_distance.msl.h"
+        entry = {"output": name, "family_region": name, "owner": "generated_file", **ownership.fingerprint(header.read_bytes())}
+        self.assertEqual(ownership.verify(self.root, {"schema": 1, "native_regions": [entry]})["verification"]["regions_and_files"], 1)
+        entry["output"] = "../../lib/vectorindex/src/unowned.h"
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            ownership.verify(self.root, {"schema": 1, "native_regions": [entry]})
+
     def test_rejects_overlap_and_unclosed_markers(self):
         for data in (b"// tile-codegen:begin a family\n", b"// tile-codegen:begin a family\n// quant-kernel-codegen:begin b\n", b"// tile-codegen:begin a family\n// tile-codegen:end b family\n"):
             with self.assertRaises(ValueError):

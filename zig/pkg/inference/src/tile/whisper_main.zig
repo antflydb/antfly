@@ -28,7 +28,7 @@
 const std = @import("std");
 const audio = @import("inference_audio");
 const whisper = @import("whisper_model.zig");
-const parallel = @import("parallel.zig");
+const parallel = @import("antfly_tile").parallel;
 
 /// <|startoftranscript|><|en|><|transcribe|><|notimestamps|>
 const prompt = [_]u32{ 50258, 50259, 50359, 50363 };

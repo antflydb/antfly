@@ -347,14 +347,29 @@ pub fn build(b: *std.Build) void {
     const quant_kernel_codegen_step = b.step("quant-kernel-codegen", "Verify dev-generated quant kernel sources are fresh");
     quant_kernel_codegen_step.dependOn(&quant_kernel_codegen_check.step);
 
-    // Tile kernels (prototype, src/tile/): one Zig description lowered to
+    // Shared Tile kernels (lib/tile), with inference adapters in src/tile:
+    // one Zig description lowered to
     // CPU @Vector code, Metal and CUDA. Host-only; no GPU needed.
+    const host_tile_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ shared_lib_root, "lib/tile/src/mod.zig" })),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
     const tile_kernel_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = workflow_ctx.path("src/tile/tests.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     }) });
-    b.step("test-tile-kernels", "Check tile kernel lowerings against the scalar reference").dependOn(&b.addRunArtifact(tile_kernel_tests).step);
+    const shared_tile_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ shared_lib_root, "lib/tile/src/tests.zig" })),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    const shared_tile_tests_run = b.addRunArtifact(shared_tile_tests);
+    tile_kernel_tests.root_module.addImport("antfly_tile", host_tile_mod);
+    const tile_tests_step = b.step("test-tile-kernels", "Check tile kernel lowerings against the scalar reference");
+    tile_tests_step.dependOn(&b.addRunArtifact(tile_kernel_tests).step);
+    tile_tests_step.dependOn(&shared_tile_tests_run.step);
     const tile_kernel_codegen_exe = b.addExecutable(.{
         .name = "antfly-tile-kernel-codegen",
         .root_module = b.createModule(.{
@@ -363,6 +378,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .debug,
         }),
     });
+    tile_kernel_codegen_exe.root_module.addImport("antfly_tile", host_tile_mod);
     const tile_kernel_codegen_run = workflow_ctx.addRunArtifact(tile_kernel_codegen_exe);
     tile_kernel_codegen_run.addPassthruArgs();
     b.step("tile-kernel-codegen", "Verify (or --write) sources rendered from tile kernels").dependOn(&tile_kernel_codegen_run.step);
@@ -398,6 +414,11 @@ pub fn build(b: *std.Build) void {
             .optimize = if (optimize == .debug) .fast else optimize,
         }),
     });
+    tile_whisper_exe.root_module.addImport("antfly_tile", b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ shared_lib_root, "lib/tile/src/mod.zig" })),
+        .target = tile_whisper_target,
+        .optimize = if (optimize == .debug) .fast else optimize,
+    }));
     tile_whisper_exe.root_module.addImport("inference_audio", runtime_graph.inference_audio_mod);
     b.step("check-tile-whisper", "Compile the prototype CPU Whisper CLI without model fixtures").dependOn(&tile_whisper_exe.step);
     const tile_whisper_run = b.addRunArtifact(tile_whisper_exe);
@@ -2050,6 +2071,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    linalg_tests.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     runtime_build.addX86Kernels(
         b,
         linalg_tests.root_module,

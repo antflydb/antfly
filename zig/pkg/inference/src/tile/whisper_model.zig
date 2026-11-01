@@ -24,13 +24,13 @@
 //! flatten to the [out, in * k] the im2col GEMM takes.
 
 const std = @import("std");
-const fexpr = @import("fexpr.zig");
-const gemm = @import("gemm.zig");
-const norm = @import("norm.zig");
-const attention = @import("attention.zig");
-const layout = @import("layout.zig");
-const tile = @import("tile.zig");
-const cpu = @import("cpu.zig");
+const fexpr = @import("antfly_tile").fexpr;
+const gemm = @import("antfly_tile").gemm;
+const norm = @import("antfly_tile").norm;
+const attention = @import("antfly_tile").attention;
+const layout = @import("antfly_tile").layout;
+const tile = @import("antfly_tile").tile;
+const cpu = @import("antfly_tile").cpu;
 const whisper_logits = @import("whisper_logits.zig");
 
 const acc = fexpr.acc;

@@ -17,9 +17,9 @@
 //! Run with `zig build test-tile-kernels`.
 
 const std = @import("std");
-const tile = @import("tile.zig");
-const cpu = @import("cpu.zig");
-const gpu = @import("gpu.zig");
+const tile = @import("antfly_tile").tile;
+const cpu = @import("antfly_tile").cpu;
+const gpu = @import("antfly_tile").gpu;
 const whisper = @import("whisper_logits.zig");
 
 const k = whisper.kernel;
@@ -189,12 +189,12 @@ test "tile cpu vexp matches @exp" {
 
 // ---- Model primitives (GEMM, LayerNorm, attention, data movement) ----
 
-const fexpr = @import("fexpr.zig");
-const vmath = @import("vmath.zig");
-const gemm = @import("gemm.zig");
-const norm = @import("norm.zig");
-const attention = @import("attention.zig");
-const layout = @import("layout.zig");
+const fexpr = @import("antfly_tile").fexpr;
+const vmath = @import("antfly_tile").vmath;
+const gemm = @import("antfly_tile").gemm;
+const norm = @import("antfly_tile").norm;
+const attention = @import("antfly_tile").attention;
+const layout = @import("antfly_tile").layout;
 
 fn fill(rng: std.Random, xs: []f32, scale: f32) void {
     for (xs) |*x| x.* = (rng.float(f32) - 0.5) * 2 * scale;

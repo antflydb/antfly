@@ -42,6 +42,9 @@ pub const Gemm = struct {
     pub fn usesBias(comptime g: Gemm) bool {
         return g.epilogue.uses(.bias);
     }
+    pub fn usesGate(comptime g: Gemm) bool {
+        return g.epilogue.uses(.gate);
+    }
     pub fn usesResidual(comptime g: Gemm) bool {
         return g.epilogue.uses(.residual);
     }
@@ -52,6 +55,7 @@ pub const Args = struct {
     w: []const f32,
     bias: []const f32 = &.{},
     /// Pointer, not slice, so it may alias `out`.
+    gate: ?[*]const f32 = null,
     residual: ?[*]const f32 = null,
     out: [*]f32,
     m: usize,
@@ -71,7 +75,8 @@ pub fn reference(comptime g: Gemm, a: Args) void {
         for (0..a.k) |kk| s += @as(f64, a.x[i * a.k + kk]) * a.w[j * a.k + kk];
         const b: f64 = if (g.usesBias()) a.bias[j] else 0;
         const r: f64 = if (g.usesResidual()) a.residual.?[i * a.n + j] else 0;
-        a.out[i * a.n + j] = @floatCast(g.epilogue.evalF64(s, b, r));
+        const gate: f64 = if (g.usesGate()) a.gate.?[i * a.n + j] else 0;
+        a.out[i * a.n + j] = @floatCast(g.epilogue.evalF64Inputs(.{ .value = s, .bias = b, .gate = gate, .residual = r }));
     };
 }
 
@@ -124,6 +129,10 @@ fn rangeRows(comptime g: Gemm, a: Args, m0: usize, m1: usize, n0: usize, n1: usi
 
 /// MR x NR outputs; K vectorized 16 wide with one accumulator per output.
 inline fn block(comptime g: Gemm, comptime mr: usize, comptime nr: usize, a: Args, row0: usize, col0: usize) void {
+    @setEvalBranchQuota(20_000);
+    const use_bias = comptime g.usesBias();
+    const use_gate = comptime g.usesGate();
+    const use_residual = comptime g.usesResidual();
     var acc: [mr][nr]V = @splat(@splat(@splat(0)));
     var kk: usize = 0;
     while (kk + lanes <= a.k) : (kk += lanes) {
@@ -139,15 +148,17 @@ inline fn block(comptime g: Gemm, comptime mr: usize, comptime nr: usize, a: Arg
         var sums: @Vector(nr, f32) = undefined;
         var bias: @Vector(nr, f32) = @splat(0);
         var res: @Vector(nr, f32) = @splat(0);
+        var gate: @Vector(nr, f32) = @splat(0);
         inline for (0..nr) |c| {
             var s = @reduce(.Add, acc[r][c]);
             var t = kk;
             while (t < a.k) : (t += 1) s += a.x[(row0 + r) * a.k + t] * a.w[(col0 + c) * a.k + t];
             sums[c] = s;
-            if (comptime g.usesBias()) bias[c] = a.bias[col0 + c];
-            if (comptime g.usesResidual()) res[c] = a.residual.?[(row0 + r) * a.n + col0 + c];
+            if (use_bias) bias[c] = a.bias[col0 + c];
+            if (use_gate) gate[c] = a.gate.?[(row0 + r) * a.n + col0 + c];
+            if (use_residual) res[c] = a.residual.?[(row0 + r) * a.n + col0 + c];
         }
-        const y = g.epilogue.evalVec(nr, sums, bias, res);
+        const y = g.epilogue.evalVecInputs(nr, fexpr.DefaultMath, .{ .value = sums, .bias = bias, .gate = gate, .residual = res });
         inline for (0..nr) |c| a.out[(row0 + r) * a.n + col0 + c] = y[c];
     }
 }

@@ -292,6 +292,7 @@ SOURCE_MODULES = {
     "antfly_storage_root": ("zig/pkg/antfly-embedded/src/capi_embedded_root.zig",),
     "antfly_synthesizing": ("zig/lib/synthesizing/src/mod.zig",),
     "antfly_transcribing": ("zig/lib/transcribing/src/mod.zig",),
+    "antfly_tile": ("zig/lib/tile/src/mod.zig",),
     "antfly_vector": ("zig/lib/vector/src/mod.zig",),
     "antfly_vectorindex": ("zig/lib/vectorindex/src/mod.zig",),
     "bloom": ("zig/lib/bloom/src/mod.zig",),

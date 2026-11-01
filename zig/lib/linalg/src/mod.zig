@@ -396,25 +396,7 @@ pub fn meanPool(
     hidden: usize,
 ) ![]f32 {
     const result = try allocator.alloc(f32, batch * hidden);
-    @memset(result, 0.0);
-
-    for (0..batch) |b| {
-        var count: f32 = 0.0;
-        for (0..seq_len) |s| {
-            if (attention_mask[b * seq_len + s] > 0) {
-                const offset = (b * seq_len + s) * hidden;
-                for (0..hidden) |h| {
-                    result[b * hidden + h] += hidden_states[offset + h];
-                }
-                count += 1.0;
-            }
-        }
-        if (count > 0.0) {
-            for (0..hidden) |h| {
-                result[b * hidden + h] /= count;
-            }
-        }
-    }
+    for (0..batch) |b| @import("antfly_tile").norm.maskedMeanTyped(primitives.vec_len, i32, hidden_states[b * seq_len * hidden ..][0 .. seq_len * hidden], attention_mask[b * seq_len ..][0..seq_len], result[b * hidden ..][0..hidden], seq_len, hidden);
 
     return result;
 }

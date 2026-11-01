@@ -36,6 +36,11 @@ pub fn createCodegen(ctx: Context) CreateCodegenResult {
             .link_libc = true,
         }),
     });
+    quant_kernel_codegen_exe.root_module.addImport("antfly_tile", b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/tile/src/mod.zig" })),
+        .target = b.graph.host,
+        .optimize = .safe,
+    }));
     const quant_kernel_codegen_check = ctx.addRunArtifact(quant_kernel_codegen_exe);
     quant_kernel_codegen_check.addPassthruArgs();
     const quant_kernel_codegen_test_check = ctx.addRunArtifact(quant_kernel_codegen_exe);

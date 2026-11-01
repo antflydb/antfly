@@ -442,3 +442,17 @@ fn escape(comptime s: []const u8) []const u8 {
     };
     return out;
 }
+
+/// A literal macro can be embedded in an Objective-C/CUDA source factory.
+pub fn sourceMacro(comptime name: []const u8, comptime source: []const u8) []const u8 {
+    @setEvalBranchQuota(2_000_000);
+    var out: []const u8 = license_header ++ "// Generated from zig/lib/tile. Do not edit.\n#define " ++ name ++ " \\\n";
+    var start: usize = 0;
+    for (source, 0..) |ch, i| {
+        if (ch != '\n') continue;
+        out = out ++ "    \"" ++ escape(source[start..i]) ++ "\\n\"" ++ (if (i + 1 < source.len) " \\\n" else "\n");
+        start = i + 1;
+    }
+    if (start < source.len) out = out ++ "    \"" ++ escape(source[start..]) ++ "\"\n";
+    return out;
+}

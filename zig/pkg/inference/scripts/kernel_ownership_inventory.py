@@ -61,8 +61,8 @@ def verify(root, inventory):
     package = (root / "zig/pkg/inference").resolve()
     def path(name):
         result = (package / name).resolve()
-        if not result.is_relative_to(package):
-            raise ValueError("inventory path escapes inference package")
+        if not result.is_relative_to(package) and not result.is_relative_to((root / "zig/lib/tile").resolve()) and result != (root / "zig/lib/vectorindex/src/kmeans_distance.msl.h").resolve():
+            raise ValueError("inventory path escapes owned kernel sources")
         return result
     indexed = {}
     outputs = {}

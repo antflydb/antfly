@@ -690,8 +690,8 @@ test "device grammar state follows ruleWindow token by token" {
 test "tile-generated logits statistics match hostLogitsStats" {
     // The tile RowReduce in src/tile/whisper_logits.zig is the single source
     // for the generated CPU, Metal and CUDA kernels; keep it on this contract.
-    const tile = @import("../tile/tile.zig");
-    const tile_cpu = @import("../tile/cpu.zig");
+    const tile = @import("antfly_tile").tile;
+    const tile_cpu = @import("antfly_tile").cpu;
     const tile_whisper = @import("../tile/whisper_logits.zig");
     const k = tile_whisper.kernel;
 

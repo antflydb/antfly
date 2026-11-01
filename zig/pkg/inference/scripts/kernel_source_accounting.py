@@ -208,7 +208,7 @@ def account(root, baseline):
             row['groups'].append(add('documentation', a, b))
         elif '/scripts/' in name or '/bench/' in name or '/tools/' in name or '/testing/' in name or (name == 'zig/pkg/inference/build.zig') or name.endswith('/quant_kernel_metal_runtime_check.zig'):
             row['groups'].append(add('tests_and_benchmark_tooling', a, b))
-        elif '/generated/' in name:
+        elif '/generated/' in name or name.endswith('/kmeans_distance.msl.h'):
             row['groups'].append(add('generated', a, b))
         else:
             (a, ag) = managed(a)
@@ -243,7 +243,7 @@ def account(root, baseline):
                 group = 'authored_cuda_launch'
             elif name.endswith(('/native_compute.zig', '/cuda/cuda_compute.zig')):
                 group = 'authored_cpu_and_result_ownership'
-            elif '/src/tile/' in name:
+            elif '/src/tile/' in name or name.startswith('zig/lib/tile/'):
                 group = 'authored_tile_program_owners'
             elif '/graph/quant_kernel_' in name:
                 group = 'authored_generator_owners'

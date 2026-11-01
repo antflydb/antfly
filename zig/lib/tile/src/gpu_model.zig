@@ -22,7 +22,7 @@
 //!
 //! | kernel     | buffers                                  | params                                 | grid                         | threads            |
 //! |------------|------------------------------------------|----------------------------------------|------------------------------|--------------------|
-//! | GEMM       | x, w, [bias], [residual], out            | m, n, k                                | ceil(n/tile_n), ceil(m/tile_m) | `Gemm.threads()` |
+//! | GEMM       | x, w, [bias], [gate], [residual], out            | m, n, k                                | ceil(n/tile_n), ceil(m/tile_m) | `Gemm.threads()` |
 //! | LayerNorm  | x, gamma, beta, out                      | rows, dim                              | rows                         | `threads`          |
 //! | attention  | q, k, v, out                             | tq, tk, heads, ld_q/k/v/o, causal, q_offset, scale | ceil(tq/queries_per_block), heads | 32 * queries_per_block |
 //! | im2col     | x, out                                   | channels, t_in, t_out                  | ceil(t_out*channels*kernel / threads) | `threads`   |
@@ -149,6 +149,21 @@ fn structDecl(comptime l: L, comptime name: []const u8, comptime fields: []const
     return s ++ (if (l.lang == .opencl) " } " ++ name ++ ";\n" else " };\n");
 }
 
+/// Emit once per source module. Native GEMM schedules may use these same
+/// expression helpers at their stores without adopting the portable GEMM loop.
+pub fn epilogueHelpers(comptime e: fexpr.FExpr, comptime lang: Lang) []const u8 {
+    const l: L = .{ .lang = lang };
+    var s: []const u8 = "";
+    if (e.uses(.silu)) s = s ++ l.func() ++ " float antfly_tile_silu(float x) { return x / (1.0f + " ++ l.exp() ++ "(-x)); }\n";
+    if (e.uses(.round_f16)) s = s ++ l.pick(
+        "inline float antfly_tile_round_f16(float x) { return float(half(x)); }\n",
+        "#include <cuda_fp16.h>\nstatic __device__ __forceinline__ float antfly_tile_round_f16(float x) { return __half2float(__float2half_rn(x)); }\n",
+        "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\ninline float antfly_tile_round_f16(float x) { return convert_float(convert_half_rte(x)); }\n",
+    );
+    if (e.uses(.round_bf16)) s = s ++ l.func() ++ " float antfly_tile_round_bf16(float x) { " ++ l.uint() ++ " u = " ++ l.pick("as_type<uint>(x)", "__float_as_uint(x)", "as_uint(x)") ++ "; u = ((u & 0x7fffffffu) > 0x7f800000u) ? ((u & 0xffff0000u) | 0x00400000u) : ((u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u); return " ++ l.pick("as_type<float>(u)", "__uint_as_float(u)", "as_float(u)") ++ "; }\n";
+    return s;
+}
+
 /// Shared declarations: params structs and math helpers.
 pub fn preamble(comptime lang: Lang) []const u8 {
     const l: L = .{ .lang = lang };
@@ -192,6 +207,10 @@ pub fn renderGemm(comptime g: gemm.Gemm, comptime lang: Lang) []const u8 {
         var slot: usize = 2;
         if (g.usesBias()) {
             args = args ++ .{l.in("float", "bias", slot)};
+            slot += 1;
+        }
+        if (g.usesGate()) {
+            args = args ++ .{l.inAliased("float", "gate", slot)};
             slot += 1;
         }
         if (g.usesResidual()) {
@@ -254,7 +273,7 @@ pub fn renderGemm(comptime g: gemm.Gemm, comptime lang: Lang) []const u8 {
             .threads = threads,
             .barrier = l.barrier(),
             .fma = l.fma(),
-            .epilogue = g.epilogue.render("v", "bias[gc]", "residual[gr * p.n + gc]"),
+            .epilogue = g.epilogue.renderInputs(.{}, .{ .value = "v", .bias = "bias[gc]", .gate = "gate[gr * p.n + gc]", .residual = "residual[gr * p.n + gc]" }),
         });
         return s;
     }
@@ -274,6 +293,68 @@ fn blockSum(comptime l: L, comptime v: []const u8, comptime name: []const u8) []
         \\    }}
         \\
     , .{ .ws = l.warpSum(v), .barrier = l.barrier(), .u = l.uint(), .name = name });
+}
+
+/// Uncentered RMS reduction: one sum of squares, no mean/variance pass.
+pub fn renderRmsNorm(comptime rn: norm.RmsNorm, comptime lang: Lang) []const u8 {
+    comptime {
+        const l: L = .{ .lang = lang };
+        const u = l.uint();
+        if (rn.threads == 0 or rn.threads > 1024 or rn.threads % 32 != 0) @compileError("RMS threads must be a nonzero multiple of 32 up to 1024");
+        var s = l.kernel(rn.name, rn.threads, &.{ l.inAliased("float", "x", 0), l.in("float", "gamma", 1), l.out("out", 2), l.params("antfly_tile_norm_params", 3) }, &.{
+            "uint row [[threadgroup_position_in_grid]]",    "uint tid [[thread_index_in_threadgroup]]",
+            "uint lane [[thread_index_in_simdgroup]]",      "uint sg [[simdgroup_index_in_threadgroup]]",
+            "uint sg_count [[simdgroups_per_threadgroup]]",
+        });
+        s = s ++ l.ids(
+            "    const unsigned int row = blockIdx.x; const unsigned int tid = threadIdx.x;\n    const unsigned int lane = tid & 31u; const unsigned int sg = tid >> 5u; const unsigned int sg_count = (blockDim.x + 31u) >> 5u;\n",
+            fmt("    const uint row = get_group_id(0); const uint tid = get_local_id(0);\n    const uint lane = tid & 31u; const uint sg = tid >> 5u; const uint sg_count = (get_local_size(0) + 31u) >> 5u;\n    __local float wsum[{d}];\n", .{rn.threads}),
+        );
+        s = s ++ fmt("    {s} red[32];\n    if (row >= p.rows) return;\n    const {s} base = row * p.dim;\n    float q = 0.0f;\n    for ({s} c = tid; c < p.dim; c += {d}u) {{ const float v = x[base + c]; q += v * v; }}\n    float sq = 0.0f;\n", .{ l.shared(), u, u, rn.threads });
+        s = s ++ blockSum(l, "q", "sq");
+        s = s ++ fmt("    const float inv = {s}(sq / (float)p.dim + {e}f);\n    for ({s} c = tid; c < p.dim; c += {d}u) out[base + c] = (x[base + c] * inv) * gamma[c];\n}}\n", .{ l.rsqrt(), rn.eps, u, rn.threads });
+        return s;
+    }
+}
+
+/// One thread per output column; selected tokens accumulate in row order.
+/// Buffers x, mask (positive means included), out, params {rows, dim}.
+pub fn renderMaskedMean(comptime m: norm.MaskedMean, comptime lang: Lang) []const u8 {
+    comptime {
+        const l: L = .{ .lang = lang };
+        var s = l.kernel(m.name, m.threads, &.{ l.in("float", "x", 0), l.in("int", "mask", 1), l.out("out", 2), l.params("antfly_tile_norm_params", 3) }, &.{"uint gid [[thread_position_in_grid]]"});
+        s = s ++ globalId(l);
+        s = s ++ fmt("    if (gid >= p.dim) return;\n    float sum = 0.0f, count = 0.0f;\n    for ({s} r = 0; r < p.rows; ++r) {{ if (mask[r] > 0) {{ sum += x[r * p.dim + gid]; count += 1.0f; }} }}\n    out[gid] = count > 0.0f ? sum / count : 0.0f;\n}}\n", .{l.uint()});
+        return s;
+    }
+}
+
+/// Typed strided copy/gather. Host validates all views/indices before launch;
+/// GPU offsets use 64 bits to avoid overflowing flattened tensor addresses.
+/// Buffers: src, [ids], dst, params. Grid ceil(rows*cols/threads).
+pub fn renderCopy(comptime c: layout.Copy, comptime lang: Lang) []const u8 {
+    comptime {
+        const l: L = .{ .lang = lang };
+        const ty = switch (c.element) {
+            .f32 => "float",
+            .f16 => l.pick("half", "__half", "half"),
+            .u32 => l.uint(),
+            .i32 => "int",
+        };
+        const address = l.pick("ulong", "unsigned long long", "ulong");
+        const params_name = c.name ++ "_params";
+        var s: []const u8 = if (c.element == .f16) l.pick("", "#include <cuda_fp16.h>\n", "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n") else "";
+        s = s ++ structDecl(l, params_name, &.{ .{ address, "rows" }, .{ address, "cols" }, .{ address, "src_offset" }, .{ address, "src_row_stride" }, .{ address, "src_col_stride" }, .{ address, "dst_offset" }, .{ address, "dst_row_stride" }, .{ address, "dst_col_stride" } });
+        var args: []const []const u8 = &.{l.in(ty, "src", 0)};
+        if (c.gather) args = args ++ .{l.in("uint", "ids", 1)};
+        const slot = if (c.gather) 2 else 1;
+        const output = l.pick(fmt("device {s} *dst [[buffer({d})]]", .{ ty, slot }), fmt("{s} *dst", .{ty}), fmt("__global {s} *dst", .{ty}));
+        s = s ++ l.kernel(c.name, c.threads, args ++ .{ output, l.params(params_name, slot + 1) }, &.{ "uint group [[threadgroup_position_in_grid]]", "uint tid [[thread_index_in_threadgroup]]" });
+        s = s ++ l.pick(fmt("    const ulong gid = (ulong)group * {d}ul + tid;\n", .{c.threads}), "", "");
+        s = s ++ l.ids("    const unsigned long long gid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n", "    const ulong gid = get_global_id(0);\n");
+        s = s ++ fmt("    if (gid >= p.rows * p.cols) return;\n    const {s} row = gid / p.cols, col = gid % p.cols;\n    const {s} sr = {s};\n    dst[p.dst_offset + row * p.dst_row_stride + col * p.dst_col_stride] = src[p.src_offset + sr * p.src_row_stride + col * p.src_col_stride];\n}}\n", .{ address, address, if (c.gather) "ids[row]" else "row" });
+        return s;
+    }
 }
 
 pub fn renderLayerNorm(comptime ln: norm.LayerNorm, comptime lang: Lang) []const u8 {
@@ -399,6 +480,20 @@ pub fn renderModule(comptime kernels: type, comptime lang: Lang, comptime title:
     comptime {
         @setEvalBranchQuota(2_000_000);
         var s: []const u8 = gpu.license_header ++ "// Generated by `zig build tile-kernel-codegen -- --write` from " ++ title ++ ". Do not edit.\n\n" ++ preamble(lang);
+        var has_silu = false;
+        var has_f16 = false;
+        var has_bf16 = false;
+        for (std.meta.declarations(kernels)) |decl_name| {
+            const k = @field(kernels, decl_name);
+            if (@TypeOf(k) == gemm.Gemm) {
+                has_silu = has_silu or k.epilogue.uses(.silu);
+                has_f16 = has_f16 or k.epilogue.uses(.round_f16);
+                has_bf16 = has_bf16 or k.epilogue.uses(.round_bf16);
+            }
+        }
+        if (has_silu) s = s ++ epilogueHelpers(fexpr.acc.siluOf(), lang);
+        if (has_f16) s = s ++ epilogueHelpers(fexpr.acc.roundF16(), lang);
+        if (has_bf16) s = s ++ epilogueHelpers(fexpr.acc.roundBf16(), lang);
         for (std.meta.declarations(kernels)) |decl_name| {
             const k = @field(kernels, decl_name);
             const T = @TypeOf(k);
@@ -406,6 +501,12 @@ pub fn renderModule(comptime kernels: type, comptime lang: Lang, comptime title:
                 renderGemm(k, lang)
             else if (T == norm.LayerNorm)
                 renderLayerNorm(k, lang)
+            else if (T == norm.RmsNorm)
+                renderRmsNorm(k, lang)
+            else if (T == norm.MaskedMean)
+                renderMaskedMean(k, lang)
+            else if (T == layout.Copy)
+                renderCopy(k, lang)
             else if (T == attention.Attention)
                 renderAttention(k, lang)
             else if (T == layout.Im2col)

@@ -31,6 +31,7 @@ fn createCpuComputeModule(ctx: Context, source: []const u8) *std.Build.Module {
             .{ .name = "ml", .module = ctx.graph.ml_mod },
             .{ .name = "antfly_platform", .module = ctx.graph.platform_mod },
             .{ .name = "inference_linalg", .module = ctx.graph.inference_linalg_mod },
+            .{ .name = "antfly_tile", .module = ctx.graph.tile_mod },
         },
     });
     module.addOptions("build_options", runtime_build.addBuildOptions(ctx.b, .{
@@ -75,6 +76,7 @@ pub fn addTrainingAndLinalg(ctx: Context) void {
     const training_bench_step = ctx.step("bench-training", "Run the native training benchmark");
     training_bench_step.dependOn(&run_training_bench.step);
     linalg_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    linalg_bench_exe.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     const run_linalg_bench = ctx.addRunArtifact(linalg_bench_exe);
     run_linalg_bench.addPassthruArgs();
     const linalg_bench_step = ctx.step("bench-linalg", "Run the shared linalg benchmark");
@@ -95,6 +97,7 @@ pub fn addGliner(ctx: Context) void {
     gliner2_bench_exe.root_module.addImport("ml", ctx.graph.ml_mod);
     if (ctx.graph.pjrt_mod) |pjrt| gliner2_bench_exe.root_module.addImport("pjrt", pjrt);
     gliner2_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    gliner2_bench_exe.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     gliner2_bench_exe.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
     gliner2_bench_exe.root_module.addImport("antfly_image", ctx.graph.image_mod);
     gliner2_bench_exe.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
@@ -168,6 +171,7 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         .inference_tokenizer_mod = ctx.graph.inference_tokenizer_mod,
         .inference_hf_tokenizer_mod = ctx.graph.inference_hf_tokenizer_mod,
         .inference_linalg_mod = ctx.graph.inference_linalg_mod,
+        .tile_mod = ctx.graph.tile_mod,
         .inference_fixed_tokenizer_data_mod = ctx.graph.inference_fixed_tokenizer_data_mod,
         .jsonschema_mod = ctx.graph.jsonschema_mod,
         .scraping_mod = ctx.graph.scraping_mod,
@@ -192,6 +196,7 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         const pjrt = if (artifact.kind.isTest()) ctx.graph.qualification_pjrt_mod else ctx.graph.pjrt_mod;
         if (pjrt) |module| artifact.root_module.addImport("pjrt", module);
         artifact.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+        artifact.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
         artifact.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
         artifact.root_module.addImport("antfly_image", ctx.graph.image_mod);
         artifact.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
@@ -221,6 +226,7 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
     });
     decide_bench.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
     decide_bench.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    decide_bench.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     decide_bench.root_module.link_libc = true;
     ctx.step("bench-gliner25-decide-build", "Build the loaded-model GLiNER2.5-Decide request benchmark").dependOn(&b.addInstallArtifact(decide_bench, .{}).step);
     const decide_quant_bench = b.addExecutable(.{
@@ -255,6 +261,7 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
     gliner25_cpu_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
     gliner25_cpu_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
     gliner25_cpu_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    gliner25_cpu_bench_exe.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     // The imported native runtime owns backend and BLAS linkage.
     gliner25_cpu_bench_exe.root_module.link_libc = true;
     const install_gliner25_cpu_bench = b.addInstallArtifact(gliner25_cpu_bench_exe, .{});
@@ -272,6 +279,7 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
     gliner25_cuda_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
     gliner25_cuda_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
     gliner25_cuda_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    gliner25_cuda_bench_exe.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     gliner25_cuda_bench_exe.root_module.link_libc = true;
     const install_gliner25_cuda_bench = b.addInstallArtifact(gliner25_cuda_bench_exe, .{});
     ctx.step("bench-gliner25-cuda-build", "Build the GLiNER2.5 CUDA direct-core worker (requires CUDA and ReleaseFast)").dependOn(&install_gliner25_cuda_bench.step);

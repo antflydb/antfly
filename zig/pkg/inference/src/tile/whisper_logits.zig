@@ -24,7 +24,7 @@
 //! (`ANTFLY_TILE_WHISPER_LOGITS=1`); the hand-written reduce kernel, which
 //! also chooses the token and advances the grammar, is unchanged.
 
-const tile = @import("tile.zig");
+const tile = @import("antfly_tile").tile;
 
 const index = tile.index;
 const param = tile.param;

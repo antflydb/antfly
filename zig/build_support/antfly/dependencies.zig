@@ -94,6 +94,7 @@ pub const Shared = struct {
     platform_mod: *std.Build.Module,
     objectstore_mod: *std.Build.Module,
     google_mod: *std.Build.Module,
+    tile_mod: *std.Build.Module,
     vector_mod: *std.Build.Module,
     hash_mod: *std.Build.Module,
     hash_bench_mod: *std.Build.Module,
@@ -510,12 +511,18 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    const tile_mod = b.createModule(.{
+        .root_source_file = b.path("lib/tile/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const vector_mod = b.createModule(.{
         .root_source_file = b.path("lib/vector/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
     vector_mod.addImport("protobuf", protobuf_mod);
+    vector_mod.addImport("antfly_tile", tile_mod);
     const hash_mod = b.createModule(.{
         .root_source_file = b.path("lib/hash/src/mod.zig"),
         .target = target,
@@ -795,6 +802,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .skip_openapi = false,
         },
         .shared = .{
+            .tile = tile_mod,
             .build_info_mod = build_info.module,
             .build_info_object = build_info.object,
             .tokenizer_mod = tokenizer.tokenizer,
@@ -1450,6 +1458,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .platform_mod = platform_mod,
         .objectstore_mod = objectstore_mod,
         .google_mod = google_mod,
+        .tile_mod = tile_mod,
         .vector_mod = vector_mod,
         .hash_mod = hash_mod,
         .hash_bench_mod = hash_bench_mod,
