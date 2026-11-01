@@ -830,7 +830,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "aggregation full-result capture survives a later primary write",
             "aggregation selection and rerun share a read lease without repeating the raft barrier",
             "local query provider returns complete aggregations and preserves the requested hit page",
-            "aggregation domain",
             "aggregation full-result rerun counts text matches and each vector window without changing ranked page",
             "provisioned single-group queries retain coordinator-owned finalization",
             "provisioned query delegates single-group physical execution to local read source",
@@ -1176,7 +1175,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "aggregation full-result capture survives a later primary write",
             "aggregation selection and rerun share a read lease without repeating the raft barrier",
             "local query provider returns complete aggregations and preserves the requested hit page",
-            "aggregation domain",
             "aggregation full-result rerun counts text matches and each vector window without changing ranked page",
             "provisioned single-group queries retain coordinator-owned finalization",
             "provisioned query delegates single-group physical execution to local read source",
@@ -1680,10 +1678,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_aggregation_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-aggregation-tests",
         .root_module = api_table_reads_docid_test_mod,
-        .filters = &.{ "aggregation-only collection", "aggregation completeness", "aggregation context", "aggregation full-result rerun", "aggregation domain", "encode vector-only query does not create a match-all text component", "api query contract keeps filter carriers out of vector fusion" },
+        .filters = &.{ "aggregation-only collection", "aggregation completeness", "aggregation context", "aggregation full-result rerun", "encode vector-only query does not create a match-all text component", "api query contract keeps filter carriers out of vector fusion" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-aggregation-test", "Run captured aggregation collection, completeness and generation regressions").dependOn(&api_aggregation_tests.run(b).step);
+    // Pure domain tests have one small compiler owner, shared by manual API
+    // gates and the normal unit aggregate instead of repeated API roots.
+    inline for (.{ "antfly-api-aggregation-test", "antfly-api-table-read-test" }) |name|
+        b.top_level_steps.get(name).?.step.dependOn(&b.top_level_steps.get("aggregation-plan-test").?.step);
     const rewrite_admission_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn rewrite admission", "relational integrity restore staging rewrite intent" },

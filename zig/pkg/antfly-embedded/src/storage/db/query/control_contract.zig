@@ -253,32 +253,19 @@ pub fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {
         req.reranker != null;
 }
 
-pub fn componentPaging(req: types.SearchRequest) ComponentPaging {
-    var limit = if (req.reranker) |reranker|
-        reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset
-    else
-        req.limit +| req.offset;
-    const needs_component_window = requestHasPostprocessPageTransforms(req);
-
-    if (!needs_component_window) {
-        return .{
-            .offset = req.offset,
-            .limit = req.limit,
-        };
-    }
-
-    if (req.merge_config) |merge_config| {
-        if (merge_config.window_size > limit) limit = merge_config.window_size;
-    }
-    if (req.reranker) |reranker| {
-        const reranker_window = reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset;
-        if (reranker_window > limit) limit = reranker_window;
-    }
-
+pub fn pagingPlanInput(req: types.SearchRequest) @import("paging_plan.zig").Input {
     return .{
-        .offset = 0,
-        .limit = limit,
+        .offset = req.offset,
+        .limit = req.limit,
+        .merge_window = if (req.merge_config) |config| config.window_size else null,
+        .reranking = if (req.reranker) |config| .{ .candidate_count = config.candidate_count, .top_n = config.top_n } else null,
+        .has_pruner = req.pruner != null,
     };
+}
+
+pub fn componentPaging(req: types.SearchRequest) ComponentPaging {
+    const result = @import("paging_plan.zig").componentPaging(pagingPlanInput(req));
+    return .{ .offset = result.offset, .limit = result.limit };
 }
 
 pub fn pagingCandidateWindow(paging: ComponentPaging) u32 {

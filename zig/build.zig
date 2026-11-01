@@ -1108,6 +1108,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     b.step("antfly-storage-owner-test", "Run real compiled storage owner ABI regressions").dependOn(&storage_owner_runs.runs[0].step);
     b.step("antfly-storage-owner-source-test", "Run compiled owner source and callback regressions").dependOn(&storage_owner_runs.runs[1].step);
     owner_tests.storage_test_step.dependOn(&b.top_level_steps.get("local-query-contract-test").?.step);
+    owner_tests.unit_test_step.dependOn(&b.top_level_steps.get("aggregation-plan-test").?.step);
+    owner_tests.unit_test_step.dependOn(&b.top_level_steps.get("query-paging-test").?.step);
     owner_tests.integration_test_step.dependOn(&b.top_level_steps.get("local-query-contract-test").?.step);
     for (storage_owner_runs.runs) |run| {
         owner_tests.storage_test_step.dependOn(&run.step);

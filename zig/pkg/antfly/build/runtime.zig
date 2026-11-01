@@ -258,6 +258,18 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         }
     }
 
+    // Install the exact production owners for emitted-code attribution. This
+    // reuses their compiler steps; it does not create a second build profile.
+    const archive_step = b.step("runtime-archives", "Install all production runtime and physical owner archives for attribution");
+    for (runtime_library_artifacts) |artifact| if (artifact) |owner|
+        archive_step.dependOn(&b.addInstallArtifact(owner, .{}).step);
+    if (options.native_storage) |owner| {
+        archive_step.dependOn(&b.addInstallArtifact(owner, .{}).step);
+        b.step("runtime-unit-storage-engine", "Compile only the shared physical storage engine").dependOn(&owner.step);
+    }
+    archive_step.dependOn(&b.addInstallArtifact(options.native_inference, .{}).step);
+    b.step("runtime-unit-inference-core", "Compile only the shared physical inference engine").dependOn(&options.native_inference.step);
+
     const query_archives = b.step("query-owner-archives", "Install the independently compiled storage adapter and complete query owner archives");
     inline for (.{ .storage_kernel, .local_query }) |unit| {
         query_archives.dependOn(&b.addInstallArtifact(runtime_library_artifacts[@backingInt(@as(RuntimeLibraryUnit, unit))].?, .{}).step);

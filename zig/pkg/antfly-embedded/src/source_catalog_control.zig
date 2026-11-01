@@ -50,6 +50,7 @@ pub const api_public_embedding_query = @import("api/public_embedding_query.zig")
 pub const api_public_query_string = @import("api/public_query_string.zig");
 pub const api_public_search_request = @import("api/public_search_request.zig");
 pub const api_public_text_query = @import("api/public_text_query.zig");
+pub const api_aggregation_plan = @import("api/aggregation_plan.zig");
 pub const api_query = @import("api/query.zig");
 pub const api_query_contract = @import("api/query_contract.zig");
 pub const api_query_response = @import("api/query_response.zig");

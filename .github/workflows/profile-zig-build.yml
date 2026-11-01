@@ -7,7 +7,7 @@ on:
       step:
         type: choice
         default: memory-test
-        options: [memory-test, unit-storage-compile, architecture-probe-test, local-query-contract-test, local-query-owner-test, antfly-storage-owner-test, runtime-unit-local_query, antfly]
+        options: [memory-test, unit-storage-compile, architecture-probe-test, local-query-contract-test, local-query-owner-test, opaque-query-consumer-compile, opaque-query-owner-test, aggregation-plan-test, query-paging-test, mutation-plan-test, antfly-storage-owner-test, runtime-unit-local_query, runtime-unit-api_kernel, runtime-unit-storage-engine, runtime-unit-inference-core, runtime-archives, antfly]
       optimize:
         type: choice
         default: debug
@@ -53,7 +53,7 @@ jobs:
       - name: Verify diagnostic attribution
         run: |
           python3 -m unittest discover -s scripts -p 'test_*zig*memory.py'
-          python3 -m unittest discover -s scripts -p test_report_zig_binary_size.py
+          python3 -m unittest discover -s scripts -p 'test_report_zig_*.py'
       - name: Record exact experiment profile
         env:
           BUILD_STEP: ${{ inputs.step }}
@@ -79,6 +79,24 @@ jobs:
           scripts/diagnose-zig-build-memory.sh --command --label build --no-stack-sample \
             --target x86_64-linux-gnu --optimize "$BUILD_OPTIMIZE" --strip false --install-step "$BUILD_STEP" -- \
             /usr/bin/time -v python3 tools/run_bounded_zig_build.py -- "${args[@]}"
+      - name: Attribute emitted production owners
+        if: ${{ success() && (inputs.step == 'antfly' || inputs.step == 'runtime-archives') }}
+        env:
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
+          CLI_OPTIMIZE: ${{ inputs.cli_optimize }}
+        run: |
+          args=(build runtime-archives -Dtarget=x86_64-linux-gnu -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" -Dstrip=false -Dmetal=false -Dcuda=false)
+          if [ "$CLI_OPTIMIZE" != inherit ]; then args+=("-Dcli-optimize=$CLI_OPTIMIZE"); fi
+          (cd zig && python3 tools/run_bounded_zig_build.py -- "${args[@]}")
+          artifacts=()
+          for archive in zig/zig-out/lib/libantfly*.a; do
+            owner=$(basename "$archive" .a)
+            artifacts+=(--artifact "$owner=$archive")
+          done
+          python3 scripts/report_zig_archive_work.py "${artifacts[@]}" \
+            --forbid 'libantfly-runtime-local_query=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
+            --forbid 'libantfly-storage-kernel=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
+            --output .benchmark-results/compile-costs/archive-work.json
       - name: Attribute linked symbols and embedded asset candidates
         if: ${{ success() && inputs.step == 'antfly' }}
         run: |
