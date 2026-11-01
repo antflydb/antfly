@@ -258,6 +258,7 @@ def native_worker(config, index, ready, start, results, finish=None):
             success_windows = [0] * max(1, math.ceil(config["seconds"] / 60))
             sequence = 0
             last_write = None
+            latest_churn_writes = {}
             while time.monotonic() < deadline:
                 key = f"worker-{index}-{sequence if config['workload'] == 'append' else sequence % 128}"
                 payload = {"inserts": {key: {"text": "v" * 1024, "sequence": sequence}}}
@@ -270,6 +271,8 @@ def native_worker(config, index, ready, start, results, finish=None):
                     )
                     success_windows[window] += 1
                     last_write = {"key": key, "sequence": sequence}
+                    if config["workload"] == "churn":
+                        latest_churn_writes[key] = last_write
                 except af.BusyError:
                     busy.append(time.perf_counter_ns() - began_call)
                 sequence += 1
@@ -346,6 +349,8 @@ def native_worker(config, index, ready, start, results, finish=None):
                 "proof_observed_until": proof_observed_until,
                 "admission": admission,
                 "last_write": last_write,
+                # At most 128 keys per worker, including holes left by Busy.
+                "latest_churn_writes": list(latest_churn_writes.values()),
                 **usage,
             }
             if config.get("allocator_diagnostics", False):
@@ -369,6 +374,18 @@ def native_worker(config, index, ready, start, results, finish=None):
         if not announced:
             ready.put(failure)
         results.put(failure)
+
+
+def acknowledged_writes(workers: list[dict]) -> list[dict]:
+    """Use actual acknowledgments; Busy can leave holes in a churn sequence."""
+    return [
+        write
+        for worker in workers
+        for write in (
+            worker.get("latest_churn_writes")
+            or ([worker["last_write"]] if worker.get("last_write") else [])
+        )
+    ]
 
 
 def verify(library: str, database: Path, expected: list[dict]) -> None:
@@ -699,6 +716,8 @@ def native_cases(args):
                     if worker["last_write"] is not None
                 ]
                 row["expected_last_writes"] = expected
+                expected = acknowledged_writes(workers)
+                row["expected_latest_writes"] = expected
                 try:
                     checked = subprocess.run(
                         [
