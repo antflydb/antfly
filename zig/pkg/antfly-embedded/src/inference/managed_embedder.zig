@@ -5313,7 +5313,24 @@ fn probeEmbeddingDimensionsRetryingTransient(
             // Never sleep past the point where the next attempt would no
             // longer have a meaningful amount of the deadline left.
             const delay_ns = @min(repair_failure.repairTransientBackoffNs(attempt), remaining_ns -| min_probe_attempt_remaining_ns);
-            platform_time.sleepNs(delay_ns);
+            // Wait out the backoff the same cancellable, deadline-aware way
+            // the query retry paths do: an unconditional sleep here would
+            // hold a cancelled or expiring probe (and its worker) for up to
+            // one backoff step -- four seconds at the cap -- instead of
+            // noticing within a 25ms poll. The wait rechecks cancellation
+            // and the shared deadline immediately before it returns, so the
+            // next loop iteration dispatches (or gives up) on fresh state.
+            const wait_context: RequestContext = .{
+                .io = embeddingIo(entry),
+                .deadline_ns = deadline_ns,
+                .cancellation = entry.cancellation,
+                .progress = entry.progress,
+            };
+            repair_failure.admissionRetryWaitNs(wait_context, delay_ns) catch |wait_err| switch (wait_err) {
+                error.Cancelled => return error.Cancelled,
+                error.Timeout => return out_of_time_err,
+                else => |e| return e,
+            };
             attempt += 1;
         }
     }
@@ -10321,6 +10338,38 @@ test "managed embedder dimension probe surfaces caller cancellation mid-retry in
     // One attempt only: cancellation is checked (and wins) right after it
     // fails, before any backoff sleep is considered.
     try std.testing.expectEqual(@as(usize, 1), local.calls);
+}
+
+test "managed embedder dimension probe backoff wait is cancellable" {
+    // Regression test: an unconditional sleep for the backoff would hold a
+    // cancelled probe (and its worker) for up to the full backoff step --
+    // four seconds at the cap -- before noticing. Cancelling partway into
+    // the *first* backoff (500ms) must return error.Cancelled within about
+    // one poll interval instead.
+    var local = FlakyLocalAntflyEmbedder{ .failures_remaining = std.math.maxInt(usize) };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, antfly_embeddinggemma_index_json, .{});
+    defer parsed.deinit();
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    const Canceller = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            platform_time.sleepNs(30 * std.time.ns_per_ms);
+            flag.store(true, .release);
+        }
+    };
+    const canceller = try std.Thread.spawn(.{}, Canceller.run, .{&cancelled});
+    defer canceller.join();
+
+    const started_ns = monotonicNowNs();
+    try std.testing.expectError(error.Cancelled, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
+        .probe_retry_budget_ns = 10 * std.time.ns_per_s,
+        .cancellation = CancellationToken.fromAtomic(&cancelled),
+    }));
+    // Comfortably above the 30ms cancellation delay plus one 25ms poll
+    // step, comfortably below the 500ms first backoff this would otherwise
+    // have slept through.
+    try std.testing.expect(monotonicNowNs() - started_ns < 200 * std.time.ns_per_ms);
 }
 
 test "managed embedder dimension probe spends slow provider attempts against the same deadline" {
