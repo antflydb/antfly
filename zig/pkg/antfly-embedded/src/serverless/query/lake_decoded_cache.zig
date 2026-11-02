@@ -39,6 +39,10 @@ pub const Item = struct {
     /// Validated physical header for a decoded page, keyed by immutable object
     /// version, exact range and interpretation. Consumer quotas are not cached.
     parquet_page_header: ?@import("lake_parquet_page.zig").ParsedHeader = null,
+    /// Typed Parquet payloads use individually reclaimable allocations. Codec
+    /// scratch and vector growth must not survive in a monotonic cache arena.
+    owned_columns: ?@import("lake_parquet_rowgroup.zig").OwnedColumns = null,
+    owned_dictionary: bool = false,
     /// Close extension resources while its immutable dependencies are pinned.
     extension_deinit: ?*const fn (*anyopaque) void = null,
     // Snapshot-local canonical row-ID ordering and totals, computed once.
@@ -68,6 +72,8 @@ pub const Item = struct {
         const parent = self.dependency;
         const a = self.budget.backing;
         if (self.extension_deinit) |close| close(self.payload.extension);
+        if (self.owned_columns) |*columns| columns.deinit(self.budget.allocator());
+        if (self.owned_dictionary) self.payload.dictionary.deinit(self.budget.allocator());
         for (self.dependencies) |item| cache.releaseLocked(item);
         for (self.foreign_dependencies) |lease| {
             std.debug.assert(lease.cache != cache);
@@ -192,7 +198,7 @@ pub const Cache = struct {
                 // Consumer allocation/materialization policy is deliberately
                 // absent from physical page keys. Retry with this reader's
                 // loader instead of inheriting another reader's smaller cap.
-                if (failure == error.Canceled or failure == error.DeadlineExceeded or failure == error.OutOfMemory or failure == error.SqlMemoryLimitExceeded or failure == error.ParquetRowGroupTooLarge) continue;
+                if (failure == error.Canceled or failure == error.DeadlineExceeded or failure == error.OutOfMemory or failure == error.SqlMemoryLimitExceeded or failure == error.ParquetRowGroupTooLarge or failure == error.ParquetPageTooLarge) continue;
                 return failure;
             }
             if (self.exclusive_loading or (!exclusive and self.exclusive_waiters != 0) or (exclusive and self.flights.count() != 0) or self.flights.count() >= self.max_loaders) {

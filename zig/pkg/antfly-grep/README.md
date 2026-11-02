@@ -219,7 +219,7 @@ antfly-grep ask 'Where are permissions checked?' --threshold 0.7 --json .
 antfly-grep cache clear
 ```
 
-The default HTTP backend uses the public [decision contract](../../../docs/guides/decisions.md).
+The default HTTP backend uses the public [decision contract](../../../docs/reference/decisions.md).
 `--endpoint` accepts the full decision URL; `--base-url` appends `/decisions`.
 `ANTFLY_GREP_TOKEN` supplies the bearer token. `--timeout-ms` bounds requests.
 Redirects and cookies are disabled. Malformed, duplicate, missing, out-of-range,
@@ -586,6 +586,52 @@ Build for a dynamically linked libc (for example, `x86_64-linux-gnu`); a static
 musl executable supports lexical/HTTP searches and reports
 `DynamicInferenceRequiresDynamicLibc` for local inference. `--version` records
 the compilation target and linkage.
+
+## Releases and installation
+
+Grep has independent versions and release tags: `antfly-grep/vX.Y.Z`, including
+prereleases such as `antfly-grep/v0.1.0-rc.1`. It is distributed separately from
+the Antfly server and embedded library. See the repository's
+[release design](../../../RELEASE.md#independent-grep-releases) for the operator
+workflow and native qualification matrix.
+
+Download the matching `antfly-grep_<version>_<OS>_<arch>[_gnu].tar.gz` archive and
+`SHA256SUMS` from that tag's GitHub Release. Linux x86-64 and ARM64 have portable
+musl and glibc 2.28+ (`_gnu`) builds; Darwin ARM64 requires macOS 15+. Use GNU
+Linux builds for optional local dynamic inference. Verify the archive's entry
+in `SHA256SUMS` before extracting it, then install under a user-owned prefix:
+
+```sh
+# After downloading the archive and SHA256SUMS:
+awk '$2 == "antfly-grep_0.1.0-rc.1_Darwin_arm64.tar.gz"' SHA256SUMS | shasum -a 256 --check
+mkdir -p /path/to/extracted-release
+tar -xzf antfly-grep_0.1.0-rc.1_Darwin_arm64.tar.gz -C /path/to/extracted-release
+/path/to/extracted-release/install.sh --prefix "$HOME/.local"
+"$HOME/.local/bin/antfly-grep" --version
+```
+
+The archive includes the binary, installer, completions, manpage, schemas and
+license notices. Installation does not require an Antfly server or libantfly.
+Server-backed search remains an optional integration with its own endpoint and
+credentials. Grep releases do not change Antfly's stable release channel.
+
+## Continuous integration
+
+The shared Zig workflow runs one native Linux x86-64 grep qualification job for
+its admitted suite:
+
+- `zig-base / grep` runs `grep-test` (unit, CLI, hardening, compatibility and
+  integration fixtures), a seeded 500-case differential campaign against pinned
+  ripgrep, and standalone packaging checks.
+- `zig-full / grep` runs the same checks with 5,000 differential cases and adds
+  the extended/codecs, single-CPU, cold-cache-advice, and 1/2/4/8-worker repository
+  benchmarks.
+
+Each job is required by its `zig-base` or `zig-full` aggregate. Full runs select
+only the full profile, reusing its build for correctness and benchmarks. Base
+runs follow the Zig change filter; inference-only validation skips grep. Reports
+and the standalone archive are uploaded as `zig-base-grep` or `zig-full-grep`.
+Server-backed indexed-search tests continue in the Antfly E2E base/full suites.
 
 ## Generated conformance, hardening and profiling
 
@@ -4606,7 +4652,11 @@ The default 1,000-request cap applies to all index and provider attempts across
 lanes. Default-budget image searches can overlap a manifest page only when
 conservative current-page retry/split headroom remains; explicit finite budgets
 and text-stage searches keep serial metadata admission. Server-owned conditional
-source identities remain [future API work](../../../docs/design/antfly-grep.md#future-generic-conditional-source-projection); warm images still receive full byte validation.
+source identities use the generic [conditional projection contract](../../../docs/design/antfly-grep.md#conditional-source-projection-and-future-storage-authorities).
+Warm descriptor and decision hits can omit image transfers after a current
+permission/revision check. Changed values or unavailable scores materialize and
+validate full bytes. Older servers retain full-value fallback. That qualification used the server reference path, which reads and hashes
+selected values. The follow-up below adds bounded storage-owned scalar proofs.
 
 The [rolling-evidence qualification](bench/results/grep-rolling-evidence-summary.json)
 compares this implementation with the preceding cross-parent binary. In a
@@ -4637,6 +4687,276 @@ cases and Windows cross-compilation passed. The report records these final
 validation hashes separately; its performance measurements remain pinned to the
 earlier measured binaries. Failed deferred drains join and discard remaining
 borrowers before retiring any manifest page, including failures inside cleanup.
+
+The [conditional-projection qualification](bench/results/grep-conditional-projection-summary.json)
+compares the merged rolling-lane binary with bounded verified-image descriptors
+and cross-manifest worker refill. Five alternating fixture rounds produced these
+medians (baseline → candidate):
+
+| Fixture | macOS elapsed | Constrained Linux elapsed |
+|---|---:|---:|
+| 128 large images, cold | 454 → 525 ms | 415 → 475 ms |
+| 128 large images, warm | 229 → 205 ms | 210 → 239 ms |
+| 24 single-row pages, slow first parent, cold | 1,872 → 998 ms | 1,767 → 922 ms |
+| 24 single-row pages, warm | 720 → 674 ms | 690 → 658 ms |
+
+For the large-image warm fixture, median CLI child CPU falls from 117.6 to
+17.1 ms on macOS and 187.8 to 33.0 ms in Linux; peak RSS falls from 24.7 to
+7.1 MiB and 40.2 to 16.8 MiB. Projected image bytes fall from 44,742,400 to
+zero on macOS and 5,243,250 in Linux. The bounded best-effort descriptor cache
+can lose facts to collisions or racing writes; those cases safely materialize
+source again. Warm zero-transfer and lower elapsed time are therefore not
+guaranteed. Cold large-image latency regresses, and tiny-image warm child CPU
+increases. Both variants already make zero warm provider calls.
+
+These are generated-image/constant-score loopback fixtures with 20 ms artificial
+HTTP delays. Linux runs in a two-CPU, 1-GiB container in the existing VM on the
+same physical Mac. The server fixture's hashing contributes to wall time but
+not CLI child CPU. The native server used for those measurements reads and hashes
+selected values; those measurements do not establish server CPU/storage savings,
+live-provider token savings, or independent cross-host performance. The compact
+report pins binary and driver hashes; raw trials and logs remain ignored.
+
+Final qualification passed 285 Linux CLI cases (three platform skips), all
+28 macOS media cases, 151 query-contract tests with zero leaks, and 27 native
+server cases (seven opt-in benchmark skips). The native cases include single-
+and two-shard delivery, warm omission, current-value changes, authorization,
+revision and snapshot fences. SDK, MCP/OpenAPI, packaging and boundary checks
+also pass. The broad macOS suite has an intermittent watcher assertion; affected
+cases pass in isolation, and the inventory-visit failure reproduces on the merged
+baseline. The report preserves this qualification and exact artifact hashes.
+
+
+The [conditional planning qualification](bench/results/grep-conditional-planning-summary.json)
+compares the reviewed PR binary with score-aware retrieval and bounded cache
+writer serialization. Changed questions now request full grouped values directly;
+warm hits retain the exact descriptors used to make their conditional requests.
+Conditional response bytes and full-image processing scratch have separate
+admission estimates, with the existing shared processing limit unchanged.
+
+Five alternating rounds of the same 128-image fixture show these medians:
+
+| Host | Changed-question elapsed | Warm elapsed | Warm CLI child CPU |
+|---|---:|---:|---:|
+| macOS ARM64 | 693 → 534 ms | 220 → 214 ms | 17.3 → 12.1 ms |
+| Linux ARM64 VM, 2 CPUs / 1 GiB | 654 → 473 ms | 222 → 192 ms | 35.6 → 11.8 ms |
+
+Changed-question index requests fall from 33 to 17. Warm requests fall from
+17/18 to 10, with zero image bytes on both candidate hosts. Both baselines
+already avoid warm inference. Cold CPU and peak RSS do not improve uniformly.
+These constant-score fixtures impose 20 ms HTTP delays; child CPU excludes the
+Python server. Linux shares the physical Mac. These results establish neither
+live model cost savings nor a universal speed or memory guarantee.
+
+The native source-only retrieval path now publishes bounded canonical-value
+certificates atomically with storage writes. Current scalar leaves can be
+omitted without loading or hashing their payloads, after fresh authorization
+and publication checks. Certificates bind content, directory and canonicalizer
+ABI; unsupported/stale cases use reference delivery and bounded repair. Other
+selected fields and storage layouts can still require source reads. The metadata
+and write hashing cost are explicit in the design, rather than implying free
+reads or writes. `e2e/antfly/bench_source_projection.py` separately qualifies
+native server ingestion, full delivery and conditional delivery without a model.
+
+
+The same qualification measures the final native server after merging main
+through `871c143788` (#1262), using five alternating rounds, eight fresh documents
+with 256 KiB ASCII values, one shard, exact response hashes and mandatory
+certificate-hit checks. Each candidate round records 16 certificate hits and no
+full-value fallbacks. Median times:
+
+| Native phase | Elapsed, baseline → current | Server process CPU, baseline → current |
+|---|---:|---:|
+| Ingestion | 56.36 → 66.24 ms | 64.69 → 80.22 ms |
+| Full delivery | 15.21 → 17.36 ms | 12.42 → 14.83 ms |
+| Conditional delivery | 10.29 → 2.16 ms | 8.89 → 1.09 ms |
+
+Conditional delivery is about 79% faster and uses 88% less server CPU in this
+synthetic corpus. Ingestion/full delivery regress about 14–24% in elapsed/CPU
+terms. Conditional peak RSS is 152.5 → 149.3 MiB. The candidate also includes
+main's CLI unification; this pair does not isolate that merge. The report retains
+the separate pre-main feature qualification, where ingestion/full-delivery costs
+were about 5–7%. Shared-host measurements and background work vary between runs.
+
+Whole-process CPU includes background work, and sampled RSS is not an allocation
+bound. These are fresh native JSON certificates on the shared Mac, with no
+physical-I/O or live-model claim. Unsupported/stale layouts retain reference
+execution. Proof reuse shifts work to bounded metadata and writes; authorization
+and remaining selected source reads still have a cost.
+
+Final validation: 288 CLI cases on each host (286 macOS / 285 Linux passed;
+two/three platform skips), 149 query contracts, 15 identity/publication/snapshot
+cases, 91 logical-field cases plus one skip, and 27 native integration cases plus
+seven opt-in benchmark skips. Contract tests report zero leaks. The real storage
+regression verifies published certificates, retained read cuts and replacement
+visibility; parsed ID-query worker round trips exercise the actual eligible
+request shape. Storage discovery, compatibility, license boundaries and Windows
+CLI cross-compilation pass. Raw trials and logs remain ignored.
+
+After the main merge, 149 query contracts, 15 identity/storage cases, 91 logical
+field cases (one skip), 27 native cases (seven opt-in benchmark skips), four
+release-packaging checks and the Apache boundary pass. Rebuilt macOS, Linux and
+Windows CLI binaries are byte-identical to the fully tested binaries above.
+Main's unified CLI and Apache licensing are preserved; the compact report records
+the final native binary and both pre-/post-main measurement sets separately.
+
+
+The final main refresh through `2aed23bb0e` (#1264/#1265) is merged in
+`5447f58f3a`. Both 288-case CLI suites pass again, along with shared PDF/mock OCR
+integration, 149 query contracts, 15 identity/storage cases, 91 logical-field
+cases (one skip), generated error-name checks and both error-transport tests.
+Windows CLI cross-compilation and the Apache boundary pass. Relevant query/storage
+source hashes and macOS/Linux CLI bytes match the qualified build. Native server
+integration and timings remain pinned to the recorded `9ca2e6e28f` build; the
+compact report distinguishes this final targeted validation.
+
+
+The generic conditional-source follow-up (`611a4ce4ca`, main merged through
+`c1bc94b174`) uses an explicit canonicalization ABI with fixed compatibility
+vectors, collects identities during directory publication, and batches owned
+metadata within one pinned transaction. Equal omission masks share byte-bounded
+source reads. Admission accounts for coalesced range retention or full primary
+sizes according to backend capabilities; each subwindow closes its scope before
+the next opens. One large row can progress, and point reads reuse their metadata
+scope. CLI shape buckets fetch concurrently through the existing worker pool,
+with proportional reservations under one page-memory budget.
+
+The [generic qualification](bench/results/grep-generic-conditional-summary.json)
+records six client controls and thirteen native cases: ASCII, escaped/Unicode,
+numeric, wide, opaque, small and mixed values; 1/8/64 rows; and exact, parent,
+wildcard and exclusion masks. Native cases use five alternating trials and ten
+individually timed reads per phase, with parsing outside timings and every
+response checked. Ordinary reads and fallback layouts are controls, not omitted
+from the results. Raw reports/logs are local and unpublished under `output/`.
+
+Mixed-shape client requests fall from 10 to 4; dense warm-image requests fall
+from 18 to 12. Warm client CPU/latency improve in these fixtures, while tiny cold
+client CPU can increase. Native gains are modest and uneven: eight-row ASCII
+conditional delivery is 1.086 → 0.983 ms; the single-row control is 0.662 →
+0.738 ms and mixed exact delivery is 1.350 → 1.490 ms. These are workload and
+host-dependent tradeoffs, not a universal throughput, memory or zero-cost claim.
+Native caches are warm; the Linux VM shares the Mac host and has two CPUs/1 GiB.
+The report preserves all medians, binary/corpus hashes and reproduction commands.
+
+Final checks pass: 287 macOS CLI cases plus two skips; 286 Linux VM CLI cases
+plus three skips; 149 query, 18 identity/storage and 94 logical-field contracts
+(one skip, zero leaks). The eighteen focused storage tests also pass in the
+Linux VM, including full-value range adapters, scope retirement, mixed masks,
+large-row progress and cancellation/allocation failures. Build them portably
+with `zig build source-value-identity-test-build -Dtarget=aarch64-linux-gnu`
+from `zig/`. All 28 real-server indexed tests pass (seven opt-in benchmark skips),
+including persisted certificate upgrade from the previous server. Windows CLI
+cross-compilation, compatibility/storage discovery and the Apache boundary pass.
+The final source rebuild produces the same qualified native binary hash.
+
+### Bounded materialization and decision request bodies
+
+Conditional materialization keeps reconstructed rows in reclaimable subwindow
+scratch. Complete primary values borrow their pinned read scope until projection
+finishes; the existing owned logical-read API retains its ownership contract.
+One selector serves each window, and small overlays restore omitted ancestors
+without decoding retained payloads into a second JSON tree. The public encoder
+streams finalized sources while preserving source-dependent hierarchy metadata,
+private-field removal, duplicate-key rejection and number normalization.
+
+Strict preparation produces a receipt bounded to immutable source bytes. The
+span writer copies strings whose spellings already match the default JSON
+encoder, including canonical control escapes. Noncanonical escapes, numbers and
+unqualified input retain normalization. This receipt is temporary syntax evidence;
+it grants no document access or cross-source reuse.
+
+Remote decision requests borrow qualified image URLs of at least 4 KiB through
+HTTPx body segments. Smaller image, text-only and local-runtime requests use the
+ordinary contiguous encoder, allocating no segment plan. Exact admission counts
+known large URL lengths without serializing those payloads into a counting sink.
+Inputs stay pinned through transport completion, cancellation and retries. The
+wire schema, request/response limits and inference budgets are unchanged.
+
+Metadata rewrites can reuse canonical leaf certificates from the writer's current
+snapshot when decoded ancestry, leaf kind, raw length/digest and canonical ABI
+match. Unsupported layouts retain the fused reference writer. The incoming body
+still needs validation and its content digest, and the primary JSON row is still
+written. The [design](../../../docs/design/antfly-grep.md#conditional-source-projection-and-future-storage-authorities)
+specifies the separate immutable-value/manifest migration needed to remove that
+write amplification, including retained ownership and rollback requirements.
+
+The [materialization qualification](bench/results/grep-materialization-summary.json)
+compares these changes with PR head `0f28b974b9` using five alternating client
+trials on tiny and 256 KiB images. For 128 large-image decisions, median client
+CPU falls 195.0 → 133.2 ms on macOS and 276.5 → 193.9 ms in the constrained
+Linux VM. Median peak RSS falls 58.5 → 33.6 MiB and 88.5 → 45.0 MiB,
+respectively. Tiny cold-image CPU is 47.5 → 48.2 ms on macOS, retaining the
+ordinary encoder. Warm score hits make no provider calls. These are fixture
+measurements; request counts, transfer bytes and model billing are not reduced
+by borrowing the body. The VM shares the same physical host; elapsed-time
+measurements are sensitive to concurrent host work.
+
+Raw trials and logs remain local under ignored `output/`; the compact report
+preserves binary/source hashes, controls, medians and reproduction commands.
+
+Focused validation passes 24 identity/storage, 151 API contract and 96 logical-field
+tests (one skip), with zero leaks. The CLI suites pass 287 macOS cases (two
+skips) and 286 cases in the constrained Linux VM (three skips). The storage suite
+covers arena retention, borrowed/owned read lifetimes, current-snapshot identity
+reuse, changed ancestry, incompatible certificates and allocation failures.
+Request-body tests cover all decision transports, exact wire bytes, URL-proof
+invalidation, sizing and cancellation-compatible borrowed lifetimes.
+
+The thirteen native cases use three alternating trials, five individually timed
+reads per phase and two verified metadata rewrites per trial. Eight-row full-source
+latency is 10.74 → 9.54 ms for ASCII, 25.41 → 19.76 ms for escaped strings,
+and 24.24 → 19.13 ms for Unicode. Escaped-value metadata-update CPU falls
+152.44 → 137.20 ms; primary JSON is still physically rewritten. Controls remain
+mixed: numeric full-source delivery is 0.92 → 1.07 ms, while the single-row
+metadata-update CPU control is 17.49 → 18.03 ms. Ordinary reads, conditional
+hits, opaque/small values, 1/8/64 rows and parent/wildcard/exclusion masks all
+remain in the report. These warm-cache, shared-host results establish measured
+tradeoffs, not universal latency or zero-cost guarantees.
+
+All 28 real-server indexed integration cases pass against the final native binary
+(seven opt-in benchmark skips). The 24 identity/storage regressions also pass in
+the constrained Linux VM, including canonical-string receipt activation and scope
+boundaries.
+
+
+### Experimental storage format is deferred
+
+PR #1263 keeps the existing document storage format. Immutable payloads, field
+publication packs and automatic migration are preserved separately on the
+`experiment/immutable-document-format` branch pending mixed-workload
+qualification. Format-independent analysis caching and FST cleanup require no
+storage upgrade. See the [split decision](../../../docs/design/antfly-grep.md#format-migration-split-2026-10-26)
+for the measured tradeoffs and upgrade criteria.
+
+For indexed images, `--indexed-media-transport=source` targets the Antfly inference
+gateway. The CLI obtains fresh authorized value identities and sends table,
+document, field, revision and content-hash references instead of downloading and
+resending image bytes. The gateway rechecks authorization, revision, identity
+and content before provider delivery. Expanded-image admission limits still
+apply; a reference is not a read grant. The default inline transport remains
+available for ordinary decision endpoints. This uses the existing document
+format.
+
+### General conditional projection
+
+Indexed image reuse uses the ordinary query API's `select` expression map and
+`params`, with pure expressions returned in `_computed`. `fields` stays a list
+of strings and controls `_source` independently. `value_identity`, `is_missing`
+and lazy CASE lower to the existing SQL scalar binder and VM. The unreleased
+`source_projection` / `_source_projection` protocol is removed. Servers that
+reject or ignore `select` fall back to ordinary image reads; missing computed
+values never count as verified cache hits. Source-reference transport requires
+an identity-capable server.
+
+The inference gateway batches images within a parent, then batches parents with
+identical masks and filters. It preserves authorization, revision and digest
+checks per reference, and temporary lookup failures retain retryable statuses.
+See [the design](../../../docs/design/antfly-grep.md#conditional-source-projection-and-future-storage-authorities)
+for the API, limits, metadata fast path and fallback rules. Historical source
+projection reports above predate this interface. The updated
+`e2e/antfly/bench_source_projection.py` compares ordinary, cold, metadata-backed
+warm, and equivalent value-reading reference expressions; optional comparison
+binaries must support `select`.
 
 Cloud catalog queries return an authenticated policy proof for snapshot traversal.
 A selected source's first successful ordinary content query returns its own
@@ -4686,3 +5006,29 @@ endpoints with `mode: source`. There is no separate Cloud `/sources` API. The
 Cloud session adapter pins authenticated query identity and catalog/source policy
 headers across pagination, asset reads and token renewal; the gateway enforces
 current row permissions.
+
+Projection delivery uses the same numeric semantics for direct fields, aliases,
+CASE arms and typed JSON operations, including nested numbers and underflow.
+Request-owned programs and unconditional read sets avoid repeated binding; CASE
+branches remain lazy. Immutable completed-output receipts avoid repeated
+validation/copying, and opaque identity hashing streams without a payload DOM.
+Media lookup uses at most four concurrent groups under the existing request
+budget; identical payload inspection is shared only within the request, while
+claims remain checked per reference.
+
+The [bounded-reuse qualification](../../../docs/design/antfly-grep.md#release-qualification-for-the-bounded-reuse-follow-up-2026-10-27)
+records source/media controls, hashes, costs and reproduction commands. Large
+computed reads use 27–32% less CPU in those paired runs. Distinct-source media
+latency improves with higher sampled RSS; small writes do not uniformly improve.
+The server comparison includes newer main changes and is not an isolated or
+universal performance guarantee. Document format and canonical ABI are unchanged.
+
+
+The [alias and media reuse qualification](../../../docs/design/antfly-grep.md#release-qualification-for-alias-and-media-reuse-2026-10-28)
+records the current production binary, paired controls and repeated observations.
+Escaped aliases use 42% less server CPU and alias chains 34% less; larger full
+source projections use 16–36% less. Small projections are near parity, and media
+CPU/latency gains vary by case, with increases retained in the report. These are
+warm synthetic whole-server comparisons against an older main revision on one
+shared host. They do not establish universal or zero-cost behavior. Document
+format and canonical ABI remain unchanged.

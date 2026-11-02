@@ -7,8 +7,9 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
+  Field,
+  FieldLabel,
   Input,
-  Label,
 } from "@antfly/design-system";
 import type { DocumentArtifactManifest } from "@antfly/sdk";
 import { useCallback, useState } from "react";
@@ -142,8 +143,8 @@ export function DocumentArtifactsPanel({ tableName }: DocumentArtifactsPanelProp
           <CardTitle>Document Artifacts</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="artifact-document-key">Document key</Label>
+          <Field className="gap-2">
+            <FieldLabel htmlFor="artifact-document-key">Document key</FieldLabel>
             <div className="flex gap-2">
               <Input
                 id="artifact-document-key"
@@ -161,7 +162,7 @@ export function DocumentArtifactsPanel({ tableName }: DocumentArtifactsPanelProp
                 Load
               </Button>
             </div>
-          </div>
+          </Field>
 
           {error && (
             <Alert variant="destructive">

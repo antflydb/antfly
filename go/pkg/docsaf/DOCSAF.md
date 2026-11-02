@@ -101,14 +101,15 @@ docsaf sync --dir ./docs --inline-content --table docs --create-table
 
 Docsaf is a client that configures and ingests into Antfly; it is not part of
 the Antfly server. To enable selective PDF OCR through that client, pass the Reader
-provider configuration when the table is created. The Antfly server extracts embedded text
-per page, renders only deficient pages at 150 DPI by default, preserves table
-layout in the OCR prompt, and feeds the selected text into the same chunk,
-full-text, and vector artifacts:
+provider configuration when the table is created. Docsaf writes it as the
+extraction's `ocr.reader`. The Antfly server extracts embedded text per page,
+renders only deficient pages at 150 DPI by default, reads them with the
+configured reader, and feeds the selected text into the same chunk, full-text,
+and vector artifacts:
 
 ```bash
 docsaf sync --dir ./docs --base-url s3://docs-bucket --table docs --create-table \
-  --ocr-config-json '{"provider":"antfly","model":"<reader-model>"}' \
+  --ocr-config-json '{"provider":"antfly","model":"lightonai/LightOnOCR-3-0.8B"}' \
   --ocr-render-dpi 150
 ```
 

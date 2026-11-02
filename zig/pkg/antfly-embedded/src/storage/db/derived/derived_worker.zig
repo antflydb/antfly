@@ -137,6 +137,10 @@ pub const CatchUpOptions = struct {
 
 pub const catch_up_max_records_per_window_default: usize = 2048;
 pub const catch_up_max_chunk_bytes_default: u64 = 16 * 1024 * 1024;
+/// Detached owners pin primary roots while constructing a window. Bound that
+/// retention independently of foreground/explicit catch-up batch amortization.
+pub const catch_up_background_max_records: usize = 64;
+pub const catch_up_background_max_chunk_bytes: u64 = 1024 * 1024;
 pub const dense_replay_estimated_vector_bytes_default: u64 = 384 * @sizeOf(f32);
 
 pub fn targetHintForManagedIndex(index_ref: index_manager_mod.ManagedIndexRef) change_journal_mod.TargetHint {
@@ -162,7 +166,9 @@ fn logCatchUpError(
     if (err == error.ArtifactRepairRequired) return;
     if (err == error.CatchUpDeadlineExceeded) return;
     // Superseded snapshots retain replay debt for a later maintenance turn.
-    if (err == error.Canceled or err == error.EnrichmentWaitCanceled) return;
+    // A source fence can observe that supersession while opening or applying
+    // its journal cursor; it is the same retry, not an index failure.
+    if (err == error.Canceled or err == error.EnrichmentWaitCanceled or err == error.EnrichmentSourceChanged) return;
     if (index_ref.kind == .dense_vector and err == error.NotFound) return;
     std.log.err(
         "derived catch_up failed index={s} kind={s} phase={s} sequence={} scanned_entries={} applied_entries={} err={s}",

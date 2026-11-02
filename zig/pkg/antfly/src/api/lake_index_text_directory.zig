@@ -242,7 +242,6 @@ pub const Publisher = struct {
         self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
         self.pages.admitPublication();
         self.initReducers(a, self.pages.store(), io);
-        inline for (.{ "files", "segments", "routing", "ordered" }) |name| @field(self, name).private_pages.phase = store.io_phase;
     }
     fn initReducers(self: *Publisher, a: A, storage: tree.Store, io: std.Io) void {
         self.manager = .{ .alloc = a, .io = io, .context = self, .checkpoint = check };
@@ -265,7 +264,6 @@ pub const Publisher = struct {
     pub fn preferAdditions(self: *Publisher) void {
         inline for (.{ "files", "segments", "routing", "ordered" }) |name| {
             @field(self, name).addition_first = true;
-            @field(self, name).forest.policy = .addition_first;
         }
     }
     pub fn finish(self: *Publisher, old: Roots) !Roots {
@@ -277,7 +275,6 @@ pub const Publisher = struct {
             var fresh = Mutations.init(self.metadata.group_arena.child_allocator, &self.manager, self.segments.destination);
             defer fresh.deinit();
             fresh.reduction = @import("lake_index_sort_directory.zig").reduce;
-            fresh.private_pages.phase = self.metadata.files.private_pages.phase;
             var cursor = try tree.Cursor.init(self.metadata.group_arena.child_allocator, self.segments.destination, segments, "", null);
             defer cursor.deinit();
             var region = std.heap.ArenaAllocator.init(self.metadata.group_arena.child_allocator);
@@ -331,7 +328,6 @@ pub fn publishFileRecords(a: A, store: *stores.ArtifactStore, records: []const F
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = io, .context = &check, .checkpoint = Check.call };
     defer manager.deinit();
     var mutations = Mutations.init(a, &manager, pages.store());
-    mutations.private_pages.phase = store.io_phase;
     defer mutations.deinit();
     for ([_]bool{ true, false }) |deleting| for (if (deleting) removed else records) |record| {
         try token.check();
@@ -1300,7 +1296,7 @@ pub const SelectedCursor = struct {
     }
 };
 
-test "external lake serving metadata additions override late deletions within and across durable runs" {
+test "external lake serving metadata additions override late deletions within and across spill runs" {
     const a = std.testing.allocator;
     var temporary = try local.common_test_directory.TestDirectory.init("serving-directory-addition-priority");
     defer temporary.cleanup();
@@ -1316,13 +1312,11 @@ test "external lake serving metadata additions override late deletions within an
     const removed = corpus.term_directory.identity("removed");
     try publisher.files.add(id, "replacement", 11);
     try publisher.files.add(id, null, 11);
-    try publisher.files.flush();
     try publisher.files.add(id, null, 11);
     try publisher.files.add(removed, null, 3);
-    try publisher.files.flush();
     try std.testing.expectEqual(@as(u64, 0), publisher.writes);
     try std.testing.expectEqual(@as(u64, 0), publisher.reads);
-    try std.testing.expect(publisher.files.private_pages.pool != null);
+    try std.testing.expectEqual(@as(usize, 0), publisher.manager.files);
     try publisher.files.add(id, "newest", 6);
     try publisher.files.add(id, null, 6);
     const root = (try publisher.files.finish(null)).?;
@@ -1333,7 +1327,7 @@ test "external lake serving metadata additions override late deletions within an
     try std.testing.expect(try cursor.next() == null);
 }
 
-test "external lake private metadata recycles consumed runs under a live spill quota" {
+test "external lake private metadata streams one bounded reduction under a live spill quota" {
     const a = std.testing.allocator;
     const Check = struct {
         fn call(_: *anyopaque) !void {}
@@ -1346,12 +1340,12 @@ test "external lake private metadata recycles consumed runs under a live spill q
     {
         var mutations = Mutations.init(a, &manager, memory.store());
         defer mutations.deinit();
+        mutations.sort.memory_bytes = 16 * 1024;
         const value: [128]u8 = @splat(42);
         for (0..4096) |i| {
             var id: Id = @splat(0);
             std.mem.writeInt(u64, id[24..32], i, .big);
             try mutations.add(id, &value, 0);
-            if ((i + 1) % 16 == 0) try mutations.flush();
         }
         const root = (try mutations.finish(null)).?;
         var cursor = try tree.Cursor.init(a, memory.store(), root, "", null);
@@ -1362,8 +1356,8 @@ test "external lake private metadata recycles consumed runs under a live spill q
             try std.testing.expectEqualSlices(u8, &value, record.value);
         }
         try std.testing.expectEqual(@as(usize, 4096), count);
-        // Logical history exceeds the quota. Only live
-        // inputs and uncommitted output survive, with one physical run file.
+        // Cumulative merge writes exceed the live quota. Consumed inputs
+        // are recycled in shared extents instead of accumulating on disk.
         try std.testing.expect(manager.written_bytes > manager.max_bytes);
         try std.testing.expect(manager.peak_bytes <= manager.max_bytes);
         try std.testing.expect(manager.peak_files < 8);
@@ -1628,7 +1622,7 @@ pub const SortCursor = struct {
         var owned = true;
         defer if (owned) self.deinit();
         self.reader.init(root.domain);
-        var page = try tree.readPage(a, self.reader.pages.store(), ref);
+        var page = try tree.readNavigationPage(a, self.reader.pages.store(), ref);
         defer page.deinit(a);
         if (page.aggregate.len != 32 or std.mem.allEqual(u8, page.aggregate, 0)) return null;
         var first = try tree.Cursor.init(a, self.reader.pages.store(), ref, "", null);

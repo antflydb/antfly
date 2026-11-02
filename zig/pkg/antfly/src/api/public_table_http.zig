@@ -424,6 +424,7 @@ pub const TableApi = struct {
         MethodNotAllowed,
         DocIdentityUnavailable,
         InternalFailure,
+        InferenceUnavailable,
     };
 
     pub const ExecuteReprocessDocumentArtifactRangeError = error{
@@ -863,6 +864,26 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
         .json = true,
         .retry_after_seconds = storage_read_temporarily_unavailable_retry_after_seconds,
     };
+}
+
+/// Preserve operation outcomes across query adapters before dependency-error
+/// classification can mistake cancellation for an upstream provider failure.
+pub fn queryCancellationError(err: anyerror) ?error{ Timeout, DeadlineExceeded, Canceled } {
+    return switch (err) {
+        error.Timeout => error.Timeout,
+        error.DeadlineExceeded => error.DeadlineExceeded,
+        error.Canceled, error.Cancelled => error.Canceled,
+        else => null,
+    };
+}
+
+test "highlight query cancellation classification preserves deadline identity before dependency normalization" {
+    try std.testing.expectEqual(error.Timeout, queryCancellationError(error.Timeout).?);
+    try std.testing.expectEqual(error.DeadlineExceeded, queryCancellationError(error.DeadlineExceeded).?);
+    try std.testing.expectEqual(error.Canceled, queryCancellationError(error.Canceled).?);
+    try std.testing.expectEqual(error.Canceled, queryCancellationError(error.Cancelled).?);
+    try std.testing.expect(queryCancellationError(error.ConnectionResetByPeer) == null);
+    try std.testing.expect(queryCancellationError(error.OutOfMemory) == null);
 }
 
 pub fn queryDependencyErrorOwnedResponse(
@@ -2941,6 +2962,7 @@ pub fn handleReprocessDocumentArtifact(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.InferenceUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "{\"error\":\"artifact_inference_unavailable\",\"message\":\"Artifact inference is temporarily unavailable\",\"retryable\":true}") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact reprocess failed") },
     };
     return .{
@@ -6577,6 +6599,7 @@ test "public document artifact reprocess handler returns accepted" {
             _: operation.RequestContext,
         ) TableApi.ExecuteReprocessDocumentArtifactError!void {
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
+            if (std.mem.eql(u8, doc_key, "doc:retry")) return error.InferenceUnavailable;
             if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
             if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
         }
@@ -6593,6 +6616,13 @@ test "public document artifact reprocess handler returns accepted" {
 
     try std.testing.expectEqual(@as(u16, 202), resp.status);
     try std.testing.expectEqualStrings("{\"reprocess\":\"triggered\"}", resp.body);
+    var retry = try handleReprocessDocumentArtifact(std.testing.allocator, "docs", "doc:retry", "document_units_v1", Backend.iface());
+    defer retry.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), retry.status);
+    var body = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, retry.body, .{});
+    defer body.deinit();
+    try std.testing.expectEqualStrings("artifact_inference_unavailable", body.value.object.get("error").?.string);
+    try std.testing.expect(body.value.object.get("retryable").?.bool);
 }
 
 test "public document artifact range reprocess handler returns bounded summary" {

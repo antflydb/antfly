@@ -77,8 +77,8 @@ pub const Context = struct {
         try @as(*@import("../../common/runnable_scheduler.zig").Execution, @ptrCast(@alignCast(raw))).checkpoint();
     }
     pub fn checkLifetime(self: Context) !void {
-        if (self.cancellation) |token| try token.check();
         if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        if (self.cancellation) |token| try token.check();
         if (self.execution) |execution| try execution.checkLifetime();
         if (self.authority) |hook| try hook.check(hook.ptr);
         if (self.read_lease) |hook| try hook.check(hook.ptr);
@@ -413,4 +413,17 @@ test "lake SQL lifetime authority survives execution binding without borrowing o
     try std.testing.expectEqual(@as(usize, 0), fixture.borrowed);
     try std.testing.expectEqual(@as(usize, 4), fixture.checks);
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+}
+
+test "external lake bounded window profiles deadline identity survives flattened transport cancellation" {
+    const Bool = struct {
+        fn canceled(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    var state: u8 = 0;
+    const expired: Context = .{ .deadline_ns = 1, .cancellation = storage.CancellationToken.fromCallback(&state, Bool.canceled) };
+    try std.testing.expectError(error.DeadlineExceeded, expired.ensureActive());
+    const canceled_context: Context = .{ .cancellation = expired.cancellation };
+    try std.testing.expectError(error.Canceled, canceled_context.ensureActive());
 }

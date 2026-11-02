@@ -29,14 +29,12 @@ export function StatCard({
     <Card className={cn("overflow-hidden", className)} {...props}>
       <CardContent className="flex items-start justify-between gap-4">
         <div className="space-y-1">
-          <p className="font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground">
-            {label}
-          </p>
+          <p className="font-sans text-[13px] text-muted-foreground">{label}</p>
           <p className="font-display text-3xl tracking-tight text-foreground">{value}</p>
           {delta ? <p className={cn("text-xs font-medium", toneClasses[tone])}>{delta}</p> : null}
         </div>
         {icon ? (
-          <div className="grid size-10 place-items-center rounded-none bg-accent text-accent-foreground">
+          <div className="grid size-10 place-items-center rounded-md bg-accent text-accent-foreground">
             {icon}
           </div>
         ) : null}

@@ -17,7 +17,8 @@
 //! participates in planning; adding consumers cannot change parent identities.
 const std = @import("std");
 
-pub const Kind = enum { embedding, transcribe, classify };
+pub const diarization = @import("diarization.zig");
+pub const Kind = enum { embedding, transcribe, classify, diarize };
 pub const Target = struct {
     name: []const u8,
     kind: Kind,
@@ -32,9 +33,30 @@ pub const Target = struct {
     dimensions: ?usize = null,
     language: ?[]const u8 = null,
     diarize: bool = false,
+    diarization: ?diarization.Config = null,
     top_k: usize = 5,
+    pub fn hasDiarization(self: Target) bool {
+        return self.kind == .diarize or (self.kind == .transcribe and self.diarize) or self.diarization != null;
+    }
+    pub fn speakerConfig(self: Target) diarization.Config {
+        return self.diarization orelse .{};
+    }
+    pub fn speakerModel(self: Target) []const u8 {
+        return if (self.kind == .diarize) self.model else self.speakerConfig().model orelse diarization.default_model;
+    }
 
     pub const Window = struct { ordinal: u64, sub_index: u32 };
+    pub fn speakerRecipeIdentity(self: Target, a: std.mem.Allocator, identity: []const u8, revision: []const u8, speaker_revision: []const u8) ![64]u8 {
+        const base = try self.recipeIdentity(a, identity, revision);
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .format = diarization.algorithm, .base = base, .speaker_revision = speaker_revision, .config = self.speakerConfig() }, .{});
+        defer a.free(encoded);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+    pub fn receiptRecipeIdentity(self: Target, a: std.mem.Allocator, receipt: Result) ![64]u8 {
+        return if (self.hasDiarization()) self.speakerRecipeIdentity(a, receipt.model_identity, receipt.model_revision, receipt.speaker_model_revision orelse "") else self.recipeIdentity(a, receipt.model_identity, receipt.model_revision);
+    }
     pub fn wants(self: Target, ordinal: u64, sub_index: u32) bool {
         if (!self.execute) return false;
         for (self.skip_windows) |window| if (window.ordinal == ordinal and window.sub_index == sub_index) return false;
@@ -89,6 +111,10 @@ pub const Config = struct {
         if (self.targets.len == 0 or self.targets.len > 16) return error.InvalidChunkOutputs;
         var found = false;
         for (self.targets, 0..) |target, index| {
+            if (target.diarization) |options| try options.validate();
+            if (target.diarize and target.kind != .transcribe) return error.InvalidChunkOutputs;
+            if (target.diarization != null and target.kind == .classify) return error.InvalidChunkOutputs;
+            if (target.kind == .diarize) if (target.speakerConfig().model) |model| if (!std.mem.eql(u8, model, target.model)) return error.InvalidChunkOutputs;
             if (target.name.len == 0 or target.name.len > 128 or target.model.len == 0 or target.model.len > 4096 or !std.unicode.utf8ValidateSlice(target.name)) return error.InvalidChunkOutputs;
             if (target.skip_windows.len > 4096) return error.InvalidChunkOutputs;
             if (target.dimensions == 0 or target.top_k == 0 or target.top_k > 128) return error.InvalidChunkOutputs;
@@ -114,8 +140,8 @@ pub const Span = struct {
     text: []const u8,
     start_ns: i64,
     end_ns: i64,
-    /// Local to this output sub-window. Speaker numbering across independent
-    /// windows requires an explicit diarization stitching stage.
+    /// Source scoped when the output carries speaker_scope=source. Older
+    /// receipts without that marker retain their local sub-window scope.
     speaker_index: ?u32 = null,
 };
 pub const Label = struct { label: []const u8, score: f32 };
@@ -137,11 +163,15 @@ pub const Result = struct {
     embedding: ?[]const f32 = null,
     spans: ?[]const Span = null,
     labels: ?[]const Label = null,
+    speaker_spans: ?[]const diarization.Span = null,
+    speaker_scope: ?enum { source } = null,
+    speaker_model_revision: ?[]const u8 = null,
 
     pub fn reusable(self: Result) bool {
         return (self.status == .failed and self.terminal) or (self.status == .complete and switch (self.kind) {
             .embedding => self.embedding != null,
             .transcribe => self.spans != null,
+            .diarize => self.speaker_spans != null,
             .classify => self.labels != null,
         });
     }
@@ -151,11 +181,11 @@ pub const Result = struct {
         if ((self.start_ns == null) != (self.end_ns == null)) return error.InvalidChunkOutput;
         if (self.start_ns) |start| if (start < 0 or self.end_ns.? < start) return error.InvalidChunkOutput;
         if (self.status == .skipped) {
-            if ((target.execute and target.skip_windows.len == 0) or self.code != null or self.embedding != null or self.spans != null or self.labels != null) return error.InvalidChunkOutput;
+            if ((target.execute and target.skip_windows.len == 0) or self.code != null or self.embedding != null or self.spans != null or self.labels != null or self.speaker_spans != null) return error.InvalidChunkOutput;
             return;
         }
         if (self.status == .failed) {
-            if (self.code == null or self.embedding != null or self.spans != null or self.labels != null) return error.InvalidChunkOutput;
+            if (self.code == null or self.embedding != null or self.spans != null or self.labels != null or self.speaker_spans != null) return error.InvalidChunkOutput;
             return;
         }
         if (self.terminal or self.code != null or self.model_identity.len != 64 or self.model_revision.len != 64 or self.recipe_id.len != 64) return error.InvalidChunkOutput;
@@ -163,15 +193,21 @@ pub const Result = struct {
         var digest: [32]u8 = undefined;
         for ([_][]const u8{ self.model_identity, self.model_revision, self.recipe_id }) |value| _ = std.fmt.hexToBytes(&digest, value) catch return error.InvalidChunkOutput;
 
+        if (target.hasDiarization()) {
+            const revision = self.speaker_model_revision orelse return error.InvalidChunkOutput;
+            if (revision.len != 64) return error.InvalidChunkOutput;
+            _ = std.fmt.hexToBytes(&digest, revision) catch return error.InvalidChunkOutput;
+            if (target.speakerConfig().model_identity) |pin| if (!std.mem.eql(u8, pin, revision)) return error.EmbeddingIdentityMismatch;
+        }
         switch (self.kind) {
             .embedding => {
-                if (self.spans != null or self.labels != null) return error.InvalidChunkOutput;
+                if (self.spans != null or self.labels != null or self.speaker_spans != null) return error.InvalidChunkOutput;
                 const vector = self.embedding orelse return error.InvalidChunkOutput;
                 if (vector.len == 0 or (target.dimensions != null and target.dimensions.? != vector.len)) return error.InvalidChunkOutput;
                 for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidChunkOutput;
             },
             .transcribe => {
-                if (self.embedding != null or self.labels != null) return error.InvalidChunkOutput;
+                if (self.embedding != null or self.labels != null or self.speaker_spans != null) return error.InvalidChunkOutput;
                 const spans = self.spans orelse return error.InvalidChunkOutput;
                 const start = self.start_ns orelse return error.InvalidChunkOutput;
                 const end = self.end_ns orelse return error.InvalidChunkOutput;
@@ -181,8 +217,20 @@ pub const Result = struct {
                     previous = span.start_ns;
                 }
             },
+            .diarize => {
+                if (self.embedding != null or self.spans != null or self.labels != null or self.speaker_scope != .source) return error.InvalidChunkOutput;
+                const spans = self.speaker_spans orelse return error.InvalidChunkOutput;
+                var previous = self.start_ns orelse return error.InvalidChunkOutput;
+                const end = self.end_ns orelse return error.InvalidChunkOutput;
+                for (spans) |span| {
+                    if (span.start_ns != previous or span.end_ns <= span.start_ns or span.end_ns > end) return error.InvalidChunkOutput;
+                    if (span.speaker_index) |index| if (index >= target.speakerConfig().max_speakers) return error.InvalidChunkOutput;
+                    previous = span.end_ns;
+                }
+                if (previous != end) return error.InvalidChunkOutput;
+            },
             .classify => {
-                if (self.embedding != null or self.spans != null) return error.InvalidChunkOutput;
+                if (self.embedding != null or self.spans != null or self.speaker_spans != null or self.speaker_scope != null) return error.InvalidChunkOutput;
                 const labels = self.labels orelse return error.InvalidChunkOutput;
                 if (labels.len > target.top_k) return error.InvalidChunkOutput;
                 var previous: f32 = std.math.inf(f32);
@@ -251,6 +299,7 @@ pub const TranscriptSpan = struct {
     parent_ordinal: u32,
     sub_index: u32,
     speaker_index: ?u32,
+    speaker_scope: ?enum { source } = null,
 };
 pub const Projection = struct {
     text: []const u8,
@@ -286,7 +335,7 @@ pub fn project(a: std.mem.Allocator, rows: []const Row) !Projection {
                 if (text.items.len != 0) try text.append(a, ' ');
                 const first: u32 = @intCast(text.items.len);
                 try text.appendSlice(a, phrase.text);
-                try spans.append(a, .{ .char_start = first, .char_end = @intCast(text.items.len), .start_ns = phrase.start_ns, .end_ns = phrase.end_ns, .parent_ordinal = row.chunk_id, .sub_index = output.sub_index, .speaker_index = phrase.speaker_index });
+                try spans.append(a, .{ .char_start = first, .char_end = @intCast(text.items.len), .start_ns = phrase.start_ns, .end_ns = phrase.end_ns, .parent_ordinal = row.chunk_id, .sub_index = output.sub_index, .speaker_index = phrase.speaker_index, .speaker_scope = if (output.speaker_scope != null) .source else null });
             };
         }
         if (failed) projection.failed_chunks += 1 else projection.complete_chunks += 1;
@@ -302,16 +351,17 @@ pub const CoverageCounts = struct {
     embedding: CoverageValues = .{},
     transcribe: CoverageValues = .{},
     classify: CoverageValues = .{},
+    diarize: CoverageValues = .{},
     pub fn add(self: CoverageCounts, delta: CoverageCounts) CoverageCounts {
         var result = self;
-        inline for (.{ "embedding", "transcribe", "classify" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
+        inline for (.{ "embedding", "transcribe", "classify", "diarize" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
             @field(@field(result, kind), name) +|= @field(@field(delta, kind), name);
         };
         return result;
     }
     pub fn mergeMaximum(self: CoverageCounts, other: CoverageCounts) CoverageCounts {
         var result = self;
-        inline for (.{ "embedding", "transcribe", "classify" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
+        inline for (.{ "embedding", "transcribe", "classify", "diarize" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
             @field(@field(result, kind), name) = @max(@field(@field(result, kind), name), @field(@field(other, kind), name));
         };
         return result;
@@ -462,4 +512,40 @@ test "model aware media selective receipts preserve healthy windows and independ
     const hydrated = try mergeResults(arena.allocator(), &fresh, &cached, 3);
     try std.testing.expect(hydrated[0].labels != null);
     try std.testing.expectEqual(@as(u32, 2), hydrated[0].attempts);
+}
+
+test "model aware media diarization recipes bind speaker bytes and clustering without changing unrelated recipes" {
+    const a = std.testing.allocator;
+    var target = Target{ .name = "speech", .kind = .transcribe, .model = "whisper", .diarize = true };
+    const first = try target.speakerRecipeIdentity(a, "whisper-id", "whisper-rev", "speaker-rev1");
+    const deployed = try target.speakerRecipeIdentity(a, "whisper-id", "whisper-rev", "speaker-rev2");
+    try std.testing.expect(!std.mem.eql(u8, &first, &deployed));
+    target.diarization = .{ .similarity_threshold = 0.7 };
+    const configured = try target.speakerRecipeIdentity(a, "whisper-id", "whisper-rev", "speaker-rev1");
+    try std.testing.expect(!std.mem.eql(u8, &first, &configured));
+    target.execute = false;
+    target.skip_windows = &.{.{ .ordinal = 5, .sub_index = 0 }};
+    try std.testing.expectEqualSlices(u8, &configured, &try target.speakerRecipeIdentity(a, "whisper-id", "whisper-rev", "speaker-rev1"));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const revision: [64]u8 = @splat('a');
+    const receipt = Result{ .name = "voices", .kind = .diarize, .required = true, .model = "speaker", .model_identity = &revision, .model_revision = &revision, .recipe_id = &first, .status = .complete, .speaker_scope = .source, .speaker_model_revision = &revision, .start_ns = 0, .end_ns = 30, .speaker_spans = &.{ .{ .start_ns = 0, .end_ns = 10, .speaker_index = 0 }, .{ .start_ns = 10, .end_ns = 20 }, .{ .start_ns = 20, .end_ns = 30, .speaker_index = 0 } } };
+    const voices = Target{ .name = "voices", .kind = .diarize, .model = "speaker" };
+    try receipt.validate(voices);
+    const identity = try voices.receiptRecipeIdentity(a, receipt);
+    try std.testing.expectEqualSlices(u8, &identity, &try voices.speakerRecipeIdentity(a, receipt.model_identity, receipt.model_revision, &revision));
+    var redeployed = receipt;
+    const new_revision: [64]u8 = @splat('b');
+    redeployed.speaker_model_revision = &new_revision;
+    try std.testing.expect(!std.mem.eql(u8, &identity, &try voices.receiptRecipeIdentity(a, redeployed)));
+    var legacy = receipt;
+    legacy.speaker_model_revision = null;
+    try std.testing.expectError(error.InvalidChunkOutput, legacy.validate(voices));
+    try std.testing.expect(!std.mem.eql(u8, &identity, &try voices.receiptRecipeIdentity(a, legacy)));
+    try std.testing.expect(receipt.reusable());
+    var missing = receipt;
+    missing.speaker_spans = receipt.speaker_spans.?[0..2];
+    try std.testing.expectError(error.InvalidChunkOutput, missing.validate(voices));
+    const projection = try project(arena.allocator(), &.{.{ .chunk_id = 0, .outputs = &.{receipt} }});
+    try std.testing.expectEqualStrings("", projection.text);
 }

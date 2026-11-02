@@ -16,8 +16,8 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-// Fence merged logical-query layouts and failure/guard contracts.
-pub const abi_version: u32 = 68;
+// Fence the merged scheduling, resource and failure contracts.
+pub const abi_version: u32 = 86;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -816,6 +816,13 @@ pub const Status = enum(u32) {
     unsupported_exact_sort = 838,
     invalid_document_checkpoint = 839,
     too_many_active_jobs = 840,
+    hierarchy_cursor_stale = 841,
+    read_transient_failure = 842,
+    read_request_failed = 843,
+    invalid_gcs_url = 844,
+    gcs_connection_not_found_or_out_of_scope = 845,
+    ambiguous_gcs_connection = 846,
+    invalid_connection_credentials = 847,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

@@ -15,7 +15,7 @@
 
 //! Bounded, restartable physical materialization for disposable restore decoders.
 const std = @import("std");
-const engine = @import("engine.zig");
+const engine = @import("engine_dispatch.zig").implementation;
 const portable = @import("portable_backup.zig");
 const store_mod = @import("docstore.zig");
 const cancellation_mod = @import("antfly_cancellation");

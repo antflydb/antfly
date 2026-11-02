@@ -196,7 +196,8 @@ tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX")"
 tmp_ptx="$tmp_root/kernels.ptx"
 tmp_fatbin="$tmp_root/kernels.fatbin"
 tmp_sm89="$tmp_root/kernels.sm89.cubin"
-trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"; rmdir "$tmp_root"' EXIT
+tmp_symbols="$tmp_root/kernels.symbols"
+trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89" "$tmp_symbols"; rmdir "$tmp_root"' EXIT
 
 required_symbols=(
   antfly_audio_logmel_f32
@@ -511,8 +512,20 @@ required_symbols=(
 
 check_required_symbols() {
   local file="$1"
+  local symbol_source="$file"
+  case "$file" in
+    *.fatbin|*.cubin)
+      # Compressed images do not expose symbol names in their raw bytes.
+      if [ -z "$cuobjdump" ]; then
+        printf 'error: cuobjdump is required to validate binary CUDA artifacts\n' >&2
+        exit 1
+      fi
+      "$cuobjdump" --dump-elf-symbols "$file" > "$tmp_symbols"
+      symbol_source="$tmp_symbols"
+      ;;
+  esac
   for symbol in "${required_symbols[@]}"; do
-    if ! grep -a -q "$symbol" "$file"; then
+    if ! grep -a -F -w -q -- "$symbol" "$symbol_source"; then
       printf 'error: generated CUDA artifact is missing symbol %s\n' "$symbol" >&2
       exit 1
     fi
@@ -555,7 +568,8 @@ build_portable_ptx() {
 }
 
 build_fatbin() {
-  "$nvcc" -fatbin "$src" -o "$tmp_fatbin" \
+  # Compress all architecture images losslessly; CUDA owns decompression.
+  "$nvcc" -fatbin --compress-mode=size "$src" -o "$tmp_fatbin" \
     -gencode=arch=compute_75,code=sm_75 \
     -gencode=arch=compute_80,code=sm_80 \
     -gencode=arch=compute_89,code=sm_89 \

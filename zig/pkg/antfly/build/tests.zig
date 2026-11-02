@@ -174,9 +174,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .link_libc = true,
     });
     test_imports.configure(b, runnable_config_mod, true, true);
+    runnable_config_mod.addImport("antfly_resources_openapi", antfly_imports.common_openapi.import_table.get("antfly_resources_openapi").?);
     const runnable_config_tests = b.addTest(.{
         .root_module = runnable_config_mod,
-        .filters = &.{"config runnable scheduler"},
+        .filters = &.{ "config runnable scheduler", "config query waiting", "config workload envelope" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-runnable-config-test", "Verify public runnable policy parsing and managed cleanup capacity")
@@ -259,6 +260,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("replay-allocation-bench", "Build the allocation-counted replay benchmark")
         .dependOn(&b.addInstallArtifact(replay_allocation_bench, .{}).step);
 
+    const batch_contract_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/storage_batch_contract_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, batch_contract_mod, true, true);
+    const batch_contract_tests = b.addTest(.{
+        .name = "storage-batch-contract-tests",
+        .root_module = batch_contract_mod,
+        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector callback publishes and retires without reinference after acceptance" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("storage-batch-contract-test", "Verify collector OOM ownership and bounded provider batches without HTTP discovery")
+        .dependOn(&addFilteredTestRunArtifact(b, batch_contract_tests).step);
+
     const functions_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/functions_test_root.zig"),
         .target = target,
@@ -271,11 +287,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Parser/worker projection contracts need no HTTP server or linked kernel.
     // Reuse the lean source-discovery root so this boundary remains affordable
     // to check independently of the full API runtime harness.
+    const contribution_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "analyzed contributions", "introducer.", "bounded merge splits output" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("analyzed-contribution-test", "Verify bounded analysis reuse on the existing document format")
+        .dependOn(&b.addRunArtifact(contribution_tests).step);
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, contribution_tests, "analyzed-contribution-test-build", "Build portable analysis reuse tests", "antfly-analyzed-contribution-tests");
+
     const query_contract_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = selectTestFilters(b, &.{ "api query contract", "local query contract", "decision functions worker transport", "query string:" }) });
     b.step("query-contract-test", "Run query parsing, worker transport and projection contracts").dependOn(&b.addRunArtifact(query_contract_tests).step);
 
     const logical_field_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = selectTestFilters(b, &.{ "logical value", "logical query", "projection checkpoint external storage" }) });
     b.step("logical-field-query-test", "Verify logical query parsing, planning and original-value membership").dependOn(&addFilteredTestRunArtifact(b, logical_field_tests).step);
+
+    const source_identity_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "logical value conditional", "document mutation revision", "public graph metric borrowed wire cached content authority", "public graph metric borrowed wire backfill", "projected authority backfill" } });
+    b.step("source-value-identity-test", "Verify atomic source identity publication, migration and conditional reads").dependOn(&b.addRunArtifact(source_identity_tests).step);
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, source_identity_tests, "source-value-identity-test-build", "Build portable source identity and bounded read-window tests without executing them", "antfly-source-value-identity-tests");
 
     const api_http_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_http_runtime_test_root.zig"),
@@ -711,6 +740,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "SQL pgwire native", "SQL stateless fallback", "pgwire consumer", "pgwire direct cell encoding", "pgwire encoded JSONB", "pgwire frozen JSONB" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const managed_sources_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"managed source"} });
+    b.step("antfly-api-managed-sources-test", "Run managed CDC source configuration and status contracts").dependOn(&addFilteredTestRunArtifact(b, managed_sources_tests).step);
     b.step("antfly-api-sql-native-cells-test", "Verify native SQL result cells and retained-read requirements")
         .dependOn(&addFilteredTestRunArtifact(b, sql_native_cells_tests).step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
@@ -1669,6 +1700,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "postgres libpq cancelled FIFO head hands capacity to next waiter",
         "postgres libpq idle reclamation transfers only missing capacity",
         "postgres libpq reclamation leaves permit scheduling responsive",
+        "postgres libpq connection-error sanitizer",
         "query embedding cache owns results and coalesces misses",
         "query embedding cache keys isolate security domains",
         "managed embedder deadlines bound provider pacing and transport",
@@ -2437,6 +2469,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-resolver-namespace-test", "Validate durable namespace dependencies, bounded replay and restart inheritance")
         .dependOn(&addFilteredTestRunArtifact(b, resolver_namespace_tests).step);
 
+    const enrichment_shorthand_api_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{"enrichment shorthand"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-enrichment-shorthand-test", "Validate enrichment shorthand expansion into producer configs")
+        .dependOn(&addFilteredTestRunArtifact(b, enrichment_shorthand_api_tests).step);
+
     const memory_api_check = b.addTest(.{ .name = "memory-api-check", .root_module = api_http_runtime_test_mod, .filters = &.{"native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("memory-api-check", "Compile native memory HTTP and MCP tests").dependOn(&memory_api_check.step);
     const memory_api_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
@@ -2572,6 +2612,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_connection_filters = &.{
         "HTTP connection record",
         "HTTP connection DISCARD",
+        "HTTP connection directory",
         "HTTP connection recovers",
         "HTTP connection keeps",
         "HTTP connection reconciles",
@@ -2966,7 +3007,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const cmd_tests = b.addTest(.{
         .root_module = cmd_test_mod,
-        .filters = &.{ "cmd.cli.", "client URL option" },
+        .filters = &.{ "cmd.cli.", "client URL option", "client runtime" },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -3574,10 +3615,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     text_frontier_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const text_frontier_tests = b.addTest(.{
         .root_module = text_frontier_mod,
-        .filters = selectTestFilters(b, &.{ "external lake global frontier", "external lake metadata navigation", "external lake bounded window profiles", "external lake exact segment admission", "external lake bounded transforms", "external lake bounded window lookahead", "external lake bounded WAL", "constant score" }),
-        // The combined real-file/cloud owner peaks near 10 GB under optimized
-        // codegen; declare headroom instead of compiling twice on RSS retry.
-        .max_rss = @as(usize, if (optimize == .debug) 8 else 12) * 1024 * 1024 * 1024,
+        .filters = selectTestFilters(b, &.{ "external lake global frontier", "external lake metadata navigation", "external lake navigation scoped waves", "external lake bounded window profiles", "external lake exact segment admission", "external lake bounded transforms", "external lake bounded window lookahead", "external lake bounded WAL", "constant score" }),
+        // The full external-lake Debug selection measured 12.92 GB on macOS;
+        // optimized codegen peaks near 10 GB. Reserve compiler headroom so a
+        // broader test filter can run without a failed RSS admission/recompile.
+        .max_rss = @as(usize, if (optimize == .debug) (if (target.result.os.tag == .macos) 16 else 8) else 12) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-text-frontier-test", "Verify metadata-only global admission, score bounds, ties and bounded profile aggregation")
@@ -5697,6 +5739,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"system catalog standalone relation coordinator"},
     });
     b.step("antfly-standalone-pgwire-ddl-test", "Run standalone relation publication and guarded DDL tests").dependOn(&addFilteredTestRunArtifact(b, standalone_ddl_tests).step);
+    const standalone_cdc_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"standalone cdc"},
+    });
+    b.step("antfly-standalone-cdc-test", "Run standalone PostgreSQL CDC scheduling and status tests").dependOn(&addFilteredTestRunArtifact(b, standalone_cdc_tests).step);
 
     // This filter set boots the real CLI/standalone and Lite server paths
     // (HA, hot-standby, Lite adoption, ...), which reach the real
@@ -7257,7 +7304,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lite_merge_publication_runtime_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions" },
+        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions", "db manual text producers merge capacity without optional workers", "db bulk ingest keeps full text merge maintenance live", "db text merge structural pause rejects manual turns", "db text merge stop does not deadlock against a producer's assisted fallback", "text merge publication handoff releases index lease before global contention", "db delete full text index drains active merge before closing generation", "db close stops text admission before joining derived publishers", "db structural mutation autonomously retries transient maintenance restart failures" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-merge-publication-runtime-test", "Verify incremental merge publication handoff and shutdown")
@@ -7960,6 +8007,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.group_sources.",
             "storage.db.resolver_authority.",
             "storage.db.resolver_curation.",
+            "storage.db.resolver_query_context.",
+            "storage.db.resolver_static_profiles.",
             "storage.db.dense_exact.",
             "storage.db.doc_filter_wire.",
             "storage.db.doc_identity.",
@@ -8051,6 +8100,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.table_catalog.",
             "storage.db.resolution_handoff.",
             "storage.db.resolution_runtime.",
+            "storage.db.repair_failure.",
             "storage.db.root_identity.",
             "storage.db.root_signing_identity.",
             "storage.db.snapshot_admission.",
@@ -8112,6 +8162,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.enrichment.",
             "storage.engine.",
             "storage.logical_source.",
+            "storage.db.field_projection_source.",
+            "storage.source_value_identity.",
             "storage.document_projection.",
             "storage.filesystem_capacity.",
             "storage.generation_publication.",

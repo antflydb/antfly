@@ -206,6 +206,12 @@ pub fn liteSchemaJson(handle: *h.Handle, alloc: std.mem.Allocator, id: u64) !?[]
 }
 
 pub fn get(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {
+    const database = try getUnrecovered(handle, name);
+    try @import("sql_ddl.zig").requireRecovered(handle, database, name);
+    return database;
+}
+
+fn getUnrecovered(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {
     try loadCatalog(handle);
     if (std.mem.eql(u8, name, "default")) return &handle.db;
     handle.embedded_table_open_mutex.lockUncancelable(h.handleLockIo());
@@ -231,7 +237,10 @@ pub fn create(handle: *h.Handle, name: []const u8, schema: []const u8, if_not_ex
     if (name.len == 0 or name.len > 1024 or std.mem.indexOfScalar(u8, name, 0) != null or !std.unicode.utf8ValidateSlice(name)) return error.InvalidSqlParameters;
     try loadCatalog(handle);
     if (std.mem.eql(u8, name, "default") or handle.embedded_table_records.contains(name)) {
-        if (if_not_exists) return;
+        if (if_not_exists) {
+            _ = try get(handle, name);
+            return;
+        }
         return error.TableAlreadyExists;
     }
     var parsed_schema = try h.tables_api.parseValidatedTableSchema(handle.alloc, schema);
@@ -408,7 +417,7 @@ pub fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) callcon
         return @call(.auto, @extern(*const @TypeOf(antfly_db_list_tables_json), .{ .name = "antfly_db_list_tables_json" }), .{ ptr, out });
     h.capi.clearLastError();
     out.* = .{};
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = api.enterHandleWithIntent(ptr, .exclusive, .read_only) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);
@@ -438,7 +447,7 @@ pub fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?*anyopa
         return @call(.auto, @extern(*const @TypeOf(antfly_db_open_table), .{ .name = "antfly_db_open_table" }), .{ ptr, name, out });
     h.capi.clearLastError();
     out.* = null;
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = api.enterHandleWithIntent(ptr, .exclusive, .read_only) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return h.capi.ensureError(code, @src().fn_name);

@@ -29,9 +29,8 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-// Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
-// Fence merged logical-query layouts and failure/guard contracts.
-pub const abi_version: u32 = 62;
+// Fence the merged scheduling, resource and retained document contracts.
+pub const abi_version: u32 = 63;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -130,6 +129,8 @@ pub const AuthorizationDecision = enum(c_int) {
     unauthorized = 1,
     forbidden = 2,
     not_ready = 3,
+    /// Deployment policy rejects public writes; distinct from missing RBAC.
+    public_inference_disabled = 4,
 };
 
 pub const AuthorizeInferenceContext = extern struct {

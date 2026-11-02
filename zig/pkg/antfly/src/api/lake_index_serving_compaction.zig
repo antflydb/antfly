@@ -511,13 +511,10 @@ fn publishDeltaWithStagingLimit(a: A, out: A, store: *stores.ArtifactStore, curr
     defer terms.deinit();
     terms.enableDurable(pages.store());
     var ownership = corpus.text_directory.Mutations.init(a, &manager, pages.store());
-    ownership.private_pages.phase = store.io_phase;
     defer ownership.deinit();
     var source_routes = corpus.text_directory.Mutations.init(a, &manager, pages.store());
-    source_routes.private_pages.phase = store.io_phase;
     defer source_routes.deinit();
     var ties = corpus.text_directory.Mutations.init(a, &manager, pages.store());
-    ties.private_pages.phase = store.io_phase;
     ties.reduction = @import("lake_index_text_ties.zig").reduce;
     defer ties.deinit();
     var metadata: corpus.text_directory.Publisher = undefined;

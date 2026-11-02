@@ -981,6 +981,66 @@ describe("InferenceClient with mock fetch", () => {
   });
 
   describe("embedDense (negotiated dense-vector helper)", () => {
+    it.each([
+      { failedIndexes: [0] },
+      { failedIndexes: [1] },
+      { failedIndexes: [2] },
+      { failedIndexes: [0, 1, 2] },
+    ])("rejects per-item failures at indexes $failedIndexes instead of shifting vectors", async ({
+      failedIndexes,
+    }) => {
+      const data = [0, 1, 2]
+        .filter((index) => !failedIndexes.includes(index))
+        .map((index) => ({ object: "embedding", index, embedding: [index, 0.5] }));
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            model: "model",
+            data,
+            errors: failedIndexes.map((index) => ({
+              index,
+              code: "INVALID_INPUT",
+              message: "Invalid input",
+              stage: "parse",
+              retryable: false,
+              status: 400,
+            })),
+            summary: { total: 3, succeeded: data.length, failed: failedIndexes.length },
+          }),
+          { headers: { "Content-Type": "application/json" } }
+        )
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.embedDense("model", ["first", "second", "third"], { error_policy: "per_item" })
+      ).rejects.toThrow("use embed() to inspect indexed results and errors");
+    });
+
+    it("accepts per-item responses when every input succeeds", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            model: "model",
+            data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2] }],
+            errors: [],
+            summary: { total: 1, succeeded: 1, failed: 0 },
+          }),
+          { headers: { "Content-Type": "application/json" } }
+        )
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.embedDense("model", ["text"], { error_policy: "per_item" })
+      ).resolves.toEqual([[0.1, 0.2]]);
+      expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]?.body as string)).toMatchObject({
+        error_policy: "per_item",
+      });
+    });
+
     it("extracts dense vectors from the current OpenAI-compatible JSON response", async () => {
       vi.mocked(fetch).mockResolvedValueOnce(
         new Response(

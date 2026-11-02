@@ -2258,6 +2258,9 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.RequiredMediaOutputFailed,
         error.DocumentModelRevisionMismatch,
         error.DocumentBudgetExhausted,
+        // The request's estimate exceeds the configured inference budget;
+        // contention surfaces as ResourceTemporarilyUnavailable instead.
+        error.MemoryBudgetExceeded,
         error.InvalidDocumentCheckpoint,
         error.InvalidDocumentSource,
         error.InvalidDocumentSelection,
@@ -2385,6 +2388,35 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         // budget and are parked for repair if that budget is exhausted.
         else => .retryable_request,
     };
+}
+
+/// The shared repair/enrichment classification decides which retryable
+/// failures leave a document's attempt budget untouched.
+fn enrichmentFailureSparesAttemptBudget(err: anyerror) bool {
+    return types.repair_failure.isAdmissionRefusal(err);
+}
+
+test "transient refusals do not spend the enrichment attempt budget" {
+    try std.testing.expect(enrichmentFailureSparesAttemptBudget(error.ResourceTemporarilyUnavailable));
+    // Rate limits are transient but bounded, so outages park as repair debt.
+    try std.testing.expect(!enrichmentFailureSparesAttemptBudget(error.EmbedRateLimited));
+    try std.testing.expect(!enrichmentFailureSparesAttemptBudget(error.MemoryBudgetExceeded));
+    // A request that can never fit the configured budget is permanent.
+    try std.testing.expect(!isRetryableEnrichmentError(error.MemoryBudgetExceeded));
+    try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
+}
+
+test "normalized local admission refusal is exempt but normalized provider transient failure is not" {
+    // managed_embedder.normalizeLocalEmbeddingError reports a local
+    // provider's admission refusal as error.EmbedAdmissionRefused, distinct
+    // from error.EmbedTransientFailure (a real provider failure: 5xx,
+    // timeout, connection error). Dense, sparse, and media embedding all
+    // share that one normalization function, so this exemption must hold for
+    // all three without re-deriving it per call site.
+    try std.testing.expect(enrichmentFailureSparesAttemptBudget(error.EmbedAdmissionRefused));
+    try std.testing.expect(!enrichmentFailureSparesAttemptBudget(error.EmbedTransientFailure));
+    try std.testing.expect(isRetryableEnrichmentError(error.EmbedAdmissionRefused));
+    try std.testing.expect(isRetryableEnrichmentError(error.EmbedTransientFailure));
 }
 
 pub fn isRetryableEnrichmentError(err: anyerror) bool {
@@ -2556,19 +2588,47 @@ fn retryBudgetAllowsYield(consecutive_retry_count: u32, max_attempts: u32) bool 
     return @as(u64, consecutive_retry_count) +| 1 < @max(max_attempts, 1);
 }
 
-fn activeRequestRetryBudgetAllowsYield(runtime: *EnrichmentRuntime) bool {
+/// Admission refusals never ran the request, so `enrichmentFailureSparesAttemptBudget`
+/// keeps them off the document's attempt budget (`retry_failure_count`). Left
+/// unbounded, a request permanently over the configured resource budget (for
+/// example, one that will never fit under `--inference-scratch-budget-mb` for
+/// any concurrent caller) would wait for admission forever instead of
+/// surfacing as repair debt. This ceiling is independent of
+/// `worker_retry_max_attempts` and deliberately generous: ordinary admission
+/// contention clears in a handful of backoffs.
+const admission_wait_max_attempts: u32 = 1000;
+
+fn admissionWaitBudgetAllowsYield(waited_attempts: u32) bool {
+    return retryBudgetAllowsYield(waited_attempts, admission_wait_max_attempts);
+}
+
+/// The budget an error should be checked against: the document's durable
+/// attempt budget for work that actually ran, or the separate, much larger
+/// admission-wait ceiling for admission refusals that never did. Keeping the
+/// yield decision and `recordRetryableError`'s accounting on the same
+/// `enrichmentFailureSparesAttemptBudget` classification is what lets an
+/// admission refusal retry past `worker_retry_max_attempts`.
+fn requestRetryBudgetAllows(prior_attempts: u32, max_attempts: u32, spares_attempt_budget: bool) bool {
+    return if (spares_attempt_budget)
+        admissionWaitBudgetAllowsYield(prior_attempts)
+    else
+        retryBudgetAllowsYield(prior_attempts, max_attempts);
+}
+
+fn activeRequestRetryBudgetAllowsYield(runtime: *EnrichmentRuntime, err: anyerror) bool {
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
     if (runtime.active_failure_fingerprint == 0) {
         runtime.retry_error_has_request_identity = false;
         return true;
     }
+    const spares_attempt_budget = enrichmentFailureSparesAttemptBudget(err);
     const prior_attempts = requestPriorAttempts(
         runtime.active_failure_fingerprint,
         runtime.retry_failure_fingerprint,
-        runtime.retry_failure_count,
+        if (spares_attempt_budget) runtime.transient_retry_count else runtime.retry_failure_count,
     );
-    const allows_yield = retryBudgetAllowsYield(prior_attempts, runtime.config.worker_retry_max_attempts);
+    const allows_yield = requestRetryBudgetAllows(prior_attempts, runtime.config.worker_retry_max_attempts, spares_attempt_budget);
     runtime.retry_error_has_request_identity = allows_yield;
     return allows_yield;
 }
@@ -2580,16 +2640,17 @@ fn activeRequestRetryBudgetAllowsYield(runtime: *EnrichmentRuntime) bool {
 /// `FailureScope`, and the lane boundary (`LanePipeline`) installs the
 /// failing lane's identity once, on the scanner thread, right before the
 /// error reaches the supervisor.
-fn requestRetryBudgetAllowsYieldFor(runtime: *EnrichmentRuntime, fingerprint: u64) bool {
+fn requestRetryBudgetAllowsYieldFor(runtime: *EnrichmentRuntime, fingerprint: u64, err: anyerror) bool {
     if (fingerprint == 0) return true;
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
+    const spares_attempt_budget = enrichmentFailureSparesAttemptBudget(err);
     const prior_attempts = requestPriorAttempts(
         fingerprint,
         runtime.retry_failure_fingerprint,
-        runtime.retry_failure_count,
+        if (spares_attempt_budget) runtime.transient_retry_count else runtime.retry_failure_count,
     );
-    return retryBudgetAllowsYield(prior_attempts, runtime.config.worker_retry_max_attempts);
+    return requestRetryBudgetAllows(prior_attempts, runtime.config.worker_retry_max_attempts, spares_attempt_budget);
 }
 
 /// `shouldYieldRequestError` for an explicit identity; see
@@ -2599,7 +2660,7 @@ fn shouldYieldRequestErrorFor(runtime: *EnrichmentRuntime, fingerprint: u64, err
     return switch (enrichmentErrorDisposition(err)) {
         .fatal_worker => true,
         .terminal_request => false,
-        .retryable_request => requestRetryBudgetAllowsYieldFor(runtime, fingerprint),
+        .retryable_request => requestRetryBudgetAllowsYieldFor(runtime, fingerprint, err),
     };
 }
 
@@ -2708,12 +2769,18 @@ fn workerLoopRetryScopeIfAllowed(runtime: *EnrichmentRuntime, err: anyerror) ?Wo
         runtime.active_failure_fingerprint != 0;
     runtime.retry_error_has_request_identity = false;
     if (request_owned) {
+        // Re-derive the same budget shouldYieldRequestError already admitted
+        // this request against, using the same admission-refusal exemption,
+        // so this recheck cannot reject a request that was already granted
+        // another attempt (which would stop the whole worker via recordError
+        // instead of just parking the document).
+        const spares_attempt_budget = enrichmentFailureSparesAttemptBudget(err);
         const request_prior_attempts = requestPriorAttempts(
             runtime.active_failure_fingerprint,
             runtime.retry_failure_fingerprint,
-            runtime.retry_failure_count,
+            if (spares_attempt_budget) runtime.transient_retry_count else runtime.retry_failure_count,
         );
-        return if (retryBudgetAllowsYield(request_prior_attempts, runtime.config.worker_retry_max_attempts))
+        return if (requestRetryBudgetAllows(request_prior_attempts, runtime.config.worker_retry_max_attempts, spares_attempt_budget))
             .request
         else
             null;
@@ -2747,7 +2814,7 @@ fn shouldYieldRequestError(runtime: *EnrichmentRuntime, err: anyerror) bool {
         // the supervisor ceiling.
         // Pipeline failures have no request identity and must never consume a
         // document budget or be converted into terminal document coverage.
-        .retryable_request => activeRequestRetryBudgetAllowsYield(runtime),
+        .retryable_request => activeRequestRetryBudgetAllowsYield(runtime, err),
     };
 }
 
@@ -3034,10 +3101,232 @@ test "worker retry preserves only an explicitly authorized request identity" {
     };
 
     runtime.active_failure_fingerprint = 1234;
-    try std.testing.expect(activeRequestRetryBudgetAllowsYield(&runtime));
+    try std.testing.expect(activeRequestRetryBudgetAllowsYield(&runtime, error.EmbedRateLimited));
     try std.testing.expect(runtime.retry_error_has_request_identity);
     try std.testing.expect(workerLoopRetryBudgetAllowsYield(&runtime, error.EmbedRateLimited));
     try std.testing.expectEqual(@as(u64, 1234), runtime.active_failure_fingerprint);
+    try std.testing.expect(!runtime.retry_error_has_request_identity);
+}
+
+test "admission refusals retry past worker_retry_max_attempts without parking" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 55;
+    // A plain attempt-budget check (prior_attempts=0, max_attempts=1) would
+    // already deny this: 0 + 1 < 1 is false. The admission exemption must
+    // still let the very first refusal yield.
+    try std.testing.expect(shouldYieldRequestError(&runtime, error.ResourceTemporarilyUnavailable));
+    try std.testing.expect(runtime.retry_error_has_request_identity);
+
+    runtime.retry_failure_fingerprint = runtime.active_failure_fingerprint;
+    var refusal: u32 = 0;
+    while (refusal < 10) : (refusal += 1) {
+        runtime.transient_retry_count = refusal;
+        try std.testing.expect(shouldYieldRequestError(&runtime, error.ResourceTemporarilyUnavailable));
+        // Admission refusals never spend retry_failure_count, so once
+        // admission frees up the request still has its full attempt budget.
+        try std.testing.expectEqual(@as(u32, 0), runtime.retry_failure_count);
+    }
+}
+
+test "admission refusal on the final allowed attempt still yields" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 77;
+    runtime.retry_failure_fingerprint = 77;
+    // The document's ordinary attempt budget is already exhausted: the next
+    // non-admission attempt under this identity would park.
+    try std.testing.expect(!retryBudgetAllowsYield(runtime.retry_failure_count, runtime.config.worker_retry_max_attempts));
+    try std.testing.expect(!shouldYieldRequestError(&runtime, error.EmbedRateLimited));
+    try std.testing.expect(!runtime.retry_error_has_request_identity);
+
+    // An admission refusal under the same identity is exempt from that
+    // exhausted budget: the request never ran, so it still yields instead of
+    // parking the document.
+    try std.testing.expect(shouldYieldRequestError(&runtime, error.ResourceTemporarilyUnavailable));
+    try std.testing.expect(runtime.retry_error_has_request_identity);
+}
+
+test "a dense or media embedder refusing admission after adapter normalization never spends the document retry budget" {
+    // managed_embedder.normalizeLocalEmbeddingError reports the local
+    // provider's admission refusal as error.EmbedAdmissionRefused, not the
+    // raw error.ResourceTemporarilyUnavailable. Dense and media document
+    // embedding read that normalized error directly (they never retry
+    // through managed_embedder's query-only retry wrapper), so the
+    // document's attempt budget must stay untouched across many repeated
+    // refusals, exactly like the pre-normalization identity does.
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 55;
+    // A plain attempt-budget check (prior_attempts=0, max_attempts=1) would
+    // already deny this: 0 + 1 < 1 is false. The admission exemption must
+    // still let the very first refusal yield.
+    try std.testing.expect(shouldYieldRequestError(&runtime, error.EmbedAdmissionRefused));
+    try std.testing.expect(runtime.retry_error_has_request_identity);
+
+    runtime.retry_failure_fingerprint = runtime.active_failure_fingerprint;
+    var refusal: u32 = 0;
+    while (refusal < 10) : (refusal += 1) {
+        runtime.transient_retry_count = refusal;
+        try std.testing.expect(shouldYieldRequestError(&runtime, error.EmbedAdmissionRefused));
+        // Admission refusals never spend retry_failure_count, so once
+        // admission frees up the request still has its full attempt budget.
+        try std.testing.expectEqual(@as(u32, 0), runtime.retry_failure_count);
+    }
+}
+
+test "a real embedding provider transient failure still spends the document retry budget" {
+    // Contrast with the admission-refusal test above: error.EmbedTransientFailure
+    // is the managed embedding adapters' identity for a real provider
+    // failure (5xx, timeout, connection error). It must not share the
+    // admission exemption, or a genuinely failing provider would retry past
+    // the document's attempt budget instead of eventually parking as repair
+    // debt.
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 77;
+    runtime.retry_failure_fingerprint = 77;
+    // The document's ordinary attempt budget is already exhausted.
+    try std.testing.expect(!retryBudgetAllowsYield(runtime.retry_failure_count, runtime.config.worker_retry_max_attempts));
+    try std.testing.expect(!shouldYieldRequestError(&runtime, error.EmbedTransientFailure));
+    try std.testing.expect(!runtime.retry_error_has_request_identity);
+}
+
+test "shouldYieldRequestErrorFor applies the same admission exemption as the active identity check" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    const fingerprint: u64 = 202;
+    runtime.retry_failure_fingerprint = fingerprint;
+    // A non-admission transient error has nothing left to spend.
+    try std.testing.expect(!shouldYieldRequestErrorFor(&runtime, fingerprint, error.EmbedRateLimited));
+    // An admission refusal for the same identity is still exempt.
+    try std.testing.expect(shouldYieldRequestErrorFor(&runtime, fingerprint, error.ResourceTemporarilyUnavailable));
+}
+
+test "worker loop retry recheck applies the same admission exemption as the inline check" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    // As if shouldYieldRequestError already admitted this exact request.
+    runtime.active_failure_fingerprint = 101;
+    runtime.retry_failure_fingerprint = 101;
+    runtime.retry_error_has_request_identity = true;
+    try std.testing.expectEqual(
+        WorkerRetryScope.request,
+        workerLoopRetryScopeIfAllowed(&runtime, error.ResourceTemporarilyUnavailable).?,
+    );
+}
+
+test "the admission-wait budget is bounded so a permanently refused request eventually parks" {
+    try std.testing.expect(admissionWaitBudgetAllowsYield(admission_wait_max_attempts - 2));
+    try std.testing.expect(!admissionWaitBudgetAllowsYield(admission_wait_max_attempts - 1));
+
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .worker_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+
+    runtime.active_failure_fingerprint = 88;
+    runtime.retry_failure_fingerprint = 88;
+    runtime.transient_retry_count = admission_wait_max_attempts - 1;
+    // Even an admission refusal eventually parks once the much larger,
+    // independent admission-wait ceiling is spent: a request permanently
+    // over the configured resource budget cannot wait for admission forever.
+    try std.testing.expect(!shouldYieldRequestError(&runtime, error.ResourceTemporarilyUnavailable));
     try std.testing.expect(!runtime.retry_error_has_request_identity);
 }
 
@@ -4030,7 +4319,18 @@ fn embedDenseBatchAttempt(dense_embedder: embedder_mod.DenseEmbedder, runtime: *
 }
 
 fn embedDenseBatchAttemptLimits(dense_embedder: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32, limits: ?DenseBatchLimits) ![]const []const f32 {
-    if (limits) |bounded| return plannedDenseBatches(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), bounded);
+    if (limits) |bounded| {
+        // Foreground calls promise an interruptible provider. Background
+        // publication also uses a context for deadline/progress fences, but
+        // must continue to support legacy synchronous providers.
+        if (!denseProviderSupportsContext(dense_embedder)) {
+            if (foregroundProviderRequestContext(runtime)) |context| {
+                try context.check();
+                return error.UncancellableInferenceProvider;
+            }
+        }
+        return plannedDenseBatches(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), bounded);
+    }
     // Context-aware callbacks still require an explicit reentrancy guarantee.
     // Custom and legacy providers retain their serial path by default.
     const parallelism = @min(@min(generatedEmbedParallelBatches(), @max(@as(usize, 1), dense_embedder.dense_batch_concurrency)), texts.len);
@@ -4050,7 +4350,8 @@ fn parallelDenseBatchWithCapacityFallback(alloc: Allocator, io: Io, provider: em
 }
 
 fn denseBatchCapacityFailure(err: anyerror) bool {
-    return err == error.EmbedTransientFailure or err == error.ResourceTemporarilyUnavailable;
+    return err == error.EmbedTransientFailure or err == error.ResourceTemporarilyUnavailable or
+        err == error.EmbedAdmissionRefused;
 }
 
 fn noteDenseBatchFailure(failure: *?anyerror, err: anyerror) void {
@@ -4077,6 +4378,12 @@ fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbe
 }
 
 const DenseBatchLimits = struct { items: usize, bytes: usize };
+
+fn denseProviderSupportsContext(provider: embedder_mod.DenseEmbedder) bool {
+    return provider.dense_embed_batch_with_context_fn != null or
+        provider.dense_embed_with_context_fn != null or
+        (provider.part_lease != null and provider.dense_embed_batch_planned_fn != null);
+}
 
 fn denseBatchParallelism(provider: embedder_mod.DenseEmbedder) usize {
     if (provider.dense_embed_batch_with_context_fn == null) return 1;
@@ -4122,7 +4429,18 @@ fn parallelDenseBatchPlanned(alloc: Allocator, io: Io, provider: embedder_mod.De
         dims: u32,
         context: inference_request_context.RequestContext,
         fn run(self: *@This()) anyerror![]const []const f32 {
-            return self.provider.embedDenseBatchWithContext(self.alloc, self.name, self.texts, self.dims, self.context);
+            if (denseProviderSupportsContext(self.provider))
+                return self.provider.embedDenseBatchWithContext(self.alloc, self.name, self.texts, self.dims, self.context);
+            // Legacy providers are serialized by denseBatchParallelism. Keep
+            // limits and cancellation fences around their synchronous call,
+            // without claiming the provider itself can be interrupted.
+            try self.context.check();
+            const vectors = try self.provider.embedDenseBatch(self.alloc, self.name, self.texts, self.dims);
+            self.context.check() catch |err| {
+                embedder_mod.freeDenseEmbeddingBatch(self.alloc, vectors);
+                return err;
+            };
+            return vectors;
         }
     };
     const vectors = try alloc.alloc([]const f32, texts.len);
@@ -4181,6 +4499,95 @@ fn parallelDenseBatchPlanned(alloc: Allocator, io: Io, provider: embedder_mod.De
     }
     try context.check();
     return vectors;
+}
+
+test "bounded dense legacy providers remain serial and obey item byte and cancellation fences" {
+    const Harness = struct {
+        calls: usize = 0,
+        batches: usize = 0,
+        largest_items: usize = 0,
+        largest_bytes: usize = 0,
+        cancel_on_return: bool = false,
+        cancelled: bool = false,
+        fn isCancelled(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            return self.cancelled;
+        }
+        fn batch(ptr: *anyopaque, alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batches += 1;
+            self.largest_items = @max(self.largest_items, texts.len);
+            self.largest_bytes = @max(self.largest_bytes, textBatchByteStats(texts).total_bytes);
+            const out = try alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |vector| alloc.free(vector);
+                alloc.free(out);
+            }
+            for (texts, out) |text, *vector| {
+                vector.* = try embed(ptr, alloc, name, text, dims);
+                initialized += 1;
+            }
+            if (self.cancel_on_return) self.cancelled = true;
+            return out;
+        }
+        fn embed(ptr: *anyopaque, alloc: Allocator, _: []const u8, text: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const vector = try alloc.alloc(f32, dims);
+            @memset(vector, @as(f32, @floatFromInt(try std.fmt.parseUnsigned(u32, text, 10))));
+            return vector;
+        }
+    };
+    var harness: Harness = .{};
+    const provider: embedder_mod.DenseEmbedder = .{ .ptr = &harness, .dense_embed_fn = Harness.embed, .dense_embed_batch_fn = Harness.batch, .dense_batch_concurrency = 4 };
+    try std.testing.expectEqual(@as(usize, 1), denseBatchParallelism(provider));
+    const alloc = std.testing.allocator;
+    const context: inference_request_context.RequestContext = .{ .io = std.testing.io, .deadline_ns = null };
+    const texts = [_][]const u8{ "1", "2", "3", "4", "5" };
+    const vectors = try plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, context, .{ .items = 2, .bytes = 2 });
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+    for (vectors, 1..) |vector, value| try std.testing.expectEqual(@as(f32, @floatFromInt(value)), vector[0]);
+    try std.testing.expectEqual(@as(usize, 5), harness.calls);
+    try std.testing.expectEqual(@as(usize, 3), harness.batches);
+    try std.testing.expectEqual(@as(usize, 2), harness.largest_items);
+    try std.testing.expectEqual(@as(usize, 2), harness.largest_bytes);
+    const byte_limited = try plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, context, .{ .items = 4, .bytes = 2 });
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, byte_limited);
+    try std.testing.expectEqual(@as(usize, 6), harness.batches);
+    try std.testing.expectEqual(@as(usize, 2), harness.largest_items);
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, plannedDenseBatches(alloc, std.testing.io, provider, "model", &.{"123"}, 1, context, .{ .items = 2, .bytes = 2 }));
+    var expired = context;
+    expired.deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, expired, .{ .items = 2, .bytes = 2 }));
+    try std.testing.expectEqual(@as(usize, 10), harness.calls);
+    var cancelled = context;
+    cancelled.cancellation = .{ .ptr = &harness, .is_cancelled_fn = Harness.isCancelled };
+    harness.cancel_on_return = true;
+    // Cancellation arriving inside an uninterruptible callback must release
+    // all returned vectors and stop before a second bounded batch is issued.
+    try std.testing.expectError(error.Cancelled, plannedDenseBatches(alloc, std.testing.io, provider, "model", &texts, 1, cancelled, .{ .items = 2, .bytes = 2 }));
+    try std.testing.expectEqual(@as(usize, 7), harness.batches);
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .io = std.testing.io },
+        .ownership = undefined,
+        .active_provider_guard = .{ .deadline_ns = std.math.maxInt(u64) },
+    };
+    // An explicit foreground cancellation contract still requires a
+    // controlled callback; bounding a batch must not weaken that contract.
+    try std.testing.expectError(error.UncancellableInferenceProvider, embedDenseBatchAttemptLimits(provider, &runtime, "model", &texts, 1, .{ .items = 2, .bytes = 2 }));
+    try std.testing.expectEqual(@as(usize, 7), harness.batches);
 }
 
 test "parallel dense inference preserves order drains failures and bounds provider concurrency" {
@@ -5496,6 +5903,7 @@ fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment
                     .embedding => delta.embedding = values,
                     .transcribe => delta.transcribe = values,
                     .classify => delta.classify = values,
+                    .diarize => delta.diarize = values,
                 }
             }
         }
@@ -5923,6 +6331,9 @@ const UnsupportedEnrichmentRuntime = struct {
     retry_after_hint_ms: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
     retry_failure_count: u32 = 0,
+    /// Transient refusals of the current failure identity. They pace the
+    /// back-off but never spend `retry_failure_count`'s attempt budget.
+    transient_retry_count: u32 = 0,
     terminal_failure_min_sequence: u64 = 0,
     terminal_failure_max_sequence: u64 = 0,
     active_failure_fingerprint: u64 = 0,
@@ -6492,6 +6903,9 @@ const PlatformEnrichmentRuntime = struct {
     retry_after_hint_ms: u64 = 0,
     retry_failure_fingerprint: u64 = 0,
     retry_failure_count: u32 = 0,
+    /// Transient refusals of the current failure identity. They pace the
+    /// back-off but never spend `retry_failure_count`'s attempt budget.
+    transient_retry_count: u32 = 0,
     terminal_failure_min_sequence: u64 = 0,
     terminal_failure_max_sequence: u64 = 0,
     active_failure_fingerprint: u64 = 0,
@@ -7416,13 +7830,19 @@ const PlatformEnrichmentRuntime = struct {
         if (self.retry_failure_fingerprint != self.active_failure_fingerprint) {
             self.retry_failure_fingerprint = self.active_failure_fingerprint;
             self.retry_failure_count = 0;
+            self.transient_retry_count = 0;
         }
-        if (!awaiting_publication) self.retry_failure_count +|= 1;
+        // Admission refusals never ran the request: back off, but keep the
+        // document's attempt budget for work that actually failed.
+        const transient = !awaiting_publication and enrichmentFailureSparesAttemptBudget(err);
+        if (!awaiting_publication) {
+            if (transient) self.transient_retry_count +|= 1 else self.retry_failure_count +|= 1;
+        }
         // A normal ordered acknowledgement wait is not a provider failure.
         // In particular, many census pages must not exponentially delay one
         // another or inherit an earlier provider's backoff hint.
         const retry_ordinal = if (awaiting_publication) 0 else if (scope == .request)
-            self.retry_failure_count
+            self.retry_failure_count +| self.transient_retry_count
         else
             self.consecutive_retry_count;
         const delay_ms = workerRetryDelayWithHintMs(retry_ordinal, if (awaiting_publication) 0 else self.retry_after_hint_ms);
@@ -8266,7 +8686,7 @@ fn noteTerminalRequestFailure(
     indexes: []const []const u8,
     artifact_name: []const u8,
     completed_failure_fingerprint: u64,
-    failure: anyerror,
+    failure_name: []const u8,
 ) !void {
     const maybe_io = lockRuntime(runtime);
     const interval = mergedTerminalFailureInterval(
@@ -8288,7 +8708,7 @@ fn noteTerminalRequestFailure(
         runtime.retry_failure_fingerprint = 0;
         runtime.retry_failure_count = 0;
     }
-    runtime.last_error_code = types.RuntimeErrorName.init(@errorName(failure));
+    runtime.last_error_code = types.RuntimeErrorName.init(failure_name);
     runtime.error_count += 1;
     runtime.fatal_error_count += 1;
     runtime.retrying = false;
@@ -8374,7 +8794,13 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
 }
 
 fn recordIsolatedRequestErrorFor(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, err: anyerror, attempt_number: u64) !void {
-    std.log.warn("enrichment request failed index={s} artifact={s} doc_key={s}: {s}", .{ request.index_name, requestEmbeddingName(request), request.doc_key, @errorName(err) });
+    try recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), attempt_number);
+}
+
+/// `error_name` is the durable, operator-visible cause. Callers that wrap a
+/// lower-level failure pass that failure's name rather than the wrapper.
+fn recordIsolatedRequestErrorNamed(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, error_name: []const u8, attempt_number: u64) !void {
+    std.log.warn("enrichment request failed index={s} artifact={s} doc_key={s}: {s}", .{ request.index_name, requestEmbeddingName(request), request.doc_key, error_name });
     const owned_indexes = if (runtime.coverage_apply_mutex != null)
         try affectedIndexesForRequestAlloc(runtime, request)
     else
@@ -8400,7 +8826,7 @@ fn recordIsolatedRequestErrorFor(runtime: *EnrichmentRuntime, window: ?*Generate
                     .asset, .chunk_text => "",
                 },
                 .doc_key = request.doc_key,
-                .error_name = @errorName(err),
+                .error_name = error_name,
                 .attempts = attempt_number,
                 .sequence = request.sequence,
             });
@@ -8422,7 +8848,7 @@ fn recordIsolatedRequestErrorFor(runtime: *EnrichmentRuntime, window: ?*Generate
             .asset, .chunk_text => requestArtifactName(request),
         },
         requestFailureFingerprint(request),
-        err,
+        error_name,
     );
     runtime.notifyStatusHook();
 }
@@ -11164,7 +11590,10 @@ test "shared PDF enrollment skips completed metadata and byte fingerprints befor
     defer cache.deinit();
     var lease = try cache.adoptOwned(url, null, .{ .content_type = try alloc.dupe(u8, "application/pdf"), .data = try alloc.dupe(u8, source) });
     defer lease.deinit();
-    for ([_][]const u8{ "{}", "{\"etag\":\"revision-one\"}" }) |config_json| {
+    for ([_][]const u8{
+        "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}",
+        "{\"etag\":\"revision-one\",\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}",
+    }) |config_json| {
         const producer_json = try std.fmt.allocPrint(alloc, "{{\"type\":\"document_extraction\",\"config\":{s}}}", .{config_json});
         defer alloc.free(producer_json);
         const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .doc_key = "source", .index_name = "reader", .artifact_name = "reader", .source_field = "url", .producer_json = producer_json };
@@ -14914,6 +15343,7 @@ fn indexDocumentProducerRequired(a: Allocator, item: AssetProducerBatchItem) !bo
     return provider == .string and std.mem.eql(u8, provider.string, "antfly");
 }
 fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer_mod.Producer, items: []AssetProducerBatchItem, window: *GeneratedReplayWindow, scope: *FailureScope) !void {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     const Task = struct {
         runtime: *EnrichmentRuntime,
         producer: asset_producer_mod.Producer,
@@ -15066,10 +15496,10 @@ fn mediaRepairDecision(a: Allocator, desired: @import("inference_chunker").outpu
     var changed = false;
     for (original) |value| if (std.mem.eql(u8, value.name, desired.name)) {
         seen = true;
-        const identity = try desired.recipeIdentity(a, if (current_identity) |current| current.model_identity else value.model_identity, if (current_identity) |current| current.model_revision else value.model_revision);
+        const identity = try desired.receiptRecipeIdentity(a, current_identity orelse value);
         changed = changed or !std.mem.eql(u8, &identity, value.recipe_id);
         if (desired.model_identity) |pin| changed = changed or !std.mem.eql(u8, pin, value.model_identity);
-        failed = failed or (value.status != .complete and !value.terminal) or (value.status == .complete and value.embedding == null and value.spans == null and value.labels == null);
+        failed = failed or (value.status != .complete and !value.terminal) or (value.status == .complete and value.embedding == null and value.spans == null and value.labels == null and value.speaker_spans == null);
     };
     return .{ .needed = !seen or failed or changed };
 }
@@ -15172,24 +15602,27 @@ fn repairMediaOutputPrepared(runtime: *EnrichmentRuntime, request: enrichment_ty
         if (current_identity) |identity| {
             replacement.model_identity = identity.model_identity;
             replacement.model_revision = identity.model_revision;
+            replacement.speaker_model_revision = identity.speaker_model_revision;
         }
         replacement.kind = desired.kind;
         replacement.required = desired.required;
-        const failure_identity = try desired.recipeIdentity(scratch, replacement.model_identity, replacement.model_revision);
+        const failure_identity = try desired.receiptRecipeIdentity(scratch, replacement);
         replacement.recipe_id = try scratch.dupe(u8, &failure_identity);
         replacement.status = .failed;
         replacement.code = @errorName(failure.?);
         replacement.embedding = null;
         replacement.spans = null;
         replacement.labels = null;
+        replacement.speaker_spans = null;
         try replacements.append(scratch, replacement);
     };
     if (replacements.items.len == 0 and failure != null) {
         const model_identity = if (current_identity) |value| value.model_identity else "";
         const model_revision = if (current_identity) |value| value.model_revision else "";
-        const identity = try desired.recipeIdentity(scratch, model_identity, model_revision);
+        const speaker_revision = if (current_identity) |value| value.speaker_model_revision else null;
+        const identity = if (desired.hasDiarization()) try desired.speakerRecipeIdentity(scratch, model_identity, model_revision, speaker_revision orelse "") else try desired.recipeIdentity(scratch, model_identity, model_revision);
         const owned_identity = try scratch.dupe(u8, &identity);
-        try replacements.append(scratch, .{ .name = desired.name, .kind = desired.kind, .required = desired.required, .model = desired.model, .model_identity = model_identity, .model_revision = model_revision, .recipe_id = owned_identity, .start_ns = metadata.descriptor.coordinates.start_ns, .end_ns = metadata.descriptor.coordinates.end_ns, .status = .failed, .code = @errorName(failure.?) });
+        try replacements.append(scratch, .{ .name = desired.name, .kind = desired.kind, .required = desired.required, .model = desired.model, .model_identity = model_identity, .model_revision = model_revision, .speaker_model_revision = speaker_revision, .recipe_id = owned_identity, .start_ns = metadata.descriptor.coordinates.start_ns, .end_ns = metadata.descriptor.coordinates.end_ns, .status = .failed, .code = @errorName(failure.?) });
     }
     if (replacements.items.len == 0) return error.InvalidChunkOutput;
     // Old embedded receipts predate explicit attempt counters: an existing
@@ -15332,7 +15765,7 @@ fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.
             const values = try std.json.parseFromSliceLeaky([]@import("inference_chunker").outputs.Result, decision_arena.allocator(), parent.outputs_json orelse "[]", .{});
             for (values) |value| {
                 if (!std.mem.eql(u8, value.name, name) or !value.reusable()) continue;
-                const recipe = try target.recipeIdentity(decision_arena.allocator(), if (current_output) |current| current.model_identity else value.model_identity, if (current_output) |current| current.model_revision else value.model_revision);
+                const recipe = try target.receiptRecipeIdentity(decision_arena.allocator(), current_output orelse value);
                 if (skips.items.len < 4096 and std.mem.eql(u8, &recipe, value.recipe_id)) try skips.append(decision_arena.allocator(), .{ .ordinal = parent.descriptor.ordinal, .sub_index = value.sub_index });
             }
         }
@@ -15777,6 +16210,7 @@ const IndexDocumentCheckpoint = struct {
     }
 };
 fn retireIndexDocumentCheckpoint(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, authority: ?*const @import("../artifact_producer_context.zig").Token) !void {
+    if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     var arena = std.heap.ArenaAllocator.init(runtime.alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -16315,6 +16749,7 @@ fn processDocumentExtractionAsset(
         .prepared_pdf_session = if (prepared_pdf_session) |*session| session else null,
     };
     defer collect_ctx.deinit();
+    var prepared_marking = document_extraction_mod.UnconfiguredGeneratedTextSink{ .alloc = document_extraction_alloc, .config = &extraction_config, .inner = collect_ctx.sink() };
     const extraction_result = if (prepared_pdf_session) |*session|
         document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
             document_extraction_alloc,
@@ -16322,7 +16757,7 @@ fn processDocumentExtractionAsset(
             if (extraction_config.content_type.len > 0) extraction_config.content_type else downloaded.content_type,
             extraction_config.ocr_mode,
             extraction_config.ocr_quality,
-            collect_ctx.sink(),
+            prepared_marking.sink(),
             if (page_text_spool) |*spool| spool.cache() else null,
         )
     else
@@ -17791,6 +18226,13 @@ pub fn runNativePdfOcrGroundingIntegration(
         .ocr_executor = .reader,
         .ocr_model = "multistage-integration",
         .ocr_config_json = "{\"provider\":\"antfly\",\"model\":\"multistage-integration\"}",
+        // Constructed directly rather than through parseConfig, so the
+        // reader's normal .plain policy (empty prompt; real readers run
+        // their own default OCR task) never gets resolved here. The
+        // synthetic multistage-integration fake reader this target exercises
+        // requires the literal "<OCR>" text, matching every other reader
+        // request this file builds by hand.
+        .ocr_prompt = document_extraction_mod.florence_ocr_prompt,
         .ocr_render_dpi = 72,
         .pdf_render_max_parallel_pages = 1,
         .pdf_decode_limits = .{
@@ -26396,7 +26838,7 @@ fn replayModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: en
     config.embedding.?.task_type = try a.dupe(u8, metadata.task_type);
     config.embedding.?.model_identity = try a.dupe(u8, metadata.model_identity);
     var policy = @import("../../../chunking/types.zig").MediaPolicy{};
-    inline for (@typeInfo(@TypeOf(metadata.policy)).@"struct".field_names) |name| @field(policy, name) = @intCast(@field(metadata.policy, name));
+    inline for (@typeInfo(@TypeOf(metadata.policy)).@"struct".field_names) |name| @field(policy, name) = if (@TypeOf(@field(metadata.policy, name)) == bool) @field(metadata.policy, name) else @intCast(@field(metadata.policy, name));
     config.policy = policy;
     // Route through the consumer's canonical endpoint, never a recipe-supplied
     // URL or credential. Existing execution context supplies authenticated I/O.
@@ -26494,7 +26936,7 @@ fn modelEmbeddingMetadataForWindow(a: Allocator, request: enrichment_types.Gener
         }
     }
     if (value.status == .complete and value.embedding != null) try value.validate(target);
-    const recipe = try target.recipeIdentity(a, value.model_identity, value.model_revision);
+    const recipe = try target.receiptRecipeIdentity(a, value);
     if (!std.mem.eql(u8, &recipe, value.recipe_id)) return error.IncompatibleChunkEmbeddingTarget;
     inline for (.{ "model", "model_identity", "model_revision" }) |field| {
         a.free(@field(result, field));
@@ -32139,6 +32581,34 @@ pub fn documentExtractionEmptyCoverageIsTerminalFailure(alloc: Allocator, manife
     return chunk_count == 0 and (ocr_failed_count > 0 or failed_pages > 0);
 }
 
+/// The first OCR unit failure recorded in an extraction manifest, if any.
+pub fn documentExtractionFailureCauseAlloc(alloc: Allocator, manifest_json: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const details = parsed.value.object.get("ocr_failure_details") orelse return null;
+    if (details != .array) return null;
+    for (details.array.items) |detail| {
+        if (detail != .object) continue;
+        const message = detail.object.get("error_message") orelse continue;
+        if (message != .string or message.string.len == 0) continue;
+        // Unit warnings read "<method> failed: <ErrorName>".
+        const name = if (std.mem.lastIndexOf(u8, message.string, ": ")) |at| message.string[at + 2 ..] else message.string;
+        if (name.len > 0) return try alloc.dupe(u8, name);
+    }
+    return null;
+}
+
+test "empty document extraction reports the OCR unit failure cause" {
+    const a = std.testing.allocator;
+    const cause = (try documentExtractionFailureCauseAlloc(a,
+        \\{"chunk_count":0,"ocr_failed_count":1,"ocr_failure_details":[{"unit_id":"image:000001","retained_method":"ocr_pending","error_message":"ocr_text failed: ResourceLimitExceeded","retryable":false}]}
+    )).?;
+    defer a.free(cause);
+    try std.testing.expectEqualStrings("ResourceLimitExceeded", cause);
+    try std.testing.expect((try documentExtractionFailureCauseAlloc(a, "{\"chunk_count\":0,\"ocr_failure_details\":[]}")) == null);
+}
+
 fn documentExtractionEmptyCoverageOutcome(alloc: Allocator, manifest_json: []const u8) !CoverageOutcome {
     return if (try documentExtractionEmptyCoverageIsTerminalFailure(alloc, manifest_json))
         .terminal_failed
@@ -32211,7 +32681,11 @@ fn finalizeEmptyDocumentExtractionCoverage(
         // Mainline coverage transitions revalidate terminal outcomes against
         // durable repair debt. Publish that debt before queueing the guarded
         // transition so an empty OCR failure cannot look like a healthy skip.
-        try recordIsolatedRequestError(runtime, window, request, error.DocumentExtractionProducedNoUsableText);
+        // Report the OCR units' own failure (for example an admission
+        // refusal) when there is one, not the generic empty-result wrapper.
+        const cause = try documentExtractionFailureCauseAlloc(runtime.alloc, manifest_json);
+        defer if (cause) |value| runtime.alloc.free(value);
+        try recordIsolatedRequestErrorNamed(runtime, window, request, cause orelse @errorName(error.DocumentExtractionProducedNoUsableText), requestAttemptNumber(runtime));
         return;
     }
     try queueCoverageOutcomeForRequest(runtime, window, request, outcome);
@@ -34642,14 +35116,14 @@ test "durable enrichment retry progress preserves unrelated request debt across 
     runtime.consecutive_retry_count = 6;
     runtime.retry_failure_fingerprint = 91;
     runtime.retry_failure_count = 4;
-    try noteTerminalRequestFailure(&runtime, 7, &.{}, "", 92, error.TestFailure);
+    try noteTerminalRequestFailure(&runtime, 7, &.{}, "", 92, "TestFailure");
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u32, 0), persisted.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
 
     // Parking the request which owns the budget retires that debt.
-    try noteTerminalRequestFailure(&runtime, 8, &.{}, "", 91, error.TestFailure);
+    try noteTerminalRequestFailure(&runtime, 8, &.{}, "", 91, "TestFailure");
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 0), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 0), persisted.retry_failure_count);
@@ -35382,7 +35856,7 @@ fn extractSourceText(
     defer parsed.deinit();
     if (parsed.value != .object) return null;
     const source = enrichment_types.sourceFieldValue(parsed.value, request.source_field, request.group_artifact_name.len > 0);
-    if (source != .string) return null;
+    if (source != .string or source.string.len == 0) return null;
     return try alloc.dupe(u8, source.string);
 }
 
@@ -38799,6 +39273,27 @@ test "extractSourceText without template returns null for missing field" {
     try std.testing.expect(result == null);
 }
 
+test "enrichment extractSourceText empty fields and templates share no output while preserving whitespace" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "", "{{body}}" }) |template_| {
+        const request: enrichment_types.GeneratedEnrichmentRequest = .{
+            .kind = .dense_embedding,
+            .index_name = "idx",
+            .doc_key = "doc:1",
+            .source_field = "body",
+            .source_template = template_,
+        };
+        for ([_][]const u8{ "{\"body\":\"\"}", "{}", "{\"body\":null}" }) |doc| {
+            const result = try extractSourceText(alloc, .{}, doc, request);
+            defer if (result) |text| alloc.free(text);
+            try std.testing.expect(result == null);
+        }
+        const whitespace = (try extractSourceText(alloc, .{}, "{\"body\":\" \\t\\n\"}", request)).?;
+        defer alloc.free(whitespace);
+        try std.testing.expectEqualStrings(" \t\n", whitespace);
+    }
+}
+
 test "extractSourceText with template skips _embeddings field" {
     const alloc = std.testing.allocator;
     const doc = "{\"title\":\"Hello\",\"_embeddings\":[1,2,3]}";
@@ -42088,4 +42583,34 @@ test "enrichment maintenance document failures share durable retry policy" {
     }
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.CloudflareRateLimited));
     try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));
+}
+
+test "model aware media diarized repair receipts reuse source identities and detect companion deployments" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const O = @import("inference_chunker").outputs;
+    const target = O.Target{ .name = "speech", .kind = .transcribe, .model = "whisper", .diarize = true };
+    const primary: [64]u8 = @splat('a');
+    const speaker: [64]u8 = @splat('b');
+    var receipt = O.Result{ .name = "speech", .kind = .transcribe, .model = "whisper", .required = true, .model_identity = &primary, .model_revision = &primary, .speaker_model_revision = &speaker, .recipe_id = "", .status = .complete, .speaker_scope = .source, .start_ns = 0, .end_ns = 1, .spans = &.{.{ .text = "hello", .start_ns = 0, .end_ns = 1, .speaker_index = 0 }} };
+    const recipe = try target.receiptRecipeIdentity(alloc, receipt);
+    receipt.recipe_id = &recipe;
+    var metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 1 } }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "whisper", .model_identity = &primary, .task_type = "TRANSCRIBE", .dimensions = 0, .policy = .{}, .outputs_json = try std.json.Stringify.valueAlloc(alloc, &[_]O.Result{receipt}, .{ .emit_null_optional_fields = false }) };
+    try std.testing.expect(!(try mediaRepairDecision(alloc, target, &metadata, receipt)).needed);
+    const next_speaker: [64]u8 = @splat('c');
+    var deployed = receipt;
+    deployed.speaker_model_revision = &next_speaker;
+    try std.testing.expect((try mediaRepairDecision(alloc, target, &metadata, deployed)).needed);
+    var configured = target;
+    configured.diarization = .{ .similarity_threshold = 0.7 };
+    try std.testing.expect((try mediaRepairDecision(alloc, configured, &metadata, receipt)).needed);
+    // Legacy local labels cannot satisfy a request for the new source scope.
+    var legacy = receipt;
+    legacy.speaker_model_revision = null;
+    const legacy_recipe = try target.recipeIdentity(alloc, legacy.model_identity, legacy.model_revision);
+    legacy.recipe_id = &legacy_recipe;
+    metadata.outputs_json = try std.json.Stringify.valueAlloc(alloc, &[_]O.Result{legacy}, .{ .emit_null_optional_fields = false });
+    try std.testing.expect((try mediaRepairDecision(alloc, target, &metadata, receipt)).needed);
 }

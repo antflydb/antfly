@@ -481,18 +481,24 @@ a fixed 16-slot reorder buffer also bounds zero-byte result metadata. When that
 buffer approaches capacity, admission waits for the oldest outstanding parent.
 A slow parent therefore cannot grow a corpus-sized queue. Error paths cancel,
 join and release all borrowers without waiting for a missing sequence forever.
-A page-scope deferred drain must also join on its own failure; deferring that
-join to the outer scheduler destructor would let the manifest arena retire first.
-Failed drains discard remaining staged output while preserving already emitted
-records and completed accounting.
+Each job independently retains its manifest and asset pages. Advancing discovery
+releases the coordinator's reference; worker references persist until the jobs
+are joined. Failure paths join every launched job before releasing its final
+page references, including partial launch. Failed drains discard remaining staged
+output while preserving already emitted records and completed accounting.
 Compatible model work coalesces across parents with unique wire IDs. A
 single-parent window retains intra-document provider parallelism.
 
 An asset window contains at most eight parents and 8 MiB conservative evidence.
-Plan complete first waves, shrinking the parent prefix when its shape or
-conservative byte estimate changes; never preload unused partial waves. Only
-equal image-field projection shapes are grouped. Unioning unrelated fields
-would overfetch those fields on every row. A group is one current ID-filtered
+Plan complete first waves, shrinking the parent prefix at the conservative
+transfer bound; never preload unused partial waves. Within that bounded prefix,
+normalize field order and bucket equal projection shapes, including alternating
+shapes. Singletons retain ordinary point loading. Independent groups use the
+existing persistent worker pool concurrently; one-group windows remain inline.
+Page-memory reservations are apportioned by estimated transfer size before
+launch, with a combined bound of the configured page budget. Join every fetch
+before retiring its manifest, including partial launch and error paths.
+Unioning unrelated fields would overfetch those fields on every row. A group is one current ID-filtered
 query, with no ordering or retained pagination state. Each returned parent
 independently checks access and revision before its payloads are validated.
 Missing/denied/changed parents do not authorize their image bytes or score reuse.
@@ -545,35 +551,1065 @@ constrained Linux VM; it does not establish zero-cost execution. The later
 measures the rolling scheduler, shared admission and borrowed envelopes, including
 the sustained-image warm-latency/memory tradeoff.
 
-Warm scores still require fresh authorized asset validation. Avoiding those image
-bytes requires a generic server-owned source/asset identity contract: an identity
-must bind the exact stored bytes at the authorized read cut, survive only valid
-immutable revisions, and be distinct from caller-supplied revision or digest
-metadata. A trusted identity may select a previously verified score; absent or
-changed identity must materialize and validate bytes. No caller-written manifest,
-TTL, cached permission result or segment ID establishes that guarantee. The CLI
-retains full validation until that server contract exists.
+Warm scores require a fresh authorized query. General scalar projection lets a
+server confirm previously validated image identities without transferring the
+image again. Manifest digests and caller revision fields are never authority.
+Missing or changed identities materialize and validate bytes; a score miss also
+materializes bytes before provider dispatch.
+
+### Conditional source projection and future storage authorities
+
+The long-term public interface preserves `fields: string[]` as the source mask
+and adds a `select` map of named pure expressions. Source fields remain in
+`_source`; expressions appear in `_computed`. Existing typed SDK callers and
+wildcard/exclusion semantics remain compatible. A source field requested by
+`fields` is always returned: CASE never silently changes that mask. The earlier
+unreleased `source_projection` / `_source_projection` delivery protocol is
+removed rather than established as a second projection language.
+
+```json
+{
+  "query": {"bool": {"filter": {"ids": ["source-1"]}}},
+  "fields": ["grep.revision", "grep.permissions"],
+  "params": {"known": {"source-1": "sv1-<64 lowercase hex characters>"}},
+  "select": {
+    "identity": {"call": "value_identity", "args": [{"field": "payloads.image"}]},
+    "changed": {"is_distinct_from": [
+      {"ref": "identity"},
+      {"call": "jsonb_extract_path_text", "args": [{"param": "known"}, {"field": "_id"}]}
+    ]},
+    "image": {"case": [{
+      "when": {"ref": "changed"},
+      "then": {"field": "payloads.image"}
+    }], "else": {"literal": null}}
+  }
+}
+```
+
+JSON expressions lower to the existing SQL scalar AST, binder and VM. CASE,
+casts, pure functions and three-valued conditions share SQL semantics; this is
+not a second evaluator. Dynamic document operands are jsonb; callers cast them
+explicitly for typed scalar functions. `literal` and `param` accept data, never
+SQL text. `ref` refers to a sibling expression; all dependencies are bound before
+execution, cycles and collisions with `evaluate.compute` are rejected. Pure
+projection does not change membership or ranking. AI/provider calls stay in
+`evaluate`; they cannot occur implicitly in `select`, including untaken branches.
+`value_identity` returns an opaque value identity for present null as well as
+other values. An absent path returns SQL NULL; `is_missing` distinguishes that
+from stored JSON null. Conditions never grant permissions or resurrect a row.
+
+Binding validates the entire expression graph, but a row's lazy column loader
+reads only executed branches. A matching identity does not load the image.
+Selecting the image through `fields` still loads it independently. Parameters
+are bounded to 1 MiB / 1,024 entries, selection to 64 named expressions, depth
+64 and 8,192 expression nodes. SQL VM work and output budgets still apply.
+
+Native output-only queries evaluate after retrieval under the publication lease.
+Each 64-row window pins a read transaction, batches authenticated content and
+identity metadata, and releases per-row scratch and read scopes. Identity and
+existence use exact current metadata when available; selected fields load through
+the ordinary verified logical range reader. Uncertified, small, stale and unsupported
+layouts fall back safely. Source-dependent stages retain complete afterimages
+and project at final output; column providers use lazy selected-column access.
+Distributed retrieval selects the global page before scalar evaluation. Large
+selected rows evaluate lazily at the physical owner during retained-cut hydration;
+eager small rows and nondeferred/retained routes evaluate at the coordinator.
+Discarded candidates never evaluate faulting output expressions. Internal worker
+envelopes carry the original source mask separately from input dependencies. A request-bound internal receipt prevents repeated evaluation and
+never appears in the public `_computed` map. Older workers retain source values
+for coordinator evaluation; no public projection-state transport is required.
+
+Gateway table-image materialization uses ordinary authorized queries with the
+original ingress identity. Exact duplicate references share one request-local
+lookup. Images of a parent are unioned first; parents batch only when their
+field/image masks and filters match, at most 32 references per query. This avoids
+Cartesian projection overfetch. Every reference still checks live row permissions,
+revision, optional identity, byte length, digest, format and pixel bounds before
+any provider dispatch. One deadline covers all groups. Missing rows become 404;
+429, 503 and timeouts retain retryable gateway statuses. Source locators never
+reach providers, and aggregate image limits apply before lookup and after expansion.
+
+`sv1` is a versioned server-computed identity over the typed JSON value delivered
+by that authorized read cut. Hashing streams into SHA-256 without allocating an
+encoded copy. The reference path reads current selected values before
+hashing and omission. Eligible native JSON retrieval instead uses bounded,
+storage-owned canonical-value certificates published atomically with the primary
+value, content proof, projection directory and mutation revision. Certificates
+bind the original content length/digest, exact directory digest, value kind and
+semantic canonicalizer ABI. They certify disjoint terminal ranges (scalar leaves, arrays and opaque objects); expanded object parents are excluded to avoid overlapping work. Raw directory
+hashes are never value identities. The existing directory format and coverage
+budget are unchanged. Rows below the existing 16 KiB projection threshold
+receive no certificate. Each optional certificate is bounded below 18 KiB.
+
+The ABI is an explicitly versioned typed-JSON contract, independent of comments,
+tests, compiler identity, and lookup implementation. Fixed canonicalization and
+ABI golden vectors gate toolchain changes; a semantic change requires an ABI
+revision. Unknown ABIs fall back safely. Editing certificate plumbing does not
+invalidate an existing table's proofs. Atomic writes and bounded repair collect
+canonical terminal identities during the successful directory encoding walk, rather
+than reparsing the finished directory. Already validated, unescaped UTF-8 JSON
+strings and booleans/null use borrowed canonical bytes; escaped strings and
+numbers retain typed canonicalization. Both routes must produce identical sv1
+identities. Directory coverage and fallback admission remain unchanged.
+
+Eligible reads prepare at most 64 rows from one pinned transaction. One sorted,
+deduplicated batch loads content/revision/TTL metadata; a second loads directories
+and certificates. Owned bounded metadata survives backend-buffer retirement.
+Per-row lazy reads reuse the same proof and directory; no cross-request snapshot
+or authorization cache is introduced. Final source and computed bytes belong to
+the result allocator. Native final source uses the strict projection engine and
+its immutable syntax receipt; unsupported source layouts retain ordinary strict
+normalization. Benchmark qualification must include cold and warm reads,
+metadata updates, full-source masks, row counts, output size, CPU and peak memory.
+Earlier source-delivery benchmark reports used the removed experimental protocol;
+they are historical measurements, not measurements of the select interface.
+
+Primary rewrites may reuse canonical terminal certificates from the same writer
+snapshot. The previous content proof must match the current mutation revision;
+its directory and certificate must pass length, kind, digest and canonical ABI
+checks. Layouts without a qualified terminal of at least 4 KiB retain the
+fused reference writer. Reuse requires matching decoded ancestry/name, terminal kind, raw length and
+raw SHA-256 digest. Packed indices and offsets are never sufficient. Added,
+reordered, renamed or moved siblings cannot misassociate records. Repeated writes
+in one transaction use its latest publication. Missing/stale/incompatible proofs
+rebuild through the reference canonicalizer; unordered bulk imports keep the
+reference writer path. The new body, directory, certificate and revision are
+published atomically. No previous primary body is loaded to qualify reuse.
+
+This optimization avoids re-decoding and canonical hashing of unchanged leaves;
+it still validates/hashes the incoming JSON and rewrites the primary row. Removing
+that write amplification requires a separate versioned storage representation:
+immutable content-addressed large values, small mutable row manifests, atomic
+manifest/authority publication, snapshot-aware blob ownership and reclamation,
+replication/backup/export support, and logical full/range reads that reconstruct
+the existing public JSON. A digest must never act as a read grant: current row
+membership, revision and authorization remain mandatory. Such a representation
+must be gated by mixed-version/rollback tests and metadata-update WAL/compaction
+measurements before activation. A new content-authority version must bind the
+manifest and its leaf digests; a manifest/Merkle digest cannot be interpreted as
+the legacy SHA-256 of reconstructed primary JSON. Public `sv1` identities remain
+canonical-value identities across either representation. Blob ownership belongs
+to the table and pinned storage cut, with publication and reclamation fenced by
+the same writer transaction and retained snapshots. Failed commits, leader
+changes, export/import and crash recovery must preserve those ownership facts. The current format remains full primary JSON;
+certificate reuse alone makes no claim about avoiding its disk writes.
+
+A current certificate permits unchanged terminals to be omitted without loading or
+hashing those payloads. Current permissions, revision, query membership and
+publication fences still apply. Missing, stale, unsupported or ABI-incompatible
+certificates use the full-value reference path. Existing bounded authority
+backfill repairs eligible legacy rows without changing their logical revisions.
+Uncertified opaque values and source-dependent operators retain reference execution.
+Other selected metadata may still require storage-frame reads or a full-layout
+fallback: certificate reuse is not a guarantee of zero physical disk I/O.
 
 
-### Future generic conditional source projection
+The CLI retains bounded verified descriptors (digest, MIME, dimensions, length
+and server identity), never image payloads, in the existing atomic artifact
+cache. Keys include endpoint, table, parent, field and credential context, plus
+a build digest of the image validators. The cache uses 256 buckets and four
+1 KiB slots per bucket; records can be evicted at any time. Current permissions
+and expected revision are rechecked before any descriptor is accepted. Lower
+current image-byte/pixel limits still apply. Before grouped retrieval, a bounded score-cache probe identifies fields whose
+current question already has a reusable decision. Changed questions request full
+values immediately in the same grouped query, avoiding conditional-then-full
+round trips. This probe is only a planning hint; actual score use rechecks expiry
+after fresh authorization and identity verification. The request retains the
+exact verified descriptors it sends, so later cache eviction does not require
+reopening them. Expired/evicted scores still force ordinary materialization.
+Image constructors retain an immutable URL extent proven to contain only the
+supported data-URL prefix and validated base64 alphabet. Exact evidence sizing
+counts escaped text/framing and adds the known URL length without rescanning the
+payload. Request encoders emit owned framing plus borrowed qualified URL segments
+through HTTPx's existing H1/H2 transport. URLs below 4 KiB remain in contiguous
+framing to avoid extra frames/syscalls for tiny inputs. Replacing a URL invalidates its extent
+proof; unqualified strings retain ordinary escaping. Inputs stay pinned through
+completion/cancellation/retries, and the original request-size, concurrency and
+response limits still apply. The local inference ABI receives a contiguous body.
 
-Skipping warm image bytes requires a general query-source contract, rather than
-a grep endpoint or a caller-maintained companion digest. A future conditional
-projection should request explicit logical source paths and return opaque,
-versioned value identities computed or certified by the server. Identities must
-bind exact stored values at the same authorized read cut as returned metadata.
-The server may omit a value only when a supplied previous identity matches that
-current value; a caller-supplied expected identity is a condition, never proof.
-Missing fields must differ from stored nulls, and missing/old authorities require
-value reads or ordinary full projection. Current filters and authorization apply
-before every omission decision, including retained snapshots and distributed or
-external-table reads. No cached authorization grant survives into a later query.
+Descriptors never enter provider requests: an explicit materialization guard
+runs before coalescing and dispatch. Conditional fallback retains ordinary
+source/request budgets and avoids charging the same logical image twice.
+Conditional-response transfer admission accounts for small identity responses
+separately from full-image processing scratch. The shared processing admission
+budget remains unchanged. Bucket-striped writer locks serialize cache bucket
+read/choose/publish operations within the process, preserving fitting colliding
+entries; readers remain lock-free and cross-process races remain safe misses.
+Disabling caches also disables conditional identity work. Older servers that
+ignore the extension return full values; those rejecting it receive one ordinary
+projection retry, charged to the same request budget. No permission result is
+cached by this mechanism.
 
-The client would retain only bounded, verified image descriptors (decoded digest,
-MIME, dimensions, length and source identity) beside scores, scoped by endpoint,
-table, parent, field and credential context. Changed identities or missing scores
-materialize and validate payloads again. Capability negotiation must preserve
-full-byte fallback against older servers. Digest persistence belongs with the
-existing storage-owned projection authorities and publication fences, not in an
-ingester-owned schema field. This contract and its client reuse path are future
-work; the current implementation continues to fetch and validate warm bytes.
+Manifest pages have independent worker leases. Completed lanes can refill across
+page boundaries while output stays in discovery order. At most eight active
+jobs, sixteen staged results, the coordinator page and one prefetched page are
+retained; there is no corpus-sized page or reorder inventory. Explicit finite
+evaluation budgets retain serial admission. Every launch, cancellation, decode,
+output and drain failure joins borrowers before releasing their pages. The shared
+64 MiB conservative image admission pool remains in place; warm reuse removes
+transfer and validation work instead of raising that pool's limit.
+
+
+## Format migration split (2026-10-26)
+
+PR #1263 retains the existing ASCH25 writer and reader contract. Automatic
+format activation, immutable document manifests, logical-authority v2,
+source/field publication packs, migration/replay coordination and their
+format-specific transfer/recovery paths are deferred together to the
+`experiment/immutable-document-format` follow-up branch. That branch preserves
+the complete implementation, design history, fixtures and qualification tools;
+it is experimental and is not approved for automatic migration.
+
+The PR retains format-independent sparse FST cleanup, bounded analyzed-text
+contribution reuse and the existing query/gateway improvements. The analysis
+cache keys actual text bytes and the complete analyzer pipeline. It is lazy,
+resource-accounted and reclaimable, and cache hits write no durable metadata.
+It cannot supply source authority or select an old document revision. Tests
+compare complete encoded segments across analyzers, reclamation, changed and
+reordered document updates, and compaction. The update fixture checks that
+schema format stays at 25 and primary rows remain ordinary JSON.
+
+The experimental qualification showed 16% lower CPU and 15% lower RSS for dense
+code updates against the earlier native implementation. Compared with legacy
+inline storage, large metadata-only updates used about 32x fewer primary WAL
+bytes, but 4 KiB rows in already-admitted tables used about 4x CPU and 3.7x update
+elapsed time. The 2x update-speed target failed. These measurements describe
+the experimental branch, not the smaller format-independent PR; they must not
+be reused as performance claims for the split PR.
+
+Before automatic upgrades can return, qualify a hybrid layout with cheap
+small-row storage, source planning before body hydration, and compiled-field
+reuse across publication/compaction. Require paired old-binary comparisons on
+mixed small/large, sparse/dense, changing/unchanged, entropy/compressible,
+read-heavy and sustained-compaction workloads, plus recovery and distributed
+transfer tests. CPU, peak memory and tail latency must meet explicit regression
+budgets; large-payload write savings alone do not qualify all-user migration.
+Older-reader fencing and snapshot-based rollback remain mandatory for any new
+physical format. No released table is converted by this PR.
+
+Split validation on macOS passed 67 compiler/update tests (one benchmark skip),
+21 FST tests, 152 query-contract tests and 97 logical-field tests (one skip),
+with no reported leaks. The CLI sweep covered 290 cases: after correcting the
+source-reference fixture and regenerating packaged tooling, its six failed
+cases all passed on the optimized recheck; two optional cases were skipped.
+This is split/correctness validation, not a new performance qualification or
+an independent Linux hardware result.
+
+### Conditional select qualification (2026-10-26)
+
+The general expression interface was qualified on macOS ARM64 (14 logical CPUs)
+with the native Debug binary `f8aae9f09f1a`, eight 256 KiB values, three alternating
+server rounds and five reads per phase. Both compared paths use the same binary,
+authorization, query membership, result values and SQL VM. The reference wraps
+its identity operand in pure JSON functions so it must read the current value;
+the direct operand can use the native certificate. Result digests are checked
+across variants and phases. These are warm-cache, shared-host measurements.
+
+| Delivery | Metadata-backed CPU / elapsed | Value-reading reference CPU / elapsed | Response |
+|---|---:|---:|---:|
+| Full values | 121.35 / 107.72 ms | 136.08 / 118.53 ms | 2,099,088 B |
+| Matching known identities | 8.42 / 8.17 ms | 52.33 / 44.54 ms | about 1,952 B |
+
+This fixture shows roughly 6.2× less CPU for matching identities and a smaller
+full-value CPU saving. Ordinary source delivery without expressions is a separate
+control: 24.92 ms CPU / 21.45 ms elapsed. General computed full-value delivery
+still incurs additional VM/JSON serialization work. This is not a universal
+speedup, zero-cost execution, a release throughput claim, or evidence for changing
+the document format. The follow-up qualification below removes repeated
+`_computed` parsing and serialization while preserving strict JSON and expression semantics.
+
+The reproducible driver is `zig/e2e/antfly/bench_source_projection.py`; run with
+`--rounds 3 --queries-per-phase 5 --documents 8 --value-bytes 262144 --metadata-updates 2`. Raw reports and logs stay ignored under `output/`.
+Validation includes 157 native query/worker contracts, 17 source-identity/read
+contracts, gateway suites, 353 Python query round trips, the Go SDK suite, and
+291 CLI cases (two optional skips). Native indexed integration covers single-
+and multi-shard final-page evaluation, default/wildcard/exclusion source masks,
+NULL/missing, retained revisions, authorization and grouped image reads. Fixtures
+establish orchestration, not live-provider relevance or production Cloud ACL quality.
+
+
+### Projection review fixes and serialization follow-up (2026-10-26)
+
+The projection compiler now resolves aliases iteratively, counts depth across
+references, and evaluates requested aliases in dependency order without recursive
+VM entry. Array operands resolve against original positions before output masks;
+nested user keys such as `metadata._type` are accepted. Normalized local/worker
+responses validate completed outputs before restoring source-finalization
+receipts, so a source mask is applied once across both single- and multi-shard
+routes. The API wire shape remains unchanged and ASCH25 is unchanged.
+
+Computed output stays as validated JSON spans through worker decoding and final
+serialization. Native scalar reads parse their authenticated row views directly;
+growing encoding buffers use reclaimable scratch before exact output ownership.
+This removes repeated payload DOMs and unescaping/re-escaping. SQL semantics,
+lazy CASE, strict duplicate/malformed JSON rejection, typed JSON numeric semantics,
+revision proofs and authorization remain enforced. See the shared
+[projection execution contract](logical-field-queries.md#projection-execution-and-ownership).
+
+The paired driver compared baseline `f8aae9f09f1a` with candidate `1fde63794362`
+on the same shared macOS ARM64 host (14 logical CPUs), using Debug builds, eight
+256 KiB target values, three alternating rounds and five reads per phase. Two
+metadata updates also verify unchanged-value identities. Mixed data includes
+escaped strings, Unicode, numbers, wide objects, opaque arrays and small values.
+The driver verifies result digests across variants and phases. Filesystem and
+storage caches are warm after ingestion; full delivery means a client identity
+miss, not a cold disk read. The candidate also includes the origin/main merge.
+
+| Workload | Full computed CPU, before → after | Full elapsed, before → after | Known-identity CPU, before → after |
+|---|---:|---:|---:|
+| Ascii | 100.50 → 59.87 ms | 91.72 → 55.57 ms | 6.49 → 7.02 ms |
+| Mixed | 110.77 → 68.26 ms | 99.45 → 61.87 ms | 11.14 → 11.66 ms |
+
+Full computed CPU decreased about 38–40%. Ordinary stored-source controls were
+20.48 → 21.81 ms CPU for ASCII and 22.86 → 23.39 ms for mixed data. Known-identity
+reads were about 0.5 ms slower in these runs. Full computed output still costs
+about 2.7–2.9 times ordinary source delivery; these results are not a universal
+speedup or a zero-cost claim.
+
+Process RSS was not consistently lower: full-phase medians were 336 → 378 MiB
+for ASCII and 284 → 285 MiB for mixed data. These whole-process, sampled figures
+include the main merge and background allocation/reclamation; they do not isolate
+this patch's allocation costs and are not allocation bounds. Production builds,
+other hosts and storage/cache conditions require separate qualification.
+
+Reproduce with `zig/e2e/antfly/bench_source_projection.py BINARY --baseline BASELINE
+--rounds 3 --queries-per-phase 5 --documents 8 --value-bytes 262144
+--metadata-updates 2 --output REPORT`; repeat with `--workload mixed`. Both
+executables should retain the name `antfly` for the native API fixture. Raw
+reports/logs remain ignored under `output/review-1263/`.
+
+Validation: 190 focused native query/worker contracts, the compiled native-array
+source regression, 293 CLI cases (two optional skips), 32 indexed native-server
+cases (eight optional profiling skips), 353 Python round trips, the Go SDK suite,
+and OpenAPI/specification/license-boundary checks. Native tests cover small/large
+array rows in one and two shards, nested underscore keys, rejected oversized alias
+depth, and a legal 64-alias chain. Fixtures establish behavior, not live-provider
+quality or an independent Linux hardware result.
+
+
+### Bounded scalar delivery and opaque identity coverage
+
+Admission walks every literal and parameter value iteratively before recursive
+copying, hashing or encoding. The budget includes unused parameters and untaken
+CASE branches; invalid requests fail without entering the fixed-depth JSON
+writer. Limits apply to raw data independently of expression/alias depth.
+
+Native scalar delivery prepares source masks and operand selectors once per
+owner request, alongside its immutable SQL programs. Row-local views borrow
+only bytes loaded under that row's pinned revision and authorization. Full-body
+fallbacks share one prepared row view across operands, and resolved raw spans
+are memoized, avoiding repeated full-row indexing for many-output requests. If
+an earlier operator already materialized a value, subsequent outputs reuse it
+rather than preparing a second view. Direct
+JSON columns and the selected CASE branch can forward validated raw spans to
+`_computed`; CASE conditions and operations still use the shared SQL VM. Alias
+outputs keep those spans until a consumer needs a typed value, then materialize
+once. Numbers are normalized with the same parser and formatter as typed JSON,
+including nested values. SQL numeric coercions, array fanout and unsupported
+paths use the typed reference path. Both paths enforce cancellation, nesting, work and output
+budgets. This is request-local reuse; no global cache retains user parameters,
+source bytes, snapshots or permissions across requests.
+
+The final public source selector applies caller masks and reserved root-field
+exclusions together, before native finalization. It is shared across hydrated
+rows. Arrays are projected once, and nested user keys such as `metadata._type`
+remain visible. Unsupported selector shapes keep the strict DOM fallback.
+
+Opaque terminal certificates use coverage epoch SVI2 with the existing bounded
+sidecar layout, without changing the document format or canonical ABI. New
+readers accept SVI1 and SVI2; older readers safely fall back for an unknown
+sidecar epoch. SVI1 directories containing opaque terminals request bounded
+repair. SVI2 records that coverage was attempted, so unsupported deep terminals
+do not trigger repeated repair. Captured object parents are not
+hashed again. Exact path resolution is mandatory: an array or opaque object's
+certificate cannot prove a descendant's existence or identity. Missing records
+in older sidecars retain the reference read and bounded repair. Composite
+canonicalization uses a bounded streaming walker and declines optional
+certificates beyond 128 levels; ordinary document ingestion does not require a
+certificate. Reuse
+still checks revision, content proof, directory binding, ancestry, kind, length
+and raw digest. It avoids canonicalizing an unchanged large array/object during
+metadata updates, while continuing to validate and rewrite the incoming primary
+row. No zero-cost or universal throughput guarantee follows from this change.
+
+
+Projection admission now retains the bound program for the request lifetime.
+Hydration and response encoding borrow it only when the encoded input has the
+same immutable address and length; copied or transported inputs bind locally.
+The parsed-request owner releases the plan separately from `SearchRequest`
+value copies. Borrowers never release it, and the handle is never serialized.
+The program holds its own data parameters; sharing is limited to that one
+request. This removes repeated admission/output binding without a global plan
+cache or cross-request parameter state. Failure injection verifies cleanup and
+cloned-parameter isolation. Manually constructed requests retain owned local
+preparation, so older workers and non-parser consumers preserve their behavior.
+
+
+Raw output validation counts logical JSON values for the VM work budget, not
+scanner fragments or object keys. Escaped strings and surrogate-pair Unicode
+therefore have the same value-step budget as the typed VM. Fragment scanning
+polls cancellation independently of those steps. Validation has a bounded
+container stack isolated in a separate helper. Native equivalence fixtures include large escaped strings,
+Unicode, wide objects, cancellation and empty malformed input.
+
+
+### ReleaseFast qualification after the bounded-delivery follow-up
+
+The 2026-10-27 paired run compares native macOS ARM64 ReleaseFast servers
+built with pinned Zig 0.17.0. The baseline is original PR head `7badb5658d`
+merged with the same `origin/main` revision `ca4339f030` as the candidate
+(baseline tree commit `c26dd115c5465539c71d8a62b6fcc90e237e15f9`,
+candidate runtime source `952f4161577b0f5de5a3e4f1b1a177562ef43b45`).
+Both binaries report `antfly dev (zig runtime)`. Their SHA-256 hashes are:
+
+- Baseline: `7456751926649113da3802df93fa6354005d01b3bb16a12218d8db90d2100db0`.
+- Candidate: `e4b1d40f6e707e39cfe388f65be91af10da70435f766896c701dd08e0025afbe`.
+
+Each workload uses five fresh-server trials per variant, alternating variant
+order, with five queries per read phase: 25 samples per variant/read phase.
+Each server ingests eight documents, with 256 KiB target large values, and
+performs two metadata updates. The small workload adds 60 metadata outputs
+for 64 computed outputs. Updates preserve and verify these fields. Medians
+below include the whole server process; background work and a shared host
+contribute noise. Filesystem/storage caches are warm after ingestion. A full
+read means a client identity miss, not cold storage. There is no inference.
+
+| Workload | Known-identity CPU ms | Known-identity elapsed ms | Full computed CPU ms | Full computed elapsed ms |
+|---|---:|---:|---:|---:|
+| ASCII | 0.69 → 0.69 | 1.18 → 1.20 | 10.03 → 10.63 | 11.48 → 12.23 |
+| Mixed | 1.38 → 0.70 | 1.99 → 1.16 | 14.08 → 13.98 | 15.37 → 15.20 |
+| Opaque array | 5.54 → 0.69 | 6.20 → 1.24 | 11.96 → 10.52 | 13.40 → 11.82 |
+| Small / 64 outputs | 1.85 → 1.55 | 2.30 → 1.93 | 1.77 → 1.53 | 2.19 → 1.95 |
+
+Every value is baseline → candidate. Opaque known-identity reads use about
+8× less CPU and take about 5× less elapsed time; mixed known-identity CPU
+decreases about 49%. Small full-output CPU decreases about 13%. Full ASCII
+CPU increases about 6%, and full mixed delivery is nearly unchanged. These
+results replace neither the typed reference path nor its equivalence checks.
+
+| Workload | Ingest CPU ms | Metadata-update CPU ms | Ordinary source CPU ms | Known-identity RSS MiB |
+|---|---:|---:|---:|---:|
+| ASCII | 54.50 → 55.41 | 37.81 → 38.96 | 3.53 → 3.59 | 203.69 → 202.08 |
+| Mixed | 65.34 → 69.66 | 44.13 → 43.78 | 4.07 → 4.31 | 205.67 → 207.95 |
+| Opaque array | 51.07 → 57.02 | 38.90 → 39.14 | 3.57 → 3.67 | 199.89 → 202.80 |
+| Small / 64 outputs | 17.39 → 18.25 | 10.17 → 10.12 | 0.97 → 1.32 | 170.41 → 170.94 |
+
+Building reusable opaque certificates adds about 12% ingestion CPU in this
+fixture. Metadata updates still rewrite primary documents; they are not free.
+Ordinary small-row CPU rises by about 0.35 ms in this confirmation, while the
+initial three-trial run showed the opposite direction. Sub-millisecond controls
+need more isolated host qualification before attributing them to the patch.
+RSS is sampled every 5 ms and is not an allocation bound; memory is not
+consistently lower. This is a targeted read improvement, not a universal
+speedup or a zero-cost claim. Linux hardware, cold storage, sustained writes
+and concurrent production load need independent performance qualification.
+
+The driver checks source/computed output hashes across binaries and across
+optimized/reference phases, including results after each metadata update.
+For each opaque candidate trial, identity profiling records 96 genuine
+certificate hits and zero fallback rows; the baseline records 176 fallback
+rows. Full-value output still reads and encodes the payload. The older binary
+has no certificate-hit counter, so its zero counter is not evidence of zero
+hits for other workloads. Small rows correctly retain full operand fallback.
+
+Reproduce with `zig/e2e/antfly/bench_source_projection.py BINARY --baseline BASELINE
+--rounds 5 --queries-per-phase 5 --documents 8 --value-bytes 262144
+--metadata-updates 2 --workload WORKLOAD --output REPORT`, for `ascii`, `mixed`,
+`opaque` and `small`; add `--metadata-outputs 60` for `small`. Both executable
+basenames must be `antfly`. Reports retain binary hashes, host details, corpus
+and output hashes, individual samples, medians and certificate counters. Raw
+JSON/logs and the source/version manifest remain ignored under
+`output/projection-followup/` rather than committed.
+
+Final validation: ReleaseFast build and cached rebuild both passed 71/71
+steps; nine server smoke tests passed; the full indexed-server suite passed
+43 cases with seven opt-in profiling cases skipped. The suite includes
+scalar/opaque persisted upgrades and older-reader rollback with one/two
+shards. The 196 focused query/worker contracts, 18 identity/publication cases,
+native borrowed-program retrieval, raw/VM work-budget equivalence,
+allocation-failure cleanup, Go SDK tests, 356 Python query/resolver cases,
+OpenAPI regeneration, Apache boundary (2,553 files) and control catalog
+checks passed. Local tests do not replace maintainer-approved PR CI.
+
+
+### Numeric consistency, bounded reuse and media materialization follow-up
+
+A direct `select` field, an alias, a selected CASE arm and a typed SQL JSON
+operation must return the same logical numbers regardless of output order or
+whether another output materialized the source first. The native path now uses
+the existing typed JSON number parser and formatter, including numbers inside
+arrays and objects. For example, `1e-400` follows the current VM's underflow to
+zero; the fast path cannot preserve a different numeric value. SQL numeric
+casts retain their separate type/precision rules. Changing the canonical ABI
+would require an explicit compatibility change; this fix does not change it.
+
+One streaming walker handles numeric normalization, logical-value work budgets
+and canonical identity encoding. Output strings can retain their original escape
+spelling, while identity hashing uses the default typed canonical spelling.
+The scanner supplies syntax/UTF-8 validation and fragmented-string cancellation;
+strict duplicate-key policy is established by the admitted source, not replaced
+by this walker. Unchanged output borrows the existing extent. A changed numeric
+encoding allocates only the resulting wire bytes, not a payload DOM. Opaque
+identity hashing retains only bounded scanner/container state and declines
+optional certificates beyond 128 levels. Ordinary document format remains ASCH25.
+
+Hydration finalization now borrows the admitted program under the same exact
+encoded-input witness as response encoding. Unconditional direct-field operands
+are deduplicated once in that immutable plan. Each selected row can read these
+operands together through one pinned scope and shared projected view. Conditional
+operands remain lazy; untaken CASE branches are not prefetched. The scope closes
+before row scratch is released. Unsupported selectors retain the reference path.
+
+Completed native outputs carry an owned, optional receipt bound to their exact
+immutable bytes and program fingerprint. Ordinary candidates carry only a nullable
+pointer; receipt storage is allocated only for projected hits. Cloning copies and
+rebinds the receipt after copying the complete immutable bytes; moves transfer
+ownership, replacements retire it, and allocation failures release both objects.
+These are syntax/execution receipts, never read grants. Transported outputs must
+validate their syntax, binding set and fingerprint locally. Standard marker-last
+outputs can then regain a local receipt; other layouts use the general fallback.
+The public serializer emits leading computed members plus their closing brace,
+omitting the private trailer without copying the payload into a second object.
+Only explicit immutable producer objects skip another generic raw-JSON validation;
+ordinary constructors and parsed values preserve their validation behavior.
+Generic `RawValue` retains its original slice-sized representation.
+
+Media source groups use at most four concurrent queries under one ingress
+identity and shared deadline. Isolated job arenas share the request memory budget;
+no child uses the parent arena concurrently, and every child is joined/canceled
+before its arena is freed. Scheduling failure degrades to inline work. Each group
+still executes the ordinary authorized query and independently checks every
+reference's revision, identity and permissions. Complete filters are encoded and
+interned once with exact equality, including collision checks; comparisons do not
+serialize them repeatedly. Temporary interned encodings die before source reads.
+A regression groups 128 distinct filters with a bounded 2 MiB grouping budget.
+
+Identical materialized URLs share decoding, digest and image inspection only
+within the request, after source lookup. Every reference still checks its own
+digest, MIME, length and pixel cap. Decode scratch is reclaimed through the
+existing budget rather than retained in the request arena. The expanded JSON
+limit is computed from the compact request and exact source-to-URL substitutions;
+verified base64 data URLs are JSON-safe ASCII, so they need no second image-sized
+counting-encoder pass. Deep source/filter data is rejected before recursive
+cloning or fixed-depth serialization. These changes do not cache authorization
+or claim lower model billing or improved relevance.
+
+The isolated ReleaseFast digest benchmark uses five alternating trials and
+32 hashes per trial on synthetic opaque arrays. Both paths check the same typed
+identity ABI. Figures are medians per hash; allocation figures are allocator byte
+volume, not peak memory or process RSS. Both implementations run in the same
+binary with the same allocator, outside HTTP/storage and corpus construction.
+
+| Workload | DOM reference µs → streaming µs | Allocated bytes, reference → streaming |
+|---|---:|---:|
+| opaque_ascii | 424.86 → 367.52 | 591293 → 129 |
+| opaque_escaped | 1906.86 → 1642.73 | 654331 → 129 |
+| opaque_unicode | 734.32 → 513.85 | 591265 → 129 |
+| opaque_small | 0.43 → 0.31 | 1477 → 129 |
+
+Reproduce from `zig/` with pinned Zig 0.17.0:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig run -O ReleaseFast --dep identity \
+  -Mroot=tools/bench_canonical_json.zig \
+  -Midentity=pkg/antfly-embedded/src/common/value_identity.zig
+ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig test --dep canonical \
+  -Mroot=tools/test_canonical_json.zig \
+  -Mcanonical=pkg/antfly-embedded/src/common/canonical_json.zig
+```
+
+The paired media driver is `zig/e2e/antfly/bench_media_materialization.py`.
+It covers tiny/large PNGs, shared/distinct masks and duplicated/unique payloads.
+Every invocation stops at `ModelRequired`, after source materialization and
+verification but before any model/provider execution. Separate one/two-shard
+server fixtures check successful materialization plus digest, permission and
+revision rejection. Its timings measure source work, not inference latency.
+Raw logs/reports remain ignored under `output/projection-followup/`.
+
+
+### Release qualification for the bounded-reuse follow-up (2026-10-27)
+The measured ReleaseFast executable uses production source `915e5493a2b8`,
+including `main` through `7dabd028d66d`. Its SHA-256 is
+`d2a0401ddb9573148dcadf2c524772dd8fd566469e00fc2c2dc8fe84fd8e508f`
+(251,319,128 bytes). The preserved performance baseline uses runtime source
+`952f4161577b`, `main` through `ca4339f030a6`, and SHA-256
+`e4b1d40f6e707e39cfe388f65be91af10da70435f766896c701dd08e0025afbe`.
+**The candidate includes newer main changes; whole-server deltas do not isolate
+all effects of this follow-up.** The separate same-binary digest comparison above
+isolates that kernel. Both server executables report `antfly dev (zig runtime)`.
+
+The final current-source build passed. The indexed HTTP suite passed 49 cases;
+seven opt-in profiling cases were skipped. It covers one/two-shard projections,
+numeric order/alias/identity equivalence, source masks, retained pagination,
+authorization, media claim rejection and persisted SVI1/SVI2 upgrade/old-reader
+rollback. The rollback executable is the older SHA-256
+`7456751926649113da3802df93fa6354005d01b3bb16a12218d8db90d2100db0`;
+the performance baseline already understands SVI2 and cannot establish that
+rollback property.
+
+The paired source driver ran five alternating trials, five reads per phase,
+eight documents and two metadata updates per trial on a shared 14-logical-CPU
+macOS ARM64 host. Large target values are approximately 256 KiB; mixed data also
+contains small/numeric/wide values. `small64` uses tiny values; `wide64` uses large
+ASCII targets. Both add 60 distinct metadata outputs. Each run verifies output
+hashes against ordinary reference reads and across binaries, certificate reuse,
+and identities after metadata updates. Storage/filesystem caches are warm after
+ingestion. CPU is whole-process CPU including background work; sampled RSS is
+neither allocation volume nor a hard peak bound. Values below are medians,
+baseline → candidate.
+
+| Workload | Full computed elapsed ms | Full computed CPU ms | Full computed RSS MiB | Conditional CPU ms |
+|---|---:|---:|---:|---:|
+| ascii | 11.33 → 8.65 | 9.97 → 7.30 | 204.1 → 203.5 | 0.77 → 0.71 |
+| mixed | 15.02 → 11.24 | 13.91 → 10.02 | 207.0 → 207.7 | 0.74 → 0.71 |
+| opaque | 12.11 → 8.80 | 10.59 → 7.59 | 203.6 → 205.1 | 0.75 → 0.73 |
+| small64 | 3.30 → 4.39 | 2.03 → 1.89 | 176.5 → 176.4 | 2.34 → 2.08 |
+| wide64 | 13.09 → 9.75 | 11.76 → 8.45 | 204.8 → 206.0 | 2.17 → 1.70 |
+| escaped | 33.80 → 23.47 | 32.48 → 22.20 | 216.4 → 217.9 | 0.68 → 0.58 |
+| unicode | 36.07 → 25.40 | 35.39 → 24.29 | 204.0 → 206.5 | 0.66 → 0.65 |
+
+Controls retain the actual costs outside computed reads. Positive percentages
+mean more candidate CPU; negative percentages mean less. These are observed
+shared-host deltas, not regression tolerances or performance guarantees.
+
+| Workload | Ordinary-read CPU change | Ingestion CPU change | Metadata-update CPU change |
+|---|---:|---:|---:|
+| ascii | -6.7% | +3.7% | +3.7% |
+| mixed | -2.1% | +0.7% | -1.3% |
+| opaque | +3.5% | -2.9% | -1.7% |
+| small64 | -6.7% | -10.0% | +3.7% |
+| wide64 | +4.3% | +3.1% | -0.9% |
+| escaped | -3.0% | -1.5% | +0.5% |
+| unicode | -1.2% | +0.9% | -4.1% |
+
+The model-free media comparison uses five alternating trials and five requests
+per trial, with four images per request. Tiny PNGs are 1×1; large PNGs are
+256×256 random RGBA data. Distinct-mask cases exercise separate source groups;
+shared-mask cases already batch into one query. Duplicate cases reuse identical
+payloads across distinct parent documents. Every request reaches `ModelRequired`
+after materialization and verification, before any provider call. Median values
+are baseline → candidate.
+
+| Media workload | Elapsed ms | Server CPU ms | Sampled RSS MiB |
+|---|---:|---:|---:|
+| tiny_shared_duplicates | 0.87 → 0.83 | 1.36 → 1.24 | 167.97 → 167.81 |
+| tiny_distinct_unique | 1.54 → 1.11 | 2.62 → 2.74 | 168.12 → 188.55 |
+| large_shared_duplicates | 15.47 → 11.14 | 15.10 → 10.68 | 205.19 → 203.98 |
+| large_distinct_unique | 16.38 → 5.83 | 16.00 → 12.54 | 215.42 → 229.86 |
+| large_distinct_duplicates | 16.38 → 4.62 | 16.09 → 12.07 | 207.06 → 228.94 |
+
+Concurrency reduces large distinct-source latency while increasing sampled RSS
+by roughly 14–22 MiB in these cases. Tiny distinct-source CPU increases about
+4.5%; this is a latency/memory tradeoff, not free throughput. Four concurrent
+groups and the shared request quota bound scheduling and materialized payloads;
+process RSS also includes runtime thread/allocator state outside those payloads.
+No model latency, billing, quality, cold-cache behavior or cross-host guarantee is
+measured. Large computed-source CPU falls about 27–32% here, while ordinary reads,
+writes, small values and RSS do not improve uniformly.
+
+Reproduce the source comparison from the repository root, substituting the
+preserved prior executable for `/path/to/baseline/antfly`:
+
+```sh
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_source_projection.py \
+  zig/zig-out/bin/antfly --baseline /path/to/baseline/antfly \
+  --rounds 5 --queries-per-phase 5 --documents 8 --value-bytes 262144 \
+  --metadata-updates 2 --workload ascii \
+  --output output/projection-followup/source-ascii.json
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_media_materialization.py \
+  zig/zig-out/bin/antfly --baseline /path/to/baseline/antfly \
+  --rounds 5 --queries-per-phase 5 \
+  --output output/projection-followup/media.json
+```
+
+Repeat source runs with `mixed`, `opaque`, `escaped` and `unicode`. Add
+`--metadata-outputs 60` for `ascii` (wide64) and `small` (small64). Reports retain
+binary hashes, corpus/output hashes, host details, all samples and medians.
+
+A separate five-trial small64 repeat retained the same hashes and observed full
+computed elapsed 2.03 → 1.98 ms, CPU 1.54 → 1.48 ms and sampled RSS
+170.8 → 170.4 MiB. Conditional elapsed was 2.13 → 2.10 ms and CPU
+1.66 → 1.60 ms. Metadata updates were 8.82 → 9.14 ms and CPU
+10.01 → 10.50 ms. The first run's full-read latency regression did not repeat;
+both runs are retained rather than selecting a favorable sample. Metadata-update
+CPU was about 4–5% higher in both small runs. These results support reduced read
+work, not a universally better latency, memory or write-cost claim.
+
+
+### Alias-preserving values and bounded result consumers
+
+The follow-up keeps the public `fields` / `select` / `params` contract, ASCH25
+primary documents and the value-identity ABI unchanged. Internal normalized
+values now retain immutable bytes, their original extent, logical-node count
+and height. Reuse charges the consuming VM's work, depth and output limits and
+polls cancellation; a receipt cannot turn off resource accounting. Strict native
+views can certify string/bool/null scalar extents immediately. Strings have no
+numeric descendants and retain their admitted escape spelling, so this avoids a
+second string scan. Unqualified sources still use the scanner; numbers and
+composites still normalize with the typed JSON parser/formatter. Duplicate or
+malformed native nodes cannot issue a receipt.
+
+Raw outputs retain the selected column's provenance through aliases and CASE.
+Only executed pure forwarding paths carry it: computed/coerced values keep the
+ordinary typed VM. `value_identity(ref(alias))` can use the same pinned source
+identity as the selected field, with row-local memoization. A present raw value,
+including JSON null, proves `is_missing(ref(alias))` false without a DOM. Ordinary
+consuming operators still materialize typed values when required. These facts
+are scoped to immutable row bytes; they are neither wire metadata nor access
+capabilities, and no request-global/user-global value cache is added.
+
+The request prepares the union of public source fields and unconditional direct
+operands. Native storage fetches selected rows in owned byte windows, at most
+1 MiB of proven original bytes and 64 keys per batch, inside the existing pinned
+transaction. Unknown proofs or individually large rows keep lazy per-row reads.
+Metadata windows remain bounded independently. Public source output can reuse
+that row view, applying its mask once; array operand positions remain original.
+CASE-only operands are not included unless explicitly requested as public source.
+The distributed hydration path uses the same mechanism and read-cut ownership.
+
+Gateway lookups select flat value, image-presence and optional identity bindings
+through ordinary scalar projection. Array indexes are resolved before public
+mask compaction. Group planning accounts for every binding, splitting below the
+64-output ceiling while retaining the 32-reference ceiling. Values, revisions
+and permissions keep independent checks, and missing images remain distinct
+from present null/invalid values.
+
+A synchronous typed consumer receives the same canonical result that ordinary
+query execution would encode. Query permits, catalog binding, table permission,
+row policy, snapshot/revision checks, cancellation and result lifecycle fences
+run through the existing public query service. The consumer copies only values
+it retains before the producer retires; it does not manufacture a second HTTP
+response and then parse it. Providers without typed delivery retain the wire
+path. A producer omitting computed output may trigger one fresh authorized query
+for complete root fields when no reference pins an identity. That conservative
+fallback preserves original array positions. Identity-pinned references never
+downgrade, and fallback queries retain the original deadline and recheck policy.
+Consumer failures cross the generic delivery boundary as `QueryDeliveryFailed`
+while the gateway retains their original classification (for example, revision
+mismatch, absence or permission failure).
+
+Media work now uses a rolling pool of at most four groups. Completed slots are
+joined, copied and retired before being refilled; one slow group cannot force a
+barrier between cohorts. An 8 MiB active estimate and the shared SQL I/O scheduler
+bound concurrent admission across requests. Estimates never replace actual
+request quotas or the verified expanded-input limit. Oversized required groups
+run inline; tiny requests below 64 KiB estimated encoded payload also run inline
+to avoid task/stack overhead. The latter is a cost policy with a possible remote
+latency tradeoff, not a universal storage claim. Parent copies and child scratch
+share a synchronizing allocator lock during overlap. Every task is joined or
+canceled before its descriptor or arena retires, including failure paths.
+
+`e2e/antfly/bench_projection_aliases.py` compares equivalent direct-field and alias
+identity/missing expressions, including three-copy chains, with exact output
+hashes across both modes and binaries. The media driver also covers eight groups
+and skewed image sizes. Shared deterministic PNG generation lives in
+`e2e/antfly/media_fixture.py`. No model/provider call is needed for these checks.
+Qualification results and the source/host limitations follow below; raw reports
+remain ignored under `output/projection-followup/`.
+
+
+Typed consumers retain producer leases until the callback finishes and do not
+opt into spooled/consumed delivery. Lake execution therefore hydrates before the
+typed callback. Archive column plans include bound scalar dependencies independently
+of the public source mask: `fields: []` cannot erase operands needed by `select`,
+and constant-only outputs need no source columns. This is a conservative column
+read set for archive providers, not a claim of native per-field lazy I/O there.
+Column-backed scalar output also retains requested `_source` values; public array
+masking and scalar resolution use separate views of original positions. Ordinary
+column wire responses without scalar outputs keep streaming rather than building
+an extra DOM. Owned fallback plans use reclaimable scratch without bypassing quotas.
+
+Media query layout is selected from path structure. Object-only paths use the
+ordinary public source projection and a borrowed typed result; computing a
+second large scalar output adds work without changing path semantics. Any
+numeric path segment conservatively selects flat value/missing bindings so
+array masks cannot compact an index before resolution. Optional identity pins
+use independent computed identity outputs in either layout; projected source
+keys cannot impersonate them. Missing computed pins never downgrade. This
+choice is independent of image size, document IDs and benchmark corpus. A paired
+all-flat implementation regressed large four-image CPU about 41%, motivating
+this structural source/scalar split; that rejected result remains in ignored
+qualification evidence rather than becoming a performance claim.
+
+The in-process boundary carries a `ResultView` with optional row-aligned
+`encoded_sources`. A non-null encoded source replaces that row's `_source` only
+when the existing public-wire source witness matches the immutable bytes. Native
+JSON rows can therefore bypass producer parsing and cloning; already-typed
+column results retain their `_source` maps. The consumer handles the available
+representation before the same producer lease ends. Caller-parsed JSON and
+unqualified sources cannot acquire this fast path. Graph requests retain normal
+wire delivery. No public response schema or query authority changes.
+
+Gateway decoding charges a cumulative 32 MiB encoded-input limit before parsing
+borrowed sources or computed values, while retained payload, expansion, digest,
+revision, identity and live-policy checks remain independent. Identity output is
+never taken from source keys, including encoded-source and wire fallbacks. A
+1 MiB native source is covered by a contract test with only a 128 KiB preparation
+arena, proving that the adapter does not require a payload-sized parse/clone.
+The column-backed source-mask test explicitly retains typed source delivery.
+
+The intermediate `dfbc59d9de77` release passed 57 HTTP cases but still increased
+large-media CPU 16–32% because ordinary typed-source preparation parsed and
+cloned JSON before consumption. Its executable, manifest and reports are retained
+under ignored `output/projection-followup/structural-dfbc/`. The encoded-source
+view reuses the representation already accepted by the public wire encoder;
+it does not infer a new validation receipt from untrusted payload bytes.
+
+Native table readers forward synchronous result delivery through the same bound,
+provisioned and hosted read callbacks and transient-read retries as wire queries.
+A consumer-bearing query finalizes at that owner instead of escaping through a
+single-shard encoded-response shortcut. Legacy providers without the optional
+callback retain their owned wire response; no process-local consumer enters a
+shard RPC or a new public endpoint.
+
+A native encoded-result consumer can prepare source-only masks with the same
+private projection IR and zero named scalar bindings. Ordinary public wire
+queries retain their established projection path. Preparation belongs to the
+physical delivery plan after catalog/lake routing, not public query parsing.
+This admits source masks to bounded native hydration without
+computing an unused identity. Completion fingerprints remain private worker
+transport metadata; public source-only responses omit `_computed`. Count-only,
+empty-source and unsupported execution shapes retain their existing paths, as
+do source masks beyond the prepared program's metadata bounds. No empty public
+`select` or new source-projection option is introduced.
+
+A source-only response lacking a completion witness cannot certify whether
+numeric array masks were already applied. The coordinator refuses to infer that
+state. An unsupported source-only program can fall back once to the existing
+whole-query read, preserving filters, policy, consistency, retained cut and
+original deadlines. Named scalar expressions never downgrade. Consumer failures
+are normalized to `QueryDeliveryFailed` and cannot trigger this compatibility
+retry; the gateway retains the original failure classification locally.
+
+Encoded-delivery source preparation leaves ordered, retained/cursor and offset
+queries on their existing projection path. Native consumers with retained cuts
+or graph dialects also retain finalized wire responses, preserving carrier-owned
+continuation and exhaustion semantics. Private worker source programs still
+reconstruct their exact completion fingerprint, including during authenticated
+hydration; public source-only planning does not make a new pagination contract.
+
+Release qualification of `106b1e4b254c` caught ordinary-read regressions when
+source-only programs were injected during all public parsing: Unicode ordinary
+CPU rose 69% and escaped-string ordinary CPU rose 26%. That executable and its
+reports remain in ignored `output/projection-followup/delivery-global-106b/`;
+it is not the final qualified build. Source-program preparation now belongs to
+native encoded-result delivery, after lake routing. Ordinary wire reads keep
+their existing physical plan. Media groups estimated below 64 KiB encoded use
+owned-wire delivery; larger groups request the borrowed result view. Estimates
+choose a representation only: actual source/wire budgets, authorization,
+identity, digest, MIME and decoded bounds are enforced in both paths.
+
+Native result delivery is an explicit query-execution option through both the
+query-only and modern-search dispatch branches. Sharing catalog resolution with
+an outer consumer does not give a nested join/retrieval query that consumer:
+internal subqueries retain owned responses until final assembly. Regression
+coverage invokes the dispatcher with both request shapes, requires the native
+consumer and prepared source program, and separately verifies nested wire
+ownership without inheriting the outer consumer. The pre-fix dispatcher test
+failed with `UnexpectedLegacyQuery`, rather than relying on a fixture that
+unconditionally returns a prepared response.
+
+Qualification at `8420bd4f9ccf` passed 57 HTTP cases and retained alias/source CPU
+gains; ordinary Unicode and escaped-string controls returned near their baseline.
+The expanded media suite still regressed large-media CPU about 20–34%, exposing
+a second dispatch branch that discarded delivery for query-only bodies. That
+executable and its reports remain in ignored
+`output/projection-followup/delivery-dispatch-8420/`; it is not the final media
+qualification. The consumer is now passed explicitly through both branches,
+with nested query dispatch explicitly retaining its owned response.
+
+
+### Release qualification for alias and media reuse (2026-10-28)
+
+The measured production source is `0826126861ed`, including `main` through
+`125f49a9c5fd`. Its ReleaseFast server SHA-256 is
+`45f189800b5c1cd675a650672a7a54cf92e2553c0929ac290140e273747fb1fe`
+(251,637,048 bytes). The fresh grep SHA-256 is
+`a0a088ceb721a5b980f09b58920694e4931f962fe6ab1d5ab6dc7aba6efb84ff`
+(8,350,072 bytes). The preserved baseline is production source `915e5493a2b8`,
+main through `7dabd028d66d`, server SHA-256
+`d2a0401ddb9573148dcadf2c524772dd8fd566469e00fc2c2dc8fe84fd8e508f`.
+Both servers report `antfly dev (zig runtime)`. The candidate includes newer
+main changes: these whole-server comparisons do not isolate every optimization.
+Primary documents remain ASCH25 and the canonical value ABI is unchanged.
+
+The full indexed HTTP suite passed **57 cases**, with seven optional profiling
+cases skipped. This includes small/large original array paths and object paths,
+one/two shards, missing fields, digest/revision/permission rejection, 128 pinned
+references split below the binding limit, 130 rows crossing byte/key windows,
+retained pagination and persisted upgrade/old-reader rollback. Native checks
+passed 208 query contracts, 19 identity/publication cases, 31 shared-provider and
+67 gateway cases, targeted lake source/dependency tests, and eleven shared
+scheduler cases including overlapping parent/child allocation. The Apache
+boundary check covered 2,563 files; storage control, formatting and Python lint
+also passed. The merged source also passed the full Go SDK suite, the source/joined OpenAPI comparison and native generated-API checks. These checks are distinct from approval-gated repository CI.
+
+All comparisons use five alternating trials and five requests per phase, on the
+same shared 14-logical-CPU macOS ARM64 host with warm synthetic storage. CPU is
+whole-server CPU, including background work. RSS is periodically sampled, not an
+allocation counter or a hard peak bound; residency changes on this shared host
+can produce large swings. No model/provider is invoked. Reports retain binary,
+corpus and output hashes and every sample under ignored `output/`. Tables show
+median baseline → candidate; neither universal performance nor zero cost follows
+from these measurements.
+
+Alias comparisons return identical logical output hashes for direct fields and aliases, with four approximately 256 KiB values. Copy chains emit each intermediate output.
+
+| Alias workload / mode | Elapsed ms | Server CPU ms | Sampled RSS MiB |
+|---|---:|---:|---:|
+| escaped_opaque_copies0 / field | 10.72 → 10.90 | 9.79 → 9.83 | 195.3 → 193.1 |
+| escaped_opaque_copies0 / alias | 17.77 → 10.82 | 17.01 → 9.85 | 193.4 → 193.4 |
+| escaped_opaque_copies3 / field | 34.15 → 28.26 | 31.97 → 26.13 | 215.4 → 214.8 |
+| escaped_opaque_copies3 / alias | 40.88 → 28.09 | 38.87 → 25.50 | 213.6 → 214.6 |
+| unicode_string_copies0 / field | 11.99 → 10.60 | 11.02 → 9.66 | 189.2 → 190.0 |
+| unicode_string_copies0 / alias | 14.25 → 10.53 | 13.39 → 9.67 | 189.2 → 190.3 |
+| unicode_string_copies3 / field | 39.95 → 34.99 | 38.71 → 33.31 | 201.8 → 205.4 |
+| unicode_string_copies3 / alias | 42.09 → 34.42 | 40.65 → 32.94 | 202.2 → 205.7 |
+
+The source comparison uses eight documents and two metadata updates per trial. `small64` and `wide64` add 60 distinct metadata outputs. Full and conditional outputs are checked against ordinary reference reads, with certificate reuse and updated identities verified.
+
+| Source workload | Full elapsed ms | Full CPU ms | Full RSS MiB | Conditional CPU ms |
+|---|---:|---:|---:|---:|
+| ascii | 9.04 → 6.36 | 7.57 → 4.87 | 204.8 → 201.4 | 0.73 → 0.68 |
+| mixed | 11.30 → 8.31 | 9.99 → 7.06 | 210.3 → 212.4 | 0.71 → 0.73 |
+| opaque | 8.99 → 7.77 | 7.60 → 6.36 | 201.3 → 205.9 | 0.80 → 0.71 |
+| small64 | 2.03 → 2.13 | 1.56 → 1.62 | 171.2 → 171.3 | 1.60 → 1.62 |
+| wide64 | 10.25 → 7.67 | 9.03 → 6.12 | 208.8 → 205.4 | 1.89 → 1.93 |
+| escaped | 24.51 → 16.92 | 22.99 → 15.32 | 217.2 → 214.3 | 0.77 → 0.74 |
+| unicode | 25.58 → 20.50 | 24.48 → 19.33 | 205.1 → 206.9 | 0.76 → 0.75 |
+
+Positive control percentages mean more candidate CPU, negative percentages less. These controls include background process work and are not regression tolerances.
+
+| Source workload | Ordinary CPU change | Ingestion CPU change | Metadata-update CPU change |
+|---|---:|---:|---:|
+| ascii | +2.8% | +8.2% | +0.0% |
+| mixed | -3.7% | -3.3% | -0.8% |
+| opaque | -9.2% | +4.9% | -0.3% |
+| small64 | -0.8% | +1.2% | +0.6% |
+| wide64 | +1.1% | +1.0% | +1.3% |
+| escaped | -1.2% | -0.6% | +3.0% |
+| unicode | -2.7% | -2.6% | -0.7% |
+
+Media requests reach `ModelRequired` after authorization and all payload checks, before model resolution. Tiny PNGs are 1×1; medium PNGs are 64×64; crossover PNGs are 128×128; large PNGs are 256×256 random RGBA. Four images are used unless the name ends in `eight`. The skewed case has one 512×512 and seven 64×64 images.
+
+| Media workload | Elapsed ms | Server CPU ms | Sampled RSS MiB |
+|---|---:|---:|---:|
+| tiny_shared_duplicates | 0.82 → 0.70 | 1.22 → 0.97 | 167.8 → 166.4 |
+| tiny_distinct_unique | 1.04 → 1.12 | 2.63 → 1.89 | 188.6 → 166.5 |
+| medium_shared_duplicates | 1.78 → 1.50 | 1.97 → 2.48 | 170.5 → 170.1 |
+| medium_distinct_unique | 2.13 → 1.46 | 3.53 → 2.60 | 191.2 → 190.3 |
+| crossover_shared_duplicates | 3.67 → 3.55 | 3.11 → 3.01 | 176.8 → 176.2 |
+| crossover_distinct_unique | 2.19 → 2.66 | 4.32 → 4.49 | 198.9 → 198.8 |
+| large_shared_duplicates | 11.59 → 11.09 | 11.10 → 10.65 | 203.4 → 201.7 |
+| large_distinct_unique | 5.64 → 5.00 | 12.71 → 12.17 | 229.4 → 227.9 |
+| large_distinct_duplicates | 4.66 → 5.00 | 11.96 → 11.59 | 225.7 → 225.5 |
+| large_distinct_unique_eight | 9.40 → 9.19 | 24.51 → 23.90 | 263.0 → 264.2 |
+| skewed_distinct_eight | 13.57 → 12.07 | 16.42 → 15.38 | 233.9 → 232.4 |
+
+The following diagnostic compares the prior intermediate `dfbc59d9de77`, which includes main through `ff2c66bd7ba6`. The candidate includes newer main, so this is not an isolated measurement of delivery changes; that baseline server SHA-256 is `b6b3eb53f6bcb1ab5d1b31ed1cf63723f83cf0fad6d7e3bce450bee4616120c7`.
+
+| Prior-build media workload | Elapsed ms | Server CPU ms | CPU change | Sampled RSS MiB |
+|---|---:|---:|---:|---:|
+| tiny_shared_duplicates | 3.46 → 2.84 | 1.03 → 2.43 | +135.8% | 151.4 → 170.5 |
+| tiny_distinct_unique | 1.35 → 1.62 | 2.06 → 2.06 | +0.1% | 163.4 → 166.5 |
+| medium_shared_duplicates | 1.65 → 1.55 | 2.41 → 1.01 | -58.2% | 168.9 → 170.0 |
+| medium_distinct_unique | 1.23 → 1.37 | 2.23 → 2.36 | +6.1% | 189.1 → 189.2 |
+| crossover_shared_duplicates | 4.38 → 3.48 | 3.82 → 2.91 | -23.9% | 176.7 → 176.5 |
+| crossover_distinct_unique | 3.36 → 2.16 | 5.32 → 4.36 | -18.1% | 197.0 → 198.6 |
+| large_shared_duplicates | 14.63 → 11.42 | 14.12 → 10.91 | -22.8% | 202.8 → 202.9 |
+| large_distinct_unique | 6.00 → 5.19 | 15.24 → 11.98 | -21.4% | 225.2 → 228.2 |
+| large_distinct_duplicates | 5.58 → 4.43 | 14.95 → 11.56 | -22.7% | 223.3 → 225.2 |
+| large_distinct_unique_eight | 10.95 → 8.98 | 31.14 → 23.29 | -25.2% | 263.8 → 266.4 |
+| skewed_distinct_eight | 15.12 → 11.76 | 18.08 → 14.65 | -19.0% | 231.1 → 232.4 |
+
+Control repeats retain the same binaries and corpus/output hashes; both first and repeated observations are retained.
+
+| Repeated workload / phase | Elapsed ms | CPU ms | Sampled RSS MiB |
+|---|---:|---:|---:|
+| small64 / ordinary | 0.86 → 0.89 | 1.16 → 1.30 | 167.8 → 167.8 |
+| small64 / full | 2.13 → 2.15 | 1.61 → 1.59 | 170.9 → 171.1 |
+| small64 / conditional | 2.15 → 2.18 | 1.60 → 1.67 | 171.1 → 171.5 |
+| small64 / ingest | 9.78 → 11.22 | 18.54 → 19.36 | 164.3 → 164.5 |
+| small64 / metadata_update | 9.43 → 9.60 | 10.89 → 10.93 | 173.6 → 173.7 |
+| escaped / ordinary | 9.38 → 9.16 | 7.68 → 7.65 | 212.5 → 214.0 |
+| escaped / full | 23.82 → 16.57 | 22.43 → 14.89 | 215.2 → 217.7 |
+| escaped / conditional | 1.25 → 1.25 | 0.71 → 0.74 | 215.2 → 217.6 |
+| escaped / ingest | 108.18 → 107.80 | 122.46 → 124.25 | 206.8 → 211.0 |
+| escaped / metadata_update | 76.83 → 76.05 | 75.60 → 75.36 | 238.7 → 239.6 |
+
+The medium/crossover controls were repeated separately with the same binaries and corpus, rather than replacing the initial measurements.
+
+| Repeated media workload | Elapsed ms | CPU ms | CPU change | Sampled RSS MiB |
+|---|---:|---:|---:|---:|
+| medium_shared_duplicates | 1.57 → 1.40 | 1.15 → 1.16 | +1.2% | 170.7 → 170.1 |
+| medium_distinct_unique | 1.32 → 1.17 | 2.27 → 2.03 | -10.6% | 187.0 → 185.3 |
+| crossover_shared_duplicates | 3.36 → 3.29 | 2.90 → 2.85 | -1.8% | 176.6 → 176.2 |
+| crossover_distinct_unique | 2.23 → 2.38 | 4.34 → 4.24 | -2.3% | 198.8 → 198.0 |
+
+An initial all-flat implementation at `5ae406f3a0ca` passed correctness but
+increased large four-image CPU about 41% versus the same baseline. It is not the
+qualified implementation. Its reports and manifest remain in ignored
+`output/projection-followup/all-flat-5ae/`. The subsequent structural-only build `dfbc59d9de77` still regressed large-media CPU 16–32%; its executable and reports are retained in ignored `output/projection-followup/structural-dfbc/`. The qualified shape uses source-only preparation and borrowed native delivery to avoid unused scalar computation and the source DOM clone. Numeric paths still
+pay for scalar resolution because public masks otherwise compact their indexes.
+
+
+The strongest measured gain is eliminating repeated normalization of forwarded
+values: escaped aliases use 42% less CPU and escaped alias chains 34% less CPU,
+with matching outputs. Full source projections use 16–36% less CPU for the larger
+fixtures; the 64-output small-value workload is near parity. Conditional hits
+remain sub-millisecond in server CPU for the larger four-output cases, rather
+than becoming free. Ordinary-read controls range from −9.2% to +2.8% in the
+initial source runs. The small64 repeat increases ordinary CPU by 0.14 ms and
+conditional CPU by 0.07 ms; these costs remain visible in the tables.
+
+Media gains are smaller against the original baseline than against the regressed
+intermediate. Large-media CPU falls about 2.5–6.3%; some elapsed times increase.
+The initial medium shared-source result increases CPU 26% (0.51 ms), while its
+repeat increases 1.2% (0.014 ms). Crossover distinct-source latency increases in
+both runs despite nearly flat CPU. The prior-build tiny shared-source control
+also has a large CPU percentage increase at small absolute times. The different
+main revisions, background work and shared host prevent attributing these small
+controls to a single code path or claiming a universal win. Both initial and
+repeat observations are retained. Broader storage/host and sustained concurrency
+qualification remains necessary for performance guarantees.
+
+Source-only programs are prepared only for native encoded-result delivery.
+Ordinary wire parsing keeps its existing plan. Both terminal dispatcher shapes
+preserve explicit delivery, while nested retrieval/join calls require owned
+intermediate results. These ownership and planning rules are covered by the
+dispatch regression, rather than inferred from a successful end-to-end request.
+
+Reproduce from the repository root with the preserved baseline executable:
+
+```sh
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_projection_aliases.py \
+  zig/zig-out/bin/antfly --baseline /path/to/baseline/antfly \
+  --rounds 5 --queries-per-phase 5 \
+  --output output/projection-followup/aliases.json
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_source_projection.py \
+  zig/zig-out/bin/antfly --baseline /path/to/baseline/antfly \
+  --rounds 5 --queries-per-phase 5 --documents 8 --value-bytes 262144 \
+  --metadata-updates 2 --workload ascii \
+  --output output/projection-followup/source-ascii.json
+zig/e2e/antfly/.venv/bin/python zig/e2e/antfly/bench_media_materialization.py \
+  zig/zig-out/bin/antfly --baseline /path/to/baseline/antfly \
+  --rounds 5 --queries-per-phase 5 \
+  --output output/projection-followup/media.json
+```
+
+Repeat source runs with `mixed`, `opaque`, `escaped` and `unicode`; add
+`--metadata-outputs 60` to `small` and `ascii` for `small64` and `wide64`.
+These results do not measure inference quality/billing, cold storage, sustained
+cross-request throughput or other hosts. Allocation and admission bounds remain
+required even when CPU or latency improves.
+
+
+After release qualification, main advanced again. The follow-up merges
+`386c2761eafc0f8cbc4022b15c4f639f718d1024`, preserving both projection and new
+prompt-cache types in generated clients. Native API bindings were regenerated;
+93 generated-API steps and two tests passed. The source OpenAPI comparison, full
+Go SDK suite, Python export syntax, 2,578-file Apache boundary and storage control
+catalog passed. The merged native query/provider/gateway run passed all 76 build
+steps, including 208 query contracts, 31 provider cases and 67 gateway cases with
+no failures or leaks. The numerical tables above continue to identify the actual
+measured `0826126861ed` runtime; they are not measurements of this newer merge.

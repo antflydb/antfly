@@ -7,8 +7,9 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
+  Field,
+  FieldLabel,
   Input,
-  Label,
 } from "@antfly/design-system";
 import type {
   DocumentArtifactReprocessJob,
@@ -148,44 +149,44 @@ export function TableReprocessPanel({ tableName }: TableReprocessPanelProps) {
           <CardTitle>Table Reprocess</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="reprocess-artifact-name">Artifact name</Label>
+          <Field className="gap-2">
+            <FieldLabel htmlFor="reprocess-artifact-name">Artifact name</FieldLabel>
             <Input
               id="reprocess-artifact-name"
               value={artifactName}
               onChange={(event) => setArtifactName(event.target.value)}
               placeholder="document_units_v1"
             />
-          </div>
+          </Field>
           <div className="grid gap-3 md:grid-cols-2">
-            <div className="space-y-2">
-              <Label htmlFor="reprocess-from-key">From key</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="reprocess-from-key">From key</FieldLabel>
               <Input
                 id="reprocess-from-key"
                 value={fromKey}
                 onChange={(event) => setFromKey(event.target.value)}
                 placeholder="exclusive"
               />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="reprocess-to-key">To key</Label>
+            </Field>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="reprocess-to-key">To key</FieldLabel>
               <Input
                 id="reprocess-to-key"
                 value={toKey}
                 onChange={(event) => setToKey(event.target.value)}
                 placeholder="inclusive"
               />
-            </div>
+            </Field>
           </div>
-          <div className="space-y-2">
-            <Label htmlFor="reprocess-limit">Pass limit</Label>
+          <Field className="gap-2">
+            <FieldLabel htmlFor="reprocess-limit">Pass limit</FieldLabel>
             <Input
               id="reprocess-limit"
               value={limit}
               onChange={(event) => setLimit(event.target.value)}
               inputMode="numeric"
             />
-          </div>
+          </Field>
 
           {error && (
             <Alert variant="destructive">

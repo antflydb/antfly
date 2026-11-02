@@ -16,6 +16,7 @@
 """Public input cannot select private APIs, arbitrary sources or DSL options."""
 
 import json
+import pytest
 from pathlib import Path
 import sys
 import threading
@@ -217,7 +218,14 @@ class SearchGatewayTest(unittest.TestCase):
                     "frame-ancestors 'none'",
                     response.headers["Content-Security-Policy"],
                 )
-                self.assertIn(b"Hacker News search", response.read())
+                self.assertIn(b"Hacker News Search", response.read())
+            with urlopen(
+                root + "/?q=database&type=comment&sort=date", timeout=2
+            ) as response:
+                self.assertIn(b'type="module"', response.read())
+            with urlopen(root + "/search-state.mjs", timeout=2) as response:
+                self.assertIn("javascript", response.headers["Content-Type"])
+                self.assertIn(b"export function requestFor", response.read())
         finally:
             server.shutdown()
             server.server_close()
@@ -256,12 +264,13 @@ def test_public_views_against_native_query_contract(tmp_path):
     )
     backend = f"http://127.0.0.1:{port}/db/v1"
 
-    def call(path, body=None):
+    def call(path, body=None, method=None):
         with urlopen(
             Request(
                 backend + path,
                 None if body is None else json.dumps(body).encode(),
                 {"Content-Type": "application/json"},
+                method=method,
             ),
             timeout=30,
         ) as response:
@@ -369,6 +378,73 @@ def test_public_views_against_native_query_contract(tmp_path):
                     } == {"hn_archive" if view == "history" else "hn_current"}
                 else:
                     assert len(second["hits"]["hits"]) == 20
+            # Exercise the same filtered, ordered API against a real saved overlay,
+            # including numeric tie-breaking and continuation across both tables.
+            call("/sources/hackernews", method="DELETE")
+            call(
+                "/sources/hackernews",
+                {
+                    "source": {
+                        "overlay": {
+                            "base": {"table": "hn_archive"},
+                            "changes": {"table": "hn_current"},
+                            "key": ["hn_id"],
+                        }
+                    }
+                },
+            )
+            cutoff = int(time.time()) - 60
+            for table in ("hn_archive", "hn_current"):
+                call(
+                    f"/tables/{table}/batch",
+                    {
+                        "inserts": {
+                            f"{table}-comment-{i}": {
+                                "hn_id": 100 + i,
+                                "body": "database comment",
+                                "title": table,
+                                "created_at": cutoff + i,
+                                "points": i,
+                                "author": "tester",
+                                "item_type": "comment",
+                            }
+                            for i in range(25)
+                        },
+                        "sync_level": "full_index",
+                    },
+                )
+            for view in ("history", "recent", "all"):
+                body = {
+                    "q": "database",
+                    "view": view,
+                    "type": "comment",
+                    "sort": "date",
+                    "date_from": cutoff,
+                    "date_to": cutoff + 86400,
+                }
+                first = search(body)
+                assert len(first["hits"]["hits"]) == 20
+                assert first["cursor"]
+                if view == "recent":
+                    body["recent_since"] = first["recent_since"]
+                second = search(dict(body, cursor=first["cursor"]))
+                hits = first["hits"]["hits"] + second["hits"]["hits"]
+                assert [hit["_source"]["hn_id"] for hit in hits] == list(
+                    range(124, 99, -1)
+                )
+                assert all(hit["_source"]["item_type"] == "comment" for hit in hits)
+                empty = search(
+                    dict(body, date_from=cutoff - 172800, date_to=cutoff - 86400)
+                )
+                assert empty["hits"]["hits"] == []
+                window = search(dict(body, date_from=cutoff + 5, date_to=cutoff + 10))
+                assert [hit["_source"]["hn_id"] for hit in window["hits"]["hits"]] == [
+                    109,
+                    108,
+                    107,
+                    106,
+                    105,
+                ]
         finally:
             if gateway is not None:
                 gateway.shutdown()
@@ -380,3 +456,68 @@ def test_public_views_against_native_query_contract(tmp_path):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+
+
+def test_public_type_date_filters_and_ordering_are_backend_predicates():
+    for view in ("all", "history", "recent"):
+        value = {
+            "q": "database",
+            "view": view,
+            "type": "comment",
+            "sort": "date",
+            "date_from": 1700000000,
+            "date_to": 1800000000,
+        }
+        if view == "recent":
+            value["recent_since"] = 1750000000
+        query = search_request(value)
+        assert query["order_by"] == [
+            {"field": "created_at", "desc": True},
+            {"field": "hn_id", "desc": True},
+        ]
+        assert "source_ranking" not in query
+        predicates = query["filter_query"]["conjuncts"]
+        assert predicates[-1] == {"term": {"path": "/item_type", "value": "comment"}}
+        assert {
+            "range": {"path": "/created_at", "gte": 1700000000, "lt": 1800000000}
+        } in predicates
+        if view == "recent":
+            assert predicates[0] == {
+                "range": {"path": "/created_at", "gte": 1750000000}
+            }
+        if view != "all":
+            cursor = next_cursor(query, SearchGatewayTest.page())
+            assert (
+                search_request(dict(value, cursor=cursor))["remote_snapshot"]
+                == "native2:retained"
+            )
+            for change in (
+                {"type": "story"},
+                {"sort": "relevance"},
+                {"date_from": 1700000001},
+                {"date_to": 1800000001},
+            ):
+                with pytest.raises(ValueError):
+                    search_request({**value, **change, "cursor": cursor})
+    assert search_request({"q": "db", "type": "story"})["filter_query"] == {
+        "term": {"path": "/item_type", "value": "story"}
+    }
+
+
+def test_invalid_public_filters_cannot_inject_a_query():
+    import pytest
+
+    for change in (
+        {"type": ["story"]},
+        {"type": "admin"},
+        {"sort": "_id"},
+        {"sort": None},
+        {"date_from": True},
+        {"date_to": -1},
+        {"date_from": 1.5},
+        {"date_from": 30, "date_to": 20},
+        {"date_to": 253402300801},
+        {"order_by": [{"field": "_id"}]},
+    ):
+        with pytest.raises(ValueError):
+            search_request({"q": "db", **change})

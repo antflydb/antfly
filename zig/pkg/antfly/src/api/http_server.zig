@@ -2079,6 +2079,11 @@ pub const StatusSource = struct {
         free_routing_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
+        /// Whether this backend can ever replicate a non-empty
+        /// `replication_sources` definition right now (an HA hot-standby
+        /// primary cannot). `null` means the backend has no such
+        /// restriction — cluster mode and every existing fixture.
+        replication_sources_supported: ?*const fn (ptr: *anyopaque) anyerror!bool = null,
         publish_vector_migration_table: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         begin_vector_migration_command: ?*const fn (ptr: *anyopaque, table_name: []const u8) anyerror!void = null,
         end_vector_migration_command: ?*const fn (ptr: *anyopaque, table_name: []const u8) void = null,
@@ -2255,6 +2260,13 @@ pub const StatusSource = struct {
     pub fn replaceTableDefinition(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const fn_ptr = self.vtable.replace_table_definition orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("replace_table_definition", self.boundary_dispatch, fn_ptr, .{ self.ptr, expected, replacement });
+    }
+
+    /// Defaults to true: only a backend with a real restriction (standalone
+    /// bound to an HA hot-standby primary) sets the vtable capability.
+    pub fn replicationSourcesSupported(self: StatusSource) !bool {
+        const fn_ptr = self.vtable.replication_sources_supported orelse return true;
+        return try BoundaryAbi.call("replication_sources_supported", self.boundary_dispatch, fn_ptr, .{self.ptr});
     }
 
     pub fn lakeIndexLifecycleAuthority(self: *const StatusSource, request: api_operation.RequestContext) ?@import("lake_index_reader_lease.zig").Authority {
@@ -4166,7 +4178,7 @@ pub const ApiHttpServer = struct {
     mcp_sessions: mcp.InMemorySessionStore = .{},
     memory_mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
-    inference_sessions: @import("antfly_local_sources").common_provider_registry.gateway.Sessions = .{},
+    inference_sessions: @import("antfly_local_sources").common_inference_gateway.Sessions = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -6256,7 +6268,7 @@ pub const ApiHttpServer = struct {
         }
         fn dispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table: []const u8, body: []const u8, filter: ?[]const u8, deadline: ?u64, cancellation: ?CancellationToken) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const result = try self.server.executePublicTableQueryDispatchWithIdentity(alloc, source, table, body, filter, self.identity, deadline, cancellation, null, null, self.resolver, null);
+            const result = try self.server.executePublicTableQueryDispatchWithIdentity(alloc, source, table, body, filter, self.identity, deadline, cancellation, null, null, self.resolver, null, self.resolver.execution_team);
             return result.json;
         }
         fn build(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, value: std.json.Value, deadline: ?u64, cancellation: ?CancellationToken) anyerror!query_api.OwnedQueryRequest {
@@ -6281,6 +6293,7 @@ pub const ApiHttpServer = struct {
             null,
             execution_deadline_ns,
             cancellation,
+            null,
             null,
             null,
             null,
@@ -9432,7 +9445,7 @@ pub const ApiHttpServer = struct {
         request: AuthenticatedRequest,
         permission: kernel_abi.InferencePermission,
     ) !kernel_abi.AuthorizationDecision {
-        if (permission == .write and !self.publicInferenceEnabled()) return .forbidden;
+        if (permission == .write and !self.publicInferenceEnabled()) return .public_inference_disabled;
         if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null and
             request.trusted_principal == null)
             return .allowed;
@@ -15907,6 +15920,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.Timeout => return error.Timeout,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.DocumentArtifactPublicationFailed => return error.DocumentArtifactPublicationFailed,
@@ -16002,6 +16016,7 @@ pub const ApiHttpServer = struct {
             null,
             null,
             null,
+            null,
         );
         return response.json;
     }
@@ -16074,6 +16089,7 @@ pub const ApiHttpServer = struct {
                 response_label,
                 bound_join,
                 resolver,
+                resolver.delivery,
                 resolver.execution_team,
             ) catch |err| switch (err) {
                 error.IndexRebuilding,
@@ -16365,6 +16381,7 @@ pub const ApiHttpServer = struct {
             binding.label,
             if (binding.join) |*join| join else null,
             &resolver,
+            null,
             normalized.execution_team,
         ) catch |err| {
             if (query_api.isPublicQueryValidationError(err)) return error.InvalidRetrievalAgentRequest;
@@ -16385,6 +16402,7 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
         catalog_resolver: ?*CatalogQueryResolver,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
         execution_team: ?*@import("antfly_runtime_abi").runnable_abi.Team,
     ) !query_api.QueryResponse {
         var catalog_arena = std.heap.ArenaAllocator.init(alloc);
@@ -16408,7 +16426,7 @@ pub const ApiHttpServer = struct {
                 cancellation,
                 response_label,
                 resolver,
-                resolver.delivery,
+                delivery,
                 execution_team,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest,
@@ -16589,7 +16607,7 @@ pub const ApiHttpServer = struct {
             return .{ .json = try distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources) };
         }
 
-        const result = self.executePlainPublicTableQuery(
+        const result = self.executePlainPublicTableQueryWithDelivery(
             alloc,
             source,
             table_name,
@@ -16601,6 +16619,8 @@ pub const ApiHttpServer = struct {
             cancellation,
             response_label,
             resolver,
+            delivery,
+            execution_team,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest,
@@ -17153,7 +17173,12 @@ pub const ApiHttpServer = struct {
         query_req.req.cancellation = cancellation;
         if (query_req.req.graph_queries.len > 0) query_req.req.graph_query_diagnostic_sink = graph_query_diagnostic.sink();
         query_req.req.response_table_name = response_label;
-        if (query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
+        // Hierarchy traversal owns its source-revision cursor. Capturing a
+        // whole-table native cut here both bypasses its stale-revision check
+        // and rejects Lite, whose storage cannot publish a directory snapshot.
+        // Explicit retained tokens from existing callers still follow their
+        // normal validation path; ordinary sorted search continues to pin.
+        if (query_req.req.hierarchy_children == null and query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
             if (query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0) return error.CatalogGenerationChanged;
             const context: api_operation.RequestContext = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none };
             if (try self.queryTableDefinition(resolver.arena, resolver, table_name, context)) |table| {
@@ -17198,7 +17223,12 @@ pub const ApiHttpServer = struct {
             if (try @import("lake_index_text_query.zig").executeWithDelivery(alloc, self, table, query_req.req, lake_request, delivery)) |result| return result;
         }
         if (query_req.req.remote_snapshot != null and query_req.req.native_query_cut == null) return error.InvalidQueryRequest;
-        return (queryWithTransientReadRetry(
+        // Source-program preparation is a physical delivery choice, not a
+        // change to every ordinary public query. Wire consumers keep the native
+        // reader's owned-response shortcut; lake delivery was handled above.
+        const native_delivery = if (delivery) |sink| (if (sink.typed_result != null) sink else null) else null;
+        if (native_delivery != null) try query_req.prepareEncodedDelivery(alloc);
+        return (queryWithTransientReadRetryAndDelivery(
             alloc,
             self.sharedApiIo(),
             source,
@@ -17206,6 +17236,7 @@ pub const ApiHttpServer = struct {
             query_req.req,
             .read_index,
             .{ .resolve = self },
+            native_delivery,
         ) catch |err| switch (err) {
             // Public filter syntax is validated and attributed during request
             // normalization. A later InvalidArgument can originate from any
@@ -17444,6 +17475,22 @@ pub const ApiHttpServer = struct {
         consistency: raft_mod.ReadConsistency,
         missing_index_lifecycle: MissingIndexLifecycle,
     ) !?query_api.QueryResponse {
+        return queryWithTransientReadRetryAndDelivery(alloc, retry_io, source, table_name, req, consistency, missing_index_lifecycle, null);
+    }
+
+    fn queryWithTransientReadRetryAndDelivery(
+        alloc: std.mem.Allocator,
+        retry_io: ?std.Io,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        requested: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+        missing_index_lifecycle: MissingIndexLifecycle,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+    ) !?query_api.QueryResponse {
+        var req = requested;
+        const source_only = if (req.field_projection_plan) |shared| (if (shared.get(req.field_projection_json)) |plan| plan.bindings.len == 0 else false) else false;
+        var source_fallback = false;
         const retry_timeout_ns = 5 * std.time.ns_per_s;
         const retry_poll_ns = 25 * std.time.ns_per_ms;
         const start_ns = retryMonotonicNs(retry_io);
@@ -17453,7 +17500,19 @@ pub const ApiHttpServer = struct {
         while (true) : (attempts += 1) {
             try ensureRequestActive(req.cancellation);
             if (retryDeadlineExpired(retry_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
-            return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
+            return source.queryWithDelivery(alloc, table_name, req, consistency, delivery) catch |err| switch (err) {
+                error.UnsupportedQueryRequest, error.InvalidQueryRequest, error.InvalidArgument => {
+                    if (!source_only or source_fallback) return err;
+                    // Source-only preparation is an optimization, never a
+                    // requirement imposed on older workers. Keep all filters,
+                    // authority, cut, consistency and deadlines on one retry.
+                    source_fallback = true;
+                    req.field_projection_json = &.{};
+                    req.field_projection_plan = null;
+                    req.field_projection_transport = false;
+                    req.defer_stored_projection = false;
+                    continue;
+                },
                 error.IndexGenerationMismatch => {
                     // Release the failed query's entire snapshot before one
                     // fresh attempt. Never retry just a reverse-edge probe:
@@ -19597,6 +19656,7 @@ pub const ApiHttpServer = struct {
         const source = self.table_writes orelse return error.NotFound;
         try ensureTableOperationActive(request);
         const handled = source.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
+            error.ReadTransientFailure => return error.InferenceUnavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.InvalidArgument, error.NotFound => return error.NotFound,
             else => {
@@ -23352,7 +23412,7 @@ pub const ApiHttpServer = struct {
     pub fn executeMemoryService(self: *ApiHttpServer, space: []const u8, input: @import("memory.zig").Request, borrowed_identity: ?AuthenticatedIdentity, borrowed_context: api_operation.RequestContext) !contextual_operations.OwnedResponse {
         return self.executeMemoryServiceInner(space, input, borrowed_identity, borrowed_context) catch |err| {
             const status_code = @import("memory.zig").status(err);
-            return contextual_operations.jsonWithStatus(status_code, try std.json.Stringify.valueAlloc(self.alloc, .{ .code = @errorName(err), .@"error" = @errorName(err), .retryable = status_code == 503 or status_code == 429 }, .{}), false);
+            return contextual_operations.jsonWithStatus(status_code, try std.json.Stringify.valueAlloc(self.alloc, .{ .code = @errorName(err), .@"error" = @import("memory.zig").errorMessage(err), .retryable = status_code == 503 or status_code == 429 }, .{}), false);
         };
     }
     fn executeMemoryServiceInner(self: *ApiHttpServer, space: []const u8, input: @import("memory.zig").Request, borrowed_identity: ?AuthenticatedIdentity, borrowed_context: api_operation.RequestContext) !contextual_operations.OwnedResponse {
@@ -24032,6 +24092,12 @@ pub const ApiHttpServer = struct {
         );
     }
 
+    pub fn consumePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, identity: ?AuthenticatedIdentity, cancellation: ?*const http_common.RequestCancellation, delivery: @import("antfly_local_sources").api_query_response.Delivery) !contextual_operations.OwnedResponse {
+        if (!self.tryAcquireQuery()) return self.queryOverloadedResponse();
+        defer self.releaseQuery();
+        return self.handleAdmittedPublicTableQueryWithDelivery(table_name, body, "application/json", identity, cancellation, delivery);
+    }
+
     /// Execute while the caller holds this server's query permit. Transport
     /// adapters use this to retain protocol-specific overload responses
     /// without double-counting application admission.
@@ -24156,9 +24222,15 @@ pub const ApiHttpServer = struct {
                 try self_.target.write_fn(self_.target.ptr, bytes);
                 try self_.resumeOutput();
             }
+            fn consume(raw: *anyopaque, result: @import("antfly_local_sources").api_query_response.ResultView) !void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                try self_.server.reachQueryResultLifecycle("public.table.query", self_.table_name, 0);
+                const target = self_.target.typed_result.?;
+                try target.consume(target.ptr, result);
+            }
         };
         var bridge: ?Bridge = if (delivery) |target| .{ .server = self, .table_name = table_name, .target = target, .execution = execution } else null;
-        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_remote_query = remote_query, .execution_team = if (team) |*value| value else null, .delivery = if (bridge) |*value| .{ .ptr = value, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = true } else null };
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_remote_query = remote_query, .execution_team = if (team) |*value| value else null, .delivery = if (bridge) |*value| .{ .ptr = value, .typed_result = if (value.target.typed_result != null) .{ .ptr = value, .consume = Bridge.consume } else null, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = value.target.typed_result == null } else null };
         var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none, .execution_team = resolver.execution_team }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer binding.deinit();
         if (bridge) |*value| value.table_name = binding.physical;
@@ -25133,6 +25205,7 @@ pub const ApiHttpServer = struct {
             .force = parsed.value.force,
             .control = control,
             .repair_id = repair_id,
+            .operator_initiated = control == null,
         }) catch |err| switch (err) {
             error.InvalidArgument => return try publicOperationTextResponse(self.alloc, 400, "invalid repair request"),
             error.StaleIndexRepairControl => return try publicOperationTextResponse(self.alloc, 409, "repair changed; refresh and retry"),
@@ -25142,11 +25215,19 @@ pub const ApiHttpServer = struct {
             },
         }) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
+        var summary_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer summary_arena.deinit();
+        const remaining: ?repair_jobs.RemainingFailures = if (control == null)
+            try self.remainingRepairFailures(summary_arena.allocator(), table_name, parsed.value.index, if (target == .artifact) parsed.value.kind else null)
+        else
+            null;
         const response_body = try std.json.Stringify.valueAlloc(self.alloc, .{
             .table = table_name,
             .target = @tagName(target),
             .limit = limit,
             .result = result,
+            .remaining_failures = if (remaining) |value| value.groups else null,
+            .remaining_failures_truncated = if (remaining) |value| value.truncated else null,
         }, .{ .emit_null_optional_fields = false });
         return .{ .status = 200, .body = response_body, .json = true };
     }
@@ -25515,6 +25596,7 @@ pub const ApiHttpServer = struct {
             .repair_job_id = running_state.job_id,
             .repair_attempt_id = running_state.attempt_id,
             .repair_job_created_at_ms = running_state.created_at_millis,
+            .operator_initiated = running_state.control == null,
         }, .{
             .cancel_check = .{
                 .ptr = &cancel_probe,
@@ -26671,11 +26753,50 @@ pub const ApiHttpServer = struct {
         });
     }
 
+    const repair_summary_issue_limit: u32 = 500;
+
+    /// Documents that still fail, grouped by error code with a next step.
+    /// Allocates in `arena`. A failed listing yields an empty summary rather
+    /// than failing the repair response.
+    fn remainingRepairFailures(
+        self: *ApiHttpServer,
+        arena: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: ?[]const u8,
+        kind: ?db_mod.types.ArtifactRepairKind,
+    ) !repair_jobs.RemainingFailures {
+        const source = self.table_writes orelse return .{};
+        const listed = (source.listArtifactRepairIssues(arena, table_name, .{
+            .target = .artifact,
+            .artifact_kind = kind,
+            .index_name = index_name,
+            .limit = repair_summary_issue_limit,
+        }) catch |err| {
+            std.log.warn("repair failure summary unavailable table={s} err={s}", .{ table_name, @errorName(err) });
+            return .{};
+        }) orelse return .{};
+        return try repair_jobs.remainingFailuresAlloc(arena, listed.issues, listed.has_more);
+    }
+
     fn catalogJobResponse(self: *ApiHttpServer, comptime State: type, status: u16, encoded: []const u8) !public_table_http.OwnedResponse {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var state = try std.json.parseFromSliceLeaky(State, a, encoded, .{ .ignore_unknown_fields = true });
+        if (comptime State == repair_jobs.JobState) {
+            if (state.control == null and repair_jobs.isTerminalPhase(state.phase)) {
+                // Live from the repair issues, which stay the source of truth
+                // after the job finishes.
+                const remaining = try self.remainingRepairFailures(
+                    a,
+                    state.table_name,
+                    state.index,
+                    if (std.mem.eql(u8, state.target, "artifact")) state.kind else null,
+                );
+                state.remaining_failures = remaining.groups;
+                state.remaining_failures_truncated = remaining.truncated;
+            }
+        }
         var names = RestoreCatalogNames{ .source = self.source, .arena = a };
         const target = try system_catalog.Target.parse(try names.resolve(state.table_name));
         state.table_name = try target.displayNameAlloc(a);
@@ -30135,7 +30256,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: Authorizat
         if (std.mem.indexOfScalar(u8, remainder, '/')) |separator| {
             const suffix = remainder[separator + 1 ..];
             if (std.mem.eql(u8, suffix, "lake/catalog") or std.mem.eql(u8, suffix, "lake/changes") or std.mem.eql(u8, suffix, "lake/maintenance") or std.mem.eql(u8, suffix, "lake/commits") or std.mem.startsWith(u8, suffix, "lake/commits/")) {
-                if (isReadMethod(method) or method == .POST) return try tablePermission(alloc, remainder[0..separator], if (isReadMethod(method)) .read else .admin);
+                if (isReadMethod(method) or method == .POST) return try tablePermission(alloc, remainder[0..separator], if (isReadMethod(method)) .read else if (std.mem.eql(u8, suffix, "lake/changes")) .write else .admin);
             }
         }
     }
@@ -30509,6 +30630,42 @@ test "internal service credentials cannot authorize public inference routes" {
         kernel_abi.AuthorizationDecision.forbidden,
         try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .write),
     );
+}
+
+test "httpx inference gateway authorization tells disabled public inference apart from missing permission" {
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const secret = "inference-policy-test-secret";
+    const now_seconds: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = secret,
+        .issuer = "cluster-a",
+        .subject = "node:7",
+    }, now_seconds);
+    defer alloc.free(token);
+    for ([_]struct { config: []const u8, expected: kernel_abi.AuthorizationDecision }{
+        // The deployment fence runs first and names itself.
+        .{ .config = "{\"public_inference\":{\"enabled\":false}}", .expected = .public_inference_disabled },
+        // With the fence open, a caller without inference write stays forbidden.
+        .{ .config = "{\"public_inference\":{\"enabled\":true}}", .expected = .forbidden },
+    }) |case| {
+        var config = try common_config.Config.parseFromSlice(alloc, case.config);
+        defer config.deinit();
+        var server = ApiHttpServer.init(alloc, .{
+            .node_config = &config,
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "cluster-a",
+        }, FakeSource.iface(), null, null);
+        defer server.deinit();
+        try std.testing.expectEqual(case.expected, try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .write));
+    }
 }
 
 test "api http server validates dedicated internal service runtime credentials" {
@@ -31519,6 +31676,7 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
 }
 
 pub fn normalizeQueryOperationalError(err: anyerror) ?anyerror {
+    if (public_table_http.queryCancellationError(err)) |operation| return operation;
     if (err == error.ValueSearchRequiresScan or err == error.ValueSearchLimitExceeded or err == error.MetricNotReady or err == error.MetricStale or err == error.DecisionLimitExceeded) return err;
     if (err == error.RemoteOutcomeUncertain or err == error.RemoteAttemptCapacity) return error.DistributedQueryUnavailable;
     if (normalizeQueryEmbeddingOperationalError(err)) |normalized| return normalized;
@@ -35063,9 +35221,10 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
             try std.testing.expect(req.hierarchy_children != null);
             try std.testing.expectEqualStrings("doc:a", req.hierarchy_children.?.parent_id);
             try std.testing.expectEqualStrings(row_filter, req.filter_query_json);
-            try std.testing.expect(req.remote_snapshot != null);
-            try std.testing.expect(req.native_query_cut != null);
-            try std.testing.expectEqual(self.calls == 0, req.native_query_cut.?.create);
+            // A page cursor is fenced by the source hierarchy revision. It
+            // must cross the HTTP/worker seam without a directory-only cut.
+            try std.testing.expect(req.remote_snapshot == null);
+            try std.testing.expect(req.native_query_cut == null);
             try std.testing.expectEqual(@as(usize, 2), req.order_by.len);
             try std.testing.expectEqualStrings("_hierarchy.position", req.order_by[0].field);
             try std.testing.expectEqualStrings("_id", req.order_by[1].field);
@@ -35114,8 +35273,8 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
             self.calls += 1;
             return .{ .json = try std.fmt.allocPrint(
                 inner_alloc,
-                "{{\"responses\":[{{\"remote_snapshot\":\"{s}\",\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{s}\",\"_sort\":[\"{s}\",\"{s}\"],\"_source\":{s}}}]}} ,\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
-                .{ req.remote_snapshot.?, public_unit_id, position, public_unit_id, hit.stored_data.? },
+                "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{s}\",\"_sort\":[\"{s}\",\"{s}\"],\"_source\":{s}}}]}} ,\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
+                .{ public_unit_id, position, public_unit_id, hit.stored_data.? },
             ) };
         }
     };
@@ -35146,22 +35305,17 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
     defer first.deinit(alloc);
     var first_json = try std.json.parseFromSlice(std.json.Value, alloc, first.json, .{});
     defer first_json.deinit();
+    try std.testing.expect(first_json.value.object.get("responses").?.array.items[0].object.get("remote_snapshot") == null);
     const first_hit = first_json.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
     try std.testing.expectEqualStrings(position, first_hit.get("_sort").?.array.items[0].string);
     try std.testing.expectEqualStrings(public_unit_id, first_hit.get("_sort").?.array.items[1].string);
     try std.testing.expectEqualStrings("page one", first_hit.get("_source").?.object.get("text").?.string);
 
-    var replay_request = try std.json.parseFromSlice(std.json.Value, alloc, replay_template, .{ .allocate = .alloc_always });
-    defer replay_request.deinit();
-    try replay_request.value.object.put(replay_request.arena.allocator(), "remote_snapshot", first_json.value.object.get("responses").?.array.items[0].object.get("remote_snapshot").?);
-    const replay_body = try std.json.Stringify.valueAlloc(alloc, replay_request.value, .{});
-    defer alloc.free(replay_body);
-
     var replay = try server.executePlainPublicTableQuery(
         alloc,
         reads.source(),
         "docs",
-        replay_body,
+        replay_template,
         row_filter,
         null,
         null,
@@ -35171,6 +35325,21 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
         null,
     );
     defer replay.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), reads.calls);
+    // Ordinary ordered pages still require their retained snapshot token.
+    try std.testing.expectError(error.CatalogGenerationChanged, server.executePlainPublicTableQuery(
+        alloc,
+        reads.source(),
+        "docs",
+        "{\"fields\":[],\"order_by\":[{\"field\":\"_id\"}],\"search_after\":[\"doc:a\"]}",
+        row_filter,
+        null,
+        null,
+        .{ .domain = .internal, .value = "test" },
+        null,
+        null,
+        null,
+    ));
     try std.testing.expectEqual(@as(usize, 2), reads.calls);
 }
 
@@ -59998,6 +60167,7 @@ test "api http server executes direct foreign table aggregations through registr
         null,
         null,
         null,
+        null,
     ));
     var unsupported_response = try server.publicQueryOperationErrorResponse("pg_customers", unsupported_body, error.UnsupportedQueryRequest);
     defer unsupported_response.deinit(alloc);
@@ -65799,4 +65969,135 @@ test "httpx inference gateway document authority recovery does not block existin
     const migrated = (try backend.capability().get(a, "documents/legacy")).?;
     defer a.free(migrated);
     try std.testing.expect(migrated.len > 0);
+}
+
+test "httpx inference gateway native delivery preserves retries and source only compatibility" {
+    const a = std.testing.allocator;
+    var parsed = try query_contract.parsePublicQueryRequest(a, null, "docs", "{\"query\":{\"match_all\":{}},\"fields\":[\"images.preview\"]}");
+    defer parsed.deinit(a);
+    try parsed.prepareEncodedDelivery(a);
+    const Fake = struct {
+        attempts: usize = 0,
+        legacy: bool = false,
+        expected_prefix: []const u8 = "tenant/",
+        require_prepared: bool = false,
+        allow_wire: bool = false,
+        wire_calls: usize = 0,
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query, .query_with_delivery = queryWithDelivery } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+        fn query(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.wire_calls += 1;
+            if (!self.allow_wire) return error.UnexpectedLegacyQuery;
+            try std.testing.expect(req.field_projection_plan == null);
+            try std.testing.expect(req.field_projection_json.len == 0);
+            return try query_contract.encodeQueryResponses(alloc, table, req, .{}, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 });
+        }
+        fn queryWithDelivery(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, delivery: ?@import("antfly_local_sources").api_query_response.Delivery) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts += 1;
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqualStrings(self.expected_prefix, req.filter_prefix);
+            if (self.require_prepared) {
+                try std.testing.expect(req.field_projection_plan != null);
+                try std.testing.expect(req.field_projection_json.len != 0);
+            }
+            if (self.legacy and req.field_projection_json.len != 0) return error.InvalidQueryRequest;
+            if (self.legacy) {
+                try std.testing.expect(req.field_projection_plan == null);
+                try std.testing.expect(!req.defer_stored_projection);
+            }
+            return try query_contract.encodeQueryResponsesWithDelivery(alloc, table, req, .{}, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, delivery);
+        }
+    };
+    const Sink = struct {
+        count: usize = 0,
+        reject: bool = false,
+        fn start(_: *anyopaque, _: usize) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn write(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedWireEncoding;
+        }
+        fn consume(raw: *anyopaque, view: @import("antfly_local_sources").api_query_response.ResultView) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            try std.testing.expect(view.result.status == 200);
+            if (self.reject) return error.ConsumerRejected;
+        }
+    };
+    var sink: Sink = .{};
+    const delivery: @import("antfly_local_sources").api_query_response.Delivery = .{ .ptr = &sink, .start_fn = Sink.start, .write_fn = Sink.write, .typed_result = .{ .ptr = &sink, .consume = Sink.consume } };
+    var req = parsed.req;
+    req.filter_prefix = "tenant/";
+    var native: Fake = .{};
+    var direct = (try ApiHttpServer.queryWithTransientReadRetryAndDelivery(a, null, native.source(), "docs", req, .read_index, .none, delivery)).?;
+    defer direct.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), native.attempts);
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    try std.testing.expectEqual(@as(?usize, 0), direct.delivered_bytes);
+    var older: Fake = .{ .legacy = true };
+    sink = .{};
+    var compatible = (try ApiHttpServer.queryWithTransientReadRetryAndDelivery(a, null, older.source(), "docs", req, .read_index, .none, delivery)).?;
+    defer compatible.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), older.attempts);
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    // A consumer failure must not be mistaken for an older worker and replayed.
+    native = .{};
+    sink = .{ .reject = true };
+    try std.testing.expectError(error.QueryDeliveryFailed, ApiHttpServer.queryWithTransientReadRetryAndDelivery(a, null, native.source(), "docs", req, .read_index, .none, delivery));
+    try std.testing.expectEqual(@as(usize, 1), native.attempts);
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    // Named expressions are requested behavior and never a compatibility hint.
+    var named = try query_contract.parsePublicQueryRequest(a, null, "docs", "{\"fields\":[],\"select\":{\"x\":{\"literal\":1}}}");
+    defer named.deinit(a);
+    var named_req = named.req;
+    named_req.filter_prefix = "tenant/";
+    older = .{ .legacy = true };
+    sink = .{};
+    try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetryAndDelivery(a, null, older.source(), "docs", named_req, .read_index, .none, delivery));
+    try std.testing.expectEqual(@as(usize, 1), older.attempts);
+    try std.testing.expectEqual(@as(usize, 0), sink.count);
+
+    const Status = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Status.status } }, null, null);
+    defer server.deinit();
+    // Exercise dispatch, not only its lower-level retry helper. Query-only
+    // bodies and modern search bodies reach different normalization branches.
+    // Both must preserve the admitted native consumer and source preparation.
+    for ([_][]const u8{
+        "{\"query\":{\"bool\":{\"filter\":{\"ids\":[\"a\"]}}},\"fields\":[\"images.preview\",\"revision\",\"permissions\"],\"limit\":1}",
+        "{\"filter_query\":{\"ids\":[\"a\"]},\"fields\":[\"images.preview\",\"revision\",\"permissions\"],\"limit\":1}",
+    }) |body| {
+        native = .{ .expected_prefix = "", .require_prepared = true };
+        sink = .{};
+        var resolver = ApiHttpServer.CatalogQueryResolver{ .arena = a, .delivery = delivery };
+        var dispatched = try server.executePublicTableQueryDispatchWithIdentity(a, native.source(), "docs", body, null, null, null, null, null, null, &resolver, delivery, null);
+        defer dispatched.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), native.attempts);
+        try std.testing.expectEqual(@as(usize, 1), sink.count);
+        try std.testing.expectEqual(@as(?usize, 0), dispatched.delivered_bytes);
+        // Nested join/retrieval dispatch must retain its owned response even
+        // while sharing catalog state with an outer native consumer.
+        native = .{ .expected_prefix = "", .allow_wire = true };
+        sink = .{};
+        var nested = try server.executePublicTableQueryDispatchWithIdentity(a, native.source(), "docs", body, null, null, null, null, null, null, &resolver, null, null);
+        defer nested.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), native.wire_calls);
+        try std.testing.expectEqual(@as(usize, 0), native.attempts);
+        try std.testing.expectEqual(@as(usize, 0), sink.count);
+        try std.testing.expect(nested.json.len != 0);
+        try std.testing.expect(nested.delivered_bytes == null);
+    }
 }

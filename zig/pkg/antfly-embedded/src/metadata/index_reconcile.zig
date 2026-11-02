@@ -710,38 +710,7 @@ pub fn desiredResolverContains(desired: []const resolver_catalog.ResolverConfig,
     return false;
 }
 
-pub fn collectDesiredResolvers(
-    alloc: std.mem.Allocator,
-    value: std.json.Value,
-    out: *std.ArrayListUnmanaged(resolver_catalog.ResolverConfig),
-) !void {
-    switch (value) {
-        .object => |object| {
-            if (object.get("resolvers")) |resolvers| {
-                if (resolvers == .array) {
-                    for (resolvers.array.items) |item| {
-                        if (item != .object) continue;
-                        const parsed = try resolver_catalog.ResolverConfig.parseValue(alloc, item);
-                        // `parsed.value` is owned by the parse arena; clone with
-                        // `alloc` so `out`'s entries free correctly (and so they
-                        // outlive the arena).
-                        defer parsed.deinit();
-                        try out.append(alloc, try resolver_catalog.ResolverConfig.clone(alloc, parsed.value));
-                    }
-                }
-            }
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or indexes_api.index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
-                try collectDesiredResolvers(alloc, entry.value_ptr.*, out);
-            }
-        },
-        .array => |array| {
-            for (array.items) |item| try collectDesiredResolvers(alloc, item, out);
-        },
-        else => {},
-    }
-}
+pub const collectDesiredResolvers = resolver_catalog.collectDesiredResolvers;
 
 pub fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     if (value != .object) return .full_text;

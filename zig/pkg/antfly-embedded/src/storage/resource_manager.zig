@@ -16,6 +16,7 @@
 const std = @import("std");
 const read_admission = @import("../common/read_admission.zig");
 const builtin = @import("builtin");
+const allocator_residency = @import("antfly_platform").allocator.reclamation;
 const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
 const cache_budget = @import("antfly_cache_budget");
@@ -1025,6 +1026,8 @@ const DerivedRecoverableRetryCounters = struct {
             error.ResourceBudgetExceeded,
             error.SchedulerFull,
             error.ResourceTemporarilyUnavailable,
+            error.CapacityUnavailable,
+            error.CapacityObservationStale,
             error.PostingWalTooLarge,
             error.PersistentDescriptorAdmissionExhausted,
             error.TextMergeBackpressureTimeout,
@@ -5844,6 +5847,7 @@ pub const BudgetedAllocator = struct {
         return_address: usize,
     };
 
+    residency: allocator_residency.Registry = .{},
     allocator_mutex: std.atomic.Mutex = .unlocked,
     backing: std.mem.Allocator,
     reservation: Reservation,
@@ -6025,6 +6029,7 @@ pub const BudgetedAllocator = struct {
     }
 
     pub fn deinit(self: *BudgetedAllocator) void {
+        std.debug.assert(!self.residency.active());
         std.debug.assert(self.borrowed_bytes == 0);
         self.reservation.release();
         self.* = undefined;
@@ -6046,6 +6051,28 @@ pub const BudgetedAllocator = struct {
         return null;
     }
 
+    /// Direct refundable host layer, without unwrapping arenas or quotas.
+    /// Callers retain this allocator for all storage and pre-acquire its lock
+    /// nonblockingly before reclaiming optional buffers from another owner.
+    pub fn reclamationLayer(candidate: std.mem.Allocator) ?struct { owner: *BudgetedAllocator, backing: std.mem.Allocator, mutex: *std.atomic.Mutex } {
+        if (candidate.vtable.alloc != lockedAlloc) return null;
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(candidate.ptr));
+        if (!self.reclaim_on_denial) return null;
+        return .{ .owner = self, .backing = self.backing, .mutex = &self.allocator_mutex };
+    }
+    pub fn availableAllocationBytesThreadSafe(self: *BudgetedAllocator) usize {
+        const held = allocator_residency.Guard.held(&self.allocator_mutex);
+        if (!held) lockAtomic(&self.allocator_mutex);
+        defer if (!held) self.allocator_mutex.unlock();
+        const spare = self.reservation.bytes -| (self.live_bytes - self.borrowed_bytes);
+        return std.math.cast(usize, spare +| self.reservation.manager.availableAdmissionBytes(self.reservation.slice)) orelse std.math.maxInt(usize);
+    }
+    pub fn prepareAllocation(self: *BudgetedAllocator, growth: usize) void {
+        if (growth == 0 or !allocator_residency.Guard.allowed() or !self.residency.active()) return;
+        while (growth > self.availableAllocationBytesThreadSafe()) {
+            if (!self.residency.reclaimOne()) return;
+        }
+    }
     pub fn allocator(self: *BudgetedAllocator) std.mem.Allocator {
         return .{
             .ptr = self,
@@ -6089,14 +6116,21 @@ pub const BudgetedAllocator = struct {
     }
     fn lockedAllocOutcome(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize, allow_reclaim: bool) LockedAllocationResult {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
-        lockAtomic(&self.allocator_mutex);
-        const generation = self.denial_generation;
-        const ptr = allocImpl(ctx, len, alignment, ret_addr, false);
-        const result = LockedAllocationResult{ .ptr = ptr, .cause = if (ptr == null) self.last_allocation_failure.?.cause else null };
-        const reclaim = allow_reclaim and ptr == null and self.reclaim_on_denial and self.denial_generation != generation;
-        const deficit = if (reclaim) self.reclaim_deficit else 0;
-        self.allocator_mutex.unlock();
-        if (!reclaim or deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) == 0) return result;
+        if (allow_reclaim) self.prepareAllocation(len);
+        const attempt = block: {
+            allocator_residency.Guard.enter(&self.allocator_mutex);
+            defer allocator_residency.Guard.leave();
+            lockAtomic(&self.allocator_mutex);
+            defer self.allocator_mutex.unlock();
+            const generation = self.denial_generation;
+            const ptr = allocImpl(ctx, len, alignment, ret_addr, false);
+            const result = LockedAllocationResult{ .ptr = ptr, .cause = if (ptr == null) self.last_allocation_failure.?.cause else null };
+            const reclaim = allow_reclaim and ptr == null and self.reclaim_on_denial and self.denial_generation != generation;
+            break :block .{ .result = result, .deficit = if (reclaim) self.reclaim_deficit else 0 };
+        };
+        if (attempt.deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, attempt.deficit) == 0) return attempt.result;
+        allocator_residency.Guard.enter(&self.allocator_mutex);
+        defer allocator_residency.Guard.leave();
         lockAtomic(&self.allocator_mutex);
         defer self.allocator_mutex.unlock();
         const retried = allocImpl(ctx, len, alignment, ret_addr, false);
@@ -6110,13 +6144,20 @@ pub const BudgetedAllocator = struct {
     }
     fn lockedResizeWithPolicy(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize, allow_reclaim: bool) bool {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
-        lockAtomic(&self.allocator_mutex);
-        const generation = self.denial_generation;
-        const result = resizeImpl(ctx, memory, alignment, new_len, ret_addr, false);
-        const reclaim = allow_reclaim and !result and self.reclaim_on_denial and self.denial_generation != generation;
-        const deficit = if (reclaim) self.reclaim_deficit else 0;
-        self.allocator_mutex.unlock();
-        if (!reclaim or deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) == 0) return result;
+        if (allow_reclaim) self.prepareAllocation(new_len -| memory.len);
+        const attempt = block: {
+            allocator_residency.Guard.enter(&self.allocator_mutex);
+            defer allocator_residency.Guard.leave();
+            lockAtomic(&self.allocator_mutex);
+            defer self.allocator_mutex.unlock();
+            const generation = self.denial_generation;
+            const result = resizeImpl(ctx, memory, alignment, new_len, ret_addr, false);
+            const reclaim = allow_reclaim and !result and self.reclaim_on_denial and self.denial_generation != generation;
+            break :block .{ .result = result, .deficit = if (reclaim) self.reclaim_deficit else 0 };
+        };
+        if (attempt.deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, attempt.deficit) == 0) return attempt.result;
+        allocator_residency.Guard.enter(&self.allocator_mutex);
+        defer allocator_residency.Guard.leave();
         lockAtomic(&self.allocator_mutex);
         defer self.allocator_mutex.unlock();
         return resizeImpl(ctx, memory, alignment, new_len, ret_addr, false);
@@ -6129,21 +6170,31 @@ pub const BudgetedAllocator = struct {
     }
     fn lockedRemapWithPolicy(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize, allow_reclaim: bool) ?[*]u8 {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
-        lockAtomic(&self.allocator_mutex);
-        const generation = self.denial_generation;
-        const result = remapImpl(ctx, memory, alignment, new_len, ret_addr, false);
-        const reclaim = allow_reclaim and result == null and self.reclaim_on_denial and self.denial_generation != generation;
-        const deficit = if (reclaim) self.reclaim_deficit else 0;
-        self.allocator_mutex.unlock();
-        if (!reclaim or deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) == 0) return result;
+        if (allow_reclaim) self.prepareAllocation(new_len -| memory.len);
+        const attempt = block: {
+            allocator_residency.Guard.enter(&self.allocator_mutex);
+            defer allocator_residency.Guard.leave();
+            lockAtomic(&self.allocator_mutex);
+            defer self.allocator_mutex.unlock();
+            const generation = self.denial_generation;
+            const result = remapImpl(ctx, memory, alignment, new_len, ret_addr, false);
+            const reclaim = allow_reclaim and result == null and self.reclaim_on_denial and self.denial_generation != generation;
+            break :block .{ .result = result, .deficit = if (reclaim) self.reclaim_deficit else 0 };
+        };
+        if (attempt.deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, attempt.deficit) == 0) return attempt.result;
+        allocator_residency.Guard.enter(&self.allocator_mutex);
+        defer allocator_residency.Guard.leave();
         lockAtomic(&self.allocator_mutex);
         defer self.allocator_mutex.unlock();
         return remapImpl(ctx, memory, alignment, new_len, ret_addr, false);
     }
     fn lockedFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
-        lockAtomic(&self.allocator_mutex);
-        defer self.allocator_mutex.unlock();
+        const reuse = allocator_residency.Guard.reuse(&self.allocator_mutex);
+        allocator_residency.Guard.enter(&self.allocator_mutex);
+        defer allocator_residency.Guard.leave();
+        if (!reuse) lockAtomic(&self.allocator_mutex);
+        defer if (!reuse) self.allocator_mutex.unlock();
         free(ctx, memory, alignment, ret_addr);
     }
 
@@ -10531,4 +10582,31 @@ test "controlled physical sync resumable payload concurrent consumers cannot dup
     try std.testing.expectEqual(@as(usize, 1), try future.await(io));
     try std.testing.expectEqual(@as(usize, 1), state.calls);
     try std.testing.expectEqual(@as(usize, 1), state.destroyed);
+}
+
+test "SQL host allocator optional residency includes owned spare credit and preserves opaque regions" {
+    const a = std.testing.allocator;
+    var options: Options = .{ .memory_budget = .{ .hard_limit_bytes = 128 << 10 } };
+    options.budgets[sliceIndex(.sql_execution_working_set)] = .{ .hard_limit_bytes = 64 << 10 };
+    var manager = ResourceManager.init(options);
+    defer manager.deinit(a);
+    var host = BudgetedAllocator.initReclaiming(&manager, .sql_execution_working_set, a, 1);
+    defer host.deinit();
+    host.credit_quantum = 64 << 10;
+    const first = try host.threadSafeAllocator().alloc(u8, 4096);
+    defer host.threadSafeAllocator().free(first);
+    try std.testing.expectEqual(@as(u64, 0), manager.availableAdmissionBytes(.sql_execution_working_set));
+    try std.testing.expectEqual(@as(usize, (64 << 10) - 4096), host.availableAllocationBytesThreadSafe());
+    const second = try host.threadSafeAllocator().alloc(u8, (64 << 10) - 4096);
+    defer host.threadSafeAllocator().free(second);
+    try std.testing.expectEqual(@as(usize, 0), host.availableAllocationBytesThreadSafe());
+    try std.testing.expect(!host.denied());
+    try std.testing.expect(BudgetedAllocator.reclamationLayer(host.threadSafeAllocator()) != null);
+    try std.testing.expect(BudgetedAllocator.reclamationLayer(host.allocator()) == null);
+    var arena = std.heap.ArenaAllocator.init(host.threadSafeAllocator());
+    defer arena.deinit();
+    try std.testing.expect(BudgetedAllocator.reclamationLayer(arena.allocator()) == null);
+    var ordinary = BudgetedAllocator.init(&manager, .sql_execution_working_set, a, 1);
+    defer ordinary.deinit();
+    try std.testing.expect(BudgetedAllocator.reclamationLayer(ordinary.threadSafeAllocator()) == null);
 }

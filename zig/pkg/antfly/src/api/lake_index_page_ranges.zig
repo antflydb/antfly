@@ -13,59 +13,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bounded query-owned navigation range waves. Cache units remain individual
-//! authenticated pages; physical requests coalesce nearby misses in one pack.
+//! Navigation adapter for the shared authenticated range planner.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const tree = @import("../serverless/graph_segment/page_tree.zig");
 const pages = @import("../serverless/graph_segment/page_store.zig");
 const stores = @import("../serverless/artifacts/store.zig");
 const artifacts = @import("lake_index_aggregate_artifact.zig");
+const ranges = @import("lake_artifact_ranges.zig");
 const A = std.mem.Allocator;
-const Token = @import("antfly_cancellation").CancellationToken;
 const Context = local.serverless_query_lake_read_context.Context;
 const Execution = local.common_request_admission.runnable_scheduler.Execution;
-const scheduling = local.sql_parallel_scheduler;
-
-/// Temporary wave payloads outlive task joins, so their reservation is separate
-/// from worker metadata. A reserved child consumes no CPU and retires only after
-/// its buffers and physical-cache leases are gone.
-pub const Workspace = struct {
-    execution: Execution = .{},
-    pub fn reserve(self: *Workspace, context: Context, bytes: usize) !bool {
-        const parent = context.execution orelse return false;
-        const io = context.io orelse return false;
-        try context.ensureActive();
-        // Verified bounded reads promise no fan-out, even on configurations
-        // where the bounded lane shares ordinary CPU capacity.
-        if (parent.entry) |entry| if (entry.read_lane == .bounded) return false;
-        const retained = std.math.add(u64, bytes, @sizeOf(Workspace)) catch return error.InvalidRunnableDemand;
-        self.execution.reserveChild(parent, io, retained) catch |err| {
-            if (err == error.SchedulerFull or err == error.ExecutionWaitUnsupported) return false;
-            return err;
-        };
-        return true;
-    }
-    pub fn deinit(self: *Workspace) void {
-        self.execution.finish();
-    }
-};
-
-fn copy(a: A, bytes: []const u8, context: Context) ![]u8 {
-    try context.ensureActive();
-    const output = try a.alloc(u8, bytes.len);
-    errdefer a.free(output);
-    var offset: usize = 0;
-    while (offset != bytes.len) {
-        const end = offset + @min(16 * 1024, bytes.len - offset);
-        @memcpy(output[offset..end], bytes[offset..end]);
-        offset = end;
-        try context.ensureActive();
-    }
-    return output;
-}
-fn discardVoid(_: A, _: void) void {}
-pub const Budget = struct { ptr: *anyopaque, charge: *const fn (*anyopaque, u64) anyerror!void };
+pub const Workspace = ranges.Workspace;
+const Token = @import("antfly_cancellation").CancellationToken;
+pub const Budget = ranges.Budget;
 pub const Batch = struct {
     a: A,
     refs: []const tree.Ref,
@@ -81,248 +42,20 @@ pub const Batch = struct {
         return null;
     }
 };
-const Decoded = local.serverless_query_lake_decoded_cache;
-const Job = struct {
-    const Physical = struct { start: u64, bytes: []const u8 };
-    store: stores.ArtifactStore,
-    a: A,
-    id: []const u8,
-    domain: [32]u8,
-    refs: []const tree.Ref,
-    begin: u64,
-    length: usize,
-    token: Token,
-    cached: ?artifacts.CachedRead,
-    lease: ?Decoded.Lease = null,
-    result: ?[]const u8 = null,
-    fn deinit(self: *Job) void {
-        if (self.lease) |lease| lease.release() else if (self.result) |bytes| self.a.free(bytes);
-    }
-    const Read = struct {
-        job: *Job,
-        context: Context,
-        fn canceled(raw: *const anyopaque) bool {
-            const self: *const @This() = @ptrCast(@alignCast(raw));
-            self.job.token.check() catch return true;
-            // Provider polling runs while parked; it must never reacquire CPU.
-            self.context.checkLifetime() catch return true;
-            return false;
-        }
-        fn read(self: *@This(), alloc: A) ![]u8 {
-            const job = self.job;
-            const token: Token = .{ .ptr = self, .is_cancelled_fn = canceled };
-            const bytes = try job.store.getRangeAllocFor(alloc, job.id, job.begin, job.length, token, self.context);
-            errdefer alloc.free(bytes);
-            if (bytes.len != job.length) return error.ArtifactIntegrityMismatch;
-            if (job.cached) |cache| cache.cache.recordPhysicalRead(bytes.len);
-            // Authenticate on this worker's CPU, after physical IO has resumed.
-            for (job.refs) |ref| {
-                try self.context.ensureActive();
-                const id = try pages.PageStore.identity(job.domain, ref);
-                if (!std.mem.eql(u8, job.id, &id) or ref.offset() < job.begin or @as(u64, ref.offset()) + ref.bytes > job.begin + job.length) continue;
-                const offset: usize = @intCast(ref.offset() - job.begin);
-                try stores.validatePayloadSha256For(bytes[offset..][0..ref.bytes], &std.fmt.bytesToHex(&ref.digest, .lower), token, self.context);
-            }
-            return bytes;
-        }
-        fn fill(raw: *anyopaque, item: *Decoded.Item) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            const a = item.arena.allocator();
-            const value = a.create(Physical) catch |err| {
-                if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
-                return err;
-            };
-            const bytes = self.read(a) catch |err| {
-                if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
-                return err;
-            };
-            value.* = .{ .start = self.job.begin, .bytes = bytes };
-            item.payload = .{ .extension = value };
-        }
-    };
-    fn run(self: *Job) anyerror!void {
-        var context: Context = if (self.cached) |cache| cache.context else .{};
-        // Legacy workers have no borrowed CPU. Their caller validates its own
-        // checkpoint before dispatch and after joining; lifetime still travels.
-        if (context.execution == null and context.wait == null) context.checkpoint = null;
-        return self.runFor(context);
-    }
-    fn runChild(self: *Job, execution: *Execution) anyerror!void {
-        return self.runFor(self.cached.?.context.withExecution(execution));
-    }
-    fn runFor(self: *Job, context: Context) anyerror!void {
-        try self.token.check();
-        try context.ensureActive();
-        var reader: Read = .{ .job = self, .context = context };
-        if (self.cached) |cache| {
-            var hash = std.crypto.hash.sha2.Sha256.init(.{});
-            hash.update("native-lake-navigation-range-wave-v1");
-            hash.update(&cache.scope);
-            hash.update(self.id);
-            const domain = hash.finalResult();
-            var interval: [16]u8 = undefined;
-            std.mem.writeInt(u64, interval[0..8], self.begin, .big);
-            std.mem.writeInt(u64, interval[8..16], self.begin + self.length, .big);
-            hash.update(&interval);
-            var current = context;
-            current.cancellation = .fromCallback(&reader, Read.canceled);
-            const lease = cache.cache.physical.acquireCovered(hash.finalResult(), self.length * 2 + 64 * 1024, current, .{ .ptr = &reader, .load = Read.fill }, .{ .domain = domain, .start = self.begin, .end = self.begin + self.length }) catch |err| fallback: {
-                try self.token.check();
-                try context.ensureActive();
-                if (err != error.SqlMemoryLimitExceeded) return err;
-                break :fallback null;
-            };
-            if (lease) |held| {
-                errdefer held.release();
-                const value: *const Physical = @ptrCast(@alignCast(held.item.payload.extension));
-                if (value.start > self.begin or self.begin - value.start > value.bytes.len or self.length > value.bytes.len - (self.begin - value.start)) return error.ArtifactIntegrityMismatch;
-                self.result = value.bytes[@intCast(self.begin - value.start)..][0..self.length];
-                self.lease = held;
-                return;
-            }
-        }
-        self.result = try reader.read(self.a);
-    }
-};
-
 pub fn load(a: A, store: stores.ArtifactStore, domain: [32]u8, refs: []const tree.Ref, token: Token, cached: ?artifacts.CachedRead, budget: Budget) !Batch {
     if (refs.len > tree.max_read_batch) return error.InvalidGraphPage;
-    try token.check();
-    const context: Context = if (cached) |cache| cache.context else .{};
-    try context.ensureActive();
-    var result: Batch = .{ .a = a, .refs = refs };
-    errdefer result.deinit();
     var ids: [tree.max_read_batch][175]u8 = undefined;
-    var key_storage: [tree.max_read_batch][256]u8 = undefined;
-    var keys: [tree.max_read_batch][]const u8 = undefined;
-    var missing: [tree.max_read_batch]usize = undefined;
-    var count: usize = 0;
-    var logical: u64 = 0;
+    var units: [tree.max_read_batch]ranges.Unit = undefined;
     for (refs, 0..) |ref, i| {
         try ref.validate();
         ids[i] = try pages.PageStore.identity(domain, ref);
-        keys[i] = if (ref.offset() == 0 and ref.bytes == ref.artifactBytes()) &ids[i] else try std.fmt.bufPrint(&key_storage[i], "{s}:page:{x}:{x}", .{ ids[i], ref.offset(), ref.bytes });
-        logical += ref.bytes;
-        if (cached) |cache| if (try cache.cache.lookupImmutableBlockLease(a, cache.scope, keys[i], ref.bytes, ref.digest, cache.context)) |found| {
-            var lease = found;
-            defer lease.deinit();
-            result.values[i] = try copy(a, lease.bytes(), context);
-            continue;
-        };
-        missing[count] = i;
-        count += 1;
+        units[i] = .{ .object = .{ .artifact_id = &ids[i], .checksum = ids[i][7..71], .byte_len = ref.artifactBytes() }, .offset = ref.offset(), .bytes = ref.bytes, .digest = ref.digest };
     }
-    const Order = struct {
-        refs: []const tree.Ref,
-        ids: []const [175]u8,
-        fn less(self: @This(), l: usize, r: usize) bool {
-            const order = std.mem.order(u8, &self.ids[l], &self.ids[r]);
-            return order == .lt or (order == .eq and self.refs[l].offset() < self.refs[r].offset());
-        }
-    };
-    std.mem.sort(usize, missing[0..count], Order{ .refs = refs, .ids = ids[0..refs.len] }, Order.less);
-    var temporary: local.sql_memory_budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = std.math.maxInt(usize) };
-    var allocations: scheduling.LockedAllocator = .{ .backing = temporary.allocator() };
-    var jobs: [tree.max_read_batch]Job = undefined;
-    var group_for: [tree.max_read_batch]usize = undefined;
-    var groups: usize = 0;
-    var gap_bytes: u64 = 0;
-    for (missing[0..count]) |i| {
-        const ref = refs[i];
-        const end = @as(u64, ref.offset()) + ref.bytes;
-        if (groups != 0) {
-            const previous = &jobs[groups - 1];
-            if (std.mem.eql(u8, previous.id, &ids[i]) and ref.offset() <= previous.begin + previous.length + 16 * 1024 and
-                @max(end, previous.begin + previous.length) - previous.begin <= tree.max_page_bytes)
-            {
-                const length: usize = @intCast(@max(end, previous.begin + previous.length) - previous.begin);
-                gap_bytes += ref.offset() -| (previous.begin + previous.length);
-                previous.length = length;
-                group_for[i] = groups - 1;
-                continue;
-            }
-        }
-        jobs[groups] = .{ .store = store, .a = allocations.allocator(), .id = &ids[i], .begin = ref.offset(), .length = ref.bytes, .token = token, .domain = domain, .refs = refs, .cached = cached };
-        group_for[i] = groups;
-        groups += 1;
-    }
-    // Worker metadata retires at join; payloads remain live through result
-    // copying. Fund that distinct lifetime before allocating or dispatching IO.
-    var workspace: Workspace = .{};
-    defer workspace.deinit();
-    if (context.execution != null and groups != 0) {
-        var bytes: usize = 0;
-        for (jobs[0..groups]) |job| bytes += job.length * 2 + 64 * 1024;
-        if (!try workspace.reserve(context, bytes)) {
-            // Capacity refusal keeps the required, caller-funded page path.
-            // No speculative worker or temporary wave allocation was published.
-            try budget.charge(budget.ptr, logical);
-            for (missing[0..count]) |i| {
-                result.values[i] = try artifacts.readPageRangeFor(a, store, .{ .artifact_id = &ids[i], .checksum = ids[i][7..71], .byte_len = refs[i].artifactBytes() }, refs[i].offset(), refs[i].bytes, refs[i].digest, token, cached, context);
-            }
-            return result;
-        }
-        temporary.limit = bytes;
-    }
-    // Cache hits retain the ordinary logical read charge. Coalesced gaps are
-    // additional physical traffic and cannot bypass the request's allowance.
-    try budget.charge(budget.ptr, logical + gap_bytes);
-    defer for (jobs[0..groups]) |*job| job.deinit();
-    var tasks: [tree.max_read_batch]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
-    const io = if (cached) |cache| cache.context.io else null;
-    defer if (io) |active| for (&tasks) |*task| if (task.*) |*held| {
-        held.cancel(active) catch {};
-    };
-    var failure: ?anyerror = null;
-    for (jobs[0..groups], 0..) |*job, i| {
-        if (failure != null) break;
-        try context.ensureActive();
-        if (io) |active| if (groups > 1) {
-            if (context.execution) |execution| {
-                const scope: scheduling.ExecutionScope = .{ .execution = execution, .allocator = allocations.allocator(), .io = active, .wait = context.wait orelse local.sql_spill.childWait(execution) };
-                tasks[i] = scope.submit(0, allocations.allocator(), Job.runChild, .{job}, discardVoid) catch |err| fallback: {
-                    if (err != error.ConcurrencyUnavailable) return err;
-                    break :fallback null;
-                };
-            } else if (context.wait == null) tasks[i] = scheduling.global().submitIo(active, job.length * 2 + 64 * 1024, Job.run, .{job});
-        };
-        if (tasks[i] == null) job.run() catch |err| {
-            failure = err;
-        };
-    }
-    if (io) |active| for (&tasks) |*task| if (task.*) |*held| {
-        held.await(active) catch |err| {
-            if (failure == null) failure = err;
-        };
-        task.* = null;
-    };
-    if (failure) |err| return err;
-    try context.ensureActive();
-    const Loader = struct {
-        data: []const u8,
-        context: Context,
-        fn read(raw: *anyopaque, alloc: A) ![]u8 {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            return copy(alloc, self.data, self.context);
-        }
-        fn traffic(_: *anyopaque) local.serverless_query_lake_serving_cache.Cache.ProviderRead {
-            return .{ .requests = 0, .bytes = 0 };
-        }
-    };
-    for (missing[0..count]) |i| {
-        try token.check();
-        try context.ensureActive();
-        const job = jobs[group_for[i]];
-        const offset: usize = @intCast(refs[i].offset() - job.begin);
-        const bytes = job.result.?[offset..][0..refs[i].bytes];
-        try stores.validatePayloadSha256For(bytes, &std.fmt.bytesToHex(&refs[i].digest, .lower), token, context);
-        var loader: Loader = .{ .data = bytes, .context = context };
-        result.values[i] = if (cached) |cache| try cache.cache.readImmutableAlloc(a, cache.scope, keys[i], bytes.len, refs[i].digest, cache.context, .{ .ptr = &loader, .load = Loader.read, .provider_read = Loader.traffic }) else try copy(a, bytes, context);
-    }
-    return result;
+    const batch = try ranges.load(a, store, units[0..refs.len], token, cached, budget, .{ .max_range = tree.max_page_bytes, .max_gap = 16 * 1024 });
+    return .{ .a = a, .refs = refs, .values = batch.values[0..tree.max_read_batch].* };
 }
 
-test "external lake navigation range waves coalesce authenticate cache and bound budgets" {
+test "external lake metadata navigation range waves coalesce authenticate cache and bound budgets" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("lake-range-waves");
     defer directory.cleanup();
@@ -356,11 +89,18 @@ test "external lake navigation range waves coalesce authenticate cache and bound
             if (self.corrupt and bytes.len > 128) bytes[128] ^= 1;
             return bytes;
         }
+        fn getFor(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Token, context: Context) ![]u8 {
+            return local.sql_execution_wait.runOwned(context.wait, get, .{ raw, alloc, id, offset, length, token }, discardRange, .{alloc});
+        }
+        fn discardRange(range_payload: []u8, alloc: A) void {
+            alloc.free(range_payload);
+        }
     };
     var probe: Probe = .{ .vtable = backend.vtable };
     Probe.active = &probe;
     var vtable = backend.vtable.*;
     vtable.get_range_alloc_with_cancellation = Probe.get;
+    vtable.get_range_alloc_for = Probe.getFor;
     backend.vtable = &vtable;
     var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer cache.deinit();
@@ -514,6 +254,12 @@ test "external lake navigation scoped waves retain payload credit through joins 
             }
             return bytes;
         }
+        fn getFor(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Token, context: Context) ![]u8 {
+            return local.sql_execution_wait.runOwned(context.wait, get, .{ raw, alloc, id, offset, length, token }, discardRange, .{alloc});
+        }
+        fn discardRange(range_payload: []u8, alloc: A) void {
+            alloc.free(range_payload);
+        }
     };
     const Charge = struct {
         fn charge(raw: *anyopaque, bytes: u64) !void {
@@ -543,6 +289,7 @@ test "external lake navigation scoped waves retain payload credit through joins 
     }
     const refs = [_]tree.Ref{ references[0], references[1], references[2], references[0] };
     for (std.enums.values(Case)) |case| {
+        errdefer std.debug.print("navigation original-scope case={s}\n", .{@tagName(case)});
         var owner = try Runnable.Scheduler.init(.{ .slots = 2, .control_slots = 1, .max_operations = if (case == .wave_refused) 2 else if (case == .child_refused) 3 else 16, .max_bytes = 4 * 1024 * 1024, .control_bytes = 64 * 1024 });
         defer owner.close();
         var threads = std.Io.Threaded.init(a, .{ .concurrent_limit = .limited(0) });
@@ -556,6 +303,7 @@ test "external lake navigation scoped waves retain payload credit through joins 
         defer cache.deinit();
         var vtable = store.vtable.*;
         vtable.get_range_alloc_with_cancellation = Probe.get;
+        vtable.get_range_alloc_for = Probe.getFor;
         var observed = store;
         observed.ptr = &probe;
         observed.vtable = &vtable;
@@ -571,8 +319,11 @@ test "external lake navigation scoped waves retain payload credit through joins 
                 var batch = try result;
                 defer batch.deinit();
                 for (batch.values[0..4], [_]u8{ 71, 71, 72, 71 }) |bytes, value| for (bytes.?) |byte| try std.testing.expectEqual(value, byte);
-                try std.testing.expectEqual(@as(usize, if (case == .wave_refused or case == .bounded) 3 else 2), probe.reads.load(.acquire));
-                try std.testing.expectEqual(@as(u64, 4096 - 512 - @as(u64, if (case == .wave_refused or case == .bounded) 0 else 16)), remaining);
+                // Main's authenticated coalescing also applies to serial,
+                // caller-funded fallback. It dispatches no child and charges
+                // the same actual gap bytes as the parallel path.
+                try std.testing.expectEqual(@as(usize, 2), probe.reads.load(.acquire));
+                try std.testing.expectEqual(@as(u64, 4096 - 512 - 16), remaining);
                 if (case == .success) {
                     try std.testing.expect(probe.children.load(.acquire) > 0);
                     try std.testing.expect(probe.retained_joins > 0);

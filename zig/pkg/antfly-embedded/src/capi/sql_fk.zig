@@ -89,6 +89,11 @@ pub fn publishInitial(adapter: anytype, alloc: std.mem.Allocator, target: []cons
 }
 
 fn publishMode(adapter: anytype, alloc: std.mem.Allocator, target: []const u8, version: u32, drop: bool, create: bool) !bool {
+    const root = adapter.handle orelse return error.UnsupportedSqlExecution;
+    try @import("sql_ddl.zig").requireCatalogRecovered(root);
+    const was_recovering = root.sql_ddl_recovering;
+    root.sql_ddl_recovering = true;
+    defer root.sql_ddl_recovering = was_recovering;
     const db = adapter.db;
     const handle = adapter.handle.?;
     const metadata = try adapter.localCatalog(alloc, version);
@@ -250,6 +255,9 @@ fn finish(handle: *h.Handle, alloc: std.mem.Allocator, initial: Job) !void {
 }
 
 pub fn recover(handle: *h.Handle) !void {
+    const was_recovering = handle.sql_ddl_recovering;
+    handle.sql_ddl_recovering = true;
+    defer handle.sql_ddl_recovering = was_recovering;
     const bytes = (try handle.db.core.getStoreValue(handle.alloc, key)) orelse return;
     defer handle.alloc.free(bytes);
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.SqlStatementReadUnavailable;

@@ -30,21 +30,28 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
-    .{ .status = .corrupt_input, .err = error.CorruptInput },
-    .{ .status = .invalid_table_file, .err = error.InvalidTableFile },
-    .{ .status = .table_block_checksum_mismatch, .err = error.TableBlockChecksumMismatch },
+    .{ .status = .ambiguous_gcs_connection, .err = error.AmbiguousGcsConnection },
     .{ .status = .backpressured, .err = error.Backpressured },
     .{ .status = .commit_completion_pending, .err = error.CommitCompletionPending },
-    .{ .status = .invalid_transaction_participant, .err = error.InvalidParticipant },
-    .{ .status = .transaction_closed, .err = error.TransactionClosed },
-    .{ .status = .scheduler_closed, .err = error.SchedulerClosed },
-    .{ .status = .scheduler_full, .err = error.SchedulerFull },
-    .{ .status = .runnable_wait_timeout, .err = error.RunnableWaitTimeout },
+    .{ .status = .corrupt_input, .err = error.CorruptInput },
     .{ .status = .execution_wait_unsupported, .err = error.ExecutionWaitUnsupported },
+    .{ .status = .gcs_connection_not_found_or_out_of_scope, .err = error.GcsConnectionNotFoundOrOutOfScope },
+    .{ .status = .hierarchy_cursor_stale, .err = error.HierarchyCursorStale },
+    .{ .status = .invalid_connection_credentials, .err = error.InvalidConnectionCredentials },
+    .{ .status = .invalid_gcs_url, .err = error.InvalidGcsUrl },
     .{ .status = .invalid_runnable_demand, .err = error.InvalidRunnableDemand },
     .{ .status = .invalid_runnable_policy, .err = error.InvalidRunnablePolicy },
     .{ .status = .invalid_runnable_transition, .err = error.InvalidRunnableTransition },
+    .{ .status = .invalid_table_file, .err = error.InvalidTableFile },
+    .{ .status = .invalid_transaction_participant, .err = error.InvalidParticipant },
     .{ .status = .manager_cleanup_capacity_unavailable, .err = error.ManagerCleanupCapacityUnavailable },
+    .{ .status = .read_request_failed, .err = error.ReadRequestFailed },
+    .{ .status = .read_transient_failure, .err = error.ReadTransientFailure },
+    .{ .status = .runnable_wait_timeout, .err = error.RunnableWaitTimeout },
+    .{ .status = .scheduler_closed, .err = error.SchedulerClosed },
+    .{ .status = .scheduler_full, .err = error.SchedulerFull },
+    .{ .status = .table_block_checksum_mismatch, .err = error.TableBlockChecksumMismatch },
+    .{ .status = .transaction_closed, .err = error.TransactionClosed },
     .{ .status = .invalid_document_checkpoint, .err = error.InvalidDocumentCheckpoint },
     .{ .status = .too_many_active_jobs, .err = error.TooManyActiveJobs },
     .{ .status = .grouped_source_owner_changed, .err = error.GroupedSourceOwnerChanged },
@@ -1098,6 +1105,15 @@ test "index readiness survives the local query and storage owner boundary" {
     }
 }
 
+test "hierarchy cursor conflicts survive local query and storage owner boundaries" {
+    for ([_]abi.FailureBoundary{ .local_query, .storage_owner }) |boundary| {
+        const failure = failureFromError(error.HierarchyCursorStale, boundary, abi.abi_version, 4);
+        try std.testing.expectEqual(abi.Status.hierarchy_cursor_stale, failure.status);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(error.HierarchyCursorStale, statusToError(failure.status));
+    }
+}
+
 test "committed visibility outcomes survive the storage owner boundary" {
     for ([_]anyerror{
         error.EnrichmentRetryInProgress,
@@ -1171,5 +1187,14 @@ test "logical value exact sort rejection survives both compiled query boundaries
         try std.testing.expect(failure.status != .internal);
         try std.testing.expectError(error.UnsupportedExactSort, statusToError(failure.status));
         try std.testing.expectEqualStrings("UnsupportedExactSort", failure.errorName());
+    }
+}
+
+test "reader failures and scoped GCS failures retain exact storage boundary identity" {
+    inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
+        const failure = failureFromError(expected, .storage_owner, abi.abi_version, 4);
+        try std.testing.expect(failure.status != .internal);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(expected, statusToError(failure.status));
     }
 }

@@ -88,6 +88,8 @@ def test_models_exposes_reader_inputs(api):
 
 
 @pytest.mark.model_integration
+@pytest.mark.inference_model("eviction")
+@pytest.mark.parametrize("base_url", ["eviction"], indirect=True)
 def test_composite_model_eviction_churn_stays_healthy(api):
     """Audio-sidecar teardown and reader eviction must not corrupt the server."""
 
@@ -109,7 +111,7 @@ def test_composite_model_eviction_churn_stays_healthy(api):
     }
     image = make_text_png_uri(["INVOICE", "TOTAL 123"], scale=6, padding=12)
 
-    # e2e-full runs with max_loaded_models=1, making each alternation evict the
+    # This dedicated server has max_loaded_models=1, making each alternation evict the
     # previous composite model. Repeating the transition catches stale sidecar
     # handles and allocator damage at the operation that introduced it.
     for _ in range(3):

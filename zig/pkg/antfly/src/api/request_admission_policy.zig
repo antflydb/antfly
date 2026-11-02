@@ -59,6 +59,8 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "namespaceReviewResolverMention", .class = .write },
     .{ .operation_id = "listEntityResolverState", .class = .none },
     .{ .operation_id = "namespaceListEntityResolverState", .class = .none },
+    .{ .operation_id = "listEntityResolverProgress", .class = .none },
+    .{ .operation_id = "namespaceListEntityResolverProgress", .class = .none },
     .{ .operation_id = "proposeCuration", .class = .write },
     .{ .operation_id = "namespaceProposeCuration", .class = .write },
     .{ .operation_id = "listCurationProposals", .class = .none },

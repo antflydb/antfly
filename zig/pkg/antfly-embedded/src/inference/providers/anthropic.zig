@@ -291,6 +291,7 @@ pub fn requestJsonAlloc(alloc: Allocator, cfg: lib.GeneratorConfig, model: []con
         if (schema != .object) return error.InvalidInferenceRequest;
         var format_ = try single(a, "type", str("json_schema"));
         try put(a, &format_, "schema", schema);
+        _ = std.json.parseFromValueLeaky(lib.anthropic_api.JSONOutputFormatParam, a, format_, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceRequest;
         try put(a, &root, "output_config", try single(a, "format", format_));
     }
     if (cfg.tools_json) |raw| {
@@ -305,6 +306,7 @@ pub fn requestJsonAlloc(alloc: Allocator, cfg: lib.GeneratorConfig, model: []con
             if (schema != .object) return error.InvalidInferenceRequest;
             try put(a, &native_tool, "input_schema", schema);
             if (function.object.get("strict")) |value| try put(a, &native_tool, "strict", value);
+            _ = std.json.parseFromValueLeaky(lib.anthropic_api.ToolParam, a, native_tool, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceRequest;
             try native.array.append(native_tool);
         }
         try put(a, &root, "tools", native);
@@ -318,6 +320,9 @@ pub fn requestJsonAlloc(alloc: Allocator, cfg: lib.GeneratorConfig, model: []con
         };
         try put(a, &root, "tool_choice", native);
     }
+    // Validate against the official SDK-derived envelope without round-tripping
+    // signed native content or dropping compatible extension fields.
+    _ = std.json.parseFromValueLeaky(lib.anthropic_api.CreateMessageRequest, a, root, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceRequest;
     return std.json.Stringify.valueAlloc(alloc, root, .{});
 }
 
@@ -403,6 +408,8 @@ fn usage(value: Json) !lib.GenerationUsage {
 pub fn responseAlloc(a: Allocator, body: []const u8) !inference.GenerateResult {
     var parsed = try std.json.parseFromSlice(Json, a, body, .{});
     defer parsed.deinit();
+    var envelope = std.json.parseFromValue(lib.anthropic_api.Message, a, parsed.value, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceResponse;
+    defer envelope.deinit();
     if (!std.mem.eql(u8, try string(try get(parsed.value, "role")), "assistant")) return error.InvalidInferenceResponse;
     const blocks = try get(parsed.value, "content");
     if (blocks != .array) return error.InvalidInferenceResponse;

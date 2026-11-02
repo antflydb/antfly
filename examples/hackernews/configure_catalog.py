@@ -39,6 +39,10 @@ def main():
         parser.error("use an object-store table root")
     if args.mode == "rest" and not (args.rest_connection and args.rest_uri):
         parser.error("REST requires --rest-connection and --rest-uri")
+    print(json.dumps(table_definition(args), indent=2))
+
+
+def table_definition(args):
     catalog = {"type": args.mode}
     if args.mode == "rest":
         catalog.update(
@@ -57,48 +61,49 @@ def main():
     }
     for column in ("hn_id", "created_at", "points"):
         properties[column]["x-antfly-field"] = {"type": "numeric", "sortable": True}
-    print(
-        json.dumps(
-            {
-                "schema": {
-                    "storage_mode": "relational",
-                    "relational_indexes": [
-                        {"name": column + "_idx", "keys": [{"column": column}]}
-                        for column in (
-                            "hn_id",
-                            "created_at",
-                            "item_type",
-                            "author",
-                            "points",
-                        )
-                    ],
-                    "default_type": "row",
-                    "enforce_types": True,
-                    "document_schemas": {
-                        "row": {
-                            "schema": {
-                                "type": "object",
-                                "properties": properties,
-                                "additionalProperties": False,
-                            }
-                        }
-                    },
-                    "base_source": {
-                        "kind": "external",
-                        "format": "iceberg",
-                        "table_id": args.table_id,
-                        "uri": args.warehouse,
-                        "credentials": {"ref": args.source_connection},
-                        "schema_fingerprint": "auto",
-                        "write_policy": "iceberg_writer",
-                        "catalog": catalog,
-                    },
-                },
-                "indexes": {"body_text": {"type": "full_text"}},
+    for column in ("item_type", "author"):
+        properties[column]["x-antfly-field"] = {"type": "keyword", "sortable": True}
+    return {
+        "schema": {
+            "storage_mode": "relational",
+            "relational_indexes": [
+                {"name": column + "_idx", "keys": [{"column": column}]}
+                for column in (
+                    "hn_id",
+                    "created_at",
+                    "item_type",
+                    "author",
+                    "points",
+                )
+            ],
+            "default_type": "row",
+            "enforce_types": True,
+            "document_schemas": {
+                "row": {
+                    "schema": {
+                        "type": "object",
+                        "properties": properties,
+                        "additionalProperties": False,
+                    }
+                }
             },
-            indent=2,
-        )
-    )
+            "base_source": {
+                "kind": "external",
+                "format": "iceberg",
+                "table_id": args.table_id,
+                "uri": args.warehouse,
+                "credentials": {"ref": args.source_connection},
+                "schema_fingerprint": "auto",
+                "write_policy": "iceberg_writer",
+                "catalog": catalog,
+            },
+        },
+        "indexes": {
+            # Keep sortable metadata in the text corpus's typed doc values.
+            # Queries still select the body field for matching/highlighting.
+            "body_text": {"type": "full_text", "store_source": True}
+        },
+    }
 
 
 if __name__ == "__main__":

@@ -22,6 +22,10 @@ class InferenceBatchExecutionReport:
         serial_items (int):
         rejected_items (int): Items rejected before model execution by validation, resolution, or admission.
         fallback_items (int):
+        max_native_step_items (int | Unset): Largest successfully executed native decoder step observed by these
+            items, including peers from other requests. Zero or absent means
+            unobserved, one means singleton execution. This is measured at
+            execution, never inferred from native_items or request cardinality.
         fallback_reason (None | str | Unset):
     """
 
@@ -31,6 +35,7 @@ class InferenceBatchExecutionReport:
     serial_items: int
     rejected_items: int
     fallback_items: int
+    max_native_step_items: int | Unset = UNSET
     fallback_reason: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -46,6 +51,8 @@ class InferenceBatchExecutionReport:
         rejected_items = self.rejected_items
 
         fallback_items = self.fallback_items
+
+        max_native_step_items = self.max_native_step_items
 
         fallback_reason: None | str | Unset
         if isinstance(self.fallback_reason, Unset):
@@ -65,6 +72,8 @@ class InferenceBatchExecutionReport:
                 "fallback_items": fallback_items,
             }
         )
+        if max_native_step_items is not UNSET:
+            field_dict["max_native_step_items"] = max_native_step_items
         if fallback_reason is not UNSET:
             field_dict["fallback_reason"] = fallback_reason
 
@@ -85,6 +94,8 @@ class InferenceBatchExecutionReport:
 
         fallback_items = d.pop("fallback_items")
 
+        max_native_step_items = d.pop("max_native_step_items", UNSET)
+
         def _parse_fallback_reason(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -101,6 +112,7 @@ class InferenceBatchExecutionReport:
             serial_items=serial_items,
             rejected_items=rejected_items,
             fallback_items=fallback_items,
+            max_native_step_items=max_native_step_items,
             fallback_reason=fallback_reason,
         )
 

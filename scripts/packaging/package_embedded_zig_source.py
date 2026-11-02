@@ -47,7 +47,6 @@ BUILD_INPUTS = {
     "zig/build.zig.zon",
     "zig/embedded.build.zig",
     "zig/build_test_filters.zig",
-    "zig/pdf_standard_fonts.zig",
     "zig/lib/tokenizer/testdata/embedder/tokenizer.json",
     "zig/tools/build_support.zig",
     "zig/tools/check_files_equal.zig",

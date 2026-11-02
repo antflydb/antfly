@@ -75,6 +75,7 @@ complete -c antfly-grep -l ignore-vcs
 complete -c antfly-grep -l include-dependencies
 complete -c antfly-grep -l include-sensitive
 complete -c antfly-grep -l include-zero
+complete -c antfly-grep -l indexed-media-transport -r -f -a 'inline source'
 complete -c antfly-grep -l invert-match
 complete -c antfly-grep -l json
 complete -c antfly-grep -l json-compact

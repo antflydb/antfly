@@ -15,8 +15,12 @@
 
 const std = @import("std");
 
+pub fn releaseVersion(b: *std.Build) []const u8 {
+    return b.option([]const u8, "grep-version", "Standalone grep release version") orelse "0.1.0-dev";
+}
+
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
-    return addConfigured(b, target, optimize, b.option([]const u8, "antfly-version", "Release version") orelse "0.1.0-dev", b.option(bool, "strip", "Strip grep debug information for release archives") orelse false);
+    return addConfigured(b, target, optimize, releaseVersion(b), b.option(bool, "strip", "Strip grep debug information for release archives") orelse false);
 }
 
 pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, release_version: []const u8, strip: bool) void {
@@ -81,7 +85,38 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     parser_hash.update(@embedFile("src/source.zig"));
     var parser_digest: [32]u8 = undefined;
     parser_hash.final(&parser_digest);
+    // Verified image facts must retire when any validator/codec source changes.
+    var image_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    image_hash.update(@import("builtin").zig_version_string);
+    b.dependOnDirectoryContents(b.path("lib/image/src"));
+    image_hash.update(@embedFile("../../lib/source_evidence/root.zig"));
+    image_hash.update(@embedFile("../../lib/decisions/evidence.zig"));
+    image_hash.update(@embedFile("src/image_descriptor.zig"));
+    var image_dir = b.root.openDir(cache_io, "lib/image/src", .{ .iterate = true }) catch @panic("open image sources");
+    defer image_dir.close(cache_io);
+    var image_walk = image_dir.walk(b.allocator) catch @panic("walk image sources");
+    defer image_walk.deinit();
+    var image_paths: std.ArrayList([]const u8) = .empty;
+    while (image_walk.next(cache_io) catch @panic("image source paths")) |entry| if (entry.kind == .file) {
+        b.dependOnFileContents(b.path(b.fmt("lib/image/src/{s}", .{entry.path})));
+        image_paths.append(b.allocator, b.allocator.dupe(u8, entry.path) catch @panic("image path allocation")) catch @panic("image path allocation");
+    } else if (entry.kind == .directory) b.dependOnDirectoryContents(b.path(b.fmt("lib/image/src/{s}", .{entry.path})));
+    std.mem.sort([]const u8, image_paths.items, {}, struct {
+        fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.order(u8, lhs, rhs) == .lt;
+        }
+    }.less);
+    for (image_paths.items) |path| {
+        const bytes = image_dir.readFileAlloc(cache_io, path, b.allocator, .limited(16 * 1024 * 1024)) catch @panic("read image source");
+        image_hash.update(path);
+        image_hash.update(&.{0});
+        image_hash.update(bytes);
+        b.allocator.free(bytes);
+    }
+    var image_digest: [32]u8 = undefined;
+    image_hash.final(&image_digest);
     const cache_options = b.addOptions();
+    cache_options.addOption([32]u8, "image_validator_digest", image_digest);
     cache_options.addOption([32]u8, "parser_digest", parser_digest);
     cache_options.addOption(bool, "workspace_profile", b.option(bool, "grep-workspace-profile", "Emit bounded per-request workspace phase timings to stderr (diagnostic build)") orelse false);
     lib.addImport("grep_cache_options", cache_options.createModule());

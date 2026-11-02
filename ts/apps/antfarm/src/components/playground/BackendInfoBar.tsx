@@ -81,9 +81,7 @@ export function BackendInfoBar() {
           aria-hidden="true"
         />
         <Wifi className="h-3.5 w-3.5 text-muted-foreground" />
-        <span className="font-mono text-[11px] font-medium uppercase tracking-[0.08em] af-status-text-success">
-          Connected
-        </span>
+        <span className="text-xs font-medium af-status-text-success">Connected</span>
       </div>
 
       <label className="flex items-center gap-2 text-xs">

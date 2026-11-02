@@ -84,8 +84,9 @@ pub const Config = struct {
     log: ?logging_openapi.Config = null,
     tls: ?TlsConfig = null,
     cors: ?CorsConfig = null,
+    resources: platform.resource_policy.Resources = .{},
+    /// Derived internal admission view of canonical resources; never parsed as a root policy.
     admission: AdmissionConfig = .{},
-    graph_execution: graph_work_budget.Limits = .{},
     mcp: McpConfig = .{},
     pgwire: ?PgwireConfig = null,
     backup: BackupConfig = .{},
@@ -194,16 +195,12 @@ pub const Config = struct {
         operation_timeout_ms: u64 = default_backup_operation_timeout_ms,
     };
 
-    fn graphExecutionLimitsFromOpenApi(value: ?common_openapi.GraphExecutionConfig) !graph_work_budget.Limits {
-        const config = value orelse return .{};
-        var limits: graph_work_budget.Limits = .{};
-        inline for (comptime std.meta.fieldNames(graph_work_budget.Limits)) |reflected_name| {
-            if (@field(config, reflected_name)) |configured| {
-                @field(limits, reflected_name) = std.math.cast(usize, configured) orelse return error.InvalidConfig;
-            }
-        }
-        try limits.validate();
-        return limits;
+    fn parseGenerationBatching(alloc: std.mem.Allocator, raw: ?std.json.Value) !platform.inference_settings.GenerationBatching {
+        const object = raw orelse return .{};
+        const value = object.object.get("generation_batching") orelse return .{};
+        const parsed = try std.json.parseFromValue(platform.inference_settings.GenerationBatching, alloc, value, .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        return parsed.value;
     }
 
     pub const MetadataConfig = struct {
@@ -459,6 +456,7 @@ pub const Config = struct {
             cuda_precision: ?CudaPrecision = null,
             kind: []u8,
             name: []u8,
+            pin: bool = true,
             backend: ?[]u8 = null,
             format: ?[]u8 = null,
             quantization: ?[]u8 = null,
@@ -485,23 +483,18 @@ pub const Config = struct {
         kernel_jit: KernelJitConfig = .{},
         prompt_cache: PromptCacheConfig = .{},
         keep_alive: ?[]u8 = null,
-        // `keep_alive_ms` is not part of the shared openapi inference schema
-        // (only the `keep_alive` duration string is); it exists solely so
-        // `antfly inference run`'s config loader (parseRunConfig in
-        // inference_runtime/runtime.zig) can accept the operator's flat
-        // integer-millisecond spelling. Never populated by the generic
-        // `Config.parseFromSlice` openapi path.
-        keep_alive_ms: ?u64 = null,
         // True only when `antfly inference run`'s merged config (nested
-        // `inference.prompt_cache` or the operator's flat top-level
-        // `prompt_cache`) explicitly set a `prompt_cache` object.
+        // `inference.prompt_cache`) explicitly set a `prompt_cache` object.
         // `PromptCacheConfig.enabled` defaults to false once that object is
         // present, but the run server's own built-in default is enabled=true;
         // this flag lets callers keep that default when the key is absent
         // entirely. Never populated by the generic `Config.parseFromSlice`
         // openapi path.
         prompt_cache_configured: bool = false,
+        generation_batching: platform.inference_settings.GenerationBatching = .{},
         max_loaded_models: ?i64 = null,
+        http_max_body_mb: usize = 10,
+        pool_size: usize = 2,
 
         pub fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
@@ -572,7 +565,7 @@ pub const Config = struct {
     pub const S3AddressingStyle = enum { path, virtual_hosted };
     pub const BucketProvisioning = enum { require_existing, create_if_missing };
     pub const AwsCredentialSource = enum { default, static, profile, web_identity };
-    pub const GcsCredentialSource = enum { default, bearer_token, service_account };
+    pub const GcsCredentialSource = scraping.GcsCredentialSource;
 
     pub const AwsCredentialConfig = struct {
         source: AwsCredentialSource = .default,
@@ -600,21 +593,7 @@ pub const Config = struct {
         }
     };
 
-    pub const GcsCredentialConfig = struct {
-        source: GcsCredentialSource = .default,
-        bearer_token: ?[]u8 = null,
-        service_account_json: ?[]u8 = null,
-        credentials_path: ?[]u8 = null,
-        scope: ?[]u8 = null,
-
-        pub fn deinit(self: *GcsCredentialConfig, alloc: std.mem.Allocator) void {
-            if (self.bearer_token) |value| alloc.free(value);
-            if (self.service_account_json) |value| alloc.free(value);
-            if (self.credentials_path) |value| alloc.free(value);
-            if (self.scope) |value| alloc.free(value);
-            self.* = undefined;
-        }
-    };
+    pub const GcsCredentialConfig = scraping.GcsCredentialConfig;
 
     pub const ConnectionConfig = struct {
         display_name: ?[]u8 = null,
@@ -880,88 +859,11 @@ pub const Config = struct {
             .max_timeout_ms = try optionalU32Field(policy.object, "max_timeout_ms") orelse 3_600_000,
         } else .{};
         try public_inference.validate();
-        var canonical_inference_max_concurrent_requests: ?u32 = null;
-        var query_waiting = default_query_waiting;
-        var query_waiting_explicit = false;
-        var runnable_policy: ?@import("runnable_scheduler.zig").Config = default_runnable_policy;
-        var max_request_duration_ms: u64 = 300_000;
-        var max_request_memory_bytes: u64 = 256 << 20;
-        var max_retained_memory_bytes: u64 = 256 << 20;
-        if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "runnable", "max_request_duration_ms", "max_request_memory_bytes", "max_retained_memory_bytes" });
-            const admission_object = switch (admission_value) {
-                .object => |object| object,
-                else => return error.InvalidConfig,
-            };
-            if (admission_object.get("runnable")) |value| {
-                if (value == .null) {
-                    runnable_policy = null;
-                } else {
-                    var policy = std.json.parseFromValue(@import("runnable_scheduler.zig").Config, alloc, value, .{}) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => return error.InvalidConfig,
-                    };
-                    defer policy.deinit();
-                    policy.value.validateManagedCleanupCapacity() catch return error.InvalidConfig;
-                    runnable_policy = policy.value;
-                }
-            }
-            max_request_duration_ms = try optionalU64Field(admission_object, "max_request_duration_ms") orelse 300_000;
-            if (max_request_duration_ms == 0 or max_request_duration_ms > 86_400_000) return error.InvalidConfig;
-            max_request_memory_bytes = try optionalU64Field(admission_object, "max_request_memory_bytes") orelse 256 << 20;
-            max_retained_memory_bytes = try optionalU64Field(admission_object, "max_retained_memory_bytes") orelse 256 << 20;
-            if (max_retained_memory_bytes < 1 << 20 or max_retained_memory_bytes > std.math.maxInt(usize)) return error.InvalidConfig;
-            if (max_request_memory_bytes < 1 << 20 or max_request_memory_bytes > std.math.maxInt(usize)) return error.InvalidConfig;
-            if (admission_object.get("query") != null) {
-                try validateObjectMemberFields(admission_object, "query", &.{ "max_concurrent_requests", "waiting" });
-                const query_object = admission_object.get("query").?.object;
-                if (query_object.get("waiting")) |waiting_value| {
-                    query_waiting_explicit = true;
-                    try validateObjectMemberFields(query_object, "waiting", &.{ "max_queued_requests", "max_queued_bytes", "max_wait_ms" });
-                    const waiting_object = switch (waiting_value) {
-                        .object => |object| object,
-                        else => return error.InvalidConfig,
-                    };
-                    query_waiting = .{
-                        .max_queued_requests = try optionalU32Field(waiting_object, "max_queued_requests") orelse 0,
-                        .max_queued_bytes = try optionalU64Field(waiting_object, "max_queued_bytes") orelse 0,
-                        .max_wait_ms = try optionalU32Field(waiting_object, "max_wait_ms") orelse 0,
-                    };
-                    try query_waiting.validate();
-                }
-            }
-            if (admission_object.get("write") != null) {
-                try validateObjectMemberFields(admission_object, "write", &.{"max_concurrent_requests"});
-            }
-            if (admission_object.get("inference") != null) {
-                try validateObjectMemberFields(admission_object, "inference", &.{"max_concurrent_requests"});
-                canonical_inference_max_concurrent_requests = try optionalU32Field(
-                    admission_object.get("inference").?.object,
-                    "max_concurrent_requests",
-                );
-            }
-        }
-        // Null rolls back new dispatch and implicit waiting. A separately
-        // configured queue remains an explicit operator choice.
-        if (runnable_policy == null and !query_waiting_explicit) query_waiting = .{};
-        var legacy_inference_max_concurrent_requests: ?u32 = null;
-        if (root.get("inference")) |inference_value| {
-            const inference_object = switch (inference_value) {
-                .object => |object| object,
-                else => return error.InvalidConfig,
-            };
-            if (inference_object.get("admission") != null) return error.InvalidConfig;
-            legacy_inference_max_concurrent_requests = try optionalU32Field(
-                inference_object,
-                "max_concurrent_requests",
-            );
-        }
-        if (canonical_inference_max_concurrent_requests != null and
-            legacy_inference_max_concurrent_requests != null and
-            canonical_inference_max_concurrent_requests.? != legacy_inference_max_concurrent_requests.?)
-        {
-            return error.InvalidConfig;
-        }
+        platform.inference_settings.validateCanonicalLocations(root) catch return error.InvalidConfig;
+        const resources = if (root.get("resources")) |value|
+            platform.resource_policy.Resources.parse(alloc, value) catch return error.InvalidConfig
+        else
+            platform.resource_policy.Resources{};
         var mcp_max_tool_result_bytes = default_mcp_max_tool_result_bytes;
         if (root.get("mcp")) |mcp_value| {
             try validateObjectMemberFields(root, "mcp", &.{"max_tool_result_bytes"});
@@ -1117,36 +1019,16 @@ pub const Config = struct {
                 .key = if (tls.key) |value| try alloc.dupe(u8, value) else null,
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
+            .resources = resources,
             .admission = .{
-                .runnable = runnable_policy,
-                .max_request_duration_ms = max_request_duration_ms,
-                .max_request_memory_bytes = max_request_memory_bytes,
-                .max_retained_memory_bytes = max_retained_memory_bytes,
-                .query = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
-                    if (admission.query) |query|
-                        if (query.max_concurrent_requests) |value|
-                            std.math.cast(u32, value) orelse return error.InvalidConfig
-                        else
-                            default_query_max_concurrent_requests
-                    else
-                        default_query_max_concurrent_requests
-                else
-                    default_query_max_concurrent_requests, .waiting = query_waiting },
-                .write = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
-                    if (admission.write) |write|
-                        if (write.max_concurrent_requests) |value|
-                            std.math.cast(u32, value) orelse return error.InvalidConfig
-                        else
-                            default_write_max_concurrent_requests
-                    else
-                        default_write_max_concurrent_requests
-                else
-                    default_write_max_concurrent_requests },
-                .inference = .{ .max_concurrent_requests = canonical_inference_max_concurrent_requests orelse
-                    legacy_inference_max_concurrent_requests orelse
-                    default_inference_max_concurrent_requests },
+                .runnable = resources.execution.runnable,
+                .max_request_duration_ms = resources.execution.max_request_duration_ms,
+                .max_request_memory_bytes = resources.execution.max_request_memory_bytes,
+                .max_retained_memory_bytes = resources.execution.max_retained_memory_bytes,
+                .query = .{ .max_concurrent_requests = resources.query.admission.max_concurrent_requests, .waiting = if (resources.query.admission.waiting) |w| .{ .max_queued_requests = w.max_queued_requests, .max_queued_bytes = w.max_queued_bytes, .max_wait_ms = w.max_wait_ms } else if (resources.execution.runnable == null) .{} else default_query_waiting },
+                .write = .{ .max_concurrent_requests = resources.write.admission.max_concurrent_requests },
+                .inference = .{ .max_concurrent_requests = resources.inference.admission.max_concurrent_requests },
             },
-            .graph_execution = try graphExecutionLimitsFromOpenApi(validated.value.graph_execution),
             .mcp = .{ .max_tool_result_bytes = mcp_max_tool_result_bytes },
             .backup = .{ .operation_timeout_ms = backup_operation_timeout_ms },
             .metadata = try parseMetadataConfig(
@@ -1173,12 +1055,12 @@ pub const Config = struct {
                 .kernel_jit = kernel_jit,
                 .prompt_cache = prompt_cache,
                 .keep_alive = if (inference.keep_alive) |value| try alloc.dupe(u8, value) else null,
+                .generation_batching = try parseGenerationBatching(alloc, raw_root.get("inference")),
                 .max_loaded_models = inference.max_loaded_models,
+                .http_max_body_mb = if (inference.http_max_body_mb) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 10,
+                .pool_size = if (inference.pool_size) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 2,
             } else .{},
-            .remote_content = if (raw_root.get("remote_content")) |remote_content|
-                try parseRemoteContentConfig(alloc, remote_content)
-            else
-                null,
+            .remote_content = try remoteContentForConnections(alloc, raw_root.get("remote_content"), &connections),
             .connections = connections,
             .shard_allocation = .{
                 .default_shards_per_table = try optionalU32Field(root, "default_shards_per_table") orelse if (deployment_mode.supportsLite()) default_standalone_shards_per_table else default_config_shards_per_table,
@@ -1445,7 +1327,10 @@ pub fn loadFromPathWithSecretsWithIo(
 ) !Config {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
     defer alloc.free(raw);
-    return try Config.parseFromSliceWithSecrets(alloc, raw, secret_store);
+    return Config.parseFromSliceWithSecrets(alloc, raw, secret_store) catch |err| {
+        platform.inference_settings.diagnoseInvalidConfig(alloc, raw);
+        return err;
+    };
 }
 
 pub fn loadFromPathWithSecretsForDeployment(
@@ -1466,7 +1351,10 @@ pub fn loadFromPathWithSecretsForDeploymentWithIo(
 ) !Config {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
     defer alloc.free(raw);
-    return try Config.parseFromSliceWithSecretsForDeployment(alloc, raw, secret_store, deployment_mode);
+    return Config.parseFromSliceWithSecretsForDeployment(alloc, raw, secret_store, deployment_mode) catch |err| {
+        platform.inference_settings.diagnoseInvalidConfig(alloc, raw);
+        return err;
+    };
 }
 
 pub fn resolveLocalRoleBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config, role: []const u8) ![]u8 {
@@ -1897,6 +1785,37 @@ fn rawOptionalStringField(
     };
 }
 
+fn remoteContentForConnections(
+    alloc: std.mem.Allocator,
+    raw: ?std.json.Value,
+    connections: *const Config.ConnectionsConfig,
+) !?Config.RemoteContentConfig {
+    var result: ?Config.RemoteContentConfig = if (raw) |value| try parseRemoteContentConfig(alloc, value) else null;
+    errdefer if (result) |*cfg| cfg.deinit(alloc);
+    var it = connections.iterator();
+    while (it.next()) |entry| {
+        const connection = entry.value_ptr;
+        if (connection.kind != .external_io) continue;
+        const external = connection.external_io orelse continue;
+        if (external.protocol != .gcs) continue;
+        var fetch_allowed = false;
+        for (connection.capabilities) |capability| if (std.mem.eql(u8, capability, "content.fetch")) {
+            fetch_allowed = true;
+            break;
+        };
+        if (!fetch_allowed) continue;
+        if (result == null) result = .{};
+        try result.?.gcs_connections.put(alloc, entry.key_ptr.*, .{
+            .buckets = external.buckets,
+            .prefix = external.prefix,
+            .project_id = external.project_id,
+            .endpoint = external.endpoint,
+            .credentials = external.gcs_credentials,
+        });
+    }
+    return result;
+}
+
 fn parseRemoteContentConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.RemoteContentConfig {
     const parsed = try std.json.parseFromValue(scraping_openapi.RemoteContentConfig, alloc, value, .{
         .allocate = .alloc_always,
@@ -1965,6 +1884,29 @@ pub fn remoteContentSecurityJsonAlloc(
     defer snapshot.deinit();
     const security = snapshot.config.security orelse scraping.ContentSecurityConfig{};
     return try std.json.Stringify.valueAlloc(alloc, security, .{});
+}
+
+/// Preserve scoped GCS content connections as well as destination policy
+/// across the storage-owner boundary. Secret references stay unresolved until
+/// the destination has passed connection selection and scope validation.
+pub fn remoteContentSnapshotJsonAlloc(
+    alloc: std.mem.Allocator,
+    remote_content: *const scraping.RemoteContentConfig,
+) ![]u8 {
+    var snapshot = try remote_content.acquire();
+    defer snapshot.deinit();
+    const config = snapshot.config;
+    const entries = try alloc.alloc(scraping.RemoteContentSnapshotData.NamedGcsConnection, config.gcs_connections.count());
+    defer alloc.free(entries);
+    var it = config.gcs_connections.iterator();
+    var index: usize = 0;
+    while (it.next()) |entry| : (index += 1) {
+        entries[index] = .{ .name = entry.key_ptr.*, .connection = entry.value_ptr.* };
+    }
+    return try std.json.Stringify.valueAlloc(alloc, scraping.RemoteContentSnapshotData{
+        .security = config.security orelse .{},
+        .gcs_connections = entries,
+    }, .{});
 }
 
 fn parseRemoteContentS3Credential(alloc: std.mem.Allocator, value: std.json.Value) !Config.S3CredentialConfig {
@@ -2597,7 +2539,7 @@ pub fn parseInferencePreloadModels(
             .object => |entry| entry,
             else => return error.InvalidConfig,
         };
-        if (!objectContainsOnly(model_object, &.{ "kind", "name", "backend", "cuda_precision", "format", "quantization", "residency_mode", "memory_budget_mb" }))
+        if (!objectContainsOnly(model_object, &.{ "kind", "name", "pin", "backend", "cuda_precision", "format", "quantization", "residency_mode", "memory_budget_mb" }))
             return error.InvalidConfig;
         // Include the partially parsed entry in error cleanup as soon as any
         // owned fields can be allocated (e.g. a missing name after kind).
@@ -2605,6 +2547,7 @@ pub fn parseInferencePreloadModels(
         filled = i + 1;
         out[i].kind = try requiredStringFieldDup(alloc, model_object, "kind");
         out[i].name = try requiredStringFieldDup(alloc, model_object, "name");
+        out[i].pin = try optionalBoolField(model_object, "pin") orelse true;
         out[i].backend = try optionalStringFieldDup(alloc, model_object, "backend");
         out[i].cuda_precision = try optionalEnumField(Config.InferenceConfig.WarmModelConfig.CudaPrecision, model_object, "cuda_precision");
         out[i].format = try optionalStringFieldDup(alloc, model_object, "format");
@@ -2830,17 +2773,14 @@ test "common config extracts antfly settings" {
         \\  },
         \\  "storage": {
         \\    "engine": "local",
-        \\    "local": { "base_dir": "antflydb" }
+        \\    "local": {
+        \\      "base_dir": "antflydb"
+        \\    }
         \\  },
         \\  "replication_factor": 1,
         \\  "default_shards_per_table": 1,
         \\  "max_shard_size_bytes": 1024,
         \\  "max_shards_per_table": 4,
-        \\  "admission": {
-        \\    "query": { "max_concurrent_requests": 11 },
-        \\    "write": { "max_concurrent_requests": 5 },
-        \\    "inference": { "max_concurrent_requests": 7 }
-        \\  },
         \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
@@ -2861,16 +2801,41 @@ test "common config extracts antfly settings" {
         \\    "keep_alive": "1m30s",
         \\    "max_loaded_models": 4,
         \\    "preload": [
-        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
+        \\      {
+        \\        "kind": "generator",
+        \\        "name": "antflydb/gemma-e2b",
+        \\        "backend": "metal",
+        \\        "format": "gguf",
+        \\        "quantization": "q4_k"
+        \\      }
         \\    ],
         \\    "content_security": {
-        \\      "allowed_hosts": ["models.example.com"],
+        \\      "allowed_hosts": [
+        \\        "models.example.com"
+        \\      ],
         \\      "block_private_ips": true
         \\    },
         \\    "s3_credentials": {
         \\      "endpoint": "s3.amazonaws.com",
         \\      "access_key_id": "antfly-key",
         \\      "secret_access_key": "antfly-secret"
+        \\    }
+        \\  },
+        \\  "resources": {
+        \\    "query": {
+        \\      "admission": {
+        \\        "max_concurrent_requests": 11
+        \\      }
+        \\    },
+        \\    "write": {
+        \\      "admission": {
+        \\        "max_concurrent_requests": 5
+        \\      }
+        \\    },
+        \\    "inference": {
+        \\      "admission": {
+        \\        "max_concurrent_requests": 7
+        \\      }
         \\    }
         \\  }
         \\}
@@ -2885,9 +2850,9 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
-    try std.testing.expectEqual(@as(u32, 11), cfg.admission.query.max_concurrent_requests);
-    try std.testing.expectEqual(@as(u32, 5), cfg.admission.write.max_concurrent_requests);
-    try std.testing.expectEqual(@as(u32, 7), cfg.admission.inference.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 11), cfg.resources.query.admission.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 5), cfg.resources.write.admission.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 7), cfg.resources.inference.admission.max_concurrent_requests);
     try std.testing.expectEqual(Config.InferenceConfig.KernelJitConfig.Mode.shadow, cfg.inference.kernel_jit.mode);
     try std.testing.expectEqualStrings("/tmp/antfly-jit", cfg.inference.kernel_jit.cache_dir.?);
     try std.testing.expectEqual(@as(usize, 256), cfg.inference.kernel_jit.max_cache_bytes_mb);
@@ -2914,47 +2879,29 @@ test "common config extracts antfly settings" {
 
 test "common config preserves disabled foreground admission" {
     var cfg = try Config.parseFromSlice(std.testing.allocator,
-        \\{"admission":{"query":{"max_concurrent_requests":0},"write":{"max_concurrent_requests":0},"inference":{"max_concurrent_requests":0}}}
+        \\{"resources":{"query":{"admission":{"max_concurrent_requests":0}},"write":{"admission":{"max_concurrent_requests":0}},"inference":{"admission":{"max_concurrent_requests":0}}}}
     );
     defer cfg.deinit();
-    try std.testing.expectEqual(@as(u32, 0), cfg.admission.query.max_concurrent_requests);
-    try std.testing.expectEqual(@as(u32, 0), cfg.admission.write.max_concurrent_requests);
-    try std.testing.expectEqual(@as(u32, 0), cfg.admission.inference.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 0), cfg.resources.query.admission.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 0), cfg.resources.write.admission.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 0), cfg.resources.inference.admission.max_concurrent_requests);
 }
 
 test "common config rejects unknown admission settings" {
     try std.testing.expectError(
         error.InvalidConfig,
         Config.parseFromSlice(std.testing.allocator,
-            \\{"admission":{"query":{"max_concurent_requests":1}}}
+            \\{"resources":{"query":{"admission":{"max_concurent_requests":1}}}}
         ),
     );
     try std.testing.expectError(
         error.InvalidConfig,
         Config.parseFromSlice(std.testing.allocator,
-            \\{"admission":{"writes":{"max_concurrent_requests":1}}}
+            \\{"resources":{"writes":{"admission":{"max_concurrent_requests":1}}}}
         ),
     );
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
         \\{"inference":{"admission":{"max_concurrent_requests":1}}}
-    ));
-}
-
-test "common config migrates the legacy inference admission spelling" {
-    var legacy = try Config.parseFromSlice(std.testing.allocator,
-        \\{"inference":{"api_url":"http://127.0.0.1:8090","max_concurrent_requests":7}}
-    );
-    defer legacy.deinit();
-    try std.testing.expectEqual(@as(u32, 7), legacy.admission.inference.max_concurrent_requests);
-
-    var matching = try Config.parseFromSlice(std.testing.allocator,
-        \\{"admission":{"inference":{"max_concurrent_requests":7}},"inference":{"api_url":"http://127.0.0.1:8090","max_concurrent_requests":7}}
-    );
-    defer matching.deinit();
-    try std.testing.expectEqual(@as(u32, 7), matching.admission.inference.max_concurrent_requests);
-
-    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
-        \\{"admission":{"inference":{"max_concurrent_requests":8}},"inference":{"api_url":"http://127.0.0.1:8090","max_concurrent_requests":7}}
     ));
 }
 
@@ -3735,13 +3682,13 @@ test "common config parses minimal config with admission defaults" {
     try std.testing.expect(cfg.storage.local_base_dir == null);
     try std.testing.expect(cfg.health_enabled);
     try std.testing.expectEqual(@as(?u16, default_health_port), cfg.health_port);
-    try std.testing.expectEqual(default_query_max_concurrent_requests, cfg.admission.query.max_concurrent_requests);
-    try std.testing.expectEqual(default_write_max_concurrent_requests, cfg.admission.write.max_concurrent_requests);
-    try std.testing.expectEqual(default_inference_max_concurrent_requests, cfg.admission.inference.max_concurrent_requests);
-    try std.testing.expectEqual(graph_work_budget.default_max_explored_nodes, cfg.graph_execution.max_explored_nodes);
-    try std.testing.expectEqual(graph_work_budget.default_max_explored_edges, cfg.graph_execution.max_explored_edges);
-    try std.testing.expectEqual(graph_work_budget.default_max_retained_state_bytes, cfg.graph_execution.max_retained_state_bytes);
-    try std.testing.expectEqual(graph_work_budget.default_max_distinct_identities, cfg.graph_execution.max_distinct_identities);
+    try std.testing.expectEqual(default_query_max_concurrent_requests, cfg.resources.query.admission.max_concurrent_requests);
+    try std.testing.expectEqual(default_write_max_concurrent_requests, cfg.resources.write.admission.max_concurrent_requests);
+    try std.testing.expectEqual(default_inference_max_concurrent_requests, cfg.resources.inference.admission.max_concurrent_requests);
+    try std.testing.expectEqual(graph_work_budget.default_max_explored_nodes, cfg.resources.query.request_limits.graph.max_explored_nodes);
+    try std.testing.expectEqual(graph_work_budget.default_max_explored_edges, cfg.resources.query.request_limits.graph.max_explored_edges);
+    try std.testing.expectEqual(graph_work_budget.default_max_retained_state_bytes, cfg.resources.query.request_limits.graph.max_retained_state_bytes);
+    try std.testing.expectEqual(graph_work_budget.default_max_distinct_identities, cfg.resources.query.request_limits.graph.max_distinct_identities);
     try std.testing.expectEqual(default_mcp_max_tool_result_bytes, cfg.mcp.max_tool_result_bytes);
     try std.testing.expectEqual(default_backup_operation_timeout_ms, cfg.backup.operation_timeout_ms);
     try std.testing.expectEqual(@as(u32, default_config_shards_per_table), cfg.shard_allocation.default_shards_per_table);
@@ -3784,18 +3731,18 @@ test "common config validates backup operation timeout" {
 
 test "common config parses operator-owned graph execution ceilings" {
     var cfg = try Config.parseFromSlice(std.testing.allocator,
-        \\{"graph_execution":{"max_explored_nodes":4096,"max_explored_edges":8192,"max_explored_edge_bytes":1048576,"max_scanned_anchors":2048,"max_intermediate_states":1024,"max_retained_state_bytes":2097152,"max_distinct_identities":512,"max_distinct_state_bytes":524288}}
+        \\{"resources":{"query":{"request_limits":{"graph":{"max_explored_nodes":4096,"max_explored_edges":8192,"max_explored_edge_bytes":1048576,"max_scanned_anchors":2048,"max_intermediate_states":1024,"max_retained_state_bytes":2097152,"max_distinct_identities":512,"max_distinct_state_bytes":524288}}}}}
     );
     defer cfg.deinit();
 
-    try std.testing.expectEqual(@as(usize, 4096), cfg.graph_execution.max_explored_nodes);
-    try std.testing.expectEqual(@as(usize, 8192), cfg.graph_execution.max_explored_edges);
-    try std.testing.expectEqual(@as(usize, 1_048_576), cfg.graph_execution.max_explored_edge_bytes);
-    try std.testing.expectEqual(@as(usize, 2048), cfg.graph_execution.max_scanned_anchors);
-    try std.testing.expectEqual(@as(usize, 1024), cfg.graph_execution.max_intermediate_states);
-    try std.testing.expectEqual(@as(usize, 2_097_152), cfg.graph_execution.max_retained_state_bytes);
-    try std.testing.expectEqual(@as(usize, 512), cfg.graph_execution.max_distinct_identities);
-    try std.testing.expectEqual(@as(usize, 524_288), cfg.graph_execution.max_distinct_state_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.resources.query.request_limits.graph.max_explored_nodes);
+    try std.testing.expectEqual(@as(usize, 8192), cfg.resources.query.request_limits.graph.max_explored_edges);
+    try std.testing.expectEqual(@as(usize, 1_048_576), cfg.resources.query.request_limits.graph.max_explored_edge_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), cfg.resources.query.request_limits.graph.max_scanned_anchors);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.resources.query.request_limits.graph.max_intermediate_states);
+    try std.testing.expectEqual(@as(usize, 2_097_152), cfg.resources.query.request_limits.graph.max_retained_state_bytes);
+    try std.testing.expectEqual(@as(usize, 512), cfg.resources.query.request_limits.graph.max_distinct_identities);
+    try std.testing.expectEqual(@as(usize, 524_288), cfg.resources.query.request_limits.graph.max_distinct_state_bytes);
 }
 
 test "common config parses MCP tool result compatibility budget" {
@@ -4069,7 +4016,7 @@ test "common config bootstraps named secret sources before resolving credentials
 
 test "config query waiting validates complete bounds and automatic defaults" {
     var cfg = try Config.parseFromSlice(std.testing.allocator,
-        \\{"admission":{"query":{"max_concurrent_requests":4,"waiting":{"max_queued_requests":8,"max_queued_bytes":1048576,"max_wait_ms":100}}}}
+        \\{"resources":{"query":{"admission":{"max_concurrent_requests":4,"waiting":{"max_queued_requests":8,"max_queued_bytes":1048576,"max_wait_ms":100}}}}}
     );
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u32, 4), cfg.admission.query.max_concurrent_requests);
@@ -4080,15 +4027,15 @@ test "config query waiting validates complete bounds and automatic defaults" {
     defer legacy.deinit();
     try std.testing.expectEqualDeep(default_query_waiting, legacy.admission.query.waiting);
     for ([_][]const u8{
-        \\{"admission":{"query":{"waiting":{"max_wait_ms":1}}}}
+        \\{"resources":{"query":{"admission":{"waiting":{"max_wait_ms":1}}}}}
         ,
-        \\{"admission":{"query":{"waiting":{"max_queued_requests":1,"max_queued_bytes":1,"max_wait_ms":0}}}}
+        \\{"resources":{"query":{"admission":{"waiting":{"max_queued_requests":1,"max_queued_bytes":1,"max_wait_ms":0}}}}}
         ,
-        \\{"admission":{"query":{"waiting":{"max_queued_requests":1,"max_queued_bytes":1,"max_wait_ms":60001}}}}
+        \\{"resources":{"query":{"admission":{"waiting":{"max_queued_requests":1,"max_queued_bytes":1,"max_wait_ms":60001}}}}}
         ,
-        \\{"admission":{"query":{"waiting":{"max_queue_requests":1}}}}
+        \\{"resources":{"query":{"admission":{"waiting":{"max_queue_requests":1}}}}}
         ,
-        \\{"admission":{"write":{"waiting":{"max_wait_ms":1}}}}
+        \\{"resources":{"write":{"admission":{"waiting":{"max_wait_ms":1}}}}}
         ,
     }) |body| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, body));
 }
@@ -4121,17 +4068,17 @@ test "config query waiting retained pgwire policy validates independent budgets"
 }
 
 test "config workload envelope validates finite allocation limits" {
-    var config = try Config.parseFromSlice(std.testing.allocator, "{\"admission\":{\"max_request_memory_bytes\":1048576}}");
+    var config = try Config.parseFromSlice(std.testing.allocator, "{\"resources\":{\"execution\":{\"max_request_memory_bytes\":1048576}}}");
     defer config.deinit();
     try std.testing.expectEqual(@as(u64, 1048576), config.admission.max_request_memory_bytes);
-    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, "{\"admission\":{\"max_request_memory_bytes\":0}}"));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, "{\"resources\":{\"execution\":{\"max_request_memory_bytes\":0}}}"));
 }
 
 test "config workload envelope validates retained allocation limits" {
-    var config = try Config.parseFromSlice(std.testing.allocator, "{\"admission\":{\"max_retained_memory_bytes\":1048576}}");
+    var config = try Config.parseFromSlice(std.testing.allocator, "{\"resources\":{\"execution\":{\"max_retained_memory_bytes\":1048576}}}");
     defer config.deinit();
     try std.testing.expectEqual(@as(u64, 1048576), config.admission.max_retained_memory_bytes);
-    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, "{\"admission\":{\"max_retained_memory_bytes\":0}}"));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, "{\"resources\":{\"execution\":{\"max_retained_memory_bytes\":0}}}"));
 }
 
 fn parseLakeCacheConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.LakeCacheConfig {
@@ -4230,67 +4177,67 @@ test "config runnable scheduler validates canonical policy and explicit rollback
     var legacy = try Config.parseFromSlice(alloc, "{}");
     defer legacy.deinit();
     try std.testing.expectEqualDeep(default_runnable_policy, legacy.admission.runnable.?);
-    var disabled = try Config.parseFromSlice(alloc, "{\"admission\":{\"runnable\":null}}");
+    var disabled = try Config.parseFromSlice(alloc, "{\"resources\":{\"execution\":{\"runnable\":null}}}");
     defer disabled.deinit();
     try std.testing.expect(disabled.admission.runnable == null);
     try std.testing.expectEqual(@as(u32, 0), disabled.admission.query.waiting.max_wait_ms);
     var defaults = try Config.parseFromSlice(alloc,
-        \\{"admission":{"runnable":{}}}
+        \\{"resources":{"execution":{"runnable":{}}}}
     );
     defer defaults.deinit();
     try std.testing.expectEqual(@as(usize, 8), defaults.admission.runnable.?.slots);
     try std.testing.expectEqual(@as(usize, 0), defaults.admission.runnable.?.cleanup_slots);
     var enabled = try Config.parseFromSlice(alloc,
-        \\{"admission":{"runnable":{"slots":3,"control_slots":1,"cleanup_slots":1,"weights":[2,1,1,1],"max_operations":20,"max_bytes":65536,"control_bytes":8192,"max_wait_ms":500,"max_backfills":2,"quantum_ms":1,"checkpoint_budget":8}}}
+        \\{"resources":{"execution":{"runnable":{"slots":3,"control_slots":1,"cleanup_slots":1,"weights":[2,1,1,1],"max_operations":20,"max_bytes":65536,"control_bytes":8192,"max_wait_ms":500,"max_backfills":2,"quantum_ms":1,"checkpoint_budget":8}}}}
     );
     defer enabled.deinit();
     const policy = enabled.admission.runnable.?;
     try std.testing.expectEqual(@as(usize, 3), policy.slots);
     try std.testing.expectEqual(@as(usize, 1), policy.cleanup_slots);
     try std.testing.expectEqual(@as(u32, 8), policy.checkpoint_budget);
-    const body = try std.json.Stringify.valueAlloc(alloc, .{ .admission = .{ .runnable = policy } }, .{});
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .resources = .{ .execution = .{ .runnable = policy } } }, .{});
     defer alloc.free(body);
     var reopened = try Config.parseFromSlice(alloc, body);
     defer reopened.deinit();
     try std.testing.expectEqualDeep(policy, reopened.admission.runnable.?);
     var elastic = try Config.parseFromSlice(alloc,
-        \\{"admission":{"runnable":{"slots":5,"cleanup_slots":1,"read_isolation":true,"bounded_read_slots":2}}}
+        \\{"resources":{"execution":{"runnable":{"slots":5,"cleanup_slots":1,"read_isolation":true,"bounded_read_slots":2}}}}
     );
     defer elastic.deinit();
     try std.testing.expectEqual(@as(usize, 2), elastic.admission.runnable.?.bounded_read_slots);
-    const elastic_body = try std.json.Stringify.valueAlloc(alloc, .{ .admission = .{ .runnable = elastic.admission.runnable.? } }, .{});
+    const elastic_body = try std.json.Stringify.valueAlloc(alloc, .{ .resources = .{ .execution = .{ .runnable = elastic.admission.runnable.? } } }, .{});
     defer alloc.free(elastic_body);
     var elastic_reopened = try Config.parseFromSlice(alloc, elastic_body);
     defer elastic_reopened.deinit();
     try std.testing.expectEqualDeep(elastic.admission.runnable.?, elastic_reopened.admission.runnable.?);
     for ([_][]const u8{
-        \\{"admission":{"runnable":{"slots":2}}}
+        \\{"resources":{"execution":{"runnable":{"slots":2}}}}
         ,
-        \\{"admission":{"runnable":{"slots":3,"control_slots":2}}}
+        \\{"resources":{"execution":{"runnable":{"slots":3,"control_slots":2}}}}
         ,
-        \\{"admission":{"runnable":{"cleanup_slots":2}}}
+        \\{"resources":{"execution":{"runnable":{"cleanup_slots":2}}}}
         ,
-        \\{"admission":{"runnable":{"cleanup_slots":-1}}}
+        \\{"resources":{"execution":{"runnable":{"cleanup_slots":-1}}}}
         ,
-        \\{"admission":{"runnable":{"slots":3,"control_slots":2,"cleanup_slots":1}}}
+        \\{"resources":{"execution":{"runnable":{"slots":3,"control_slots":2,"cleanup_slots":1}}}}
         ,
-        \\{"admission":{"runnable":{"max_operations":2}}}
+        \\{"resources":{"execution":{"runnable":{"max_operations":2}}}}
         ,
-        \\{"admission":{"runnable":{"max_operations":3}}}
+        \\{"resources":{"execution":{"runnable":{"max_operations":3}}}}
         ,
-        \\{"admission":{"runnable":{"slots":1}}}
+        \\{"resources":{"execution":{"runnable":{"slots":1}}}}
         ,
-        \\{"admission":{"runnable":{"control_slots":8}}}
+        \\{"resources":{"execution":{"runnable":{"control_slots":8}}}}
         ,
-        \\{"admission":{"runnable":{"max_operations":1}}}
+        \\{"resources":{"execution":{"runnable":{"max_operations":1}}}}
         ,
-        \\{"admission":{"runnable":{"max_bytes":65536,"control_bytes":65536}}}
+        \\{"resources":{"execution":{"runnable":{"max_bytes":65536,"control_bytes":65536}}}}
         ,
-        \\{"admission":{"runnable":{"weights":[1,0,1,1]}}}
+        \\{"resources":{"execution":{"runnable":{"weights":[1,0,1,1]}}}}
         ,
-        \\{"admission":{"runnable":{"quantum_ms":0}}}
+        \\{"resources":{"execution":{"runnable":{"quantum_ms":0}}}}
         ,
-        \\{"admission":{"runnable":{"unknown":1}}}
+        \\{"resources":{"execution":{"runnable":{"unknown":1}}}}
         ,
     }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, invalid));
 }
@@ -4310,7 +4257,7 @@ test "common config HTTP lifetime has finite defaults and validates explicit dur
     var defaults = try Config.parseFromSlice(a, "{}");
     defer defaults.deinit();
     try std.testing.expectEqual(@as(u64, 300_000), defaults.admission.max_request_duration_ms);
-    var configured = try Config.parseFromSlice(a, "{\"admission\":{\"max_request_duration_ms\":1234}}");
+    var configured = try Config.parseFromSlice(a, "{\"resources\":{\"execution\":{\"max_request_duration_ms\":1234}}}");
     defer configured.deinit();
     try std.testing.expectEqual(@as(u64, 1234), configured.admission.max_request_duration_ms);
     for ([_][]const u8{ "0", "-1", "86400001", "\"invalid\"" }) |value| {
@@ -4404,4 +4351,37 @@ test "external lake connection capabilities preserve explicit workflow names" {
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fault.run, .{raw});
+}
+
+test "common config resources share byte and inference request policy" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"resources":{"memory":{"max_bytes":536870912},"inference":{"memory":{"max_device_bytes":21474836480},"admission":{"max_concurrent_requests":1,"max_work_units":8},"request_limits":{"max_output_tokens_per_item":64}}}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 536870912), cfg.resources.memory.max_bytes);
+    try std.testing.expectEqual(@as(usize, 21474836480), cfg.resources.inference.memory.max_device_bytes);
+    try std.testing.expectEqual(@as(?usize, 64), cfg.resources.inference.request_limits.max_output_tokens_per_item);
+    inline for (.{ "{\"admission\":{}}", "{\"graph_execution\":{}}", "{\"inference\":{\"max_concurrent_requests\":1}}" }) |raw| {
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
+    }
+}
+
+test "GCS content views require explicit connection capability and borrow scoped configuration" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"connections":{
+        \\ "fetch":{"kind":"external_io","capabilities":["content.fetch"],"external_io":{"protocol":"gcs","buckets":["originals"],"prefix":"objects/sha256","credentials":{"source":"default"}}},
+        \\ "storage":{"kind":"external_io","capabilities":["objects.read"],"external_io":{"protocol":"gcs","buckets":["private-backups"],"credentials":{"source":"default"}}}
+        \\}}
+    ;
+    var config = try Config.parseFromSlice(a, raw);
+    defer config.deinit();
+    const remote = config.remote_content.?;
+    try std.testing.expectEqual(@as(usize, 1), remote.gcs_connections.count());
+    const view = remote.gcs_connections.get("fetch").?;
+    try std.testing.expectEqualStrings("originals", view.buckets[0]);
+    try std.testing.expectEqualStrings("objects/sha256", view.prefix.?);
+    try std.testing.expectEqual(Config.GcsCredentialSource.default, view.credentials.source);
+    try std.testing.expect(remote.gcs_connections.get("storage") == null);
+    try std.testing.expect(view.prefix.?.ptr == config.connections.get("fetch").?.external_io.?.prefix.?.ptr);
 }

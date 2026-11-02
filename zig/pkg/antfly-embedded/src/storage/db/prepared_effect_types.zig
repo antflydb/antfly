@@ -43,7 +43,7 @@ pub const PrecomputedGeneratedBatch = struct {
     generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
     coverage_outcomes: []PrecomputedCoverageOutcome = &.{},
 
-    pub fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
+    pub noinline fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
         for (self.artifact_writes) |write| {
             alloc.free(@constCast(write.key));
             alloc.free(@constCast(write.value));

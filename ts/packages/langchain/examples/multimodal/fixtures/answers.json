@@ -1,0 +1,157 @@
+{
+  "license": "Apache-2.0; synthetic fixture created for this repository",
+  "summary_revision": "orchard-proxy-v1",
+  "summaries": {
+    "figure-1": "Quarterly shipment bar chart comparing Q1, Q2 and Q3 crate totals. An audit marker appears in the upper right.",
+    "figure-2": "Escalation system diagram showing sensor, controller and pager connected by directional arrows, with a temperature threshold."
+  },
+  "questions": [
+    {
+      "id": "text-owner",
+      "category": "text",
+      "question": "Who owns operations?",
+      "answer_terms": ["Mira Chen"],
+      "parents": ["page-1"]
+    },
+    {
+      "id": "text-window",
+      "category": "text",
+      "question": "What is the escalation window?",
+      "answer_terms": ["24"],
+      "parents": ["page-1"]
+    },
+    {
+      "id": "text-target",
+      "category": "text",
+      "question": "What is the Q3 shipment target?",
+      "answer_terms": ["120"],
+      "parents": ["page-1"]
+    },
+    {
+      "id": "text-products",
+      "category": "text",
+      "question": "Which two fruits does Orchard ship?",
+      "answer_terms": ["apples", "pears"],
+      "parents": ["page-1"]
+    },
+    {
+      "id": "table-pears",
+      "category": "table",
+      "question": "How many pears shipped in Q3?",
+      "answer_terms": ["40"],
+      "parents": ["page-1"]
+    },
+    {
+      "id": "table-apples",
+      "category": "table",
+      "question": "How many apples shipped in Q2?",
+      "answer_terms": ["60"],
+      "parents": ["page-1"]
+    },
+    {
+      "id": "table-q1",
+      "category": "table",
+      "question": "How many pears shipped in Q1?",
+      "answer_terms": ["20"],
+      "parents": ["page-1"]
+    },
+    {
+      "id": "table-change",
+      "category": "table",
+      "question": "By how many crates did apple shipments increase from Q1 to Q3?",
+      "answer_terms": ["40"],
+      "parents": ["page-1"]
+    },
+    {
+      "id": "visual-total",
+      "category": "visual",
+      "question": "How many total crates shipped in Q3 according to the chart?",
+      "answer_terms": ["120"],
+      "parents": ["figure-1"]
+    },
+    {
+      "id": "visual-only",
+      "category": "visual",
+      "question": "What color and shape is the audit marker in the quarterly shipment chart?",
+      "answer_terms": ["orange"],
+      "answer_any": ["circle", "circular"],
+      "parents": ["figure-1"],
+      "requires_image": true
+    },
+    {
+      "id": "visual-threshold",
+      "category": "visual",
+      "question": "What temperature threshold is shown in the escalation system diagram?",
+      "answer_terms": ["85"],
+      "parents": ["figure-2"],
+      "requires_image": true
+    },
+    {
+      "id": "visual-route",
+      "category": "visual",
+      "question": "Which component follows Controller in the escalation diagram?",
+      "answer_terms": ["Pager"],
+      "parents": ["figure-2"],
+      "requires_image": true
+    },
+    {
+      "id": "cross-target",
+      "category": "cross_modal",
+      "question": "Compare the Q3 total in the shipment chart with the target stated in the report. Was the target met?",
+      "answer_terms": ["120", "target"],
+      "parents": ["figure-1", "page-1"]
+    },
+    {
+      "id": "cross-window",
+      "category": "cross_modal",
+      "question": "Give both the escalation window in the prose and the temperature threshold in the diagram.",
+      "answer_terms": ["24", "85"],
+      "parents": ["page-1", "figure-2"],
+      "requires_image": true
+    },
+    {
+      "id": "cross-owner",
+      "category": "cross_modal",
+      "question": "Who owns operations, and which component comes after Controller in the diagram?",
+      "answer_terms": ["Mira Chen", "Pager"],
+      "parents": ["page-1", "figure-2"],
+      "requires_image": true
+    },
+    {
+      "id": "cross-fruit",
+      "category": "cross_modal",
+      "question": "How many pears shipped in Q3 in the table, and how many total crates does the Q3 chart show?",
+      "answer_terms": ["40", "120"],
+      "parents": ["page-1", "figure-1"]
+    },
+    {
+      "id": "negative-phone",
+      "category": "negative",
+      "question": "What is the CEO's phone number?",
+      "answer_terms": ["insufficient evidence"],
+      "parents": []
+    },
+    {
+      "id": "negative-revenue",
+      "category": "negative",
+      "question": "What was Q3 revenue in dollars?",
+      "answer_terms": ["insufficient evidence"],
+      "parents": []
+    },
+    {
+      "id": "negative-q4",
+      "category": "negative",
+      "question": "What is the confirmed actual shipment total for Q4?",
+      "answer_terms": ["insufficient evidence"],
+      "parents": []
+    },
+    {
+      "id": "negative-home",
+      "category": "negative",
+      "question": "What is Mira Chen's home address?",
+      "answer_terms": ["insufficient evidence"],
+      "parents": []
+    }
+  ],
+  "evaluation_revision": "orchard-eval-v1-20-frozen-2026-10-26"
+}

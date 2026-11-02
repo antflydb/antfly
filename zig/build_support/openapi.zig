@@ -168,6 +168,12 @@ pub fn addOpenApiSourceSteps(
     // Always inspect the destination, even when generation is cached. Missing
     // and extra files must be detected without mutating the source tree.
     check.has_side_effects = true;
+    const bedrock_contract = b.addSystemCommand(&.{"python3"});
+    bedrock_contract.addFileArg2(b.path("../scripts/generate_bedrock_openapi.py"), .{ .make_absolute = true });
+    bedrock_contract.addArg("--check");
+    bedrock_contract.has_side_effects = true;
+    check.step.dependOn(&bedrock_contract.step);
+    regen.step.dependOn(&bedrock_contract.step);
 
     const antfly_generated_root = "pkg/antfly-embedded/src/openapi/generated";
     const inference_generated_root = "pkg/inference/src/api/generated";
@@ -251,11 +257,13 @@ pub fn addOpenApiSourceSteps(
             .{ "../shared/s3.yaml", "antfly_s3_openapi" },
         }),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/shared/middleware.yaml"), "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi", "types", &.{}),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/shared/resources.yaml"), "antfly_resources_openapi", antfly_generated_root ++ "/antfly_resources_openapi", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/shared/scraping.yaml"), "antfly_scraping_openapi", antfly_generated_root ++ "/antfly_scraping_openapi", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/shared/s3.yaml"), "antfly_s3_openapi", antfly_generated_root ++ "/antfly_s3_openapi", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/inference/config.yaml"), "antfly_inference_config_openapi", antfly_generated_root ++ "/antfly_inference_config_openapi", "types", &.{
             .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
             .{ "../shared/scraping.yaml", "antfly_scraping_openapi" },
+            .{ "../shared/resources.yaml", "antfly_resources_openapi" },
             .{ "../shared/s3.yaml", "antfly_s3_openapi" },
             .{ "../shared/logging.yaml", "antfly_logging_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
@@ -276,6 +284,7 @@ pub fn addOpenApiSourceSteps(
             .{ "reranking.yaml", "antfly_reranking_openapi" },
             .{ "chunking.yaml", "antfly_chunking_openapi" },
             .{ "../shared/scraping.yaml", "antfly_scraping_openapi" },
+            .{ "../shared/resources.yaml", "antfly_resources_openapi" },
             .{ "../shared/s3.yaml", "antfly_s3_openapi" },
             .{ "../inference/config.yaml", "antfly_inference_config_openapi" },
         }),
@@ -292,12 +301,16 @@ pub fn addOpenApiSourceSteps(
             .{ "websearch.yaml", "antfly_websearch_openapi" },
         }),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_generated_root ++ "/inference_api", "types,server,client", &.{
+            .{ "./config.yaml", "antfly_inference_config_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
             .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
             .{ "../ai/decision.yaml", "antfly_decision_openapi" },
         }),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/cloudflare-openapi.json"), "cloudflare_api", antfly_generated_root ++ "/cloudflare_api", "types", &.{}),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/fastino-openapi.json"), "fastino_api", antfly_generated_root ++ "/fastino_api", "types", &.{}),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/anthropic-openapi.json"), "anthropic_api", antfly_generated_root ++ "/anthropic_api", "types", &.{}),
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/bedrock-openapi.json"), "bedrock_api", antfly_generated_root ++ "/bedrock_api", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
         .{
             .directory = openapi_build.addGeneratedDirectory(b, .{
@@ -441,6 +454,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     const middleware_openapi_mod = committedModule(b, options, "antfly_middleware_openapi", false);
     const scraping_openapi_mod = committedModule(b, options, "antfly_scraping_openapi", false);
     const s3_openapi_mod = committedModule(b, options, "antfly_s3_openapi", false);
+    const resources_openapi_mod = committedModule(b, options, "antfly_resources_openapi", false);
     const inference_config_openapi_mod = committedModule(b, options, "antfly_inference_config_openapi", false);
     const chunking_api_openapi_mod = committedModule(b, options, "antfly_chunking_api_openapi", false);
     const chunking_openapi_mod = committedModule(b, options, "antfly_chunking_openapi", false);
@@ -516,6 +530,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     audio_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_resources_openapi", resources_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -530,6 +545,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     common_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
     common_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
     common_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
+    common_openapi_mod.addImport("antfly_resources_openapi", resources_openapi_mod);
     common_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     common_openapi_mod.addImport("antfly_inference_config_openapi", inference_config_openapi_mod);
 

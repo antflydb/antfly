@@ -13,19 +13,47 @@ on:
     types: [published]
   workflow_dispatch:
 
-permissions: {}
+permissions:
+  contents: read
+
+concurrency:
+  group: colony-docs-and-pin
+  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   trigger:
+    if: github.event_name != 'release' || !startsWith(github.event.release.tag_name, 'antfly-grep/')
     runs-on: ubuntu-latest
+    outputs:
+      sync_request: ${{ steps.request.outputs.sync_request }}
     steps:
+      - name: Record the validation request
+        id: request
+        run: echo "sync_request=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
       - name: Trigger colony rebuild
         uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
         with:
           token: ${{ secrets.COLONY_DISPATCH_TOKEN }}
           repository: antflydb/colony
           event-type: antfly-docs-updated
-          client-payload: '{"ref":"${{ github.ref_name }}","sha":"${{ github.sha }}","event":"${{ github.event_name }}"}'
+          client-payload: '{"ref":"${{ github.ref_name }}","sha":"${{ github.sha }}","event":"${{ github.event_name }}","sync_request":"${{ steps.request.outputs.sync_request }}"}'
+
+
+  publish-colony-pin:
+    needs: trigger
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      # Public publisher code only; private Colony code is never checked out here.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Publish the validated gitlink using the existing Colony writer
+        env:
+          COLONY_DISPATCH_TOKEN: ${{ secrets.COLONY_DISPATCH_TOKEN }}
+          SYNC_REQUEST: ${{ needs.trigger.outputs.sync_request }}
+        run: python3 .github/scripts/publish_colony_pin.py

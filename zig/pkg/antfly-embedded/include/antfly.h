@@ -41,8 +41,10 @@ typedef enum antfly_error_code {
     /* The operation requires a capability unavailable on this platform or
      * filesystem. Retrying unchanged will not succeed. */
     ANTFLY_UNSUPPORTED = 8,
-    /* Derived work stalled or a worker failed. Inspect pending-work diagnostics
-     * and repair or reopen the database; primary-only writes may still succeed. */
+    /* Derived work stalled or a worker failed. A batch may already have
+     * committed its primary write; inspect the error detail and pending-work
+     * diagnostics. Do not replay a batch reported as committed. Repair or
+     * reopen the database; primary-only writes may still succeed. */
     ANTFLY_STALLED = 9,
     /* The operation was cancelled, including a pending replacement or a
      * progress/stream callback returning false. */
@@ -157,8 +159,11 @@ typedef struct antfly_open_options {
     uint32_t inference_combined_budget_mb;
     uint32_t inference_kv_budget_mb;
     uint32_t inference_scratch_budget_mb;
-    /* Milliseconds to retry a Lite operation while another process holds the
-     * writer lease (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 fails immediately. */
+    /* Milliseconds to retry Lite admission while another process holds the
+     * writer lease or advances the allocator checkpoint (ANTFLY_BUSY), like
+     * sqlite3_busy_timeout. 0 fails immediately. Mutation bodies are never
+     * replayed by this admission retry. A successful proof may admit an
+     * unchanged tip after the timeout if no lease wait is needed. */
     uint64_t busy_timeout_ms;
     uint64_t reserved[6];
     /* Optional model directory for database enrichments; empty uses default. */
@@ -544,6 +549,8 @@ antfly_error_code antfly_db_delete_index(antfly_db *db, antfly_slice name, bool 
 /** Cancel a running or failed shadow by its new name; idempotent. Leaves the
  * serving index intact and schedules bounded shadow-artifact cleanup. Failed
  * jobs do not retry or pin replay; cancel before registering a fresh attempt.
+ * Reusing the name can return ANTFLY_BUSY (IndexArtifactCleanupPending) until
+ * cleanup finishes, including after replay has drained. Retry with bounded backoff.
  * delete_index on either name also cancels dependent replacements. */
 antfly_error_code antfly_db_cancel_replacement(antfly_db *db, antfly_slice name, bool *out_cancelled);
 antfly_error_code antfly_db_list_enrichments_json(antfly_db *db, antfly_buffer *out);

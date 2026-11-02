@@ -1,3 +1,4 @@
+export type { ChartConfig } from "../components/ui/chart";
 export {
   ChartContainer,
   ChartLegend,
@@ -6,7 +7,6 @@ export {
   ChartTooltip,
   ChartTooltipContent,
 } from "../components/ui/chart";
-export type { ChartConfig } from "../components/ui/chart";
 
 export const chartSeries = [
   "var(--chart-1)",

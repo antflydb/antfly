@@ -9,8 +9,9 @@ import {
   CardDescription,
   CardHeader,
   CardTitle,
+  Field,
+  FieldLabel,
   Input,
-  Label,
 } from "@antfly/design-system";
 import type { FormEvent } from "react";
 import { useState } from "react";
@@ -85,8 +86,8 @@ export function LoginPage() {
               </Alert>
             )}
 
-            <div className="space-y-2">
-              <Label htmlFor="username">Username</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="username">Username</FieldLabel>
               <Input
                 id="username"
                 type="text"
@@ -97,10 +98,10 @@ export function LoginPage() {
                 autoFocus
                 required
               />
-            </div>
+            </Field>
 
-            <div className="space-y-2">
-              <Label htmlFor="password">Password</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="password">Password</FieldLabel>
               <Input
                 id="password"
                 type="password"
@@ -110,7 +111,7 @@ export function LoginPage() {
                 disabled={isLoading}
                 required
               />
-            </div>
+            </Field>
 
             <Button type="submit" className="w-full" disabled={isLoading}>
               {isLoading ? "Signing in..." : "Sign in"}

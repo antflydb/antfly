@@ -1021,29 +1021,46 @@ comptime {
     validateCheckedInCatalog() catch |err| @compileError(@errorName(err));
 }
 
-pub fn targetForComputeCapability(major: i32, minor: i32) ?compiler.Target {
-    if (major == 8 and minor == 9) return cuda_sm89_target;
-    return null;
+/// Portable SIMT matmul/decode artifacts include compute_75 PTX and SM80 SASS.
+/// This is execution support, independent of the GPU named by benchmark
+/// evidence. Loaded-symbol and operation ABI checks remain at the call site.
+pub fn portableCudaDeviceSupported(major: i32, minor: i32) bool {
+    return @import("cuda_execution_contract.zig").CudaExecutionContract.portable_simt_sm75.supportsDevice(major, minor);
 }
 
-pub fn resolve(
-    signature: op.SpecializationSignature,
-    shape: op.RuntimeShape,
-    major: i32,
-    minor: i32,
-) !?compiler.CatalogEntry {
-    const target = targetForComputeCapability(major, minor) orelse return null;
-    return catalog.resolve(.{ .signature = signature, .runtime = shape, .target = target });
+fn executionSupported(entry: compiler.CatalogEntry, major: i32, minor: i32) bool {
+    if (entry.target.backend != .cuda) return false;
+    if (major == 8 and minor == 9) return true;
+    if (!portableCudaDeviceSupported(major, minor) or entry.target.required_features != 0) return false;
+    const artifact = compiler.generatedRegistryArtifactForKernel(.cuda, entry.kernel_id) orelse return false;
+    const contract = artifact.cudaExecutionContract() orelse return false;
+    if (!contract.supportsDevice(major, minor)) return false;
+    // Use the common hardware envelope; larger architecture-specific schedules
+    // require their own execution contract rather than borrowed SM89 evidence.
+    entry.schedule.validateForTarget(.{ .backend = .cuda, .architecture = "cuda_simt_sm75", .limits = .{
+        .max_threads_per_block = 1024,
+        .max_shared_memory_bytes = 48 * 1024,
+        .max_registers_per_thread = 255,
+        .max_registers_per_block = 64 * 1024,
+    } }) catch return false;
+    return true;
 }
 
-pub fn resolveGgmlQ8_1(
-    signature: op.SpecializationSignature,
-    shape: op.RuntimeShape,
-    major: i32,
-    minor: i32,
-) !?compiler.CatalogEntry {
-    const target = targetForComputeCapability(major, minor) orelse return null;
-    return ggml_q8_1_catalog.resolve(.{ .signature = signature, .runtime = shape, .target = target });
+fn resolveForDevice(source: compiler.Catalog, signature: op.SpecializationSignature, shape: op.RuntimeShape, major: i32, minor: i32) !?compiler.CatalogEntry {
+    // Look up the immutable evidence-bound candidate without relabeling its
+    // evidence as an A100/Hopper/Spark measurement. Execution eligibility is
+    // a separate check against the actual device and artifact build contract.
+    const candidate = (try source.resolve(.{ .signature = signature, .runtime = shape, .target = cuda_sm89_target })) orelse return null;
+    if (!executionSupported(candidate, major, minor)) return null;
+    return candidate;
+}
+
+pub fn resolve(signature: op.SpecializationSignature, shape: op.RuntimeShape, major: i32, minor: i32) !?compiler.CatalogEntry {
+    return resolveForDevice(catalog, signature, shape, major, minor);
+}
+
+pub fn resolveGgmlQ8_1(signature: op.SpecializationSignature, shape: op.RuntimeShape, major: i32, minor: i32) !?compiler.CatalogEntry {
+    return resolveForDevice(ggml_q8_1_catalog, signature, shape, major, minor);
 }
 
 test "checked-in CUDA AOT catalog is unambiguous" {
@@ -1470,7 +1487,7 @@ test "catalog resolves long-context SM89 split-K online decode without widening 
     outside.query_heads = 16;
     try std.testing.expect((try resolve(signature, outside, 8, 9)) == null);
     outside.query_heads = 8;
-    try std.testing.expect((try resolve(signature, outside, 8, 0)) == null);
+    try std.testing.expect((try resolve(signature, outside, 8, 0)) != null);
 }
 
 test "catalog resolves qualified SM89 F16 Flash-prefill buckets" {
@@ -1707,4 +1724,30 @@ test "catalog resolves exact SM89 Q6_K Q8_1 argmax family shapes" {
         .input_dim = 2560,
         .output_dim = 262_144,
     }, 8, 9)) == null);
+}
+
+test "CUDA catalog separates portable matmul execution from immutable benchmark evidence" {
+    const baseline = entries[0];
+    const shape = op.RuntimeShape{ .rows = 1, .input_dim = 256, .output_dim = 1536 };
+    for ([_][2]i32{ .{ 7, 5 }, .{ 8, 0 }, .{ 8, 6 }, .{ 8, 9 }, .{ 9, 0 }, .{ 12, 1 } }) |cc| {
+        const selected = (try resolve(baseline.signature, shape, cc[0], cc[1])) orelse return error.ExpectedPortableMatmul;
+        try std.testing.expectEqualStrings(baseline.kernel_id, selected.kernel_id);
+        try std.testing.expectEqual(baseline.fingerprint(), selected.fingerprint());
+        try std.testing.expectEqualStrings("sm_89", selected.target.architecture);
+        try validateEntryAgainstRegistry(selected);
+    }
+    try std.testing.expect((try resolve(baseline.signature, shape, 7, 0)) == null);
+    try std.testing.expect((try resolve(baseline.signature, .{ .rows = 2, .input_dim = 256, .output_dim = 1536 }, 8, 0)) == null);
+    var excessive = baseline;
+    excessive.schedule.resources.static_shared_memory_bytes = 49 * 1024;
+    try std.testing.expect(!executionSupported(excessive, 8, 0));
+    var feature = baseline;
+    feature.target.required_features = 1;
+    try std.testing.expect(!executionSupported(feature, 8, 0));
+    for (entries) |entry| switch (entry.signature) {
+        .attention => |attention| if (attention.kind == .prefill_flash) {
+            try std.testing.expect(!executionSupported(entry, 8, 0));
+        },
+        else => {},
+    };
 }

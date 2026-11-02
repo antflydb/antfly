@@ -48,6 +48,8 @@ Imported 100 images in 45.2s (2.2 images/sec)
 
 ## Running the Example
 
+Set `ANTFLY_URL` if Antfly is not at `http://localhost:8080/db/v1`.
+
 ```bash
 # From the repository root
 go run ./examples/image-search
@@ -61,6 +63,23 @@ To run the batch import, first download the MMIR dataset:
 ```bash
 curl -o mmir_dataset.tsv.gz "https://storage.googleapis.com/gresearch/wit-retrieval/mmir_dataset_train-00000-of-00005.tsv.gz"
 ```
+
+## Search Your Own Screenshots, Images, and PDFs
+
+Pass `-dir` to index a local folder instead of the sample images:
+
+```bash
+go run ./examples/image-search -dir ~/Desktop
+go run ./examples/image-search -dir ~/Screenshots "error message" "login page" "dark mode UI"
+```
+
+Supported files are `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.tiff`, and `.pdf`. Each document stores only the file name, path, and a `file://` URL; the `{{remoteMedia url=file_url}}{{filename}}` template reads the file from disk at enrichment time, so no image data is copied into Antfly. Files must stay in place, and re-running updates existing entries because document IDs come from the file path.
+
+<!-- include: local.go#local_ingest -->
+
+<!-- include: local.go#local_search -->
+
+CLIP embeds the first page of a PDF. For full-text search over PDFs and scans, add a text index; see the [Multimodal Guide](/docs/guides/multimodal).
 
 ## Tips
 

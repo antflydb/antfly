@@ -225,6 +225,11 @@ fatbin cubins for the supported SM targets when `cuobjdump` is available, and
 checks that required CUDA symbols are present before updating checked-in
 artifacts. CUDA-enabled CI may verify checked-in artifact freshness, but normal
 CI should not need CUDA.
+Fatbin generation explicitly uses `--compress-mode=size`. This losslessly
+compresses device code; the CUDA driver handles decompression at module load.
+All supported cubins and the PTX fallback remain included. The compression
+format requires drivers from CUDA 12.4 or newer; it does not reduce model
+weights, runtime device allocations, or the PTX ISA driver requirement above.
 The equivalent Linux CUDA 13.2 build target is
 `zig build cuda-artifacts-check`.
 

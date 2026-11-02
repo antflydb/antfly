@@ -8,6 +8,10 @@ import type { RequestAdmission, RequestAdmissionOptions } from "./request-admiss
 
 // Request/Response types
 export type EmbedRequest = components["schemas"]["InferenceEmbedRequest"];
+export type EmbedOptions = Pick<
+  EmbedRequest,
+  "task_type" | "dimensions" | "instruction" | "error_policy"
+> & { truncate?: boolean; signal?: AbortSignal };
 export type EmbedResponse = components["schemas"]["InferenceEmbedResponse"];
 
 export type ChunkRequest = components["schemas"]["InferenceChunkRequest"];
@@ -90,10 +94,10 @@ export type ImageURL = components["schemas"]["InferenceImageURL"];
 
 // Configuration types
 export type Config = components["schemas"]["InferenceConfig"];
-export type ContentSecurityConfig = components["schemas"]["InferenceContentSecurityConfig"];
-export type Credentials = components["schemas"]["InferenceCredentials"];
-export type Level = components["schemas"]["InferenceLevel"];
-export type Style = components["schemas"]["InferenceStyle"];
+export type ContentSecurityConfig = components["schemas"]["ContentSecurityConfig"];
+export type Credentials = components["schemas"]["Credentials"];
+export type Level = components["schemas"]["Level"];
+export type Style = components["schemas"]["Style"];
 
 // Error type
 export type InferenceError = components["schemas"]["InferenceError"];

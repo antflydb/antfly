@@ -1,0 +1,41 @@
+{
+  "status": "Repair admission fixed; performance qualification running",
+  "base_commit": "f1b4ddc21b7d5daffe75c29229da84fea467b9a9",
+  "merged_1449_runtime_commit": "c647b9238ceeef00492a1cfd71f76fe398f7ecba",
+  "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+  "importer_note": "Original Rust Debug importer; externally owned Codex timeout/retry changes excluded",
+  "correctness": {
+    "merged_1449_native": {
+      "passed": 703,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaks": 0
+    },
+    "merged_1449_capi": {
+      "passed": 289,
+      "skipped": 3,
+      "failed": 0,
+      "leaks": 0
+    },
+    "sdk_after_repair_fix": {
+      "passed": 205,
+      "failed": 0,
+      "source_note": "c647b9238c plus the follow-up sql_ddl change, before rebasing on merged main; current-main gates pending"
+    },
+    "problem": "Namespace admission treated published FK activation debt as unfinished publication and blocked the parent repair needed to resolve it. Publication fences remain strict; activation stays queued while guarded repair is admitted."
+  },
+  "qualification_pending": [
+    "Current-main Debug build/ABI/C API/SDK checks",
+    "Matched Debug and ReleaseFast importer comparisons with exact #1436 and branch-base controls",
+    "All 15 frozen inputs with primary-content/integrity checks and payload attribution at equivalent catch-up/merge state",
+    "Original unchanged importer three-writer/one-reader contention",
+    "Ten-minute eight-writer indexed active-write soak with per-worker progress, file-size samples, acknowledged values, integrity, catch-up, search and reopen"
+  ],
+  "measurement_rules": [
+    "Use exact library/importer hashes and verified frozen inputs",
+    "Do not run timing phases alongside active native builds",
+    "Record host load, CPU/RSS, build mode and descriptor limit",
+    "Censor and report watchdogs, Busy and failed imports rather than counting them as successes",
+    "Publish aggregate receipts only; private inputs and raw logs remain ignored"
+  ]
+}

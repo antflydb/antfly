@@ -220,17 +220,20 @@ is an optimization gap and does not fail the semantic model check. The
 means every emitted signature probe resolved, not that every possible runtime
 route is promoted.
 
-The checked-in exact catalog currently targets CUDA `sm_89` only. Its scope is
+The checked-in catalog currently records CUDA `sm_89` benchmark evidence. Its scope is
 selected Q4_0 and Q4_K row-1 matmuls, Q4_0 x Q8_1 fused FFN shapes, Q6_K x
 Q8_1 K=2560 and K=3840 tile-argmax candidates, and Gemma 4 decode-attention
 topologies. In the merged unified generated-artifact registry, 21 CUDA entries
 are non-promoted; no single Q4_K route represents the remaining candidate set.
 The generated Q4 runtime routes are default-off. When a route is explicitly
-enabled, it is target-guarded to SM89; other compute capabilities use the
-handwritten fallback even when their code objects are present in the fatbin.
-Development experiments can bypass this target and promotion guard with
-`ANTFLY_INFERENCE_CUDA_ALLOW_UNPROMOTED_GENERATED_KERNELS=1`; results from that
-mode are not production evidence.
+enabled, execution follows the renderer's typed instruction/layout contract,
+loaded symbols, supported shapes and resource bounds. Portable SIMT routes
+support SM75+ without relabeling SM89 benchmark evidence as measurements on
+other GPUs. Generated Flash-prefill implementations that index opaque WMMA
+fragments retain their actual layout restriction. Unsupported contracts use the
+handwritten CUDA fallback. There is no device/promotion bypass environment
+variable; candidate promotion and explicit runtime controls remain independent
+of execution compatibility.
 `production_enabled` records benchmark qualification; it does not imply
 runtime-default dispatch. The five qualified Q4_0 routes require their positive
 runtime opt-ins, and the master disable gate remains authoritative. The
@@ -1166,9 +1169,10 @@ resize coefficients, and token IDs. Only the final embedding vector is downloade
 synchronized before NVDEC unmaps them. Decoder errors discard cached surfaces;
 successful clips reuse the decoder.
 
-The supported envelope is progressive 8-bit SDR H.264 MP4, at most 60 seconds,
+The supported envelope is progressive 8-bit 4:2:0 SDR MP4 with H.264 (avc1),
+HEVC Main (hvc1/hev1), or AV1 Main (av01), at most 60 seconds,
 256 MiB, 4096 pixels per side, and 18,000 packets. HTTP/CLI request budgets can
-be narrower. Rotation, non-square pixels, HDR, interlacing, other codecs, and
+be narrower. Rotation, non-square pixels, 10-bit video, HDR, interlacing, other codecs, and
 mixed text/image/audio/video groups are rejected. The existing Gemma4 generation
 sampler and still-image preprocessing are unchanged. NVDEC's `libnvcuvid.so.1`
 is required at runtime; no FFmpeg process or runtime CUDA compiler is needed.
@@ -1181,6 +1185,40 @@ their input indexes and valid sibling inputs can still complete.
 For HTTP serving, set `ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda` so ordinary
 requests use CUDA. A CUDA-specific preload alone does not force that selection.
 Configure backend and scratch budgets for the model plus video workspace.
+
+CUDA video admits container inspection under a host-only preprocessing permit,
+then plans execution from the inspected geometry and sampled frame count. The
+device request covers the bounded media arena, RGB/patch staging, pending vision
+inputs, and projected rows. Compressed MP4 bytes remain host input. The encoder
+phase reduces the reservation after decoding/projection; retained NVDEC surfaces
+have a separate cache lease against the same budgets. This replaces the fixed
+1.5 GiB workspace and maximum-length preflight for short clips. It does not
+change sampling, token packing, or embedding arithmetic.
+
+Admission failure logs identify preflight, retry after cache reclamation, or
+encoder phase, with estimated request bytes, occupancy snapshots, and limits.
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS=1` also reports tracked physical
+device allocation high water and retained decoder bytes. These counters include
+the explicit NVDEC policy envelope, not driver-private allocation measurements.
+
+Run repeatability, invalid-input recovery, text/audio controls, cleanup metrics,
+and concurrent mixed traffic against an owned server with:
+
+```bash
+python3 zig/pkg/inference/scripts/embeddinggemma2/cuda_video_qualification.py \
+  --binary zig/zig-out/bin/antfly --model-dir /path/to/embeddinggemma2 \
+  --clip zig/pkg/inference/src/testdata/video/closed.mp4 \
+  --clip zig/pkg/inference/scripts/embeddinggemma2/testdata/video/video-h264.mp4 \
+  --audio zig/lib/audio/testdata/tone.wav \
+  --output .benchmark-results/video-cuda/qualification.json
+```
+
+Repeat `--clip` for additional durations and production reproductions. Use
+`--scratch-budget-mb 1024 --mixed-jobs 0` to check serial constrained admission;
+concurrent requests still compete for that cap. Evidence includes checkpoint
+receipt verification, binary/tool/input hashes, source SHA and diff hash, GPU
+identity, vectors, recovery outcomes, process RSS, and cleanup metrics. This
+runner does not establish independent reference parity or qualify another GPU.
 
 The checked-in six-second fixture at `src/testdata/video/closed.mp4` and its
 provenance record cover decoder, sampling, cancellation, and resident preprocessing
@@ -1512,3 +1550,68 @@ than the entire stream. Failed event creation/recording conservatively falls
 back to a stream drain. Event recording covers successful and failed execution
 exits, including final output reads. Model unload and lost-context cleanup retain
 their existing admission and ownership contracts.
+
+### MP4 codec and AAC qualification
+
+`src/testdata/video/codecs/receipt.json` pins the synthetic AVC/HEVC/AV1 fixtures
+and independent FFmpeg decoded-pixel hashes. CUDA tests compare selected YUV420
+pixels exactly, switch codecs at the same geometry, and check cancellation and
+reservation cleanup. HEVC/AV1 require NVDEC support on the deployment GPU; the
+portable MP4 reader still defaults to AVC/JPEG. Before backend selection,
+contract pixel accounting takes the maximum across viable portable and CUDA
+tracks, including mixed-codec MP4 files. `hev1` may supply its parameter sets
+in timed samples; `hvc1` requires them in its decoder configuration.
+Gemma4's sampler is unchanged.
+
+AAC-LC in M4A/MP4 or ADTS, and HE-AAC v1/v2 in M4A, use the existing native CPU
+audio decoder before the CUDA audio encoder. They do not use NVDEC. Qualification
+checks sample count/rate, bit-identical streaming/full decode, mean absolute PCM
+error at most 1e-4 against FFmpeg, and the audio library's 50 dB PCM SNR floor
+for the owned HE-AAC/PS fixtures. AAC-LC SNR is recorded separately: transient
+and speech fixtures can fall below 50 dB while meeting the absolute-error bound.
+CUDA embeddings must match a WAV containing the exact native decoded F32 samples
+with max error 1e-5.
+
+Independent acceptance additionally requires AAC embeddings versus the pinned
+FFmpeg-derived F32 WAV to have cosine similarity >= 0.995 and max component error
+<= 0.01, for every repeat and every audio fixture. These fixed global bounds mean
+at most 0.1 Euclidean drift for normalized unit vectors and at most 1% of unit
+norm in any component. This is bounded interoperability, not bit-exact decoder
+or pretrained-model reference parity. The corpus covers tones, silence, quiet
+audio, transients, a synthetic musical sequence, English/Spanish speech, HE-AAC
+v1/v2, ADTS, and audio extracted from a muxed MP4.
+
+A corpus-level retrieval gate requires each silence/transient/music/speech AAC
+embedding to rank its matching independent WAV first. Each mismatched reference
+must also fail the same cosine/component acceptance predicate. Reports retain
+all vectors, PCM errors, reference scores, and top-1 margins; a reference request
+failure or failed comparison fails qualification. No per-fixture embedding
+threshold exceptions or noisy-sample exclusions are used.
+
+Install fixture-generation dependencies from
+`scripts/embeddinggemma2/requirements-mp4-codecs.txt` into a worktree-local venv.
+Build the standalone PCM qualification helper from the repository root, keeping
+all caches and output in the worktree:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR="$PWD/zig/.zig-cache/global" zig build-exe \
+  -OReleaseFast --dep audio \
+  -Mroot=zig/pkg/inference/scripts/embeddinggemma2/aac_pcm_qualification.zig \
+  -OReleaseFast --dep antfly_media -Maudio=zig/lib/audio/src/mod.zig \
+  -OReleaseFast -Mantfly_media=zig/lib/media/src/mod.zig \
+  -lc -femit-bin=zig/zig-out/bin/aac-pcm-qualification
+python3 zig/pkg/inference/scripts/embeddinggemma2/qualify_mp4_codecs.py \
+  --binary zig/zig-out/bin/antfly-inference-http-server \
+  --model-dir /path/to/embeddinggemma2 \
+  --pcm-probe zig/zig-out/bin/aac-pcm-qualification \
+  --output .benchmark-results/mp4-codecs/qualification.json
+```
+
+The default scratch budget is 4096 MiB for the combined AAC/video cohort. For
+long-video admission checks, use the generated 60-second fixture directory with
+`--fixtures <directory> --video-only --scratch-budget-mb 1024`. The runner checks
+repeats, normalized finite 768-dimensional vectors, malformed input, deadlines,
+recovery, mixed traffic, and idle admission accounting. Its process-memory guard
+defaults to the production automatic physical/cgroup envelope; an explicit
+`--process-memory-budget-mb` covers the entire shared leaf cgroup, including
+unrelated compilers, rather than just the inference worker.

@@ -1,3 +1,4 @@
+import { AntflyHTTPError, AntflyResponseError } from "./errors.js";
 /**
  * Antfly SDK Client
  * Provides a high-level interface for interacting with the Antfly API
@@ -443,7 +444,7 @@ function indexMutationError(prefix: string, error: unknown, response: Response |
       Number.isSafeInteger(retryAfter) && retryAfter > 0 ? retryAfter : undefined
     );
   }
-  return new Error(message);
+  return new AntflyHTTPError(message, response?.status ?? 0, error);
 }
 
 function normalizedWriteOptions(
@@ -800,7 +801,7 @@ export class AntflyClient {
     relational = false,
     errorFactory?: (status: number, body: unknown) => Error | undefined,
     redirect?: RequestRedirect,
-    method: "POST" | "DELETE" = "POST",
+    method: "POST" | "DELETE" | "GET" = "POST",
     credentials?: RequestCredentials,
     extraHeaders?: Record<string, string>
   ): Promise<{ data?: T; text: string; status: number }> {
@@ -840,7 +841,11 @@ export class AntflyClient {
         const structured = errorFactory(response.status, errorBody);
         if (structured) throw structured;
       }
-      throw new Error(`${errorPrefix}: ${response.status} ${message}`);
+      throw new AntflyHTTPError(
+        `${errorPrefix}: ${response.status} ${message}`,
+        response.status,
+        errorBody
+      );
     }
 
     const { text, truncated } = await readLimitedResponseText(response, opts.maxResponseBytes);
@@ -1021,7 +1026,7 @@ export class AntflyClient {
     path: string,
     request: unknown,
     options?: WriteOptions,
-    method: "POST" | "DELETE" = "POST",
+    method: "POST" | "DELETE" | "GET" = "POST",
     extraHeaders?: Record<string, string>
   ): Promise<T | undefined> {
     const { data } = await this.postBoundedJSON<T>(
@@ -1114,8 +1119,42 @@ export class AntflyClient {
       options,
       "DELETE"
     );
-    if (!data || Array.isArray(data) || typeof data !== "object" || Object.keys(data).length !== 0)
+    // Older servers serialized the empty acknowledgment as [] rather than {}.
+    // Neither form carries data; reject nonempty or scalar acknowledgments.
+    if (!data || typeof data !== "object" || Object.keys(data).length !== 0)
       throw new Error("Invalid SQL connection close response");
+  }
+
+  /** Read a durable SQL transaction receipt without retrying or replaying its mutation. */
+  async getSQLTransactionOutcome(
+    transactionId: string,
+    options?: WriteOptions
+  ): Promise<{
+    transaction_id: string;
+    disposition: components["schemas"]["TransactionSessionStatus"]["disposition"];
+  }> {
+    if (!/^[0-9a-f]{32}$/.test(transactionId))
+      throw new Error("SQL transaction ID must be 32 lowercase hexadecimal characters");
+    const data = await this.sqlRequest<components["schemas"]["TransactionSessionDetailsResponse"]>(
+      `/db/v1/transactions/${transactionId}`,
+      undefined,
+      options,
+      "GET"
+    );
+    if (
+      !data ||
+      data.transaction_id !== transactionId ||
+      ![
+        "active",
+        "outcome_unknown",
+        "committed",
+        "committed_pending",
+        "committed_repair_required",
+        "aborted",
+      ].includes(data.disposition)
+    )
+      throw new Error("Invalid SQL transaction outcome response");
+    return { transaction_id: data.transaction_id, disposition: data.disposition };
   }
 
   /**
@@ -1955,10 +1994,15 @@ export class AntflyClient {
      * Get table details and status
      */
     get: async (tableName: string): Promise<Table | undefined> => {
-      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}", {
+      const { data, error, response } = await this.client.GET("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
-      if (error) throw new Error(`Failed to get table: ${apiErrorMessage(error)}`);
+      if (!response.ok)
+        throw new AntflyHTTPError(
+          `Failed to get table: ${apiErrorMessage(error)}`,
+          response?.status ?? 0,
+          error
+        );
       return data;
     },
 
@@ -2088,13 +2132,11 @@ export class AntflyClient {
         "Batch operation failed",
         "marshalling batch request"
       );
-      return (
-        data ?? {
-          inserted: Object.keys(request.inserts ?? {}).length,
-          deleted: request.deletes?.length ?? 0,
-          transformed: request.transforms?.length ?? 0,
-        }
-      );
+      if (!data)
+        throw new AntflyResponseError(
+          "Batch operation failed: missing mutation outcome; do not blindly retry"
+        );
+      return data;
     },
 
     rows: {
@@ -2255,13 +2297,21 @@ export class AntflyClient {
      * @param options.fields - Comma-separated list of fields to include (e.g., "title,author,metadata.tags")
      */
     lookup: async (tableName: string, key: string, options?: { fields?: string }) => {
-      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/documents/{key}", {
-        params: {
-          path: { tableName, key },
-          query: options?.fields ? { fields: options.fields } : undefined,
-        },
-      });
-      if (error) throw new Error(`Key lookup failed: ${error.error}`);
+      const { data, error, response } = await this.client.GET(
+        "/db/v1/tables/{tableName}/documents/{key}",
+        {
+          params: {
+            path: { tableName, key },
+            query: options?.fields ? { fields: options.fields } : undefined,
+          },
+        }
+      );
+      if (!response.ok)
+        throw new AntflyHTTPError(
+          `Key lookup failed: ${apiErrorMessage(error)}`,
+          response?.status ?? 0,
+          error
+        );
       return data;
     },
 
@@ -3579,13 +3629,18 @@ export class AntflyClient {
      * Get index details
      */
     get: async (tableName: string, indexName: string) => {
-      const { data, error } = await this.client.GET(
+      const { data, error, response } = await this.client.GET(
         "/db/v1/tables/{tableName}/indexes/{indexName}",
         {
           params: { path: { tableName, indexName } },
         }
       );
-      if (error) throw new Error(`Failed to get index: ${error.error}`);
+      if (!response.ok)
+        throw new AntflyHTTPError(
+          `Failed to get index: ${apiErrorMessage(error)}`,
+          response?.status ?? 0,
+          error
+        );
       if (!data) throw new Error("Failed to get index: unexpected empty response");
       return data;
     },
@@ -3831,6 +3886,8 @@ export interface InferenceGatewayModel {
   availability?: string;
   freshness?: string;
   gateway_capabilities?: Record<string, "supported" | "unsupported" | "unknown">;
+  /** False when public inference is disabled: the model is installed, but calls return 403. */
+  invocable?: boolean;
 }
 export interface InferenceGatewayCatalog {
   /** Deployment policy; omitted by servers predating public inference controls. */

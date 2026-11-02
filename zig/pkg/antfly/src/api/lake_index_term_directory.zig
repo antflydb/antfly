@@ -91,8 +91,8 @@ pub fn reduce(a: A, entries: []const tree.Entry, height: u8) ![]u8 {
     var result: ?Branch = null;
     for (entries) |entry| {
         const contribution: Branch = if (height == 0) blk: {
-            if (entry.key.len < 34) return error.InvalidNativeLakeTermDirectory;
-            const id: [32]u8 = entry.key[entry.key.len - 32 ..][0..32].*;
+            if (entry.keyView().len() < 34) return error.InvalidNativeLakeTermDirectory;
+            const id: [32]u8 = entry.keyView().tail(32).?;
             break :blk .{ .first = id, .last = id, .envelope = try stats.Summary.decode(entry.value) };
         } else blk: {
             const value = try Branch.decode(entry.aggregate);

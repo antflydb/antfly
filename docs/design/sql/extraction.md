@@ -604,7 +604,7 @@ proof. Metadata persists one immutable verifier per node/store/root identity.
 Signed retirement paging and ACKs bind the cluster, store, root, ticket and
 request cut. Hosted child provision/release receipts carry a root attestation
 checked against enrollment, the plan and current placement. See
-[store-root enrollment](../../store-root-enrollment.md).
+[store-root enrollment](../../operations/store-root-enrollment.md).
 
 The worker verifies an exact cold owner bootstrap and persists a checksummed
 local intent before quiescing the owner, Raft, readers, writers and snapshots.

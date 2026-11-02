@@ -13,15 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Schema-aware execution inside an admitted, managed model session. CUDA
-//! groups compatible inputs into bounded physical batches; native and Metal
-//! retain their qualified serial request execution.
+//! Schema-aware execution inside an admitted, managed model session. CUDA and
+//! Metal group compatible inputs into bounded physical batches; native retains
+//! its qualified serial request execution.
 //! Output is buffered atomically and independently bounded across all inputs.
 const std = @import("std");
 const wire = @import("extraction_v2.zig");
 const model = @import("../models/gliner_boundary.zig");
 const engine = @import("../architectures/gliner/boundary_engine.zig");
 const device_request = @import("../architectures/gliner/boundary_request_device.zig");
+const device_engine = @import("../architectures/gliner/boundary_engine_device.zig");
 const processor = @import("../pipelines/gliner_boundary_processor.zig");
 const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
 const compute = @import("../ops/ops.zig");
@@ -195,10 +196,62 @@ fn workspaceGeometryFor(backend: compute.BackendKind, allocator: Allocator, conf
     return receiver.peak_tokens;
 }
 
+/// Encoder device bytes the reference (non-resident) Metal/CUDA path needs for
+/// this exact request: the largest encoder plan over the batches and windows it
+/// will execute. Admission reserves this instead of the configured encoder
+/// ceiling, so a short input does not hold the whole ceiling. Never exceeds
+/// `options.device.max_encoder_device_bytes`; planning fails if it would.
+pub fn referenceEncoderDeviceBytes(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !usize {
+    if (backend != .metal and backend != .cuda) return error.UnsupportedGlinerBoundaryBackend;
+    const identity = options.identity orelse return error.MissingGlinerBoundaryIdentity;
+    const Precision = @TypeOf(identity.precision);
+    const Receiver = struct {
+        config: *const model.Config,
+        options: Options,
+        precision: Precision,
+        peak: usize = 0,
+        failure: ?anyerror = null,
+        fn note(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            if (self.failure != null) return;
+            const planned = device_engine.plan(self.config, prepared, .{
+                .precision = self.precision,
+                .execution_policy = .reference_v1,
+                .admission = self.options.engine.limits,
+                .max_device_bytes = self.options.device.max_encoder_device_bytes,
+                .control = self.options.control,
+            }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.peak = @max(self.peak, planned.device_upper_bound_bytes);
+        }
+        pub fn observe(self: *@This(), _: usize, _: usize, _: usize, prepared: *const processor.PreparedBatch) !void {
+            self.note(prepared);
+            if (self.failure) |err| return err;
+        }
+        // observeGroupBatch already planned the physical batch. Per-item
+        // qualification views retain its tensors but slice samples to one row,
+        // so they are not complete batches accepted by the device planner.
+        pub fn observeSingle(_: *@This(), _: Allocator, _: []const u8, _: *const processor.PreparedBatch, _: processor.Options) !void {}
+        pub fn observeGroupBatch(self: *@This(), prepared: *const processor.PreparedBatch) !void {
+            self.note(prepared);
+            if (self.failure) |err| return err;
+        }
+        pub fn observeWindowGroup(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            self.note(prepared);
+        }
+    };
+    var receiver = Receiver{ .config = config, .options = options, .precision = identity.precision };
+    try planRequestGeometry(backend, allocator, config, tokenizer, request, options, &receiver);
+    if (receiver.failure) |err| return err;
+    if (receiver.peak == 0) return error.InvalidBoundaryPipelineInput;
+    return receiver.peak;
+}
+
 /// Contiguous compatible items share one forward pass without reordering results.
 /// The same preparation/planning routine runs before qualification and execution.
 fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, items: []const wire.Item, options: Options) !processor.PreparedBatch {
-    const limit = if (backend == .cuda) @min(options.processor.max_batch_items, options.engine.limits.max_batch, options.pipeline.head_limits.max_batch, options.pipeline.task_limits.math.max_batch, options.device.head.max_batch) else 1;
+    const limit = if (backend == .cuda or backend == .metal) @min(options.processor.max_batch_items, options.engine.limits.max_batch, options.pipeline.head_limits.max_batch, options.pipeline.task_limits.math.max_batch, options.device.head.max_batch) else 1;
     if (limit == 0 or items.len == 0) return error.ResourceLimitExceeded;
     var count: usize = 1;
     while (count < @min(limit, items.len) and items[count].options.long_document.mode != .window and std.meta.eql(items[0].options, items[count].options)) : (count += 1) {}
@@ -234,6 +287,8 @@ fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *con
 }
 
 fn observeGroup(allocator: Allocator, config: *const model.Config, items: []const wire.Item, prepared: *const processor.PreparedBatch, options: Options, gate: anytype) !void {
+    // Planners that size device work see the batch exactly as it executes.
+    if (comptime @hasDecl(@TypeOf(gate.*), "observeGroupBatch")) try gate.observeGroupBatch(prepared);
     for (items[0..prepared.samples.len], 0..) |*item, index| {
         // Preserve the physical padded length in every item's policy check.
         var view = prepared.*;
@@ -974,7 +1029,7 @@ test "boundary qualification quiet geometry releases every failed allocation" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, QualificationGeometryTest.exercise, .{.success});
 }
 
-test "CUDA boundary request groups distinct ragged inputs within physical limits" {
+test "GPU boundary request groups distinct ragged inputs within physical limits" {
     const a = std.testing.allocator;
     var request = try wire.parseJson(a,
         \\{"schema_version":2,"model":"geometry-only","schema":{"entities":["person"]},"inputs":[{"content":"Ada"},{"content":"Ada visited 東京 with Grace"},{"content":"last","options":{"word_splitter":"char"}}]}
@@ -1005,9 +1060,76 @@ test "CUDA boundary request groups distinct ragged inputs within physical limits
     var bounded = try prepareGroup(.cuda, a, &config, tokenizer.tokenizer(), request.items, options);
     defer bounded.deinit();
     try std.testing.expectEqual(@as(usize, 1), bounded.samples.len);
-    var serial = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items, .{});
+    var metal = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items, .{});
+    defer metal.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metal.samples.len);
+    try std.testing.expectEqualSlices(i64, group.input_ids, metal.input_ids);
+    try std.testing.expectEqualSlices(i64, group.attention_mask, metal.attention_mask);
+    var metal_bounded = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items, options);
+    defer metal_bounded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metal_bounded.samples.len);
+    var serial = try prepareGroup(.native, a, &config, tokenizer.tokenizer(), request.items, .{});
     defer serial.deinit();
     try std.testing.expectEqual(@as(usize, 1), serial.samples.len);
+    const geometry_options = Options{ .identity = .{ .backbone = .small, .precision = .fp32, .weight = artifact.Digest.of("geometry weight"), .sidecars = @splat(artifact.Digest.of("geometry sidecar")) } };
+    var tail = try prepareGroup(.metal, a, &config, tokenizer.tokenizer(), request.items[2..], geometry_options);
+    defer tail.deinit();
+    const peak = try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, geometry_options);
+    try std.testing.expectEqual(@max(metal.input_ids.len, tail.input_ids.len), peak);
+    var serial_geometry_options = geometry_options;
+    serial_geometry_options.engine.limits.max_batch = 1;
+    try std.testing.expect(peak > try workspaceGeometry(a, &config, tokenizer.tokenizer(), &request, serial_geometry_options));
+    // The reference device path reserves the request's own encoder plan, not
+    // the configured ceiling, and refuses a ceiling the request cannot fit.
+    const encoder_bytes = try referenceEncoderDeviceBytes(.metal, a, &config, tokenizer.tokenizer(), &request, geometry_options);
+    try std.testing.expect(encoder_bytes > 0);
+    try std.testing.expect(encoder_bytes < geometry_options.device.max_encoder_device_bytes);
+    try std.testing.expect(encoder_bytes > try referenceEncoderDeviceBytes(.metal, a, &config, tokenizer.tokenizer(), &request, serial_geometry_options));
+    var tight = geometry_options;
+    tight.device.max_encoder_device_bytes = encoder_bytes - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.metal, a, &config, tokenizer.tokenizer(), &request, tight));
+}
+
+test "GPU boundary classification windows fit backend-specific reference reservations" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"geometry-only","schema":{"classifications":[{"name":"intent","labels":["refund","support"]}]},"inputs":[{"content":"Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada Ada"}]}
+    , .{});
+    defer request.deinit();
+    request.items[0].options.long_document = .{ .mode = .window, .window_words = 4, .overlap_words = 1, .max_windows = 16 };
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    const config = QualificationGeometryTest.config();
+    const options = Options{ .identity = .{ .backbone = .small, .precision = .fp32, .weight = artifact.Digest.of("geometry weight"), .sidecars = @splat(artifact.Digest.of("geometry sidecar")) } };
+    const metal_reserved = try referenceEncoderDeviceBytes(.metal, a, &config, tokenizer.tokenizer(), &request, options);
+    const reserved = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, options);
+    const Receiver = struct {
+        config: *const model.Config,
+        options: Options,
+        peak: usize = 0,
+        failure: ?anyerror = null,
+        fn note(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            const planned = device_engine.plan(self.config, prepared, .{ .precision = .fp32, .max_device_bytes = self.options.device.max_encoder_device_bytes }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.peak = @max(self.peak, planned.device_upper_bound_bytes);
+        }
+        pub fn observe(self: *@This(), _: usize, _: usize, _: usize, prepared: *const processor.PreparedBatch) !void {
+            self.note(prepared);
+        }
+        pub fn observeSingle(_: *@This(), _: Allocator, _: []const u8, _: *const processor.PreparedBatch, _: processor.Options) !void {}
+        pub fn observeWindowGroup(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            self.note(prepared);
+        }
+    };
+    var receiver = Receiver{ .config = &config, .options = options };
+    try planRequestGeometry(.cuda, a, &config, tokenizer.tokenizer(), &request, options, &receiver);
+    if (receiver.failure) |err| return err;
+    try std.testing.expectEqual(receiver.peak, reserved);
+    try std.testing.expect(reserved > metal_reserved);
+    var tight = options;
+    tight.device.max_encoder_device_bytes = reserved - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, tight));
 }
 
 test "CUDA boundary managed Multi-Decide batches windows and recovers after cancellation" {

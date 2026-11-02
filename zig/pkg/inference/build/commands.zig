@@ -42,7 +42,8 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
         .name = "antfly-inference-bench-server",
         // Retain video codec compiler headroom and main's larger Darwin Metal
         // allowance for the production prepared-pipeline benchmark.
-        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 12) * 1024 * 1024 * 1024,
+        .max_rss = std.math.mul(usize, b.option(usize, "bench-server-compile-memory-mb", "Declared HTTP benchmark server compiler memory bound in MiB") orelse
+            (@as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 12) * 1024), 1024 * 1024) catch @panic("benchmark server compiler memory bound overflows"),
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/benchmark_server.zig"),
             .target = ctx.target,
@@ -78,7 +79,12 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const http_default_memory_gib: usize = if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal)
         (if (ctx.optimize == .small) 10 else 14)
     else if (ctx.hasAccelerator()) 8 else 6;
-    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else http_default_memory_gib * 1024;
+    // The Zig 0.17 stripped CUDA server measured 12.08 GB on GB10/aarch64.
+    // Reserve 14 GiB for this profile; retain the existing other-host claims.
+    const aarch64_cuda_http_release = ctx.target.result.os.tag == .linux and
+        ctx.target.result.cpu.arch == .aarch64 and ctx.backend.enable_cuda and
+        ctx.optimize == .fast and ctx.strip;
+    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else if (aarch64_cuda_http_release) 14 * 1024 else http_default_memory_gib * 1024;
     const http_server = b.addExecutable(.{
         .name = "antfly-inference-http-server",
         .max_rss = http_compile_memory_mb * 1024 * 1024,

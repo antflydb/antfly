@@ -18,10 +18,11 @@ const std = @import("std");
 const httpx = @import("httpx");
 const sources = @import("antfly_local_sources");
 const registry = sources.common_provider_registry;
-const gateway = registry.gateway;
-const tasks = registry.tasks;
+const gateway = @import("antfly_local_sources").common_inference_gateway;
+const tasks = @import("antfly_local_sources").common_inference_tasks;
 const Json = std.json.Value;
 const payloads = @import("inference_payload.zig");
+pub const source_media = @import("inference_source.zig");
 const empty_registry = registry.Registry.init(std.heap.page_allocator);
 const generating = sources.generating_mod;
 
@@ -69,6 +70,7 @@ const ExecutionOptions = struct {
     attempt_limit: u8 = 8,
     operation: ?[]const u8 = null,
     attachments: ?[]const httpx.attachment_envelope.Attachment = null,
+    source_port: ?source_media.Port = null,
     authorization: ?[]const u8 = null,
     attempt_observer: ?httpx.AttemptObserver = null,
 };
@@ -277,7 +279,7 @@ pub fn view(server: anytype) !gateway.View {
 }
 
 pub fn disabledResponse(ctx: *httpx.Context) !httpx.Response {
-    return ctx.status(403).json(.{ .@"error" = .{ .code = "PublicInferenceDisabled", .type = "permission_error", .message = "Public inference is disabled for this deployment" } });
+    return ctx.status(403).json(.{ .@"error" = .{ .code = "PublicInferenceDisabled", .type = "permission_error", .message = "Public inference is disabled on this deployment; set public_inference.enabled in the server config" } });
 }
 
 const InvocationState = struct {
@@ -369,8 +371,11 @@ pub fn execute(server: anytype, ctx: *httpx.Context, task: gateway.Task) !httpx.
 
 /// The registered handler supplies operation identity; URI spelling never selects an adapter.
 pub fn executeOperation(server: anytype, ctx: *httpx.Context, task: gateway.Task, operation: ?[]const u8) !httpx.Response {
+    return executeOperationWithSources(server, ctx, task, operation, null);
+}
+pub fn executeOperationWithSources(server: anytype, ctx: *httpx.Context, task: gateway.Task, operation: ?[]const u8, port: ?source_media.Port) !httpx.Response {
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 64 * 1024 * 1024 };
-    return executeBounded(server, ctx, task, budget.allocator(), .{ .attempt_limit = try attemptBudget(ctx), .operation = operation }) catch |err| {
+    return executeBounded(server, ctx, task, budget.allocator(), .{ .attempt_limit = try attemptBudget(ctx), .operation = operation, .source_port = port }) catch |err| {
         if (err == error.InferenceResponseCommitted) return err;
         if (budget.exhausted) return error.InferenceRequestTooLarge;
         return err;
@@ -387,6 +392,7 @@ fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, back
     var execution = options;
     execution.attachments = payload.attachments;
     const request = payload.value;
+    try source_media.resolve(a, request, execution.source_port);
     if (request != .object) return error.InvalidInferenceRequest;
     if (try generatedSelector(task, request)) |model| return executeGenerated(server, ctx, task, a, request, model, execution);
     var effective = request;
@@ -1224,6 +1230,9 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
 }
 
 pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
+    return batchWithSources(server, ctx, null);
+}
+pub fn batchWithSources(server: anytype, ctx: *httpx.Context, port: ?source_media.Port) !httpx.Response {
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 64 << 20 };
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
@@ -1253,7 +1262,7 @@ pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
     const results = try a.alloc(Result, items.array.items.len);
     var succeeded: usize = 0;
     const deadline = @import("../request_deadline.zig").platformDeadline(ctx) orelse @import("connections.zig").inferenceInvocationDeadlineNs();
-    const options = ExecutionOptions{ .response_delivery = .buffered, .attempt_limit = try attemptBudget(ctx) };
+    const options = ExecutionOptions{ .response_delivery = .buffered, .attempt_limit = try attemptBudget(ctx), .source_port = port };
     for (items.array.items, results, 0..) |item, *result, index| {
         result.* = .{ .custom_id = item.object.get("custom_id").?.string, .index = index };
         if (ctx.isCancellationRequested()) return error.Canceled;
@@ -1417,23 +1426,8 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
     const a = arena.allocator();
-    var root: Json = .{ .object = .empty };
-    if (server.publicInferenceEnabled()) if (server.antfly_provider) |provider| if (provider.list_models_json) |list| {
-        const bytes = list(provider.ptr, a) catch null;
-        if (bytes) |value| root = std.json.parseFromSliceLeaky(Json, a, value, .{}) catch .{ .object = .empty };
-    };
-    if (root != .object) root = .{ .object = .empty };
-    if (!root.object.contains("allow_downloads")) try root.object.put(a, "allow_downloads", .{ .bool = false });
-    if (!root.object.contains("backends")) try root.object.put(a, "backends", .{ .object = .empty });
-    inline for (.{ "chunkers", "rerankers", "embedders", "generators", "extractors", "deciders", "rewriters", "readers", "transcribers" }) |category| {
-        if (!root.object.contains(category)) try root.object.put(a, category, .{ .object = .empty });
-    }
-    try root.object.put(a, "public_inference_enabled", .{ .bool = server.publicInferenceEnabled() });
-    if (!server.publicInferenceEnabled()) {
-        try root.object.put(a, "object", .{ .string = "list" });
-        try root.object.put(a, "data", .{ .array = std.array_list.Managed(Json).init(a) });
-        return ctx.json(root);
-    }
+    var root = try localModelCatalog(a, server);
+    if (!server.publicInferenceEnabled()) return ctx.json(root);
     const named = try view(server);
     var data: Json = root.object.get("data") orelse .{ .array = std.array_list.Managed(Json).init(a) };
     if (data != .array) data = .{ .array = std.array_list.Managed(Json).init(a) };
@@ -1499,6 +1493,59 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
     try root.object.put(a, "object", .{ .string = "list" });
     try root.object.put(a, "data", data);
     return ctx.json(root);
+}
+
+/// The node's own installed-model catalog. It reads only the local inference
+/// provider, so it never probes connections or remote upstreams. While public
+/// execution is disabled it is the complete response, with every entry marked
+/// `invocable: false`; when enabled, callers extend it with aliases and
+/// connections.
+fn localModelCatalog(a: std.mem.Allocator, server: anytype) !Json {
+    var root: Json = .{ .object = .empty };
+    if (server.antfly_provider) |provider| if (provider.list_models_json) |list| {
+        const bytes = list(provider.ptr, a) catch |err| blk: {
+            // The catalog degrades to empty, so say why instead of failing silently.
+            std.log.warn("model catalog listing failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (bytes) |value| root = std.json.parseFromSliceLeaky(Json, a, value, .{}) catch .{ .object = .empty };
+    };
+    if (root != .object) root = .{ .object = .empty };
+    if (!root.object.contains("allow_downloads")) try root.object.put(a, "allow_downloads", .{ .bool = false });
+    if (!root.object.contains("backends")) try root.object.put(a, "backends", .{ .object = .empty });
+    inline for (local_catalog_categories) |category| {
+        if (!root.object.contains(category)) try root.object.put(a, category, .{ .object = .empty });
+    }
+    try root.object.put(a, "public_inference_enabled", .{ .bool = server.publicInferenceEnabled() });
+    if (!server.publicInferenceEnabled()) {
+        try markLocalCatalogNotInvocable(a, &root);
+        try root.object.put(a, "object", .{ .string = "list" });
+        const data = root.object.get("data");
+        if (data == null or data.? != .array)
+            try root.object.put(a, "data", .{ .array = std.array_list.Managed(Json).init(a) });
+    }
+    return root;
+}
+
+const local_catalog_categories = .{ "chunkers", "rerankers", "embedders", "generators", "extractors", "deciders", "rewriters", "readers", "transcribers" };
+
+/// Mark a local catalog listed while public execution is disabled. Entries keep
+/// their compatibility and error; `invocable: false` says public calls will 403.
+fn markLocalCatalogNotInvocable(a: std.mem.Allocator, root: *Json) !void {
+    // Local predictors come from this node's ML directory, not connection
+    // transports, and are equally not invocable while disabled.
+    inline for (local_catalog_categories ++ .{"predictors"}) |category| {
+        if (root.object.getPtr(category)) |group| if (group.* == .object) {
+            for (group.object.values()) |*entry| if (entry.* == .object) {
+                try entry.object.put(a, "invocable", .{ .bool = false });
+            };
+        };
+    }
+    if (root.object.getPtr("data")) |data| if (data.* == .array) {
+        for (data.array.items) |*entry| if (entry.* == .object) {
+            try entry.object.put(a, "invocable", .{ .bool = false });
+        };
+    };
 }
 
 fn connectionCatalogCapabilities(named: gateway.View, category: []const u8, connection: []const u8, model: []const u8) gateway.Capabilities {
@@ -1712,6 +1759,50 @@ fn ownsLocalAdmission(server: anytype, named: gateway.View, task: gateway.Task, 
         },
         else => false,
     };
+}
+
+test "httpx inference gateway lists local models without public execution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The fake exposes only the local provider: no connection, alias, or
+    // predictor transport members exist to probe, so the catalog is local-only.
+    const Provider = struct {
+        ptr: *anyopaque,
+        list_models_json: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]u8,
+        fn list(_: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
+            return alloc.dupe(u8,
+                \\{"generators":{"acme/demo":{"compatibility":"compatible"}},
+                \\ "extractors":{"acme/broken":{"compatibility":"incompatible","error":{"code":"MissingGlinerSpanEncoderConfig","message":"unreadable"}}},
+                \\ "predictors":{"risk":{"task":"predict","num_features":2,"num_outputs":1}},
+                \\ "object":"list","data":[{"id":"acme/demo","object":"model"}]}
+            );
+        }
+    };
+    const Server = struct {
+        enabled: bool,
+        antfly_provider: ?Provider,
+        fn publicInferenceEnabled(self: *@This()) bool {
+            return self.enabled;
+        }
+    };
+    var token: u8 = 0;
+    var server: Server = .{ .enabled = false, .antfly_provider = .{ .ptr = &token, .list_models_json = Provider.list } };
+    const disabled = try localModelCatalog(a, &server);
+    try std.testing.expect(!disabled.object.get("public_inference_enabled").?.bool);
+    const demo = disabled.object.get("generators").?.object.get("acme/demo").?.object;
+    try std.testing.expect(!demo.get("invocable").?.bool);
+    try std.testing.expectEqualStrings("compatible", demo.get("compatibility").?.string);
+    const broken = disabled.object.get("extractors").?.object.get("acme/broken").?.object;
+    try std.testing.expectEqualStrings("MissingGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
+    try std.testing.expect(!broken.get("invocable").?.bool);
+    try std.testing.expect(!disabled.object.get("data").?.array.items[0].object.get("invocable").?.bool);
+    try std.testing.expect(!disabled.object.get("predictors").?.object.get("risk").?.object.get("invocable").?.bool);
+
+    server.enabled = true;
+    const enabled = try localModelCatalog(a, &server);
+    try std.testing.expect(enabled.object.get("public_inference_enabled").?.bool);
+    try std.testing.expect(!enabled.object.get("generators").?.object.get("acme/demo").?.object.contains("invocable"));
 }
 
 test "httpx inference gateway physical catalogs preserve task ambiguity" {

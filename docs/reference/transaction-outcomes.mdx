@@ -44,6 +44,6 @@ A durable decision and a completed search visibility barrier are separate
 facts. `sync_level` selects the write-local barrier; pending results do not
 undo the committed decision. See the [write contract](https://github.com/antflydb/antfly/blob/main/zig/DB.md#write-contract)
 and [derived readiness and repair](https://github.com/antflydb/antfly/blob/main/zig/DB.md#readiness-and-repair).
-For writable lake reads, [read requirements](/docs/read-requirements) carry a
+For writable lake reads, [read requirements](read-requirements.md) carry a
 minimum accepted/published frontier; they do not replace transaction recovery
 or identify a retained cursor snapshot.
