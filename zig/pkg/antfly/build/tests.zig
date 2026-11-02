@@ -6172,6 +6172,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed graph root-specific traversal matches independent roots",
         "distributed graph visited maps charge actual allocations and reject undersized budgets",
         "distributed graph adjacency cache surrenders optional memory",
+        "distributed graph adjacency cache reclaims backing budgets and declines opaque owners",
+        "distributed graph adjacency cache parent reclamation respects pins and coordinator accounting",
         "api query contract legacy graph node filters use retrieval validation",
         "api query contract graph permission filters stop denied roots and intermediates",
         "public graph metric borrowed wire",

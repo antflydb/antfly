@@ -29,6 +29,8 @@ const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
 const graph_paths_mod = @import("antfly_local_sources").graph_paths;
 const graph_traversal_mod = @import("antfly_local_sources").graph_traversal;
 const graph_work_budget = @import("antfly_local_sources").graph_work_budget;
+const graph_memory_budget = @import("antfly_local_sources").sql_memory_budget;
+const graph_reclamation = @import("antfly_platform").allocator.reclamation;
 const graph_distinct_budget_diagnostic = @import("antfly_local_sources").graph_distinct_budget_diagnostic;
 const graph_work_budget_diagnostic = @import("antfly_local_sources").graph_work_budget_diagnostic;
 const graph_path_weight_diagnostic = @import("antfly_local_sources").graph_path_weight_diagnostic;
@@ -3362,7 +3364,8 @@ const CanonicalEdgeBatch = struct {
         const a = self.tracked.allocator();
         const budget = reader.physical_work_budget orelse return;
         if (budget.max_retained_state_bytes -| budget.retained_state_bytes < 2 * 1024 * 1024) return;
-        for (frontier) |item| {
+        for (frontier, 0..) |item, i| {
+            if (reader.root_groups) |groups| if (groups.representative(reader.frontier_base + i) != reader.frontier_base + i) continue;
             if (max_depth != 0 and item.depth >= max_depth) continue;
             const tagged = item.table orelse reader.source_table;
             const names = [_][]const u8{ tagged, reader.source_table };
@@ -3459,6 +3462,8 @@ const DistributedEdgeReader = struct {
     physical_work_budget: ?*graph_pattern_mod.WorkBudget = null,
     prefetched: ?*CanonicalEdgeBatch = null,
     reuse_cache: ?*TraversalReadCache = null,
+    root_groups: ?*const RootFrontierGroups = null,
+    frontier_base: usize = 0,
 
     pub fn routingIndexTable(self: @This(), table: ?[]const u8) ?[]const u8 {
         return table orelse self.source_table;
@@ -5188,16 +5193,115 @@ const TraversalReadCache = struct {
     active: ?*const Entry = null,
     capacity: usize = 0,
 
+    mutex: std.atomic.Mutex = .unlocked,
+    parents: [32]Parent = undefined,
+    parent_count: usize = 0,
+    const Parent = struct { registry: *graph_reclamation.Registry, hook: graph_reclamation.Reclaimer };
+
+    fn lock(self: *@This()) void {
+        platform_sync.lockYielding(&self.mutex);
+    }
+    // Parent allocation callbacks may run on fanout threads. They only free
+    // local cache storage; the coordinator refunds its graph lease under lock.
+    fn settle(self: *@This()) void {
+        if (self.tracked) |tracked| self.reservation.resize(tracked.live_bytes) catch unreachable;
+    }
+    const FreeLocks = struct {
+        held: [32]*std.atomic.Mutex = undefined,
+        count: usize = 0,
+        fn take(self: *@This(), mutex: *std.atomic.Mutex) bool {
+            const Guard = graph_reclamation.Guard;
+            if (Guard.held(mutex)) return true;
+            if (self.count == self.held.len or !Guard.allowed() or !mutex.tryLock()) return false;
+            self.held[self.count] = mutex;
+            self.count += 1;
+            Guard.enter(mutex);
+            return true;
+        }
+        fn acquire(self: *@This(), backing: std.mem.Allocator) bool {
+            var current = backing;
+            for (0..32) |_| {
+                if (graph_memory_budget.parentAllocator(current)) |parent| {
+                    const budget: *graph_memory_budget = @ptrCast(@alignCast(current.ptr));
+                    if (!self.take(&budget.mutex)) return false;
+                    current = parent;
+                } else if (graph_reclamation.Quota.owner(current)) |quota| {
+                    if (!self.take(&quota.mutex)) return false;
+                    current = quota.backing;
+                } else if (@import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator.parentAllocator(current)) |parent| {
+                    const owner: *@import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator = @ptrCast(@alignCast(current.ptr));
+                    if (!self.take(owner.shared_mutex orelse &owner.mutex)) return false;
+                    current = parent;
+                } else return graph_memory_budget.reusableHeadroom(current) != null;
+            }
+            return false;
+        }
+        fn deinit(self: *@This()) void {
+            while (self.count > 0) {
+                self.count -= 1;
+                graph_reclamation.Guard.leave();
+                self.held[self.count].unlock();
+            }
+        }
+    };
+    fn reclaimParent(raw: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!graph_reclamation.Guard.allowed() or !self.mutex.tryLock()) return false;
+        defer self.mutex.unlock();
+        const tracked = if (self.tracked) |*tracked| tracked else return false;
+        var locks = FreeLocks{};
+        defer locks.deinit();
+        if (!locks.acquire(tracked.backing)) return false;
+        graph_reclamation.Guard.beginReclaim();
+        defer graph_reclamation.Guard.endReclaim();
+        for (&self.entries, 0..) |*entry, i| if (entry.*) |*value| {
+            if (self.active == value) continue;
+            self.evict(i);
+            return true;
+        };
+        return false;
+    }
+    fn registerParents(self: *@This(), backing: std.mem.Allocator) void {
+        var current = backing;
+        for (0..32) |_| {
+            var registry: ?*graph_reclamation.Registry = null;
+            const parent = if (graph_memory_budget.parentAllocator(current)) |parent| blk: {
+                const owner: *graph_memory_budget = @ptrCast(@alignCast(current.ptr));
+                registry = &owner.residency;
+                break :blk parent;
+            } else if (graph_reclamation.Quota.owner(current)) |owner| blk: {
+                registry = &owner.residency;
+                break :blk owner.backing;
+            } else @import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator.parentAllocator(current) orelse return;
+            if (registry) |owner| {
+                const link = &self.parents[self.parent_count];
+                link.* = .{ .registry = owner, .hook = .{ .ptr = self, .reclaim = reclaimParent } };
+                owner.register(&link.hook);
+                self.parent_count += 1;
+            }
+            current = parent;
+        }
+    }
+
     fn pin(self: *@This(), table: []const u8, group: ?u64, node: FrontierState) ?*const Entry {
+        self.lock();
+        defer self.mutex.unlock();
+        self.settle();
         std.debug.assert(self.active == null);
-        self.active = self.get(table, group, node);
+        self.active = self.getLocked(table, group, node);
         return self.active;
     }
     fn unpin(self: *@This()) void {
+        self.lock();
+        defer self.mutex.unlock();
         self.active = null;
+        self.settle();
     }
     fn reclaim(ctx: *anyopaque, needed: usize) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        self.settle();
         const budget = self.reservation.budget orelse return;
         for (&self.entries, 0..) |*entry, i| {
             if (needed <= budget.max_retained_state_bytes -| budget.retained_state_bytes) break;
@@ -5210,6 +5314,12 @@ const TraversalReadCache = struct {
     }
 
     fn get(self: *@This(), table: []const u8, group: ?u64, node: FrontierState) ?*const Entry {
+        self.lock();
+        defer self.mutex.unlock();
+        self.settle();
+        return self.getLocked(table, group, node);
+    }
+    fn getLocked(self: *@This(), table: []const u8, group: ?u64, node: FrontierState) ?*const Entry {
         for (&self.entries) |*maybe| if (maybe.*) |*entry| {
             if (entry.group == group and std.mem.eql(u8, entry.table, table) and graph_node_identity.equal(.{ .table = entry.identity.table(), .key = entry.identity.key() }, .{ .table = node.table, .key = node.key })) return entry;
         };
@@ -5226,8 +5336,20 @@ const TraversalReadCache = struct {
         }
     }
     fn put(self: *@This(), backing: std.mem.Allocator, budget: *graph_work_budget.WorkBudget, table: []const u8, group: ?u64, node: FrontierState, result: db_mod.types.GraphSearchResult, groups: []const u64) void {
-        if (self.get(table, group, node) != null) return;
+        self.lock();
+        defer self.mutex.unlock();
+        self.settle();
+        if (self.getLocked(table, group, node) != null) return;
+        // Standard arenas can be bypassed for optional storage, but quotas
+        // remain authoritative. Opaque/nonrefundable owners decline caching.
+        const cache_backing = graph_memory_budget.reclaimingAllocator(backing);
+        const parent_room = graph_memory_budget.reusableHeadroom(cache_backing) orelse return;
         if (self.tracked == null) {
+            {
+                var locks = FreeLocks{};
+                defer locks.deinit();
+                if (!locks.acquire(cache_backing)) return;
+            }
             const allowance = @min(@as(usize, 8 * 1024 * 1024), (budget.max_retained_state_bytes -| budget.retained_state_bytes) / 8);
             if (allowance < 4096) return;
             // One synchronous traversal owns this optional memory provider.
@@ -5235,14 +5357,15 @@ const TraversalReadCache = struct {
             self.reservation = .{ .budget = budget };
             self.capacity = allowance;
             self.local_budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = allowance });
-            self.tracked = .{ .backing = backing, .budget = &self.local_budget };
+            self.tracked = .{ .backing = cache_backing, .budget = &self.local_budget };
+            self.registerParents(cache_backing);
             budget.state_reclaimer = .{ .ctx = self, .reclaim = reclaim };
         }
         std.debug.assert(self.active == null);
         self.evict(self.cursor);
         // Reserve only available construction headroom, and return all unused
         // bytes immediately, including when an oversized entry is declined.
-        const ceiling = @min(self.capacity, self.reservation.bytes + (budget.max_retained_state_bytes -| budget.retained_state_bytes));
+        const ceiling = @min(self.capacity, @min(self.reservation.bytes + (budget.max_retained_state_bytes -| budget.retained_state_bytes), self.tracked.?.live_bytes +| parent_room));
         self.reservation.resize(ceiling) catch return;
         self.local_budget.max_retained_state_bytes = ceiling;
         defer self.reservation.resize(self.tracked.?.live_bytes) catch unreachable;
@@ -5261,6 +5384,11 @@ const TraversalReadCache = struct {
         self.entries[self.cursor] = .{ .table = owned_table, .group = group, .identity = identity, .result = owned_result, .groups = owned_groups };
     }
     fn deinit(self: *@This()) void {
+        // Unregister before taking the cache lock, joining any parent callback.
+        for (self.parents[0..self.parent_count]) |*parent| parent.registry.unregister(&parent.hook);
+        self.parent_count = 0;
+        self.lock();
+        defer self.mutex.unlock();
         for (0..self.entries.len) |i| self.evict(i);
         if (self.tracked) |tracked| std.debug.assert(tracked.live_bytes == 0);
         if (self.reservation.budget) |budget| budget.state_reclaimer = null;
@@ -5422,7 +5550,12 @@ fn executeDistributedTraverse(
                 .reuse_cache = if (reuse_reads) &read_cache else null,
             };
             for (frontier, 0..) |item, frontier_index| {
-                if (batch_edges and frontier_index % 64 == 0) try edge_batch.prepare(reader, frontier[frontier_index..@min(frontier.len, frontier_index + 64)], max_depth, graph_query.query.params);
+                if (batch_edges and frontier_index % 64 == 0) {
+                    var batch_reader = reader;
+                    batch_reader.root_groups = &root_groups;
+                    batch_reader.frontier_base = frontier_index;
+                    try edge_batch.prepare(batch_reader, frontier[frontier_index..@min(frontier.len, frontier_index + 64)], max_depth, graph_query.query.params);
+                }
                 if (root_groups.representative(frontier_index) != frontier_index) continue;
                 if (max_depth != 0 and item.depth >= max_depth) continue;
                 const tagged_table = item.table orelse table_name;
@@ -5431,7 +5564,7 @@ fn executeDistributedTraverse(
                 for (tables[0..table_count]) |expansion_table| {
                     try metric_batch.prepareTable(expansion_table);
                     const cached = if (reuse_reads) read_cache.pin(expansion_table, null, item) else null;
-                    defer read_cache.unpin();
+                    defer if (cached != null) read_cache.unpin();
                     var fresh: ?CanonicalGraphStep = null;
                     defer if (fresh) |*step| step.deinit(alloc);
                     if (cached == null) {
@@ -16189,6 +16322,101 @@ test "distributed graph adjacency cache surrenders optional memory" {
     budget.releaseStateBytes(budget.max_retained_state_bytes);
 }
 
+test "distributed graph adjacency cache reclaims backing budgets and declines opaque owners" {
+    const a = std.testing.allocator;
+    const node = FrontierState{ .key = @constCast("root") };
+    const result = db_mod.types.GraphSearchResult{ .name = @constCast(""), .nodes = @constCast(&[_]graph_query_mod.GraphResultNode{.{ .key = @constCast("child"), .depth = 1, .distance = 1 }}), .hits = &.{}, .total_hits = 1 };
+    // Opaque quota wrappers cannot prove refundable storage or expose hooks.
+    // Declining speculation keeps mandatory allocations within their quota.
+    {
+        var parent = @import("antfly_local_sources").storage_lite_test_allocator.BudgetAllocator{ .backing = a, .limit = 4096 };
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 32 * 1024 });
+        var cache = TraversalReadCache{};
+        defer cache.deinit();
+        cache.put(parent.allocator(), &budget, "docs", null, node, result, &.{});
+        try std.testing.expect(cache.get("docs", null, node) == null);
+        const required = try parent.allocator().alloc(u8, 4096);
+        parent.allocator().free(required);
+        try std.testing.expectEqual(@as(usize, 0), parent.live);
+    }
+    // Direct allocations, not just graph-tracked allocations, can reclaim
+    // cached payloads through every known budget layer in the backing chain.
+    for (0..5) |kind| {
+        var quota = graph_reclamation.Quota.init(a, 4096);
+        defer quota.deinit();
+        var sql = graph_memory_budget{ .backing = if (kind == 1) a else quota.allocator(), .limit = if (kind == 1) 4096 else 16384 };
+        var region = std.heap.ArenaAllocator.init(quota.allocator());
+        defer region.deinit();
+        var locked = @import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator{ .backing = sql.allocator() };
+        const parent = if (kind == 0 or kind == 3) quota.allocator() else if (kind == 4) locked.allocator() else sql.allocator();
+        const backing = if (kind == 3) region.allocator() else parent;
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 32 * 1024 });
+        {
+            var cache = TraversalReadCache{};
+            defer cache.deinit();
+            cache.put(backing, &budget, "docs", null, node, result, &.{});
+            try std.testing.expect(cache.get("docs", null, node) != null);
+            try std.testing.expect(budget.retained_state_bytes > 0);
+            const required = try parent.alloc(u8, 4096);
+            defer parent.free(required);
+            try std.testing.expect(cache.get("docs", null, node) == null);
+            try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+        }
+        try std.testing.expect(!quota.residency.active() and !sql.residency.active());
+        try std.testing.expectEqual(@as(usize, 0), sql.live);
+        try std.testing.expectEqual(@as(usize, 0), quota.live_bytes);
+    }
+    // Historical arena accounting cannot refund optional residency.
+    {
+        var monotonic = graph_memory_budget{ .backing = a, .limit = 4096, .monotonic = true };
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 32 * 1024 });
+        var cache = TraversalReadCache{};
+        defer cache.deinit();
+        cache.put(monotonic.allocator(), &budget, "docs", null, node, result, &.{});
+        try std.testing.expect(cache.get("docs", null, node) == null);
+        try std.testing.expectEqual(@as(usize, 0), monotonic.spent);
+    }
+}
+
+test "distributed graph adjacency cache parent reclamation respects pins and coordinator accounting" {
+    const a = std.testing.allocator;
+    var quota = graph_reclamation.Quota.init(a, 4096);
+    defer quota.deinit();
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 32 * 1024 });
+    var cache = TraversalReadCache{};
+    defer cache.deinit();
+    const node = FrontierState{ .key = @constCast("root") };
+    const result = db_mod.types.GraphSearchResult{ .name = @constCast(""), .nodes = @constCast(&[_]graph_query_mod.GraphResultNode{.{ .key = @constCast("child"), .depth = 1, .distance = 1 }}), .hits = &.{}, .total_hits = 1 };
+    cache.put(quota.allocator(), &budget, "docs", null, node, result, &.{});
+    const pinned = cache.pin("docs", null, node).?;
+    try std.testing.expectError(error.OutOfMemory, quota.allocator().alloc(u8, 4096));
+    try std.testing.expectEqualStrings("child", pinned.result.nodes[0].key);
+    cache.unpin();
+    const retained = budget.retained_state_bytes;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const Task = struct {
+        fn run(parent: std.mem.Allocator, failure: *?anyerror) void {
+            const required = parent.alloc(u8, 4096) catch |err| {
+                failure.* = err;
+                return;
+            };
+            parent.free(required);
+        }
+    };
+    var failure: ?anyerror = null;
+    var group: std.Io.Group = .init;
+    group.async(io_impl.io(), Task.run, .{ quota.allocator(), &failure });
+    try group.await(io_impl.io());
+    if (failure) |err| return err;
+    // A fanout callback frees physical bytes but leaves the coordinator's
+    // WorkBudget untouched until its next synchronized cache operation.
+    try std.testing.expect(retained > 0);
+    try std.testing.expectEqual(retained, budget.retained_state_bytes);
+    try std.testing.expect(cache.get("docs", null, node) == null);
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
 test "distributed graph visited maps charge actual allocations and reject undersized budgets" {
     const a = std.testing.allocator;
     var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 1024 });
@@ -17599,6 +17827,7 @@ test "distributed graph metric post processing applies max results after filter 
         fail_scores: bool = false,
         edge_calls: usize = 0,
         batch_edge_calls: usize = 0,
+        batch_edge_keys: usize = 0,
         unsupported_batch: bool = false,
         metadata_override: ?[]const u8 = null,
         batch_edge_cap: ?u32 = null,
@@ -17663,7 +17892,10 @@ test "distributed graph metric post processing applies max results after filter 
                         .clock = .awake,
                     } });
                 }
-            } else state.batch_edge_calls += 1;
+            } else {
+                state.batch_edge_calls += 1;
+                state.batch_edge_keys += request.keys.len;
+            }
             if (state.fail_batch and group == 22) return error.TopologyChanged;
             if (state.unsupported_batch) return error.GraphEdgesBatchUnsupported;
             try std.testing.expect(request.keys.len <= 64);
@@ -17766,6 +17998,8 @@ test "distributed graph metric post processing applies max results after filter 
         try std.testing.expectEqual(@as(usize, 260), overlapping.nodes.len);
         try std.testing.expectEqual(@as(usize, 0), fixture.edge_calls);
         try std.testing.expectEqual(@as(usize, 12), fixture.batch_edge_calls);
+        // 130 roots + 129 unique endpoints, once on each of two shards.
+        try std.testing.expectEqual(@as(usize, 518), fixture.batch_edge_keys);
     }
     // Compare selection ownership with a wide cached payload, independently
     // of response creation. No filtered-out payload needs a second copy.
