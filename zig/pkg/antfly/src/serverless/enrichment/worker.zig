@@ -600,7 +600,7 @@ pub const SparseEnricher = struct {
         var source_input_bytes = fact.source_input_bytes orelse try bodyPayloadBytes(fact.body.bytes);
         const original_read_budget = pages.remaining_read_bytes;
         defer pages.remaining_read_bytes = original_read_budget;
-        var replay_remaining = cfg.document_limits.max_replay_bytes;
+        var replay_remaining: u64 = cfg.document_limits.max_replay_bytes;
         const stored = try document_facts.readStoredBodyAlloc(self.alloc, pages, fact.body);
         defer self.alloc.free(stored);
         var base = fact.body;
@@ -1600,6 +1600,26 @@ fn buildChunkEmbeddingsAlloc(
     errdefer {
         for (out[0..initialized]) |*chunk_embedding| chunk_embedding.deinit(alloc);
     }
+    // Remote providers can embed a bounded chunk window in one invocation.
+    // Keep the legacy per-chunk path for providers without a batch contract.
+    if (model_preference == .require_model) if (self.chunk_embedder) |embedder| if (embedder.dense_embed_batch_fn != null) {
+        const vectors = try embedder.embedDenseBatch(alloc, self.chunk_embedding_name orelse return EnrichmentError.MissingChunkEmbeddingName, chunks, @intCast(dims));
+        defer {
+            for (vectors) |vector| alloc.free(vector);
+            alloc.free(vectors);
+        }
+        if (vectors.len != chunks.len) return error.ChunkEmbeddingBatchMismatch;
+        for (chunks, vectors, out) |chunk, vector, *item| {
+            if (vector.len != dims) return error.ChunkEmbeddingBatchMismatch;
+            for (vector) |value| if (!std.math.isFinite(value)) return error.ChunkEmbeddingBatchMismatch;
+            const owned_chunk = try alloc.dupe(u8, chunk);
+            errdefer alloc.free(owned_chunk);
+            const owned_vector = try alloc.dupe(f32, vector);
+            item.* = .{ .chunk = owned_chunk, .embedding = owned_vector };
+            initialized += 1;
+        }
+        return .{ .embeddings = out, .used_model = true, .used_fallback = false };
+    };
     var used_model = false;
     var used_fallback = false;
     for (chunks, 0..) |chunk, idx| {
@@ -3222,6 +3242,46 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "serverless required dense batches preserve ordering and unwind partial allocations" {
+    const Run = struct {
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedSingleEmbedding;
+        }
+        fn batch(raw: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const calls: *usize = @ptrCast(@alignCast(raw));
+            calls.* += 1;
+            const vectors = try a.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| a.free(vector);
+                a.free(vectors);
+            }
+            for (vectors, 0..) |*vector, i| {
+                const owned = try a.alloc(f32, dims);
+                @memset(owned, @floatFromInt(i + 1));
+                vector.* = owned;
+                initialized += 1;
+            }
+            return vectors;
+        }
+        fn run(a: Allocator) !void {
+            var calls: usize = 0;
+            var enricher = SparseEnricher{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = undefined };
+            defer enricher.deinit();
+            try enricher.setChunkEmbedder(.{ .ptr = &calls, .dense_embed_fn = single, .dense_embed_batch_fn = batch }, "test", 2);
+            const result = try buildChunkEmbeddingsAlloc(&enricher, &.{ "first", "second" }, 2, .require_model);
+            defer {
+                for (result.embeddings) |*entry| entry.deinit(a);
+                a.free(result.embeddings);
+            }
+            try std.testing.expectEqual(@as(usize, 1), calls);
+            try std.testing.expectEqual(@as(f32, 1), result.embeddings[0].embedding[0]);
+            try std.testing.expectEqual(@as(f32, 2), result.embeddings[1].embedding[0]);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "model aware media serverless chunks use the shared paged provider and retain recipes" {

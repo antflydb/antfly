@@ -5718,11 +5718,12 @@ pub const Node = struct {
             prompt = expanded;
         }
 
-        const media_admission = try generation.nativeGenerationMediaAdmission(
+        const media_admission = try generation.nativeGenerationMediaAdmissionForBackend(
             allocator,
             model_dir,
             messages,
             gpt_config,
+            if (model.session.backend() == .cuda) .cuda else .generic,
         );
         const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
@@ -8195,7 +8196,7 @@ pub const Node = struct {
         const control = self.extractionExecutionControl(null);
         const lane = try model.native_reader_execution_lane.acquire(control);
         defer lane.release();
-        const media = try generation.nativeGenerationMediaAdmission(a, model.model_dir, &.{.{ .role = "user", .content = "", .image_bytes = &.{fixture} }}, cfg);
+        const media = try generation.nativeGenerationMediaAdmissionForBackend(a, model.model_dir, &.{.{ .role = "user", .content = "", .image_bytes = &.{fixture} }}, cfg, if (model.session.backend() == .cuda) .cuda else .generic);
         const one = try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, if (model.session.backend() == .cuda) .cuda else .metal, media);
         const limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(model.session, self.defaultGenerationLimits(.gpu)));
         const width = qwen3vl_projector.maxResidentVisionBatchItems(if (model.session.backend() == .cuda) .cuda else .metal);
@@ -8649,12 +8650,14 @@ pub const Node = struct {
         // images in that batch. Keep host/history/output reservations additive;
         // the epoch owns the bounded transient GPU workspace for that batch.
         const share_vision_peak = !platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK");
-        const shared_vision_bytes = try memory.visionBatchPeak(features.vision_batch_items);
-        const shared_vision_host_bytes = try memory.visionFrameHostPeak(features.visionRetainedBlocks(), features.vision_batch_items);
+        const shared_vision_bytes = try memory.visionBatchPeak(if (backend == .cuda) 1 else features.vision_batch_items);
+        const shared_vision_host_bytes = try memory.visionFrameHostPeak(features.visionRetainedBlocks(), if (backend == .cuda) 1 else features.vision_batch_items);
         const amounts = if (share_vision_peak) memory.amounts else try memory.amounts.merge(.{
             .backend_scratch_bytes = memory.vision_backend_peak,
             .host_scratch_bytes = try memory.visionFrameHostPeak(features.visionRetainedBlocks(), 1),
         });
+        const decoder_workspace: ?@import("reader_workspace.zig").Decoder = if (backend == .cuda and features.shared_decoder_scratch) memory.decoder_workspace else null;
+        const solo_decoder_peak = if (decoder_workspace) |plan| try plan.peak(1) else memory.decoder_backend_peak;
         const contract = try resolvedInferenceExecutorContract(self, "read", &model.manifest);
         if (image.len > @min(readInlineSourceByteCap(self), contract.batch.max_encoded_media_bytes) or
             (try measureExecutorDecodedImages(&model.manifest, &.{image})) > (contract.batch.max_decoded_pixels orelse std.math.maxInt(u64)))
@@ -8664,20 +8667,20 @@ pub const Node = struct {
         // fit even alone instead of returning retryable capacity errors.
         const solo = try features.soloPagePlan(
             amounts,
-            try std.math.add(usize, if (share_vision_peak) shared_vision_bytes else 0, memory.decoder_backend_peak),
+            try std.math.add(usize, if (share_vision_peak) shared_vision_bytes else 0, solo_decoder_peak),
             if (share_vision_peak) shared_vision_host_bytes else 0,
         );
-        if (!(solo.fitsLimits(limits) catch false)) {
-            std.log.warn("LightOnOCR3 read page exceeds the generation budget even when admitted alone scratch_bytes={d} scratch_limit_bytes={d}; raise --scratch-budget-mb or the other generation budgets", .{
-                solo.host_scratch_bytes +| solo.backend_scratch_bytes, limits.scratch_limit_bytes,
-            });
+        const solo_denial = solo.firstLimitExceeded(limits) catch return error.ResourceLimitExceeded;
+        if (solo_denial) |denial| {
+            var detail: [512]u8 = undefined;
+            std.log.warn("{s}", .{try lightOnSoloBudgetDenialMessage(&detail, denial)});
             return error.ResourceLimitExceeded;
         }
         const extended_epoch = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EXTENDED_EPOCH");
         // Refill completed slots in the same resident epoch. The simultaneous
         // window and every GPU forward retain their existing independent caps.
         const epoch_page_limit: usize = if (extended_epoch) 256 else 64;
-        var factory = LightOnStreamContext.Factory{ .node = self, .model = model, .cfg = cfg, .limits = limits, .physical_rows_limit = try lightOnCohortRowLimit(self.lightOnReaderRows(), contract.batch.max_items, model.manifest.capabilities), .epoch_page_limit = epoch_page_limit, .cuda_batch_enabled = self.lightOnCudaBatchEnabled(), .decoder_peak = memory.decoder_backend_peak, .features = features, .control = control };
+        var factory = LightOnStreamContext.Factory{ .node = self, .model = model, .cfg = cfg, .limits = limits, .physical_rows_limit = try lightOnCohortRowLimit(self.lightOnReaderRows(), contract.batch.max_items, model.manifest.capabilities), .epoch_page_limit = epoch_page_limit, .cuda_batch_enabled = self.lightOnCudaBatchEnabled(), .decoder_peak = memory.decoder_backend_peak, .decoder_workspace = decoder_workspace, .dynamic_vision_batch_items = if (backend == .cuda) features.vision_batch_items else 0, .features = features, .control = control };
         // Queue before admission and GPU allocation. Only active slots reserve
         // live resources; independently completed pages immediately free slots.
         // Logical occupancy can exceed the physical per-step contract. Every
@@ -8698,10 +8701,9 @@ pub const Node = struct {
         var admission_wait = LightOnAdmissionWait{ .last_progress_ns = admission_wait_started, .observed_steps = if (progress_aware_admission) ctx.coordinator.schedulerStats().step_batches_total else 0 };
         var admission_progress_poll_ns = admission_wait_started;
         var logged_wait = false;
-        var retry_delay_ns: u64 = std.time.ns_per_ms;
         var admission = while (true) {
             try control.check();
-            const admitted = ctx.admitPage(&factory, if (share_vision_peak) shared_vision_bytes else null, if (share_vision_peak) shared_vision_host_bytes else 0, amounts) catch |err| {
+            const admitted = ctx.admitRegisteredPage(&factory, index, if (share_vision_peak) shared_vision_bytes else null, if (share_vision_peak) shared_vision_host_bytes else 0, amounts) catch |err| {
                 // Live-memory pressure is transient as peers retire. Keep the
                 // page queued without its per-page lease; never bypass a cap.
                 if (err != error.ResourceTemporarilyUnavailable) return err;
@@ -8722,8 +8724,7 @@ pub const Node = struct {
                     });
                     logged_wait = true;
                 }
-                platform.time.sleepNs(retry_delay_ns);
-                if (ctx.phase_wait_ns != 0) retry_delay_ns = @min(retry_delay_ns * 2, 10 * std.time.ns_per_ms);
+                platform.time.sleepNs(admission_wait.nextRetryDelayNs());
                 continue;
             };
             break admitted;
@@ -12985,11 +12986,12 @@ pub const Node = struct {
             allocator.free(prompt);
             prompt = expanded;
         }
-        const media_admission = try generation.nativeGenerationMediaAdmission(
+        const media_admission = try generation.nativeGenerationMediaAdmissionForBackend(
             allocator,
             model_dir,
             messages,
             gpt_config,
+            if (model.session.backend() == .cuda) .cuda else .generic,
         );
         const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
@@ -14186,6 +14188,7 @@ pub const Node = struct {
                 parsed_docs.items,
                 gpt_cfg,
                 @min(model.manifest.maxTextSequenceLength(), qwen3vl_reranker.default_max_length),
+                if (model.session.backend() == .cuda) .cuda else .generic,
             ) catch return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = "Qwen3-VL reranker image geometry exceeds the supported admission envelope",
@@ -18691,6 +18694,7 @@ pub const Node = struct {
         documents: []const ParsedMultimodalRerankDocument,
         config: gpt_model_mod.Config,
         max_length: usize,
+        backend: qwen3vl_projector.AdmissionBackend,
     ) !generation.NativeGenerationMediaAdmission {
         if (config.family != .qwen3_vl or max_length == 0) {
             return error.InvalidRerankerConfiguration;
@@ -18700,7 +18704,7 @@ pub const Node = struct {
             if (document.images.len == 0) continue;
             const context_limit = max_length / document.images.len;
             if (context_limit < 4) return error.InputTokenLimitExceeded;
-            const estimate = try qwen3vl_projector.estimateAdmission(
+            const estimate = try qwen3vl_projector.estimateAdmissionForBackend(
                 document.images,
                 config,
                 .{
@@ -18708,6 +18712,7 @@ pub const Node = struct {
                     .min_merged_tokens = 4,
                     .max_merged_tokens = @min(@as(usize, 576), context_limit),
                 },
+                backend,
             );
             result.token_allowance = @max(
                 result.token_allowance,
@@ -21134,7 +21139,9 @@ pub const Node = struct {
             ) catch |err| switch (err) {
                 error.ReadOutputTruncated => return ctx.status(400).json(.{
                     .@"error" = "OUTPUT_TRUNCATED",
-                    .message = "Qwen3-VL reached 'max_tokens' before completing OCR; increase 'max_tokens' and retry",
+                    .message = try std.fmt.allocPrint(ctx.allocator, "{s} reached max_tokens={d} before completing OCR; increase max_tokens within model and deployment limits, or inspect output for repetition if already at the limit", .{
+                        if (admission_manifest.isLightOnOcr3()) @as([]const u8, "LightOnOCR-3") else "Qwen3-VL", max_tokens.?,
+                    }),
                 }),
                 error.ImageDecodeFailed => return readImageErrorResponse(ctx, err),
                 error.QueueFull => return transientCapacityFailureResponse(
@@ -28562,6 +28569,13 @@ fn lightOnPhysicalRowCeiling() usize {
 const LightOnAdmissionWait = struct {
     last_progress_ns: u64,
     observed_steps: u64 = 0,
+    retry_delay_ns: u64 = std.time.ns_per_ms,
+
+    fn nextRetryDelayNs(self: *LightOnAdmissionWait) u64 {
+        const delay = self.retry_delay_ns;
+        self.retry_delay_ns = @min(delay * 2, 10 * std.time.ns_per_ms);
+        return delay;
+    }
 
     fn expired(self: *LightOnAdmissionWait, now: u64, steps: ?u64) bool {
         if (steps) |current| {
@@ -28574,6 +28588,22 @@ const LightOnAdmissionWait = struct {
     }
 };
 
+fn lightOnSoloBudgetDenialMessage(buf: []u8, denial: runtime.tier.memory.AdmissionAmounts.LimitExceeded) ![]const u8 {
+    const limit = @tagName(denial.limit);
+    return std.fmt.bufPrint(buf, "LightOnOCR3 read page exceeds the generation budget even when admitted alone limit={s} required_bytes={d} limit_bytes={d}; increase --{s}-budget-mb (standalone: --inference-{s}-budget-mb) or reduce image size or output tokens", .{
+        limit, denial.requested_bytes, denial.limit_bytes, limit, limit,
+    });
+}
+
+test "LightOnOCR3 solo denial names the combined budget rather than scratch" {
+    var buf: [512]u8 = undefined;
+    const message = try lightOnSoloBudgetDenialMessage(&buf, .{ .limit = .combined, .requested_bytes = 130, .limit_bytes = 120 });
+    try std.testing.expect(std.mem.indexOf(u8, message, "limit=combined required_bytes=130 limit_bytes=120") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "--combined-budget-mb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "--inference-combined-budget-mb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "scratch") == null);
+}
+
 test "LightOnOCR3 wide admission waits for progressing cohorts and bounds stalled capacity" {
     const second = std.time.ns_per_s;
     var active = LightOnAdmissionWait{ .last_progress_ns = 0, .observed_steps = 7 };
@@ -28584,6 +28614,8 @@ test "LightOnOCR3 wide admission waits for progressing cohorts and bounds stalle
     try std.testing.expect(!active.expired(89 * second, 10));
     try std.testing.expect(active.expired(90 * second, 10));
     var legacy = LightOnAdmissionWait{ .last_progress_ns = second };
+    for ([_]u64{ 1, 2, 4, 8, 10, 10 }) |ms|
+        try std.testing.expectEqual(ms * std.time.ns_per_ms, legacy.nextRetryDelayNs());
     try std.testing.expect(!legacy.expired(30 * second, null));
     try std.testing.expect(legacy.expired(31 * second, null));
     // Saturate a clock sample preceding initialization rather than underflow.
@@ -39990,13 +40022,13 @@ test "Qwen3-VL multimodal reranker reserves projector scratch before execution" 
         .vision_deepstack_visual_indexes_len = 3,
     };
 
-    const estimate = try Node.qwen3VlRerankerMediaAdmission(&documents, config, 8192);
+    const estimate = try Node.qwen3VlRerankerMediaAdmission(&documents, config, 8192, .generic);
     try std.testing.expect(estimate.token_allowance >= 5);
     try std.testing.expect(estimate.host_scratch_bytes > 0);
     try std.testing.expect(estimate.backend_scratch_bytes > 0);
     try std.testing.expectError(
         error.InputTokenLimitExceeded,
-        Node.qwen3VlRerankerMediaAdmission(&documents, config, 3),
+        Node.qwen3VlRerankerMediaAdmission(&documents, config, 3, .generic),
     );
 }
 
@@ -47680,4 +47712,80 @@ test "reader batching API reports measured completion without inferring it from 
         const result = try Node.toApiReadObject(arena.allocator(), .{ .allocator = arena.allocator(), .text = "same text", .completion = completion }, 0);
         try std.testing.expectEqualStrings(expected, result.status.?);
     }
+}
+
+test "dynamic CUDA admission counts admitted pages and rolls back failed batch growth" {
+    const memory = runtime.tier.memory;
+    const Context = Node.LightOnStreamContext;
+    const mib = 1024 * 1024;
+    var node: Node = undefined;
+    node.model_manager = model_manager_mod.ModelManager.init(std.testing.allocator, backends_mod.SessionManager.init(std.testing.allocator));
+    defer node.model_manager.deinit();
+    var bootstrap = try node.model_manager.acquireRunResourceAmounts(.cpu, .{}, .{});
+    bootstrap.release();
+    const controller = &node.model_manager.resource_domain.?.admission;
+    controller.configureSharedLimits(.{});
+    controller.live_capacity_bytes = 1024 * mib;
+    controller.live_pending_bytes = 1;
+    controller.live_epoch = 1;
+    var anchor = try controller.tryAcquire(.cpu, .{}, .{}, false);
+    anchor.live_reserved_bytes = 1;
+    defer anchor.release();
+    const limits = memory.Limits{ .host_limit_bytes = 8 * mib, .backend_limit_bytes = 32 * mib, .combined_limit_bytes = 40 * mib, .kv_limit_bytes = 8 * mib, .scratch_limit_bytes = 32 * mib };
+    const capacity = memory.AdmissionAmounts{ .backend_scratch_bytes = 24 * mib, .backend_kv_bytes = 8 * mib };
+    var model_lease = try controller.tryAcquire(.gpu, limits, capacity, false);
+    defer model_lease.release();
+    var workspace = memory.ReservedGenerationWorkspace{ .floor = limits, .capacity = capacity };
+    defer workspace.borrowed.deinit();
+    var model: model_manager_mod.LoadedModel = undefined;
+    model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
+    var ctx: Context = undefined;
+    ctx.cb = null;
+    ctx.features = .{};
+    ctx.cfg = .{};
+    ctx.auxiliary_ready = .init(true);
+    ctx.phase_wait_ns = 100 * std.time.ns_per_us;
+    ctx.phase_fair = false;
+    ctx.step_mutex = .unlocked;
+    ctx.step_gate = .{};
+    ctx.gate_events = false;
+    ctx.decoder_peak = .{};
+    ctx.vision_peak = .{};
+    ctx.vision_host_peak = .{};
+    ctx.published_decoder_peak = .init(0);
+    ctx.published_vision_peak = .init(0);
+    ctx.published_vision_host_peak = .init(0);
+    ctx.decoder_workspace = null;
+    ctx.vision_per_item_peak = 0;
+    ctx.vision_host_per_item_peak = 0;
+    ctx.controls_mutex = .unlocked;
+    ctx.controls = @splat(null);
+    ctx.admitted_controls = @splat(false);
+    ctx.admitted_workspace = @splat(null);
+    ctx.admitted_vision = @splat(0);
+    ctx.admitted_host = @splat(0);
+    ctx.admitted_pages = 0;
+    ctx.registered_pages = 0;
+    ctx.registered_window_peak = 0;
+    defer ctx.decoder_peak.deinit();
+    defer ctx.vision_peak.deinit();
+    defer ctx.vision_host_peak.deinit();
+    var factory = Context.Factory{ .node = &node, .model = &model, .cfg = .{}, .limits = limits, .physical_rows_limit = 32, .decoder_workspace = .{ .per_item = 8 * mib, .head = 2 * mib, .max_items = 4 }, .dynamic_vision_batch_items = 4, .control = .{} };
+    const page = memory.AdmissionAmounts{ .host_scratch_bytes = mib, .backend_scratch_bytes = mib, .backend_kv_bytes = 2 * mib };
+    const first_index = ctx.register(.{});
+    const pending_index = ctx.register(.{});
+    var first = try ctx.admitRegisteredPage(&factory, first_index, 4 * mib, 0, page);
+    defer first.release();
+    try std.testing.expectEqual(@as(usize, 10 * mib), ctx.decoder_peak.bytes);
+    try std.testing.expectEqual(@as(usize, 4 * mib), ctx.vision_peak.bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, ctx.admitRegisteredPage(&factory, pending_index, 4 * mib, 0, page));
+    try std.testing.expectEqual(@as(usize, 10 * mib), ctx.decoder_peak.bytes);
+    try std.testing.expectEqual(@as(usize, 4 * mib), ctx.vision_peak.bytes);
+    try std.testing.expectEqual(@as(usize, 1), ctx.admitted_pages);
+    first.release();
+    ctx.unregister(first_index);
+    var next = try ctx.admitRegisteredPage(&factory, pending_index, 4 * mib, 0, page);
+    defer next.release();
+    ctx.unregister(pending_index);
+    try std.testing.expectEqual(@as(usize, 0), ctx.admitted_pages);
 }

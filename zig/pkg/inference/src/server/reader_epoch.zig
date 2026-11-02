@@ -66,6 +66,11 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         controls_mutex: std.atomic.Mutex = .unlocked,
         controls: [reader_execution_pool.Pool.max_capacity]?InferenceExecutionControl = @splat(null),
         registered_pages: usize = 0,
+        admitted_pages: usize = 0,
+        admitted_controls: [reader_execution_pool.Pool.max_capacity]bool = @splat(false),
+        admitted_vision: [reader_execution_pool.Pool.max_capacity]usize = @splat(0),
+        admitted_host: [reader_execution_pool.Pool.max_capacity]usize = @splat(0),
+        admitted_workspace: [reader_execution_pool.Pool.max_capacity]?@import("reader_workspace.zig").Decoder = @splat(null),
         registered_window_peak: usize = 0,
         execution_id: u64,
         completed: usize = 0,
@@ -83,6 +88,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         vision_peak: reader_execution_pool.SharedPeak(model_manager_mod.GenerationAdmissionLease) = .{},
         vision_host_peak: reader_execution_pool.SharedPeak(model_manager_mod.GenerationAdmissionLease) = .{},
         decoder_peak: reader_execution_pool.SharedPeak(model_manager_mod.GenerationAdmissionLease) = .{},
+        decoder_workspace: ?@import("reader_workspace.zig").Decoder = null,
+        vision_per_item_peak: usize = 0,
+        vision_host_per_item_peak: usize = 0,
         worker: ?std.Thread = null,
         worker_io: ?std.Io.Threaded = null,
         worker_wake: std.Io.Event = .unset,
@@ -102,6 +110,8 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             epoch_page_limit: usize = 64,
             cuda_batch_enabled: bool = false,
             decoder_peak: usize = 0,
+            decoder_workspace: ?@import("reader_workspace.zig").Decoder = null,
+            dynamic_vision_batch_items: usize = 0,
             features: ExecutionFeatures = .{},
             control: InferenceExecutionControl,
         };
@@ -302,6 +312,18 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             try control.lockWithPoll(&ctx.step_mutex, ctx.phase_wait_ns);
             ctx.invalidateCudaDecodeGraph();
         }
+        // Lease bookkeeping enqueues no GPU work and changes no captured
+        // buffer. In particular a denied page must not repeatedly invalidate
+        // the graph used by the already-admitted decode cohort.
+        fn lockAdmission(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
+            if (ctx.phase_fair) _ = ctx.phase_waiters.fetchAdd(1, .acq_rel);
+            defer if (ctx.phase_fair) {
+                ctx.finishPhaseWait();
+            };
+            const queued = if (ctx.gate_events) try ctx.step_gate.acquireWithPriority(control, true) else null;
+            errdefer if (queued) |lease| lease.release();
+            try control.lockWithPoll(&ctx.step_mutex, ctx.phase_wait_ns);
+        }
         fn invalidateCudaDecodeGraph(ctx: *LightOnStreamContext) void {
             // Vision and other foreground phases may resize shared CUDA
             // scratch. Retire captured addresses before that phase executes.
@@ -330,32 +352,103 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (ctx.gate_events) (execution_control_mod.ExecutionLane.Lease{ .lane = &ctx.step_gate }).release();
         }
         pub fn admitPage(ctx: *LightOnStreamContext, factory: *Factory, peak: ?usize, host_peak: usize, amounts: runtime.tier.memory.AdmissionAmounts) !model_manager_mod.GenerationAdmissionLease {
+            return ctx.admitPageInternal(factory, null, peak, host_peak, amounts);
+        }
+        pub fn admitRegisteredPage(ctx: *LightOnStreamContext, factory: *Factory, index: usize, peak: ?usize, host_peak: usize, amounts: runtime.tier.memory.AdmissionAmounts) !model_manager_mod.GenerationAdmissionLease {
+            return ctx.admitPageInternal(factory, index, peak, host_peak, amounts);
+        }
+        fn admitPageInternal(ctx: *LightOnStreamContext, factory: *Factory, index: ?usize, peak: ?usize, host_peak: usize, amounts: runtime.tier.memory.AdmissionAmounts) !model_manager_mod.GenerationAdmissionLease {
             // Resource-bearing choices are immutable for a shared backend.
             if (!std.meta.eql(ctx.features, factory.features) or ctx.cfg.compact_qwen35_kv != factory.cfg.compact_qwen35_kv or ctx.cfg.qwen35_device_only_state != factory.cfg.qwen35_device_only_state) return error.InvalidBatchDecodeState;
             const needs_auxiliary = !ctx.auxiliary_ready.load(.acquire);
             const needs_peak = if (peak) |bytes| ctx.phase_wait_ns == 0 or bytes > ctx.published_vision_peak.load(.acquire) else false;
             const needs_host_peak = host_peak > 0 and (ctx.phase_wait_ns == 0 or host_peak > ctx.published_vision_host_peak.load(.acquire));
-            const needs_decoder_peak = factory.decoder_peak != 0 and (ctx.phase_wait_ns == 0 or factory.decoder_peak > ctx.published_decoder_peak.load(.acquire));
-            if (needs_auxiliary or needs_peak or needs_host_peak or needs_decoder_peak) {
-                try ctx.lockStep(factory.control);
+            const needs_decoder_peak = factory.decoder_workspace != null or (factory.decoder_peak != 0 and (ctx.phase_wait_ns == 0 or factory.decoder_peak > ctx.published_decoder_peak.load(.acquire)));
+            if (needs_auxiliary or needs_peak or needs_host_peak or needs_decoder_peak or factory.dynamic_vision_batch_items != 0) {
+                try ctx.lockAdmission(factory.control);
                 defer ctx.unlockStep();
+                const vision_mark = if (peak != null) ctx.vision_peak.mark() else null;
+                const host_mark = if (host_peak != 0) ctx.vision_host_peak.mark() else null;
+                const decoder_mark = if (factory.decoder_peak != 0 or factory.decoder_workspace != null) ctx.decoder_peak.mark() else null;
+                const old_workspace = if (factory.decoder_workspace != null) ctx.decoder_workspace else null;
+                const old_vision = if (factory.dynamic_vision_batch_items != 0) ctx.vision_per_item_peak else 0;
+                const old_host = if (factory.dynamic_vision_batch_items != 0) ctx.vision_host_per_item_peak else 0;
+                var committed = false;
+                defer if (!committed) {
+                    // No GPU consumer can use these increments before this
+                    // gate returns. A denied page must not strand shared leases
+                    // that keep all pending pages from ever entering the epoch.
+                    if (vision_mark) |before| ctx.vision_peak.rollback(before);
+                    if (host_mark) |before| ctx.vision_host_peak.rollback(before);
+                    if (decoder_mark) |before| ctx.decoder_peak.rollback(before);
+                    ctx.decoder_workspace = old_workspace;
+                    ctx.vision_per_item_peak = old_vision;
+                    ctx.vision_host_per_item_peak = old_host;
+                    if (vision_mark != null) ctx.published_vision_peak.store(ctx.vision_peak.bytes, .release);
+                    if (host_mark != null) ctx.published_vision_host_peak.store(ctx.vision_host_peak.bytes, .release);
+                    if (decoder_mark != null) ctx.published_decoder_peak.store(ctx.decoder_peak.bytes, .release);
+                };
                 if (!ctx.auxiliary_ready.load(.acquire)) {
                     ctx.auxiliary_lease = try factory.node.model_manager.acquireGenerationResources(&.{.{ .session = factory.model.session, .resources = .{ .backend_class = .gpu, .limits = factory.limits, .amounts = ctx.features.auxiliaryAmounts() } }});
                     ctx.auxiliary_acquisitions += 1;
                     ctx.auxiliary_ready.store(true, .release);
                 }
-                if (peak) |bytes| {
+                const ActivePlan = struct { pages: usize, vision: usize, host: usize, decoder: ?@import("reader_workspace.zig").Decoder };
+                const active: ActivePlan = blk: {
+                    if (factory.dynamic_vision_batch_items == 0 and factory.decoder_workspace == null)
+                        break :blk .{ .pages = @as(usize, 1), .vision = peak orelse 0, .host = host_peak, .decoder = factory.decoder_workspace };
+                    platform.sync.lockYielding(&ctx.controls_mutex);
+                    defer ctx.controls_mutex.unlock();
+                    var plan: ActivePlan = .{ .pages = ctx.admitted_pages + 1, .vision = peak orelse 0, .host = host_peak, .decoder = factory.decoder_workspace };
+                    for (ctx.admitted_controls, 0..) |admitted, slot| if (admitted) {
+                        plan.vision = @max(plan.vision, ctx.admitted_vision[slot]);
+                        plan.host = @max(plan.host, ctx.admitted_host[slot]);
+                        if (ctx.admitted_workspace[slot]) |other| plan.decoder = if (plan.decoder) |candidate| try candidate.merge(other) else other;
+                    };
+                    break :blk plan;
+                };
+                const active_pages = active.pages;
+                if (peak) |per_item| {
+                    ctx.vision_per_item_peak = active.vision;
+                    const bytes = if (factory.dynamic_vision_batch_items != 0)
+                        try @import("reader_workspace.zig").batchPeak(ctx.vision_per_item_peak, active_pages, factory.dynamic_vision_batch_items)
+                    else
+                        per_item;
                     try ctx.vision_peak.grow(bytes, factory, acquireVisionPeak);
                     if (ctx.phase_wait_ns != 0) ctx.published_vision_peak.store(ctx.vision_peak.bytes, .release);
                 }
-                if (factory.decoder_peak != 0) {
-                    try ctx.decoder_peak.grow(factory.decoder_peak, factory, acquireVisionPeak);
+                if (factory.decoder_peak != 0 or factory.decoder_workspace != null) {
+                    var bytes = factory.decoder_peak;
+                    if (factory.decoder_workspace) |plan| {
+                        _ = plan;
+                        ctx.decoder_workspace = active.decoder;
+                        bytes = try ctx.decoder_workspace.?.peak(active_pages);
+                    }
+                    try ctx.decoder_peak.grow(bytes, factory, acquireVisionPeak);
                     if (ctx.phase_wait_ns != 0) ctx.published_decoder_peak.store(ctx.decoder_peak.bytes, .release);
                 }
                 if (host_peak != 0) {
-                    try ctx.vision_host_peak.grow(host_peak, factory, acquireVisionHostPeak);
+                    ctx.vision_host_per_item_peak = active.host;
+                    const bytes = if (factory.dynamic_vision_batch_items != 0)
+                        try @import("reader_workspace.zig").batchPeak(ctx.vision_host_per_item_peak, active_pages, factory.dynamic_vision_batch_items)
+                    else
+                        host_peak;
+                    try ctx.vision_host_peak.grow(bytes, factory, acquireVisionHostPeak);
                     if (ctx.phase_wait_ns != 0) ctx.published_vision_host_peak.store(ctx.vision_host_peak.bytes, .release);
                 }
+                const lease = try factory.node.model_manager.acquireGenerationResources(&.{.{ .session = factory.model.session, .resources = .{ .backend_class = .gpu, .limits = factory.limits, .amounts = amounts } }});
+                if (index) |slot| {
+                    platform.sync.lockYielding(&ctx.controls_mutex);
+                    defer ctx.controls_mutex.unlock();
+                    std.debug.assert(ctx.controls[slot] != null and !ctx.admitted_controls[slot]);
+                    ctx.admitted_controls[slot] = true;
+                    ctx.admitted_vision[slot] = peak orelse 0;
+                    ctx.admitted_host[slot] = host_peak;
+                    ctx.admitted_workspace[slot] = factory.decoder_workspace;
+                    ctx.admitted_pages += 1;
+                }
+                committed = true;
+                return lease;
             }
             return factory.node.model_manager.acquireGenerationResources(&.{.{ .session = factory.model.session, .resources = .{ .backend_class = .gpu, .limits = factory.limits, .amounts = amounts } }});
         }
@@ -377,6 +470,14 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             std.debug.assert(ctx.controls[index] != null and ctx.registered_pages > 0);
             ctx.controls[index] = null;
             ctx.registered_pages -= 1;
+            if (ctx.admitted_controls[index]) {
+                std.debug.assert(ctx.admitted_pages > 0);
+                ctx.admitted_controls[index] = false;
+                ctx.admitted_vision[index] = 0;
+                ctx.admitted_host[index] = 0;
+                ctx.admitted_workspace[index] = null;
+                ctx.admitted_pages -= 1;
+            }
         }
         pub fn check(raw: ?*anyopaque) !void {
             const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw.?));

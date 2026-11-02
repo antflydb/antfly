@@ -13,333 +13,198 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Segmented lake-ingestion WAL: immutable transaction records and request
-//! intents, one conditional tail pointer, durable acceptance receipts. Normal
-//! append work is independent of archive age. Bounded pending depth provides
-//! backpressure while preserving every acknowledged transaction across crashes.
+//! Lake transactions over the shared indexed object WAL. This adapter owns CDC
+//! admission policy, not a separate append/receipt/retention storage protocol.
 const std = @import("std");
 const objectstore = @import("objectstore");
 const catalog = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog;
+const ObjectWal = @import("wal/object_store.zig").ObjectStore;
+const IndexedWal = @import("wal/indexed_object_store.zig").IndexedObjectStore;
 const A = std.mem.Allocator;
+const namespace = "lake-transactions";
 pub const max_pending = 64;
-pub const Record = struct { lsn: u64, payload: []const u8, operation_id: []const u8, previous: ?[]const u8 };
-const StoredRecord = struct { lsn: u64, payload_ref: []const u8, operation_id: []const u8, previous: ?[]const u8 };
-const Receipt = struct { version: u8 = 1, lsn: u64, operation_id: []const u8, payload_hash: []const u8 };
-pub const Head = struct { lsn: u64, key: []const u8 };
+pub const Record = struct { lsn: u64, payload: []const u8, operation_id: []const u8, previous: ?[]const u8 = null };
+pub const Head = struct { lsn: u64, key: []const u8, captured: IndexedWal.CapturedHead };
 pub const Range = struct { lsn: u64, records: []const Record };
-const Object = struct { bytes: []const u8, etag: ?[]const u8 };
 pub const Store = struct {
     client: objectstore.Client,
     bucket: []const u8,
     prefix: []const u8,
     context: catalog.types.Context = .{},
-    fn key(self: Store, a: A, relative: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(a, "{s}/{s}", .{ self.prefix, relative });
-    }
-    fn get(self: Store, a: A, key_name: []const u8) !?Object {
+
+    pub fn open(self: *const Store, a: A, initialize: bool) !ObjectWal {
         try self.context.ensureActive();
         var client = self.client;
-        var response = client.getObject(self.bucket, key_name, .{ .cancellation = catalog.types.contextCancellation(&self.context), .max_response_bytes = 12 * 1024 * 1024 }) catch |err| switch (err) {
-            error.NotFound, error.ObjectNotFound, error.FileNotFound => return null,
-            else => return err,
-        };
-        defer response.deinit(client.allocator);
-        return .{ .bytes = try a.dupe(u8, response.body), .etag = if (response.metadata.etag) |etag| try a.dupe(u8, etag) else null };
-    }
-    fn put(self: Store, a: A, key_name: []const u8, bytes: []const u8) !void {
+        client.allocator = a;
+        const bucket = try a.dupe(u8, self.bucket);
+        errdefer a.free(bucket);
+        var wal: ObjectWal = .{ .alloc = a, .client = client, .owns_client = false, .bucket = bucket, .prefix = try a.dupe(u8, self.prefix), .cancellation = catalog.types.contextCancellation(&self.context) };
+        errdefer wal.deinit();
+        // Unmarked, nonempty prefixes fail closed. Pre-release lake state must
+        // be exported/rebuilt into a fresh incarnation, never silently hidden.
+        try wal.enableIndexed(.{ .read_state = true, .packed_pages = true, .managed_collection = true, .initialize = initialize });
         try self.context.ensureActive();
-        var client = self.client;
-        var result = client.putObject(self.bucket, key_name, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
-            error.PreconditionFailed, error.ObjectAlreadyExists => {
-                const old = (try self.get(a, key_name)) orelse return error.LakeWalOutcomeUnknown;
-                if (!std.mem.eql(u8, old.bytes, bytes)) return error.WalIdempotencyConflict;
-                return;
-            },
-            else => return err,
-        };
-        defer result.deinit(client.allocator);
+        return wal;
     }
-    fn loadRecord(self: Store, a: A, ref: []const u8) !StoredRecord {
-        if (!std.mem.startsWith(u8, ref, "records/") or ref.len != "records/".len + 64) return error.InvalidWal;
-        const data = (try self.get(a, try self.key(a, ref))) orelse return error.LakeWalCoverageGap;
-        if (!std.mem.eql(u8, &catalog.types.digestHex(data.bytes), ref["records/".len..])) return error.InvalidWal;
-        return std.json.parseFromSliceLeaky(StoredRecord, a, data.bytes, .{});
+    pub fn collectionNamespace(_: Store) []const u8 {
+        return namespace;
     }
-    fn tail(self: Store, a: A) !struct { head: ?Head, etag: ?[]const u8 } {
-        const data = (try self.get(a, try self.key(a, "tail.json"))) orelse return .{ .head = null, .etag = null };
-        return .{ .head = try std.json.parseFromSliceLeaky(Head, a, data.bytes, .{}), .etag = data.etag orelse return error.MissingObjectEtag };
-    }
-    fn readPayload(self: Store, a: A, record: StoredRecord) ![]const u8 {
-        const ref = record.payload_ref;
-        if (!std.mem.startsWith(u8, ref, "payloads/") or (ref.len != "payloads/".len + 64 and ref.len != "payloads/".len + 129)) return error.InvalidWal;
-        const data = (try self.get(a, try self.key(a, ref))) orelse return error.LakeWalCoverageGap;
-        if (!std.mem.eql(u8, &catalog.types.digestHex(data.bytes), ref[ref.len - 64 ..])) return error.InvalidWal;
-        return data.bytes;
-    }
-    fn expand(self: Store, a: A, record: StoredRecord) !Record {
-        return .{ .lsn = record.lsn, .payload = try self.readPayload(a, record), .operation_id = record.operation_id, .previous = record.previous };
-    }
-    /// Monotone admission watermark; validation must not enumerate WAL rows.
     pub fn watermark(self: Store, a: A) !u64 {
-        return if ((try self.tail(a)).head) |head| head.lsn else 0;
+        var wal = try self.open(a, false);
+        defer wal.deinit();
+        return wal.indexed.?.latestLsn(namespace);
     }
     pub fn latest(self: Store, a: A) !?Record {
-        const current = try self.tail(a);
-        return if (current.head) |head| try self.expand(a, try self.loadRecord(a, head.key)) else null;
+        var wal = try self.open(a, false);
+        defer wal.deinit();
+        const cut = try wal.indexed.?.captureRead(namespace);
+        if (cut.snapshot.latest_lsn < cut.snapshot.first_lsn) return null;
+        const rows = try wal.indexed.?.readCapturedRangeAlloc(a, namespace, cut, .{ .start_lsn = cut.snapshot.latest_lsn, .end_lsn = cut.snapshot.latest_lsn, .max_records = 1, .max_bytes = 32 * 1024 * 1024, .cancellation = catalog.types.contextCancellation(&self.context) });
+        const records = try adaptRows(a, rows);
+        defer a.free(records);
+        return records[0];
     }
-    fn receipt(self: Store, a: A, record_key: []const u8, record: StoredRecord) !void {
-        const path = try self.key(a, try std.fmt.allocPrint(a, "receipts/{s}", .{catalog.types.digestHex(record.operation_id)}));
-        const proof: Receipt = .{ .lsn = record.lsn, .operation_id = record.operation_id, .payload_hash = record.payload_ref[record.payload_ref.len - 64 ..] };
-        const bytes = try std.json.Stringify.valueAlloc(a, proof, .{});
-        if (try self.get(a, path)) |old| {
-            if (std.mem.eql(u8, old.bytes, bytes)) return;
-            if (!std.mem.eql(u8, old.bytes, record_key)) return error.WalIdempotencyConflict;
-            var client = self.client;
-            var upgraded = try client.putObject(self.bucket, path, bytes, .{ .if_match_etag = old.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&self.context) });
-            upgraded.deinit(client.allocator);
-            return;
-        }
-        try self.put(a, path, bytes);
+    fn adapt(row: @import("wal/types.zig").Record) !Record {
+        return .{ .lsn = row.lsn, .payload = row.payload, .operation_id = row.operation_id orelse return error.InvalidWal };
     }
-    /// Resolve a retry from its receipt or walk only the unreceipted recent
-    /// chain. The drain persists receipts before committing coverage, so old
-    /// acknowledged requests never require traversing archived history.
+    fn adaptRows(a: A, rows: []@import("wal/types.zig").Record) ![]Record {
+        defer a.free(rows);
+        errdefer for (rows) |row| {
+            a.free(row.payload);
+            if (row.operation_id) |id| a.free(id);
+        };
+        const records = try a.alloc(Record, rows.len);
+        errdefer a.free(records);
+        for (rows, records) |row, *out| out.* = try adapt(row);
+        return records;
+    }
     pub fn find(self: Store, a: A, id: []const u8, payload: []const u8) !?u64 {
-        const receipt_key = try self.key(a, try std.fmt.allocPrint(a, "receipts/{s}", .{catalog.types.digestHex(id)}));
-        if (try self.get(a, receipt_key)) |proof| {
-            if (proof.bytes.len != 0 and proof.bytes[0] == '{') {
-                const receipt_value = try std.json.parseFromSliceLeaky(Receipt, a, proof.bytes, .{});
-                if (receipt_value.version != 1 or receipt_value.lsn == 0 or !std.mem.eql(u8, receipt_value.operation_id, id) or !std.mem.eql(u8, receipt_value.payload_hash, &catalog.types.digestHex(payload))) return error.WalIdempotencyConflict;
-                return receipt_value.lsn;
-            }
-            const record = try self.loadRecord(a, proof.bytes);
-            if (!std.mem.eql(u8, record.operation_id, id) or !std.mem.eql(u8, try self.readPayload(a, record), payload)) return error.WalIdempotencyConflict;
-            return record.lsn;
-        }
-        const intent_key = try self.key(a, try std.fmt.allocPrint(a, "requests/{s}", .{catalog.types.digestHex(id)}));
-        const intent = (try self.get(a, intent_key)) orelse return null;
-        const candidate = try self.loadRecord(a, intent.bytes);
-        if (!std.mem.eql(u8, candidate.operation_id, id) or !std.mem.eql(u8, try self.readPayload(a, candidate), payload)) return error.WalIdempotencyConflict;
-        const current = try self.tail(a);
-        var ref = if (current.head) |head| @as(?[]const u8, head.key) else null;
-        var checked: usize = 0;
-        while (ref) |record_key| : (checked += 1) {
-            if (checked >= max_pending) return error.LakeWalOutcomeUnknown;
-            const record = try self.loadRecord(a, record_key);
-            if (record.lsn < candidate.lsn) return null;
-            if (record.lsn == candidate.lsn) {
-                if (!std.mem.eql(u8, record_key, intent.bytes)) return error.LakeCheckpointConflict;
-                try self.receipt(a, record_key, record);
-                return record.lsn;
-            }
-            ref = record.previous;
-        }
-        return null;
+        var wal = try self.open(a, false);
+        defer wal.deinit();
+        return wal.indexed.?.findIdempotent(namespace, 0, payload, id);
     }
+    /// One format check and one HEAD/receipt observation for the whole CDC
+    /// admission. The Store (and its cancellation context) must outlive it.
+    pub fn beginAdmission(self: *const Store, a: A, id: []const u8, payload: []const u8) !Admission {
+        var wal = try self.open(a, false);
+        errdefer wal.deinit();
+        const observation = try wal.indexed.?.beginAdmission(namespace, 0, payload, id);
+        return .{ .wal = wal, .observation = observation, .context = &self.context };
+    }
+    pub const Admission = struct {
+        wal: ObjectWal,
+        observation: IndexedWal.Admission,
+        context: *const catalog.types.Context,
+        pub fn deinit(self: *@This()) void {
+            self.observation.deinit();
+            self.wal.deinit();
+        }
+        pub fn latest(self: *@This(), a: A) !?Record {
+            const cut = self.observation.captured;
+            if (cut.snapshot.latest_lsn < cut.snapshot.first_lsn) return null;
+            const rows = try self.wal.indexed.?.readCapturedRangeAlloc(a, namespace, cut, .{ .start_lsn = cut.snapshot.latest_lsn, .end_lsn = cut.snapshot.latest_lsn, .max_records = 1, .max_bytes = 32 * 1024 * 1024, .cancellation = catalog.types.contextCancellation(self.context) });
+            const records = try Store.adaptRows(a, rows);
+            defer a.free(records);
+            return records[0];
+        }
+        pub fn append(self: *@This(), covered_lsn: u64) !u64 {
+            if (self.observation.accepted) |accepted| return accepted;
+            try self.context.ensureActive();
+            const latest_lsn = self.observation.captured.snapshot.latest_lsn;
+            if (covered_lsn > latest_lsn) return error.LakeWalCoverageGap;
+            if (latest_lsn - covered_lsn >= max_pending) return error.LakeIngestionBackpressure;
+            const indexed = self.wal.indexed.?;
+            indexed.max_new_lsn = std.math.add(u64, covered_lsn, max_pending) catch return error.InvalidWal;
+            try self.wal.initializeIndexed();
+            return (self.observation.append() catch |err| {
+                // A lost ACK may follow the atomic HEAD CAS. Reconcile only
+                // that exceptional path against a fresh durable receipt.
+                if (try indexed.findIdempotent(namespace, 0, self.observation.payload, self.observation.operation_id)) |accepted| return accepted;
+                return switch (err) {
+                    error.PublicationLagExceeded => error.LakeIngestionBackpressure,
+                    else => err,
+                };
+            }) orelse error.LakeCheckpointConflict;
+        }
+    };
     pub fn append(self: Store, a: A, id: []const u8, payload: []const u8, expected_lsn: u64, covered_lsn: u64) !u64 {
-        if (try self.find(a, id, payload)) |lsn| return lsn;
-        const current = try self.tail(a);
-        const latest_lsn = if (current.head) |head| head.lsn else 0;
-        if (latest_lsn != expected_lsn) return error.LakeCheckpointConflict;
-        if (covered_lsn > latest_lsn) return error.LakeWalCoverageGap;
-        if (latest_lsn - covered_lsn >= max_pending) return error.LakeIngestionBackpressure;
-        if (latest_lsn == std.math.maxInt(u64)) return error.InvalidWal;
-        const payload_ref = try std.fmt.allocPrint(a, "payloads/{s}-{s}", .{ catalog.types.digestHex(id), catalog.types.digestHex(payload) });
-        try self.put(a, try self.key(a, payload_ref), payload);
-        const record: StoredRecord = .{ .lsn = latest_lsn + 1, .payload_ref = payload_ref, .operation_id = id, .previous = if (current.head) |head| head.key else null };
-        const bytes = try std.json.Stringify.valueAlloc(a, record, .{});
-        const record_key = try std.fmt.allocPrint(a, "records/{s}", .{catalog.types.digestHex(bytes)});
-        try self.put(a, try self.key(a, record_key), bytes);
-        const intent_key = try self.key(a, try std.fmt.allocPrint(a, "requests/{s}", .{catalog.types.digestHex(id)}));
-        try self.put(a, intent_key, record_key);
-        const head = try std.json.Stringify.valueAlloc(a, Head{ .lsn = record.lsn, .key = record_key }, .{});
-        try self.context.ensureActive();
-        var client = self.client;
-        var result = client.putObject(self.bucket, try self.key(a, "tail.json"), head, .{ .if_none_match = current.head == null, .if_match_etag = current.etag, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| {
-            // A transport error may follow a successful conditional write.
-            // Resolve immutable chain evidence before telling a caller to retry.
-            if (try self.find(a, id, payload)) |accepted| return accepted;
-            return switch (err) {
-                error.PreconditionFailed => error.LakeCheckpointConflict,
-                else => error.LakeWalOutcomeUnknown,
-            };
-        };
-        defer result.deinit(client.allocator);
-        try self.receipt(a, record_key, record);
-        return record.lsn;
+        var admission = try self.beginAdmission(a, id, payload);
+        defer admission.deinit();
+        if (admission.observation.accepted) |accepted| return accepted;
+        if (admission.observation.captured.snapshot.latest_lsn != expected_lsn) return error.LakeCheckpointConflict;
+        return admission.append(covered_lsn);
     }
-    /// Pin one immutable accepted tail and return its complete bounded suffix.
-    /// Changes accepted after this call belong to a subsequent read snapshot.
-    /// Validate retirement and capture the immutable chain identity once.
     pub fn pin(self: Store, a: A, cut: u64) !?Head {
-        if (cut < try self.gcFloor(a)) return error.LakeOverlayCoverageUnavailable;
-        const current = try self.tail(a);
-        const head = current.head orelse {
-            if (cut != 0) return error.LakeWalCoverageGap;
-            return null;
-        };
-        if (head.lsn < cut or head.lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
-        return head;
+        var wal = try self.open(a, false);
+        defer wal.deinit();
+        const captured = try wal.indexed.?.captureRead(namespace);
+        const snapshot = captured.snapshot;
+        if (cut < snapshot.first_lsn - 1) return error.LakeOverlayCoverageUnavailable;
+        if (snapshot.latest_lsn < cut) return error.LakeWalCoverageGap;
+        if (snapshot.latest_lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
+        if (snapshot.latest_lsn == 0) return null;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&captured.scope);
+        hash.update(&snapshot.identity);
+        const identity = hash.finalResult();
+        return .{ .lsn = snapshot.latest_lsn, .key = try a.dupe(u8, &std.fmt.bytesToHex(identity, .lower)), .captured = captured };
     }
     pub fn range(self: Store, a: A, cut: u64) !Range {
         return self.rangePinned(a, cut, try self.pin(a, cut));
     }
-    /// The caller owns the pin, and must have validated it using pin().
-    pub fn rangePinned(self: Store, a: A, cut: u64, pinned: ?Head) !Range {
-        const head = pinned orelse return .{ .lsn = cut, .records = &.{} };
-        if (head.lsn < cut or head.lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
-        var records: std.ArrayList(Record) = .empty;
-        var ref = head.key;
-        var expected = head.lsn;
-        var bytes: usize = 0;
-        while (expected > cut) : (expected -= 1) {
-            const record = try self.loadRecord(a, ref);
-            if (record.lsn != expected) return error.LakeWalCoverageGap;
-            const expanded = try self.expand(a, record);
-            bytes = std.math.add(usize, bytes, expanded.payload.len) catch return error.LakeOverlayTooLarge;
-            if (bytes > 32 * 1024 * 1024) return error.LakeOverlayTooLarge;
-            try records.append(a, expanded);
-            if (expected > cut + 1) ref = record.previous orelse return error.LakeWalCoverageGap;
-        }
-        std.mem.reverse(Record, records.items);
-        return .{ .lsn = head.lsn, .records = records.items };
+    pub fn rangePinned(self: Store, a: A, cut: u64, head: ?Head) !Range {
+        const pinned = head orelse return .{ .lsn = cut, .records = &.{} };
+        if (pinned.lsn < cut or pinned.lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
+        if (cut == pinned.lsn) return .{ .lsn = cut, .records = &.{} };
+        var wal = try self.open(a, false);
+        defer wal.deinit();
+        const rows = wal.indexed.?.readCapturedRangeAlloc(a, namespace, pinned.captured, .{ .start_lsn = cut + 1, .end_lsn = pinned.lsn, .max_records = max_pending, .max_bytes = 32 * 1024 * 1024, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
+            error.WalSnapshotExpired => return error.LakeOverlayCoverageUnavailable,
+            error.WalReadBudgetExceeded => return error.LakeOverlayTooLarge,
+            else => return err,
+        };
+        return .{ .lsn = pinned.lsn, .records = try adaptRows(a, rows) };
     }
-    /// Extend only a proven immutable chain; equal LSNs alone are insufficient
-    /// when a queue has been restored or its head replaced.
     pub fn rangeAfterHead(self: Store, a: A, previous: Head, head: Head) !?Range {
-        const suffix = try self.rangePinned(a, previous.lsn, head);
-        if (suffix.records.len == 0) return if (std.mem.eql(u8, previous.key, head.key)) suffix else null;
-        const parent = suffix.records[0].previous orelse return null;
-        return if (std.mem.eql(u8, previous.key, parent)) suffix else null;
+        if (!std.mem.eql(u8, &previous.captured.scope, &head.captured.scope)) return null;
+        if (previous.lsn == head.lsn) return if (std.mem.eql(u8, previous.key, head.key)) .{ .lsn = head.lsn, .records = &.{} } else null;
+        const snapshot = head.captured.snapshot;
+        // One shared authenticated parent proves incremental replay. Larger
+        // jumps use a bounded full suffix rather than trusting equal LSNs.
+        if (snapshot.parent_lsn != previous.lsn or snapshot.parent_identity == null or !std.mem.eql(u8, &snapshot.parent_identity.?, &previous.captured.snapshot.identity)) return null;
+        return try self.rangePinned(a, previous.lsn, head);
     }
     pub fn gcFloor(self: Store, a: A) !u64 {
-        const value = (try self.get(a, try self.key(a, "gc-floor"))) orelse return 0;
-        return std.fmt.parseInt(u64, value.bytes, 10);
+        var wal = try self.open(a, false);
+        defer wal.deinit();
+        return (try wal.indexed.?.readSnapshot(namespace)).first_lsn - 1;
     }
-    const PendingGc = struct { ref: []const u8, record: StoredRecord };
-    const GcCursor = struct { cut: u64, stop: u64, next: ?[]const u8, pending: ?PendingGc = null };
-    pub const GcResult = struct { records_removed: usize = 0, floor: u64 = 0, complete: bool = false };
-    /// cut must be covered by the catalog AND every retained serving generation.
-    /// Receipts retain compact payload hashes, so pruning bytes never permits an
-    /// old batch identity to be replayed as a new transaction.
+    pub const GcResult = struct { records_removed: usize = 0, floor: u64 = 0, complete: bool = false, collection: ?@import("wal/collector.zig").Collector.Result = null };
+    /// Catalog/serving leases choose the safe logical cut. The shared collector
+    /// subsequently reclaims pages under its persisted epoch/root-use contract.
     pub fn prune(self: Store, a: A, cut: u64, maximum: usize, dry_run: bool) !GcResult {
         if (maximum == 0 or maximum > 4096) return error.InvalidLakeMaintenanceLimits;
-        const floor = try self.gcFloor(a);
-        const cursor_key = try self.key(a, "gc-cursor.json");
-        var saved = try self.get(a, cursor_key);
-        if (saved == null and (cut <= floor or cut == 0)) return .{ .floor = floor, .complete = true };
-        var cursor: GcCursor = undefined;
-        if (saved) |value| cursor = try std.json.parseFromSliceLeaky(GcCursor, a, value.bytes, .{}) else {
-            const current = try self.tail(a);
-            const head = current.head orelse return error.LakeWalCoverageGap;
-            if (head.lsn < cut or head.lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
-            var ref = head.key;
-            while (true) {
-                const record = try self.loadRecord(a, ref);
-                if (record.lsn == cut) {
-                    cursor = .{ .cut = cut, .stop = @max(floor, 1), .next = record.previous };
-                    break;
-                }
-                if (record.lsn < cut) return error.LakeWalCoverageGap;
-                ref = record.previous orelse return error.LakeWalCoverageGap;
-            }
-            if (!dry_run) {
-                const cursor_bytes = try std.json.Stringify.valueAlloc(a, cursor, .{});
-                try self.put(a, cursor_key, cursor_bytes);
-                saved = try self.get(a, cursor_key);
-                if (saved == null or !std.mem.eql(u8, saved.?.bytes, cursor_bytes)) return error.LakeCheckpointConflict;
-            }
-        }
-        if (cursor.cut > cut) return error.LakeOverlayCoverageUnavailable;
-        var result: GcResult = .{ .floor = if (dry_run) floor else cursor.cut };
-        if (!dry_run) {
-            const floor_key = try self.key(a, "gc-floor");
-            const previous = try self.get(a, floor_key);
-            const current_floor = if (previous) |value| try std.fmt.parseInt(u64, value.bytes, 10) else 0;
-            if (current_floor > cursor.cut) return error.LakeWalCoverageGap;
-            if (current_floor < cursor.cut) {
-                var client = self.client;
-                var written = try client.putObject(self.bucket, floor_key, try std.fmt.allocPrint(a, "{d}", .{cursor.cut}), .{ .if_none_match = previous == null, .if_match_etag = if (previous) |value| value.etag orelse return error.MissingObjectEtag else null, .cancellation = catalog.types.contextCancellation(&self.context) });
-                written.deinit(client.allocator);
-            }
-        }
-        while (result.records_removed < maximum) {
-            const ref = if (cursor.pending) |pending| pending.ref else cursor.next orelse break;
-            const record = if (cursor.pending) |pending| pending.record else try self.loadRecord(a, ref);
-            if (record.lsn >= cursor.cut or record.lsn < cursor.stop) return error.InvalidWal;
-            const next_ref = if (record.lsn == cursor.stop) null else record.previous;
-            if (!dry_run) {
-                if (cursor.pending == null) {
-                    cursor.pending = .{ .ref = ref, .record = record };
-                    cursor.next = next_ref;
-                    saved = try self.saveGcCursor(a, cursor_key, saved.?, cursor);
-                }
-                // Upgrade legacy receipts before deleting their referenced bytes.
-                const receipt_key = try self.key(a, try std.fmt.allocPrint(a, "receipts/{s}", .{catalog.types.digestHex(record.operation_id)}));
-                const old = (try self.get(a, receipt_key)) orelse return error.LakeWalCoverageGap;
-                const proof: Receipt = .{ .lsn = record.lsn, .operation_id = record.operation_id, .payload_hash = record.payload_ref[record.payload_ref.len - 64 ..] };
-                const bytes = try std.json.Stringify.valueAlloc(a, proof, .{});
-                if (!std.mem.eql(u8, old.bytes, bytes)) {
-                    if (!std.mem.eql(u8, old.bytes, ref)) return error.InvalidWal;
-                    var client = self.client;
-                    var upgraded = try client.putObject(self.bucket, receipt_key, bytes, .{ .if_match_etag = old.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&self.context) });
-                    upgraded.deinit(client.allocator);
-                }
-                // Legacy content-addressed payloads may be shared by callers
-                // of the generic store. Retain them until a separate mark pass;
-                // new payload keys also include stable operation identity.
-                if (record.payload_ref.len == "payloads/".len + 129) try self.deleteImmutable(a, record.payload_ref);
-                try self.deleteImmutable(a, try std.fmt.allocPrint(a, "requests/{s}", .{catalog.types.digestHex(record.operation_id)}));
-                // The cursor owns a copy of the header while deletion is
-                // pending, so restart can finish even after its bytes disappear.
-                try self.deleteImmutable(a, ref);
-                cursor.pending = null;
-                saved = try self.saveGcCursor(a, cursor_key, saved.?, cursor);
-            } else cursor.next = next_ref;
-            result.records_removed += 1;
-        }
-        result.complete = cursor.next == null and cursor.pending == null;
-        if (result.complete and !dry_run) {
-            var client = self.client;
-            try client.deleteObject(self.bucket, cursor_key, .{ .if_match_etag = saved.?.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&self.context) });
-        }
-        return result;
-    }
-    fn saveGcCursor(self: Store, a: A, path: []const u8, previous: Object, value: GcCursor) !Object {
-        var client = self.client;
-        const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
-        var written = try client.putObject(self.bucket, path, bytes, .{ .if_match_etag = previous.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&self.context) });
-        defer written.deinit(client.allocator);
-        const fresh = (try self.get(a, path)) orelse return error.LakeWalCoverageGap;
-        if (!std.mem.eql(u8, fresh.bytes, bytes)) return error.LakeCheckpointConflict;
-        return fresh;
-    }
-    fn deleteImmutable(self: Store, a: A, relative: []const u8) !void {
-        const path = try self.key(a, relative);
-        const value = (try self.get(a, path)) orelse return;
-        var client = self.client;
-        try client.deleteObject(self.bucket, path, .{ .if_match_etag = value.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&self.context) });
+        var wal = try self.open(a, !dry_run);
+        defer wal.deinit();
+        const indexed = wal.indexed.?;
+        const before = try indexed.captureRead(namespace);
+        if (cut > before.snapshot.latest_lsn) return error.LakeWalCoverageGap;
+        const floor = before.snapshot.first_lsn - 1;
+        if (dry_run) return .{ .floor = floor, .records_removed = @intCast(@min(maximum, cut -| floor)), .complete = cut <= floor };
+        if (cut > floor) _ = try indexed.truncatePrefix(namespace, cut + 1);
+        const more = try indexed.compactPrefixStepWithCancellation(namespace, @min(maximum, 256), catalog.types.contextCancellation(&self.context));
+        const after = try indexed.captureRead(namespace);
+        return .{ .floor = after.snapshot.first_lsn - 1, .records_removed = @intCast(after.head.physical_first_lsn - before.head.physical_first_lsn), .complete = !more };
     }
     pub fn next(self: Store, a: A, cut: u64) !?Record {
-        const current = try self.tail(a);
-        if (current.head == null) {
-            if (cut != 0) return error.LakeWalCoverageGap;
-            return null;
-        }
-        const head = current.head.?;
-        if (head.lsn < cut) return error.LakeWalCoverageGap;
+        const head = try self.pin(a, cut) orelse return null;
         if (head.lsn == cut) return null;
-        if (head.lsn - cut > max_pending) return error.LakeWalCoverageGap;
-        var ref = head.key;
-        while (true) {
-            const record = try self.loadRecord(a, ref);
-            if (record.lsn == cut + 1) {
-                try self.receipt(a, ref, record);
-                return try self.expand(a, record);
-            }
-            if (record.lsn <= cut + 1) return error.LakeWalCoverageGap;
-            ref = record.previous orelse return error.LakeWalCoverageGap;
-        }
+        var wal = try self.open(a, false);
+        defer wal.deinit();
+        const rows = try wal.indexed.?.readCapturedRangeAlloc(a, namespace, head.captured, .{ .start_lsn = cut + 1, .end_lsn = cut + 1, .max_records = 1, .max_bytes = 32 * 1024 * 1024, .cancellation = catalog.types.contextCancellation(&self.context) });
+        const records = try adaptRows(a, rows);
+        defer a.free(records);
+        return records[0];
     }
 };
 
@@ -355,7 +220,7 @@ test "external lake segmented WAL resolves lost tail response and fences concurr
     var store: Store = .{ .client = faults.client(), .bucket = "archive", .prefix = "wal" };
     faults.put_filter = .{ .ptr = &faults, .matches = struct {
         fn call(_: *anyopaque, _: []const u8, key_name: []const u8, _: []const u8) bool {
-            return std.mem.endsWith(u8, key_name, "/tail.json");
+            return std.mem.endsWith(u8, key_name, "/HEAD");
         }
     }.call };
     faults.next_put = .{ .commit_then_fail = error.ConnectionResetByPeer };
@@ -370,7 +235,7 @@ test "external lake segmented WAL resolves lost tail response and fences concurr
     try std.testing.expectError(error.LakeWalCoverageGap, store.next(a, 3));
 }
 
-test "external lake segmented WAL bounds backlog retains old replay receipts and recovers receipt loss" {
+test "external lake segmented WAL bounds backlog retains old replay receipts and commits receipts atomically" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -382,11 +247,11 @@ test "external lake segmented WAL bounds backlog retains old replay receipts and
     const store: Store = .{ .client = faults.client(), .bucket = "archive", .prefix = "wal" };
     faults.put_filter = .{ .ptr = &faults, .matches = struct {
         fn call(_: *anyopaque, _: []const u8, key_name: []const u8, _: []const u8) bool {
-            return std.mem.indexOf(u8, key_name, "/receipts/") != null;
+            return std.mem.endsWith(u8, key_name, "/HEAD");
         }
     }.call };
     faults.next_put = .{ .commit_then_fail = error.ConnectionResetByPeer };
-    try std.testing.expectError(error.ConnectionResetByPeer, store.append(a, "first", "one", 0, 0));
+    try std.testing.expectEqual(@as(u64, 1), try store.append(a, "first", "one", 0, 0));
     try std.testing.expectEqual(@as(?u64, 1), try store.find(a, "first", "one"));
     for (1..max_pending) |index| {
         const id = try std.fmt.allocPrint(a, "batch-{d}", .{index});
@@ -432,4 +297,95 @@ test "external lake WAL collection resumes bounded jobs and preserves old idempo
     const pending = try store.range(a, 6);
     try std.testing.expectEqual(@as(usize, 1), pending.records.len);
     try std.testing.expectEqualStrings("new payload", pending.records[0].payload);
+}
+
+test "external lake unified WAL shares indexed records and rejects an unmarked legacy prefix" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    const store: Store = .{ .client = client, .bucket = "archive", .prefix = "new" };
+    _ = try store.append(ca, "batch", "transaction body", 0, 0);
+    var shared = try store.open(a, false);
+    defer shared.deinit();
+    const rows = try shared.indexed.?.readRangeAlloc(a, namespace, .{ .start_lsn = 1, .end_lsn = 1 });
+    defer @import("wal/types.zig").freeRecords(a, rows);
+    try std.testing.expectEqualStrings("transaction body", rows[0].payload);
+    try std.testing.expectEqualStrings("batch", rows[0].operation_id.?);
+    var old = try client.putObject("archive", "old/tail.json", "{\"lsn\":7}", .{});
+    defer old.deinit(a);
+    const legacy: Store = .{ .client = client, .bucket = "archive", .prefix = "old" };
+    try std.testing.expectError(error.ManagedWalMigrationRequired, legacy.watermark(ca));
+    var listed = try client.listObjects("archive", .{ .prefix = "old/" });
+    defer listed.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), listed.entries.len);
+}
+
+test "external lake unified WAL admission reuses format HEAD and receipt observation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Count = struct {
+        var gets: usize = 0;
+        var formats: usize = 0;
+        var heads: usize = 0;
+        fn get(raw: *anyopaque, alloc: A, bucket: []const u8, key: []const u8, opts: objectstore.GetOptions) !objectstore.GetResult {
+            gets += 1;
+            if (std.mem.endsWith(u8, key, "/WAL_FORMAT")) formats += 1;
+            if (std.mem.endsWith(u8, key, "/HEAD")) heads += 1;
+            const memory: *objectstore.MemoryClient = @ptrCast(@alignCast(raw));
+            var inner = memory.client();
+            inner.allocator = alloc;
+            return inner.getObject(bucket, key, opts);
+        }
+    };
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    var vtable = client.vtable.*;
+    vtable.get_object = Count.get;
+    client.vtable = &vtable;
+    const store: Store = .{ .client = client, .bucket = "archive", .prefix = "admission-reads" };
+    _ = try store.append(scratch, "one", "payload one", 0, 0);
+    Count.gets = 0;
+    Count.formats = 0;
+    Count.heads = 0;
+    var admission = try store.beginAdmission(scratch, "two", "payload two");
+    defer admission.deinit();
+    try std.testing.expectEqual(@as(?u64, null), admission.observation.accepted);
+    try std.testing.expectEqualStrings("payload one", (try admission.latest(scratch)).?.payload);
+    try std.testing.expectEqual(@as(u64, 2), try admission.append(0));
+    try std.testing.expectEqual(@as(usize, 1), Count.formats);
+    try std.testing.expectEqual(@as(usize, 1), Count.heads);
+    // One receipt seek plus the two updated tree paths, no repeated admission.
+    try std.testing.expect(Count.gets <= 5);
+}
+
+test "external lake unified WAL admission fences stale validation and reconciles concurrent exact replay" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    const store: Store = .{ .client = memory.client(), .bucket = "archive", .prefix = "admission-cas" };
+    _ = try store.append(scratch, "one", "payload one", 0, 0);
+    var stale = try store.beginAdmission(scratch, "stale", "payload stale");
+    defer stale.deinit();
+    var exact = try store.beginAdmission(scratch, "two", "payload two");
+    defer exact.deinit();
+    _ = try store.append(scratch, "two", "payload two", 1, 0);
+    try std.testing.expectError(error.LakeCheckpointConflict, stale.append(0));
+    try std.testing.expectEqual(@as(u64, 2), try exact.append(0));
+    // Durable receipts survive payload retirement and still precede policy.
+    _ = try store.prune(scratch, 2, 256, false);
+    var replay = try store.beginAdmission(scratch, "two", "payload two");
+    defer replay.deinit();
+    try std.testing.expectEqual(@as(?u64, 2), replay.observation.accepted);
+    try std.testing.expectEqual(@as(u64, 2), try replay.append(999));
+    try std.testing.expectError(error.WalIdempotencyConflict, store.beginAdmission(scratch, "two", "changed"));
 }

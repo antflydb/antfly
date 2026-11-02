@@ -191,11 +191,21 @@ pub fn nativeGenerationMediaAdmission(
     messages: []const Message,
     config: gpt_mod.Config,
 ) !NativeGenerationMediaAdmission {
+    return nativeGenerationMediaAdmissionForBackend(allocator, model_dir, messages, config, .generic);
+}
+
+pub fn nativeGenerationMediaAdmissionForBackend(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    messages: []const Message,
+    config: gpt_mod.Config,
+    backend: qwen3vl_projector.AdmissionBackend,
+) !NativeGenerationMediaAdmission {
     if (config.family == .qwen3_vl or config.hasQwen35VisionArchitectureContract()) {
         const images = try collectImagesInPromptOrder(allocator, messages);
         defer allocator.free(images);
         if (images.len == 0) return .{};
-        const projector = try qwen3vl_projector.estimateAdmission(images, config, try qwenVisionLimits(allocator, model_dir, config));
+        const projector = try qwen3vl_projector.estimateAdmissionForBackend(images, config, try qwenVisionLimits(allocator, model_dir, config), backend);
         return .{
             // The text encode already contains an image placeholder. Retaining
             // one additional token per image preserves the existing

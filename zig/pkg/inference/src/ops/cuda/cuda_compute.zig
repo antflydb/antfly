@@ -2368,6 +2368,7 @@ pub const CudaCompute = struct {
         const attention = &self.embedding_gemma2_cudnn.?;
         const key = cudnn_sdpa_mod.Key{ .batch = batch, .q_heads = hidden / 64, .kv_heads = hidden / 64, .sequence = rows / batch, .dim = 64, .scale = 0.125, .ocr_vision = true, .dtype = .bf16 };
         const workspace_bytes = (try attention.workspaceBytesFor(key)) orelse return error.CudnnFailure;
+        if (workspace_bytes > try @import("vision_memory_contract.zig").vendorWorkspaceLimit(rows, hidden)) return null;
         // Retain the existing vendor-workspace admission and retirement
         // policy; encoder temporaries create no additional retained pool.
         if (self.run_budget) |budget| {
@@ -23848,6 +23849,7 @@ fn tryReducedVisionCudnnInput(
     const use_f16 = self.capability_profile == .florence2;
     const key = cudnn_sdpa_mod.Key{ .batch = batch, .q_heads = num_heads, .kv_heads = num_heads, .sequence = seq_len, .dim = head_dim, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))), .ocr_vision = self.capability_profile == .lightonocr3, .florence_vision = use_f16, .dtype = if (use_f16) .f16 else .bf16 };
     const workspace_bytes = (try cudnn.workspaceBytesFor(key)) orelse return null;
+    if (self.capability_profile == .lightonocr3 and workspace_bytes > try @import("vision_memory_contract.zig").vendorWorkspaceLimit(try checkedMul(batch, seq_len), try checkedMul(num_heads, head_dim))) return null;
     const count = try checkedMul(batch, try checkedMul(seq_len, try checkedMul(num_heads, head_dim)));
     const activation_bytes = try checkedMul(count, @sizeOf(u16));
     var cursor: usize = 0;
