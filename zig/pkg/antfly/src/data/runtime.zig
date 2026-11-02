@@ -5502,6 +5502,8 @@ pub const DataServer = struct {
     initial_fk_retirement_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
+    leann_replication_running: std.atomic.Value(bool) = .init(false),
+    leann_replication_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     group_source_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     group_source_running: std.atomic.Value(bool) = .init(false),
     group_source_worker: ?@import("antfly_local_sources").storage_db_group_source_worker.Worker = null,
@@ -6667,6 +6669,72 @@ pub const DataServer = struct {
         var status = try std.json.parseFromSlice(antfly.db.types.GraphEndpointCleanupStatus, server.alloc, response.json, .{});
         defer status.deinit();
         if (status.value.pending) try server.proposeRaftBatchGroupWithLeaderWait(server.alloc, job.group_id, job.table, status.value.request(), .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&server.background_jobs_shutdown), .admission_deadline_ns = server.dataRaftMonotonicNs() +| 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
+    }
+
+    const LeannReplicationJob = struct {
+        server: *DataServer,
+        table: []const u8,
+        group_id: u64,
+    };
+
+    /// Leader-only LEANN replication: on a group this node leads, asks the
+    /// local DB to plan the next record of each replicated LEANN index and
+    /// proposes it. Every replica (this one included) applies committed
+    /// records in log order; see storage/leann_replicated.zig. Dispatch
+    /// only, like graph endpoint cleanup.
+    fn runLeannReplicationRound(self: *DataServer) !void {
+        const raft = self.data_raft orelse return;
+        const runtime = self.backend_runtime orelse return;
+        if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
+        if (self.leann_replication_running.swap(true, .acq_rel)) return;
+        var scheduled = false;
+        defer if (!scheduled) self.leann_replication_running.store(false, .release);
+        const catalog = self.write_source.catalog;
+        const deadline = catalog.budget(null).nowNs() +| 100 * std.time.ns_per_ms;
+        for (0..8) |_| {
+            const visit = (try self.leann_replication_sweep.next(self.alloc, catalog, deadline)) orelse return;
+            lockAtomic(&self.data_raft_mutex);
+            const leader = raft.host.http_host.host.isLocalLeader(visit.range.group_id);
+            self.data_raft_mutex.unlock();
+            if (!leader) continue;
+            const table = visit.table orelse continue;
+            const job = try self.alloc.create(LeannReplicationJob);
+            errdefer self.alloc.destroy(job);
+            const name = try self.alloc.dupe(u8, table.name);
+            errdefer self.alloc.free(name);
+            job.* = .{ .server = self, .table = name, .group_id = visit.range.group_id };
+            try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = job, .run = runLeannReplicationJob, .deinit = deinitLeannReplicationJob });
+            scheduled = true;
+            return;
+        }
+    }
+    fn deinitLeannReplicationJob(ptr: *anyopaque) void {
+        const job: *LeannReplicationJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        server.alloc.free(job.table);
+        server.alloc.destroy(job);
+        server.leann_replication_running.store(false, .release);
+    }
+    fn runLeannReplicationJob(ptr: *anyopaque) !void {
+        const job: *LeannReplicationJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (server.hotStandbyWriteGate()) |gate| try gate.check();
+        if (server.group_leadership_source) |leadership| if (!leadership.isLocalLeader(job.group_id)) return error.NotLeader;
+        var response = (try server.read_source.source().lookupGroupLocal(server.alloc, job.group_id, job.table, "", .{ .relational_topology_json = "{\"mode\":\"leann_plan\"}", .execution_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&server.background_jobs_shutdown) }, .leader_lease)) orelse return;
+        defer response.deinit(server.alloc);
+        var plan = try std.json.parseFromSlice(antfly.db.types.LeannPlanStatus, server.alloc, response.json, .{});
+        defer plan.deinit();
+        const decoder = std.base64.standard.Decoder;
+        for (plan.value.proposals) |proposal| for (proposal.records_base64) |encoded| {
+            if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+            const record = try server.alloc.alloc(u8, try decoder.calcSizeForSlice(encoded));
+            defer server.alloc.free(record);
+            try decoder.decode(record, encoded);
+            // Records of one proposal (generation chunks, then the record)
+            // must commit in order, so each waits for the previous one.
+            try server.proposeRaftBatchGroupWithLeaderWait(server.alloc, job.group_id, job.table, .{ .leann_record = .{ .index_name = proposal.index_name, .record = record }, .sync_level = .write }, .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&server.background_jobs_shutdown), .admission_deadline_ns = server.dataRaftMonotonicNs() +| 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
+        };
     }
 
     fn runInitialFkRetirementRound(self: *DataServer) !void {
@@ -9415,6 +9483,9 @@ pub const DataServer = struct {
         self.runGraphEndpointCleanupRound() catch |err| {
             std.log.warn("graph endpoint cleanup deferred err={s}", .{@errorName(err)});
         };
+        self.runLeannReplicationRound() catch |err| {
+            std.log.warn("leann replication deferred err={s}", .{@errorName(err)});
+        };
         self.runInitialFkRetirementRound() catch |err| {
             std.log.warn("initial FK retirement maintenance deferred err={s}", .{@errorName(err)});
         };
@@ -9765,6 +9836,7 @@ pub const DataServer = struct {
         self.group_source_sweep.deinit();
         if (self.group_source_worker) |*worker| worker.deinit();
         self.graph_cleanup_sweep.deinit();
+        self.leann_replication_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
         self.initial_fk_retirement_gc_cursor.deinit();
         if (self.native_query_repository) |repository| {
@@ -12474,7 +12546,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null) return proposal_req;
+        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -12497,6 +12569,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.leann_record != null) return @import("../common/data_raft_protocol.zig").batch_leann_record_protocol_version;
         if (req.artifact_publication) |command| if (command.completion) |page| if (page.group_producers) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (req.artifact_catalog) |command| if (command.binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (req.online_source) |command| if (command == .admit) {
@@ -24404,7 +24477,7 @@ pub const DataServer = struct {
         errdefer provisioned_storage.deinit();
         if (cfg.capacity_source) |source| try provisioned_storage.installCapacitySource(source);
 
-        const server = DataServer{
+        var server = DataServer{
             .alloc = alloc,
             .remote_metadata = remote_metadata,
             .data_raft = data_raft,
@@ -24444,6 +24517,8 @@ pub const DataServer = struct {
             .owned_backend_runtime = owned_backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
+        // Raft data groups replicate LEANN graphs from the leader.
+        server.write_source.leann_replication = data_raft != null;
         owned_backend_runtime = null;
         storage_kernel_context = null;
         return server;
@@ -46872,6 +46947,14 @@ fn implementationTests() type {
             const version = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
             try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true }));
             try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .deletes = &.{"hub"} }));
+        }
+
+        test "leann replication round requires an attached Raft owner and its protocol version" {
+            var server: DataServer = undefined;
+            server.data_raft = null;
+            try server.runLeannReplicationRound();
+            const version = @import("../common/data_raft_protocol.zig").batch_leann_record_protocol_version;
+            try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .leann_record = .{ .index_name = "idx", .record = "L" } }));
         }
 
         test "data runtime native FK retirement preserves source ownership and exact cold path" {

@@ -2986,6 +2986,8 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     defer if (semantic_producer_json) |raw| alloc.free(raw);
 
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
+    const leann_algorithm = try denseAlgorithmIsLeann(root);
+    if (sparse and leann_algorithm) return error.InvalidCreateTableRequest;
 
     const field_name = cfg.field;
     const template_value = cfg.template;
@@ -3152,6 +3154,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try out.appendSlice(alloc, dims_json);
     try out.appendSlice(alloc, ",\"metric\":");
     try appendJsonString(alloc, &out, metric);
+    if (leann_algorithm) try appendLeannIndexConfig(alloc, &out, root);
     if (artifact_sources.len > 0) {
         try appendArtifactIndexSources(alloc, &out, artifact_sources);
     } else {
@@ -3197,6 +3200,96 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try appendExecutionObjectIfPresent(alloc, &out, root);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+/// Reads the public `algorithm` / `leann` fields. Returns whether the dense
+/// index uses LEANN. A `leann` block requires `algorithm: "leann"`.
+fn denseAlgorithmIsLeann(root: std.json.ObjectMap) !bool {
+    const leann = if (root.get("algorithm")) |algorithm| blk: {
+        if (algorithm != .string) return error.InvalidCreateTableRequest;
+        if (std.mem.eql(u8, algorithm.string, "leann")) break :blk true;
+        if (std.mem.eql(u8, algorithm.string, "hbc")) break :blk false;
+        return error.InvalidCreateTableRequest;
+    } else false;
+    if (root.get("leann") != null and !leann) return error.InvalidCreateTableRequest;
+    return leann;
+}
+
+/// Emits the normalized internal `"algorithm":"leann","leann":{...}` fields,
+/// validating the public LeannIndexConfig ranges. Every knob is written so
+/// the stored config (and its hash) is explicit.
+fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), root: std.json.ObjectMap) !void {
+    var max_degree: i64 = 30;
+    var quantizer: []const u8 = "rabitq";
+    var search_ef: i64 = 0;
+    var bound_scale: f64 = 1.0;
+    var batch_size: i64 = 0;
+    if (root.get("leann")) |leann| {
+        if (leann != .object) return error.InvalidCreateTableRequest;
+        var it = leann.object.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+            if (std.mem.eql(u8, key, "max_degree")) {
+                max_degree = try jsonIntegerInRange(value, 4, 128);
+            } else if (std.mem.eql(u8, key, "quantizer")) {
+                if (value != .string) return error.InvalidCreateTableRequest;
+                if (!std.mem.eql(u8, value.string, "rabitq") and !std.mem.eql(u8, value.string, "pq")) return error.InvalidCreateTableRequest;
+                quantizer = value.string;
+            } else if (std.mem.eql(u8, key, "search_ef")) {
+                search_ef = try jsonIntegerInRange(value, 0, 4096);
+            } else if (std.mem.eql(u8, key, "bound_scale")) {
+                bound_scale = switch (value) {
+                    .integer => |v| @floatFromInt(v),
+                    .float => |v| v,
+                    else => return error.InvalidCreateTableRequest,
+                };
+                if (!(bound_scale >= 0 and bound_scale <= 8)) return error.InvalidCreateTableRequest;
+            } else if (std.mem.eql(u8, key, "batch_size")) {
+                batch_size = try jsonIntegerInRange(value, 0, 1024);
+            } else return error.InvalidCreateTableRequest;
+        }
+    }
+    const json = try std.fmt.allocPrint(
+        alloc,
+        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d}}}",
+        .{ max_degree, quantizer, search_ef, bound_scale, batch_size },
+    );
+    defer alloc.free(json);
+    try out.appendSlice(alloc, json);
+}
+
+fn jsonIntegerInRange(value: std.json.Value, min: i64, max: i64) !i64 {
+    if (value != .integer or value.integer < min or value.integer > max) return error.InvalidCreateTableRequest;
+    return value.integer;
+}
+
+test "managed embedder translates leann algorithm into dense config" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"external":true,"dimension":4,"distance_metric":"cosine","algorithm":"leann","leann":{"max_degree":16,"bound_scale":1.5}}
+    , .{});
+    defer parsed.deinit();
+    const out = try translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", parsed.value, .{});
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"algorithm\":\"leann\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"max_degree\":16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"quantizer\":\"rabitq\"") != null);
+
+    for ([_][]const u8{
+        \\{"external":true,"dimension":4,"leann":{"max_degree":16}}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"max_degree":2}}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"faiss"}
+        ,
+        \\{"external":true,"sparse":true,"algorithm":"leann"}
+        ,
+    }) |bad| {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, bad, .{});
+        defer p.deinit();
+        try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", p.value, .{}));
+    }
 }
 
 fn normalizeAntflyChunkerDefaultModelJson(

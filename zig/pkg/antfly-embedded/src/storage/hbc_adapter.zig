@@ -54,6 +54,7 @@ const hbc_backend = @import("hbc_backend.zig");
 const posting_segment_store_mod = @import("posting_segment_store.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const apply_rw_lock_mod = @import("db/apply_rw_lock.zig");
+const leann_store_mod = @import("leann_store.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const platform_time = @import("antfly_platform").time;
 const vec = @import("antfly_vector").vector;
@@ -5451,6 +5452,9 @@ pub const HBCIndex = struct {
     write_profile: WriteProfile = .{},
     external_vector_ctx: ?*anyopaque = null,
     external_vector_loader: ?ExternalVectorLoader = null,
+    /// Set for `algorithm: leann` indexes. Writes, deletes, searches, stats
+    /// and sync route here; the HBC tree underneath stays empty.
+    leann: ?*leann_store_mod.LeannStore = null,
     external_vector_scratch_loader: ?ExternalVectorScratchLoader = null,
     external_previous_vector_scratch_loader: ?ExternalVectorScratchLoader = null,
     external_vector_batch_scratch_loader: ?ExternalVectorBatchScratchLoader = null,
@@ -7975,6 +7979,15 @@ pub const HBCIndex = struct {
         }
     }
 
+    /// Routes this index to a LEANN store, which takes ownership of
+    /// `store`. Call after `setExternalVectorLoader`: LEANN recomputes exact
+    /// distances through that loader.
+    pub fn attachLeann(self: *HBCIndex, store: *leann_store_mod.LeannStore) !void {
+        const loader = self.external_vector_loader orelse return error.MissingVectorLoader;
+        store.setLoader(.{ .ctx = self.external_vector_ctx.?, .load = loader });
+        self.leann = store;
+    }
+
     pub fn setExternalVectorLoader(self: *HBCIndex, ctx: *anyopaque, loader: ExternalVectorLoader) void {
         self.external_vector_ctx = ctx;
         self.external_vector_loader = loader;
@@ -8371,6 +8384,10 @@ pub const HBCIndex = struct {
     }
 
     fn deinitWithBackendDisposition(self: *HBCIndex, abandon_after_crash: bool) void {
+        if (self.leann) |store| {
+            store.deinit();
+            self.leann = null;
+        }
         if (!abandon_after_crash and self.experimentalPostingCheckpointBuildPresent()) {
             _ = self.forceExperimentalPostingCheckpointBuild(true);
             if (self.experimental_posting_write_store) |*posting_store| {
@@ -8482,6 +8499,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn sync(self: *HBCIndex, force: bool) !void {
+        if (self.leann) |store| try store.sync();
         try self.env_owner.sync(force);
     }
 
@@ -16957,6 +16975,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn getMetadata(self: *HBCIndex, vector_id: u64) !?[]u8 {
+        if (self.leann) |store| return try store.getMetadata(self.alloc, vector_id);
         return try vectorindex_hbc_index.getMetadata(self, vector_id);
     }
 
@@ -17636,10 +17655,12 @@ pub const HBCIndex = struct {
 
     /// Insert a vector into the index.
     pub fn insert(self: *HBCIndex, vector_id: u64, vector_data: []const f32) !void {
+        if (self.leann) |store| return store.apply(&[_]BatchInsertItem{.{ .vector_id = vector_id, .vector = vector_data }}, &.{});
         try vectorindex_hbc_index.insert(self, vector_id, vector_data, nowNs, elapsedSince);
     }
 
     pub fn insertWithMetadata(self: *HBCIndex, vector_id: u64, vector_data: []const f32, metadata_value: []const u8) !void {
+        if (self.leann) |store| return store.apply(&[_]BatchInsertItem{.{ .vector_id = vector_id, .vector = vector_data, .metadata = metadata_value }}, &.{});
         try self.captureExactVectorBatch(&.{.{
             .vector_id = vector_id,
             .vector = vector_data,
@@ -17662,6 +17683,7 @@ pub const HBCIndex = struct {
         deletes: []const u64,
         requested_options: BatchInsertOptions,
     ) !void {
+        if (self.leann) |store| return store.apply(writes, deletes);
         var options = requested_options;
         // External artifacts may already contain every update in this source
         // batch. Finalize each affected leaf once, after its mutations, so a
@@ -17681,6 +17703,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn batchInsertWithMetadataOptions(self: *HBCIndex, items: []const BatchInsertItem, requested_options: BatchInsertOptions) !void {
+        if (self.leann) |store| return store.apply(items, &.{});
         var options = requested_options;
         if (self.hasExternalVectorLoader() and options.skip_vector_store and !options.assume_absent_ids)
             options.coalesce_leaf_writes = true;
@@ -17696,25 +17719,30 @@ pub const HBCIndex = struct {
     }
 
     pub fn batchInsertWithMetadataTxn(self: *HBCIndex, txn: anytype, items: []const BatchInsertItem) !void {
+        if (self.leann) |store| return store.apply(items, &.{});
         try vectorindex_hbc_index.batchInsertWithMetadataTxn(self, txn, items);
     }
 
     pub fn bulkBuildWithMetadata(self: *HBCIndex, items: []const BatchInsertItem) !void {
+        if (self.leann) |store| return store.apply(items, &.{});
         try self.captureExactVectorBatch(items, &.{});
         try vectorindex_hbc_index.bulkBuildWithMetadata(self, items, nowNs, elapsedSince);
     }
 
     pub fn bulkBuildWithMetadataOptions(self: *HBCIndex, items: []const BatchInsertItem, options: BulkBuildOptions) !void {
+        if (self.leann) |store| return store.apply(items, &.{});
         try self.captureExactVectorBatch(items, &.{});
         try vectorindex_hbc_index.bulkBuildWithMetadataOptions(self, items, options, nowNs, elapsedSince);
     }
 
     pub fn bulkBuildWithMetadataTxn(self: *HBCIndex, txn: anytype, items: []const BatchInsertItem) !void {
+        if (self.leann) |store| return store.apply(items, &.{});
         try self.captureExactVectorBatch(items, &.{});
         try vectorindex_hbc_index.bulkBuildWithMetadataTxn(self, txn, items);
     }
 
     pub fn bulkBuildPreparedInputsTxn(self: *HBCIndex, txn: anytype, inputs: []const PreparedBulkBuildInput) !void {
+        if (self.leann) |store| return store.apply(inputs, &.{});
         try self.captureExactVectorPreparedBulkBuild(inputs);
         try vectorindex_hbc_index.bulkBuildPreparedInputsTxn(self, txn, inputs);
     }
@@ -17725,6 +17753,7 @@ pub const HBCIndex = struct {
         inputs: []const PreparedBulkBuildInput,
         options: BulkBuildOptions,
     ) !void {
+        if (self.leann) |store| return store.apply(inputs, &.{});
         try self.captureExactVectorPreparedBulkBuild(inputs);
         try vectorindex_hbc_index.bulkBuildPreparedInputsTxnOptions(self, txn, inputs, options, nowNs, elapsedSince);
     }
@@ -17735,6 +17764,7 @@ pub const HBCIndex = struct {
         items: []const BatchInsertItem,
         options: BulkBuildOptions,
     ) !void {
+        if (self.leann) |store| return store.apply(items, &.{});
         try self.captureExactVectorBatch(items, &.{});
         try vectorindex_hbc_index.bulkBuildWithMetadataTxnOptions(self, txn, items, options, nowNs, elapsedSince);
     }
@@ -17753,6 +17783,7 @@ pub const HBCIndex = struct {
         items: []const BatchInsertItem,
         options: BatchInsertOptions,
     ) !void {
+        if (self.leann) |store| return store.apply(items, &.{});
         try vectorindex_hbc_index.batchInsertWithMetadataTxnOptions(self, txn, items, options);
     }
 
@@ -17886,6 +17917,7 @@ pub const HBCIndex = struct {
         transformed_vector: []f32,
         options: BatchInsertOptions,
     ) !void {
+        if (self.leann) |store| return store.apply(&[_]BatchInsertItem{.{ .vector_id = vector_id, .vector = vector_data, .metadata = metadata_value }}, &.{});
         try vectorindex_hbc_index.insertWithMetadataTxnOptions(
             self,
             txn,
@@ -18777,14 +18809,17 @@ pub const HBCIndex = struct {
     }
 
     pub fn searchWithRequest(self: *HBCIndex, req: SearchRequest) !SearchResults {
+        if (self.leann) |store| return try store.search(self.alloc, req);
         return try vectorindex_hbc_index.searchWithRequest(self, req, nowNs, elapsedSince);
     }
 
     pub fn searchProfiled(self: *HBCIndex, query: []const f32, k: usize) !ProfiledSearchResults {
+        if (self.leann) |store| return .{ .results = try store.search(self.alloc, .{ .query = query, .k = k }), .profile = .{} };
         return try vectorindex_hbc_index.searchProfiled(self, query, k, nowNs, elapsedSince);
     }
 
     pub fn searchProfiledRequest(self: *HBCIndex, req: SearchRequest) !ProfiledSearchResults {
+        if (self.leann) |store| return .{ .results = try store.search(self.alloc, req), .profile = .{} };
         return try vectorindex_hbc_index.searchProfiledRequest(self, req, nowNs, elapsedSince);
     }
 
@@ -19038,16 +19073,19 @@ pub const HBCIndex = struct {
 
     /// Delete a vector from the index by ID.
     pub fn delete(self: *HBCIndex, vector_id: u64) !void {
+        if (self.leann) |store| return store.apply(&[_]BatchInsertItem{}, &.{vector_id});
         try self.captureExactVectorBatch(&.{}, &.{vector_id});
         try vectorindex_hbc_index.delete(self, vector_id);
     }
 
     pub fn batchDelete(self: *HBCIndex, vector_ids: []const u64) !void {
+        if (self.leann) |store| return store.apply(&[_]BatchInsertItem{}, vector_ids);
         try self.captureExactVectorBatch(&.{}, vector_ids);
         try vectorindex_hbc_index.batchDelete(self, vector_ids);
     }
 
     fn deleteTxn(self: *HBCIndex, txn: anytype, vector_id: u64) !void {
+        if (self.leann) |store| return store.apply(&[_]BatchInsertItem{}, &.{vector_id});
         try vectorindex_hbc_index.deleteTxn(self, txn, vector_id);
     }
 
@@ -19165,6 +19203,10 @@ pub const HBCIndex = struct {
     }
 
     pub fn stats(self: *const HBCIndex) IndexStats {
+        if (self.leann) |store| {
+            const st = store.stats();
+            return .{ .dims = self.config.dims, .active_count = st.live, .node_count = st.graph_nodes, .root_node = 0, .branching_factor = self.config.branching_factor, .leaf_size = self.config.leaf_size };
+        }
         if (self.boundSearchView()) |view| return .{
             .dims = self.config.dims,
             .root_node = view.root_node,
