@@ -418,13 +418,6 @@ pub const GraphCache = struct {
     }
 };
 
-/// Hash a model configuration struct by hashing the raw bytes of its
-/// non-pointer fields. Works for any packed struct of integer/float/enum
-/// fields — callers pass the byte representation.
-pub fn hashConfigBytes(bytes: []const u8) u64 {
-    return std.hash.Wyhash.hash(0x517cc1b727220a95, bytes);
-}
-
 /// Bucket a sequence length to the next power of 2 (for prefill cache
 /// hit improvement). Decode seq_len=1 is returned as-is.
 pub fn bucketSeqLen(seq_len: u32) u32 {

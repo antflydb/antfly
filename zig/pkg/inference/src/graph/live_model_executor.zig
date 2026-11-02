@@ -23,6 +23,7 @@ const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const model_runtime = @import("model_runtime.zig");
+const session_decoder = @import("session_decoder.zig");
 
 /// Live whole-model executor for native sessions.
 ///
@@ -31,30 +32,22 @@ const model_runtime = @import("model_runtime.zig");
 /// generation path, this runtime owns decode-state advancement itself: prefill
 /// seeds the cache, decode consumes one token and advances the cache for the
 /// next step.
-const ExecutorContext = struct {
-    allocator: std.mem.Allocator,
-    session: backends.Session,
-    gpt_config: gpt_mod.Config,
-    kv_dtype: ?runtime.kv.pool.KvDType = null,
-    shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
-};
-
 const RuntimeContext = struct {
     allocator: std.mem.Allocator,
     cb: ops.ComputeBackend,
-    gpt_config: gpt_mod.Config,
+    definition: *session_decoder.Definition,
     kv_manager: runtime.kv.manager.KvManager,
     pool_id: runtime.kv.block.KvPoolId,
     decode_runtime: decode_state_runtime.DecodeStateRuntime,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
 
-    fn init(
-        allocator: std.mem.Allocator,
-        session: backends.Session,
-        gpt_config: gpt_mod.Config,
-        kv_dtype_override: ?runtime.kv.pool.KvDType,
-        shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
-    ) !*RuntimeContext {
+    fn init(allocator: std.mem.Allocator, source: *session_decoder.Definition) !*RuntimeContext {
+        const definition = try source.acquireForRuntime(allocator);
+        errdefer definition.release();
+        const session = definition.session;
+        const gpt_config = definition.configuration.value;
+        const kv_dtype_override = definition.kv_dtype;
+        const shared_moe_cache = definition.shared_moe_cache;
         const cb = try session.acquireComputeBackend(allocator, .{});
         errdefer {
             var cb_mut = cb;
@@ -88,7 +81,7 @@ const RuntimeContext = struct {
         ctx.* = .{
             .allocator = allocator,
             .cb = cb,
-            .gpt_config = gpt_config,
+            .definition = definition,
             .kv_manager = kv_manager,
             .pool_id = pool_id,
             .decode_runtime = undefined,
@@ -112,13 +105,14 @@ const RuntimeContext = struct {
             self.pool_id,
             self.shared_moe_cache,
         );
-        self.decode_runtime.configureForGptConfig(self.gpt_config);
+        self.decode_runtime.configureForGptConfig(self.definition.configuration.value);
     }
 
     pub fn deinit(self: *RuntimeContext) void {
         self.decode_runtime.deinit();
         self.kv_manager.deinit();
         self.cb.deinit();
+        self.definition.release();
         self.allocator.destroy(self);
     }
 
@@ -193,11 +187,6 @@ const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .reset = runtimeReset,
 };
 
-const executor_vtable = model_runtime.ModelExecutor.VTable{
-    .create_runtime = createRuntime,
-    .deinit = executorDeinit,
-};
-
 fn supportsBackend(backend: backends.BackendType) bool {
     return switch (backend) {
         .native, .metal => true,
@@ -217,32 +206,11 @@ pub fn createModelExecutor(
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
 ) !model_runtime.ModelExecutor {
     if (!supportsSession(session)) return error.UnsupportedCompileBackend;
-    const ctx = try allocator.create(ExecutorContext);
-    ctx.* = .{
-        .allocator = allocator,
-        .session = session,
-        .gpt_config = gpt_config,
-        .kv_dtype = kv_dtype,
-        .shared_moe_cache = shared_moe_cache,
-    };
-    return .{ .ptr = ctx, .vtable = &executor_vtable };
+    return session_decoder.createExecutor(allocator, session, &gpt_config, kv_dtype, shared_moe_cache, createRuntime);
 }
 
-fn createRuntime(ctx: *anyopaque, allocator: std.mem.Allocator) !model_runtime.ModelRuntime {
-    const exec_ctx: *ExecutorContext = @ptrCast(@alignCast(ctx));
-    const runtime_ctx = try RuntimeContext.init(
-        allocator,
-        exec_ctx.session,
-        exec_ctx.gpt_config,
-        exec_ctx.kv_dtype,
-        exec_ctx.shared_moe_cache,
-    );
-    return .{ .ptr = runtime_ctx, .vtable = &runtime_vtable };
-}
-
-fn executorDeinit(ctx: *anyopaque) void {
-    const exec_ctx: *ExecutorContext = @ptrCast(@alignCast(ctx));
-    exec_ctx.allocator.destroy(exec_ctx);
+fn createRuntime(definition: *session_decoder.Definition, allocator: std.mem.Allocator) !model_runtime.ModelRuntime {
+    return .{ .ptr = try RuntimeContext.init(allocator, definition), .vtable = &runtime_vtable };
 }
 
 fn runtimeCapabilities(ctx: *anyopaque) model_runtime.RuntimeCapabilities {
@@ -340,7 +308,7 @@ fn runtimeDecodeGreedy(
         .token_id = @intCast(try gpt_arch.forwardGreedyLastToken(
             &runtime_ctx.cb,
             allocator,
-            runtime_ctx.gpt_config,
+            runtime_ctx.definition.configuration.value,
             input_ids[0..],
             1,
             step.seq_len,
@@ -360,14 +328,14 @@ fn forwardLastLogits(
     const logits = try gpt_arch.forward(
         &runtime_ctx.cb,
         allocator,
-        runtime_ctx.gpt_config,
+        runtime_ctx.definition.configuration.value,
         input_ids,
         1,
         seq_len,
         decode_context,
     );
     defer allocator.free(logits);
-    const vocab_size: usize = @intCast(runtime_ctx.gpt_config.vocab_size);
+    const vocab_size: usize = @intCast(runtime_ctx.definition.configuration.value.vocab_size);
     const last_pos_offset = (query_seq_len - 1) * vocab_size;
     return allocator.dupe(f32, logits[last_pos_offset..][0..vocab_size]);
 }

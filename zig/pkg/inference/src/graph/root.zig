@@ -51,6 +51,7 @@ pub const quant_kernel_model_catalog = @import("quant_kernel_model_catalog.zig")
 pub const quant_recipe = @import("quant_recipe.zig");
 pub const quant_kernel_metal_renderer = @import("quant_kernel_metal_renderer.zig");
 pub const model_runtime = @import("model_runtime.zig");
+pub const session_decoder = @import("session_decoder.zig");
 pub const decode_state_runtime = @import("decode_state_runtime.zig");
 pub const decode_batch = @import("decode_batch.zig");
 pub const decoder_work = @import("decoder_work.zig");
@@ -167,6 +168,7 @@ test {
     _ = quant_kernel_metal_renderer;
     _ = quant_recipe;
     _ = model_runtime;
+    _ = session_decoder;
     _ = decode_state_runtime;
     _ = decode_batch;
     _ = decoder_work;

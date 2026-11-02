@@ -242,7 +242,7 @@ fn directSessionRuntime(
     const owner = cache_mod.SessionRuntimeOwner{
         .session_ptr = session.ptr,
         .session_vtable = session.vtable,
-        .config_hash = cache_mod.hashConfigBytes(std.mem.asBytes(&gpt_config)),
+        .config_hash = gpt_config.fingerprint(),
         .kv_dtype = context.kv_dtype,
         .shared_moe_cache = context.shared_moe_cache,
     };

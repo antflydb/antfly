@@ -136,7 +136,14 @@ preparation API do not by themselves complete these remaining requirements:
   Backend pointers are borrowed from their real owner; temporary context values
   never become the owner of cached executors or physical bindings. Immutable
   model configuration is borrowed, avoiding a full metadata copy per step;
-  cache keys hash its content rather than the pointer. Tied heads, optional
+  cache keys canonicalize semantic fields, ignoring struct padding and prefix
+  allocation addresses while hashing prefix bytes. Native and Metal whole-model
+  executors share `graph/session_decoder.zig` for immutable definition ownership.
+  Definitions own configuration slices and survive executor retirement. Runtimes
+  share metadata within the same allocator lifetime or clone it into their own
+  allocator before request allocator retirement; failed migration preserves the
+  original definition. No metadata allocation or reference counting occurs per
+  decoder step. Tied heads, optional
   scales and omitted-projection aliases live in the architecture weight adapter.
   Self-contained Metal session runtimes have an explicit loaded-session/config,
   KV dtype and shared-expert-cache owner key. Transient request backend wrappers

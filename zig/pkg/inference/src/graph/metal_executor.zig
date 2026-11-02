@@ -34,6 +34,7 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const contracts = @import("backend_contracts.zig");
 const model_runtime = @import("model_runtime.zig");
+const session_decoder = @import("session_decoder.zig");
 const quant_matmul = @import("quant_matmul.zig");
 
 const c_std = std.c;
@@ -955,14 +956,6 @@ fn disablePagedKvDebug() bool {
         std.ascii.eqlIgnoreCase(slice, "on");
 }
 
-const ExecutorContext = struct {
-    allocator: std.mem.Allocator,
-    session: backends.Session,
-    gpt_config: gpt_mod.Config,
-    kv_dtype: ?runtime.kv.pool.KvDType = null,
-    shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
-};
-
 const DecoderRuntimeSpanState = struct {
     kv_tokens: usize,
     kv_position_offset: usize,
@@ -1351,7 +1344,7 @@ const RuntimeContext = struct {
     references: std.atomic.Value(usize) = .init(1),
     allocator: std.mem.Allocator,
     cb: ops.ComputeBackend,
-    gpt_config: gpt_mod.Config,
+    definition: *session_decoder.Definition,
     use_decoder_runtime_executor: bool,
     kv_storage: runtime.kv.storage_runtime.KvStorageRuntime,
     pool_id: runtime.kv.block.KvPoolId,
@@ -1370,13 +1363,13 @@ const RuntimeContext = struct {
     greedy_device_token_tensor: ?ops.CT,
     greedy_device_token_id: ?i64,
 
-    fn init(
-        allocator: std.mem.Allocator,
-        session: backends.Session,
-        gpt_config: gpt_mod.Config,
-        kv_dtype_override: ?runtime.kv.pool.KvDType,
-        shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
-    ) !*RuntimeContext {
+    fn init(allocator: std.mem.Allocator, source: *session_decoder.Definition) !*RuntimeContext {
+        const definition = try source.acquireForRuntime(allocator);
+        errdefer definition.release();
+        const session = definition.session;
+        const gpt_config = definition.configuration.value;
+        const kv_dtype_override = definition.kv_dtype;
+        const shared_moe_cache = definition.shared_moe_cache;
         // The runtime outlives the request that creates it and is cached on
         // the loaded model, so it must not hold the per-request Metal lease.
         const cb = try session.acquireComputeBackend(allocator, .{ .borrow_shared_provider = true });
@@ -1416,7 +1409,7 @@ const RuntimeContext = struct {
         ctx.* = .{
             .allocator = allocator,
             .cb = cb,
-            .gpt_config = gpt_config,
+            .definition = definition,
             .use_decoder_runtime_executor = session.backend() == .metal,
             .kv_storage = kv_storage,
             .pool_id = pool_id,
@@ -1458,6 +1451,7 @@ const RuntimeContext = struct {
         self.kv_metadata.deinit(&self.kv_storage);
         self.kv_storage.deinit();
         self.cb.deinit();
+        self.definition.release();
         self.allocator.destroy(self);
     }
 
@@ -1529,7 +1523,7 @@ const RuntimeContext = struct {
         const maybe_result = gpt_arch.forwardGreedyLastTokenFromTokenTensor(
             &self.cb,
             allocator,
-            self.gpt_config,
+            self.definition.configuration.value,
             input_token,
             1,
             seq_len,
@@ -1558,7 +1552,7 @@ const RuntimeContext = struct {
     }
 
     fn decoderRuntimeConfiguredLayerCount(self: *const RuntimeContext) usize {
-        return self.gpt_config.num_hidden_layers;
+        return self.definition.configuration.value.num_hidden_layers;
     }
 
     fn decoderRuntimeExecutorEnabled(self: *const RuntimeContext) bool {
@@ -1728,7 +1722,7 @@ const RuntimeContext = struct {
     fn configureKvPolicy(self: *RuntimeContext, max_inflight_tokens: usize, allow_swa_ring: bool) !void {
         try self.kv_metadata.configureKvPolicy(
             max_inflight_tokens,
-            allow_swa_ring and self.gpt_config.supportsSplitSwaGlobalKvRing(),
+            allow_swa_ring and self.definition.configuration.value.supportsSplitSwaGlobalKvRing(),
         );
     }
 
@@ -1845,7 +1839,7 @@ const RuntimeContext = struct {
         const prepare_started_at = monotonicNowNs();
         const prepare = try self.cb.decoderRuntimePrepareOrReuseFamily(
             self.allocator,
-            self.gpt_config,
+            self.definition.configuration.value,
             kv_view.token_count,
             configured_layer_count,
         );
@@ -1884,7 +1878,7 @@ const RuntimeContext = struct {
         const output = if (try metal_runtime.forwardLastLogitsTensorFamily(
             &self.cb,
             allocator,
-            self.gpt_config,
+            self.definition.configuration.value,
             configured_layer_count,
             token_id,
             seq_len,
@@ -1892,7 +1886,7 @@ const RuntimeContext = struct {
         )) |logits| model_runtime.ModelOutput{
             .device_logits = logits,
             .device_logits_backend = self.cb,
-            .final_logit_softcap = self.gpt_config.final_logit_softcapping,
+            .final_logit_softcap = self.definition.configuration.value.final_logit_softcapping,
         } else null;
         if (output != null) {
             self.noteDecoderRuntimeStateFromCurrentView();
@@ -1915,7 +1909,7 @@ const RuntimeContext = struct {
         request: model_runtime.DecodeRequest,
     ) !?i64 {
         if (request.attention_mode != .paged_decode) return null;
-        if (self.gpt_config.family != .gemma) return null;
+        if (self.definition.configuration.value.family != .gemma) return null;
         const configured_layer_count = self.decoderRuntimeConfiguredLayerCount();
         if (self.pipelined_decode_armed and self.pipelined_decode_mode != .greedy) {
             return error.PipelinedDecodeModeChanged;
@@ -1941,7 +1935,7 @@ const RuntimeContext = struct {
                 return try metal_runtime.forwardGreedyTokenFamily(
                     &self.cb,
                     allocator,
-                    self.gpt_config,
+                    self.definition.configuration.value,
                     configured_layer_count,
                     request.token_id,
                     arm_seq_len,
@@ -1951,7 +1945,7 @@ const RuntimeContext = struct {
             const armed = metal_runtime.forwardGreedyTokenPipelinedArmFamily(
                 &self.cb,
                 allocator,
-                self.gpt_config,
+                self.definition.configuration.value,
                 configured_layer_count,
                 request.token_id,
                 arm_seq_len,
@@ -1961,7 +1955,7 @@ const RuntimeContext = struct {
                 return try metal_runtime.forwardGreedyTokenFamily(
                     &self.cb,
                     allocator,
-                    self.gpt_config,
+                    self.definition.configuration.value,
                     configured_layer_count,
                     request.token_id,
                     arm_seq_len,
@@ -1990,7 +1984,7 @@ const RuntimeContext = struct {
         if (try metal_runtime.forwardGreedyTokenPipelinedStepFamily(
             &self.cb,
             allocator,
-            self.gpt_config,
+            self.definition.configuration.value,
             configured_layer_count,
             next_step.seq_len,
             &next_step.decode_context,
@@ -2031,7 +2025,7 @@ const RuntimeContext = struct {
             if (self.pipelined_decode_armed) return error.PipelinedSamplingContractChanged;
             return null;
         }
-        if (self.gpt_config.family != .gemma) {
+        if (self.definition.configuration.value.family != .gemma) {
             if (self.pipelined_decode_armed) return error.PipelinedSamplingContractChanged;
             return null;
         }
@@ -2048,7 +2042,7 @@ const RuntimeContext = struct {
                 return error.PipelinedSamplingContractChanged;
             }
             if (!decoder_gated_runtime.residentSampledTokenPipelineContinuationSupported(
-                self.gpt_config,
+                self.definition.configuration.value,
                 configured_layer_count,
                 request.sampling,
             )) return error.PipelinedSamplingContractChanged;
@@ -2064,7 +2058,7 @@ const RuntimeContext = struct {
             const armed = try decoder_gated_runtime.forwardSampledTokenPipelinedArm(
                 &self.cb,
                 allocator,
-                self.gpt_config,
+                self.definition.configuration.value,
                 configured_layer_count,
                 request.decode.token_id,
                 arm_step.seq_len,
@@ -2087,14 +2081,14 @@ const RuntimeContext = struct {
         const token = (try decoder_gated_runtime.forwardSampledTokenPipelinedStep(
             &self.cb,
             allocator,
-            self.gpt_config,
+            self.definition.configuration.value,
             configured_layer_count,
             next_step.seq_len,
             &next_step.decode_context,
             request.sampling,
             request.token_history,
         )) orelse return error.ResidentSamplingFrameFailed;
-        try submitSampledPipelineToken(&self.cb, token, self.gpt_config.vocab_size);
+        try submitSampledPipelineToken(&self.cb, token, self.definition.configuration.value.vocab_size);
         self.pipelined_decode_armed = true;
         self.pipelined_decode_mode = .sampled_nucleus;
         self.pipelined_sampling = request.sampling;
@@ -2115,7 +2109,7 @@ const RuntimeContext = struct {
         const token = try metal_runtime.forwardGreedyTokenFamily(
             &self.cb,
             allocator,
-            self.gpt_config,
+            self.definition.configuration.value,
             configured_layer_count,
             token_id,
             seq_len,
@@ -2141,7 +2135,7 @@ const RuntimeContext = struct {
         const token = try metal_runtime.forwardSampledTokenFamily(
             &self.cb,
             allocator,
-            self.gpt_config,
+            self.definition.configuration.value,
             configured_layer_count,
             token_id,
             seq_len,
@@ -2174,11 +2168,6 @@ const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .debug_timing_stats = runtimeDebugTimingStats,
     .reset_debug_timing_stats = runtimeResetDebugTimingStats,
     .print_debug_timing = runtimePrintDebugTiming,
-};
-
-const executor_vtable = model_runtime.ModelExecutor.VTable{
-    .create_runtime = createRuntime,
-    .deinit = executorDeinit,
 };
 
 fn envFlag(name: [:0]const u8) bool {
@@ -2348,32 +2337,11 @@ pub fn createModelExecutor(
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
 ) !model_runtime.ModelExecutor {
     if (!supportsSession(session)) return error.UnsupportedCompileBackend;
-    const ctx = try allocator.create(ExecutorContext);
-    ctx.* = .{
-        .allocator = allocator,
-        .session = session,
-        .gpt_config = gpt_config,
-        .kv_dtype = kv_dtype,
-        .shared_moe_cache = shared_moe_cache,
-    };
-    return .{ .ptr = ctx, .vtable = &executor_vtable };
+    return session_decoder.createExecutor(allocator, session, &gpt_config, kv_dtype, shared_moe_cache, createRuntime);
 }
 
-fn createRuntime(ctx: *anyopaque, allocator: std.mem.Allocator) !model_runtime.ModelRuntime {
-    const exec_ctx: *ExecutorContext = @ptrCast(@alignCast(ctx));
-    const runtime_ctx = try RuntimeContext.init(
-        allocator,
-        exec_ctx.session,
-        exec_ctx.gpt_config,
-        exec_ctx.kv_dtype,
-        exec_ctx.shared_moe_cache,
-    );
-    return .{ .ptr = runtime_ctx, .vtable = &runtime_vtable };
-}
-
-fn executorDeinit(ctx: *anyopaque) void {
-    const exec_ctx: *ExecutorContext = @ptrCast(@alignCast(ctx));
-    exec_ctx.allocator.destroy(exec_ctx);
+fn createRuntime(definition: *session_decoder.Definition, allocator: std.mem.Allocator) !model_runtime.ModelRuntime {
+    return .{ .ptr = try RuntimeContext.init(allocator, definition), .vtable = &runtime_vtable };
 }
 
 fn runtimeCapabilities(ctx: *anyopaque) model_runtime.RuntimeCapabilities {
@@ -2410,17 +2378,17 @@ fn runtimePrepare(
     // Qualified A4B currently executes through the graph fallback, not the
     // prepared dense-family decoder. Treat its explicitly requested bounded
     // page warmup as a complete prepare operation before probing that family.
-    if (a4bMappedLayer0PrewarmEnabled(runtime_ctx.gpt_config)) {
-        try prewarmA4bMappedLayer0(&runtime_ctx.cb, runtime_ctx.gpt_config);
+    if (a4bMappedLayer0PrewarmEnabled(runtime_ctx.definition.configuration.value)) {
+        try prewarmA4bMappedLayer0(&runtime_ctx.cb, runtime_ctx.definition.configuration.value);
         return true;
     }
-    if (gemma4_runtime.supportsPreparedA4bRuntimeConfig(runtime_ctx.gpt_config)) return false;
+    if (gemma4_runtime.supportsPreparedA4bRuntimeConfig(runtime_ctx.definition.configuration.value)) return false;
 
     const configured_layer_count = runtime_ctx.decoderRuntimeConfiguredLayerCount();
     const prepare_started_at = monotonicNowNs();
     const prepare = try runtime_ctx.cb.decoderRuntimePrepareOrReuseFamily(
         allocator,
-        runtime_ctx.gpt_config,
+        runtime_ctx.definition.configuration.value,
         request.kv_tokens_hint,
         configured_layer_count,
     );
@@ -2432,18 +2400,18 @@ fn runtimePrepare(
         timing_stats.runtime_prepare_family_nanos += @intCast(monotonicNowNs() - prepare_started_at);
     }
     if (prepare.prepared) {
-        prewarmEmbeddingWeight(&runtime_ctx.cb, runtime_ctx.gpt_config) catch {};
-        try prewarmA4bMappedLayer0(&runtime_ctx.cb, runtime_ctx.gpt_config);
+        prewarmEmbeddingWeight(&runtime_ctx.cb, runtime_ctx.definition.configuration.value) catch {};
+        try prewarmA4bMappedLayer0(&runtime_ctx.cb, runtime_ctx.definition.configuration.value);
         _ = decoder_gated_runtime.preplanPrefillFrame(
             &runtime_ctx.cb,
             allocator,
-            runtime_ctx.gpt_config,
+            runtime_ctx.definition.configuration.value,
             configured_layer_count,
             request.kv_tokens_hint,
         ) catch false;
         _ = decoder_gated_runtime.prewarmPleTokenEmbedding(
             &runtime_ctx.cb,
-            runtime_ctx.gpt_config,
+            runtime_ctx.definition.configuration.value,
         ) catch false;
     }
     return prepare.prepared;
@@ -2521,7 +2489,7 @@ fn runtimePrefill(
     // the fixed decode plan on the first generated token. Preparing in the
     // opposite order leaves too little shared slot-directory capacity for
     // the canonical multi-row MoE prefill.
-    const defer_a4b_decode_prepare = gemma4_runtime.supportsPreparedA4bRuntimeConfig(runtime_ctx.gpt_config);
+    const defer_a4b_decode_prepare = gemma4_runtime.supportsPreparedA4bRuntimeConfig(runtime_ctx.definition.configuration.value);
     const decoder_runtime_ready = if (request.force_host_logits)
         false
     else if (defer_a4b_decode_prepare)
@@ -2556,7 +2524,7 @@ fn runtimePrefill(
         if (try metal_runtime.forwardPrefillLastPreparedTailFamily(
             &runtime_ctx.cb,
             allocator,
-            runtime_ctx.gpt_config,
+            runtime_ctx.definition.configuration.value,
             configured_layer_count,
             request.input_ids,
             request.seq_len,
@@ -2582,7 +2550,7 @@ fn runtimePrefill(
                 .hidden_size = tail.hidden_size,
                 .vocab_size = tail.vocab_size,
                 .eps = tail.norm_eps,
-                .final_logit_softcap = runtime_ctx.gpt_config.final_logit_softcapping,
+                .final_logit_softcap = runtime_ctx.definition.configuration.value.final_logit_softcapping,
                 .use_transformed_lm_head = decoder_tail_runtime.repackQualityRawLogitsEnabled(),
                 .greedy_token_id = tail.greedy_token_id,
             } };
@@ -2651,7 +2619,7 @@ fn runtimeDecodeSample(
     timing_stats.decode_sample_calls += 1;
     runtime_ctx.clearGreedyDeviceToken();
     if (committed_direct and
-        (runtime_ctx.pipelined_decode_armed or pipelinedDecodeFrameEnabled(runtime_ctx.gpt_config)))
+        (runtime_ctx.pipelined_decode_armed or pipelinedDecodeFrameEnabled(runtime_ctx.definition.configuration.value)))
     {
         const pipelined_started_at = monotonicNowNs();
         if (try runtime_ctx.decodeSamplePipelined(allocator, request)) |token_id| {
@@ -2670,7 +2638,7 @@ fn runtimeDecodeSample(
         const token_id = (try decoder_gated_runtime.forwardResidentSampledToken(
             &runtime_ctx.cb,
             allocator,
-            runtime_ctx.gpt_config,
+            runtime_ctx.definition.configuration.value,
             configured_layer_count,
             request.decode.token_id,
             step.seq_len,
@@ -2723,7 +2691,7 @@ fn runtimeDecodeSample(
             if (try backend.sampleLastRow(&.{
                 .tensor = device_logits,
                 .rows = 1,
-                .dim = runtime_ctx.gpt_config.vocab_size,
+                .dim = runtime_ctx.definition.configuration.value.vocab_size,
                 .temperature = request.sampling.temperature,
                 .top_k = @intCast(@max(request.sampling.top_k, 0)),
                 .top_p = request.sampling.top_p,
@@ -2758,10 +2726,10 @@ fn runtimeSupportsSampleDecodeRequest(
     if (runtime_ctx.pipelined_decode_armed) return true;
     if (request.decode.attention_mode != .paged_decode) return false;
     if (!runtime_ctx.decoderRuntimeExecutorEnabled()) return false;
-    return switch (runtime_ctx.gpt_config.family) {
+    return switch (runtime_ctx.definition.configuration.value.family) {
         .llama, .mistral, .qwen2, .gemma => decoder_gated_runtime.residentSampledTokenSupported(
             &runtime_ctx.cb,
-            runtime_ctx.gpt_config,
+            runtime_ctx.definition.configuration.value,
             runtime_ctx.decoderRuntimeConfiguredLayerCount(),
             request.sampling,
             request.token_history,
@@ -2778,7 +2746,7 @@ fn runtimeDecodeGreedy(
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
     try request.check();
     timing_stats.decode_greedy_calls += 1;
-    if (pipelinedDecodeFrameEnabled(runtime_ctx.gpt_config)) {
+    if (pipelinedDecodeFrameEnabled(runtime_ctx.definition.configuration.value)) {
         const pipelined_started_at = monotonicNowNs();
         if (try runtime_ctx.decodeGreedyPipelined(allocator, request)) |token_id| {
             timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - pipelined_started_at);
@@ -2807,7 +2775,7 @@ fn runtimeDecodeGreedy(
         defer owned_output.deinit(allocator);
         if (owned_output.device_logits) |device_logits| {
             const backend = owned_output.device_logits_backend orelse return error.InvalidModelOutput;
-            if (try backend.argmaxLastRow(device_logits, 1, runtime_ctx.gpt_config.vocab_size)) |token_id| {
+            if (try backend.argmaxLastRow(device_logits, 1, runtime_ctx.definition.configuration.value.vocab_size)) |token_id| {
                 try runtime_ctx.seedGreedyDeviceToken(@intCast(token_id));
                 timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
                 return .{ .token_id = @intCast(token_id) };
@@ -2829,7 +2797,7 @@ fn runtimeDecodeGreedy(
     const token_id = try gpt_arch.forwardGreedyLastToken(
         &runtime_ctx.cb,
         allocator,
-        runtime_ctx.gpt_config,
+        runtime_ctx.definition.configuration.value,
         input_ids[0..],
         1,
         step.seq_len,
@@ -2853,14 +2821,14 @@ fn forwardLastLogits(
     const logits = try gpt_arch.forward(
         &runtime_ctx.cb,
         allocator,
-        runtime_ctx.gpt_config,
+        runtime_ctx.definition.configuration.value,
         input_ids,
         1,
         seq_len,
         decode_context,
     );
     defer allocator.free(logits);
-    const vocab_size: usize = @intCast(runtime_ctx.gpt_config.vocab_size);
+    const vocab_size: usize = @intCast(runtime_ctx.definition.configuration.value.vocab_size);
     const last_pos_offset = (query_seq_len - 1) * vocab_size;
     return allocator.dupe(f32, logits[last_pos_offset..][0..vocab_size]);
 }
@@ -3083,7 +3051,21 @@ test "resident Metal model output retains its actual backend across runtime evic
         }
     };
     for ([_]bool{ false, true }) |prepared| {
-        const context = try RuntimeContext.init(a, session, config, null, null);
+        const caller_prefix = try a.dupe(u8, "ephemeral.");
+        var caller_config = config;
+        caller_config.weight_prefix = caller_prefix;
+        var executor = createModelExecutor(a, session, caller_config, null, null) catch |err| {
+            a.free(caller_prefix);
+            return err;
+        };
+        var executor_live = true;
+        defer if (executor_live) executor.deinit();
+        @memset(caller_prefix, 'x');
+        a.free(caller_prefix);
+        const created = try executor.createRuntime(a);
+        const context: *RuntimeContext = @ptrCast(@alignCast(created.ptr));
+        executor.deinit();
+        executor_live = false;
         // Exercise output ownership with an actual device tensor independently of
         // whether this deliberately small checkpoint qualifies for a fused decoder.
         var callbacks = runtime_vtable;
@@ -3091,6 +3073,7 @@ test "resident Metal model output retains its actual backend across runtime evic
         var runtime_instance = model_runtime.ModelRuntime{ .ptr = context, .vtable = &callbacks };
         var runtime_live = true;
         defer if (runtime_live) runtime_instance.deinit();
+        try std.testing.expectEqualStrings("ephemeral.", context.definition.configuration.value.weight_prefix);
         if (prepared) {
             const norm = try context.cb.fromFloat32Shape(&.{ 1, 1 }, &.{2});
             defer context.cb.free(norm);

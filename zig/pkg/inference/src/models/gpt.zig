@@ -260,6 +260,34 @@ pub const Config = struct {
     /// Recurrent histories remain separately allocated for every linear layer.
     compact_qwen35_kv: bool = false,
 
+    /// Process cache identity of semantic field values, independent of padding
+    /// and the allocation holding weight_prefix. No allocation; the input configuration stays borrowed.
+    pub fn fingerprint(self: *const Config) u64 {
+        var bytes: [@sizeOf(Config)]u8 = undefined;
+        comptime var length: usize = 0;
+        inline for (@typeInfo(Config).@"struct".field_names) |name| {
+            const T = @FieldType(Config, name);
+            if (@typeInfo(T) != .pointer) {
+                canonicalConfigField(bytes[length..][0..@sizeOf(T)], &@field(self.*, name));
+                length += @sizeOf(T);
+            }
+        }
+        var hasher = std.hash.Wyhash.init(0x517cc1b727220a95);
+        hasher.update(bytes[0..length]);
+        inline for (@typeInfo(Config).@"struct".field_names) |name| {
+            const T = @FieldType(Config, name);
+            if (@typeInfo(T) == .pointer) {
+                const info = @typeInfo(T).pointer;
+                if (info.size != .slice or info.child != u8) @compileError("configuration fingerprints require explicit pointer content semantics");
+                const value = @field(self.*, name);
+                const size: u64 = @intCast(value.len);
+                hasher.update(std.mem.asBytes(&size));
+                hasher.update(value);
+            }
+        }
+        return hasher.final();
+    }
+
     pub fn effectiveKVHeads(self: Config) u32 {
         return if (self.num_key_value_heads > 0) self.num_key_value_heads else self.num_attention_heads;
     }
@@ -3799,4 +3827,116 @@ test "LightOnOCR3 official 4B config uses grouped recurrent heads and larger vis
     try std.testing.expectEqual(@as(u32, 24), config.vision_num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 1024), config.vision_hidden_size);
     try std.testing.expect(config.isEosToken(248046));
+}
+
+/// Cached execution retains an independent configuration snapshot. Synchronous
+/// execution continues to borrow Config; owned snapshots copy byte-slice fields.
+pub const OwnedConfig = struct {
+    value: Config,
+
+    pub fn init(allocator: std.mem.Allocator, source: *const Config) !OwnedConfig {
+        var result = OwnedConfig{ .value = source.* };
+        var initialized: usize = 0;
+        errdefer {
+            inline for (@typeInfo(Config).@"struct".field_names, 0..) |name, index| {
+                if (@typeInfo(@FieldType(Config, name)) == .pointer) {
+                    if (index < initialized) allocator.free(@field(result.value, name));
+                }
+            }
+        }
+        inline for (@typeInfo(Config).@"struct".field_names, 0..) |name, index| {
+            const T = @FieldType(Config, name);
+            if (@typeInfo(T) == .pointer) {
+                const info = @typeInfo(T).pointer;
+                if (info.size != .slice or info.child != u8) @compileError("owned configuration requires explicit pointer ownership semantics");
+                @field(result.value, name) = try allocator.dupe(u8, @field(source.*, name));
+                initialized = index + 1;
+            }
+        }
+        return result;
+    }
+
+    pub fn deinit(self: *OwnedConfig, allocator: std.mem.Allocator) void {
+        inline for (@typeInfo(Config).@"struct".field_names) |name| {
+            if (@typeInfo(@FieldType(Config, name)) == .pointer) allocator.free(@field(self.value, name));
+        }
+        self.* = undefined;
+    }
+};
+
+// Canonicalize sub-byte integers/enums and bools, preserving float bit patterns.
+// Integer arrays copy directly; enum schedules use their full storage bytes.
+fn canonicalConfigField(destination: []u8, value: anytype) void {
+    const T = @typeInfo(@TypeOf(value)).pointer.child;
+    if (comptime std.meta.hasUniqueRepresentation(T)) {
+        @memcpy(destination, std.mem.asBytes(value));
+        return;
+    }
+    switch (@typeInfo(T)) {
+        .bool => destination[0] = @intFromBool(value.*),
+        .int => |info| {
+            const canonical: @Int(info.signedness, @sizeOf(T) * 8) = @intCast(value.*);
+            @memcpy(destination, std.mem.asBytes(&canonical));
+        },
+        .@"enum" => |info| {
+            const canonical: @Int(@typeInfo(info.tag_type).int.signedness, @sizeOf(T) * 8) = @intCast(@backingInt(value.*));
+            @memcpy(destination, std.mem.asBytes(&canonical));
+        },
+        .float => |info| {
+            const bits: @Int(.unsigned, info.bits) = @bitCast(value.*);
+            @memcpy(destination, std.mem.asBytes(&bits));
+        },
+        .array => |info| for (0..info.len) |i| canonicalConfigField(destination[i * @sizeOf(info.child) ..][0..@sizeOf(info.child)], &value[i]),
+        else => @compileError("unsupported configuration fingerprint field " ++ @typeName(T)),
+    }
+}
+
+test "configuration fingerprints use prefix contents and ignore prefix allocation" {
+    var first_prefix = "model.".*;
+    var second_prefix = first_prefix;
+    const first = Config{ .family = .llama, .weight_prefix = &first_prefix };
+    const second = Config{ .family = .llama, .weight_prefix = &second_prefix };
+    try std.testing.expect(first.weight_prefix.ptr != second.weight_prefix.ptr);
+    try std.testing.expectEqual(first.fingerprint(), second.fingerprint());
+    const original = second.fingerprint();
+    const prefix_pointer = second.weight_prefix.ptr;
+    const prefix_length = second.weight_prefix.len;
+    second_prefix[0] = 'n';
+    try std.testing.expectEqual(prefix_pointer, second.weight_prefix.ptr);
+    try std.testing.expectEqual(prefix_length, second.weight_prefix.len);
+    try std.testing.expect(original != second.fingerprint());
+}
+
+test "configuration fingerprints ignore struct padding and retain numerical policy" {
+    var first = Config{ .family = .llama };
+    var second = first;
+    var fields: [@sizeOf(Config)]bool = @splat(false);
+    inline for (@typeInfo(Config).@"struct".field_names) |name| @memset(fields[@offsetOf(Config, name)..][0..@sizeOf(@FieldType(Config, name))], true);
+    for (fields, 0..) |field, i| if (!field) {
+        std.mem.asBytes(&first)[i] = 0xa5;
+        std.mem.asBytes(&second)[i] = 0x5a;
+    };
+    try std.testing.expectEqual(first.fingerprint(), second.fingerprint());
+    second.norm_eps *= 2;
+    try std.testing.expect(first.fingerprint() != second.fingerprint());
+    second = first;
+    second.deepseek_v4_attention_schedule[0] = .sliding_attention;
+    try std.testing.expect(first.fingerprint() != second.fingerprint());
+}
+
+fn checkOwnedConfig(allocator: std.mem.Allocator) !void {
+    var prefix = "model.".*;
+    const source = Config{ .family = .llama, .weight_prefix = &prefix };
+    const original_key = source.fingerprint();
+    var owned = try OwnedConfig.init(allocator, &source);
+    defer owned.deinit(allocator);
+    try std.testing.expect(source.weight_prefix.ptr != owned.value.weight_prefix.ptr);
+    @memset(&prefix, 'x');
+    try std.testing.expectEqualStrings("model.", owned.value.weight_prefix);
+    try std.testing.expectEqual(original_key, owned.value.fingerprint());
+}
+
+test "owned configuration survives caller mutation and every allocation failure" {
+    try checkOwnedConfig(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkOwnedConfig, .{});
 }

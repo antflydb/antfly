@@ -403,7 +403,7 @@ fn graphCacheKey(
 ) cache_mod.CacheKey {
     const attn_mode = cacheAttentionMode(decode_context);
     return .{
-        .config_hash = cache_mod.hashConfigBytes(std.mem.asBytes(pipeline.gpt_config)),
+        .config_hash = pipeline.gpt_config.fingerprint(),
         .batch = @intCast(batch),
         // Key the shape actually traced. Bucketing is safe only when the
         // caller has padded the physical inputs to that bucket first.
@@ -907,7 +907,7 @@ test "decoder graph cache owns tracing allocations and failed traces remain retr
                     @memset(values[5..8], 0);
                     return self.cb.fromFloat32Shape(&values, &.{ 8, 4 });
                 }
-                if (std.mem.eql(u8, name, "lm_head.weight"))
+                if (std.mem.endsWith(u8, name, "lm_head.weight"))
                     return self.cb.fromFloat32Shape(&@as([32]f32, @splat(1)), &.{ 8, 4 });
                 return error.MissingWeight;
             }
@@ -946,6 +946,19 @@ test "decoder graph cache owns tracing allocations and failed traces remain retr
         try std.testing.expect(entry == try ensureGraphEntry(&equivalent, &cache, &.{0}, 1, 1, &decode_context));
         equivalent_config.norm_eps *= 2;
         try std.testing.expect(entry != try ensureGraphEntry(&equivalent, &cache, &.{0}, 1, 1, &decode_context));
+        // Equal prefix bytes share an entry across allocations. Mutating the
+        // bytes at the same address must invalidate the semantic program key.
+        var first_prefix = "cache.".*;
+        var second_prefix = first_prefix;
+        var named_config = config;
+        named_config.weight_prefix = &first_prefix;
+        var named = pipeline;
+        named.gpt_config = &named_config;
+        const named_entry = try ensureGraphEntry(&named, &cache, &.{0}, 1, 1, &decode_context);
+        named_config.weight_prefix = &second_prefix;
+        try std.testing.expect(named_entry == try ensureGraphEntry(&named, &cache, &.{0}, 1, 1, &decode_context));
+        @memcpy(&second_prefix, "other.");
+        try std.testing.expect(named_entry != try ensureGraphEntry(&named, &cache, &.{0}, 1, 1, &decode_context));
         const first_ids: [12]i64 = @splat(0);
         const second_ids: [13]i64 = @splat(0);
         var prefill = gpt_arch.DecodeContext{ .attention_mode = .paged_prefill, .total_sequence_len = 12, .query_sequence_len = 12, .kv_sequence_len = 12 };
