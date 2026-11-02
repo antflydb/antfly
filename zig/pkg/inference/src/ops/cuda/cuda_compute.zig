@@ -13827,6 +13827,9 @@ fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
     const second = try acquireWeight(&self, "weight");
     defer freeTensor(&self, second);
     try std.testing.expect(first != second and first != borrowed and second != borrowed);
+    // Force resident metadata relocation while both acquired handles are live.
+    // Borrowed getWeight pointers may not be used across store mutation.
+    try self.resident_weights.ensureTotalCapacity(allocator, 128);
     const handle = tensorFromCt(second);
     try std.testing.expect(!handle.owns_buffer and !handle.owns_tc_quant and !handle.owns_bf16_mirror and !handle.owns_training_upload_host);
     try std.testing.expect(handle.owns_shape and handle.owned_by_tensor);
@@ -34765,6 +34768,8 @@ test "LightOnOCR3 CUDA fused recurrent input projections preserve four BF16 GEMM
         const hidden = geometry[0];
         const widths = [4]usize{ geometry[1], geometry[2], geometry[3], geometry[3] };
         var weights: [4]CT = undefined;
+        var acquired: usize = 0;
+        defer for (weights[0..acquired]) |weight| cb.free(weight);
         for (widths, 0..) |width, slot| {
             const matrix = try a.alloc(u16, hidden * width);
             defer a.free(matrix);
@@ -34774,7 +34779,10 @@ test "LightOnOCR3 CUDA fused recurrent input projections preserve four BF16 GEMM
             const shape = [_]i64{ @intCast(width), @intCast(hidden) };
             const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(matrix), .dtype = .bf16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
             try compute.insertBf16WeightFromTensor(try a.dupe(u8, name), &tensor);
-            weights[slot] = try cb.getWeight(name);
+            // Acquired metadata remains stable while later insertions grow
+            // the resident map. The model retains the device storage.
+            weights[slot] = try cb.acquireWeight(name);
+            acquired += 1;
         }
         for ([_]usize{ 1, 21, 42, 64, 432 }) |rows| {
             const values = try a.alloc(f32, rows * hidden);
@@ -34816,7 +34824,8 @@ test "LightOnOCR3 CUDA fused recurrent input projections preserve four BF16 GEMM
                 const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(matrix), .dtype = .bf16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
                 try compute.insertBf16WeightFromTensor(try a.dupe(u8, name), &tensor);
                 var changed_weights = weights;
-                changed_weights[3] = try cb.getWeight(name);
+                changed_weights[3] = try cb.acquireWeight(name);
+                defer cb.free(changed_weights[3]);
                 const changed = (try CudaCompute.lightOnInputProjections(&cb, input, changed_weights, rows, hidden, widths[0], widths[1], widths[2])).?;
                 defer for (changed) |output| cb.free(output);
                 try std.testing.expectEqual(before + 1, compute.lighton_projection_cache.count());
