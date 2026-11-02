@@ -445,7 +445,9 @@ attempts or acknowledge an incomplete generation.
 The raw extraction manifest persists `ocr_retryable_failed_count` across all
 pages, independently of the 32-entry failure diagnostic sample. Artifact PUT
 repairs inline declarations and stores the canonical table-wide declaration,
-which survives removal of its declaring index. Artifact DELETE removes both
+which survives removal of its declaring index. An embedding declaration also
+retains the owning index's admitted, credential-free producer identity when its
+inline form inherited that producer. Artifact DELETE removes both
 forms and leaves consumers for normal dependency validation to reject.
 
 These storage and catalog regressions are distinct from the outstanding
