@@ -48,10 +48,12 @@ pub const Registry = struct {
         if (std.mem.allEqual(u8, &cut.incarnation, 0) or cut.active > registry.max_active or cut.outstanding_receipts > registry.max_receipts or cut.records.len > 8 or cut.receipts.len > 8) return error.InvalidSqlBackendResponse;
         for (cut.receipts) |receipt| {
             try receipt.validate();
+            try receipt.session.requireRealm(cut.standalone);
             if (!std.mem.eql(u8, &receipt.owner.metadata_incarnation, &std.fmt.bytesToHex(cut.incarnation, .lower))) return error.CatalogGenerationChanged;
         }
         for (cut.records) |record| {
             try record.validate(a);
+            if (record.identity.session) |session| try session.requireRealm(cut.standalone);
             if (!std.mem.eql(u8, &record.identity.metadata_incarnation, &std.fmt.bytesToHex(cut.incarnation, .lower))) return error.CatalogGenerationChanged;
         }
         self.anchor = .{ .incarnation = cut.incarnation, .standalone = cut.standalone, .head = cut.head };
@@ -60,6 +62,7 @@ pub const Registry = struct {
 
     fn checkRealm(cut: registry.Snapshot, identity: registry.Identity) !void {
         if (!std.mem.eql(u8, &identity.metadata_incarnation, &std.fmt.bytesToHex(cut.incarnation, .lower))) return error.CatalogGenerationChanged;
+        if (identity.session) |session| try session.requireRealm(cut.standalone);
     }
 
     fn mutate(self: *@This(), a: A, request: registry.Mutation) !void {
@@ -175,11 +178,11 @@ pub const Registry = struct {
 /// The session proof is durable before the metadata delivery ACK. A lost ACK
 /// reply is reconciled by an authoritative absence in the same incarnation.
 /// Pending or absent admission remains debt; it cannot become ordinary commit.
-pub fn recoverSession(server: *http.ApiHttpServer, txn_id: [16]u8, bytes: []const u8, prepared: bool, aborted: bool) !void {
-    return recoverSessionWithContext(server, txn_id, bytes, prepared, aborted, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s });
+pub fn recoverSession(server: *http.ApiHttpServer, txn_id: [16]u8, bytes: []const u8, prepared: bool, aborted: bool, committed: bool) !void {
+    return recoverSessionWithContext(server, txn_id, bytes, prepared, aborted, committed, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s });
 }
 
-fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes: []const u8, prepared: bool, aborted: bool, context: local.api_operation.RequestContext) !void {
+fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes: []const u8, prepared: bool, aborted: bool, committed: bool, context: local.api_operation.RequestContext) !void {
     var region = std.heap.ArenaAllocator.init(server.alloc);
     defer region.deinit();
     const a = region.allocator();
@@ -189,7 +192,7 @@ fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes:
     const cut = try source.snapshot(a, .{ .operation = seal.identity.operation_id });
     try Registry.checkRealm(cut, seal.identity);
     if (cut.receipts.len == 0) {
-        if (!prepared and !aborted) {
+        if (!prepared and !aborted and !committed) {
             if (try source.cancelUnadmitted(a, seal)) {
                 _ = (try server.txn_sessions.recordExternalAdmissionRejection(server.alloc, txn_id, try seal.identity.owner(a))) orelse return error.SqlTransactionNotActive;
                 return;
@@ -201,10 +204,19 @@ fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes:
         if (cut.receipts[0].status == .pending) {
             if (cut.records.len != 1) return error.InvalidSqlBackendResponse;
             const record = cut.records[0];
-            if (record.phase == .preparing) _ = try Registry.advance(&source, a, record, .{ .abort = try distributed.commitVersion(record.identity.begin_timestamp) });
+            // A private commit keeps its coordinator-owned preparation alive
+            // through the immutable admission deadline. The work controller
+            // completes vote collection and decides it; a session recovery
+            // pass must not replace that live purpose with an early abort.
+            if (record.phase == .preparing and (record.identity.kind == .named or @import("antfly_platform").time.realtimeNs() >= record.identity.expires_at_unix_ns))
+                _ = try Registry.advance(&source, a, record, .{ .abort = try distributed.commitVersion(record.identity.begin_timestamp) });
             return error.MetadataMutationOutcomeUnknown;
         }
-        _ = (try server.txn_sessions.recordExternalPreparationReceipt(server.alloc, txn_id, cut.receipts[0])) orelse return error.SqlTransactionNotActive;
+        if (seal.identity.kind == .session_commit) {
+            _ = (try server.txn_sessions.recordExternalCommitReceipt(server.alloc, txn_id, cut.receipts[0])) orelse return error.SqlTransactionNotActive;
+        } else {
+            _ = (try server.txn_sessions.recordExternalPreparationReceipt(server.alloc, txn_id, cut.receipts[0])) orelse return error.SqlTransactionNotActive;
+        }
         try source.acknowledgeReceipt(a, seal.identity);
     }
     _ = (try server.txn_sessions.markExternalPreparationReceiptAcknowledged(server.alloc, txn_id)) orelse return error.SqlTransactionNotActive;
@@ -383,7 +395,7 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, a: A, co
     var operation_id: [16]u8 = undefined;
     try server.embedding_provider_runtime.io.randomSecure(&operation_id);
     const now = @import("antfly_platform").time.realtimeNs();
-    const identity: registry.Identity = .{ .session = .{ .owner_node_id = server.localSessionNodeId(), .connection_id = state.connection_id }, .gid = command.gid, .database_id = source.database_id, .native_service = root.context.native_service, .principal = actor.principal(), .txn_id = id, .operation_id = operation_id, .metadata_incarnation = std.fmt.bytesToHex(cut.incarnation, .lower), .begin_timestamp = info.begin_timestamp, .expires_at_unix_ns = try std.math.add(u64, now, 5 * std.time.ns_per_min), .plan_digest = try registry.planDigest(encoded), .manifest_digest = try registry.manifestDigest(scratch, cohort.manifest, std.fmt.bytesToHex(cut.incarnation, .lower)) };
+    const identity: registry.Identity = .{ .session = .{ .owner_node_id = server.localSessionNodeId(), .connection_id = state.connection_id, .standalone = cut.standalone }, .gid = command.gid, .database_id = source.database_id, .native_service = root.context.native_service, .principal = actor.principal(), .txn_id = id, .operation_id = operation_id, .metadata_incarnation = std.fmt.bytesToHex(cut.incarnation, .lower), .begin_timestamp = info.begin_timestamp, .expires_at_unix_ns = try std.math.add(u64, now, 5 * std.time.ns_per_min), .plan_digest = try registry.planDigest(encoded), .manifest_digest = try registry.manifestDigest(scratch, cohort.manifest, std.fmt.bytesToHex(cut.incarnation, .lower)) };
     const seal: transactions.ExternalPreparationSeal = .{ .admission_head = cut.head, .admitted_at_ns = now, .standalone = cut.standalone, .identity = identity, .actor = actor, .participants = cohort.manifest };
     var plan = (try server.txn_sessions.sealExternalEncodedExecutionPlan(server.alloc, id, seal, encoded)) orelse return error.SqlTransactionNotActive;
     defer plan.deinit();
@@ -394,7 +406,7 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, a: A, co
         // cohort remains metadata-owned recovery debt, never ordinary abort.
         const owned_seal = (try server.txn_sessions.externalPreparationSeal(server.alloc, id)) orelse return error.SqlTransactionOutcomeUnknown;
         defer server.alloc.free(owned_seal);
-        recoverSessionWithContext(server, id, owned_seal, false, false, root.context) catch {};
+        recoverSessionWithContext(server, id, owned_seal, false, false, false, root.context) catch {};
         var observed = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionOutcomeUnknown;
         defer observed.deinit(server.alloc);
         if (observed.terminal_abort) {

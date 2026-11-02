@@ -52,12 +52,29 @@ pub const Participant = struct {
 pub const SessionRef = struct {
     owner_node_id: u64,
     connection_id: ?[32]u8 = null,
+    /// The local sentinel is meaningful only in the standalone catalog realm.
+    /// The containing identity independently binds its catalog incarnation.
+    standalone: bool = false,
+    pub fn jsonStringify(self: SessionRef, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(SessionRef).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "standalone")) or self.standalone) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
     pub fn validate(self: SessionRef) !void {
-        if (self.owner_node_id == 0) return error.InvalidCatalogMutation;
+        if ((self.owner_node_id == 0) != self.standalone) return error.InvalidCatalogMutation;
         if (self.connection_id) |id| {
             for (id) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidCatalogMutation;
             if (std.mem.allEqual(u8, &id, '0')) return error.InvalidCatalogMutation;
         }
+    }
+    pub fn requireRealm(self: SessionRef, standalone: bool) !void {
+        try self.validate();
+        if (self.standalone != standalone) return error.CatalogGenerationChanged;
     }
 };
 
@@ -76,6 +93,10 @@ pub const Identity = struct {
     expires_at_unix_ns: u64,
     plan_digest: [32]u8,
     manifest_digest: [32]u8,
+
+    pub fn requiresConnectionDecoder(self: Identity) bool {
+        return self.kind == .session_commit or (self.session != null and self.session.?.standalone);
+    }
 
     pub fn validate(self: Identity) !void {
         if (self.session) |session| try session.validate();
@@ -309,6 +330,7 @@ pub const Mutation = struct {
 fn validateAdmission(self: Mutation, request: AdmissionInput, actor: Actor) !void {
     try actor.validate();
     try request.identity.validate();
+    if (request.identity.session) |session| try session.requireRealm(self.standalone);
     if (request.identity.database_id != self.database_id or !request.identity.principal.eql(actor.principal()) or
         !std.mem.eql(u8, &request.identity.operation_id, &self.admission.nonce) or
         !std.mem.eql(u8, &request.identity.metadata_incarnation, &std.fmt.bytesToHex(self.incarnation, .lower))) return error.InvalidCatalogMutation;
@@ -332,19 +354,40 @@ pub fn commandDigest(a: A, request: Mutation) ![32]u8 {
     try request.validate();
     return digest(a, "antfly:sql-prepared-command:v1\x00", admissionRequest(request));
 }
+pub const ReceiptWorkRequest = struct {
+    owner_node_id: ?u64 = null,
+    after: ?[16]u8 = null,
+    standalone: bool = false,
+    pub fn jsonStringify(self: ReceiptWorkRequest, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(ReceiptWorkRequest).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "standalone")) or self.standalone) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+    pub fn validate(self: ReceiptWorkRequest) !void {
+        if (self.standalone) {
+            if (self.owner_node_id == null or self.owner_node_id.? != 0) return error.InvalidCatalogMutation;
+        } else if (self.owner_node_id != null and self.owner_node_id.? == 0) return error.InvalidCatalogMutation;
+    }
+};
+
 pub const Read = union(enum) {
     gid: []const u8,
     operation: [16]u8,
     work: ?[16]u8,
     receipt: [16]u8,
-    receipt_work: struct { owner_node_id: ?u64 = null, after: ?[16]u8 = null },
+    receipt_work: ReceiptWorkRequest,
     pub fn validate(self: Read) !void {
         switch (self) {
             .gid => |gid| try validateGid(gid),
             .operation => |id| if (std.mem.allEqual(u8, &id, 0)) return error.InvalidCatalogMutation,
             .work => {},
             .receipt => |id| if (std.mem.allEqual(u8, &id, 0)) return error.InvalidCatalogMutation,
-            .receipt_work => |work| if (work.owner_node_id != null and work.owner_node_id.? == 0) return error.InvalidCatalogMutation,
+            .receipt_work => |work| try work.validate(),
         }
     }
 };
@@ -688,4 +731,51 @@ pub fn readReceiptWork(a: A, txn: anytype, group: u64, node: ?u64, after: ?[16]u
         used += 1;
     }
     return .{ .receipts = receipts[0..used] };
+}
+
+test "SQL prepared transaction session realms preserve clustered bytes and fence standalone sentinels" {
+    const a = std.testing.allocator;
+    const clustered: SessionRef = .{ .owner_node_id = 9 };
+    const legacy = try std.json.Stringify.valueAlloc(a, clustered, .{});
+    defer a.free(legacy);
+    try std.testing.expectEqualStrings("{\"owner_node_id\":9,\"connection_id\":null}", legacy);
+    try clustered.requireRealm(false);
+    try std.testing.expectError(error.CatalogGenerationChanged, clustered.requireRealm(true));
+    const standalone_ref: SessionRef = .{ .owner_node_id = 0, .connection_id = @splat('a'), .standalone = true };
+    try standalone_ref.requireRealm(true);
+    try std.testing.expectError(error.CatalogGenerationChanged, standalone_ref.requireRealm(false));
+    try std.testing.expectError(error.InvalidCatalogMutation, (SessionRef{ .owner_node_id = 0 }).validate());
+    try std.testing.expectError(error.InvalidCatalogMutation, (SessionRef{ .owner_node_id = 9, .standalone = true }).validate());
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const identity: Identity = .{ .kind = .session_commit, .session = standalone_ref, .gid = "", .database_id = 1, .principal = .bootstrap, .txn_id = @splat(2), .operation_id = @splat(3), .metadata_incarnation = @splat('1'), .begin_timestamp = 10, .expires_at_unix_ns = 1000, .plan_digest = try planDigest("[]"), .manifest_digest = try manifestDigest(owned, &.{}, @splat('1')) };
+    const request: Mutation = .{ .admission = .{ .nonce = identity.operation_id, .head = 0 }, .incarnation = @splat(0x11), .actor = .{ .session_user = .bootstrap, .credential = "" }, .standalone = true, .database_id = 1, .operation = .{ .admit = .{ .identity = identity, .participants = &.{}, .admitted_at_ns = 20 } } };
+    try request.validate();
+    var wrong = request;
+    wrong.standalone = false;
+    try std.testing.expectError(error.CatalogGenerationChanged, wrong.validate());
+    wrong = request;
+    wrong.operation.admit.identity.session = .{ .owner_node_id = 9, .connection_id = @splat('a') };
+    try std.testing.expectError(error.CatalogGenerationChanged, wrong.validate());
+    wrong.standalone = false;
+    try wrong.validate();
+    try std.testing.expect(!(try identity.owner(owned)).eql(try wrong.operation.admit.identity.owner(owned)));
+    const encoded = try std.json.Stringify.valueAlloc(owned, request, .{});
+    const decoded = try std.json.parseFromSliceLeaky(Mutation, owned, encoded, .{});
+    try decoded.validate();
+    try std.testing.expectEqualDeep(request, decoded);
+}
+
+test "SQL prepared transaction receipt work uses an explicit standalone realm without changing clustered selectors" {
+    const a = std.testing.allocator;
+    const clustered: Read = .{ .receipt_work = .{ .owner_node_id = 9 } };
+    const encoded = try std.json.Stringify.valueAlloc(a, clustered, .{});
+    defer a.free(encoded);
+    try std.testing.expectEqualStrings("{\"receipt_work\":{\"owner_node_id\":9,\"after\":null}}", encoded);
+    try clustered.validate();
+    try (Read{ .receipt_work = .{ .owner_node_id = 0, .standalone = true } }).validate();
+    try std.testing.expectError(error.InvalidCatalogMutation, (Read{ .receipt_work = .{ .owner_node_id = 0 } }).validate());
+    try std.testing.expectError(error.InvalidCatalogMutation, (Read{ .receipt_work = .{ .standalone = true } }).validate());
+    try std.testing.expectError(error.InvalidCatalogMutation, (Read{ .receipt_work = .{ .owner_node_id = 9, .standalone = true } }).validate());
 }

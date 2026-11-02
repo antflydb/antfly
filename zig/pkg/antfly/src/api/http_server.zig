@@ -6385,7 +6385,7 @@ pub const ApiHttpServer = struct {
             defer recovery.deinit(self.alloc);
             switch (recovery) {
                 .external_preparation => |item| {
-                    @import("sql_prepared_coordinator.zig").recoverSession(self, item.txn_id, item.seal, item.prepared, item.aborted) catch |err| switch (err) {
+                    @import("sql_prepared_coordinator.zig").recoverSession(self, item.txn_id, item.seal, item.prepared, item.aborted, item.committed) catch |err| switch (err) {
                         error.MetadataMutationOutcomeUnknown, error.CatalogGenerationChanged, error.Canceled, error.DeadlineExceeded => {},
                         else => std.log.warn("prepared transaction session receipt deferred err={s}", .{@errorName(err)}),
                     };

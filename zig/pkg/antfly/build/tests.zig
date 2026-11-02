@@ -5850,6 +5850,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone native TRUNCATE external FK and graph publish after restart",
             "standalone ordinary FK publication uses durable native receipts after restart",
             "standalone public SQL CASCADE retires mutual FK owners",
+            "standalone SQL prepared transactions preserve node-zero ownership and row decisions across cold reopen",
             "standalone ordinary schema migration never acquires native FK ownership",
             "standalone canceled initial self FK retires exact private owners after restart",
             "system catalog resolver curation standalone record commits retain large destination definitions",
@@ -5857,6 +5858,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });
+    const standalone_sql_prepared_run = b.addRunArtifact(standalone_initial_fk_tests);
+    standalone_sql_prepared_run.addArgs(&.{ "--test-filter", "standalone SQL prepared transactions preserve node-zero ownership and row decisions across cold reopen", "--require-no-skips" });
+    b.step("antfly-standalone-sql-prepared-test", "Verify public standalone prepared rows, local ownership and complete cold resolution").dependOn(&standalone_sql_prepared_run.step);
     // These fixtures use resident DB owners, not the control-only source in
     // the initial-FK executable. Keep them linked but never silently skipped.
     const standalone_policy_ha_test_mod = b.createModule(.{

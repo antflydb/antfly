@@ -40287,18 +40287,23 @@ pub const RaftApplyStore = struct {
         const standalone = group == group_ids.main_metadata_group_id and try stagingGet(txn, standalone_catalog_key) != null;
         if (request.standalone != standalone) return error.CatalogGenerationChanged;
         _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_prepared_transactions_version);
-        const private = switch (request.operation) {
-            .admit => |admission| admission.identity.kind == .session_commit,
-            .cancel_admission => |cancel| cancel.original.identity.kind == .session_commit,
+        const connection_decoder = switch (request.operation) {
+            .admit => |admission| admission.identity.requiresConnectionDecoder(),
+            .cancel_admission => |cancel| cancel.original.identity.requiresConnectionDecoder(),
             .advance => |change| blk: {
                 var scratch = std.heap.ArenaAllocator.init(self.alloc);
                 defer scratch.deinit();
                 const record = (try PreparedTransactions.readOperation(scratch.allocator(), txn, group, change.owner.operation_id)) orelse break :blk false;
-                break :blk record.identity.kind == .session_commit;
+                break :blk record.identity.requiresConnectionDecoder();
             },
-            .acknowledge_receipt => false,
+            .acknowledge_receipt => |ack| blk: {
+                var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                defer scratch.deinit();
+                const receipt = (try PreparedTransactions.readReceipt(scratch.allocator(), txn, group, ack.owner.operation_id)) orelse break :blk false;
+                break :blk receipt.kind == .session_commit or receipt.session.standalone;
+            },
         };
-        if (private) _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_connection_transactions_version);
+        if (connection_decoder) _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_connection_transactions_version);
     }
 
     fn planSqlPreparedTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: PreparedTransactions.Mutation) !PreparedTransactions.Plan {
@@ -40422,6 +40427,8 @@ pub const RaftApplyStore = struct {
         const journal: PreparedTransactions.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
         const active = try PreparedTransactions.activeCount(a, &txn, group);
         const standalone = group == group_ids.main_metadata_group_id and try stagingGet(&txn, standalone_catalog_key) != null;
+        if (request == .receipt_work and request.receipt_work.owner_node_id != null and request.receipt_work.standalone != standalone)
+            return error.CatalogGenerationChanged;
         var revision_buffer: [160]u8 = undefined;
         const revision_bytes = try stagingGet(&txn, if (standalone) standalone_revision_key else try catalogRevisionKeyForGroup(&revision_buffer, group));
         const revision: u64 = if (revision_bytes) |bytes| blk: {
@@ -40439,6 +40446,8 @@ pub const RaftApplyStore = struct {
         const receipt = if (request == .receipt or request == .operation) try PreparedTransactions.readReceipt(a, &txn, group, if (request == .receipt) request.receipt else request.operation) else null;
         const receipt_work: PreparedTransactions.ReceiptWork = if (request == .receipt_work) try PreparedTransactions.readReceiptWork(a, &txn, group, request.receipt_work.owner_node_id, request.receipt_work.after) else .{ .receipts = if (receipt) |value| try a.dupe(PreparedTransactions.Receipt, &.{value}) else &.{} };
         if (receipt_work.receipts.len > outstanding) return error.InvalidCatalogRecord;
+        for (receipt_work.receipts) |value| try value.session.requireRealm(standalone);
+        for (work.records) |value| if (value.identity.session) |session| try session.requireRealm(standalone);
         try context.ensureActive();
         return std.json.Stringify.valueAlloc(alloc, PreparedTransactions.Snapshot{ .standalone = standalone, .catalog_revision = revision, .incarnation = incarnation, .head = try journal.head(a), .active = active, .records = work.records, .receipts = receipt_work.receipts, .outstanding_receipts = outstanding, .next_after = if (request == .receipt_work) receipt_work.next_after else work.next_after }, .{});
     }
@@ -67357,4 +67366,73 @@ test "SQL native index namespace source digest tracks selected incarnations only
     try std.testing.expectEqual(record.sql_materialized_view_id, borrowed.sql_materialized_view_id);
     try std.testing.expectEqual(.object, borrowed.query_definition.?.storage_engine);
     try std.testing.expectEqual(record.object_storage_generation, borrowed.query_definition.?.object_storage_generation);
+}
+
+test "SQL prepared transaction standalone sessions require the native decoder floor and retain realm-bound receipts through cold reopen" {
+    const T = SessionCommitRegistryFixture;
+    const P = T.P;
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/standalone-session-realm", .{tmp.sub_path});
+    const Helper = struct {
+        fn read(store: *RaftApplyStore, backing: std.mem.Allocator, lookup: P.Read) !P.Snapshot {
+            return std.json.parseFromSliceLeaky(P.Snapshot, backing, try store.sqlPreparedRead(backing, T.group, lookup, .{ .setting_admin = true }), .{});
+        }
+        fn submit(store: *RaftApplyStore, backing: std.mem.Allocator, request: P.Mutation) !void {
+            const expected = try std.json.parseFromSliceLeaky(P.outcomes.Outcome, backing, try store.prepareSqlPreparedTransaction(backing, T.group, request), .{});
+            _ = try expected.result();
+            try store.applyStandaloneCommand(T.group, .{ .apply_sql_prepared_transaction = try std.json.Stringify.valueAlloc(backing, request, .{}) });
+            const result = try std.json.parseFromSliceLeaky(?P.outcomes.Outcome, backing, try store.sqlPreparedOutcome(backing, T.group, request), .{});
+            _ = try (result orelse return error.MissingSessionCommit).result();
+        }
+        fn advance(store: *RaftApplyStore, backing: std.mem.Allocator, value: P.Identity, nonce: u8, action: P.Action) !void {
+            const cut = try read(store, backing, .{ .operation = value.operation_id });
+            if (cut.records.len != 1) return error.MissingSessionCommit;
+            try submit(store, backing, .{ .admission = .{ .nonce = @splat(nonce), .head = cut.head }, .incarnation = cut.incarnation, .actor = .{ .session_user = .bootstrap, .credential = "" }, .standalone = true, .database_id = 1, .operation = .{ .advance = .{ .owner = try value.owner(backing), .expected_revision = cut.records[0].revision, .action = action } } });
+        }
+    };
+    var identity = try T.identity(a, .session_commit, 1, "");
+    identity.session.?.owner_node_id = 0;
+    identity.session.?.standalone = true;
+    for (0..3) |phase| {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+        defer store.deinit();
+        if (phase == 0) {
+            try store.applyStandaloneCommand(T.group, .{ .initialize_metadata_incarnation = T.seed });
+            try store.replaceStandaloneCatalog(T.group, try store.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
+            try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.sql_connection_transactions_version - 1, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            const cut = try Helper.read(&store, a, .{ .operation = identity.operation_id });
+            var request = T.admission(identity);
+            request.standalone = true;
+            request.admission.head = cut.head;
+            try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.prepareSqlPreparedTransaction(a, T.group, request));
+            try store.applyStandaloneCommand(T.group, .{ .apply_sql_prepared_transaction = try std.json.Stringify.valueAlloc(a, request, .{}) });
+            try std.testing.expectEqual(@as(usize, 0), (try Helper.read(&store, a, .{ .operation = identity.operation_id })).records.len);
+            try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.sql_connection_transactions_version, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            var wrong = request;
+            wrong.standalone = false;
+            try std.testing.expectError(error.CatalogGenerationChanged, store.prepareSqlPreparedTransaction(a, T.group, wrong));
+            try Helper.submit(&store, a, request);
+            try Helper.submit(&store, a, request);
+            try Helper.advance(&store, a, identity, 2, .prepare);
+            try Helper.advance(&store, a, identity, 3, .{ .commit = .{ .version = 20, .sync_level = identity.commit_sync_level } });
+            try Helper.advance(&store, a, identity, 4, .handoff);
+        } else {
+            try std.testing.expectError(error.CatalogGenerationChanged, Helper.read(&store, a, .{ .receipt_work = .{ .owner_node_id = 9 } }));
+            const cut = try Helper.read(&store, a, .{ .receipt_work = .{ .owner_node_id = 0, .standalone = true } });
+            try std.testing.expect(cut.standalone);
+            if (phase == 1) {
+                try std.testing.expectEqual(@as(usize, 1), cut.receipts.len);
+                try std.testing.expect(cut.receipts[0].session.standalone);
+                try std.testing.expectEqual(@as(u64, 0), cut.receipts[0].session.owner_node_id);
+                try std.testing.expectEqual(.committed, cut.receipts[0].status);
+                try std.testing.expectEqual(@as(u64, 20), cut.receipts[0].decision.?.version);
+                try Helper.submit(&store, a, .{ .admission = .{ .nonce = @splat(5), .head = cut.head }, .incarnation = cut.incarnation, .actor = .{ .session_user = .bootstrap, .credential = "" }, .standalone = true, .database_id = 1, .operation = .{ .acknowledge_receipt = .{ .owner = try identity.owner(a), .txn_id = identity.txn_id } } });
+            } else try std.testing.expectEqual(@as(usize, 0), cut.receipts.len);
+        }
+    }
 }

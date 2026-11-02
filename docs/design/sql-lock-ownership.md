@@ -188,14 +188,12 @@ resolution/handoff replies. The metadata gate passes 11 tests and transaction ga
 pass 130 tests, without skips, failures or leaks. These are backend staging and
 regression gates, not public SQL lock case closures.
 
-Protocol 136 is reserved for private admissions, while the advertised protocol
-remains 135. The native receiver rejects private proposals below 136, including
-late proposals that bypass preflight, without installing a job or reservation.
-Changing the advertised protocol also requires matching service/proposal floors
-and enabled-protocol proposal/snapshot/restore qualification. Those changes,
-private local-session result adoption, immutable lock transaction scope admission,
-connection/expiry fencing and the public ordered SQL effect provider remain
-required before complete SQL locking activation.
+Protocol 136 now advertises private session decisions and standalone ownership.
+Service and proposal floors match the native receiver, which rejects private
+proposals below 136, including late proposals that bypass preflight. Enabled
+native admission, cold receipts and ACK replay are qualified. Immutable lock
+transaction scope admission, connection/expiry fencing and the public ordered
+SQL effect provider remain required before complete SQL locking activation.
 
 
 ## Durable completion and receipt replay qualification
@@ -219,17 +217,22 @@ tests (44 local and 89 main), without failures, skips or leaks. The mounted publ
 SQL/pgwire PREPARE gate additionally passes all three Debug tests, including the
 complete multi-owner cold recovery campaign.
 
-Private receipt adoption remains an unapplied proposal. It must atomically retain
-the exact private decision
-before acknowledging metadata, and the recovery dispatcher must preserve private
-purpose across every lost reply. The optional version codec alone does not enable
-that path. The separate protocol-136 source proposal also remains unapplied. No
-SQL inventory case has been closed by these additional recovery foundations.
+Private receipt adoption now atomically retains the exact decision before
+acknowledging metadata. Recovery preserves the private purpose, decision version
+and frozen sync level after execution inputs are retired. Exact adoption and ACK
+replays do not write additional local session versions. Debug transaction gates
+pass 148 tests, including failed adoption, failed ACK and cold recovery for both
+private outcomes. The mounted public PREPARE gate passes all three tests.
 
-Standalone ownership needs explicit qualification as part of public activation:
-the HTTP server uses node zero when no session router is configured, while the
-existing prepared-session reference validator rejects node zero. A standalone
-owner must be fenced by its catalog incarnation and standalone realm rather than
-mapped to a fabricated cluster node. Clustered envelopes must still reject the
-local sentinel. Both receipt-work selection and cold session decoding need the
-same owner semantics before this path is exposed.
+Standalone references explicitly carry their realm and retain node zero; clustered
+references keep their existing JSON bytes and reject the local sentinel. Native
+receipt selection checks the actual catalog realm. The metadata Debug gate passes
+13 tests plus its declaration check, including decoder-floor rejection and cold
+standalone receipt/ACK replay. A public standalone SQL test additionally passes
+through three cold runtime phases: prepared rows remain invisible, commit and
+abort resolve independently, and a retired GID can be reused without adopting the
+old decision. This test runs in the existing native control-source cohort.
+
+These recovery foundations do not close any SQL lock inventory cases or enable
+public advisory functions. Connection scopes and ordered effect integration
+remain the next activation boundary.

@@ -18816,3 +18816,93 @@ test "standalone cdc review rejects replication sources with scoped HA ownership
     std.debug.print("review scoped HA cdc_supported={} publication_supported={}\n", .{ try metadata.statusSource().replicationSourcesSupported(), metadata.standaloneRelationPublicationSupported() });
     try std.testing.expectError(error.HACatalogReplicationSourcesUnsupported, LocalStandaloneMetadata.createTable(&metadata, a, "tickets", .{ .replication_sources_json = sources }));
 }
+
+test "standalone SQL prepared transactions preserve node-zero ownership and row decisions across cold reopen" {
+    const alloc = std.testing.allocator;
+    const SQLResponse = @import("antfly_metadata_openapi").types.SQLResponse;
+    const Helper = struct {
+        fn sql(a: std.mem.Allocator, server: *antfly.public_api.ApiHttpServer, session: ?[]const u8, statement: []const u8) !std.json.Parsed(SQLResponse) {
+            const body = try std.json.Stringify.valueAlloc(a, .{ .statement = statement, .session_id = session }, .{});
+            defer a.free(body);
+            var reply = try antfly.public_api.http_server.RestoreWorkerTestDriver.request(server, .{ .method = .POST, .uri = "/sql", .content_type = "application/json", .body = body });
+            defer reply.deinit(a);
+            if (reply.status != 200 and reply.status != 202) std.debug.print("standalone prepared SQL={s} status={d} body={s}\n", .{ statement, reply.status, reply.body });
+            try std.testing.expect(reply.status == 200 or reply.status == 202);
+            return std.json.parseFromSlice(SQLResponse, a, reply.body, .{ .allocate = .alloc_always });
+        }
+        fn command(a: std.mem.Allocator, server: *antfly.public_api.ApiHttpServer, session: ?[]const u8, statement: []const u8, tag: []const u8) !void {
+            var response = try sql(a, server, session, statement);
+            defer response.deinit();
+            try std.testing.expectEqualStrings(tag, response.value.command_tag);
+        }
+        fn rows(a: std.mem.Allocator, server: *antfly.public_api.ApiHttpServer, expected: []const []const u8) !void {
+            var response = try sql(a, server, null, "SELECT id FROM lock_probe ORDER BY id");
+            defer response.deinit();
+            try std.testing.expectEqual(expected.len, response.value.rows.len);
+            for (response.value.rows, expected) |row, want| {
+                try std.testing.expectEqual(@as(usize, 1), row.len);
+                try std.testing.expectEqualStrings(want, row[0].string);
+            }
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standalone-sql-prepared", .{tmp.sub_path});
+    defer alloc.free(root);
+    const catalog_path = try std.fmt.allocPrint(alloc, "{s}/catalog.json", .{root});
+    defer alloc.free(catalog_path);
+    const sessions_path = try std.fmt.allocPrint(alloc, "{s}/sql-sessions", .{root});
+    defer alloc.free(sessions_path);
+    for (0..3) |phase| {
+        var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+        defer backend.deinit();
+        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, catalog_path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        var server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
+            .replica_root_dir = root,
+            .replica_catalog_path = catalog_path,
+            .backend_runtime = backend.ptr(),
+            .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://localhost", .role = "data" },
+            .api_server_cfg = .{ .deployment_mode = .standalone, .session_store_path = sessions_path },
+        }, metadata.catalogSource(), metadata.statusSource());
+        defer server.deinit();
+        if (comptime !control_only_storage_sources) server.write_source.write_cache = &server.provisioned_storage.write_cache;
+        metadata.data_server = &server;
+        metadata.local_schema_progress_provider = localSchemaProgressProvider(&server);
+        metadata.attachRestoreRetirementOwnership();
+        try activateStandaloneNativeFixture(&metadata);
+        try server.initApiServer();
+        try awaitStandaloneRelationFixture(&metadata, &server);
+        const api = &server.http_server.?;
+        try std.testing.expectEqual(@as(u64, 0), api.localSessionNodeId());
+        if (phase == 0) {
+            try Helper.command(alloc, api, null, "CREATE TABLE lock_probe(id TEXT PRIMARY KEY, v INTEGER)", "CREATE TABLE");
+            for ([_][]const u8{ "commit", "abort" }) |kind| {
+                var begun = try Helper.sql(alloc, api, null, "BEGIN");
+                defer begun.deinit();
+                const id = begun.value.session_id orelse return error.TestUnexpectedResult;
+                const insert = try std.fmt.allocPrint(alloc, "INSERT INTO lock_probe(id,v) VALUES ('{s}',1)", .{kind});
+                defer alloc.free(insert);
+                try Helper.command(alloc, api, id, insert, "INSERT");
+                const prepare = try std.fmt.allocPrint(alloc, "PREPARE TRANSACTION 'local_{s}'", .{kind});
+                defer alloc.free(prepare);
+                try Helper.command(alloc, api, id, prepare, "PREPARE TRANSACTION");
+            }
+            // Physical participants retain private rows; ordinary MVCC readers
+            // see the preceding committed image throughout the prepared interval.
+            try Helper.rows(alloc, api, &.{});
+        } else if (phase == 1) {
+            try Helper.rows(alloc, api, &.{});
+            try Helper.command(alloc, api, null, "COMMIT PREPARED 'local_commit'", "COMMIT PREPARED");
+            try Helper.command(alloc, api, null, "ROLLBACK PREPARED 'local_abort'", "ROLLBACK PREPARED");
+            try Helper.rows(alloc, api, &.{"commit"});
+        } else {
+            try Helper.rows(alloc, api, &.{"commit"});
+            // A retired GID can be reused without adopting the old admission.
+            var begun = try Helper.sql(alloc, api, null, "BEGIN");
+            defer begun.deinit();
+            try Helper.command(alloc, api, begun.value.session_id.?, "PREPARE TRANSACTION 'local_commit'", "PREPARE TRANSACTION");
+            try Helper.command(alloc, api, null, "COMMIT PREPARED 'local_commit'", "COMMIT PREPARED");
+        }
+    }
+}

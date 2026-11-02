@@ -164,13 +164,13 @@ const std = @import("std");
 /// dependent-column activation remains independently capability-gated.
 // CREATE copies native column annotations inside its guarded transaction.
 // Earlier creation-source readers must not silently discard these intents.
-pub const current_version: u16 = 135;
+pub const current_version: u16 = 136;
 /// The unreleased combined catalog profile also decodes trigger-return contracts.
 /// Keep new declarations above the older scalar-only routine capability floor.
 pub const sql_trigger_function_version: u16 = 135;
 /// SQL namespace ownership of native indexes and exact shared-journal outcomes.
 pub const sql_native_index_namespace_version: u16 = 135;
-/// Reserved; not advertised until private session-commit receiver qualification.
+/// Private session decisions and standalone ownership share native recovery.
 pub const sql_connection_transactions_version: u16 = 136;
 /// Public catalog-operation recovery binds an immutable logical target label.
 pub const table_retirement_public_version: u16 = 135;
