@@ -159,10 +159,10 @@ adapter. EmbeddingGemma 2 can still embed the original recording separately.
 
 ### Gemma 4 E4B QAT qualification
 
-The [final production-binary qualification record](../../zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-production-20261029.json)
+The [final production-binary qualification record](https://github.com/timkaye11/antfly/blob/2436225306741147443c3ef66e9891568acce5d2/zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-production-20261029.json)
 passes the predeclared gates on 73 clean LibriSpeech clips with the E4B QAT
 decoder, matching projector, F16 KV and the GB10 profile below. The
-[earlier independent-reference comparison](../../zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-reference-20261029.json)
+[earlier independent-reference comparison](https://github.com/timkaye11/antfly/blob/2436225306741147443c3ef66e9891568acce5d2/zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-reference-20261029.json)
 is retained to explain the original implementation failures:
 
 | Runtime | Word-error rate | Errors / reference words |
@@ -202,7 +202,7 @@ of audio. The passing result qualifies these fixtures and this configuration;
 it does not establish robustness for noisy recordings, legal hearings,
 overlapping speakers, or long recordings.
 
-The [GB10 performance and kernel validation record](../../zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-decode-20261029.json)
+The [GB10 performance and kernel validation record](https://github.com/timkaye11/antfly/blob/2436225306741147443c3ef66e9891568acce5d2/zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-decode-20261029.json)
 includes a sequential native/llama.cpp comparison with the same QAT GGUF, F16
 K/V, one warmup and five greedy 256-token completions per prompt. Thinking,
 draft assistants and prompt-cache reuse are disabled. Timestamped per-process
@@ -249,20 +249,13 @@ three page layouts, query lengths through 8192 and KV contexts through 32768.
 Worst absolute error is `1.25e-4` against a `5e-3` gate; output guards, input
 immutability and repeated-launch determinism pass.
 
-To use the measured profile, source it before starting the server or benchmark:
-
-```sh
-source zig/pkg/inference/scripts/gemma4/gemma4_e4b_qat_gb10.env
-python zig/pkg/inference/scripts/gemma4/benchmark_text_decode.py \
-  --binary zig/pkg/inference/zig-out/bin/antfly-inference-http-server \
-  --models-dir models --request-json '{"cache_dtype":"f16"}' \
-  --output .benchmark-results/gemma4-decode --require-quiet-gpu
-```
-
-The profile reserves 2048 total tokens for graph replay. Size bounded requests
-and the graph capacity together when measuring longer contexts. The benchmark
-preserves rejected runs and fails if GPU contention is unknown, completion-token
-budgets differ, or repeated greedy output changes.
+The measured profile remains available in `gemma4_e4b_qat_gb10.env` and
+reserves 2048 total tokens for graph replay. Size bounded requests and graph
+capacity together when measuring longer contexts. The one-off
+[text benchmark and reference setup](https://github.com/timkaye11/antfly/blob/2436225306741147443c3ef66e9891568acce5d2/zig/pkg/inference/scripts/gemma4) are archived with the
+measured revision; they are not required by the runtime. The current
+[CUDA server benchmark](../../zig/pkg/inference/scripts/gemma4/benchmark_gemma4_cuda_server.py)
+remains the maintained entry point for new text measurements.
 
 To reproduce one paged attention graph check, run from `zig/pkg/inference`:
 
@@ -321,7 +314,7 @@ python zig/pkg/inference/scripts/gemma4/qualify_transcription_reference.py \
 Both harnesses count tokens from final SSE usage, not event counts. Decode
 throughput is `(completion_tokens - 1) / (terminal_usage_time -
 first_visible_token_time)`; end-to-end throughput includes prompt processing.
-The [earlier contended run](../../zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-20261029.json)
+The [earlier contended run](https://github.com/timkaye11/antfly/blob/2436225306741147443c3ef66e9891568acce5d2/zig/pkg/inference/scripts/gemma4/qualification/e4b-qat-gb10-20261029.json)
 is retained as historical evidence.
 
 ## Registration and reading policy

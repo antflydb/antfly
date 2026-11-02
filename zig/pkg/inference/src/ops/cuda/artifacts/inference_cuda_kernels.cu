@@ -18,7 +18,6 @@
 #include <mma.h>
 #include "../../../graph/templates/cuda_q4_0_bf16_staged.cuh"
 #include "../kernels/embedding_gemma2.cuh"
-#include "../kernels/rms_q8_1_2560.cuh"
 
 using namespace nvcuda;
 
@@ -21394,7 +21393,6 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b
     }
 }
 
-#include "../kernels/gemma4_e4b_prefetch.cuh"
 
 extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
     float* dst,
@@ -27658,3 +27656,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
 #include "../../../graph/templates/cuda_gqa_repeat_split_f16.cuh"
 // Append inference-only kernels so existing kernel numbering stays stable.
 #include "../kernels/embedding_gemma2_optimized.cuh"
+
+// Keep additional Gemma4 entry points after the existing bundle to preserve kernel numbering.
+#include "../kernels/rms_q8_1_2560.cuh"
+#include "../kernels/gemma4_e4b_prefetch.cuh"
