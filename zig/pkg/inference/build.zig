@@ -2127,6 +2127,7 @@ pub fn build(b: *std.Build) void {
     });
     hf_tok_tests.root_module.addImport("sentencepiece_proto", sentencepiece_proto_mod);
     hf_tok_tests.root_module.addImport("antfly_platform", configured_platform_mod);
+    hf_tok_tests.root_module.addImport("antfly_grapheme", inference_tokenizer_mod.import_table.get("antfly_grapheme").?);
     const run_hf_tok_tests = b.addRunArtifact(hf_tok_tests);
 
     const tok_test_step = b.step("test-tokenizer", "Run tokenizer tests");

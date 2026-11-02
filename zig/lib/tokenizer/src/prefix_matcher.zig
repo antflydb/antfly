@@ -49,6 +49,7 @@ pub const PrefixMatcher = struct {
 
     pub fn initFromMap(allocator: std.mem.Allocator, vocab: *const std.StringHashMap(void)) !PrefixMatcher {
         const root = try TrieNode.init(allocator);
+        errdefer root.deinit();
 
         var it = vocab.keyIterator();
         while (it.next()) |key| {
@@ -100,6 +101,9 @@ fn addWord(root: *TrieNode, word: []const u8, allocator: std.mem.Allocator) !voi
 
         const entry = try node.children.getOrPut(codepoint);
         if (!entry.found_existing) {
+            // getOrPut publishes the key before its child has been allocated.
+            // Remove that uninitialized entry before the root's rollback walk.
+            errdefer _ = node.children.remove(codepoint);
             entry.value_ptr.* = try TrieNode.init(allocator);
         }
         node = entry.value_ptr.*;
@@ -134,4 +138,20 @@ test "basic match" {
     try std.testing.expectEqual(@as(usize, 5), matcher.findPrefixLen("hello world"));
     try std.testing.expectEqual(@as(usize, 4), matcher.findPrefixLen("hell yeah"));
     try std.testing.expectEqual(@as(usize, 0), matcher.findPrefixLen("world"));
+}
+
+test "prefix matcher releases every partially constructed trie on allocation failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var vocab = std.StringHashMap(void).init(a);
+            defer vocab.deinit();
+            try vocab.put("<alpha>", {});
+            try vocab.put("<alphabet>", {});
+            try vocab.put("\u{2581}unicode", {});
+            var matcher = try PrefixMatcher.initFromMap(a, &vocab);
+            defer matcher.deinit();
+            try std.testing.expectEqual(@as(usize, 10), matcher.findPrefixLen("<alphabet>tail"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

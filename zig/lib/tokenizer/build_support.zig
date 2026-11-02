@@ -30,12 +30,17 @@ pub fn create(b: *std.Build, options: struct {
     sentencepiece_proto: *std.Build.Module,
     grapheme: ?*std.Build.Module = null,
 }) Modules {
+    const grapheme = options.grapheme orelse b.createModule(.{
+        .root_source_file = options.root.path(b, "src/grapheme.zig"),
+        .target = options.target,
+        .optimize = options.optimize,
+    });
     const tokenizer = b.createModule(.{
         .root_source_file = options.root.path(b, "src/tokenizer.zig"),
         .target = options.target,
         .optimize = options.optimize,
         .imports = &.{
-            .{ .name = "antfly_grapheme", .module = options.grapheme orelse b.createModule(.{ .root_source_file = options.root.path(b, "src/grapheme.zig"), .target = options.target, .optimize = options.optimize }) },
+            .{ .name = "antfly_grapheme", .module = grapheme },
             .{ .name = "protobuf", .module = options.protobuf },
             .{ .name = "antfly_platform", .module = options.platform },
             .{ .name = "sentencepiece_proto", .module = options.sentencepiece_proto },
@@ -47,6 +52,7 @@ pub fn create(b: *std.Build, options: struct {
         .optimize = options.optimize,
         .imports = &.{
             .{ .name = "inference_tokenizer", .module = tokenizer },
+            .{ .name = "antfly_grapheme", .module = grapheme },
             .{ .name = "antfly_platform", .module = options.platform },
         },
     });
