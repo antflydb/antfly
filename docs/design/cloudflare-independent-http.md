@@ -109,25 +109,36 @@ dispatch lag >25 ms, transport queueing, failed bodies/fences/versions and journ
 errors fail the population. No workload retries. Join all physical peers on failure.
 Final verification checks the latest acknowledged mutations and exact counts.
 
-A dedicated GitHub-hosted Linux runner is supported by
-`.github/workflows/cloudflare-qualification.yml` and the existing `ci:cloudflare`
-admission system. **The workflow/suite registration must first land on main**;
-GitHub cannot dispatch the workflow while it exists only on this feature branch.
-Normal source approval and pinned checkout still apply. Do not bypass admission
-or merge the unfinished runtime just to enable a diagnostic.
-
-Set `ANTFLY_HTTP_TRIAL_PLAN` to the fresh public plan and install only newly generated
-disposable baseline/candidate/observer API tokens in the named CI secrets. Never
-upload account credentials, Wrangler tokens or a legacy token file. The plan is
-source-pinned, expires after an hour and is claimed in a retained artifact before
-workload I/O. Retries/replays reject the consumed execution ID. Failed/partial runs
-remain artifacts. Local `--local-diagnostic` execution cannot claim independence.
-
-Keep provider delivery monitoring active from before readiness through settlement.
-After execution, join its final poll, download results and run:
+Run the external client manually from a clean, source-pinned checkout on a quiet
+machine separate from the Cloudflare app. No CI workflow, repository secrets or
+default-branch registration is required. Supply the newly authorized disposable
+baseline/candidate/observer tokens through the process environment, never in the
+public plan or command arguments. Do not use account credentials or a legacy token.
 
 ```sh
-node qualification/reconcile-independent-http.mjs DOWNLOADED_RESULT/report.json DELIVERY_HISTORY CLOSURE_JSON
+node qualification/independent-http-trial.mjs --plan=PUBLIC_PLAN --out=FRESH_RESULT_DIRECTORY --claims=PERSISTENT_CLAIM_DIRECTORY --dedicated-client
+```
+
+`--dedicated-client` records the operator's declaration that the load generator is
+a dedicated external client. The report explicitly states that topology/isolation
+are not independently verified. Use `--local-diagnostic` instead for local/shared
+host debugging; the two modes are mutually exclusive. Neither mode changes gate
+thresholds or makes the short trial a full-gate pass.
+
+Plans contain no credential fields, bind the clean checkout's exact source revision,
+and expire after one hour. Before workload or observer I/O, an exclusive execution
+claim is written and synchronized to the persistent claims directory. Failed runs
+consume their IDs too. Reusing an ID in that ledger fails even with a different
+output directory. Replay protection is local to the retained ledger, not global
+cross-host coordination: retain it between runs and do not reset it to replay a
+plan. Prepare a fresh plan and corpus for a new attempt. Preserve partial/failed
+outputs and collect them directly from the client machine.
+
+Keep provider delivery monitoring active from before readiness through settlement.
+After execution, join its final poll and run:
+
+```sh
+node qualification/reconcile-independent-http.mjs FRESH_RESULT_DIRECTORY/report.json DELIVERY_HISTORY CLOSURE_JSON
 ```
 
 Both orders must meet numeric limits and paired non-regression with complete

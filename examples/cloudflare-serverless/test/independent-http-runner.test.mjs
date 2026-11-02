@@ -39,3 +39,14 @@ test('response body failure, overflow and cancellation preserve headers and sett
 test('a committed write from another incarnation never advances the offered-load receipt',async()=>{
  const other='01'+'b'.repeat(64)+'0000000000000002',tasks=[{attempt_id:crypto.randomUUID(),offset_ms:0,step:{op:'mutate',tenant:'a',sequence:1}}],transport={origin,token,report:()=>({peak_queued:0}),fetch:async()=>Response.json({committed:true,visibility:other},{headers:{'X-Antfly-Version':version}})},result=await runIndependent({plan,tasks,receipts,transport,maxDispatchLagMs:1000});assert.equal(result.passed,false);assert.equal(result.samples[0].error,'TrialFenceMismatch');assert.equal(result.receipts.a,fence);
 });
+
+test('manual execution claims are durable and reject replay across output directories',async()=>{
+ const {claimIndependentExecution}=await import('../qualification/independent-http-runner.mjs'),{mkdtemp,readFile,rm}=await import('node:fs/promises'),{resolve}=await import('node:path');
+ const dir=await mkdtemp(resolve('dist/manual-claims-')),source='a'.repeat(40),value={schema:1,kind:'independent-http-plan',execution_id:crypto.randomUUID(),created_at:Date.now(),runner_source_revision:source};
+ try{const planBytes=JSON.stringify(value,null,2),options={source,directory:dir,planBytes};const results=await Promise.allSettled([claimIndependentExecution(value,options),claimIndependentExecution(value,options)]);assert.equal(results.filter(r=>r.status==='fulfilled').length,1);assert.equal(results.find(r=>r.status==='rejected').reason.code,'EEXIST');const claim=results.find(r=>r.status==='fulfilled').value;assert.equal(JSON.parse(await readFile(claim.path)).execution_id,value.execution_id);const{createHash}=await import('node:crypto');assert.equal(claim.plan_sha256,createHash('sha256').update(planBytes).digest('hex'));await assert.rejects(claimIndependentExecution(value,{source,directory:dir}),{code:'EEXIST'});}finally{await rm(dir,{recursive:true});}
+});
+test('manual plans reject credentials, stale identities and changed source before claiming execution',async()=>{
+ const {claimIndependentExecution}=await import('../qualification/independent-http-runner.mjs'),{mkdtemp,access,rm}=await import('node:fs/promises'),{resolve}=await import('node:path');
+ const dir=await mkdtemp(resolve('dist/manual-plan-')),source='a'.repeat(40),plan={schema:1,kind:'independent-http-plan',execution_id:crypto.randomUUID(),created_at:Date.now(),runner_source_revision:source};
+ try{for(const change of[{observer:{token:'test-only-private-value'}},{created_at:Date.now()-3600001},{runner_source_revision:'b'.repeat(40)},{execution_id:'../../outside'}]){const directory=resolve(dir,'claims');await assert.rejects(claimIndependentExecution({...plan,...change},{source,directory}),error=>/^Independent/.test(error.message)&&!error.message.includes('test-only-private-value'));await assert.rejects(access(directory));}}finally{await rm(dir,{recursive:true});}
+});

@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import{mkdir,open}from'node:fs/promises';import{join}from'node:path';import{createHash}from'node:crypto';
 import{performance}from'node:perf_hooks';import{attemptIdentity,rayIdentity}from'./invocation-accounting.mjs';import{runPlan,validatePlan}from'./http-trial-driver.mjs';
 const uuid=()=>crypto.randomUUID(),lsn=s=>BigInt('0x'+s.slice(-16));
 // Request offsets are fixed before the first I/O. Slow responses do not move
@@ -35,4 +36,22 @@ export async function runIndependent({plan,tasks,receipts,transport,maxInFlight=
  for(const task of tasks){while(clock()-began<task.offset_ms)await sleep(Math.max(1,task.offset_ms-(clock()-began)));if(pending.size>=maxInFlight){await record({attempt_id:task.attempt_id,tenant:task.step.tenant,op:task.step.op,outcome:'error',error:'IndependentClientOverloaded',dispatch_lag_ms:Math.max(0,clock()-began-task.offset_ms),ms:Math.max(0,clock()-began-task.offset_ms)});}else launch(task);}
  await Promise.allSettled([...pending]);const metrics=transport.report(),completed=samples.length===tasks.length,failures=[];if(!completed)failures.push('IndependentPopulationIncomplete');if(samples.some(s=>s.outcome!=='ok'))failures.push('IndependentRequestFailed');if(samples.some(s=>s.dispatch_lag_ms>maxDispatchLagMs))failures.push('IndependentSchedulingLate');if(metrics.peak_queued)failures.push('IndependentTransportQueued');if(evidence_errors.length)failures.push(...evidence_errors);
  return{schema:1,qualification:false,kind:'independent-node-offered-http',passed:failures.length===0,failures:[...new Set(failures)],started_at,finished_at:wall(),max_dispatch_lag_ms:maxDispatchLagMs,offered:tasks.length,completed,peak_in_flight:peak,transport:metrics,receipts:fences,samples,invocation_ledger:{schema:1,overflow:false,attempts:ledger},unsent_attempt_ids:tasks.filter(t=>!ledger.some(l=>l.id===t.attempt_id)).map(t=>attemptIdentity(t.attempt_id))};
+}
+
+
+// Manual runs share a persistent claims directory. A failed run consumes its ID.
+export function validateIndependentExecutionPlan(plan,{source,now=Date.now()}){
+ function publicOnly(value){if(!value||typeof value!=='object')return;for(const[k,v]of Object.entries(value)){if(/token|secret|password|authorization|credential/i.test(k))throw Error('IndependentPlanContainsCredentialField');publicOnly(v);}}
+ publicOnly(plan);
+ if(plan?.schema!==1||plan.kind!=='independent-http-plan'||!/^[a-f0-9]{40}$/.test(source??'')||plan.runner_source_revision!==source||!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(plan.execution_id??'')||!Number.isSafeInteger(plan.created_at)||now-plan.created_at>3600000||plan.created_at>now+300000)throw Error('IndependentPublicPlanInvalid');
+}
+export async function claimIndependentExecution(plan,{source,directory,now=Date.now(),planBytes}){
+ validateIndependentExecutionPlan(plan,{source,now});
+ if(planBytes&&JSON.stringify(JSON.parse(planBytes))!==JSON.stringify(plan))throw Error('IndependentClaimPlanMismatch');
+ await mkdir(directory,{recursive:true,mode:0o700});
+ const path=join(directory,plan.execution_id+'.json'),file=await open(path,'wx',0o600);
+ const claim={execution_id:plan.execution_id,plan_sha256:createHash('sha256').update(planBytes??JSON.stringify(plan)).digest('hex'),source,claimed_at:now};
+ try{await file.writeFile(JSON.stringify(claim));await file.sync();}finally{await file.close();}
+ const parent=await open(directory,'r');try{await parent.sync();}finally{await parent.close();}
+ return{...claim,path};
 }

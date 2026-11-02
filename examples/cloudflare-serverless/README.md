@@ -600,8 +600,8 @@ Use `qualification/read-state-latency.mjs` for local serving comparisons and
 `qualification/r2-scale.mjs` for bounded native/R2 scale fixtures. Use the
 independent HTTP runner and eight-role observer for short hosted comparisons,
 then the original gate runner only after warm prerequisites pass. Full gate
-thresholds and source/control verification remain unchanged. Dedicated-client
-workflow activation requires its reviewed registration to land on main first.
+thresholds and source/control verification remain unchanged. Run the dedicated-client command manually from a clean checkout on a separate
+machine; no CI registration or repository secrets are required.
 
 The disk-backed local bucket avoids retaining large emulated R2 payloads in host
 RAM. Use it for large fixture runs; fixture storage is outside WASM memory metrics.
