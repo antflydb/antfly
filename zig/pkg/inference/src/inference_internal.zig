@@ -151,6 +151,7 @@ pub const architectures = struct {
 pub const models = struct {
     pub const embedding_gemma2 = @import("models/embedding_gemma2.zig");
     pub const gliner_decide_qualification = @import("models/gliner_decide_qualification.zig");
+    pub const gliner_specialty_qualification = @import("models/gliner_specialty_qualification.zig");
     pub const tensor_store = @import("models/tensor_store.zig");
     pub const manifest = @import("models/manifest.zig");
     pub const gliner_boundary_bundle = @import("models/gliner_boundary_bundle.zig");
@@ -187,6 +188,10 @@ test "embeddinggemma2 video module declarations" {
 test "GLiNER Decide artifact test reachability" {
     _ = models.gliner_decide_qualification;
     _ = models.tensor_store;
+}
+
+test "GLiNER specialty artifact test reachability" {
+    _ = models.gliner_specialty_qualification;
 }
 
 test "model aware media module declarations" {

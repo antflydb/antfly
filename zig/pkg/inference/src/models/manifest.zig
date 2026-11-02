@@ -27,6 +27,7 @@ const gpt = @import("gpt.zig");
 const embedding_gemma2 = @import("embedding_gemma2.zig");
 const gliner_boundary = @import("gliner_boundary.zig");
 const gliner_qualification = @import("gliner_boundary_qualification.zig");
+const specialty_qualification = @import("gliner_specialty_qualification.zig");
 const boundary_bundle = @import("gliner_boundary_bundle.zig");
 const compat = @import("../io/compat.zig");
 const c_file = @import("../util/c_file.zig");
@@ -394,6 +395,11 @@ pub const ModelManifest = struct {
     /// (e.g. GLiNER2.5-Decide). Its classification runs the upstream
     /// `classifier` head on the schema_version:2 route.
     gliner_span_declared: bool = false,
+    /// Exact legacy config recognition; full consumed identity still gates execution.
+    gliner_specialty_profile: ?specialty_qualification.Profile = null,
+    /// Shared small sidecars trigger a weight-bound rejection check at load;
+    /// they never select an executor or reject an unrelated fine-tune.
+    gliner_specialty_artifact_hint: ?specialty_qualification.Profile = null,
     gliner_span_encoder_family: GlinerSpanEncoderFamily = .unknown,
     gliner_span_config_digest: ?boundary_bundle.Digest = null,
     gliner_span_encoder_digest: ?boundary_bundle.Digest = null,
@@ -1030,7 +1036,48 @@ const ArtifactCatalog = struct {
         return null;
     }
 
+    /// Managed origin is a rejection obligation, never execution permission.
+    fn expectedSpecialtyProfile(self: *const ArtifactCatalog) !?specialty_qualification.Profile {
+        if (self.receipt) |*receipt| if (receipt.parsed.value.source) |source| {
+            const profile = specialty_qualification.profileForRepository(source.owner, source.name) orelse return null;
+            try specialty_qualification.requireManagedSource(profile, source.resolved_revision, source.selected_format);
+            return profile;
+        };
+        return null;
+    }
+
+    /// A shared sidecar pair only hints that load-time weight authentication
+    /// may be needed. Unrelated modern wrappers and fine-tunes remain valid.
+    fn specialtyArtifactHint(self: *const ArtifactCatalog) !?specialty_qualification.Profile {
+        const encoder = try self.readOptionalUnchecked("encoder_config/config.json") orelse return null;
+        defer self.allocator.free(encoder);
+        const encoder_digest = boundary_bundle.Digest.of(encoder);
+        var known_encoder = false;
+        for (specialty_qualification.artifacts) |artifact| {
+            encoder_digest.verify(artifact.encoder_config) catch continue;
+            known_encoder = true;
+            break;
+        }
+        if (!known_encoder) return null;
+        const tokenizer_config = try self.readOptionalUnchecked("tokenizer_config.json") orelse return null;
+        defer self.allocator.free(tokenizer_config);
+        return specialty_qualification.profileForSmallSidecars(encoder_digest, boundary_bundle.Digest.of(tokenizer_config));
+    }
+
     fn readOptional(self: *const ArtifactCatalog, name: []const u8) !?[]u8 {
+        const bytes = try self.readOptionalUnchecked(name);
+        errdefer if (bytes) |value| self.allocator.free(value);
+        if (std.mem.eql(u8, name, "config.json")) {
+            if (try self.expectedSpecialtyProfile()) |expected| {
+                const config = bytes orelse return error.UnsupportedGlinerSpecialtyArtifact;
+                if (specialty_qualification.profileForConfig(boundary_bundle.Digest.of(config)) != expected)
+                    return error.UnsupportedGlinerSpecialtyArtifact;
+            }
+        }
+        return bytes;
+    }
+
+    fn readOptionalUnchecked(self: *const ArtifactCatalog, name: []const u8) !?[]u8 {
         if (self.receipt != null) {
             const artifact = self.find(name) orelse return null;
             return try c_file.readFile(self.allocator, artifact.canonical_path);
@@ -1219,7 +1266,7 @@ pub fn hasDeclaredCapability(allocator: std.mem.Allocator, model_dir_path: []con
     defer allocator.free(bytes);
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
-    try parseModelManifestJson(&manifest, allocator, bytes);
+    try parseModelManifestDeclarations(&manifest, allocator, bytes, .capability_probe);
     return manifest.hasCapability(capability);
 }
 
@@ -1261,6 +1308,7 @@ fn parseBoundaryConfigFromCatalog(
         if (architecture == .span) {
             manifest.gliner_span_declared = try gliner_boundary.declaresSpanArchitecture(allocator, config_bytes);
             manifest.gliner_span_config_digest = boundary_bundle.Digest.of(config_bytes);
+            manifest.gliner_specialty_profile = specialty_qualification.profileForConfig(manifest.gliner_span_config_digest.?);
         }
         return false;
     }
@@ -1331,7 +1379,7 @@ fn parseSpanEncoderConfigFromCatalog(
     // never let architecture defaults fill missing geometry. Older wrappers
     // without the declared SpanExtractor contract may still carry only the
     // four historical DeBERTa dimensions for ONNX/catalog discovery.
-    if (manifest.gliner_span_declared) {
+    if (manifest.gliner_span_declared or manifest.gliner_specialty_profile != null) {
         inline for (.{ "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads", "vocab_size", "max_position_embeddings" }) |field| {
             const value = obj.get(field) orelse return error.InvalidGlinerSpanEncoderConfig;
             const number = jsonU32(value) orelse return error.InvalidGlinerSpanEncoderConfig;
@@ -1343,7 +1391,7 @@ fn parseSpanEncoderConfigFromCatalog(
         const config = try deberta.parseConfig(allocator, bytes);
         const pad_token_id = if (obj.get("pad_token_id")) |value|
             jsonU32(value) orelse return error.InvalidGlinerSpanEncoderConfig
-        else if (manifest.gliner_span_declared)
+        else if (manifest.gliner_span_declared or manifest.gliner_specialty_profile != null)
             return error.InvalidGlinerSpanEncoderConfig
         else
             @as(u32, @intCast(@max(manifest.bert_pad_token_id, 0)));
@@ -1395,6 +1443,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     const model_dir_path = catalog.model_dir_path;
     var manifest = ModelManifest{ .allocator = allocator };
     errdefer manifest.deinit();
+    manifest.gliner_specialty_artifact_hint = try catalog.specialtyArtifactHint();
 
     if (inferModelTypeFromPath(model_dir_path)) |model_type| {
         manifest.model_type = model_type;
@@ -1563,6 +1612,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
 
     var catalog = try ArtifactCatalog.initPublished(allocator, model_dir_path);
     defer catalog.deinit();
+    manifest.gliner_specialty_artifact_hint = try catalog.specialtyArtifactHint();
 
     if (inferModelTypeFromPath(model_dir_path)) |model_type| {
         manifest.model_type = model_type;
@@ -1613,18 +1663,30 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         defer allocator.free(at_bytes);
         try ignoreNonResourceMetadataError(parseAddedTokens(&manifest, at_bytes));
     }
-    // Small tokenizer metadata may declare marker IDs. Ettin lists strings
-    // only, so discovery falls back to tokenizer.json when IDs are missing.
-    if (manifest.gliner_classification_head == .label_marker_mlp) {
+    if (manifest.gliner_classification_head == .label_marker_mlp or manifest.gliner_specialty_profile != null) {
+        // Preserve small-sidecar token metadata and its validation; only the
+        // vocabulary-sized fallback is unnecessary for exact specialty profiles.
         if (try catalog.readOptional("tokenizer_config.json")) |tokenizer_config_bytes| {
             defer allocator.free(tokenizer_config_bytes);
             try parseTokenizerConfig(&manifest, allocator, tokenizer_config_bytes);
         }
-        // TokenizersBackend checkpoints (including Decide-1B) list marker
-        // names in tokenizer_config.json without their numeric IDs. Listing
-        // validation still needs the exact [L]/[SEP_STRUCT] contract, so scan
-        // tokenizer.json only when the small sidecar could not supply it.
-        if (manifest.gliner_token_l == 0 or manifest.gliner_token_sep_struct == 0) {
+        if (manifest.gliner_specialty_profile) |profile| {
+            // Discovery uses tokenizer-derived markers sealed in the exact
+            // config profile. Do not read a 16MB/8MB vocabulary merely to recover
+            // seven IDs on each request. No consumed tokenizer digest is set:
+            // full loading still reads actual bytes/markers and live admission
+            // authenticates the complete identity before execution.
+            const markers = specialty_qualification.artifacts[@backingInt(profile)].markers;
+            manifest.gliner_token_p = markers.p;
+            manifest.gliner_token_c = markers.c;
+            manifest.gliner_token_e = markers.e;
+            manifest.gliner_token_r = markers.r;
+            manifest.gliner_token_l = markers.l;
+            manifest.gliner_token_sep_struct = markers.sep_struct;
+            manifest.gliner_token_sep_text = markers.sep_text;
+        } else if (manifest.gliner_token_l == 0 or manifest.gliner_token_sep_struct == 0) {
+            // Modern span checkpoints still derive discovery markers from
+            // tokenizer metadata; they have no specialty compatibility profile.
             const tokenizer_bytes = try catalog.readOptional("tokenizer.json") orelse return error.InvalidModelManifest;
             defer allocator.free(tokenizer_bytes);
             try parseTokenizerJsonSpecialTokens(&manifest, allocator, tokenizer_bytes);
@@ -1751,7 +1813,7 @@ fn applyListingGlinerHint(manifest: *ModelManifest, allocator: std.mem.Allocator
     // publishes its marker IDs only in tokenizer.json. Discovery must not
     // require the legacy special_tokens_map sidecar; full loading still
     // validates every required marker and the consumed weight layout.
-    if (manifest.gliner_span_declared and manifest.gliner_classification_head == .label_marker_mlp and
+    if (((manifest.gliner_span_declared and manifest.gliner_classification_head == .label_marker_mlp) or manifest.gliner_specialty_profile != null) and
         std.mem.eql(u8, manifest.config_model_arch, "extractor"))
     {
         manifest.gliner_model_type = try allocator.dupe(u8, "gliner2");
@@ -1905,6 +1967,22 @@ fn applySentenceTransformersPrompts(
 }
 
 fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8) !void {
+    if (manifest.gliner_specialty_profile) |profile| {
+        // Specialty contracts are independent of modern span and Decide grants.
+        // Caller-provided manifests may narrow neither the architecture nor its
+        // task type by claiming inherited count, relation, or decision heads.
+        try validateSpecialtyManifestDeclarations(manifest, profile);
+        const capability = if (profile == .pii) "named_entity_recognition" else "classification";
+        try appendManifestStrings(manifest.allocator, &manifest.tasks, &.{"extract"});
+        try appendManifestStrings(manifest.allocator, &manifest.capabilities, &.{capability});
+        if (manifest.inputs.len == 0) try setManifestInputs(manifest.allocator, manifest, &.{"text"});
+        manifest.model_type = .extractor;
+        manifest.model_type_origin = .config;
+        manifest.gliner_max_width = 8;
+        if (manifest.gliner_model_type.len == 0) manifest.gliner_model_type = try manifest.allocator.dupe(u8, "gliner2");
+        if (profile == .gliguard) manifest.gliner_classification_head = .label_marker_mlp;
+        return;
+    }
     // No non-empty extraction evaluation qualifies the current ModernBERT
     // span checkpoint. Apply to both live loading and discovery, including
     // manifests synthesized by older versions or supplied by the caller.
@@ -3266,18 +3344,48 @@ fn parseEmbeddingProfileJson(manifest: *ModelManifest, value: std.json.Value) !v
     }
 }
 
+fn validateSpecialtyManifestDeclarations(manifest: *const ModelManifest, profile: specialty_qualification.Profile) !void {
+    for (manifest.tasks) |task| if (!std.mem.eql(u8, task, "extract")) return error.InvalidModelManifest;
+    const capability = if (profile == .pii) "named_entity_recognition" else "classification";
+    for (manifest.capabilities) |cap| if (!std.mem.eql(u8, cap, capability)) return error.InvalidModelManifest;
+    if (manifest.model_manifest_declarations.model_type and manifest.model_type != .extractor) return error.InvalidModelManifest;
+    if (manifest.inputs.len > 0 and (manifest.inputs.len != 1 or !std.mem.eql(u8, manifest.inputs[0], "text"))) return error.InvalidModelManifest;
+}
+
+const ManifestDeclarationContext = enum { artifact_load, capability_probe };
+
 fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
+    return parseModelManifestDeclarations(manifest, allocator, json_bytes, .artifact_load);
+}
+
+fn parseModelManifestDeclarations(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8, context: ManifestDeclarationContext) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        else => return error.InvalidModelManifest,
+        else => return if (manifest.gliner_specialty_profile != null) error.UnsupportedGlinerSpecialtyArtifact else error.InvalidModelManifest,
     };
     defer parsed.deinit();
 
     const obj = switch (parsed.value) {
         .object => |object| object,
-        else => return error.InvalidModelManifest,
+        else => return if (manifest.gliner_specialty_profile != null) error.UnsupportedGlinerSpecialtyArtifact else error.InvalidModelManifest,
     };
+    applyModelManifestDeclarationFields(manifest, allocator, obj, context) catch |err| {
+        // A config-derived specialty profile or an explicit specialty assertion
+        // makes malformed serving declarations an artifact rejection. Preserve
+        // resource errors and every unrelated family's existing error contract.
+        if (err == error.InvalidModelManifest and
+            (manifest.gliner_specialty_profile != null or obj.get("gliner_specialty_profile") != null))
+            return error.UnsupportedGlinerSpecialtyArtifact;
+        return err;
+    };
+    if (manifest.gliner_specialty_profile) |profile| {
+        // Exact original configs remain entity-only/classification-only even
+        // when a manually supplied declaration omits the durable assertion.
+        validateSpecialtyManifestDeclarations(manifest, profile) catch return error.UnsupportedGlinerSpecialtyArtifact;
+    }
+}
 
+fn applyModelManifestDeclarationFields(manifest: *ModelManifest, allocator: std.mem.Allocator, obj: anytype, context: ManifestDeclarationContext) !void {
     if (obj.get("media_classifier")) |value| {
         var profile = std.json.parseFromValue(@import("media_classifier_profile.zig").Profile, allocator, value, .{}) catch return error.InvalidMediaClassifierProfile;
         defer profile.deinit();
@@ -3313,6 +3421,21 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
         manifest.model_manifest_declarations.inputs = true;
     }
 
+    if (obj.get("gliner_specialty_profile")) |value| {
+        if (value != .string) return error.InvalidModelManifest;
+        const expected = std.meta.stringToEnum(specialty_qualification.Profile, value.string) orelse return error.InvalidModelManifest;
+        // A durable Antfly assertion prevents renamed installations from
+        // falling back to generic span serving after their config changes.
+        // Only the actual config digest supplies the execution candidate.
+        switch (context) {
+            .artifact_load => if (manifest.gliner_specialty_profile != expected) return error.UnsupportedGlinerSpecialtyArtifact,
+            // The cheap dispatch probe has deliberately not read config.json.
+            // Validate only declarations here, without supplying an execution
+            // profile or granting inherited Decide capabilities. Actual listing
+            // and session loading still require the config and full identity.
+            .capability_probe => try validateSpecialtyManifestDeclarations(manifest, expected),
+        }
+    }
     if (obj.get("gliner_classification_head")) |v| {
         if (v != .string or !std.mem.eql(u8, v.string, "label_marker_mlp"))
             return error.InvalidModelManifest;
@@ -8474,4 +8597,257 @@ test "dense embedding output geometry requires resolved metadata" {
     const qwen = manifest.denseEmbeddingOutput().?;
     try std.testing.expectEqual(@as(u32, 1024), qwen.native_dimensions);
     try std.testing.expectEqual(@as(u32, 32), qwen.minimum_dimensions);
+}
+
+test "specialty manifests expose only their extraction task and never Decide" {
+    const a = std.testing.allocator;
+    inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
+        var manifest = ModelManifest{ .allocator = a, .gliner_specialty_profile = profile };
+        defer manifest.deinit();
+        try applyImplicitModelTypeHints(&manifest, "local-copy");
+        try std.testing.expect(!manifest.gliner_span_declared);
+        try std.testing.expect(!manifest.isGlinerDecisionModel());
+        try std.testing.expect(manifest.hasTask("extract"));
+        try std.testing.expect(!manifest.hasTask("decide"));
+        try std.testing.expectEqual(@as(usize, 1), manifest.capabilities.len);
+        try std.testing.expectEqualStrings(if (profile == .pii) "named_entity_recognition" else "classification", manifest.capabilities[0]);
+        if (profile == .gliguard) try std.testing.expect(manifest.gliner_classification_head == .label_marker_mlp);
+    }
+}
+
+test "specialty manifests reject inherited and caller-added capabilities" {
+    const a = std.testing.allocator;
+    inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
+        var manifest = ModelManifest{ .allocator = a, .gliner_specialty_profile = profile };
+        defer manifest.deinit();
+        try appendManifestStrings(a, &manifest.capabilities, &.{"typed_decisions"});
+        try std.testing.expectError(error.InvalidModelManifest, applyImplicitModelTypeHints(&manifest, "local-copy"));
+    }
+}
+
+test "specialty canonical managed declarations pass extraction dispatch without Decide grants" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(path);
+        const capability = if (profile == .pii) "named_entity_recognition" else "classification";
+        const declaration = try std.json.Stringify.valueAlloc(a, .{
+            .type = "extractor",
+            .tasks = .{"extract"},
+            .inputs = .{"text"},
+            .capabilities = .{capability},
+            .gliner_specialty_profile = @tagName(profile),
+            .qualified_limits = .{ .specialty = .{ .sequence_tokens = 512, .physical_batch_items = if (profile == .pii) @as(usize, 1) else 8 } },
+        }, .{});
+        defer a.free(declaration);
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = declaration });
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "not JSON" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "not JSON" });
+        try std.testing.expect(!try hasDeclaredCapability(a, path, "typed_decisions"));
+        try std.testing.expect(try hasDeclaredCapability(a, path, capability));
+        var probe = ModelManifest{ .allocator = a };
+        defer probe.deinit();
+        try parseModelManifestDeclarations(&probe, a, declaration, .capability_probe);
+        try std.testing.expect(probe.gliner_specialty_profile == null);
+        try std.testing.expect(!probe.isGlinerDecisionModel());
+        // Reading actual artifacts remains strict even after a cheap probe.
+        try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, parseModelManifestJson(&probe, a, declaration));
+        const forged = try std.fmt.allocPrint(a, "{{\"type\":\"extractor\",\"gliner_specialty_profile\":\"{s}\",\"capabilities\":[\"typed_decisions\"]}}", .{@tagName(profile)});
+        defer a.free(forged);
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = forged });
+        try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, hasDeclaredCapability(a, path, "typed_decisions"));
+
+        // The same synthesized declaration must survive listing and the next
+        // extraction dispatch probe with config-derived specialty identity.
+        const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = declaration });
+        try tmp.dir.deleteFile(io, "tokenizer.json");
+        try tmp.dir.createDirPath(io, "encoder_config");
+        inline for (.{ "config.json", "encoder_config/config.json", "tokenizer_config.json" }) |name| {
+            const bytes = try fixtures.fixtureBytes(a, "specialty/" ++ @tagName(profile) ++ "/" ++ name);
+            defer a.free(bytes);
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+        }
+        const marker_ids = specialty_qualification.artifacts[@backingInt(profile)].markers;
+        const tokenizer = try std.json.Stringify.valueAlloc(a, .{ .added_tokens = .{
+            .{ .id = marker_ids.p, .content = "[P]" },
+            .{ .id = marker_ids.c, .content = "[C]" },
+            .{ .id = marker_ids.e, .content = "[E]" },
+            .{ .id = marker_ids.r, .content = "[R]" },
+            .{ .id = marker_ids.l, .content = "[L]" },
+            .{ .id = marker_ids.sep_struct, .content = "[SEP_STRUCT]" },
+            .{ .id = marker_ids.sep_text, .content = "[SEP_TEXT]" },
+        } }, .{});
+        defer a.free(tokenizer);
+        try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "" });
+        var listing = try loadListingFromDir(a, path);
+        defer listing.deinit();
+        try std.testing.expectEqual(profile, listing.gliner_specialty_profile.?);
+        try std.testing.expect(listing.hasCapability(capability));
+        try std.testing.expect(!try hasDeclaredCapability(a, path, "typed_decisions"));
+        var loaded_manifest = try loadFromDir(a, path);
+        defer loaded_manifest.deinit();
+        try std.testing.expectEqual(profile, loaded_manifest.gliner_specialty_profile.?);
+        try std.testing.expect(!loaded_manifest.isGlinerDecisionModel());
+    }
+}
+
+test "specialty listing avoids full tokenizer reads without authenticating execution" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "encoder_config");
+        inline for (.{ "config.json", "encoder_config/config.json", "tokenizer_config.json" }) |name| {
+            const bytes = try fixtures.fixtureBytes(a, "specialty/" ++ @tagName(profile) ++ "/" ++ name);
+            defer a.free(bytes);
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+        }
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "" });
+        const artifact = specialty_qualification.artifacts[@backingInt(profile)];
+        // A sparse, non-JSON vocabulary at the original artifact size makes
+        // accidental vocabulary reading/parsing observable without allocating
+        // or writing a real model-sized fixture. All listing allocations must
+        // fit well below either tokenizer's size.
+        const tokenizer_file = try tmp.dir.createFile(io, "tokenizer.json", .{});
+        try tokenizer_file.setLength(io, artifact.tokenizer.size_bytes);
+        tokenizer_file.close(io);
+        const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(path);
+        var storage: [512 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&storage);
+        var listing = try loadListingFromDir(bounded.allocator(), path);
+        defer listing.deinit();
+        try std.testing.expectEqual(profile, listing.gliner_specialty_profile.?);
+        inline for (.{ "p", "c", "e", "r", "l", "sep_struct", "sep_text" }) |name| {
+            try std.testing.expectEqual(@field(artifact.markers, name), @field(listing, "gliner_token_" ++ name));
+        }
+        try std.testing.expect(listing.gliner_span_tokenizer_digest == null);
+        try std.testing.expect(!listing.gliner_span_declared);
+        try std.testing.expect(!listing.isGlinerDecisionModel());
+
+        // Listing constants must never replace the actual consumed tokenizer
+        // in the full loader or live artifact-identity gate.
+        const changed_tokenizer = "{\"added_tokens\":[{\"id\":17,\"content\":\"[L]\"}]}";
+        try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = changed_tokenizer });
+        var full = try loadFromDir(a, path);
+        defer full.deinit();
+        try std.testing.expectEqual(@as(i32, 17), full.gliner_token_l);
+        try std.testing.expectEqualDeep(boundary_bundle.Digest.of(changed_tokenizer), full.gliner_span_tokenizer_digest.?);
+        var identity = specialty_qualification.pinnedIdentity(profile);
+        identity.sidecars.tokenizer = full.gliner_span_tokenizer_digest.?;
+        try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, specialty_qualification.require(identity));
+
+        // Recognition is content-based on every listing, never a pathname
+        // cache that survives changing the config under the same directory.
+        const changed_config = try fixtures.fixtureBytes(a, "specialty/" ++ @tagName(profile) ++ "/config.json");
+        defer a.free(changed_config);
+        changed_config[std.mem.indexOf(u8, changed_config, "5.").?] = '6';
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = changed_config });
+        var drifted = try loadListingFromDir(a, path);
+        defer drifted.deinit();
+        try std.testing.expect(drifted.gliner_specialty_profile == null);
+        try std.testing.expectEqual(@as(i32, 0), drifted.gliner_token_l);
+    }
+}
+
+test "specialty malformed serving declarations reject as artifacts without granting profiles" {
+    const a = std.testing.allocator;
+    inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
+        inline for (.{
+            "\"capabilities\":false",
+            "\"tasks\":false",
+            "\"capabilities\":[\"relations\"]",
+            "\"capabilities\":[\"typed_decisions\"],\"tasks\":[\"decide\"]",
+            "\"type\":\"classifier\"",
+            "\"inputs\":[\"image\"]",
+        }) |fields| {
+            const asserted_json = try std.fmt.allocPrint(a, "{{\"gliner_specialty_profile\":\"{s}\",{s}}}", .{ @tagName(profile), fields });
+            defer a.free(asserted_json);
+            var probe = ModelManifest{ .allocator = a };
+            defer probe.deinit();
+            try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, parseModelManifestDeclarations(&probe, a, asserted_json, .capability_probe));
+            try std.testing.expect(probe.gliner_specialty_profile == null);
+            try std.testing.expect(!probe.isGlinerDecisionModel());
+            var actual = ModelManifest{ .allocator = a, .gliner_specialty_profile = profile };
+            defer actual.deinit();
+            try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, parseModelManifestJson(&actual, a, asserted_json));
+            // A known original config cannot opt into a broader contract by
+            // omitting the generated profile assertion from a manual manifest.
+            const unasserted_json = try std.fmt.allocPrint(a, "{{{s}}}", .{fields});
+            defer a.free(unasserted_json);
+            var unasserted = ModelManifest{ .allocator = a, .gliner_specialty_profile = profile };
+            defer unasserted.deinit();
+            try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, parseModelManifestJson(&unasserted, a, unasserted_json));
+        }
+    }
+    // Generic-family declarations retain their existing parser errors.
+    var generic = ModelManifest{ .allocator = a };
+    defer generic.deinit();
+    try std.testing.expectError(error.InvalidModelManifest, parseModelManifestJson(&generic, a, "{\"capabilities\":false}"));
+    try std.testing.expectError(error.InvalidModelManifest, parseModelManifestDeclarations(&generic, a, "{\"tasks\":false}", .capability_probe));
+}
+
+test "specialty assertion rejects config drift and never grants a profile" {
+    const a = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = a };
+    defer manifest.deinit();
+    try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, parseModelManifestJson(&manifest, a, "{\"gliner_specialty_profile\":\"pii\"}"));
+    try std.testing.expect(manifest.gliner_specialty_profile == null);
+    manifest.gliner_specialty_profile = .pii;
+    try parseModelManifestJson(&manifest, a, "{\"gliner_specialty_profile\":\"pii\"}");
+    try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, parseModelManifestJson(&manifest, a, "{\"gliner_specialty_profile\":\"gliguard\"}"));
+}
+
+test "specialty same-size config drift rejects managed origin and only hints for renamed raw copies" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    inline for (.{ specialty_qualification.Profile.pii, specialty_qualification.Profile.gliguard }) |profile| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const config = try fixtures.fixtureBytes(a, "specialty/" ++ @tagName(profile) ++ "/config.json");
+        defer a.free(config);
+        const artifact = specialty_qualification.artifacts[@backingInt(profile)];
+        try boundary_bundle.Digest.of(config).verify(artifact.config);
+        config[std.mem.indexOf(u8, config, "5.").?] = '6';
+        try std.testing.expectEqual(artifact.config.size_bytes, config.len);
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "" });
+        const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{
+            .source = .{ .owner = "fastino", .name = artifact.repository["fastino/".len..], .variant = "safetensors", .resolved_revision = artifact.revision, .selected_format = "safetensors" },
+            .artifacts = &.{ .{ .path = "config.json", .size = config.len }, .{ .path = "model.safetensors", .size = 0 } },
+        }, .{});
+        defer a.free(receipt);
+        try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+        const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(path);
+        try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, loadFromDir(a, path));
+        try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, loadListingFromDir(a, path));
+
+        // A renamed, unmanaged snapshot has neither a path nor a receipt hint.
+        // Shared small sidecars cannot reject a potentially unrelated model.
+        // Only matching original weights impose rejection during session load.
+        try tmp.dir.deleteFile(io, managed_receipt.complete_filename);
+        try tmp.dir.createDirPath(io, "encoder_config");
+        inline for (.{ "encoder_config/config.json", "tokenizer_config.json" }) |name| {
+            const bytes = try fixtures.fixtureBytes(a, "specialty/" ++ @tagName(profile) ++ "/" ++ name);
+            defer a.free(bytes);
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+        }
+        var raw = try loadFromDir(a, path);
+        defer raw.deinit();
+        try std.testing.expect(raw.gliner_specialty_profile == null);
+        try std.testing.expectEqual(profile, raw.gliner_specialty_artifact_hint.?);
+        var listing = try loadListingFromDir(a, path);
+        defer listing.deinit();
+        try std.testing.expect(listing.gliner_specialty_profile == null);
+        try std.testing.expectEqual(profile, listing.gliner_specialty_artifact_hint.?);
+    }
 }

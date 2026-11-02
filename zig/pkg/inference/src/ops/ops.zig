@@ -635,6 +635,8 @@ pub const GlinerLabelGruCombinedRequest = struct {
     label_embeddings: CT,
     num_labels: usize,
     hidden_size: usize,
+    /// CountLSTM-v2 adds the label skip connection; v1 uses the GRU state directly.
+    add_residual: bool = true,
 };
 
 pub const GlinerGatherConcatReluRequest = struct {
@@ -1580,6 +1582,8 @@ pub const TrainingRuntimeStats = struct {
     download_last_bytes: u64 = 0,
     download_previous_bytes: u64 = 0,
     to_float32_calls: u64 = 0,
+    gliner_label_gru_calls: u64 = 0,
+    gliner_label_gru_no_residual_calls: u64 = 0,
     download_alloc_calls: u64 = 0,
     stream_synchronizations: u64 = 0,
     upload_synchronizations: u64 = 0,
@@ -2040,8 +2044,8 @@ pub const ComputeBackend = struct {
         // the GLiNER span head). No-op on backends without the concept.
         preferEagerQuantMirrors: ?*const fn (ctx: *anyopaque, enabled: bool) void = null,
 
-        /// GLiNER-specific CountLSTM GRU step plus skip connection:
-        /// returns `gru(label_embeddings, pos0) + label_embeddings` as
+        /// GLiNER-specific CountLSTM GRU step with optional skip connection:
+        /// returns `gru(label_embeddings, pos0) + (add_residual ? label_embeddings : 0)` as
         /// [num_labels, hidden_size].
         glinerLabelGruCombined: ?*const fn (ctx: *anyopaque, request: *const GlinerLabelGruCombinedRequest) anyerror!?CT = null,
 
@@ -3549,11 +3553,16 @@ pub const ComputeBackend = struct {
     }
 
     pub fn glinerLabelGruCombined(self: *const ComputeBackend, label_embeddings: CT, num_labels: usize, hidden_size: usize) !?CT {
+        return self.glinerLabelGru(label_embeddings, num_labels, hidden_size, true);
+    }
+
+    pub fn glinerLabelGru(self: *const ComputeBackend, label_embeddings: CT, num_labels: usize, hidden_size: usize, add_residual: bool) !?CT {
         if (self.vtable.glinerLabelGruCombined) |op| {
             return op(self.ptr, &.{
                 .label_embeddings = label_embeddings,
                 .num_labels = num_labels,
                 .hidden_size = hidden_size,
+                .add_residual = add_residual,
             });
         }
         return null;
