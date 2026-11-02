@@ -960,6 +960,8 @@ pub const Detail = enum(c_int) {
     // Append-only: numeric Detail values are part of the stable C ABI.
     embed_admission_refused,
     read_output_truncated,
+    invalid_document_extraction_config,
+    document_extraction_model_required,
 };
 
 pub const Status = extern struct {
@@ -977,6 +979,8 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.InvalidDocumentExtractionConfig => status(.invalid_argument, .invalid_document_extraction_config),
+        error.DocumentExtractionModelRequired => status(.invalid_argument, .document_extraction_model_required),
         error.ReadTransientFailure => status(.retryable, .read_transient_failure),
         error.ReadRequestFailed => status(.invalid_argument, .read_request_failed),
         error.InvalidGcsUrl => status(.invalid_argument, .invalid_gcs_url),
@@ -2730,6 +2734,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .runtime_already_ready => "RuntimeAlreadyReady",
         .embed_admission_refused => "EmbedAdmissionRefused",
         .read_output_truncated => "ReadOutputTruncated",
+        .invalid_document_extraction_config => "InvalidDocumentExtractionConfig",
+        .document_extraction_model_required => "DocumentExtractionModelRequired",
     };
 }
 
@@ -3251,5 +3257,13 @@ test "reader failures preserve retry semantics and GCS failures preserve scope s
     try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.GcsConnectionNotFoundOrOutOfScope).code);
     inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
         try std.testing.expectEqual(expected, errorFromStatus(statusFromError(expected)));
+    }
+}
+
+test "invalid persisted extraction policy retains identity across storage callbacks" {
+    inline for (.{ error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired }) |expected| {
+        const transported = comptime statusFromError(expected);
+        try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+        try std.testing.expectEqual(expected, errorFromStatus(transported));
     }
 }

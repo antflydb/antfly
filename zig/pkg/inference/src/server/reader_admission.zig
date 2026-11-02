@@ -33,6 +33,7 @@ pub fn CohortMemory(comptime Hooks: type) type {
         packed_mixed: bool = false,
         prefill_query_chunk_rows: usize = 0,
         decoder_backend_peak: usize = 0,
+        decoder_workspace: @import("reader_workspace.zig").Decoder = .{},
 
         pub fn product(values: []const usize) !usize {
             var bytes: usize = 1;
@@ -93,7 +94,9 @@ pub fn CohortMemory(comptime Hooks: type) type {
                 // this monotonic lease bounded across a long mixed-page epoch.
                 // Batched prefill returns only independent host logit rows;
                 // all combined device intermediates drain before it returns.
-                // Reserve two complete maximum-sized group working sets.
+                // Static cohorts retain two complete maximum-sized working
+                // sets. CUDA epochs use the per-item plan below, growing for
+                // admitted pages while preserving both queued working sets.
                 var two_sets = try product(&.{ working_scratch, 2, self.max_prefill_batch_items });
                 if (self.packed_mixed) {
                     if (working_rows == 0) return error.ResourceLimitExceeded;
@@ -104,6 +107,10 @@ pub fn CohortMemory(comptime Hooks: type) type {
                     two_sets = std.math.divCeil(usize, try product(&.{ two_sets, rows }), working_rows) catch return error.ResourceLimitExceeded;
                 }
                 const batch_head = try product(&.{ self.decoder_rows, logits });
+                const per_item = std.math.divCeil(usize, two_sets, self.max_prefill_batch_items) catch return error.ResourceLimitExceeded;
+                self.decoder_workspace.per_item = @max(self.decoder_workspace.per_item, per_item);
+                self.decoder_workspace.head = @max(self.decoder_workspace.head, batch_head);
+                self.decoder_workspace.max_items = self.max_prefill_batch_items;
                 const target = std.math.add(usize, two_sets, batch_head) catch return error.ResourceLimitExceeded;
                 const envelope = std.math.ceilPowerOfTwo(usize, @max(target, 1)) catch return error.ResourceLimitExceeded;
                 self.decoder_backend_peak = @max(self.decoder_backend_peak, envelope);

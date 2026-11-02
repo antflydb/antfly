@@ -243,6 +243,7 @@ pub fn addEnrichmentToTableIndexesJson(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidExtensionEnrichment;
+    const replaced_inline = @import("enrichment_catalog_update.zig").replaceInline(root, enrichment_name, config.value);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -268,7 +269,7 @@ pub fn addEnrichmentToTableIndexesJson(
         try appendJsonValue(alloc, &out, entry.value_ptr.*);
     }
 
-    if (!wrote_enrichments) {
+    if (!wrote_enrichments and replaced_inline == 0) {
         if (!first) try out.append(alloc, ',');
         try appendJsonString(alloc, &out, "enrichments");
         try out.appendSlice(alloc, ":[");
@@ -8112,6 +8113,21 @@ fn consumerTests() type {
             defer std.testing.allocator.free(removed);
             try std.testing.expect(std.mem.indexOf(u8, removed, "\"memory_embed\"") == null);
             try std.testing.expect(std.mem.indexOf(u8, removed, "\"default\"") != null);
+        }
+
+        test "artifact replacement repairs obsolete inline extraction without dropping its index" {
+            const alloc = std.testing.allocator;
+            const original =
+                \\{"document_text":{"type":"full_text","sources":[{"artifact":"chunks"}],"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr_fallback\":true}}"},{"name":"chunks","kind":"chunk","field":"text","source_artifact_name":"units","chunk_size":512}]}}
+            ;
+            const repaired = try addEnrichmentToTableIndexesJson(alloc, original, "units",
+                \\{"name":"units","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}
+            );
+            defer alloc.free(repaired);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, repaired);
+            try std.testing.expect(std.mem.indexOf(u8, repaired, "ocr_fallback") == null);
+            try std.testing.expect(std.mem.indexOf(u8, repaired, "chunks") != null);
+            try std.testing.expect(std.mem.indexOf(u8, repaired, "document_text") != null);
         }
 
         test "index metadata validates artifact enrichment graph" {
