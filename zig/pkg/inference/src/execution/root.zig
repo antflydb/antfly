@@ -29,3 +29,6 @@ pub const prepareAnalyzedGraph = @import("executable.zig").prepareAnalyzedGraph;
 pub const model_candidate = @import("model_candidate.zig");
 pub const ModelCandidate = model_candidate.Candidate;
 pub const transfer_audit = @import("transfer_audit.zig");
+
+pub const decoder_forward = @import("decoder_forward.zig");
+pub const decoder_storage = @import("decoder_storage.zig");

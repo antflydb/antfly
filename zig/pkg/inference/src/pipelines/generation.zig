@@ -19,6 +19,8 @@
 // forward pass. The pipeline runs gpt_arch.forward() to get logits, samples the next token,
 // and loops until EOS or max_tokens. Matches Go inference's TextGenerationPipeline.
 
+const decoder_storage = @import("../execution/decoder_storage.zig");
+const decoder_forward = @import("../execution/decoder_forward.zig");
 const std = @import("std");
 const native_kv_checkpoint = @import("../runtime/kv/attention_match_checkpoint.zig");
 const Gemma4Projection = @import("gemma4_channels.zig").Projection;
@@ -589,20 +591,9 @@ pub fn metalSplitSwaRingEligible(
         backends.metal_kv_storage.KeyFormat.fromKvDType(kv_dtype) != null;
 }
 
-pub const GenerationKvRoute = enum {
-    standard,
-    metal_whole_model,
-};
+pub const GenerationKvRoute = decoder_storage.Route;
 
-fn generationKvCapacityPolicy(
-    route: GenerationKvRoute,
-    split_swa_ring_eligible: bool,
-) runtime.tier.memory.GenerationKvCapacityPolicy {
-    return if (route == .metal_whole_model and split_swa_ring_eligible)
-        .split_swa_ring
-    else
-        .full_history;
-}
+const generationKvCapacityPolicy = decoder_storage.capacityPolicy;
 
 /// Resolves the KV geometry that both request admission and execution must use.
 /// Keeping this decision route-scoped prevents a caller from budgeting a
@@ -626,36 +617,19 @@ pub fn kvPoolConfig(
     config: gpt_mod.Config,
     force_sliding_trim: bool,
 ) runtime.kv.pool.KvPoolConfig {
-    return .{
-        .backend = backend,
-        .dtype = dtype,
-        .page_size_tokens = 16,
-        .num_layers_packed = @intCast(config.kvStorageLayerCount()),
-        .num_kv_heads = config.maxKvHeads(),
-        .head_dim = config.maxHeadDim(),
-        .sliding_window_size = config.kvPoolSlidingWindowSize(force_sliding_trim),
-    };
+    return decoder_storage.poolPlan(backend, dtype, &config, .{ .force_sliding_trim = force_sliding_trim });
 }
 
 /// CUDA logical owners do not need host KV mirrors when their numerical
 /// storage uses a device hook. This applies to request managers and both
 /// shared reader-epoch pools. Shared prompt-cache pools retain their ownership.
-pub fn requestKvManagerPoolConfig(storage_config: runtime.kv.pool.KvPoolConfig) runtime.kv.pool.KvPoolConfig {
-    var config = storage_config;
-    if (config.backend == .cuda) config.store_cpu_bytes = false;
-    return config;
-}
+pub const requestKvManagerPoolConfig = decoder_storage.requestMetadataPool;
 
 /// Native checkpoint preparation and restore keep numerical KV on the device.
 /// Both request pools track only the original logical positions. Preparation
 /// snapshots through the CUDA reader; host mirrors are unnecessary on this
 /// route, and trimming logical positions would violate the checkpoint contract.
-pub fn attentionMatchCheckpointPoolConfig(dtype: runtime.kv.pool.KvDType, config: gpt_mod.Config) runtime.kv.pool.KvPoolConfig {
-    var result = kvPoolConfig(.cuda, dtype, config, false);
-    result.store_cpu_bytes = false;
-    result.sliding_window_size = null;
-    return result;
-}
+pub const attentionMatchCheckpointPoolConfig = decoder_storage.checkpointPool;
 
 /// Parsed chat template for rendering messages via Jinja2.
 pub const ChatTemplate = struct {
@@ -1666,13 +1640,9 @@ fn enableCudaGatedTokenTensorDecode() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GATED_TOKEN_TENSOR_DECODE", false);
 }
 
-fn metalFinalHiddenFrameOwnsResidentPrefix(retained_prefix_tokens: usize) bool {
-    return retained_prefix_tokens == 0;
-}
+const metalFinalHiddenFrameOwnsResidentPrefix = decoder_forward.metalFinalHiddenFrameOwnsResidentPrefix;
 
-fn cudaReplayLastLogitsEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS", true);
-}
+const cudaReplayLastLogitsEnabled = decoder_forward.cudaReplayLastLogitsEnabled;
 
 // Promoted default: pending-token readback overlaps the previous token's D2H
 // copy with the next decode step. Exact-output; still guarded by
@@ -1731,9 +1701,7 @@ fn enableGemma4MtpDebug() bool {
     return gemma4_mtp_debug_override or getenvBool("ANTFLY_GEMMA4_MTP_DEBUG") or getenvBool("TERMITE_DEBUG_GEMMA4_MTP");
 }
 
-fn enableGemma4MtpVerifyTrace() bool {
-    return getenvBool("ANTFLY_GEMMA4_MTP_VERIFY_TRACE");
-}
+const enableGemma4MtpVerifyTrace = decoder_forward.hiddenRowsTraceEnabled;
 
 const Gemma4MtpPositionMode = enum {
     target_absolute,
@@ -1749,17 +1717,7 @@ const Gemma4MtpPositionMode = enum {
     }
 };
 
-const Gemma4MtpTargetHiddenSource = enum {
-    final,
-    pre_norm,
-
-    pub fn name(self: Gemma4MtpTargetHiddenSource) []const u8 {
-        return switch (self) {
-            .final => "final",
-            .pre_norm => "pre_norm",
-        };
-    }
-};
+const Gemma4MtpTargetHiddenSource = decoder_forward.HiddenSource;
 
 fn parseGemma4MtpPositionMode(raw: ?[]const u8) Gemma4MtpPositionMode {
     const value = raw orelse return .target_constant;
@@ -2200,9 +2158,7 @@ pub fn gemma4MtpAutoMinGenerationTokens() usize {
     return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_MIN_TOKENS") orelse 128;
 }
 
-fn gemma4MtpUnsafeTargetReplayEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_UNSAFE_TARGET_REPLAY", false);
-}
+const gemma4MtpUnsafeTargetReplayEnabled = decoder_forward.unsafeTargetReplayEnabled;
 
 pub fn gemma4MtpTargetReplayLikelyActive() bool {
     if (!gemma4MtpUnsafeTargetReplayEnabled()) return false;
@@ -2300,19 +2256,9 @@ fn gemma4MtpProfileSyncEnabled() bool {
     return platform.env.getenvBool("ANTFLY_GEMMA4_MTP_PROFILE_SYNC");
 }
 
-fn mtpProfileTimestamp(enabled: bool, io_opt: ?std.Io) std.Io.Timestamp {
-    if (!enabled) return std.Io.Timestamp.zero;
-    return if (io_opt) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-}
+const mtpProfileTimestamp = decoder_forward.profileTimestamp;
 
-fn mtpProfileElapsedNs(enabled: bool, io_opt: ?std.Io, started_at: std.Io.Timestamp) u64 {
-    if (!enabled) return 0;
-    if (std.meta.eql(started_at, std.Io.Timestamp.zero)) return 0;
-    const finished_at = if (io_opt) |io| std.Io.Timestamp.now(io, .awake) else return 0;
-    const elapsed = started_at.durationTo(finished_at).nanoseconds;
-    if (elapsed <= 0) return 0;
-    return @intCast(elapsed);
-}
+const mtpProfileElapsedNs = decoder_forward.profileElapsedNs;
 
 fn accumulateMtpDraftStageProfile(profile: *MtpProfileStats, stage: gemma4_mtp.DraftStageProfile) void {
     if (!profile.enabled) return;
@@ -2385,23 +2331,7 @@ fn compiledSampleRequestEligible(
         !has_suppress_token_ids;
 }
 
-fn metalCompiledSampledDecodeDefaultEligible(cfg: gpt_mod.Config) bool {
-    // Default promotion covers Gemma4 E2B. Other model geometries retain their
-    // explicit opt-in, and the exact sampling contract is checked separately.
-    return cfg.family == .gemma and cfg.gemma4_channel_protocol and
-        !cfg.gemma4_mtp_assistant and cfg.hidden_size == 1536 and
-        cfg.num_hidden_layers == 35 and cfg.num_attention_heads == 8 and
-        cfg.num_key_value_heads == 1 and cfg.attention_head_dim == 256 and
-        cfg.global_head_dim == 512 and cfg.sliding_window == 512 and
-        cfg.intermediate_size == 6144 and cfg.num_kv_shared_layers == 20;
-}
-
-fn metalCompiledSampledDecodeEnabled(cfg: gpt_mod.Config) bool {
-    return metal_runtime.appleSimdgroupFeatureEnabled(
-        "ANTFLY_INFERENCE_METAL_RESIDENT_NUCLEUS",
-        metalCompiledSampledDecodeDefaultEligible(cfg),
-    );
-}
+const metalCompiledSampledDecodeDefaultEligible = decoder_forward.compiledSampledDecodeDefaultEligible;
 
 test "compiled sampled decode defaults only to qualified Gemma4 E2B geometry" {
     const e2b: gpt_mod.Config = .{
@@ -8349,44 +8279,8 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) ![]f32 {
-        const query_seq_len = decode_context.query_sequence_len;
-        try self.rejectUnsupportedDeepSeekV4GraphMode();
-        if (self.graph_cache) |cache| {
-            return self.graphForward(cache, input_ids, batch, seq_len, decode_context);
-        }
-        if (self.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
-
-        // CUDA fast path: route the layer stack through the decoder-runtime
-        // forward (graph-replay capable, fused kernels, paged attention).
-        // This is what keeps sampled (non-greedy) decoding near greedy
-        // throughput; the interpreter below runs one op at a time with heavy
-        // per-op host overhead. Escape hatch:
-        // ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS=0.
-        if (self.cb.kind() == .cuda and cudaReplayLastLogitsEnabled()) {
-            if (gpt_arch.forwardLastLogitsWithCudaReplay(
-                &self.cb,
-                self.allocator,
-                self.gpt_config,
-                input_ids,
-                batch,
-                seq_len,
-                decode_context,
-                "gpt.standard_last_logits",
-            )) |logits| {
-                return logits;
-            } else |err| {
-                decoder_runtime_debug_stats.replay_last_logits_fallbacks += 1;
-                debugGenerationStage(
-                    "forwardLastLogits replay path failed err={s}; falling back to interpreter",
-                    .{@errorName(err)},
-                );
-            }
-        }
-
-        const logits = try gpt_arch.forward(&self.cb, self.allocator, self.gpt_config, input_ids, batch, seq_len, decode_context);
-        defer self.allocator.free(logits);
-        const last_pos_offset = (query_seq_len - 1) * @as(usize, @intCast(self.gpt_config.vocab_size));
-        return try self.allocator.dupe(f32, logits[last_pos_offset..][0..@intCast(self.gpt_config.vocab_size)]);
+        var decoder = self.physicalDecoder();
+        return decoder.forwardLastLogits(input_ids, batch, seq_len, decode_context);
     }
 
     fn forwardGreedyCompiledModelToken(
@@ -8401,21 +8295,8 @@ pub const NativeGenerationPipeline = struct {
         if (config.kv_cache_mode == .select_v1) return null;
         if (!isPureGreedyConfig(config)) return null;
         if (has_grammar or config.grammar != null) return null;
-        try self.rejectUnsupportedDeepSeekV4GraphMode();
-        const cache = self.graph_cache orelse return null;
-        if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return null;
-
-        const token_id = (try graph_mod.execution.graphForwardCompiledModelGreedyToken(
-            &self.graphExecutionContext(),
-            cache,
-            input_ids,
-            batch,
-            seq_len,
-            decode_context,
-            self.gpt_config.vocab_size,
-        )) orelse return null;
-        if (token_id < 0) return error.InvalidModelOutput;
-        return @intCast(token_id);
+        var decoder = self.physicalDecoder();
+        return decoder.forwardCompiledGreedy(input_ids, batch, seq_len, decode_context);
     }
 
     fn forwardSampledCompiledModelToken(
@@ -8427,112 +8308,36 @@ pub const NativeGenerationPipeline = struct {
         token_history: []const i64,
         has_grammar: bool,
     ) !?usize {
-        if (config.kv_cache_mode == .select_v1) return null;
-        // Greedy requests do not need a sampling feature lookup per token.
-        if (isPureGreedyConfig(config)) return null;
-        if (self.cb.kind() != .metal) return null;
-        if (!metalCompiledSampledDecodeEnabled(self.gpt_config)) return null;
-        // Grammar and static model suppression are not represented by the
-        // resident sampler contract. Decline before submission so the
-        // canonical one-logits-frame host path applies them exactly.
-        if (!compiledSampleRequestEligible(
-            config,
-            has_grammar,
-            self.gpt_config.suppressTokenIds().len != 0,
-        )) return null;
-        try self.rejectUnsupportedDeepSeekV4GraphMode();
-        const cache = self.graph_cache orelse return null;
-        if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return null;
-        if (input_ids.len != 1 or decode_context.attention_mode != .paged_decode) return null;
-
-        const token_id = (try graph_mod.execution.graphForwardCompiledModelSampledToken(
-            &self.graphExecutionContext(),
-            cache,
-            .{
-                .decode = .{
-                    .execution_control = self.execution_control,
-                    .token_id = input_ids[0],
-                    .position = seq_len - 1,
-                    .attention_mode = .paged_decode,
-                },
-                .sampling = .{
-                    .temperature = config.temperature,
-                    .top_p = config.top_p,
-                    .top_k = config.top_k,
-                    .min_p = config.min_p,
-                    .repetition_penalty = config.repetition_penalty,
-                    .frequency_penalty = config.frequency_penalty,
-                    .presence_penalty = config.presence_penalty,
-                },
-                .token_history = token_history,
-            },
-        )) orelse return null;
-        if (token_id < 0) return error.InvalidModelOutput;
-        return @intCast(token_id);
+        if (config.kv_cache_mode == .select_v1 or isPureGreedyConfig(config)) return null;
+        var decoder = self.physicalDecoder();
+        return decoder.forwardCompiledSampled(input_ids, seq_len, decode_context, .{
+            .temperature = config.temperature,
+            .top_p = config.top_p,
+            .top_k = config.top_k,
+            .min_p = config.min_p,
+            .repetition_penalty = config.repetition_penalty,
+            .frequency_penalty = config.frequency_penalty,
+            .presence_penalty = config.presence_penalty,
+        }, token_history, compiledSampleRequestEligible(config, has_grammar, self.gpt_config.suppressTokenIds().len != 0));
     }
 
     fn prepareCompiledGenerationRuntime(
         self: *NativeGenerationPipeline,
         kv_tokens_hint: usize,
     ) !bool {
-        const cache = self.graph_cache orelse return false;
-        try self.rejectUnsupportedDeepSeekV4GraphMode();
-        if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return false;
-        // ponytail: Metal prefill prepares lazily; eager prepare is only a warmup and can be skipped.
-        if (self.compiled_partition_backend == .metal) return false;
-        return graph_mod.execution.prepareCompiledModelRuntime(&self.graphExecutionContext(), cache, kv_tokens_hint);
+        var decoder = self.physicalDecoder();
+        return decoder.prepareCompiledGenerationRuntime(kv_tokens_hint);
     }
 
     fn forwardAllLogits(self: *NativeGenerationPipeline, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
         return graph_mod.decoder_step_executor.forwardAll(&self.graphExecutionContext(), self.graph_cache, input_ids, batch, seq_len, decode_context, &decoder_runtime_debug_stats.replay_last_logits_fallbacks);
     }
 
-    const ForwardAllWithHiddenHost = struct {
-        allocator: std.mem.Allocator,
-        logits: []f32,
-        hidden: []f32,
-        pre_norm_hidden: []f32,
-        rows: usize,
+    const ForwardAllWithHiddenHost = decoder_forward.ForwardAllWithHiddenHost;
 
-        pub fn deinit(self: *ForwardAllWithHiddenHost) void {
-            self.allocator.free(self.logits);
-            self.allocator.free(self.hidden);
-            self.allocator.free(self.pre_norm_hidden);
-            self.* = undefined;
-        }
-    };
+    const ForwardAllWithHiddenDevice = decoder_forward.ForwardAllWithHiddenDevice;
 
-    const ForwardAllWithHiddenDevice = struct {
-        cb: *const ComputeBackend,
-        logits: ops.CT,
-        hidden: ops.CT,
-        pre_norm_hidden: ops.CT,
-        rows: usize,
-
-        pub fn deinit(self: *ForwardAllWithHiddenDevice) void {
-            self.cb.free(self.logits);
-            self.cb.free(self.hidden);
-            self.cb.free(self.pre_norm_hidden);
-            self.* = undefined;
-        }
-    };
-
-    const ForwardHiddenDevice = struct {
-        cb: *const ComputeBackend,
-        hidden: ops.CT,
-        pre_norm_hidden: ?ops.CT,
-        rows: usize,
-        greedy_token_id: ?u32 = null,
-        prepared_tail_choices: ?[]u32 = null,
-        choices_allocator: ?std.mem.Allocator = null,
-
-        pub fn deinit(self: *ForwardHiddenDevice) void {
-            self.cb.free(self.hidden);
-            if (self.pre_norm_hidden) |pre_norm| self.cb.free(pre_norm);
-            if (self.prepared_tail_choices) |choices| self.choices_allocator.?.free(choices);
-            self.* = undefined;
-        }
-    };
+    const ForwardHiddenDevice = decoder_forward.ForwardHiddenDevice;
 
     const Gemma4MtpActivationState = struct {
         const DraftEmbeddingCacheEntry = struct {
@@ -8759,62 +8564,8 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) !ForwardAllWithHiddenHost {
-        try self.rejectUnsupportedDeepSeekV4GraphMode();
-        if (self.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
-        const allocator = self.allocator;
-        const query_seq_len = decode_context.query_sequence_len;
-        const total = batch * query_seq_len;
-        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
-        if (input_ids.len != total) return error.InvalidTensorShape;
-
-        const embed_w = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
-        defer self.cb.free(embed_w);
-        const embedded = try self.cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
-        const hidden_input = try gpt_arch.maybeScaleTokenEmbeddings(&self.cb, allocator, self.gpt_config, embedded, total, hidden_size);
-
-        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, allocator, self.gpt_config, input_ids, hidden_input, total);
-        defer if (ple_vectors) |pv| self.cb.free(pv);
-
-        const hidden_result = try gpt_arch.forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0Overrides(
-            &self.cb,
-            allocator,
-            self.gpt_config,
-            hidden_input,
-            .{},
-            batch,
-            seq_len,
-            decode_context,
-            ple_vectors,
-        );
-        defer self.cb.free(hidden_result.final_hidden);
-        defer self.cb.free(hidden_result.pre_norm_hidden);
-
-        const lm_w = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
-        defer self.cb.free(lm_w);
-
-        const logits_ct = try self.cb.linearNoBias(
-            hidden_result.final_hidden,
-            lm_w,
-            hidden_result.total_rows,
-            self.gpt_config.hidden_size,
-            self.gpt_config.vocab_size,
-        );
-        defer self.cb.free(logits_ct);
-
-        const logits_host = try self.cb.toFloat32(logits_ct, allocator);
-        gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, logits_host);
-        errdefer allocator.free(logits_host);
-        const hidden_host = try self.cb.toFloat32(hidden_result.final_hidden, allocator);
-        errdefer allocator.free(hidden_host);
-        const pre_norm_hidden_host = try self.cb.toFloat32(hidden_result.pre_norm_hidden, allocator);
-        errdefer allocator.free(pre_norm_hidden_host);
-        return .{
-            .allocator = allocator,
-            .logits = logits_host,
-            .hidden = hidden_host,
-            .pre_norm_hidden = pre_norm_hidden_host,
-            .rows = hidden_result.total_rows,
-        };
+        var decoder = self.physicalDecoder();
+        return decoder.forwardAllLogitsAndHiddenHost(input_ids, batch, seq_len, decode_context);
     }
 
     fn forwardHiddenDevice(
@@ -8824,42 +8575,8 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) !ForwardHiddenDevice {
-        try self.rejectUnsupportedDeepSeekV4GraphMode();
-        if (self.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
-        const allocator = self.allocator;
-        const query_seq_len = decode_context.query_sequence_len;
-        const total = batch * query_seq_len;
-        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
-        if (input_ids.len != total) return error.InvalidTensorShape;
-
-        const embed_w = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
-        defer self.cb.free(embed_w);
-        const embedded = try self.cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
-        const hidden_input = try gpt_arch.maybeScaleTokenEmbeddings(&self.cb, allocator, self.gpt_config, embedded, total, hidden_size);
-
-        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, allocator, self.gpt_config, input_ids, hidden_input, total);
-        defer if (ple_vectors) |pv| self.cb.free(pv);
-
-        const hidden_result = try gpt_arch.forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0Overrides(
-            &self.cb,
-            allocator,
-            self.gpt_config,
-            hidden_input,
-            .{},
-            batch,
-            seq_len,
-            decode_context,
-            ple_vectors,
-        );
-        errdefer self.cb.free(hidden_result.final_hidden);
-        errdefer self.cb.free(hidden_result.pre_norm_hidden);
-
-        return .{
-            .cb = &self.cb,
-            .hidden = hidden_result.final_hidden,
-            .pre_norm_hidden = hidden_result.pre_norm_hidden,
-            .rows = hidden_result.total_rows,
-        };
+        var decoder = self.physicalDecoder();
+        return decoder.forwardHiddenDevice(input_ids, batch, seq_len, decode_context);
     }
 
     fn tryMetalGemmaFinalHiddenFrame(
@@ -8870,76 +8587,8 @@ pub const NativeGenerationPipeline = struct {
         retained_prefix_tokens: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) !?ForwardHiddenDevice {
-        if (self.compiled_partition_backend != null or
-            self.cb.kind() != .metal or
-            self.gpt_config.family != .gemma or
-            self.gpt_config.usesMoe() or
-            !self.gpt_config.hasPle() or
-            batch != 1 or
-            input_ids.len == 0 or
-            // Prompt-cache hits attach retained host blocks to a fresh
-            // sequence. Until those rows have been materialized into the new
-            // Metal slot, the direct frame may only own uncached prefixes.
-            !metalFinalHiddenFrameOwnsResidentPrefix(retained_prefix_tokens) or
-            decode_context.attention_mode != .paged_prefill or
-            decode_context.query_sequence_len != input_ids.len)
-        {
-            return null;
-        }
-
-        const Attempt = struct {
-            pipeline: *NativeGenerationPipeline,
-            input_ids: []const i64,
-            seq_len: usize,
-            decode_context: *const gpt_arch.DecodeContext,
-            result: ?ForwardHiddenDevice = null,
-
-            fn run(context: *anyopaque) !bool {
-                const attempt: *@This() = @ptrCast(@alignCast(context));
-                const pipeline = attempt.pipeline;
-                const prepared = try pipeline.cb.decoderRuntimePrepareOrReuseFamily(
-                    pipeline.allocator,
-                    pipeline.gpt_config,
-                    attempt.decode_context.kv_sequence_len,
-                    pipeline.gpt_config.num_hidden_layers,
-                );
-                if (!prepared.prepared) return false;
-
-                const direct = (try decoder_gated_runtime.forwardFinalHiddenRows(
-                    &pipeline.cb,
-                    pipeline.allocator,
-                    pipeline.gpt_config,
-                    pipeline.gpt_config.num_hidden_layers,
-                    attempt.input_ids,
-                    attempt.seq_len,
-                    attempt.decode_context,
-                )) orelse return false;
-                attempt.result = .{
-                    .cb = &pipeline.cb,
-                    .hidden = direct.final_hidden,
-                    .pre_norm_hidden = null,
-                    .rows = direct.rows,
-                    .prepared_tail_choices = direct.prepared_tail_choices,
-                    .choices_allocator = direct.choices_allocator,
-                };
-                return true;
-            }
-        };
-
-        var attempt = Attempt{
-            .pipeline = self,
-            .input_ids = input_ids,
-            .seq_len = seq_len,
-            .decode_context = decode_context,
-        };
-        errdefer if (attempt.result) |result_value| {
-            var result = result_value;
-            result.deinit();
-        };
-        if (!try runWithDecoderRuntimeResetBoundary(&self.cb, @ptrCast(&attempt), Attempt.run)) return null;
-        const result = attempt.result orelse return null;
-        attempt.result = null;
-        return result;
+        var decoder = self.physicalDecoder();
+        return decoder.tryMetalFinalHiddenFrame(input_ids, batch, seq_len, retained_prefix_tokens, decode_context);
     }
 
     fn forwardFinalHiddenDevice(
@@ -8950,8 +8599,8 @@ pub const NativeGenerationPipeline = struct {
         retained_prefix_tokens: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) !ForwardHiddenDevice {
-        return (try self.tryMetalGemmaFinalHiddenFrame(input_ids, batch, seq_len, retained_prefix_tokens, decode_context)) orelse
-            self.forwardHiddenDevice(input_ids, batch, seq_len, decode_context);
+        var decoder = self.physicalDecoder();
+        return decoder.forwardFinalHiddenDevice(input_ids, batch, seq_len, retained_prefix_tokens, decode_context);
     }
 
     fn forwardMtpTargetHiddenDevice(
@@ -8963,16 +8612,8 @@ pub const NativeGenerationPipeline = struct {
         hidden_source: Gemma4MtpTargetHiddenSource,
         replay_label: []const u8,
     ) !ForwardHiddenDevice {
-        return self.forwardMtpTargetHiddenDeviceReplayMode(
-            input_ids,
-            batch,
-            seq_len,
-            decode_context,
-            hidden_source,
-            replay_label,
-            gemma4MtpUnsafeTargetReplayEnabled(),
-            null,
-        );
+        var decoder = self.physicalDecoder();
+        return decoder.forwardTargetHiddenDevice(input_ids, batch, seq_len, decode_context, hidden_source, replay_label);
     }
 
     fn forwardMtpTargetHiddenDevicePreparedArgmax(
@@ -8985,16 +8626,8 @@ pub const NativeGenerationPipeline = struct {
         replay_label: []const u8,
         suppress_token_ids: []const i32,
     ) !ForwardHiddenDevice {
-        return self.forwardMtpTargetHiddenDeviceReplayMode(
-            input_ids,
-            batch,
-            seq_len,
-            decode_context,
-            hidden_source,
-            replay_label,
-            gemma4MtpUnsafeTargetReplayEnabled(),
-            suppress_token_ids,
-        );
+        var decoder = self.physicalDecoder();
+        return decoder.forwardTargetHiddenDevicePreparedArgmax(input_ids, batch, seq_len, decode_context, hidden_source, replay_label, suppress_token_ids);
     }
 
     fn forwardMtpTargetHiddenDeviceNoReplay(
@@ -9005,16 +8638,8 @@ pub const NativeGenerationPipeline = struct {
         decode_context: *const gpt_arch.DecodeContext,
         hidden_source: Gemma4MtpTargetHiddenSource,
     ) !ForwardHiddenDevice {
-        return self.forwardMtpTargetHiddenDeviceReplayMode(
-            input_ids,
-            batch,
-            seq_len,
-            decode_context,
-            hidden_source,
-            "",
-            false,
-            null,
-        );
+        var decoder = self.physicalDecoder();
+        return decoder.forwardTargetHiddenDeviceNoReplay(input_ids, batch, seq_len, decode_context, hidden_source);
     }
 
     fn forwardMtpTargetHiddenDeviceReplayMode(
@@ -9028,114 +8653,8 @@ pub const NativeGenerationPipeline = struct {
         allow_replay: bool,
         prepared_tail_suppress_token_ids: ?[]const i32,
     ) !ForwardHiddenDevice {
-        if (hidden_source != .final) {
-            return self.forwardHiddenDevice(input_ids, batch, seq_len, decode_context);
-        }
-        try self.rejectUnsupportedDeepSeekV4GraphMode();
-        if (self.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
-        const allocator = self.allocator;
-        const query_seq_len = decode_context.query_sequence_len;
-        const total = batch * query_seq_len;
-        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
-        if (input_ids.len != total) return error.InvalidTensorShape;
-
-        if (self.cb.kind() == .metal) {
-            const verify_trace = enableGemma4MtpVerifyTrace();
-            const trace_stats_before = if (verify_trace) decoder_gated_runtime.getTimingStats() else undefined;
-            const trace_started_at = mtpProfileTimestamp(verify_trace, self.io);
-            const direct_result = if (prepared_tail_suppress_token_ids) |suppress_token_ids|
-                try decoder_gated_runtime.forwardFinalHiddenRowsPreparedArgmax(
-                    &self.cb,
-                    allocator,
-                    self.gpt_config,
-                    self.gpt_config.num_hidden_layers,
-                    input_ids,
-                    seq_len,
-                    decode_context,
-                    suppress_token_ids,
-                )
-            else
-                try decoder_gated_runtime.forwardFinalHiddenRows(
-                    &self.cb,
-                    allocator,
-                    self.gpt_config,
-                    self.gpt_config.num_hidden_layers,
-                    input_ids,
-                    seq_len,
-                    decode_context,
-                );
-            if (direct_result) |direct| {
-                if (verify_trace) {
-                    const wall_ns = mtpProfileElapsedNs(true, self.io, trace_started_at);
-                    const after = decoder_gated_runtime.getTimingStats();
-                    std.debug.print(
-                        "mtp-verify-trace: rows={d} wall_us={d} embed_us={d} ple_us={d} frame_begin_us={d} layer_spec_us={d} plan_us={d} execute_us={d} block_us={d} finish_us={d}\n",
-                        .{
-                            direct.rows,
-                            @divTrunc(wall_ns, std.time.ns_per_us),
-                            @as(u64, @intCast(@divTrunc(after.prefill_embed_nanos - trace_stats_before.prefill_embed_nanos, std.time.ns_per_us))),
-                            @as(u64, @intCast(@divTrunc(after.prefill_ple_prepare_nanos - trace_stats_before.prefill_ple_prepare_nanos, std.time.ns_per_us))),
-                            @as(u64, @intCast(@divTrunc(after.prefill_frame_begin_nanos - trace_stats_before.prefill_frame_begin_nanos, std.time.ns_per_us))),
-                            @as(u64, @intCast(@divTrunc(after.prefill_frame_layer_spec_nanos - trace_stats_before.prefill_frame_layer_spec_nanos, std.time.ns_per_us))),
-                            @as(u64, @intCast(@divTrunc(after.prefill_frame_plan_nanos - trace_stats_before.prefill_frame_plan_nanos, std.time.ns_per_us))),
-                            @as(u64, @intCast(@divTrunc(after.prefill_frame_execute_nanos - trace_stats_before.prefill_frame_execute_nanos, std.time.ns_per_us))),
-                            @as(u64, @intCast(@divTrunc(after.prefill_block_nanos - trace_stats_before.prefill_block_nanos, std.time.ns_per_us))),
-                            @as(u64, @intCast(@divTrunc(after.prefill_frame_finish_nanos - trace_stats_before.prefill_frame_finish_nanos, std.time.ns_per_us))),
-                        },
-                    );
-                }
-                return .{
-                    .cb = &self.cb,
-                    .hidden = direct.final_hidden,
-                    .pre_norm_hidden = null,
-                    .rows = direct.rows,
-                    .prepared_tail_choices = direct.prepared_tail_choices,
-                    .choices_allocator = direct.choices_allocator,
-                };
-            }
-        }
-
-        const embed_w = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
-        defer self.cb.free(embed_w);
-        const embedded = try self.cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
-        const hidden_input = try gpt_arch.maybeScaleTokenEmbeddings(&self.cb, allocator, self.gpt_config, embedded, total, hidden_size);
-
-        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, allocator, self.gpt_config, input_ids, hidden_input, total);
-        defer if (ple_vectors) |pv| self.cb.free(pv);
-
-        const hidden_result = if (allow_replay)
-            try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
-                &self.cb,
-                allocator,
-                self.gpt_config,
-                hidden_input,
-                .{},
-                batch,
-                seq_len,
-                decode_context,
-                ple_vectors,
-                replay_label,
-            )
-        else
-            try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
-                &self.cb,
-                allocator,
-                self.gpt_config,
-                hidden_input,
-                .{},
-                batch,
-                seq_len,
-                decode_context,
-                ple_vectors,
-            );
-        errdefer self.cb.free(hidden_result.hidden);
-
-        return .{
-            .cb = &self.cb,
-            .hidden = hidden_result.hidden,
-            .pre_norm_hidden = null,
-            .rows = hidden_result.total_rows,
-        };
+        var decoder = self.physicalDecoder();
+        return decoder.forwardTargetHiddenDeviceReplayMode(input_ids, batch, seq_len, decode_context, hidden_source, replay_label, allow_replay, prepared_tail_suppress_token_ids);
     }
 
     fn forwardAllLogitsAndHiddenDevice(
@@ -9145,55 +8664,8 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) !ForwardAllWithHiddenDevice {
-        try self.rejectUnsupportedDeepSeekV4GraphMode();
-        if (self.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
-        const allocator = self.allocator;
-        const query_seq_len = decode_context.query_sequence_len;
-        const total = batch * query_seq_len;
-        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
-        if (input_ids.len != total) return error.InvalidTensorShape;
-
-        const embed_w = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
-        defer self.cb.free(embed_w);
-        const embedded = try self.cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
-        const hidden_input = try gpt_arch.maybeScaleTokenEmbeddings(&self.cb, allocator, self.gpt_config, embedded, total, hidden_size);
-
-        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, allocator, self.gpt_config, input_ids, hidden_input, total);
-        defer if (ple_vectors) |pv| self.cb.free(pv);
-
-        const hidden_result = try gpt_arch.forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0Overrides(
-            &self.cb,
-            allocator,
-            self.gpt_config,
-            hidden_input,
-            .{},
-            batch,
-            seq_len,
-            decode_context,
-            ple_vectors,
-        );
-        errdefer self.cb.free(hidden_result.final_hidden);
-        errdefer self.cb.free(hidden_result.pre_norm_hidden);
-
-        const lm_w = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
-        defer self.cb.free(lm_w);
-
-        const logits_ct = try self.cb.linearNoBias(
-            hidden_result.final_hidden,
-            lm_w,
-            hidden_result.total_rows,
-            self.gpt_config.hidden_size,
-            self.gpt_config.vocab_size,
-        );
-        errdefer self.cb.free(logits_ct);
-
-        return .{
-            .cb = &self.cb,
-            .logits = logits_ct,
-            .hidden = hidden_result.final_hidden,
-            .pre_norm_hidden = hidden_result.pre_norm_hidden,
-            .rows = hidden_result.total_rows,
-        };
+        var decoder = self.physicalDecoder();
+        return decoder.forwardAllLogitsAndHiddenDevice(input_ids, batch, seq_len, decode_context);
     }
 
     fn dupeMtpTargetHiddenRow(
@@ -9202,14 +8674,8 @@ pub const NativeGenerationPipeline = struct {
         row: usize,
         source: Gemma4MtpTargetHiddenSource,
     ) ![]f32 {
-        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden,
-        };
-        if (hidden.len != result.rows * hidden_size) return error.InvalidTensorShape;
-        return try self.allocator.dupe(f32, hidden[row * hidden_size ..][0..hidden_size]);
+        var decoder = self.physicalDecoder();
+        return decoder.dupeTargetHiddenRow(result, row, source);
     }
 
     fn dupeMtpTargetHiddenRowFromDevice(
@@ -9218,18 +8684,8 @@ pub const NativeGenerationPipeline = struct {
         row: usize,
         source: Gemma4MtpTargetHiddenSource,
     ) ![]f32 {
-        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden,
-        };
-        const row_ct = try self.cb.sliceRows2D(self.allocator, hidden, row, 1, hidden_size);
-        defer self.cb.free(row_ct);
-        const row_host = try self.cb.toFloat32(row_ct, self.allocator);
-        errdefer self.allocator.free(row_host);
-        if (row_host.len != hidden_size) return error.InvalidTensorShape;
-        return row_host;
+        var decoder = self.physicalDecoder();
+        return decoder.dupeTargetHiddenRowFromDevice(result, row, source);
     }
 
     fn dupeMtpTargetHiddenRowFromHiddenDevice(
@@ -9238,18 +8694,8 @@ pub const NativeGenerationPipeline = struct {
         row: usize,
         source: Gemma4MtpTargetHiddenSource,
     ) ![]f32 {
-        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden orelse return error.MissingMaterializedHiddenState,
-        };
-        const row_ct = try self.cb.sliceRows2D(self.allocator, hidden, row, 1, hidden_size);
-        defer self.cb.free(row_ct);
-        const row_host = try self.cb.toFloat32(row_ct, self.allocator);
-        errdefer self.allocator.free(row_host);
-        if (row_host.len != hidden_size) return error.InvalidTensorShape;
-        return row_host;
+        var decoder = self.physicalDecoder();
+        return decoder.dupeTargetHiddenRowFromHiddenDevice(result, row, source);
     }
 
     fn copyMtpTargetHiddenRowToBackend(
@@ -9259,15 +8705,8 @@ pub const NativeGenerationPipeline = struct {
         source: Gemma4MtpTargetHiddenSource,
         dst_cb: *const ComputeBackend,
     ) !?ops.CT {
-        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden,
-        };
-        const row_ct = try self.cb.sliceRows2D(self.allocator, hidden, row, 1, hidden_size);
-        defer self.cb.free(row_ct);
-        return try dst_cb.copyTensorFromBackend(&self.cb, row_ct);
+        var decoder = self.physicalDecoder();
+        return decoder.copyTargetHiddenRowToBackend(result, row, source, dst_cb);
     }
 
     fn copyMtpTargetHiddenRowFromHiddenToBackend(
@@ -9277,15 +8716,8 @@ pub const NativeGenerationPipeline = struct {
         source: Gemma4MtpTargetHiddenSource,
         dst_cb: *const ComputeBackend,
     ) !?ops.CT {
-        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden orelse return error.MissingMaterializedHiddenState,
-        };
-        const row_ct = try self.cb.sliceRows2D(self.allocator, hidden, row, 1, hidden_size);
-        defer self.cb.free(row_ct);
-        return try dst_cb.copyTensorFromBackend(&self.cb, row_ct);
+        var decoder = self.physicalDecoder();
+        return decoder.copyTargetHiddenRowFromHiddenToBackend(result, row, source, dst_cb);
     }
 
     /// Run the forward pass through the graph IR: trace once, cache the
@@ -9299,24 +8731,17 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         decode_context: *const gpt_arch.DecodeContext,
     ) ![]f32 {
-        const allocator = self.allocator;
-        if (try graph_mod.execution.graphForwardCompiledModelLast(&self.graphExecutionContext(), cache, input_ids, batch, seq_len, decode_context)) |last_logits| {
-            return last_logits;
-        }
-        if (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model) {
-            return error.MissingCompiledModelRuntime;
-        }
+        var decoder = self.physicalDecoder();
+        return decoder.graphForward(cache, input_ids, batch, seq_len, decode_context);
+    }
 
-        const logits = try graph_mod.execution.graphForwardAll(&self.graphExecutionContext(), cache, input_ids, batch, seq_len, decode_context);
-        defer allocator.free(logits);
-        const query_seq_len = decode_context.query_sequence_len;
-        const vocab_size = self.gpt_config.vocab_size;
-
-        if (query_seq_len == 0 or vocab_size == 0) return error.InvalidTensorShape;
-        const width: usize = @intCast(vocab_size);
-        const end = try std.math.mul(usize, query_seq_len, width);
-        if (end > logits.len) return error.InvalidTensorShape;
-        return allocator.dupe(f32, logits[end - width .. end]);
+    fn physicalDecoder(self: *NativeGenerationPipeline) decoder_forward.Runtime {
+        return .{
+            .context = self.graphExecutionContext(),
+            .graph_cache = self.graph_cache,
+            .io = self.io,
+            .replay_fallbacks = &decoder_runtime_debug_stats.replay_last_logits_fallbacks,
+        };
     }
 
     fn graphExecutionContext(self: *NativeGenerationPipeline) graph_mod.execution.Context {
@@ -16618,7 +16043,6 @@ test "cached compiled_partitions attaches executors and sets owns_executors fals
     var entry = graph_mod.cache.CacheEntry{
         .key = .{ .config_hash = 1, .batch = 1, .seq_len = 1, .attention_mode = .paged_decode },
         .graph = TestGraph.init(allocator), // dummy, not used by attach logic
-        .last_used = 0,
         .compiled_partitions = cps,
     };
     defer entry.graph.deinit();

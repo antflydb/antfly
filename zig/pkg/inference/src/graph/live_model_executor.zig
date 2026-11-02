@@ -23,6 +23,8 @@ const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const model_runtime = @import("model_runtime.zig");
+const decoder_forward = @import("../execution/decoder_forward.zig");
+const decoder_storage = @import("../execution/decoder_storage.zig");
 const session_decoder = @import("session_decoder.zig");
 
 /// Live whole-model executor for native sessions.
@@ -65,17 +67,13 @@ const RuntimeContext = struct {
             .wasm => return error.UnexpectedWasmBackend,
         };
         const kv_dtype = kv_dtype_override orelse session_factory.recommendedKvDTypeForSession(session, backend_kind);
-        const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(false);
 
-        const pool_id = try kv_manager.addPool(.{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        });
+        const pool_id = try kv_manager.addPool(decoder_storage.poolPlan(
+            backend_kind,
+            kv_dtype,
+            &gpt_config,
+            .{ .layer_layout = .architectural },
+        ));
 
         const ctx = try allocator.create(RuntimeContext);
         ctx.* = .{
@@ -325,19 +323,13 @@ fn forwardLastLogits(
     query_seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) ![]f32 {
-    const logits = try gpt_arch.forward(
-        &runtime_ctx.cb,
-        allocator,
-        runtime_ctx.definition.configuration.value,
-        input_ids,
-        1,
-        seq_len,
-        decode_context,
-    );
-    defer allocator.free(logits);
-    const vocab_size: usize = @intCast(runtime_ctx.definition.configuration.value.vocab_size);
-    const last_pos_offset = (query_seq_len - 1) * vocab_size;
-    return allocator.dupe(f32, logits[last_pos_offset..][0..vocab_size]);
+    std.debug.assert(query_seq_len == decode_context.query_sequence_len);
+    var decoder = decoder_forward.Runtime{ .context = .{
+        .allocator = allocator,
+        .cb = &runtime_ctx.cb,
+        .gpt_config = &runtime_ctx.definition.configuration.value,
+    } };
+    return decoder.forwardLastLogits(input_ids, 1, seq_len, decode_context);
 }
 
 test "live model executor supports native and metal backends" {

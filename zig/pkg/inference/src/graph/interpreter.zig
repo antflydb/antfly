@@ -66,6 +66,30 @@ pub const RuntimeInput = struct {
     source_backend: ?*const ComputeBackend = null,
 };
 
+/// Borrow tensor owners while remapping bindings through a pruned graph.
+/// Removed nodes contribute no binding; malformed source/destination IDs are
+/// rejected before allocation. Only the returned metadata slice is owned.
+pub fn remapRuntimeInputs(allocator: std.mem.Allocator, groups: []const []const RuntimeInput, id_map: []const NodeId, target_nodes: usize) ![]RuntimeInput {
+    var count: usize = 0;
+    for (groups) |inputs| for (inputs) |input| {
+        if (input.node_id >= id_map.len) return error.InvalidRuntimeInputNode;
+        const mapped = id_map[input.node_id];
+        if (mapped == @import("ml").graph.null_node) continue;
+        if (mapped >= target_nodes) return error.InvalidRuntimeInputNode;
+        count = try std.math.add(usize, count, 1);
+    };
+    const result = try allocator.alloc(RuntimeInput, count);
+    var index: usize = 0;
+    for (groups) |inputs| for (inputs) |input| {
+        const mapped = id_map[input.node_id];
+        if (mapped == @import("ml").graph.null_node) continue;
+        result[index] = input;
+        result[index].node_id = mapped;
+        index += 1;
+    };
+    return result;
+}
+
 /// Pre-computed graph analysis that can be cached across executions.
 /// For a given graph these are invariant — recomputing them every
 /// decode step is pure overhead.
@@ -8814,4 +8838,33 @@ pub fn executeEmbeddingLookup(allocator: std.mem.Allocator, cb: *const ComputeBa
 pub fn ropePositionOverride(attention: ?contracts.AttentionContext) error{InvalidRoPEInput}!?usize {
     if (attention) |value| return std.math.sub(usize, value.total_sequence_len, value.query_sequence_len) catch return error.InvalidRoPEInput;
     return null;
+}
+
+fn checkPrunedRuntimeBindings(allocator: std.mem.Allocator) !void {
+    var values = [_]u64{ 1, 2, 3, 4 };
+    const backend: ComputeBackend = undefined;
+    const inputs = [_]RuntimeInput{
+        .{ .node_id = 0, .value = @ptrCast(&values[0]), .source_backend = &backend },
+        .{ .node_id = 1, .value = @ptrCast(&values[1]) },
+        .{ .node_id = 2, .value = @ptrCast(&values[2]) },
+    };
+    const extra = [_]RuntimeInput{.{ .node_id = 3, .value = @ptrCast(&values[3]) }};
+    const map = [_]NodeId{ 2, @import("ml").graph.null_node, 0, 1 };
+    const result = try remapRuntimeInputs(allocator, &.{ &inputs, &extra }, &map, 3);
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqual(@as(NodeId, 2), result[0].node_id);
+    try std.testing.expect(result[0].source_backend == &backend);
+    try std.testing.expectEqual(@as(NodeId, 0), result[1].node_id);
+    try std.testing.expectEqual(@as(NodeId, 1), result[2].node_id);
+    try std.testing.expect(result[0].value == inputs[0].value);
+    try std.testing.expect(result[1].value == inputs[2].value);
+    try std.testing.expect(result[2].value == extra[0].value);
+    try std.testing.expectError(error.InvalidRuntimeInputNode, remapRuntimeInputs(allocator, &.{&extra}, map[0..3], 3));
+    try std.testing.expectError(error.InvalidRuntimeInputNode, remapRuntimeInputs(allocator, &.{&inputs}, &map, 2));
+}
+
+test "runtime input remapping prunes removed bindings and preserves owners atomically" {
+    try checkPrunedRuntimeBindings(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPrunedRuntimeBindings, .{});
 }

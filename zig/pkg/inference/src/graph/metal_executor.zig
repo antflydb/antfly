@@ -34,6 +34,7 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const contracts = @import("backend_contracts.zig");
 const model_runtime = @import("model_runtime.zig");
+const decoder_storage = @import("../execution/decoder_storage.zig");
 const session_decoder = @import("session_decoder.zig");
 const quant_matmul = @import("quant_matmul.zig");
 
@@ -961,13 +962,7 @@ const DecoderRuntimeSpanState = struct {
     kv_position_offset: usize,
 };
 
-fn executorUsesLazyDeviceKvReserve(config: gpt_mod.Config) bool {
-    if (config.family != .gemma or !config.hasPle()) return false;
-    const mixed_width = config.hasGlobalAttentionLayers() and
-        (config.maxKvHeads() != config.effectiveKVHeads() or
-            config.maxHeadDim() != config.headDim());
-    return mixed_width or config.num_kv_shared_layers > 0;
-}
+const executorUsesLazyDeviceKvReserve = decoder_storage.lazyDeviceReservation;
 
 fn executorContractKvCacheView(kv_view: decode_state.KvView) contracts.KvCacheView {
     return .{
@@ -1378,24 +1373,13 @@ const RuntimeContext = struct {
             cb_mut.deinit();
         }
 
-        const session_backend = session.backend();
         const kv_dtype = kv_dtype_override orelse session_factory.recommendedKvDTypeForSession(session, .metal);
-        const needs_cpu_kv_bridge = switch (session_backend) {
-            .metal => false,
-            else => false,
-        };
-        const sliding_window_size = executorKvSlidingWindowSize(gpt_config);
-
-        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
-            .backend = .metal,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-            .store_cpu_bytes = needs_cpu_kv_bridge,
-        });
+        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, decoder_storage.poolPlan(
+            .metal,
+            kv_dtype,
+            &gpt_config,
+            .{ .layer_layout = .architectural, .host_mirrors = false },
+        ));
         errdefer kv_storage.deinit();
         // Phase 6 wiring: ask the Metal compute backend to install its device
         // write hook if the KV dtype matches the fast path. When unsupported

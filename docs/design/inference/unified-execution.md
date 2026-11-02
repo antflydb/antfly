@@ -99,7 +99,10 @@ preparation API do not by themselves complete these remaining requirements:
   selected outputs and their lifetime bounds are explicit policy. Physical
   backing-view propagation and conservative donation groups retain their
   storage-specific rules. Allocation-failure tests cover interval growth and
-  transfer of interval ownership into the reusable-slot plan.
+  transfer of interval ownership into the reusable-slot plan. Backward runtime
+  input groups share one checked remapping helper: removed nodes contribute no
+  binding, surviving inputs retain their backend owners, and invalid mappings
+  fail before allocation. Production and diagnostic Laya training share it.
 - Assigned outputs/workspace cover admitted native/CUDA descriptors, while Metal
   consumes its existing physical allocation plan. Prepared CUDA graphs with full
   assigned-kernel coverage can capture the plan's stable output, workspace,
@@ -172,9 +175,16 @@ preparation API do not by themselves complete these remaining requirements:
   epoch calls it directly; a separate task adapter publishes completed results
   while retaining the scheduler turn and lane. A shared execution-access record
   preserves FIFO/phase priority and cancellation-independent cleanup.
-  Sampled eager/replay/compiled forward uses the same typed entry point in the
-  runtime and generation. General KV pool policy, every eager fast path and all
-  resident task transitions have not yet migrated behind that owner.
+  `execution/decoder_forward.zig` owns nineteen logits/hidden-state and compiled
+  token dispatch methods behind a borrowed runtime context, without task or
+  tokenizer dependencies. Generation supplies request eligibility and publishes
+  results. Native whole-model execution shares the last-logits implementation;
+  retained hidden outputs point to the real backend, never the temporary adapter.
+  `execution/decoder_storage.zig` owns pool geometry, metadata-only CUDA request
+  pools, checkpoint geometry, route capacity and lazy reservation policy. Native,
+  Metal and generation reuse it while explicitly preserving architectural versus
+  compact stored-layer layouts and host-mirror choices. Remaining direct device
+  token/eager choices and resident task transitions still need migration.
 - `execution/testing/model_formats.zig` compares deterministic one-layer BERT
   and sliding-window decoder graphs loaded through real ONNX, safetensors and
   GGUF parsers. Deliberately lossy Q8_0 weights use an independently rounded CPU

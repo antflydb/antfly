@@ -255,13 +255,11 @@ test "laya pointer head gradients agree between native and resident Metal" {
         var binding = try trainer.bind(&program.graph, null);
         defer binding.deinit();
         const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, runtime });
-        const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len + 1);
-        for (combined, backward_inputs[0..combined.len]) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
         const cotangent = try scratch.alloc(f32, l.questions * l.options);
         for (cotangent, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.25;
         const seed = try cb.fromFloat32Shape(cotangent, &.{ @intCast(l.questions), @intCast(l.options) });
         defer cb.free(seed);
-        backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = seed };
+        const backward_inputs = try interpreter.remapRuntimeInputs(scratch, &.{ combined, &.{.{ .node_id = program.seed, .value = seed }} }, program.gradients.id_map, program.gradients.graph.nodeCount());
         var backward = try train.executeFramed(a, &program.gradients.graph, cb, backward_inputs);
         defer backward.deinit(cb);
         out.* = try scratch.alloc([]f32, program.wrt.len);

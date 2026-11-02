@@ -34166,7 +34166,9 @@ test "valid direct entity failures release admission and partial model state" {
         defer response.deinit();
         return error.TestUnexpectedResult;
     }
-    try std.testing.expectEqual(@as(usize, 64), request_work_test_counters.model_resolution_attempts);
+    // Each request probes a document-agent definition before resolving the
+    // ordinary extractor. Both paths release admission after failed loading.
+    try std.testing.expectEqual(@as(usize, 2 * 64), request_work_test_counters.model_resolution_attempts);
 }
 
 test "direct entity extraction response populates requested canonical fields" {

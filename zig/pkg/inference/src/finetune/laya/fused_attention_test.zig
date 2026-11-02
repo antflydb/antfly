@@ -394,19 +394,15 @@ fn gradientDivergence(a: std.mem.Allocator, cb: *const ops.ComputeBackend, cfg: 
 
     const dense_seed = try cb.fromFloat32Shape(cotangent_values, dims[0..logits_shape.rank()]);
     defer cb.free(dense_seed);
-    var dense_backward_inputs = try a.alloc(interpreter.RuntimeInput, dense_combined.len + 1);
+    const dense_backward_inputs = try interpreter.remapRuntimeInputs(a, &.{ dense_combined, &.{.{ .node_id = dense_program.seed, .value = dense_seed }} }, dense_program.gradients.id_map, dense_program.gradients.graph.nodeCount());
     defer a.free(dense_backward_inputs);
-    for (dense_combined, dense_backward_inputs[0..dense_combined.len]) |input, *dst| dst.* = .{ .node_id = dense_program.gradients.id_map[input.node_id], .value = input.value };
-    dense_backward_inputs[dense_combined.len] = .{ .node_id = dense_program.gradients.id_map[dense_program.seed], .value = dense_seed };
     var dense_backward = try interpreter.execute(a, &dense_program.gradients.graph, cb, .{ .runtime_inputs = dense_backward_inputs, .strict_integer_constants = true });
     defer dense_backward.deinit(cb);
 
     const fused_seed = try cb.fromFloat32Shape(cotangent_values, dims[0..logits_shape.rank()]);
     defer cb.free(fused_seed);
-    var fused_backward_inputs = try a.alloc(interpreter.RuntimeInput, fused_combined.len + 1);
+    const fused_backward_inputs = try interpreter.remapRuntimeInputs(a, &.{ fused_combined, &.{.{ .node_id = fused_program.seed, .value = fused_seed }} }, fused_program.gradients.id_map, fused_program.gradients.graph.nodeCount());
     defer a.free(fused_backward_inputs);
-    for (fused_combined, fused_backward_inputs[0..fused_combined.len]) |input, *dst| dst.* = .{ .node_id = fused_program.gradients.id_map[input.node_id], .value = input.value };
-    fused_backward_inputs[fused_combined.len] = .{ .node_id = fused_program.gradients.id_map[fused_program.seed], .value = fused_seed };
     var fused_backward = try interpreter.execute(a, &fused_program.gradients.graph, cb, .{ .runtime_inputs = fused_backward_inputs, .strict_integer_constants = true });
     defer fused_backward.deinit(cb);
 
