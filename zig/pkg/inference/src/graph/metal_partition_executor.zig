@@ -14395,9 +14395,11 @@ fn executeRuntimeEmbeddingLookup(
     exec_state: *interpreter.ExecState,
 ) !?CT {
     const weight = valueFor(values, inputs[0]) orelse return null;
-    const indices = valueFor(values, inputs[1]) orelse return null;
-    const host_ids = if (graph.node(inputs[1]).op == .fused_from_float32) exec_state.options.embedding_ids orelse return error.MissingRuntimeInput else null;
-    return interpreter.executeEmbeddingLookup(allocator, cb, weight, indices, host_ids, attrs.total, attrs.dim) catch |err| switch (err) {
+    const indices: interpreter.EmbeddingIndices = if (graph.node(inputs[1]).op == .fused_from_float32)
+        .{ .host = exec_state.options.embedding_ids orelse return error.MissingRuntimeInput }
+    else
+        .{ .tensor = valueFor(values, inputs[1]) orelse return null };
+    return interpreter.executeEmbeddingLookup(allocator, cb, weight, indices, attrs.total, attrs.dim) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };

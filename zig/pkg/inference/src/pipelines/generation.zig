@@ -6307,7 +6307,7 @@ pub const NativeGenerationPipeline = struct {
                 };
                 const is_last_chunk = chunk_end == prompt_ids.len;
                 var output = (graph_mod.execution.graphForwardCompiledModelOutput(
-                    self,
+                    &self.graphExecutionContext(),
                     self.graph_cache.?,
                     chunk,
                     1,
@@ -8466,7 +8466,7 @@ pub const NativeGenerationPipeline = struct {
         if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return null;
 
         const token_id = (try graph_mod.execution.graphForwardCompiledModelGreedyToken(
-            self,
+            &self.graphExecutionContext(),
             cache,
             input_ids,
             batch,
@@ -8506,7 +8506,7 @@ pub const NativeGenerationPipeline = struct {
         if (input_ids.len != 1 or decode_context.attention_mode != .paged_decode) return null;
 
         const token_id = (try graph_mod.execution.graphForwardCompiledModelSampledToken(
-            self,
+            &self.graphExecutionContext(),
             cache,
             .{
                 .decode = .{
@@ -8540,7 +8540,7 @@ pub const NativeGenerationPipeline = struct {
         if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return false;
         // ponytail: Metal prefill prepares lazily; eager prepare is only a warmup and can be skipped.
         if (self.compiled_partition_backend == .metal) return false;
-        return graph_mod.execution.prepareCompiledModelRuntime(self, cache, kv_tokens_hint);
+        return graph_mod.execution.prepareCompiledModelRuntime(&self.graphExecutionContext(), cache, kv_tokens_hint);
     }
 
     fn forwardAllLogits(
@@ -8552,7 +8552,7 @@ pub const NativeGenerationPipeline = struct {
     ) ![]f32 {
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         if (self.graph_cache) |cache| {
-            return graph_mod.execution.graphForwardAll(self, cache, input_ids, batch, seq_len, decode_context);
+            return graph_mod.execution.graphForwardAll(&self.graphExecutionContext(), cache, input_ids, batch, seq_len, decode_context);
         }
         if (self.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
 
@@ -9397,14 +9397,14 @@ pub const NativeGenerationPipeline = struct {
         decode_context: *const gpt_arch.DecodeContext,
     ) ![]f32 {
         const allocator = self.allocator;
-        if (try graph_mod.execution.graphForwardCompiledModelLast(self, cache, input_ids, batch, seq_len, decode_context)) |last_logits| {
+        if (try graph_mod.execution.graphForwardCompiledModelLast(&self.graphExecutionContext(), cache, input_ids, batch, seq_len, decode_context)) |last_logits| {
             return last_logits;
         }
         if (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model) {
             return error.MissingCompiledModelRuntime;
         }
 
-        const logits = try graph_mod.execution.graphForwardAll(self, cache, input_ids, batch, seq_len, decode_context);
+        const logits = try graph_mod.execution.graphForwardAll(&self.graphExecutionContext(), cache, input_ids, batch, seq_len, decode_context);
         defer allocator.free(logits);
         const query_seq_len = decode_context.query_sequence_len;
         const vocab_size = self.gpt_config.vocab_size;
@@ -9414,6 +9414,32 @@ pub const NativeGenerationPipeline = struct {
         const end = try std.math.mul(usize, query_seq_len, width);
         if (end > logits.len) return error.InvalidTensorShape;
         return allocator.dupe(f32, logits[end - width .. end]);
+    }
+
+    fn graphExecutionContext(self: *NativeGenerationPipeline) graph_mod.execution.Context {
+        const Adapter = struct {
+            fn get(raw: *anyopaque, name: []const u8) !ops.CT {
+                const pipeline: *NativeGenerationPipeline = @ptrCast(@alignCast(raw));
+                return pipeline.graphWeight(name);
+            }
+        };
+        return .{
+            .allocator = self.allocator,
+            .cb = &self.cb,
+            .gpt_config = self.gpt_config,
+            .weights = .{ .ptr = self, .get_fn = Adapter.get },
+            .execution_control = self.execution_control,
+            .model_dir = self.model_dir,
+            .artifact_dir = self.artifact_dir,
+            .pjrt_client = self.pjrt_client,
+            .session = self.session,
+            .kv_dtype = self.kv_dtype,
+            .shared_moe_cache = self.shared_moe_cache,
+            .device_mesh = self.device_mesh,
+            .parallel_config = self.parallel_config,
+            .compiled_partition_backend = self.compiled_partition_backend,
+            .compiled_attachment_target = self.compiled_attachment_target,
+        };
     }
 
     pub fn graphWeight(self: *NativeGenerationPipeline, name: []const u8) !ops.CT {

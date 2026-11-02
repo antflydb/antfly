@@ -331,8 +331,11 @@ fn executeNativePlannedNode(
             break :blk result.first;
         },
         .fused_embedding_lookup => |attrs| blk: {
-            const host_ids = if (graph.node(inputs[1]).op == .fused_from_float32) exec_state.options.embedding_ids orelse return error.MissingRuntimeInput else null;
-            break :blk try interpreter.executeEmbeddingLookup(allocator, cb, valueAt(values, inputs[0]), valueAt(values, inputs[1]), host_ids, attrs.total, attrs.dim);
+            const indices: interpreter.EmbeddingIndices = if (graph.node(inputs[1]).op == .fused_from_float32)
+                .{ .host = exec_state.options.embedding_ids orelse return error.MissingRuntimeInput }
+            else
+                .{ .tensor = optionalValueAt(values, inputs[1]) orelse return error.MissingRuntimeInput };
+            break :blk try interpreter.executeEmbeddingLookup(allocator, cb, valueAt(values, inputs[0]), indices, attrs.total, attrs.dim);
         },
         .fused_layer_norm => |attrs| blk: {
             break :blk try cb.layerNorm(

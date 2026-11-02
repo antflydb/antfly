@@ -123,6 +123,14 @@ preparation API do not by themselves complete these remaining requirements:
   projection, vision/audio, speculative verification and token selection).
   Historical public method names are compatibility adapters; new implementations
   extend operation descriptors/regions, preserving each admitted native schedule.
+  `graph/execution.Context` declares backend, model-weight adapter, execution
+  control and compiled-backend dependencies explicitly. Serving and offline
+  compilation use that same typed contract instead of pipeline-shaped structs.
+  Backend pointers are borrowed from their real owner; temporary context values
+  never become the owner of cached executors or physical bindings.
+  Embedding indices explicitly select host IDs or a resident tensor. Traced
+  host-ID placeholders need no materialized tensor; imported integer tensors
+  retain their resident fast path and exact integer fallback.
 - Resident stage contracts, exact typed transfers and strict readback auditing
   are implemented. Migrating every task to resident stage chaining and moving
   all KV/recurrent execution choices behind runtime owners remains incremental.

@@ -2647,8 +2647,11 @@ pub fn executeNode(
         },
 
         .fused_embedding_lookup => |attrs| {
-            const host_ids = if (graph.node(ins[1]).op == .fused_from_float32) state.options.embedding_ids orelse return error.MissingRuntimeInput else null;
-            return executeEmbeddingLookup(state.allocator orelse graph.allocator, cb, V.get(ins[0]), V.get(ins[1]), host_ids, attrs.total, attrs.dim);
+            const indices: EmbeddingIndices = if (graph.node(ins[1]).op == .fused_from_float32)
+                .{ .host = state.options.embedding_ids orelse return error.MissingRuntimeInput }
+            else
+                .{ .tensor = values[ins[1]] orelse return error.MissingRuntimeInput };
+            return executeEmbeddingLookup(state.allocator orelse graph.allocator, cb, V.get(ins[0]), indices, attrs.total, attrs.dim);
         },
 
         .fused_layer_norm => |attrs| {
@@ -8782,16 +8785,21 @@ test "native GatherND widens floating weight slices when exact import is unavail
 
 /// Shared resident-first embedding dispatch. Legacy host ID tensors use exact
 /// integer export when a resident implementation is unavailable.
-pub fn executeEmbeddingLookup(allocator: std.mem.Allocator, cb: *const ComputeBackend, weight: CT, indices: CT, host_ids: ?[]const i64, total: usize, dim: usize) !CT {
+/// Traced host IDs have no materialized placeholder tensor. Imported tensor
+/// IDs keep the resident fast path and exact integer fallback.
+pub const EmbeddingIndices = union(enum) { host: []const i64, tensor: CT };
+
+pub fn executeEmbeddingLookup(allocator: std.mem.Allocator, cb: *const ComputeBackend, weight: CT, source: EmbeddingIndices, total: usize, dim: usize) !CT {
+    const indices = switch (source) {
+        .host => |ids| return cb.embeddingLookup(weight, ids, total, dim),
+        .tensor => |tensor| tensor,
+    };
     if (try cb.embeddingLookupTensor(weight, indices, total, dim)) |device_result| {
         return device_result;
     }
     var owned_ids: ?[]i64 = null;
     defer if (owned_ids) |buf| allocator.free(buf);
     const ids = blk: {
-        if (host_ids != null) {
-            break :blk host_ids.?;
-        }
         const dtype = try cb.tensorDType(indices);
         if (dtype == .i64 or dtype == .i32) {
             const exported = (try cb.exportTensorData(indices, allocator)) orelse return error.UnsupportedIntegerTensor;
