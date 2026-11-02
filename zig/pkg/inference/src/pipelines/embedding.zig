@@ -4057,7 +4057,7 @@ test "resident qwen3 embedding requires a live guard before backend preparation"
     try std.testing.expectError(error.ProcessIsolationRequired, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1));
     pipeline.execution_control = .{ .hard_cancellation = .{ .ptr = &probe, .arm_fn = Probe.arm, .disarm_fn = Probe.disarm } };
     // Even backend construction failure must release the pipeline's guard.
-    try std.testing.expectError(error.NotArchSession, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1));
+    try std.testing.expectError(error.UnsupportedSessionComputeBackend, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1));
     try std.testing.expectEqual(@as(usize, 1), probe.disarms);
     try std.testing.expect(!probe.armed);
 }

@@ -10,7 +10,7 @@
   "changed_instructions": [],
   "changed_resources": [],
   "original_image_sha256": "0cc41e211289f4415649458aa8fd5322221f8b567e98b682212f02eedd77850d",
-  "candidate_image_sha256": "6808bf313d8d24fbeed4666e971d19025c2ff40a79cfe052ca5d0ee4cf5f493c",
+  "candidate_image_sha256": "54ad80e2ad5bf16b0f644d5ebeb68da74afa8909c6cb707107837fd0ddec1130",
   "programs": [
     {
       "arch": "sm_89",

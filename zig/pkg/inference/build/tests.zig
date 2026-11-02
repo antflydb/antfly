@@ -42,11 +42,14 @@ pub fn create(ctx: Context) Suite {
         !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
     // The optimized native CPU closeout scope peaked at 11,435,048,960
     // bytes. 12,032 MiB retains 10% headroom rounded up to 128 MiB.
-    // CUDA serving reached 19.57 GB on Linux; dual-backend macOS reached
-    // 20.66 GB. Reserve 24 GiB for CUDA and 20 GiB for the measured 17.56 GB
-    // single-Metal suite. These are compiler scheduler reservations only.
+    // The broad ARM Linux CUDA suite peaked at 26,424,184,832 bytes.
+    // 28 GiB covers that measurement with at least 10% headroom. Other CUDA
+    // hosts retain 24 GiB; Metal retains its measured 20 GiB reservation.
+    // These bounds schedule compiler memory, not model/runtime admission.
+    const cuda_arm_linux = ctx.backend.enable_cuda and b.graph.host.result.os.tag == .linux and
+        b.graph.host.result.cpu.arch == .aarch64;
     const tests = b.addTest(.{
-        .max_rss = if (native_cpu_macos) @as(usize, if (ctx.optimize == .debug) 12_672 else 12_032) * 1024 * 1024 else @as(usize, if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (native_cpu_macos) @as(usize, if (ctx.optimize == .debug) 12_672 else 12_032) * 1024 * 1024 else @as(usize, if (cuda_arm_linux) 28 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024,
 
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
