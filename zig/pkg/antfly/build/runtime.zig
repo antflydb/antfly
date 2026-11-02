@@ -321,6 +321,11 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?,
     );
     if (production_antfly_imports.shared_inference_core) linked_inference_abi_integration_mod.linkLibrary(options.native_inference);
+    // Retained document operations execute in the separately compiled media
+    // owner. Keep the dependency at final composition so its edits leave the
+    // inference compiler output reusable.
+    if (production_antfly_imports.pdf_native_contract != null)
+        linked_inference_abi_integration_mod.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.enrichment_compute)].?);
     const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
 
     for (runtime_library_link_order) |unit| {

@@ -201,16 +201,22 @@ jobs:
             python3 tools/run_bounded_zig_build.py -- "${args[@]}"
       - name: Verify compiled media owner cache isolation
         if: ${{ success() && inputs.step == 'opaque-pdf-session-test' }}
+        env:
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
         run: |
-          python3 zig/tools/check_media_owner_cache.py --report .benchmark-results/compile-costs/media-owner-cache.json
+          python3 zig/tools/check_media_owner_cache.py --optimize "$BUILD_OPTIMIZE" --report .benchmark-results/compile-costs/media-owner-cache.json
       - name: Verify retained PDF implementation and value cache isolation
         if: ${{ success() && inputs.step == 'compiled-pdf-native-test' }}
+        env:
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
         run: |
-          python3 zig/tools/check_media_owner_cache.py --retained --report .benchmark-results/compile-costs/pdf-retained-cache.json
+          python3 zig/tools/check_media_owner_cache.py --retained --optimize "$BUILD_OPTIMIZE" --report .benchmark-results/compile-costs/pdf-retained-cache.json
       - name: Compare retained PDF GPU scene preparation
         if: ${{ success() && inputs.step == 'compiled-pdf-native-test' }}
+        env:
+          BUILD_OPTIMIZE: ${{ inputs.optimize }}
         run: |
-          python3 zig/tools/check_pdf_gpu_scene_transport.py --report .benchmark-results/compile-costs/pdf-gpu-scene-transport.json
+          python3 zig/tools/check_pdf_gpu_scene_transport.py --optimize "$BUILD_OPTIMIZE" --report .benchmark-results/compile-costs/pdf-gpu-scene-transport.json
       - name: Verify architecture provider and consumer cache isolation
         if: ${{ success() && inputs.step == 'architecture-probe-test' }}
         run: |

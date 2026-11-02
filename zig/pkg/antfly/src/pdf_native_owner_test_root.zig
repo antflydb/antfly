@@ -195,13 +195,15 @@ test "compiled PDF native decoder cancellation retains caller error identity on 
     defer doc.deinit();
     const Control = struct {
         calls: std.atomic.Value(usize) = .init(0),
+        reverse: bool = false,
         fn check(ptr: ?*const anyopaque) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(@constCast(ptr.?)));
             _ = self.calls.fetchAdd(1, .monotonic);
             return error.PdfCallerOnlyDecoderStopped;
         }
-        fn run(_: *anyopaque, contexts: []const *anyopaque, operation: *const fn (*anyopaque, std.mem.Allocator) void, _: usize) anyerror!pdf.PageRenderExecutor.BatchStats {
-            for (contexts) |context| operation(context, std.heap.page_allocator);
+        fn run(raw: *anyopaque, contexts: []const *anyopaque, operation: *const fn (*anyopaque, std.mem.Allocator) void, _: usize) anyerror!pdf.PageRenderExecutor.BatchStats {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (0..contexts.len) |i| operation(contexts[if (self.reverse) contexts.len - 1 - i else i], std.heap.page_allocator);
             return .{ .peak_parallelism = contexts.len };
         }
     };
@@ -211,14 +213,15 @@ test "compiled PDF native decoder cancellation retains caller error identity on 
         const scope = c.work.Scope.enter(.{ .context = &control, .check_fn = Control.check });
         defer scope.deinit();
         try std.testing.expectError(error.PdfCallerOnlyDecoderStopped, pdf.renderParsedPagePngAlloc(a, &doc, 1, 72, 1_000_000));
-        for (0..3) |mode| {
+        for (0..4) |mode| {
+            control.reverse = mode == 3;
             var options: pdf.PageRenderBatchOptions = .{ .max_parallel_pages = 2 };
             if (mode == 1) options.executor_io = std.testing.io;
-            if (mode == 2) options.executor = .{ .ptr = &control, .concurrent_capacity = 2, .run_batch_fn = Control.run };
+            if (mode >= 2) options.executor = .{ .ptr = &control, .concurrent_capacity = 2, .run_batch_fn = Control.run };
             try std.testing.expectError(error.PdfCallerOnlyDecoderStopped, pdf.renderParsedPagesBatchAlloc(a, &doc, &.{ request, request }, options));
         }
     }
-    try std.testing.expect(control.calls.load(.monotonic) >= 4);
+    try std.testing.expect(control.calls.load(.monotonic) >= 5);
     const recovered = try pdf.renderParsedPagePngAlloc(a, &doc, 1, 72, 1_000_000);
     defer a.free(recovered);
     try std.testing.expect(recovered.len > 0);

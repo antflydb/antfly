@@ -45,7 +45,10 @@ library by 347 KB; `-Dshared-pdf-templates=false` permits comparison.
 The separately selectable `-Dshared-pdf-sessions=true` migration routes retained
 readers, fork caches, analysis and complete PNG/raster batches through that same
 owner. Shared PDF values import no implementation. Its eight-phase cache matrix
-preserves the client object across reader/renderer edits. Whole-product size and
+preserves the client object across reader/renderer edits. Routine ownership,
+cancellation, GPU-scene transport and cache checks now default to Debug; use
+`--optimize fast` on the PDF cache/scene tools for final optimized qualification.
+Whole-product size and
 memory qualification remains separate; see the [retained-owner evidence](../docs/design/compilation/history/retained-pdf-owner-2026-11-02.md).
 
 ## Compile-cost experiments

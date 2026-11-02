@@ -42,6 +42,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument(
+        "--optimize", choices=("debug", "fast", "safe"), default="debug"
+    )
     args = parser.parse_args()
     if args.timeout < 1:
         parser.error("timeout must be positive")
@@ -55,6 +58,7 @@ def main():
         ).strip(),
         script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         scope="CPU scene preparation through retained PDF owner versus direct source; GPU submission is unchanged and not measured",
+        optimize=args.optimize,
         passed=False,
     )
     with tempfile.TemporaryDirectory(dir=parent) as directory:
@@ -111,8 +115,8 @@ def main():
             "build",
             "pdf-scene-probe",
             "-Dshared-pdf-sessions=true",
-            "-Doptimize=fast",
-            "-Dstrip=true",
+            f"-Doptimize={args.optimize}",
+            f"-Dstrip={str(args.optimize != 'debug').lower()}",
             "-Dcpu=baseline",
             "-Dmetal=false",
             "-Dcuda=false",

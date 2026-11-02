@@ -1,7 +1,7 @@
 # Retained PDF operation ownership
 
-Status: implemented and focused qualification passed; complete native product
-screening is next. `-Dshared-pdf-sessions=true` selects this migration separately
+Status: implemented; focused regressions and repeated cancellation checks pass.
+Debug product screening passed; optimized size/cost screening is still pending. `-Dshared-pdf-sessions=true` selects this migration separately
 from template routing. The user accepted the earlier template size tradeoff;
 `shared-pdf-templates` now defaults to true, with an explicit false comparison
 still available. The retained migration remains separately selectable during
@@ -84,11 +84,40 @@ signatures and durable JSON/record formats are unchanged.
 - Existing seven opaque PDF/session/backend tests and two compiled-template
   tests passed before the value move; the complete product run will repeat them.
 
+## Debug iteration and cancellation qualification
+
+Routine ownership, cancellation, source-library, scene-transport and cache
+checks use Debug. `check_media_owner_cache.py` and
+`check_pdf_gpu_scene_transport.py` now default to Debug and accept an explicit
+`--optimize fast` for final qualification. The profile workflow forwards its
+selected mode. Binary-size and LLVM compile-time/memory comparisons require a
+separate optimized build after correctness is stable.
+
+Repeated execution exposed a secondary wave-cancellation race after the first
+passing focused runs. An earlier worker could report its own `Canceled` marker
+before the lane that carried the caller's original control error. Worker
+identity capture now retains forwarded identities instead of secondary local
+markers. The regression also runs a fixed executor in reverse order. The fix
+passed 200 repeated executions in each of Debug and Fast in isolated overlays
+before promotion. These runs include actual compatibility-I/O scheduling.
+The earlier passing runs alone were insufficient qualification.
+
+The seven PDF/OCR HTTP cases pass against the preserved accepted template
+baseline: inline/URL/paged OCR and JPEG inputs, automatic OCR selection,
+malformed-document terminal manifests, and local/Lite cursor reopening. The
+migrated Debug products also passed those seven cases, plus all six query
+deadline cases (13 total).
+
+Known-failing or superseded optimized runs are retained as failed receipts,
+not performance samples. After switching the iteration loop to Debug, the
+optimized product build was stopped. No new release-size or memory improvement
+has been established for retained readers yet.
+
 ## Actual cache matrix
 
 `python3 zig/tools/check_media_owner_cache.py --retained --report ...` uses a
-private overlay inside the worktree cache and removes it afterward. All phases
-passed without pulling storage or inference compilers into the media-only test:
+private overlay inside the worktree cache and removes it afterward. The earlier
+Fast matrix, before decoder-control forwarding, passed all phases without pulling storage or inference compilers into the media-only test:
 
 | Edit | Media compiler | Client compiler | Observed seconds |
 | --- | --- | --- | ---: |
@@ -111,3 +140,30 @@ Ignored receipts live in `.benchmark-results/compile-costs/`: the
 failed logs retain incorrect expected error spellings and the anonymous-enum
 layout mismatch, separately from the passing results. No PDF error semantics
 were changed to satisfy those expectations.
+
+The current cache tool additionally checks JPEG implementation and control
+interface edits, plus a reachable provider-code edit. That edit introduces a
+non-inlined volatile-read identity function into page count, preserving returned
+values while forcing a code change. It checks that the provider archive hash
+changes and the client compiler remains cached. Private overlays and their
+build output are removed after each run.
+
+## Complete Debug products
+
+The corrected graph passed all 159 build/check steps, including both products,
+CAPI smoke/export checks, CLI and inference ABI smokes, 57 storage-owner tests,
+three query-owner tests, and the nine native PDF regressions. The standalone
+inference integration executable now composes the media archive when retained
+PDF is enabled. This dependency belongs to final composition; adding it to the
+inference archive itself would damage independent compiler-cache reuse.
+
+The corrected cancellation code and all eleven Debug cache phases passed.
+Reader, renderer, JPEG and reachable provider-code edits preserve the client
+compiler; client edits preserve the provider; values, protocol and decoder
+control edits rebuild both. GPU scene preparation matches the source path in
+Debug too. These are correctness and cache results, not new release-size,
+optimized compile-time or peak-memory claims.
+
+Debug archive guards also pass: neither storage nor inference emits the raw
+PDF image decoder. The image-decoder inventory remains a separate P1c task,
+including fused JPEG preprocessing and retained VP8 state, not just RGBA decode.

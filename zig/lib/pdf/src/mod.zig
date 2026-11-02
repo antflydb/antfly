@@ -1586,7 +1586,9 @@ const PageRenderWorker = struct {
             error.RenderWorkerMemoryLimitExceeded
         else
             err;
-        self.failure_identity = image.work_control.failure(self.failure.?);
+        const identity = image.work_control.failure(self.failure.?);
+        // A sibling's wave-stop marker is secondary to the forwarded control.
+        self.failure_identity = if (identity.localError() == null) identity else null;
         if (self.failure.? == error.OutOfMemory or self.failure.? == error.Canceled)
             self.wave_control.stop();
     }

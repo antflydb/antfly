@@ -22,6 +22,7 @@ size. Implementation edits must rebuild the provider while caching the caller.
 """
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -44,6 +45,12 @@ def main():
         action="store_true",
         help="Check native retained readers, rendering implementation and pure value contracts",
     )
+    parser.add_argument(
+        "--optimize",
+        choices=("debug", "fast", "safe"),
+        default="debug",
+        help="Use Debug for routine correctness/cache checks; Fast for final LLVM qualification",
+    )
     args = parser.parse_args()
     report_path = args.report.resolve()
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,6 +60,11 @@ def main():
         scope="compiled retained PDF owner and reader-free client"
         if args.retained
         else "compiled media owner and source-free PDF caller",
+        base_git_revision=subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ZIG_ROOT, text=True
+        ).strip(),
+        script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        optimize=args.optimize,
         passed=False,
         phases=[],
     )
@@ -69,19 +81,32 @@ def main():
                 "provider": "pkg/antfly-embedded/src/storage/pdf_native_provider.zig",
                 "reader": "lib/pdf/src/reader.zig",
                 "renderer": "lib/pdf/src/render.zig",
+                "provider_code": "pkg/antfly-embedded/src/storage/pdf_native_provider.zig",
                 "decoder": "lib/image/src/jpeg.zig",
                 "control": "lib/image/src/work_control.zig",
                 "client": "pkg/antfly-embedded/src/storage/pdf_facade.zig",
                 "contract": "lib/pdf/src/values.zig",
                 "protocol": "pkg/antfly-embedded/src/storage/pdf_native_contract.zig",
             }
+        report["initial_sources_sha256"] = {
+            relative: hashlib.sha256((ZIG_ROOT / relative).read_bytes()).hexdigest()
+            for relative in paths.values()
+        }
         changed_sources = {phase: own(root, path) for phase, path in paths.items()}
         for phase in ("initial", "warm", *paths):
             if phase in changed_sources:
                 path = changed_sources[phase]
-                path.write_text(
-                    path.read_text() + "\n// Media cache isolation experiment.\n"
-                )
+                source = path.read_text()
+                if phase == "provider_code":
+                    original = "        return reader(doc).value.pageCount();"
+                    replacement = "        return cacheProbePageCount(try reader(doc).value.pageCount());\n    }\n    noinline fn cacheProbePageCount(page_total: usize) usize {\n        const guard: *volatile const usize = &page_total;\n        return guard.*;"
+                    if source.count(original) != 1:
+                        raise RuntimeError(
+                            "retained count operation changed; update reachable-code probe"
+                        )
+                    path.write_text(source.replace(original, replacement))
+                else:
+                    path.write_text(source + "\n// Media cache isolation experiment.\n")
             print("media owner:", phase, flush=True)
             started = time.monotonic()
             process = subprocess.Popen(
@@ -94,8 +119,8 @@ def main():
                     if args.retained
                     else "opaque-pdf-session-test",
                     *(["-Dshared-pdf-sessions=true"] if args.retained else []),
-                    "-Doptimize=fast",
-                    "-Dstrip=true",
+                    f"-Doptimize={args.optimize}",
+                    f"-Dstrip={str(args.optimize != 'debug').lower()}",
                     "-Dcpu=baseline",
                     "-Dmetal=false",
                     "-Dcuda=false",
@@ -132,10 +157,25 @@ def main():
                 returncode=process.returncode,
                 log=str(log),
             )
+            candidates = list(
+                (root / ".zig-cache/o").glob("*/libantfly-runtime-enrichment_compute.a")
+            )
+            if candidates:
+                archive = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+                row["provider_bytes"] = archive.stat().st_size
+                row["provider_sha256"] = hashlib.sha256(
+                    archive.read_bytes()
+                ).hexdigest()
             report["phases"].append(row)
             report_path.write_text(json.dumps(report, indent=2) + "\n")
             if process.returncode:
                 raise RuntimeError("media owner test failed: " + str(log))
+            if phase == "provider_code":
+                previous = report["phases"][-2].get("provider_sha256")
+                if not previous or row.get("provider_sha256") == previous:
+                    raise RuntimeError(
+                        "reachable provider edit did not change its archive bytes"
+                    )
             for forbidden in (
                 "antfly-storage-engine",
                 "antfly-storage-kernel",
@@ -157,7 +197,8 @@ def main():
                 ),
             ):
                 match = re.search(
-                    rf"compile {kind} {artifact} fast \S+ (cached|success)\b", output
+                    rf"compile {kind} {artifact} {re.escape(args.optimize)} \S+ (cached|success)\b",
+                    output,
                 )
                 if match is None:
                     raise RuntimeError("missing compiler attribution: " + artifact)
@@ -170,6 +211,7 @@ def main():
                     "provider",
                     "reader",
                     "renderer",
+                    "provider_code",
                     "decoder",
                     "control",
                     "contract",
