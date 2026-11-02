@@ -32,4 +32,6 @@ pub const transfer_audit = @import("transfer_audit.zig");
 
 pub const decoder_forward = @import("decoder_forward.zig");
 pub const decoder_storage = @import("decoder_storage.zig");
+pub const sequence_pool = @import("sequence_pool.zig");
 pub const text_inputs = @import("text_inputs.zig");
+pub const submission = @import("submission.zig");

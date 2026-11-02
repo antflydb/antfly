@@ -55,8 +55,12 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
         .dot => |dot| if (descriptor.input_shapes[0].rank() != 2 or !dot.lhs_contract_last or dot.k <= 1 or dot.n <= 1) {
             return false;
         },
-        .reduction => |reduction| if (reduction.geometry.rank == 0 or reduction.geometry.mask != @as(u32, 1) << @intCast(reduction.geometry.rank - 1)) {
-            return false;
+        .reduction => |reduction| {
+            const geometry = reduction.geometry;
+            if (geometry.rank == 0 or geometry.rank > 8) return false;
+            if (geometry.mask != @as(u32, 1) << @intCast(geometry.rank - 1)) {
+                _ = kernel_geometry.ReductionAxis.init(geometry) catch return false;
+            }
         },
         .slice => |map| {
             const plan = map.plan(descriptor.input_shapes[0], descriptor.output_shape) catch return false;
@@ -577,8 +581,8 @@ fn nomicBertScratchPlanEnabled() bool {
     return !getenvBool("TERMITE_METAL_DISABLE_NOMIC_BERT_SCRATCH_PLAN");
 }
 
-fn nomicBertPoolNormalizeEnabled() bool {
-    return !getenvBool("TERMITE_METAL_DISABLE_NOMIC_BERT_POOL_NORMALIZE");
+fn maskedMeanNormalizeEnabled() bool {
+    return !getenvBool("TERMITE_METAL_DISABLE_MASKED_MEAN_NORMALIZE") and !getenvBool("TERMITE_METAL_DISABLE_NOMIC_BERT_POOL_NORMALIZE");
 }
 
 fn nomicBertQ8SdpaEnabled() bool {
@@ -1845,7 +1849,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// The epoch has already admitted two complete prefill working sets.
     /// Warm one full synchronous prompt before lending any later prefix.
     pub fn setLightOnPrefillStreamLayers(cb: *const ops.ComputeBackend, layers: u8) !void {
-        if (cb.kind() != .metal or cb.vtable.regions.decoder.beginFrame != &decoderRuntimeBeginFrameOp) {
+        if (cb.kind() != .metal or cb.vtable.regions.commands.beginFrame != &decoderRuntimeBeginFrameOp) {
             if (layers != 0) return error.UnsupportedPrefillStream;
             return;
         }
@@ -1862,13 +1866,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn lightOnPrefillStreamLayers(cb: *const ops.ComputeBackend) u8 {
-        if (cb.kind() != .metal or cb.vtable.regions.decoder.beginFrame != &decoderRuntimeBeginFrameOp) return 0;
+        if (cb.kind() != .metal or cb.vtable.regions.commands.beginFrame != &decoderRuntimeBeginFrameOp) return 0;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         return if (self.lighton_prefill_stream_ready) self.lighton_prefill_stream_layers else 0;
     }
 
     pub fn noteLightOnPrefillComplete(cb: *const ops.ComputeBackend) void {
-        if (cb.kind() != .metal or cb.vtable.regions.decoder.beginFrame != &decoderRuntimeBeginFrameOp) return;
+        if (cb.kind() != .metal or cb.vtable.regions.commands.beginFrame != &decoderRuntimeBeginFrameOp) return;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         // This is called only after the complete owned prompt frame drains.
         self.lighton_prefill_stream_ready = true;
@@ -1902,7 +1906,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// The caller still owns tail submission, cancellation and token readback.
     pub fn setLightOnGpuGreedyStream(cb: *const ops.ComputeBackend, enabled: bool) !void {
         if (cb.kind() != .metal or
-            cb.vtable.regions.decoder.beginFrame != &decoderRuntimeBeginFrameOp or
+            cb.vtable.regions.commands.beginFrame != &decoderRuntimeBeginFrameOp or
             cb.vtable.regions.decoder.beginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp)
         {
             if (enabled) return error.UnsupportedGpuGreedyStream;
@@ -1951,7 +1955,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     pub fn lightOnGpuGreedyStreamEnabled(cb: *const ops.ComputeBackend) bool {
         if (cb.kind() != .metal or
-            cb.vtable.regions.decoder.beginFrame != &decoderRuntimeBeginFrameOp or
+            cb.vtable.regions.commands.beginFrame != &decoderRuntimeBeginFrameOp or
             cb.vtable.regions.decoder.beginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp)
             return false;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -9634,7 +9638,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 defer self.endActivePlannedComputeScope(scope);
                 break :blk (try metal_runtime.decoderRuntimeDotGeneral2DF32DeviceInto(self.provider_impl, input, toBuf(request.inputs[1]).metal_tensor.?, dot.m, dot.n, dot.k, if (dot.rhs_contract_last) 1 else 0, out_tensor)) != null;
             },
-            .reduction => |reduction| (try metal_runtime.decoderRuntimeReduceLastDimDeviceInto(self.provider_impl, input, reduction.geometry.output_count, reduction.geometry.reduce_count, @backingInt(reduction.mode), &.{@intCast(reduction.geometry.output_count)}, out_tensor)) != null,
+            .reduction => |reduction| blk: {
+                const geometry = reduction.geometry;
+                if (geometry.mask == @as(u32, 1) << @intCast(geometry.rank - 1)) {
+                    break :blk (try metal_runtime.decoderRuntimeReduceLastDimDeviceInto(self.provider_impl, input, geometry.output_count, geometry.reduce_count, @backingInt(reduction.mode), &.{@intCast(geometry.output_count)}, out_tensor)) != null;
+                }
+                const mapping = try kernel_geometry.ReductionAxis.init(geometry);
+                const shape = ops.kernel_descriptor.nativeDimensions(i32, descriptor.output_shape);
+                break :blk (try metal_runtime.decoderRuntimeReduceAxisF32DeviceInto(self.provider_impl, input, mapping.out_strides[0..geometry.rank], mapping.input_strides_for_out[0..geometry.rank], geometry.rank, geometry.input_count, geometry.output_count, geometry.reduce_count, mapping.reduce_stride, @backingInt(reduction.mode), shape[0..descriptor.output_shape.rank()], out_tensor)) != null;
+            },
             .transpose => |layout| blk: {
                 var axes: [8]u8 = undefined;
                 const shape = ops.kernel_descriptor.nativeDimensions(i32, descriptor.output_shape);
@@ -11427,7 +11439,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn tryDeviceReduceAxisF32(self: *MetalCompute, input: CT, axes: []const u8, input_shape: []const i64, comptime op_kind: HostReduceOp) !?CT {
         const trace = getenvBool("TERMITE_METAL_TRACE_REDUCE_PRIM");
-        if (comptime (op_kind != .sum and op_kind != .mean)) return null;
         if (axes.len != 1 or input_shape.len == 0 or input_shape.len > metal_tensor_mod.max_dims) {
             if (trace) std.debug.print("metal_reduce_prim: decline=axis_shape op={s} axes={any} input_shape={any}\n", .{ @tagName(op_kind), axes, input_shape });
             return null;
@@ -11480,53 +11491,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (trace) std.debug.print("metal_reduce_prim: decline=axis_elem_mismatch op={s} elems={d} expected={d} input_shape={any} metal_shape={any}\n", .{ @tagName(op_kind), input_metal.elemCount(), input_elems, input_shape, input_metal.shape() });
             return null;
         }
-        const reduce_dim_i64 = input_shape[axis];
-        if (reduce_dim_i64 <= 0) {
-            if (trace) std.debug.print("metal_reduce_prim: decline=axis_bad_dim op={s} axis={d} input_shape={any}\n", .{ @tagName(op_kind), axis, input_shape });
-            return null;
-        }
-        const reduce_dim: usize = @intCast(reduce_dim_i64);
-
-        var input_strides_usize: [metal_tensor_mod.max_dims]usize = undefined;
-        var output_shape_i64_buf: [metal_tensor_mod.max_dims]i64 = undefined;
-        var output_strides_usize: [metal_tensor_mod.max_dims]usize = undefined;
-        computeStrides(input_shape, input_strides_usize[0..input_shape.len]);
-        @memcpy(output_shape_i64_buf[0..input_shape.len], input_shape);
-        output_shape_i64_buf[axis] = 1;
-        const output_shape_i64 = output_shape_i64_buf[0..input_shape.len];
-        const output_elems = try shapeNumel(output_shape_i64);
-        if (output_elems > std.math.maxInt(u32) or input_strides_usize[axis] > std.math.maxInt(u32)) {
-            if (trace) std.debug.print("metal_reduce_prim: decline=axis_size_limit op={s} output_elems={d} stride={d}\n", .{ @tagName(op_kind), output_elems, input_strides_usize[axis] });
-            return null;
-        }
-        computeStrides(output_shape_i64, output_strides_usize[0..output_shape_i64.len]);
-
-        var out_strides = @as([metal_tensor_mod.max_dims]u32, @splat(0));
-        var input_strides_for_out = @as([metal_tensor_mod.max_dims]u32, @splat(0));
-        for (output_shape_i64, 0..) |_, i| {
-            if (output_strides_usize[i] > std.math.maxInt(u32) or input_strides_usize[i] > std.math.maxInt(u32)) {
-                if (trace) std.debug.print("metal_reduce_prim: decline=axis_stride_limit op={s} dim={d} out_stride={d} in_stride={d}\n", .{ @tagName(op_kind), i, output_strides_usize[i], input_strides_usize[i] });
-                return null;
-            }
-            out_strides[i] = @intCast(output_strides_usize[i]);
-            input_strides_for_out[i] = if (i == axis) 0 else @intCast(input_strides_usize[i]);
-        }
-
+        const geometry = try kernel_geometry.ReductionGeometry.init(input_shape, axes);
+        const mapping = kernel_geometry.ReductionAxis.init(geometry) catch return null;
+        const output_shape_i64 = geometry.output_dims[0..geometry.rank];
+        const output_elems = geometry.output_count;
+        const reduce_dim = geometry.reduce_count;
         const output_shape_i32 = try self.i32ShapeFromI64(output_shape_i64);
         defer self.allocator.free(output_shape_i32);
         var input_mt = try input_metal.retainedCopy();
         defer input_mt.deinit();
-        const kind: u32 = if (comptime (op_kind == .mean)) 2 else 0;
+        const kind: u32 = switch (op_kind) {
+            .sum => 0,
+            .max => 1,
+            .mean => 2,
+        };
         if (try metal_runtime.decoderRuntimeReduceAxisF32Device(
             self.provider_impl,
             input_mt,
-            out_strides[0..output_shape_i64.len],
-            input_strides_for_out[0..output_shape_i64.len],
+            mapping.out_strides[0..output_shape_i64.len],
+            mapping.input_strides_for_out[0..output_shape_i64.len],
             output_shape_i64.len,
             input_elems,
             output_elems,
             reduce_dim,
-            input_strides_usize[axis],
+            mapping.reduce_stride,
             kind,
             output_shape_i32,
         )) |tensor| {
@@ -14060,6 +14048,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn reduceMaxOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (try self.tryDeviceReduceLastDim(input, axes, input_shape, .max)) |result| return result;
+        if (try self.tryDeviceReduceAxisF32(input, axes, input_shape, .max)) |result| return result;
         return self.hostFallbackReduce(input, axes, input_shape, .max);
     }
 
@@ -16461,6 +16450,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return self.ctFromOwnedMetalTensor(tensor);
         }
         return null;
+    }
+
+    /// Reuse the admitted row-RMS program with explicit unit weights. The
+    /// optional operation declines before touching unsupported activations;
+    /// it never falls back to a host reduction.
+    fn rmsNormBareOp(ctx: *anyopaque, input: CT, dim: usize, eps: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.audio_capture != null or disableRuntimeElementwise() or dim == 0 or dim > std.math.maxInt(i32)) return null;
+        const source = denseDeviceF32(input) orelse return null;
+        if (source.ndim() != 2 or source.dim(1) <= 0 or @as(usize, @intCast(source.dim(1))) != dim) return null;
+        var device_weight = (try self.unitRmsWeightDeviceTensor(dim)) orelse return null;
+        defer device_weight.deinit();
+        var output = (try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(self.provider_impl, source, device_weight, dim, eps)) orelse return null;
+        errdefer output.deinit();
+        return self.ctFromOwnedMetalTensor(output);
     }
 
     fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
@@ -33475,9 +33479,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return output;
     }
 
-    fn nomicBertPoolNormalizeOp(
+    fn maskedMeanNormalizeOp(
         ctx: *anyopaque,
-        request: *const ops.NomicBertPoolNormalizeRequest,
+        request: *const ops.MaskedMeanNormalizeRequest,
     ) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         self.timing_stats.metal_runtime_nomic_bert_pool_normalize_attempts += 1;
@@ -33485,12 +33489,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer {
             if (!success) self.timing_stats.metal_runtime_nomic_bert_pool_normalize_failures += 1;
         }
-        if (!nomicBertPoolNormalizeEnabled()) return null;
-        if (request.batch == 0 or request.seq_len == 0 or request.hidden_size != 768) return null;
-        if (request.attention_mask.len != request.batch * request.seq_len) return null;
-        var hidden_mt = try self.ownedDeviceMetalTensorFromCt(request.hidden);
+        if (!maskedMeanNormalizeEnabled() or self.audio_capture != null) return null;
+        if (request.batch == 0 or request.seq_len == 0 or request.hidden_size == 0 or request.batch > std.math.maxInt(i32) or request.hidden_size > std.math.maxInt(i32)) return null;
+        const rows = try std.math.mul(usize, request.batch, request.seq_len);
+        const elements = try std.math.mul(usize, rows, request.hidden_size);
+        if (rows > std.math.maxInt(i32) or elements > std.math.maxInt(u32)) return null;
+        if (request.attention_mask.len != rows) return null;
+        const source = denseDeviceF32(request.hidden) orelse return null;
+        if (source.elemCount() != elements) return error.InvalidTensorShape;
+        var hidden_mt = try source.retainedView(0, elements * @sizeOf(f32), &.{ @intCast(rows), @intCast(request.hidden_size) });
         defer hidden_mt.deinit();
-        const output = (try metal_runtime.decoderRuntimeNomicPoolNormalizeF32Device(self.provider_impl, .{
+        var output = (try metal_runtime.decoderRuntimeMaskedMeanNormalizeF32Device(self.provider_impl, .{
             .hidden = hidden_mt,
             .attention_mask = request.attention_mask,
             .batch = request.batch,
@@ -33498,9 +33507,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .hidden_size = request.hidden_size,
             .normalize = request.normalize,
         })) orelse return null;
+        errdefer output.deinit();
+        const value = try self.ctFromOwnedMetalTensor(output);
         success = true;
         self.timing_stats.metal_runtime_nomic_bert_pool_normalize_successes += 1;
-        return self.ctFromOwnedMetalTensor(output);
+        return value;
     }
 
     fn finishDebertaEncoderLayer(
@@ -36637,6 +36648,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.tanh_act = tanhOp;
         vt.concat = concatOp;
         vt.rmsNorm = audioTapeRmsNorm;
+        vt.rmsNormBare = rmsNormBareOp;
         vt.rmsNormTriple = rmsNormTripleOp;
         vt.parallelFfnPostResidual = parallelFfnPostResidualOp;
         vt.addScalar = addScalarOp;
@@ -36707,9 +36719,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.regions.token_selection.readLogitsStats = whisperLogitsStatsReadOp;
         vt.regions.token_selection.writeGrammar = whisperGrammarWriteOp;
         vt.embeddingLookupDeviceToken = embeddingLookupDeviceTokenOp;
-        vt.regions.decoder.setPipelinedFrames = decoderRuntimeSetWhisperPipelinedFramesOp;
-        vt.regions.decoder.submitFrame = decoderRuntimeSubmitFrameOp;
-        vt.regions.decoder.waitSubmittedFrame = decoderRuntimeWaitSubmittedFrameOp;
+        vt.regions.commands.setPipelinedFrames = decoderRuntimeSetWhisperPipelinedFramesOp;
+        vt.regions.commands.submitFrame = decoderRuntimeSubmitFrameOp;
+        vt.regions.commands.waitSubmittedFrame = decoderRuntimeWaitSubmittedFrameOp;
         vt.linear = linearOp;
         vt.denseMlp2 = denseMlp2Op;
         vt.denseFfnLayerNorm = denseFfnLayerNormOp;
@@ -36782,21 +36794,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.regions.relative_encoder.planFrame = debertaEncoderPlanFrameOp;
         vt.regions.relative_encoder.layer = debertaEncoderLayerOp;
         vt.regions.sequence_encoder.rotaryLayer = nomicBertEncoderLayerOp;
-        vt.regions.sequence_encoder.poolNormalize = nomicBertPoolNormalizeOp;
-        vt.regions.decoder.beginFrame = decoderRuntimeBeginFrameOp;
+        vt.regions.sequence_encoder.poolNormalize = maskedMeanNormalizeOp;
+        vt.regions.commands.beginFrame = decoderRuntimeBeginFrameOp;
         vt.regions.decoder.setActiveFrameRegime = decoderRuntimeSetActiveFrameRegimeOp;
         vt.regions.decoder.pushComputeRegion = decoderRuntimePushComputeRegionOp;
         vt.regions.decoder.popComputeRegion = decoderRuntimePopComputeRegionOp;
         vt.regions.decoder.pushPlannedComputeBarrierSuppression = decoderRuntimePushPlannedComputeBarrierSuppressionOp;
         vt.regions.decoder.popPlannedComputeBarrierSuppression = decoderRuntimePopPlannedComputeBarrierSuppressionOp;
-        vt.regions.decoder.hasActiveFrame = decoderRuntimeHasActiveFrameOp;
-        vt.regions.decoder.hasSubmittedFrame = decoderRuntimeHasSubmittedFrameOp;
+        vt.regions.commands.hasActiveFrame = decoderRuntimeHasActiveFrameOp;
+        vt.regions.commands.hasSubmittedFrame = decoderRuntimeHasSubmittedFrameOp;
         vt.regions.decoder.beginMoeCheckpoint = decoderRuntimeBeginMoeCheckpointOp;
         vt.regions.decoder.finishMoeCheckpoint = decoderRuntimeFinishMoeCheckpointOp;
         vt.regions.decoder.setMoeReplayMode = decoderRuntimeSetMoeReplayModeOp;
-        vt.regions.decoder.submitAndWaitFrame = decoderRuntimeSubmitAndWaitFrameOp;
-        vt.regions.decoder.flushActiveFrame = decoderRuntimeFlushActiveFrameOp;
-        vt.regions.decoder.cancelFrame = decoderRuntimeCancelFrameOp;
+        vt.regions.commands.submitAndWaitFrame = decoderRuntimeSubmitAndWaitFrameOp;
+        vt.regions.commands.flushActiveFrame = decoderRuntimeFlushActiveFrameOp;
+        vt.regions.commands.cancelFrame = decoderRuntimeCancelFrameOp;
         vt.regions.decoder.prepareAbsoluteEmbeddings = decoderRuntimePrepareAbsoluteEmbeddingsOp;
         vt.regions.decoder.embedAbsolutePosition = decoderRuntimeEmbedAbsolutePositionOp;
         vt.regions.decoder.prepareLayerNorm = decoderRuntimePrepareLayerNormOp;
@@ -50207,4 +50219,40 @@ test "Metal pipeline census covers complete model metadata and preserves open-st
     try std.testing.expectEqual(@as(?u16, null), MetalCompute.modelPipelineFormats(&data, .{}));
     data.lazy_weights.getPtr("custom.weight").?.quantized_storage = .{ .tensor_type = .{ .known = .Q4_0 }, .shape = &.{}, .raw_bytes = &.{}, .allocator = a, .raw_owned = false };
     try std.testing.expectEqual(@as(?u16, q4 | q8), MetalCompute.modelPipelineFormats(&data, .{}));
+}
+
+test "Metal pooling and bare RMS metadata adoption failures release device outputs" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, null);
+    defer context.deinit(a);
+    var cb = context.computeBackend();
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 3, 4, 0, 0 }, &.{ 2, 2 }));
+    defer cb.free(input);
+    const warm = (try cb.rmsNormBare(input, 2, std.math.floatMin(f32))) orelse return error.TestUnexpectedResult;
+    cb.free(warm);
+    const live_before = metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes;
+    for ([_]bool{ false, true }) |pool| {
+        for (0..2) |failure_index| {
+            var scope = try @import("../execution/submission.zig").Scope.begin(&cb);
+            defer scope.deinit();
+            try std.testing.expect(scope.owns);
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = failure_index });
+            {
+                const saved_allocator = compute.allocator;
+                compute.allocator = failing.allocator();
+                defer compute.allocator = saved_allocator;
+                if (pool) {
+                    try std.testing.expectError(error.OutOfMemory, cb.maskedMeanNormalize(&.{ .hidden = input, .attention_mask = &.{ 1, 1 }, .batch = 2, .seq_len = 1, .hidden_size = 2, .normalize = true }));
+                } else {
+                    try std.testing.expectError(error.OutOfMemory, cb.rmsNormBare(input, 2, std.math.floatMin(f32)));
+                }
+            }
+            scope.deinit();
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            try std.testing.expectEqual(live_before, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
+        }
+    }
 }

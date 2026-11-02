@@ -2533,11 +2533,11 @@ pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype)
     return output;
 }
 
-/// Append Nomic mean pooling and optional L2 normalization to the active
-/// encoder frame. Requiring an active frame keeps fallback atomic: callers can
+/// Append masked mean pooling and optional L2 normalization to an active
+/// command batch. Requiring an active frame keeps fallback atomic: callers can
 /// decline before encoding, while any failure after encoder work began aborts
 /// the whole frame.
-pub fn decoderRuntimeNomicPoolNormalizeF32Device(self: anytype, request: anytype) !?MetalTensor {
+pub fn decoderRuntimeMaskedMeanNormalizeF32Device(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0 or !hasActiveFrame(runtime)) return null;
     if (request.batch == 0 or request.seq_len == 0 or request.hidden_size == 0) return null;
@@ -2579,6 +2579,9 @@ pub fn decoderRuntimeNomicPoolNormalizeF32Device(self: anytype, request: anytype
     }
     return output;
 }
+
+/// Historical API and native symbol remain compatibility bindings.
+pub const decoderRuntimeNomicPoolNormalizeF32Device = decoderRuntimeMaskedMeanNormalizeF32Device;
 
 pub fn decoderRuntimeQuantEmbeddingLookupDeviceToken(
     self: anytype,
@@ -6908,14 +6911,51 @@ pub fn decoderRuntimeReduceAxisF32Device(
     kind: u32,
     output_shape: []const i32,
 ) !?MetalTensor {
+    return decoderRuntimeReduceAxisF32DeviceImpl(self, input, out_strides, input_strides_for_out, rank, input_elems, output_elems, reduce_dim, reduce_stride, kind, output_shape, null);
+}
+
+pub fn decoderRuntimeReduceAxisF32DeviceInto(
+    self: anytype,
+    input: MetalTensor,
+    out_strides: []const u32,
+    input_strides_for_out: []const u32,
+    rank: usize,
+    input_elems: usize,
+    output_elems: usize,
+    reduce_dim: usize,
+    reduce_stride: usize,
+    kind: u32,
+    output_shape: []const i32,
+    output_override: MetalTensor,
+) !?MetalTensor {
+    return decoderRuntimeReduceAxisF32DeviceImpl(self, input, out_strides, input_strides_for_out, rank, input_elems, output_elems, reduce_dim, reduce_stride, kind, output_shape, output_override);
+}
+
+fn decoderRuntimeReduceAxisF32DeviceImpl(
+    self: anytype,
+    input: MetalTensor,
+    out_strides: []const u32,
+    input_strides_for_out: []const u32,
+    rank: usize,
+    input_elems: usize,
+    output_elems: usize,
+    reduce_dim: usize,
+    reduce_stride: usize,
+    kind: u32,
+    output_shape: []const i32,
+    output_override: ?MetalTensor,
+) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice()) return null;
     if (rank == 0 or rank > metal_tensor.max_dims or out_strides.len < rank or input_strides_for_out.len < rank) return null;
     if (input_elems == 0 or output_elems == 0 or reduce_dim == 0 or reduce_stride == 0 or kind > 2) return null;
     if (input.elemCount() != input_elems) return null;
-    var output_device = try MetalTensor.deviceAllocate(runtime, output_elems * @sizeOf(f32), .private, output_shape);
-    errdefer output_device.deinit();
+    if (output_override) |output| {
+        if (!output.isDevice() or output.elemCount() != output_elems) return null;
+    }
+    var output_device = output_override orelse try MetalTensor.deviceAllocate(runtime, output_elems * @sizeOf(f32), .private, output_shape);
+    errdefer if (output_override == null) output_device.deinit();
     const rc = termite_metal_decode_runtime_reduce_axis_f32_device(
         runtime,
         input.deviceHandle(),
@@ -6931,6 +6971,7 @@ pub fn decoderRuntimeReduceAxisF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
+    if (output_override != null) return if (rc == 0) output_device else null;
     return finishDeviceOutput(&output_device, rc);
 }
 

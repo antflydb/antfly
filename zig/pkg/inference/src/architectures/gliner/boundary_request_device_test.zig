@@ -127,12 +127,12 @@ test "gliner boundary device request rejects external frames and unwinds failed 
     vtable.backendKind = MissingDevice.kind;
     vtable.regions.relative_boundary.device = MissingDevice.execute;
     vtable.regions.relative_boundary.download = MissingDevice.download;
-    vtable.regions.decoder.hasActiveFrame = MissingDevice.active;
+    vtable.regions.commands.hasActiveFrame = MissingDevice.active;
     cb.vtable = &vtable;
     try std.testing.expectError(error.GlinerBoundaryExternalFrame, request.run(&cb, a, &config, &prepared, &schemas, .{}));
     try std.testing.expectError(error.GlinerBoundaryExternalFrame, request.runWindows(&cb, a, &config, &prepared, &schemas, .{}));
     try std.testing.expectError(error.GlinerBoundaryExternalFrame, math.Context.create(a, &cb, .{}, null));
-    vtable.regions.decoder.hasActiveFrame = null;
+    vtable.regions.commands.hasActiveFrame = null;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, MissingDevice.allocationFailure, .{ &cb, &config, &prepared, &schemas });
     const Cancel = struct {
         fn check(_: ?*anyopaque) anyerror!void {
@@ -304,7 +304,7 @@ const ContextScopeFixture = struct {
         vtable.freeTensor = free;
         vtable.regions.relative_boundary.device = execute;
         vtable.regions.relative_boundary.scope = scopeOperation;
-        vtable.regions.decoder.hasActiveFrame = active;
+        vtable.regions.commands.hasActiveFrame = active;
         var fixture = ContextScopeFixture{ .allocator = a };
         const model_bytes = 65 * 4096; // 64 distinct weights and one shared derived table.
         fixture.accounting.stats.resident_model_live_bytes = model_bytes;

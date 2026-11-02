@@ -34,13 +34,11 @@ pub fn l2NormalizeLastDim(
     const dim = input_shape[last_axis];
     if (dim <= 0) return error.UnsupportedShape;
 
-    // CUDA has a fused bare-RMS kernel but intentionally does not expose the
-    // generic reduction primitives used below. RMS(x) / sqrt(dim) is L2(x),
-    // so use that two-kernel resident path when it is available. Keep epsilon
-    // normal-sized: dividing floatMin by a typical embedding dimension makes
-    // it subnormal and risks a zero-row 0 * rsqrt(0) NaN on GPU hardware.
+    // Reuse an admitted bare-RMS row program plus a scalar epilogue. Keep
+    // epsilon normal-sized: subnormal eps can produce zero-row NaNs on GPUs.
+    // Unsupported layouts use the primitive reference below without readback.
     const dim_usize: usize = @intCast(dim);
-    if (backend.kind() == .cuda) {
+    if (backend.kind() == .cuda or backend.kind() == .metal) {
         if (try backend.rmsNormBare(input, dim_usize, std.math.floatMin(f32))) |rms| {
             errdefer backend.free(rms);
             if (try backend.multiplyScalar(rms, 1.0 / @sqrt(@as(f32, @floatFromInt(dim))))) |normalized| {

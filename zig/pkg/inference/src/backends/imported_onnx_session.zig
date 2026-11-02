@@ -588,6 +588,10 @@ pub fn createSessionWithOptions(
     return .{
         .ptr = self,
         .vtable = &imported_session_vtable,
+        .model_contract = .{ .resident_text_embeddings = switch (self.cb.kind()) {
+            .native, .metal, .cuda => true,
+            else => false,
+        } },
         .shared_compute_context = self.shared_backend_ctx,
     };
 }

@@ -158,8 +158,27 @@ preparation API do not by themselves complete these remaining requirements:
   host-ID placeholders need no materialized tensor; imported integer tensors
   retain their resident fast path and exact integer fallback.
 - Resident stage contracts, exact typed transfers and strict readback auditing
-  are implemented. Migrating every task to resident stage chaining and moving
-  all KV/recurrent execution choices behind runtime owners remains incremental.
+  are implemented. Text encoders use the session's declared resident capability
+  by default, with an explicit host override. `execution/sequence_pool.zig`
+  owns mean, CLS, max and last-token pooling, including flattened token rows,
+  masked NaNs, empty mean rows and exact integer gather fallback. It batches
+  pooling/normalization and materializes only requested final vectors. The
+  existing fused masked-mean/L2 program accepts checked generic dimensions;
+  historical Nomic request/method/native symbols remain compatibility bindings.
+  Single-row means reuse that program to normalize other pooling results.
+  No new Metal shader is needed. Prepared normalized heads skip empty batches.
+  `execution/submission.zig` owns command scopes, preserving foreign batches,
+  cancelling only owned unsubmitted work and avoiding replay after submission
+  errors. Nine generic command callbacks live in `CommandSubmissionRegion`;
+  historical decoder methods route to the same backend implementations.
+  Declared text input planning is shared by embedding and reranking. It retains
+  input order and integer precision, supplies positions/additive attention bias,
+  and sizes input/temporary storage before allocating bias buffers. Host token
+  outputs retain pooling semantics when imported graphs flatten sequence rows.
+  CUDA max reduction uses negative infinity as its identity, including fully
+  masked rows. Retained native targets keep their existing launch resources.
+  Migrating every remaining task to resident chaining and moving all
+  KV/recurrent execution choices behind runtime owners remains incremental.
   `graph/decode_batch.zig` now owns uniform, mixed prefill/decode and packed
   batch metadata assembly, including per-sequence physical KV views, recurrent
   caches and position ownership. Generation retains compatibility exports and

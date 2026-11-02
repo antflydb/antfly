@@ -1031,3 +1031,58 @@ test "prepared physical CUDA capture failure falls back before submission and re
         if (mode == 1 and iteration == 2) try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_replays);
     };
 }
+
+test "assigned single-axis reductions use the Metal plan output and preserve held frames" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const ml = @import("ml");
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const values = [_]f32{ 1, -2, 4, -1, 3, -7, -5, 8, -9, 2, -3, 6 };
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&values, &.{ 2, 3, 2 }));
+    defer cb.free(input);
+    for ([_]ops.kernel_descriptor.ReductionMode{ .sum, .max, .mean }) |mode| {
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.graph.Builder.init(&graph);
+        const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 3, 2 }));
+        const output = switch (mode) {
+            .sum => try b.reduceSum(x, &.{1}),
+            .max => try b.reduceMax(x, &.{1}),
+            .mean => try b.reduceMean(x, &.{1}),
+        };
+        try graph.markOutput(output);
+        var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+        defer program.deinit();
+        var raw_inputs = [_]interpreter.RuntimeInput{.{ .node_id = x, .value = input, .source_backend = &cb }};
+        const inputs = try program.remapInputs(&raw_inputs);
+        var executable = try prepareWithOptions(a, &program, &cb, .compiled_preferred, .{ .input_bindings = inputs });
+        defer executable.deinit();
+        var held: ?@import("../backends/session.zig").ResidentOutputs = null;
+        defer if (held) |*owner| owner.deinit();
+        const expected: [4]f32 = switch (mode) {
+            .sum => .{ 8, -10, -17, 16 },
+            .max => .{ 4, -1, -3, 8 },
+            .mean => .{ 8.0 / 3.0, -10.0 / 3.0, -17.0 / 3.0, 16.0 / 3.0 },
+        };
+        for (0..4) |iteration| {
+            var result = try executable.run(a, .{ .runtime_inputs = inputs, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+            defer result.deinit(&executable.runtime);
+            try std.testing.expectEqual(@as(u64, 1), result.stats.assigned_kernel_dispatches);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.device_host_accesses);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.boundary_output_materializations);
+            if (iteration > 1) try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
+            const actual = try cb.toFloat32(result.outputs[0], a);
+            defer a.free(actual);
+            for (expected, actual) |wanted, value| try std.testing.expectApproxEqAbs(wanted, value, 1e-6);
+            if (iteration == 0) {
+                held = .{ .outputs = result.outputs, .allocator = a, .backend = &cb };
+                result.outputs = &.{};
+            }
+        }
+        const retained = try cb.toFloat32(held.?.outputs[0], a);
+        defer a.free(retained);
+        for (expected, retained) |wanted, value| try std.testing.expectApproxEqAbs(wanted, value, 1e-6);
+    }
+}

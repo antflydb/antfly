@@ -13908,10 +13908,10 @@ const DenseQwen3PrefillProbe = struct {
         table.regions.decoder.prepareOrReuseTextPrefill = prepare;
         table.regions.decoder.planPrefillFrame = plan;
         table.regions.decoder.ensureLinearSlot = prepareHead;
-        table.regions.decoder.beginFrame = begin;
+        table.regions.commands.beginFrame = begin;
         table.regions.decoder.executeGraphCommandPlanFrame = execute;
-        table.regions.decoder.submitAndWaitFrame = submit;
-        table.regions.decoder.cancelFrame = cancel;
+        table.regions.commands.submitAndWaitFrame = submit;
+        table.regions.commands.cancelFrame = cancel;
         return table;
     }
     const config: Config = .{

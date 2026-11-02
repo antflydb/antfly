@@ -24,6 +24,9 @@ const Primitive = enum { norm_backward };
 
 const Options = struct {
     primitive: ?Primitive = null,
+    embedding_pool: ?inference.pipelines.embedding.PoolingStrategy = null,
+    embedding_resident: ?bool = null,
+    embedding_normalize: bool = true,
     rows: usize = 17,
     dim: usize = 768,
     model_dir: []const u8 = "",
@@ -48,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     var options = Options{};
     while (args.next()) |arg| {
         const value = args.next() orelse return error.MissingArgument;
-        if (std.mem.eql(u8, arg, "--primitive")) options.primitive = std.meta.stringToEnum(Primitive, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--rows")) options.rows = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--dim")) options.dim = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = value else if (std.mem.eql(u8, arg, "--backend")) options.backend = backend_choice.parse(value) orelse return error.InvalidBackend else if (std.mem.eql(u8, arg, "--batch")) options.batch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seq-len")) options.seq_len = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--warmup-iters")) options.warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--measure-iters")) options.iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--output")) options.output = value else if (std.mem.eql(u8, arg, "--diagnostics")) options.diagnostics = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-request-contexts")) options.decoder_request_contexts = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-scheduled")) options.decoder_scheduled = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-steps")) options.decoder_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--soak-seconds")) options.soak_seconds = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-pause-ms")) options.soak_pause_ms = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-allocator")) options.soak_allocator = std.meta.stringToEnum(@TypeOf(options.soak_allocator), value) orelse return error.InvalidArgument else return error.InvalidArgument;
+        if (std.mem.eql(u8, arg, "--primitive")) options.primitive = std.meta.stringToEnum(Primitive, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-pool")) options.embedding_pool = std.meta.stringToEnum(inference.pipelines.embedding.PoolingStrategy, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-resident")) options.embedding_resident = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-normalize")) options.embedding_normalize = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--rows")) options.rows = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--dim")) options.dim = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = value else if (std.mem.eql(u8, arg, "--backend")) options.backend = backend_choice.parse(value) orelse return error.InvalidBackend else if (std.mem.eql(u8, arg, "--batch")) options.batch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seq-len")) options.seq_len = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--warmup-iters")) options.warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--measure-iters")) options.iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--output")) options.output = value else if (std.mem.eql(u8, arg, "--diagnostics")) options.diagnostics = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-request-contexts")) options.decoder_request_contexts = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-scheduled")) options.decoder_scheduled = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-steps")) options.decoder_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--soak-seconds")) options.soak_seconds = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-pause-ms")) options.soak_pause_ms = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-allocator")) options.soak_allocator = std.meta.stringToEnum(@TypeOf(options.soak_allocator), value) orelse return error.InvalidArgument else return error.InvalidArgument;
     }
     if (options.primitive) |primitive| {
         if (options.backend != .native or options.rows == 0 or options.dim == 0 or options.iterations == 0 or options.soak_seconds != 0) return error.InvalidGeometry;
@@ -77,6 +80,11 @@ pub fn main(init: std.process.Init) !void {
     const model = try manager.loadFromDir(options.model_dir);
     const model_loaded = inference.platform.time.awakeNs(init.io);
     const session = model.session;
+    if (options.embedding_pool != null) {
+        if (options.decoder_steps != 0 or options.soak_seconds != 0) return error.InvalidGeometry;
+        try runEmbeddingStages(init, model, a, options);
+        return;
+    }
     if (options.decoder_steps != 0) {
         if (options.decoder_scheduled) try runScheduledDecoder(init, model, a, options) else if (options.decoder_request_contexts) try runDecoderRequests(init, model, a, options) else try runDecoder(init, model, a, options, &bounded);
         return;
@@ -690,4 +698,73 @@ noinline fn runNormBackward(init: std.process.Init, options: Options) !void {
     }
     std.mem.sort(u64, samples, {}, std.sort.asc(u64));
     std.debug.print("unified_primitive primitive=norm_backward backend=native rows={d} dim={d} iterations={d} output_elements={d} checksum={d:.9} p50_ns={d} p95_ns={d} min_ns={d}\n", .{ options.rows, options.dim, options.iterations, elements, checksum, samples[samples.len / 2], samples[@min(samples.len - 1, samples.len * 95 / 100)], samples[0] });
+}
+
+/// Actual pretokenized task entry point: encoder, pooling, normalization and
+/// requested final materialization. The same harness runs on frozen revisions;
+/// backend default selection is deliberately left to each session contract.
+fn runEmbeddingStages(init: std.process.Init, model: *inference.server.model_manager.LoadedModel, a: std.mem.Allocator, options: Options) !void {
+    var pipeline = model.embeddingPipeline(a);
+    pipeline.config.pooling = options.embedding_pool.?;
+    pipeline.config.normalize = options.embedding_normalize;
+    if (options.embedding_resident) |enabled| pipeline.config.resident_text_encoder = enabled;
+    const count = try std.math.mul(usize, options.batch, options.seq_len);
+    const ids = try a.alloc(i64, count);
+    defer a.free(ids);
+    const mask = try a.alloc(i64, count);
+    defer a.free(mask);
+    for (ids, mask, 0..) |*id, *valid, index| {
+        const column = index % options.seq_len;
+        const padding = column >= options.seq_len - 2;
+        id.* = if (padding) 0 else if (column == 0) 101 else if (column == options.seq_len - 3) 102 else @intCast(1000 + column % 1000);
+        valid.* = if (padding) 0 else 1;
+    }
+    const samples = try a.alloc(u64, options.iterations);
+    defer a.free(samples);
+    var reference: std.ArrayListUnmanaged(f32) = .empty;
+    defer reference.deinit(a);
+    const audit_mod = inference.execution.transfer_audit;
+    var uploads: u64 = 0;
+    var downloads: u64 = 0;
+    var download_bytes: u64 = 0;
+    var host_bytes: u64 = 0;
+    for (0..options.warmup + options.iterations) |iteration| {
+        var audit = audit_mod.Audit{};
+        const start = inference.platform.time.awakeNs(init.io);
+        const vectors = blk: {
+            try audit_mod.begin(&audit);
+            defer audit_mod.end();
+            break :blk try pipeline.embedTokenized(ids, mask, options.batch, options.seq_len);
+        };
+        const elapsed = inference.platform.time.awakeNs(init.io) - start;
+        defer {
+            for (vectors) |vector| a.free(vector);
+            a.free(vectors);
+        }
+        if (vectors.len != options.batch) return error.InvalidTensorShape;
+        if (iteration >= options.warmup) {
+            samples[iteration - options.warmup] = elapsed;
+            uploads += audit.upload_calls;
+            downloads += audit.download_calls;
+            download_bytes += audit.download_bytes;
+            host_bytes += audit.host_access_bytes;
+        }
+        var offset: usize = 0;
+        for (vectors) |vector| {
+            for (vector) |value| if (!std.math.isFinite(value)) return error.NonFiniteOutput;
+            if (iteration == 0) {
+                try reference.appendSlice(a, vector);
+            } else {
+                if (offset + vector.len > reference.items.len or !std.mem.eql(u8, std.mem.sliceAsBytes(reference.items[offset..][0..vector.len]), std.mem.sliceAsBytes(vector))) return error.EmbeddingResetParity;
+            }
+            offset += vector.len;
+        }
+        if (offset != reference.items.len) return error.InvalidTensorShape;
+    }
+    var checksum: f64 = 0;
+    for (reference.items) |value| checksum += value;
+    if (options.output) |path| try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(reference.items) });
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    const resident = if (comptime @hasDecl(@TypeOf(pipeline), "residentTextEncoderEnabled")) pipeline.residentTextEncoderEnabled() else pipeline.config.resident_text_encoder;
+    std.debug.print("unified_embedding_stages backend={s} pooling={s} resident={} batch={d} seq={d} iterations={d} output_elements={d} checksum={d:.9} p50_ns={d} p95_ns={d} min_ns={d} upload_calls={d} download_calls={d} download_bytes={d} host_access_bytes={d} reset_parity=exact\n", .{ @tagName(model.session.backend()), @tagName(options.embedding_pool.?), resident, options.batch, options.seq_len, options.iterations, reference.items.len, checksum, samples[samples.len / 2], samples[@min(samples.len - 1, samples.len * 95 / 100)], samples[0], uploads, downloads, download_bytes, host_bytes });
 }

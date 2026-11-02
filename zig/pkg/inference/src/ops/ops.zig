@@ -1692,7 +1692,8 @@ pub const DebertaEncoderFramePlanRequest = backend_contracts.DebertaEncoderFrame
 pub const DebertaEncoderLayerRequest = backend_contracts.DebertaEncoderLayerRequest;
 pub const NomicBertEncoderLayerSpec = backend_contracts.NomicBertEncoderLayerSpec;
 pub const NomicBertEncoderLayerRequest = backend_contracts.NomicBertEncoderLayerRequest;
-pub const NomicBertPoolNormalizeRequest = backend_contracts.NomicBertPoolNormalizeRequest;
+pub const MaskedMeanNormalizeRequest = backend_contracts.MaskedMeanNormalizeRequest;
+pub const NomicBertPoolNormalizeRequest = MaskedMeanNormalizeRequest;
 
 pub const GraphPlanSlot = struct {
     slot: usize,
@@ -2002,6 +2003,7 @@ pub const ComputeBackend = struct {
     /// pointer load and unsupported regions cost no allocations. Historical
     /// ComputeBackend methods below are compatibility adapters into these tables.
     pub const Regions = struct {
+        commands: CommandSubmissionRegion = .{},
         window_attention: WindowAttentionRegion = .{},
         action_scoring: ActionScoringRegion = .{},
         sequence_encoder: SequenceEncoderRegion = .{},
@@ -2016,14 +2018,25 @@ pub const ComputeBackend = struct {
         replay: ReplayRegion = .{},
     };
 
+    /// Device command batching is shared by encoders, pooling, projections and
+    /// decoders. Model-specific preparation/checkpoints remain in their region.
+    pub const CommandSubmissionRegion = struct {
+        setPipelinedFrames: ?*const fn (ctx: *anyopaque, enabled: bool) bool = null,
+        submitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        waitSubmittedFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        beginFrame: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        hasActiveFrame: ?*const fn (ctx: *anyopaque) bool = null,
+        hasSubmittedFrame: ?*const fn (ctx: *anyopaque) bool = null,
+        submitAndWaitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        flushActiveFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        cancelFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    };
+
     pub const DecoderRegion = struct {
         /// Temporarily suppress planned compute barriers for a backend-owned
         /// frame whose caller has stronger model-specific ordering knowledge.
         pushPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
         popPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-        setPipelinedFrames: ?*const fn (ctx: *anyopaque, enabled: bool) bool = null,
-        submitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-        waitSubmittedFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         /// Consume an active decoder-runtime frame with a batched masked
         /// argmax. Backends return null when there is no compatible frame.
         argmaxRowsSuppress: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
@@ -2048,10 +2061,6 @@ pub const ComputeBackend = struct {
         /// sequence. Backends return false before encoding when unsupported;
         /// after accepting, errors should abort the active frame.
         executeGraphCommandPlanFrame: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeGraphCommandPlanFrameRequest) anyerror!bool = null,
-        /// Begin a backend-owned decoder frame. Backends that support this
-        /// encode subsequent runtime operations into one command submission
-        /// until `decoderRuntimeSubmitAndWaitFrame` is called.
-        beginFrame: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
         /// Tag the active frame for backend-owned diagnostic attribution.
         /// This must not alter dispatch or command-buffer topology.
         setActiveFrameRegime: ?*const fn (ctx: *anyopaque, regime: DecoderRuntimeFrameRegime) anyerror!void = null,
@@ -2059,10 +2068,6 @@ pub const ComputeBackend = struct {
         /// frame. The returned token restores the prior nested region.
         pushComputeRegion: ?*const fn (ctx: *anyopaque, region: DecoderRuntimeComputeRegion) anyerror!?usize = null,
         popComputeRegion: ?*const fn (ctx: *anyopaque, previous: usize) anyerror!void = null,
-        /// Return true when a backend-owned decoder frame is already active.
-        hasActiveFrame: ?*const fn (ctx: *anyopaque) bool = null,
-        /// Submitted frames remain owned by the caller until explicitly waited.
-        hasSubmittedFrame: ?*const fn (ctx: *anyopaque) bool = null,
         /// Arm a per-layer MoE miss ledger for an optimistic decode frame.
         /// Returns false before encoding when the arena is not fully warm.
         beginMoeCheckpoint: ?*const fn (ctx: *anyopaque, layer_count: usize, top_k: usize) anyerror!bool = null,
@@ -2072,13 +2077,6 @@ pub const ComputeBackend = struct {
         /// Force the bounded replay through the synchronized route/repair
         /// path. Backends without optimistic MoE routing ignore this.
         setMoeReplayMode: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
-        /// Submit and wait for the active backend-owned decoder frame.
-        submitAndWaitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-        /// Submit and wait for the active backend-owned decoder frame, then
-        /// reopen a frame for subsequent runtime operations.
-        flushActiveFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-        /// Drop the active backend-owned decoder frame without submitting it.
-        cancelFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         /// Reuse or prepare decoder-runtime family state for the current
         /// sequence shape. Backends that do not support this can leave it
         /// null and the caller will see a zero-valued result.
@@ -2341,7 +2339,7 @@ pub const ComputeBackend = struct {
         /// backend-owned slot layout. Backends return null when the shape/path
         /// should use the ordinary eager attention + SwiGLU sequence.
         rotaryLayer: ?*const fn (ctx: *anyopaque, request: *const NomicBertEncoderLayerRequest) anyerror!?CT = null,
-        poolNormalize: ?*const fn (ctx: *anyopaque, request: *const NomicBertPoolNormalizeRequest) anyerror!?CT = null,
+        poolNormalize: ?*const fn (ctx: *anyopaque, request: *const MaskedMeanNormalizeRequest) anyerror!?CT = null,
     };
 
     pub const ActionScoringRegion = struct {
@@ -4365,21 +4363,21 @@ pub const ComputeBackend = struct {
     /// running, so the caller can keep one frame in flight behind the one
     /// it encodes. Returns false when the backend cannot pipeline.
     pub fn decoderRuntimeSetWhisperPipelinedFrames(self: *const ComputeBackend, enabled: bool) bool {
-        if (self.vtable.regions.decoder.setPipelinedFrames) |f| return f(self.ptr, enabled);
+        if (self.vtable.regions.commands.setPipelinedFrames) |f| return f(self.ptr, enabled);
         return false;
     }
 
     /// Submit the active frame without waiting; pair with
     /// `decoderRuntimeWaitSubmittedFrame`.
     pub fn decoderRuntimeSubmitFrame(self: *const ComputeBackend) !void {
-        if (self.vtable.regions.decoder.submitFrame) |op| return op(self.ptr);
+        if (self.vtable.regions.commands.submitFrame) |op| return op(self.ptr);
         return error.UnsupportedOperation;
     }
 
     /// Wait for the frame submitted by `decoderRuntimeSubmitFrame`; a no-op
     /// when none is in flight.
     pub fn decoderRuntimeWaitSubmittedFrame(self: *const ComputeBackend) !void {
-        if (self.vtable.regions.decoder.waitSubmittedFrame) |op| return op(self.ptr);
+        if (self.vtable.regions.commands.waitSubmittedFrame) |op| return op(self.ptr);
     }
 
     pub fn addLayerNorm(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
@@ -5724,15 +5722,19 @@ pub const ComputeBackend = struct {
         return null;
     }
 
-    pub fn nomicBertPoolNormalize(self: *const ComputeBackend, request: *const NomicBertPoolNormalizeRequest) !?CT {
+    pub fn maskedMeanNormalize(self: *const ComputeBackend, request: *const MaskedMeanNormalizeRequest) !?CT {
         if (self.vtable.regions.sequence_encoder.poolNormalize) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
+    /// Compatibility adapter for existing prepared encoder callers.
+    pub fn nomicBertPoolNormalize(self: *const ComputeBackend, request: *const NomicBertPoolNormalizeRequest) !?CT {
+        return self.maskedMeanNormalize(request);
+    }
 
     pub fn decoderRuntimeBeginFrame(self: *const ComputeBackend) !bool {
-        if (self.vtable.regions.decoder.beginFrame) |op| {
+        if (self.vtable.regions.commands.beginFrame) |op| {
             return op(self.ptr);
         }
         return false;
@@ -5760,14 +5762,14 @@ pub const ComputeBackend = struct {
     }
 
     pub fn decoderRuntimeHasActiveFrame(self: *const ComputeBackend) bool {
-        if (self.vtable.regions.decoder.hasActiveFrame) |op| {
+        if (self.vtable.regions.commands.hasActiveFrame) |op| {
             return op(self.ptr);
         }
         return false;
     }
 
     pub fn decoderRuntimeHasSubmittedFrame(self: *const ComputeBackend) bool {
-        if (self.vtable.regions.decoder.hasSubmittedFrame) |op| return op(self.ptr);
+        if (self.vtable.regions.commands.hasSubmittedFrame) |op| return op(self.ptr);
         return false;
     }
 
@@ -5792,19 +5794,19 @@ pub const ComputeBackend = struct {
     }
 
     pub fn decoderRuntimeSubmitAndWaitFrame(self: *const ComputeBackend) !void {
-        if (self.vtable.regions.decoder.submitAndWaitFrame) |op| {
+        if (self.vtable.regions.commands.submitAndWaitFrame) |op| {
             return op(self.ptr);
         }
     }
 
     pub fn decoderRuntimeFlushActiveFrame(self: *const ComputeBackend) !void {
-        if (self.vtable.regions.decoder.flushActiveFrame) |op| {
+        if (self.vtable.regions.commands.flushActiveFrame) |op| {
             return op(self.ptr);
         }
     }
 
     pub fn decoderRuntimeCancelFrame(self: *const ComputeBackend) !void {
-        if (self.vtable.regions.decoder.cancelFrame) |op| {
+        if (self.vtable.regions.commands.cancelFrame) |op| {
             return op(self.ptr);
         }
     }

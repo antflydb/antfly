@@ -562,7 +562,6 @@ fn metalReduceHasResidentShape(query: CapabilityQuery) bool {
     if (input_shape.dtype != .f32) return false;
     const rank = input_shape.rank();
     if (rank == 0 or attrs.axes[0] >= rank) return false;
-    if (std.meta.activeTag(query.op) == .reduce_max and attrs.axes[0] != rank - 1) return false;
     if (input_shape.dim(attrs.axes[0]) <= 0) return false;
     return shapeHasConcreteElements(input_shape);
 }

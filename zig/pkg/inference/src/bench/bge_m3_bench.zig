@@ -316,7 +316,7 @@ pub fn main(init: std.process.Init) !void {
     var pipeline = model.embeddingPipeline(allocator);
     pipeline.execution_control = cold_control;
     pipeline.config.resident_projection_required = opts.backend != .native;
-    if (opts.backend != .native and !pipeline.config.resident_text_encoder) {
+    if (opts.backend != .native and !pipeline.residentTextEncoderEnabled()) {
         return error.ResidentTextEncoderUnavailable;
     }
 

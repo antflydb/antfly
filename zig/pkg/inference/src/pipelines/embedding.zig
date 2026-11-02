@@ -19,6 +19,7 @@
 // Uses the unified Tokenizer interface (HuggingFace or SentencePiece) and any
 // backend Session (ONNX, native).
 
+const sequence_pool = @import("../execution/sequence_pool.zig");
 const text_inputs = @import("../execution/text_inputs.zig");
 const std = @import("std");
 const build_options = @import("build_options");
@@ -117,8 +118,9 @@ pub const EmbeddingConfig = struct {
     /// TemplateProcessing post-processor) are left untouched, so old and new
     /// tokenizer.json snapshots produce identical ids.
     ensure_trailing_eos_id: ?i32 = null,
-    /// Keep a supported text encoder, pooling, and normalization on the GPU.
-    resident_text_encoder: bool = false,
+    /// Infer resident stages from the session contract by default. Explicit
+    /// false retains the host reference route for qualification or callers.
+    resident_text_encoder: ?bool = null,
     /// Bidirectional EmbeddingGemma 2 uses its own resident encoder contract.
     resident_embedding_gemma2: bool = false,
     /// Keep single-image CUDA soft tokens resident through the encoder.
@@ -364,6 +366,10 @@ pub const EmbeddingPipeline = struct {
     /// Expanded tokens successfully encoded by the most recent public call.
     last_input_tokens: usize = 0,
 
+    pub fn residentTextEncoderEnabled(self: *const EmbeddingPipeline) bool {
+        return self.config.resident_text_encoder orelse self.session.model_contract.resident_text_embeddings;
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         session: backends.Session,
@@ -440,7 +446,7 @@ pub const EmbeddingPipeline = struct {
             var scoped = self.*;
             scoped.allocator = bounded.allocator();
             // Length buckets retain the admitted physical allocation ceiling.
-            const temporary = (if (self.config.resident_text_encoder and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and (self.session.backend() == .native or self.session.backend() == .metal)) scoped.embedGemma2Texts(texts) else scoped.embedWithBatchPlan(texts, .{ .batch_size = 1, .pad_final_batch = false })) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else err;
+            const temporary = (if (self.residentTextEncoderEnabled() and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and (self.session.backend() == .native or self.session.backend() == .metal)) scoped.embedGemma2Texts(texts) else scoped.embedWithBatchPlan(texts, .{ .batch_size = 1, .pad_final_batch = false })) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else err;
             defer {
                 for (temporary) |vector| scoped.allocator.free(vector);
                 scoped.allocator.free(temporary);
@@ -1123,7 +1129,7 @@ pub const EmbeddingPipeline = struct {
         }
         if (self.execution_control) |control| try control.check();
         const compact_policy = @import("../architectures/embedding_gemma2.zig").compactRowsEnabled(text_session.backend() == .metal) and
-            self.config.resident_text_encoder and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and session_factory.getEmbeddingGemma2Config(self.session) != null;
+            self.residentTextEncoderEnabled() and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and session_factory.getEmbeddingGemma2Config(self.session) != null;
         var active_rows: usize = 0;
         for (attention_mask) |value| {
             if (compact_policy and value != 0 and value != 1) return error.InvalidAttentionMask;
@@ -1185,7 +1191,7 @@ pub const EmbeddingPipeline = struct {
         };
         if (self.execution_control) |control| try control.check();
 
-        if (self.config.resident_text_encoder and (self.session.backend() == .metal or self.session.backend() == .native) and self.config.normalize and self.config.pooling == .mean and self.text_projection == null) {
+        if (self.residentTextEncoderEnabled() and (self.session.backend() == .metal or self.session.backend() == .native) and self.config.normalize and self.config.pooling == .mean and self.text_projection == null) {
             if (session_factory.getEmbeddingGemma2Config(self.session)) |cfg| {
                 const dimensions = self.config.embedding_gemma2_dimensions;
                 if (!@import("../architectures/embedding_gemma2.zig").validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
@@ -1227,7 +1233,7 @@ pub const EmbeddingPipeline = struct {
             )) |resident_embeddings| {
                 return resident_embeddings;
             }
-        } else if (self.config.resident_text_encoder) {
+        } else if (self.residentTextEncoderEnabled()) {
             if (try self.tryEmbedTextResidentEncoder(inputs, all_mask, batch, effective_len, run_permit)) |resident_embeddings| {
                 return resident_embeddings;
             }
@@ -2749,15 +2755,7 @@ pub const EmbeddingPipeline = struct {
         }
     }
 
-    const ResidentPooled = struct {
-        value: ops_mod.CT,
-        backend: *const ops_mod.ComputeBackend,
-        owns_value: bool,
-
-        pub fn deinit(self: ResidentPooled) void {
-            if (self.owns_value) self.backend.free(self.value);
-        }
-    };
+    const ResidentPooled = sequence_pool.Value;
 
     fn recordResidentProjection(
         self: *EmbeddingPipeline,
@@ -2875,7 +2873,7 @@ pub const EmbeddingPipeline = struct {
         };
         defer encoder_outputs.deinit();
 
-        var pooled = self.residentPoolTextOutput(&encoder_outputs, mask, batch, seq_len) catch |err| switch (err) {
+        const embeddings = self.finishResidentTextRows(&encoder_outputs, mask, batch, seq_len, self.config.normalize) catch |err| switch (err) {
             error.UnsupportedResidentTextPooling,
             error.UnsupportedPrimitiveOp,
             error.UnsupportedOperation,
@@ -2883,17 +2881,6 @@ pub const EmbeddingPipeline = struct {
             => return self.residentProjectionFallback(.text, "text.pool.qwen3.resident", batch, @errorName(err)),
             else => return err,
         };
-        defer pooled.deinit();
-
-        const pooled_storage = try self.allocator.alloc(ops_mod.CT, 1);
-        defer self.allocator.free(pooled_storage);
-        pooled_storage[0] = pooled.value;
-        var pooled_outputs = session_mod.ResidentOutputs{
-            .outputs = pooled_storage,
-            .backend = pooled.backend,
-            .allocator = self.allocator,
-        };
-        const embeddings = try self.resident2DToEmbeddings(&pooled_outputs, batch);
         self.recordResidentProjection(.text, .success, "text.encoder.qwen3.resident", batch, null);
         return embeddings;
     }
@@ -2939,7 +2926,7 @@ pub const EmbeddingPipeline = struct {
             .allocator = self.allocator,
         };
 
-        var pooled = self.residentPoolTextOutput(&encoder_outputs, mask, batch, seq_len) catch |err| switch (err) {
+        const embeddings = self.finishResidentTextRows(&encoder_outputs, mask, batch, seq_len, self.config.normalize and !normalize_in_frame) catch |err| switch (err) {
             error.UnsupportedResidentTextPooling,
             error.UnsupportedPrimitiveOp,
             error.UnsupportedOperation,
@@ -2947,17 +2934,6 @@ pub const EmbeddingPipeline = struct {
             => return null,
             else => return err,
         };
-        defer pooled.deinit();
-
-        const pooled_storage = try self.allocator.alloc(ops_mod.CT, 1);
-        defer self.allocator.free(pooled_storage);
-        pooled_storage[0] = pooled.value;
-        var pooled_outputs = session_mod.ResidentOutputs{
-            .outputs = pooled_storage,
-            .backend = pooled.backend,
-            .allocator = self.allocator,
-        };
-        const embeddings = try self.resident2DToEmbeddingsWithNormalization(&pooled_outputs, batch, self.config.normalize and !normalize_in_frame);
         self.recordResidentProjection(.text, .success, "text.encoder.qwen3.graph", batch, null);
         return embeddings;
     }
@@ -3054,7 +3030,7 @@ pub const EmbeddingPipeline = struct {
         defer encoder_outputs.deinit();
         if (encoder_outputs.outputs.len == 0) return error.NoOutputTensors;
 
-        var pooled = self.residentPoolTextOutput(&encoder_outputs, mask, batch, seq_len) catch |err| switch (err) {
+        const embeddings = self.finishResidentTextRows(&encoder_outputs, mask, batch, seq_len, self.config.normalize) catch |err| switch (err) {
             error.UnsupportedResidentTextPooling,
             error.UnsupportedPrimitiveOp,
             error.UnsupportedOperation,
@@ -3062,17 +3038,6 @@ pub const EmbeddingPipeline = struct {
             => return self.residentProjectionFallback(.text, "text.pool.resident", batch, @errorName(err)),
             else => return err,
         };
-        defer pooled.deinit();
-
-        const pooled_storage = try self.allocator.alloc(ops_mod.CT, 1);
-        defer self.allocator.free(pooled_storage);
-        pooled_storage[0] = pooled.value;
-        var pooled_outputs = session_mod.ResidentOutputs{
-            .outputs = pooled_storage,
-            .backend = pooled.backend,
-            .allocator = self.allocator,
-        };
-        const embeddings = try self.resident2DToEmbeddings(&pooled_outputs, batch);
         self.last_resident_backend_timing = encoder_outputs.backend.debugTimingSnapshot();
         self.recordResidentProjection(.text, .success, "text.encoder.resident", batch, null);
         return embeddings;
@@ -3166,6 +3131,19 @@ pub const EmbeddingPipeline = struct {
         return error.UnsupportedResidentProjectionInput;
     }
 
+    fn finishResidentTextRows(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, mask: []const i32, batch: usize, sequence: usize, normalize: bool) ![][]f32 {
+        if (outputs.outputs.len == 0) return error.NoOutputTensors;
+        const rows = try sequence_pool.finishHostRows(self.allocator, outputs.backend, outputs.outputs[0], mask, batch, sequence, switch (self.config.pooling) {
+            .mean => .mean,
+            .cls => .cls,
+            .max => .max,
+            .last => .last,
+        }, normalize);
+        errdefer freeEmbeddingSlices(self.allocator, rows);
+        if (self.config.resident_embedding_gemma2) for (rows) |row| try validateEmbeddingGemma2Vector(row);
+        return rows;
+    }
+
     fn residentPoolTextOutput(
         self: *EmbeddingPipeline,
         outputs: *session_mod.ResidentOutputs,
@@ -3173,165 +3151,20 @@ pub const EmbeddingPipeline = struct {
         batch: usize,
         seq_len: usize,
     ) !ResidentPooled {
-        const output = outputs.outputs[0];
-        const backend = outputs.backend;
-        const shape = try backend.tensorShape(output, outputs.allocator);
-        defer outputs.allocator.free(shape);
-
-        if (shape.len == 2) {
-            if (shape[0] == @as(i64, @intCast(batch)) and shape[1] > 0) {
-                return .{ .value = output, .backend = backend, .owns_value = false };
-            }
-            if (shape[0] == @as(i64, @intCast(batch * seq_len)) and shape[1] > 0) {
-                const hidden: usize = @intCast(shape[1]);
-                const output_shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(hidden) };
-                const reshaped = try backend.primReshape(output, &output_shape);
-                defer backend.free(reshaped);
-                return switch (self.config.pooling) {
-                    .mean => try residentMaskedMeanPool(outputs.allocator, backend, reshaped, mask, batch, seq_len, hidden),
-                    .cls => try residentClsPool(outputs.allocator, backend, reshaped, batch, seq_len, hidden),
-                    .last => try residentLastTokenPool(outputs.allocator, backend, reshaped, mask, batch, seq_len, hidden),
-                    .max => error.UnsupportedResidentTextPooling,
-                };
-            }
-            return error.ShapeMismatch;
-        }
-        if (shape.len != 3) return error.UnexpectedOutputShape;
-        if (shape[0] != @as(i64, @intCast(batch)) or shape[1] != @as(i64, @intCast(seq_len)) or shape[2] <= 0) {
-            return error.ShapeMismatch;
-        }
-
-        return switch (self.config.pooling) {
-            .mean => try residentMaskedMeanPool(outputs.allocator, backend, output, mask, batch, seq_len, @intCast(shape[2])),
-            .cls => try residentClsPool(outputs.allocator, backend, output, batch, seq_len, @intCast(shape[2])),
-            .last => try residentLastTokenPool(outputs.allocator, backend, output, mask, batch, seq_len, @intCast(shape[2])),
-            .max => error.UnsupportedResidentTextPooling,
-        };
+        if (outputs.outputs.len == 0) return error.NoOutputTensors;
+        return sequence_pool.poolOutput(outputs.allocator, outputs.backend, outputs.outputs[0], mask, batch, seq_len, switch (self.config.pooling) {
+            .mean => .mean,
+            .cls => .cls,
+            .max => .max,
+            .last => .last,
+        });
     }
 
-    fn residentMaskedMeanPool(
-        allocator: std.mem.Allocator,
-        backend: *const ops_mod.ComputeBackend,
-        output: ops_mod.CT,
-        mask: []const i32,
-        batch: usize,
-        seq_len: usize,
-        hidden: usize,
-    ) !ResidentPooled {
-        if (mask.len != batch * seq_len) return error.ShapeMismatch;
+    const residentMaskedMeanPool = sequence_pool.maskedMean;
 
-        const mask_values = try allocator.alloc(f32, batch * seq_len);
-        defer allocator.free(mask_values);
-        for (mask, 0..) |flag, i| mask_values[i] = if (flag > 0) 1.0 else 0.0;
+    const residentClsPool = sequence_pool.cls;
 
-        const mask_shape_i32 = [_]i32{ @intCast(batch), @intCast(seq_len), 1 };
-        const mask_shape = [_]i64{ @intCast(batch), @intCast(seq_len), 1 };
-        const output_shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(hidden) };
-        const sum_shape = [_]i64{ @intCast(batch), 1, @intCast(hidden) };
-        const count_shape = [_]i64{ @intCast(batch), 1, 1 };
-        const pooled_shape = [_]i64{ @intCast(batch), @intCast(hidden) };
-
-        const mask_ct = try backend.fromFloat32Shape(mask_values, &mask_shape_i32);
-        defer backend.free(mask_ct);
-        const mask_broadcast = try backend.primBroadcastInDim(mask_ct, &output_shape, &.{ 0, 1, 2 }, &mask_shape);
-        defer backend.free(mask_broadcast);
-        const masked_output = try backend.multiply(output, mask_broadcast);
-        defer backend.free(masked_output);
-        const summed = try backend.primReduceSum(masked_output, &.{1}, &output_shape);
-        defer backend.free(summed);
-        const counts = try backend.primReduceSum(mask_ct, &.{1}, &mask_shape);
-        defer backend.free(counts);
-        const count_broadcast = try backend.primBroadcastInDim(counts, &sum_shape, &.{ 0, 1, 2 }, &count_shape);
-        defer backend.free(count_broadcast);
-        const mean3d = try backend.primDivide(summed, count_broadcast);
-        defer backend.free(mean3d);
-        const mean2d = try backend.primReshape(mean3d, &pooled_shape);
-
-        return .{ .value = mean2d, .backend = backend, .owns_value = true };
-    }
-
-    fn residentClsPool(
-        allocator: std.mem.Allocator,
-        backend: *const ops_mod.ComputeBackend,
-        output: ops_mod.CT,
-        batch: usize,
-        seq_len: usize,
-        hidden: usize,
-    ) !ResidentPooled {
-        const flat_rows = std.math.mul(usize, batch, seq_len) catch return error.ShapeMismatch;
-        const flat_shape = [_]i64{
-            std.math.cast(i64, flat_rows) orelse return error.ShapeMismatch,
-            std.math.cast(i64, hidden) orelse return error.ShapeMismatch,
-        };
-        const flat = try backend.primReshape(output, &flat_shape);
-        defer backend.free(flat);
-        const row_ids = try allocator.alloc(u32, batch);
-        defer allocator.free(row_ids);
-        for (row_ids, 0..) |*row_id, b| {
-            const row = std.math.mul(usize, b, seq_len) catch return error.ShapeMismatch;
-            row_id.* = std.math.cast(u32, row) orelse return error.ShapeMismatch;
-        }
-        if (try backend.takeRows(flat, row_ids, batch, hidden)) |pooled| {
-            return .{ .value = pooled, .backend = backend, .owns_value = true };
-        }
-
-        const input_shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(hidden) };
-        const starts = [_]i64{ 0, 0, 0 };
-        const limits = [_]i64{ @intCast(batch), 1, @intCast(hidden) };
-        const strides = [_]i64{ 1, 1, 1 };
-        const pooled_shape = [_]i64{ @intCast(batch), @intCast(hidden) };
-        const sliced = try backend.primSlice(output, &starts, &limits, &strides, &input_shape);
-        defer backend.free(sliced);
-        const pooled = try backend.primReshape(sliced, &pooled_shape);
-        return .{ .value = pooled, .backend = backend, .owns_value = true };
-    }
-
-    fn residentLastTokenPool(
-        allocator: std.mem.Allocator,
-        backend: *const ops_mod.ComputeBackend,
-        output: ops_mod.CT,
-        mask: []const i32,
-        batch: usize,
-        seq_len: usize,
-        hidden: usize,
-    ) !ResidentPooled {
-        if (mask.len != batch * seq_len) return error.ShapeMismatch;
-
-        const row_ids = try allocator.alloc(u32, batch);
-        defer allocator.free(row_ids);
-        for (0..batch) |b| {
-            var last_idx: usize = 0;
-            for (0..seq_len) |s| {
-                if (mask[b * seq_len + s] > 0) last_idx = s;
-            }
-            row_ids[b] = @intCast(b * seq_len + last_idx);
-        }
-
-        const flat_shape = [_]i64{ @intCast(batch * seq_len), @intCast(hidden) };
-        const flat = backend.primReshape(output, &flat_shape) catch null;
-        if (flat) |flat_output| {
-            defer backend.free(flat_output);
-            if (try backend.takeRows(flat_output, row_ids, batch, hidden)) |pooled| {
-                return .{ .value = pooled, .backend = backend, .owns_value = true };
-            }
-        }
-
-        const host = try backend.toFloat32(output, allocator);
-        defer allocator.free(host);
-        if (host.len != batch * seq_len * hidden) return error.ShapeMismatch;
-
-        const pooled_values = try allocator.alloc(f32, batch * hidden);
-        errdefer allocator.free(pooled_values);
-        for (0..batch) |b| {
-            const src_offset = @as(usize, row_ids[b]) * hidden;
-            const dst_offset = b * hidden;
-            @memcpy(pooled_values[dst_offset .. dst_offset + hidden], host[src_offset .. src_offset + hidden]);
-        }
-
-        const pooled = try backend.fromFloat32Shape(pooled_values, &.{ @intCast(batch), @intCast(hidden) });
-        allocator.free(pooled_values);
-        return .{ .value = pooled, .backend = backend, .owns_value = true };
-    }
+    const residentLastTokenPool = sequence_pool.last;
 
     fn resident2DToEmbeddings(
         self: *EmbeddingPipeline,
@@ -5072,6 +4905,24 @@ test "embeddinggemma2 CUDA flat audio and mixed batch dispatch fit production ad
         for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
     }
     try std.testing.expect(pipeline.last_input_tokens > expected_audio.input_tokens);
+}
+
+test "embedding stages default to the session resident contract and preserve explicit host control" {
+    var marker: u8 = 0;
+    var pipeline = EmbeddingPipeline{
+        .allocator = std.testing.allocator,
+        .session = .{ .ptr = &marker, .vtable = undefined, .model_contract = .{ .resident_text_embeddings = true } },
+        .tok = undefined,
+        .config = .{},
+    };
+    try std.testing.expect(pipeline.residentTextEncoderEnabled());
+    pipeline.config.resident_text_encoder = false;
+    try std.testing.expect(!pipeline.residentTextEncoderEnabled());
+    pipeline.config.resident_text_encoder = null;
+    pipeline.session.model_contract.resident_text_embeddings = false;
+    try std.testing.expect(!pipeline.residentTextEncoderEnabled());
+    pipeline.config.resident_text_encoder = true;
+    try std.testing.expect(pipeline.residentTextEncoderEnabled());
 }
 
 test "host flattened token outputs honor every requested pooling mode" {

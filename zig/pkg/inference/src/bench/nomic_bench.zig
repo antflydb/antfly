@@ -115,7 +115,7 @@ pub fn main(init: std.process.Init) !void {
 
     var pipeline = model.embeddingPipeline(allocator);
     pipeline.config.resident_projection_required = opts.backend == .metal;
-    if (opts.backend == .metal and !pipeline.config.resident_text_encoder) {
+    if (opts.backend == .metal and !pipeline.residentTextEncoderEnabled()) {
         return error.ResidentTextEncoderUnavailable;
     }
 

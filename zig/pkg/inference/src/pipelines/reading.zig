@@ -2913,7 +2913,7 @@ test "Florence step frame drains unsupported consumers and cancels failed token 
             var lost_context = LostResult{ .base = cb };
             var lost_table = cb.vtable.*;
             lost_table.regions.decoder.argmaxRowsSuppress = LostResult.consume;
-            lost_table.regions.decoder.hasActiveFrame = LostResult.active;
+            lost_table.regions.commands.hasActiveFrame = LostResult.active;
             lost_table.regions.decoder.beginPlannedComputeScope = LostResult.scope;
             const lost_cb = ComputeBackend{ .ptr = &lost_context, .vtable = &lost_table };
             var lost_frame = try beginFlorenceStepFrame(&cb, true);

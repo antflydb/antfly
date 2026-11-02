@@ -1493,7 +1493,7 @@ pub const NomicBertEncoderLayerRequest = struct {
     norm_eps: f32,
 };
 
-pub const NomicBertPoolNormalizeRequest = struct {
+pub const MaskedMeanNormalizeRequest = struct {
     hidden: CT,
     attention_mask: []const i64,
     batch: usize,
@@ -1501,6 +1501,9 @@ pub const NomicBertPoolNormalizeRequest = struct {
     hidden_size: usize,
     normalize: bool,
 };
+
+/// Historical source compatibility; geometry and semantics are model neutral.
+pub const NomicBertPoolNormalizeRequest = MaskedMeanNormalizeRequest;
 
 test "tensor storage classes classify host and device residency" {
     try std.testing.expect(TensorStorageClass.host_f32.isHost());

@@ -277157,7 +277157,7 @@ $L__BB357_6:
 	st.local.v4.u32 	[%rd2], {%r155, %r156, %r157, %r158};
 	st.local.v4.u32 	[%rd2+16], {%r159, %r160, %r161, %r162};
 	setp.eq.s32 	%p6, %r165, 1;
-	selp.f32 	%f113, 0fFF7FFFFF, 0f00000000, %p6;
+	selp.f32 	%f113, 0fFF800000, 0f00000000, %p6;
 	setp.eq.s32 	%p7, %r163, 0;
 	mov.u32 	%r307, %r306;
 	@%p7 bra 	$L__BB358_7;
@@ -277337,12 +277337,12 @@ $L__BB358_84:
 
 $L__BB358_91:
 	setp.lt.u32 	%p90, %r132, 3;
-	mov.f32 	%f113, 0fFF7FFFFF;
+	mov.f32 	%f113, 0fFF800000;
 	mov.u32 	%r362, 0;
 	@%p90 bra 	$L__BB358_94;
 
 	sub.s32 	%r361, %r166, %r359;
-	mov.f32 	%f113, 0fFF7FFFFF;
+	mov.f32 	%f113, 0fFF800000;
 	mov.u32 	%r362, 0;
 
 $L__BB358_93:
@@ -277697,11 +277697,11 @@ $L__BB358_13:
 
 $L__BB358_29:
 	setp.lt.u32 	%p52, %r29, 3;
-	mov.f32 	%f113, 0fFF7FFFFF;
+	mov.f32 	%f113, 0fFF800000;
 	@%p52 bra 	$L__BB358_40;
 
 	sub.s32 	%r311, %r166, %r310;
-	mov.f32 	%f113, 0fFF7FFFFF;
+	mov.f32 	%f113, 0fFF800000;
 
 $L__BB358_31:
 	setp.eq.s32 	%p53, %r154, 0;

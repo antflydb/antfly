@@ -153,6 +153,38 @@ pub const ReductionGeometry = struct {
     }
 };
 
+/// Exact single-axis address mapping for a keep-dimensions reduction. The
+/// same descriptor drives eager and assigned-storage execution on Metal.
+pub const ReductionAxis = struct {
+    out_strides: [8]u32 = @splat(0),
+    input_strides_for_out: [8]u32 = @splat(0),
+    axis: u8,
+    reduce_stride: u32 = 0,
+
+    pub fn init(geometry: ReductionGeometry) !ReductionAxis {
+        if (geometry.rank == 0 or geometry.rank > 8 or @popCount(geometry.mask) != 1 or geometry.mask >> @intCast(geometry.rank) != 0) return error.InvalidShape;
+        var result = ReductionAxis{ .axis = @intCast(@ctz(geometry.mask)) };
+        var input_stride: u32 = 1;
+        var output_stride: u32 = 1;
+        var axis: usize = geometry.rank;
+        while (axis > 0) {
+            axis -= 1;
+            const dim = geometry.dims[axis];
+            if (dim == 0) return error.InvalidShape;
+            result.out_strides[axis] = output_stride;
+            if (axis == result.axis) {
+                result.reduce_stride = input_stride;
+            } else {
+                result.input_strides_for_out[axis] = input_stride;
+                output_stride = try std.math.mul(u32, output_stride, dim);
+            }
+            input_stride = try std.math.mul(u32, input_stride, dim);
+        }
+        if (input_stride != geometry.input_count or output_stride != geometry.output_count or geometry.reduce_count != geometry.dims[result.axis]) return error.InvalidShape;
+        return result;
+    }
+};
+
 /// Dense rank-two or leading-batch matrix contraction. Target kernels choose
 /// their own precision, tiling and GEMM implementations from this geometry.
 pub fn planDenseDotGeneral(lhs: []const i64, rhs: []const i64, lc: []const u8, rc: []const u8, lb: []const u8, rb: []const u8) !BatchedDotGeneralPlan {
@@ -946,4 +978,23 @@ pub fn ropeChunksPerToken(logical_shape: ?[]const i64, total_chunks: usize, seq_
         }
     }
     return total_chunks / seq_len;
+}
+
+test "single-axis reduction address plans preserve outer inner and keep-dimension strides" {
+    const geometry = try ReductionGeometry.init(&.{ 2, 3, 4 }, &.{1});
+    const plan = try ReductionAxis.init(geometry);
+    try std.testing.expectEqual(@as(u8, 1), plan.axis);
+    try std.testing.expectEqual(@as(u32, 4), plan.reduce_stride);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 4, 1 }, plan.out_strides[0..3]);
+    try std.testing.expectEqualSlices(u32, &.{ 12, 0, 1 }, plan.input_strides_for_out[0..3]);
+    const outer = try ReductionAxis.init(try ReductionGeometry.init(&.{ 2, 3, 4 }, &.{0}));
+    try std.testing.expectEqual(@as(u32, 12), outer.reduce_stride);
+    try std.testing.expectEqualSlices(u32, &.{ 12, 4, 1 }, outer.out_strides[0..3]);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 4, 1 }, outer.input_strides_for_out[0..3]);
+    try std.testing.expectError(error.InvalidShape, ReductionAxis.init(try ReductionGeometry.init(&.{ 2, 3 }, &.{})));
+    try std.testing.expectError(error.InvalidShape, ReductionAxis.init(try ReductionGeometry.init(&.{ 2, 3 }, &.{ 0, 1 })));
+    try std.testing.expectError(error.Overflow, ReductionAxis.init(try ReductionGeometry.init(&.{ 65536, 65536 }, &.{0})));
+    var malformed = geometry;
+    malformed.output_count += 1;
+    try std.testing.expectError(error.InvalidShape, ReductionAxis.init(malformed));
 }

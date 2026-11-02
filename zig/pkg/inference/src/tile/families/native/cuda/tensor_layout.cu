@@ -307,7 +307,8 @@ extern "C" __global__ void termite_primitive_reduce_f32(
     unsigned int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (out_idx >= output_count) return;
     unsigned int dims[8] = {dim0, dim1, dim2, dim3, dim4, dim5, dim6, dim7};
-    float acc = mode == 1u ? -3.402823466e+38f : 0.0f;
+    // Max has an infinite identity, including an all-negative-infinity row.
+    float acc = mode == 1u ? -__int_as_float(0x7f800000) : 0.0f;
     // A contiguous set of reduced axes is a logical [outer, reduce, inner]
     // tensor. Decode the output coordinate once, rather than doing rank-many
     // integer divisions for every input value. Preserve the serial FP32 sum
