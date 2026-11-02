@@ -1024,6 +1024,7 @@ pub const Reader = struct {
                     if (visitor) |sink| {
                         var context: @import("query/streamed_projection.zig").Context = .{
                             .scratch = temporary,
+                            .property_projection = self.cypher_projection,
                             .value = .{ .row = .{ .plan = .{ .base = projection, .arena = .init(temporary) }, .row = row } },
                         };
                         const document = decoded_key orelse (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;

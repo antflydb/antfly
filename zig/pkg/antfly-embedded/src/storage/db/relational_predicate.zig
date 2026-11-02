@@ -101,6 +101,10 @@ pub const Plan = struct {
             else => .unknown,
         };
         const order = std.mem.order(u8, left, self.operand);
+        return self.compareOrder(order);
+    }
+
+    fn compareOrder(self: *const Plan, order: std.math.Order) Truth {
         return truth(switch (self.op) {
             .eq, .is_not_distinct => order == .eq,
             .ne, .is_distinct => order != .eq,
@@ -135,10 +139,42 @@ pub const Source = struct {
         if (row.layout != self.layout or row.table_schema.relational_columns.ptr != self.columns.ptr or row.table_schema.relational_columns.len != self.columns.len)
             return error.RelationalRowSchemaMismatch;
         scratch.clearRetainingCapacity();
+        // Residual predicates bind a single ascending column. Compare borrowed
+        // byte scalars against the compiled memcomparable operand directly;
+        // constructing a row-sized key would defeat narrow COUNT projections.
+        if (self.tuple) |tuple| {
+            const key = tuple.keys[0];
+            if (key.expression == null and !key.descending and (key.column_type == .string or key.column_type == .blob)) {
+                const cell = try row.findCell(key.ordinal);
+                const is_null = cell == null or cell.?.is_null;
+                if (is_null or self.plan.operand_null or self.plan.op == .is_null or self.plan.op == .is_not_null)
+                    return self.plan.compare(&.{}, is_null);
+                const bytes = cell.?.value.bytes_val;
+                const payload_limit = tuple.encoded_bytes_limit -| 3;
+                if (tuple.encoded_bytes_limit < 3 or bytes.len > payload_limit or
+                    (bytes.len > payload_limit / 2 and std.mem.count(u8, bytes, &.{0}) > payload_limit - bytes.len))
+                    return error.RelationalIndexKeyTooLarge;
+                var position: usize = 1; // The nonnull scalar tag is shared.
+                for (bytes) |raw| {
+                    const byte = if (key.fold_ascii) std.ascii.toLower(raw) else raw;
+                    if (compareByte(self.plan.operand, &position, byte)) |order| return self.plan.compareOrder(order);
+                    if (byte == 0) if (compareByte(self.plan.operand, &position, 0xff)) |order| return self.plan.compareOrder(order);
+                }
+                for ([_]u8{ 0, 0 }) |byte| if (compareByte(self.plan.operand, &position, byte)) |order| return self.plan.compareOrder(order);
+                return self.plan.compareOrder(std.math.order(position, self.plan.operand.len));
+            }
+        }
         const has_null = if (self.tuple) |tuple| try tuple.append(alloc, scratch, row) else true;
         return self.plan.compare(scratch.items, has_null);
     }
 };
+
+fn compareByte(operand: []const u8, position: *usize, byte: u8) ?std.math.Order {
+    if (position.* == operand.len) return .gt;
+    const order = std.math.order(byte, operand[position.*]);
+    position.* += 1;
+    return if (order == .eq) null else order;
+}
 
 fn truth(value: bool) Truth {
     return if (value) .yes else .no;

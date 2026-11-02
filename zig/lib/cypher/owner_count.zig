@@ -160,6 +160,7 @@ pub const Projection = struct {
     fields: []const []const u8,
     presence: []const []const u8,
     arguments: []const Argument,
+    demand: @import("read_fields.zig").Demand,
     pub const Argument = union(enum) { field: []const u8, present: bool };
     fn dependencies(a: std.mem.Allocator, expr: *const ast.Expr, values: *std.StringHashMapUnmanaged(void), fields: *std.StringHashMapUnmanaged(void)) !bool {
         return switch (expr.value) {
@@ -236,6 +237,35 @@ pub const Projection = struct {
             for (name.*) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return null;
             if (!values.contains(name.*)) try presence.append(a, name.*);
         }
-        return .{ .fields = names, .presence = presence.items, .arguments = arguments };
+        return .{ .fields = names, .presence = presence.items, .arguments = arguments, .demand = try readDemand(a, graph, input) };
     }
 };
+
+/// Count invocations own a separate field/nullness scope. Derive it with the
+/// statement analyzer so catalog-only dependencies retain borrowed predicates
+/// without inheriting unrelated complete-value observers from the caller.
+fn readDemand(a: std.mem.Allocator, graph: catalog.Graph, input: b.CountInput) !@import("read_fields.zig").Demand {
+    const calls = try a.alloc(ast.Expr, input.arguments.len + 1);
+    const items = try a.alloc(ast.Item, calls.len);
+    const args = try a.alloc([1]*const ast.Expr, input.arguments.len);
+    for (calls, items, 0..) |*call, *item, i| {
+        call.* = .{ .span = .{}, .value = .{ .call = .{ .name = "count", .args = &.{}, .star = true } } };
+        if (i != 0) if (input.arguments[i - 1]) |argument_expr| {
+            args[i - 1] = .{argument_expr};
+            call.value.call.args = &args[i - 1];
+            call.value.call.star = false;
+        };
+        item.* = .{ .expression = call, .alias = "_owner_count" };
+    }
+    const path: ast.Path = .{ .span = .{}, .alias = null, .nodes = &.{input.node}, .edges = &.{} };
+    const clauses = [_]ast.Clause{
+        .{ .span = .{}, .operation = .{ .match = .{ .paths = &.{path}, .predicate = input.predicate } } },
+        .{ .span = .{}, .operation = .{ .project = .{ .final = true, .value = .{ .items = items } } } },
+    };
+    // Membership views can omit endpoint labels while retaining the original
+    // catalog's relationships. This invocation has no edge patterns; keep its
+    // demand graph strictly table-local as well.
+    var local = graph;
+    local.relationships = &.{};
+    return (try @import("read_fields.zig").analyze(a, .{ .source = input.source, .clauses = &clauses }, local)).demand;
+}

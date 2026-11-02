@@ -5483,3 +5483,77 @@ errors, unused-value success, implicit projection shadowing, row filters and
 whole-value controls all pass on the final binary. Python formatting/lint, six
 release-workflow regression tests and whitespace checks pass. Repository cache
 cleanup completed while preserving active builds and recent output.
+
+### Identity keys, relationship domains and borrowed label predicates
+
+Entity grouping, DISTINCT and ordering consume identity rather than the entity's
+properties. Their aliases now keep downstream demand, so an identity-only count
+can scan headers while a later complete entity return still upgrades the table
+or edge domain. Property and container group keys retain structural value demand.
+
+Relationship metadata demand is scoped to `(source physical table, index,
+stored type)`. Aliases that can identify the same physical edge share a union of
+requirements; different domains retain independent field and nested-path plans.
+Whole paths upgrade their possible edge domains, and opaque adapters retain the
+conservative global fallback. The native owner applies each domain's plan before
+owning winner metadata, for both outgoing and incoming adjacency.
+
+Label-only equality dependencies use a private predicate projection. It validates
+the selected value's Cypher numeric/depth domain and streams JSON comparisons,
+including escaped strings, containers, exact mixed numeric equality and NULL.
+The projection retains a matching catalog constant rather than copying the
+stored value. A nonmatching nonnull value uses `[NULL]`, which cannot compare
+true to any JSON value but preserves COUNT/nullness semantics. Actual NULL and
+missing values stay null/missing. Observing the property value or returning the
+complete entity disables this representation. Authorization continues to run
+against the original snapshot-owned record before projection.
+
+Document and relational readers share this comparison contract; typed scalar
+cells borrow their payloads. Comparison state is bounded by the catalog operands
+and nesting depth, while ordinary selected-value errors remain visible. The
+representation is private and does not change returned JSON or Cypher values.
+
+New authenticated regressions cover both storage layouts, identity grouping,
+positive/negative label decisions, mixed label/count observers, null/missing
+fields, disjoint relationship metadata, whole-value controls and filtered-reader
+node/edge visibility. `origin/main` at `df9f6d61a8` was merged as `c129c614a5`;
+the release-scope materialization regression suite passes all six cases.
+The final refresh also merged `eb185ad90c` as `00bbb1d568`, without conflicts;
+the updated Hacker News deployment-plan tests pass all three cases.
+
+Owner-side counts derive an invocation-local demand plan from their own match,
+filter and COUNT arguments using the same analyzer. They do not inherit unrelated
+complete-value observers from the caller, nor discard borrowed catalog predicate
+projections. Both streaming and fallback count execution restore the caller's
+demand on completion or failure. A focused regression checks the count scope's
+predicate projection independently of statement planning.
+
+Relational residual predicates compare borrowed text/blob cells directly against
+the compiled operand's escaped ordering bytes, including ASCII collation,
+embedded NUL bytes and SQL null/distinct semantics. They preserve size checks
+without constructing a full key for each candidate. This keeps owner COUNT
+filters narrow while preserving index selection and filter pushdown. A focused
+regression compares every operator against the ordinary encoder and checks a
+2 MiB candidate with an allocator that permits no allocation.
+
+Authenticated two-record measurements use a 2 MiB root string, a 2 MiB nested
+string and a 2 MiB R-edge payload. The final campaign also includes a positive
+label predicate. Bytes below are the query allocator's reported peak, rather
+than process RSS or source bytes examined.
+
+| Query shape | Review document baseline | Final document | Final relational |
+| --- | ---: | ---: | ---: |
+| `WITH DISTINCT d RETURN count(*)` | 63,431,294 B | 83,138 B | 71,636 B |
+| Entity grouping followed by count | 63,431,170 B | 83,506 B | 72,004 B |
+| `labels(d)` with a wide predicate field | 22,860,470 B | 61,952 B | 56,458 B |
+| Negative label-only count | 4,744,201 B | 63,271 B | 61,078 B |
+| Complete S relationship plus `sum(r.rank)` | 7,915,856 B | 83,578 B | 72,076 B |
+
+Both new authenticated campaigns pass with 1 MiB query budgets for narrow
+reads. Complete node/relationship controls retain their payloads under explicit
+larger budgets; null/missing and row-filtered visibility checks pass as well.
+
+Final qualification: all 558 core tests and all ten authenticated performance
+campaigns pass. The native server build, C API, document-predicate/projection,
+borrowed-count, bounded-adjacency and callback-ABI checks pass; Zig/Python
+formatting, Python lint and whitespace checks pass.

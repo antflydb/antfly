@@ -22,7 +22,9 @@ const A = std.mem.Allocator;
 /// Literal property names; children are partial maps, never public values.
 pub const Projection = struct {
     name: []const u8,
-    mode: enum { value, presence, children },
+    mode: enum { value, presence, children, predicate },
+    /// Private equality-only representative; never used for observed fields.
+    alternatives: []const std.json.Value = &.{},
     validate: bool = false,
     children: []const Projection = &.{},
 };
@@ -40,11 +42,17 @@ pub const PreparedMetadata = struct {
 };
 pub const Demand = struct {
     pub const Table = struct { name: []const u8, nodes: Entity, labels: ?[]const []const u8 };
+    pub const RelationshipDomain = struct { table: []const u8, index: []const u8, stored_type: []const u8, entity: Entity };
+    relationship_domains: []const RelationshipDomain = &.{},
     tables: []const Table = &.{},
     nodes: Entity = .{},
     relationships: Entity = .{},
     /// Null retains every catalog membership (labels() or a returned node).
     labels: ?[]const []const u8 = null,
+    pub fn relationship(self: Demand, table_name: []const u8, index: []const u8, stored_type: []const u8) Entity {
+        for (self.relationship_domains) |domain_value| if (std.mem.eql(u8, domain_value.table, table_name) and std.mem.eql(u8, domain_value.index, index) and std.mem.eql(u8, domain_value.stored_type, stored_type)) return domain_value.entity;
+        return self.relationships;
+    }
     pub fn table(self: Demand, name: []const u8) ?Table {
         for (self.tables) |item| if (std.mem.eql(u8, item.name, name)) return item;
         return null;
@@ -55,6 +63,7 @@ const Names = std.StringHashMapUnmanaged(void);
 const Binding = struct {
     kind: Kind,
     tables: []const []const u8 = &.{},
+    relationship_ids: []const usize = &.{},
     prefix: []const []const u8 = &.{},
     used: ?*bool = null,
 };
@@ -68,10 +77,12 @@ const NodePlan = struct {
     full: bool = false,
     labels_full: bool = false,
 };
+const RelationshipPlan = struct { table: []const u8, index: []const u8, stored_type: []const u8, plan: NodePlan = .{} };
 const Plan = struct {
     a: A,
     graph: catalog.Graph,
     source: []const u8,
+    relationship_plans: []RelationshipPlan,
     table_names: []const []const u8,
     tables: std.StringHashMapUnmanaged(*NodePlan) = .empty,
     label_tables: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -98,6 +109,7 @@ const Plan = struct {
         self.nodes_full = true;
         self.edges_full = true;
         self.labels_full = true;
+        for (self.relationship_plans) |*domain_value| domain_value.plan.full = true;
         var tables = self.tables.valueIterator();
         while (tables.next()) |item| {
             item.*.full = true;
@@ -119,6 +131,9 @@ const Plan = struct {
                 self.labels_full = true;
             },
         }
+        if (binding.kind != .node) for (binding.relationship_ids) |id| {
+            self.relationship_plans[id].plan.full = true;
+        };
         if (binding.kind != .relationship) for (binding.tables) |table| {
             const item = self.tables.get(table).?;
             item.full = true;
@@ -132,10 +147,37 @@ const Plan = struct {
             .relationship => if (presence) try self.edge_presence.put(self.a, name, {}) else try self.edge_values.put(self.a, name, {}),
             .path => self.complete(),
         }
+        if (binding.kind == .relationship) for (binding.relationship_ids) |id| {
+            const item = &self.relationship_plans[id].plan;
+            if (presence) try item.presence.put(self.a, name, {}) else try item.values.put(self.a, name, {});
+        };
         if (binding.kind == .node) for (binding.tables) |table| {
             const item = self.tables.get(table).?;
             if (presence) try item.presence.put(self.a, name, {}) else try item.values.put(self.a, name, {});
         };
+    }
+    fn edgeDomain(self: *Plan, edge: ast.Edge) ![]const usize {
+        var selected: std.ArrayList(usize) = .empty;
+        for (self.relationship_plans, 0..) |domain_value, id| {
+            for (self.graph.relationships) |mapping| {
+                if (!std.mem.eql(u8, domain_value.table, self.label_tables.get(mapping.source_label).?) or !std.mem.eql(u8, domain_value.index, mapping.index) or !std.mem.eql(u8, domain_value.stored_type, mapping.stored_type)) continue;
+                const matches = edge.types.len == 0 or for (edge.types) |name| {
+                    if (std.mem.eql(u8, name, mapping.name)) break true;
+                } else false;
+                if (matches) {
+                    try selected.append(self.a, id);
+                    break;
+                }
+            }
+        }
+        return selected.items;
+    }
+    fn pathEdges(self: *Plan, path: ast.Path) ![]const usize {
+        var selected: std.ArrayList(usize) = .empty;
+        for (path.edges) |edge| for (try self.edgeDomain(edge)) |id| {
+            if (std.mem.indexOfScalar(usize, selected.items, id) == null) try selected.append(self.a, id);
+        };
+        return selected.items;
     }
     fn domain(self: *Plan, node: ast.Node) ![]const []const u8 {
         // MATCH constrains an existing binding; OPTIONAL MATCH can retain it
@@ -263,7 +305,10 @@ const Plan = struct {
         if (binding.kind == .node) {
             try self.node_paths.append(self.a, path);
             for (binding.tables) |table| try self.tables.get(table).?.paths.append(self.a, path);
-        } else try self.edge_paths.append(self.a, path);
+        } else {
+            try self.edge_paths.append(self.a, path);
+            for (binding.relationship_ids) |id| try self.relationship_plans[id].plan.paths.append(self.a, path);
+        }
     }
     fn property(self: *Plan, expr: ast.Expr, presence: bool) !bool {
         const binding = (try self.lineage(expr)) orelse return false;
@@ -286,7 +331,8 @@ const Plan = struct {
                     // Every output name shadows its input, including implicit
                     // map-projection names whose value has no entity lineage.
                     _ = visible.remove(name);
-                    const forwarded = if (name.len != 0 and (!p.final or internal_return) and !p.value.distinct and !grouping) try self.lineage(item.expression.*) else null;
+                    const candidate = if (name.len != 0 and (!p.final or internal_return)) try self.lineage(item.expression.*) else null;
+                    const forwarded = if (candidate) |binding| if ((!p.value.distinct and !grouping) or binding.prefix.len == 0) candidate else null else null;
                     if (forwarded) |source| {
                         var binding = source;
                         if (binding.prefix.len != 0 and item.expression.value != .variable) {
@@ -304,7 +350,10 @@ const Plan = struct {
                 while (names_iter.next()) |key| try visible.put(self.a, key.*, next.get(key.*).?);
                 self.entities = visible;
                 try self.walk(p.value.predicate);
-                try self.walk(p.value.order);
+                for (p.value.order) |order| {
+                    const binding = if (order.expression.value == .variable) self.entities.get(order.expression.value.variable) else null;
+                    if (binding == null or binding.?.prefix.len != 0) try self.walk(order.expression.*);
+                }
                 try self.walk(p.value.skip);
                 try self.walk(p.value.limit);
                 if (p.final and !internal_return and p.value.wildcard) {
@@ -365,6 +414,7 @@ const Plan = struct {
             if (value.alias) |name| if (!self.entities.contains(name)) try self.entities.put(self.a, name, .{
                 .kind = if (T == ast.Node) .node else if (T == ast.Edge) .relationship else .path,
                 .tables = if (T == ast.Node) try self.domain(value) else if (T == ast.Path) try self.pathDomain(value) else &.{},
+                .relationship_ids = if (T == ast.Edge) try self.edgeDomain(value) else if (T == ast.Path) try self.pathEdges(value) else &.{},
             });
             if (T == ast.Node) {
                 self.unlabeled = self.unlabeled or value.labels.len == 0;
@@ -519,7 +569,7 @@ const Plan = struct {
                 else => {},
             }
         }
-        if (T == ast.Node or T == ast.Edge) for (value.properties) |entry| try self.field(.{ .kind = if (T == ast.Node) .node else .relationship, .tables = if (T == ast.Node) try self.domain(value) else &.{} }, entry.name, false);
+        if (T == ast.Node or T == ast.Edge) for (value.properties) |entry| try self.field(.{ .kind = if (T == ast.Node) .node else .relationship, .tables = if (T == ast.Node) try self.domain(value) else &.{}, .relationship_ids = if (T == ast.Edge) try self.edgeDomain(value) else &.{} }, entry.name, false);
         // Procedure yields may contain entities with implementation-defined
         // aliases. Preserve complete results across this extension boundary.
         if (T == ast.Procedure) self.complete();
@@ -547,7 +597,14 @@ pub fn analyze(a: A, query: ast.Query, graph: catalog.Graph) !Analysis {
     var table_set: Names = .empty;
     for (graph.labels) |label| try table_set.put(a, label.table, {});
     const table_names = try sortedNames(a, table_set);
-    var plan: Plan = .{ .a = a, .graph = graph, .source = query.source, .table_names = table_names };
+    var relationship_plans: std.ArrayList(RelationshipPlan) = .empty;
+    for (graph.relationships) |mapping| {
+        const table_name = graph.label(mapping.source_label).?.table;
+        for (relationship_plans.items) |domain_value| {
+            if (std.mem.eql(u8, domain_value.table, table_name) and std.mem.eql(u8, domain_value.index, mapping.index) and std.mem.eql(u8, domain_value.stored_type, mapping.stored_type)) break;
+        } else try relationship_plans.append(a, .{ .table = table_name, .index = mapping.index, .stored_type = mapping.stored_type });
+    }
+    var plan: Plan = .{ .a = a, .graph = graph, .source = query.source, .table_names = table_names, .relationship_plans = relationship_plans.items };
     for (table_names) |table| {
         const item = try a.create(NodePlan);
         item.* = .{};
@@ -574,6 +631,7 @@ pub fn analyze(a: A, query: ast.Query, graph: catalog.Graph) !Analysis {
     for (table_names, tables) |table, *out| {
         const item = plan.tables.get(table).?;
         var selected: Names = .empty;
+        var predicates: std.StringHashMapUnmanaged(std.ArrayList(@import("value.zig").Value)) = .empty;
         for (item.labels.items) |label| {
             var observed = item.labels_full or plan.labels.contains(label.name);
             if (plan.unlabeled and !observed) {
@@ -582,10 +640,35 @@ pub fn analyze(a: A, query: ast.Query, graph: catalog.Graph) !Analysis {
             }
             if (observed) {
                 try selected.put(a, label.name, {});
-                for (label.predicate) |entry| try item.values.put(a, entry.name, {});
+                for (label.predicate) |entry| {
+                    const observed_field = item.full or item.values.contains(entry.name) or for (item.paths.items) |path| {
+                        if (std.mem.eql(u8, path.parts[0], entry.name)) break true;
+                    } else false;
+                    if (observed_field) {
+                        try item.values.put(a, entry.name, {});
+                    } else {
+                        const slot = try predicates.getOrPut(a, entry.name);
+                        if (!slot.found_existing) slot.value_ptr.* = .empty;
+                        try slot.value_ptr.append(a, entry.value);
+                    }
+                }
             }
         }
-        out.* = .{ .name = table, .nodes = try entity(a, item.full, item.values, item.presence, item.paths.items), .labels = if (item.labels_full) null else try sortedNames(a, selected) };
+        var node_entity = try entity(a, item.full, item.values, item.presence, item.paths.items);
+        if (node_entity.fields) |fields| {
+            var names: Names = .empty;
+            for (fields) |name| try names.put(a, name, {});
+            var projections: std.ArrayList(Projection) = .empty;
+            try projections.appendSlice(a, node_entity.projection);
+            var iter = predicates.iterator();
+            while (iter.next()) |entry| {
+                try names.put(a, entry.key_ptr.*, {});
+                try projections.append(a, .{ .name = entry.key_ptr.*, .mode = .predicate, .alternatives = try std.json.parseFromSliceLeaky([]const std.json.Value, a, try std.json.Stringify.valueAlloc(a, entry.value_ptr.items, .{}), .{ .allocate = .alloc_always }) });
+            }
+            node_entity.fields = try sortedNames(a, names);
+            node_entity.projection = projections.items;
+        }
+        out.* = .{ .name = table, .nodes = node_entity, .labels = if (item.labels_full) null else try sortedNames(a, selected) };
     }
     for (graph.labels) |label| {
         var observed = plan.labels_full or plan.labels.contains(label.name);
@@ -600,10 +683,13 @@ pub fn analyze(a: A, query: ast.Query, graph: catalog.Graph) !Analysis {
         // Legacy adapters retain complete membership semantics.
         for (label.predicate) |entry| try plan.fields.put(a, entry.name, {});
     }
+    const domains = try a.alloc(Demand.RelationshipDomain, plan.relationship_plans.len);
+    for (plan.relationship_plans, domains) |domain_value, *out| out.* = .{ .table = domain_value.table, .index = domain_value.index, .stored_type = domain_value.stored_type, .entity = try entity(a, domain_value.plan.full, domain_value.plan.values, domain_value.plan.presence, domain_value.plan.paths.items) };
     return .{
         .fields = if (plan.full) null else try sortedNames(a, plan.fields),
         .demand = .{
             .tables = tables,
+            .relationship_domains = domains,
             .nodes = try entity(a, plan.nodes_full, plan.node_values, plan.node_presence, plan.node_paths.items),
             .relationships = try entity(a, plan.edges_full, plan.edge_values, plan.edge_presence, plan.edge_paths.items),
             .labels = if (plan.labels_full) null else try sortedNames(a, membership),

@@ -393,9 +393,11 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const self = cast(ptr);
             const work = self.work;
             const fields = self.read_fields;
+            const demand = self.read_demand;
             defer {
                 self.work = work;
                 self.read_fields = fields;
+                self.read_demand = demand;
             }
             if (try self.streamingCount(a, table, input)) |result| return result;
             return @import("owner_count.zig").run(a, self.backend(), self.graph orelse return null, table, input, work);
@@ -508,7 +510,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const previous_work = self.work;
             const previous_fields = self.read_fields;
             const previous_demand = self.read_demand;
-            self.read_demand = null;
+            self.read_demand = projection.demand;
             defer {
                 self.read_demand = previous_demand;
                 self.work = previous_work;
@@ -1684,6 +1686,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const graph = self.graph.?;
             const source_table = graph.label(mapping.source_label).?.table;
             const target_table = graph.label(mapping.target_label).?.table;
+            const relationship_demand: root.read_fields.Entity = if (self.read_demand) |demand| demand.relationship(source_table, mapping.index, mapping.stored_type) else .{};
             // Incoming adjacency physically belongs to the declared source
             // table, even when its target key belongs to another table.
             var position: Resume = if (encoded) |json| try std.json.parseFromSliceLeaky(Resume, a, json, .{}) else .{ .incoming = direction == .in or !std.mem.eql(u8, identity.table, source_table) };
@@ -1693,11 +1696,11 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const db = try self.selected(source_table);
             const authorization = try self.readAuthorization(temporary, source_table);
             const projects_metadata = if (@hasDecl(DB, "cypher_metadata_projection")) DB.cypher_metadata_projection else false;
-            const projection_json = if (projects_metadata and self.authority.prepare_metadata != null and self.read_demand != null and self.read_demand.?.relationships.fields != null)
+            const projection_json = if (projects_metadata and self.authority.prepare_metadata != null and self.read_demand != null and relationship_demand.fields != null)
                 try std.json.Stringify.valueAlloc(temporary, .{
-                    .fields = self.read_demand.?.relationships.fields.?,
-                    .presence = self.read_demand.?.relationships.presence,
-                    .projection = self.read_demand.?.relationships.projection,
+                    .fields = relationship_demand.fields.?,
+                    .presence = relationship_demand.presence,
+                    .projection = relationship_demand.projection,
                     .source = source_table,
                     .target = target_table,
                     .source_storage = self.storageTableName(source_table),
@@ -1732,7 +1735,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             defer page.deinit(temporary);
             var result: std.ArrayList(*const v.Relationship) = .empty;
             for (page.edges) |edge| {
-                const projected_metadata = if (self.read_demand) |demand| if (demand.relationships.fields != null and self.authority.prepare_metadata != null)
+                const projected_metadata = if (self.read_demand != null) if (relationship_demand.fields != null and self.authority.prepare_metadata != null)
                     try self.authority.prepare_metadata.?(self.authority.ptr, a, if (edge.metadata.len == 0) "{}" else edge.metadata)
                 else
                     null else null;
@@ -1751,7 +1754,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 if (position.incoming and outgoing_possible and source.eql(target)) continue;
                 const relationship = try a.create(v.Relationship);
                 var properties: std.ArrayList(v.Entry) = .empty;
-                const encoded_properties = if (projected_metadata) |projected| try projected.project(projected.context, a, edge.weight, self.read_demand.?.relationships) else try root.wire.relationshipProperties(a, metadata);
+                const encoded_properties = if (projected_metadata) |projected| try projected.project(projected.context, a, edge.weight, relationship_demand) else try root.wire.relationshipProperties(a, metadata);
                 if (encoded_properties) |decoded| {
                     try properties.appendSlice(a, decoded);
                 } else {

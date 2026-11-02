@@ -37,6 +37,16 @@ fn projectValue(view: *View, node: *View.Node, item: Projection, depth: usize) a
             try cypher.value.validateJsonSlice(view.alloc, node.raw, depth);
             return view.materialize(node);
         },
+        .predicate => {
+            try cypher.value.validateJsonSlice(view.alloc, node.raw, depth);
+            if (std.mem.eql(u8, std.mem.trim(u8, node.raw, " \r\n\t"), "null")) return .null;
+            for (item.alternatives) |expected| {
+                var scanner = std.json.Scanner.initCompleteInput(view.alloc, node.raw);
+                defer scanner.deinit();
+                if ((try predicateEqual(view.alloc, &scanner, expected)) orelse false) return expected;
+            }
+            return predicateNonmatch(view.alloc);
+        },
         .presence => return presenceAtDepth(view.alloc, node.raw, depth),
         .children => {
             if (item.validate) try cypher.value.validateJsonSlice(view.alloc, node.raw, depth);
@@ -66,6 +76,117 @@ fn projectTyped(view: *View, node: *View.Node, item: Projection) anyerror!cypher
         try entries.append(view.alloc, .{ .name = child.name, .value = try projectTyped(view, value, child) });
     };
     return .{ .map = entries.items };
+}
+/// The true part of Cypher equality is an equivalence relation for JSON values.
+/// A matching catalog constant therefore preserves every label equality test;
+/// A [NULL] nonmatch preserves nonnullness but cannot equal any JSON value.
+/// Only equality and nullness observers may use this private carrier.
+pub fn predicateJson(a: A, input: std.json.Value, item: Projection) !std.json.Value {
+    if (input == .null) return .null;
+    const actual: cypher.value.Value = if (input == .string) .{ .string = input.string } else try cypher.value.Value.fromJson(a, input);
+    for (item.alternatives) |expected| {
+        if (cypher.value.Value.equal(actual, try cypher.value.Value.fromJson(a, expected)) orelse false) return expected;
+    }
+    return predicateNonmatch(a);
+}
+fn predicateNonmatch(a: A) !std.json.Value {
+    var values: std.array_list.Managed(std.json.Value) = .init(a);
+    try values.append(.null);
+    return .{ .array = values };
+}
+fn stringEqual(scanner: *std.json.Scanner, expected: []const u8) !bool {
+    var offset: usize = 0;
+    var matches = true;
+    while (true) {
+        const token = try scanner.next();
+        var buffer: [4]u8 = undefined;
+        const part: []const u8 = switch (token) {
+            .string, .partial_string => |part| part,
+            .partial_string_escaped_1 => |bytes| copy: {
+                @memcpy(buffer[0..1], &bytes);
+                break :copy buffer[0..1];
+            },
+            .partial_string_escaped_2 => |bytes| copy: {
+                @memcpy(buffer[0..2], &bytes);
+                break :copy buffer[0..2];
+            },
+            .partial_string_escaped_3 => |bytes| copy: {
+                @memcpy(buffer[0..3], &bytes);
+                break :copy buffer[0..3];
+            },
+            .partial_string_escaped_4 => |bytes| copy: {
+                @memcpy(&buffer, &bytes);
+                break :copy &buffer;
+            },
+            else => return error.SyntaxError,
+        };
+        if (offset > expected.len or part.len > expected.len -| offset or !std.mem.eql(u8, part, expected[offset..@min(expected.len, offset +| part.len)])) matches = false;
+        offset +|= part.len;
+        if (token == .string) return matches and offset == expected.len;
+    }
+}
+/// Streams large actual strings/containers, owning only catalog-sized keys and
+/// comparison state. The caller validates the entire value before comparing so
+/// an early nonmatch cannot hide numeric or depth failures in its tail.
+fn predicateEqual(a: A, scanner: *std.json.Scanner, expected: std.json.Value) anyerror!?bool {
+    const kind = try scanner.peekNextTokenType();
+    if (kind == .null) {
+        _ = try scanner.next();
+        return null;
+    }
+    if (expected == .null) {
+        try scanner.skipValue();
+        return null;
+    }
+    if (expected == .string) return if (kind == .string) try stringEqual(scanner, expected.string) else false;
+    if (expected == .array) {
+        if (kind != .array_begin) return false;
+        _ = try scanner.next();
+        var unknown = false;
+        for (expected.array.items) |item| {
+            if (try scanner.peekNextTokenType() == .array_end) return false;
+            if (try predicateEqual(a, scanner, item)) |same| {
+                if (!same) return false;
+            } else unknown = true;
+        }
+        if (try scanner.next() != .array_end) return false;
+        return if (unknown) null else true;
+    }
+    if (expected == .object) {
+        if (kind != .object_begin) return false;
+        _ = try scanner.next();
+        const seen = try a.alloc(bool, expected.object.count());
+        @memset(seen, false);
+        var maximum: usize = 0;
+        for (expected.object.keys()) |key| maximum = @max(maximum, key.len);
+        var count: usize = 0;
+        var unknown = false;
+        while (try scanner.peekNextTokenType() != .object_end) {
+            if (count == seen.len) return false;
+            const token = scanner.nextAllocMax(a, .alloc_if_needed, maximum) catch |err| switch (err) {
+                error.ValueTooLong => return false,
+                else => return err,
+            };
+            const key = if (token == .string) token.string else if (token == .allocated_string) token.allocated_string else return error.SyntaxError;
+            const index = expected.object.getIndex(key) orelse return false;
+            if (seen[index]) return error.DuplicateField;
+            seen[index] = true;
+            count += 1;
+            if (try predicateEqual(a, scanner, expected.object.values()[index])) |same| {
+                if (!same) return false;
+            } else unknown = true;
+        }
+        _ = try scanner.next();
+        return if (count != seen.len) false else if (unknown) null else true;
+    }
+    const token = try scanner.next();
+    const actual: cypher.value.Value = switch (token) {
+        .true => .{ .boolean = true },
+        .false => .{ .boolean = false },
+        .number => |number| try cypher.value.Value.fromJson(a, .{ .number_string = number }),
+        else => return false,
+    };
+    return cypher.value.Value.equal(actual, try cypher.value.Value.fromJson(a, expected));
 }
 pub fn contains(names: []const []const u8, name: []const u8) bool {
     for (names) |item| if (std.mem.eql(u8, item, name)) return true;
@@ -339,4 +460,51 @@ test "Cypher demand projection keeps empty map shapes and presence validation" {
     try std.testing.expect((try rawValue(a, "42", shape)).bool);
     shape.validate = true;
     try std.testing.expectError(error.CypherNumericOverflow, rawValue(a, "{\"ignored\":9223372036854775808}", shape));
+}
+
+test "Cypher demand projection predicate representatives preserve equality without owning actual strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { actual: []const u8, alternatives: []const u8, matches: bool }{
+        .{ .actual = "\"acme\"", .alternatives = "[\"other\",\"acme\"]", .matches = true },
+        .{ .actual = "\"a\\u0063me\"", .alternatives = "[\"acme\"]", .matches = true },
+        .{ .actual = "\"\\ud83d\\ude00\"", .alternatives = "[\"😀\"]", .matches = true },
+        .{ .actual = "[1,2]", .alternatives = "[[1.0,2]]", .matches = true },
+        .{ .actual = "{\"b\":[2],\"a\":1}", .alternatives = "[{\"a\":1.0,\"b\":[2]}]", .matches = true },
+        .{ .actual = "[null,1]", .alternatives = "[[null,1]]", .matches = false },
+        .{ .actual = "null", .alternatives = "[null,1]", .matches = false },
+        .{ .actual = "{\"x\":1}", .alternatives = "[{\"a\":1}]", .matches = false },
+        .{ .actual = "[1,2,3]", .alternatives = "[[1,2]]", .matches = false },
+        .{ .actual = "true", .alternatives = "[true]", .matches = true },
+        .{ .actual = "1e0", .alternatives = "[1]", .matches = true },
+    };
+    for (cases) |case| {
+        const alternatives = try std.json.parseFromSliceLeaky([]const std.json.Value, a, case.alternatives, .{});
+        const projected = try rawValue(a, case.actual, .{ .name = "field", .mode = .predicate, .alternatives = alternatives });
+        if (case.matches) try std.testing.expect(projected != .null);
+        try std.testing.expect((projected == .null) == std.mem.eql(u8, case.actual, "null"));
+        const actual = try cypher.value.Value.fromJson(a, try std.json.parseFromSliceLeaky(std.json.Value, a, case.actual, .{ .parse_numbers = false }));
+        const representative = try cypher.value.Value.fromJson(a, projected);
+        for (alternatives) |expected| {
+            const value = try cypher.value.Value.fromJson(a, expected);
+            try std.testing.expectEqual(cypher.value.Value.equal(actual, value) orelse false, cypher.value.Value.equal(representative, value) orelse false);
+        }
+    }
+    const alternatives = try std.json.parseFromSliceLeaky([]const std.json.Value, a, "[{\"a\":0}]", .{});
+    const projection: Projection = .{ .name = "field", .mode = .predicate, .alternatives = alternatives };
+    try std.testing.expectError(error.CypherNumericOverflow, rawValue(a, "{\"a\":1,\"bad\":9223372036854775808}", projection));
+    try std.testing.expectError(error.DuplicateField, rawValue(a, "{\"bad\":{\"k\":1,\"k\":2}}", projection));
+    const wide = try a.alloc(u8, (2 << 20) + 2);
+    @memset(wide, 'x');
+    wide[0] = '"';
+    wide[wide.len - 1] = '"';
+    var quota: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 64 << 10 };
+    var scratch = std.heap.ArenaAllocator.init(quota.allocator());
+    defer scratch.deinit();
+    const rejected = try rawValue(scratch.allocator(), wide, projection);
+    try std.testing.expect(rejected == .array and rejected.array.items.len == 1 and rejected.array.items[0] == .null);
+    const scalar = try predicateJson(scratch.allocator(), .{ .string = wide[1 .. wide.len - 1] }, projection);
+    try std.testing.expect(scalar == .array);
+    try std.testing.expect(quota.peak < 64 << 10);
 }

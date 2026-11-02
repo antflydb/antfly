@@ -19,6 +19,58 @@ const Plan = @import("relational_projection.zig").Plan;
 const codec = @import("../algebraic/relational_row_codec.zig");
 const document = @import("../document_query.zig");
 const native_writer = @import("../../native_writer.zig");
+
+test "public graph metric borrowed wire owner COUNT validates borrowed residual byte comparisons" {
+    const a = std.testing.allocator;
+    const schema = @import("../../schema.zig");
+    const predicates = @import("../relational_predicate.zig");
+    const KeyValue = @import("../relational_index_keys.zig").Value;
+    const Op = @import("../../relational_index.zig").RelationalCheckOp;
+    const samples = [_]?[]const u8{ null, "", "a", "A", "a\x00", "\x00a", "aa", "ab", "é" };
+    for ([_]schema.RelationalColumnType{ .string, .blob }) |kind| {
+        const columns = [_]schema.RelationalColumn{.{ .name = "body", .path = "body", .column_type = kind, .allows_null = true }};
+        const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+        var layout = try codec.PhysicalLayout.init(a, table);
+        defer layout.deinit();
+        for ([_][]const u8{ "C", "ci" }) |collation| {
+            if (kind == .blob and std.mem.eql(u8, collation, "ci")) continue;
+            for (samples) |expected| {
+                var predicate = try predicates.Plan.init(a, table, &layout, .{ .column = "body", .collation = if (kind == .string) collation else null, .op = .eq, .value = if (expected) |bytes| if (kind == .string) .{ .string = bytes } else .{ .blob = bytes } else .null });
+                defer predicate.deinit();
+                var source = try predicate.projectSource(a, table, &layout);
+                defer source.deinit();
+                for (samples) |actual| {
+                    const encoded = try codec.serializeOrdinal(a, 1, &columns, if (actual) |bytes| &.{.{ .ordinal = 0, .path = "body", .value_type = .bytes_val, .value = .{ .bytes_val = bytes } }} else &.{}, @splat(0));
+                    defer a.free(encoded);
+                    const row = try codec.ordinalRowView(encoded, table, &layout);
+                    const value: KeyValue = if (actual) |bytes| if (kind == .string) .{ .string = bytes } else .{ .blob = bytes } else .null;
+                    var scratch: std.ArrayList(u8) = .empty;
+                    defer scratch.deinit(a);
+                    inline for (.{ Op.eq, Op.ne, Op.lt, Op.lte, Op.gt, Op.gte, Op.is_distinct, Op.is_not_distinct, Op.is_null, Op.is_not_null }) |op| {
+                        predicate.op = op;
+                        const truth = try predicate.evaluateValue(a, &scratch, value);
+                        try std.testing.expectEqual(truth, try source.evaluate(std.testing.failing_allocator, &scratch, row));
+                    }
+                }
+            }
+        }
+        const wide = try a.alloc(u8, 2 << 20);
+        defer a.free(wide);
+        @memset(wide, 0);
+        const encoded = try codec.serializeOrdinal(a, 1, &columns, &.{.{ .ordinal = 0, .path = "body", .value_type = .bytes_val, .value = .{ .bytes_val = wide } }}, @splat(0));
+        defer a.free(encoded);
+        const row = try codec.ordinalRowView(encoded, table, &layout);
+        var predicate = try predicates.Plan.init(a, table, &layout, .{ .column = "body", .op = .eq, .value = if (kind == .string) .{ .string = "tiny" } else .{ .blob = "tiny" } });
+        defer predicate.deinit();
+        var source = try predicate.projectSource(a, table, &layout);
+        defer source.deinit();
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(a);
+        try std.testing.expectEqual(predicates.Truth.no, try source.evaluate(std.testing.failing_allocator, &scratch, row));
+        try std.testing.expectEqual(@as(usize, 0), scratch.capacity);
+    }
+}
+
 pub const Context = struct {
     property_projection: []const @import("cypher").read_fields.Projection = &.{},
     scratch: std.mem.Allocator,
@@ -76,7 +128,8 @@ pub const Context = struct {
                 for (v.plan.base.ordinals) |ordinal| {
                     const column = v.row.table_schema.relational_columns[ordinal];
                     const cell = (try v.row.findCell(ordinal)) orelse continue;
-                    const value: std.json.Value = if (cell.is_null) .null else if (cell.is_json)
+                    const predicate_item = @import("cypher_projection.zig").find(self.property_projection, column.name);
+                    const value: std.json.Value = if (predicate_item != null and predicate_item.?.mode == .predicate and !cell.is_json) try @import("cypher_projection.zig").predicateJson(a, if (cell.is_null) .null else if (column.column_type == .string) .{ .string = cell.value.bytes_val } else try codec.borrowedJsonValueFromCellAlloc(a, column, cell), predicate_item.?) else if (cell.is_null) .null else if (cell.is_json)
                         if (@import("cypher_projection.zig").find(self.property_projection, column.name)) |item|
                             try @import("cypher_projection.zig").rawValue(a, cell.value.bytes_val, item)
                         else

@@ -417,11 +417,12 @@ test "read demand exports CALL lineage and retains complete value barriers" {
         "CALL { MATCH(d:D) RETURN d,count(*) AS c } RETURN d.payload.rank,c",
         "CALL { MATCH(d:D) RETURN d ORDER BY d } RETURN d.payload.rank",
         "CALL { MATCH(d:D) RETURN d } RETURN d",
-    }) |query| {
+    }, 0..) |query, i| {
         var diagnostic: root.compiler.Diagnostic = .{};
         var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
         defer compiled.deinit();
-        try std.testing.expect((try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes.fields == null);
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        if (i == 3) try std.testing.expect(demand.fields == null) else try expectNames(&.{"payload"}, demand.fields.?);
     }
     var diagnostic: root.compiler.Diagnostic = .{};
     var compiled = try root.compiler.compile(a, "CALL { MATCH(d:D) RETURN d.payload AS p } RETURN count(*)", .{}, &diagnostic);
@@ -429,4 +430,84 @@ test "read demand exports CALL lineage and retains complete value barriers" {
     const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
     try expectNames(&.{"payload"}, demand.fields.?);
     try std.testing.expectEqual(@as(usize, 0), demand.projection.len);
+}
+
+test "read demand keeps identity grouping narrow and complete entity returns observable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "MATCH(d:D) WITH DISTINCT d RETURN count(*)",
+        "MATCH(d:D) WITH d,count(*) AS n RETURN count(*)",
+        "MATCH(d:D) WITH d ORDER BY d RETURN count(*)",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        try expectNames(&.{}, (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes.fields.?);
+    }
+}
+
+test "read demand partitions relationship metadata by physical identity domain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var mapped = graph;
+    mapped.relationships = &.{
+        .{ .name = "R", .stored_type = "r", .index = "links", .source_label = "D", .target_label = "D" },
+        .{ .name = "S", .stored_type = "s", .index = "links", .source_label = "D", .target_label = "D" },
+        .{ .name = "Alias", .stored_type = "r", .index = "links", .source_label = "D", .target_label = "D" },
+    };
+    for ([_][]const u8{
+        "MATCH(a:D)-[r:R]->(b:D),(a)-[s:S]->(b) RETURN s,sum(r.rank)",
+        "MATCH(a:D)-[r:R]->(b:D),(a)-[s:Alias]->(b) RETURN s,sum(r.rank)",
+        "MATCH p=(a:D)-[:R]->(b:D) RETURN p",
+    }, 0..) |query, i| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, mapped)).demand;
+        const r = demand.relationship("docs", "links", "r");
+        const s = demand.relationship("docs", "links", "s");
+        if (i == 0) {
+            try expectNames(&.{"rank"}, r.fields.?);
+            try std.testing.expect(s.fields == null);
+        } else {
+            try std.testing.expect(r.fields == null);
+            try expectNames(&.{}, s.fields.?);
+        }
+    }
+}
+
+test "read demand separates predicate representatives from observed property values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "MATCH(d:D) RETURN labels(d)",
+        "MATCH(d:D) RETURN labels(d),d.body IS NULL",
+        "MATCH(d:D) RETURN labels(d),d.body",
+    }, 0..) |query, i| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try expectNames(&.{"body"}, demand.fields.?);
+        if (i != 2) try std.testing.expect(demand.projection[0].mode == .predicate) else try std.testing.expect(demand.projection.len == 0);
+    }
+}
+
+test "owner count derives its own borrowed membership demand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input: root.backend.CountInput = .{ .node = .{ .span = .{}, .alias = "d", .labels = &.{"Wide"}, .properties = &.{} } };
+    var membership = graph;
+    membership.labels = graph.labels[1..];
+    // Count membership deliberately excludes D although the retained catalog
+    // relationships still name it. Count demand must not resolve those edges.
+    const projection = (try @import("owner_count.zig").Projection.init(a, membership, input)).?;
+    const demand = projection.demand.table("docs").?.nodes;
+    try expectNames(&.{"body"}, demand.fields.?);
+    try std.testing.expect(demand.projection[0].mode == .predicate);
 }

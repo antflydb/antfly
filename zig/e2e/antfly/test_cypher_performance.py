@@ -2791,3 +2791,266 @@ def test_authenticated_cypher_lineage_scopes_and_endpoint_domains(monkeypatch):
     finally:
         session.close()
         server.stop()
+
+
+@pytest.mark.parametrize("relational", [False, True], ids=["document", "relational"])
+def test_authenticated_cypher_identity_membership_and_edge_domains(
+    relational, monkeypatch
+):
+    """Identity keys, label decisions and disjoint edge types retain narrow reads."""
+    write_config = conftest._write_remote_content_e2e_config
+
+    def with_graph_work_budget(*args, **kwargs):
+        path = write_config(*args, **kwargs)
+        config = json.loads(path.read_text())
+        config.setdefault("resources", {}).setdefault("query", {}).setdefault(
+            "request_limits", {}
+        )["graph"] = {
+            "max_intermediate_states": 1000000,
+            "max_retained_state_bytes": 128 << 20,
+        }
+        path.write_text(json.dumps(config))
+        return path
+
+    monkeypatch.setattr(
+        conftest, "_write_remote_content_e2e_config", with_graph_work_budget
+    )
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port(), pgwire=True)
+    session = requests.Session()
+    session.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+    base = server.api_url.rstrip("/")
+    name = "cypher_domains_" + uuid.uuid4().hex
+
+    def call(path, body=None, method="POST"):
+        try:
+            response = session.request(method, base + path, json=body, timeout=45)
+        except requests.RequestException:
+            raise AssertionError(server.log_path.read_text()[-20000:]) from None
+        assert response.status_code in (200, 201, 202), (
+            response.status_code,
+            response.text,
+        )
+        return response.json()
+
+    def query(statement, memory=1 << 20):
+        result = call(
+            f"/graphs/{name}/query",
+            {
+                "query": statement,
+                "limits": {
+                    "memory_bytes": memory,
+                    "intermediate_states": 1000000,
+                },
+            },
+        )
+        assert result["stats"]["memory_bytes"] < memory, result
+        print(
+            json.dumps(
+                {
+                    "domain_storage": "relational" if relational else "document",
+                    "domain_query": statement,
+                    "stats": result["stats"],
+                }
+            )
+        )
+        return result
+
+    def integer(value):
+        return {"type": "integer", "value": str(value)}
+
+    try:
+        if relational:
+            call(
+                "/sql",
+                {
+                    "statement": f"CREATE TABLE {name} (id TEXT, score BIGINT, body TEXT, payload JSONB)"
+                },
+            )
+        else:
+            call(f"/tables/{name}", {"num_shards": 1})
+        call(
+            f"/tables/{name}/indexes/links",
+            {"type": "graph", "edge_types": [{"name": "r"}, {"name": "s"}]},
+        )
+        deadline = time.monotonic() + 60
+        while True:
+            index = call(f"/tables/{name}/indexes/links", method="GET")
+            ready = index.get("status", {}).get("milestones", {}).get("complete", {})
+            if ready.get("reached") and not ready.get("blockers"):
+                break
+            assert time.monotonic() < deadline, index
+            time.sleep(0.1)
+        wide = "x" * (2 << 20)
+        call(
+            f"/tables/{name}/batch",
+            {
+                "inserts": {
+                    "d1": {
+                        "id": "d1",
+                        "score": 7,
+                        "body": wide,
+                        "payload": {"rank": 7, "body": wide},
+                    },
+                    "d2": {"id": "d2", "score": 0, "body": "tiny"},
+                },
+                "graph_writes": [
+                    {
+                        "index_name": "links",
+                        "source": "d1",
+                        "target": "d2",
+                        "edge_type": "r",
+                        "edge_id": "r1",
+                        "metadata_json": json.dumps({"rank": 7, "body": wide}),
+                    },
+                    {
+                        "index_name": "links",
+                        "source": "d1",
+                        "target": "d2",
+                        "edge_type": "s",
+                        "edge_id": "s1",
+                        "metadata_json": json.dumps({"id": "s"}),
+                    },
+                ],
+                "sync_level": "full_index",
+            },
+        )
+        call(
+            f"/graphs/{name}",
+            {
+                "labels": [
+                    {"name": "D", "table": name},
+                    {"name": "Wide", "table": name, "where": {"body": "notmatched"}},
+                    {"name": "Small", "table": name, "where": {"body": "tiny"}},
+                ],
+                "relationships": [
+                    {
+                        "name": "R",
+                        "index": "links",
+                        "stored_type": "r",
+                        "source_label": "D",
+                        "target_label": "D",
+                    },
+                    {
+                        "name": "S",
+                        "index": "links",
+                        "stored_type": "s",
+                        "source_label": "D",
+                        "target_label": "D",
+                    },
+                ],
+            },
+        )
+        for statement in (
+            "MATCH(d:D) RETURN count(DISTINCT d)",
+            "MATCH(d:D) WITH DISTINCT d RETURN count(*)",
+            "MATCH(d:D) WITH d,count(*) AS multiplicity RETURN count(*)",
+            "MATCH(d:D) WITH d ORDER BY d RETURN count(*)",
+        ):
+            assert query(statement)["rows"] == [[integer(2)]]
+        result = query("MATCH(d:D) RETURN labels(d) ORDER BY antfly.documentKey(d)")
+        assert result["rows"] == [
+            [
+                {
+                    "type": "list",
+                    "value": [{"type": "string", "value": label} for label in labels],
+                }
+            ]
+            for labels in (["D"], ["D", "Small"])
+        ], result
+        assert query("MATCH(d:Wide) RETURN count(*)")["rows"] == [[integer(0)]]
+        assert query("MATCH(d:Small) RETURN count(*)")["rows"] == [[integer(1)]]
+        # A mismatching nonnull predicate field remains nonnull for COUNT.
+        result = query("MATCH(d:D) RETURN labels(d),count(d.body) ORDER BY labels(d)")
+        assert len(result["rows"]) == 2 and all(
+            row[1] == integer(1) for row in result["rows"]
+        ), result
+        result = query("MATCH(a:D)-[r:R]->(b:D),(a)-[s:S]->(b) RETURN s,sum(r.rank)")
+        assert len(result["rows"]) == 1, result
+        assert (
+            result["rows"][0][0]["value"]["properties"]["value"]["id"]["value"] == "s"
+        ), result
+        assert result["rows"][0][1] == integer(7), result
+        result = query("MATCH(a:D)-[r:R]->(b:D) WITH DISTINCT r RETURN count(*)")
+        assert result["rows"] == [[integer(1)]], result
+        result = query("MATCH(d:D) WHERE d.id='d1' WITH DISTINCT d RETURN d", 128 << 20)
+        assert (
+            result["rows"][0][0]["value"]["properties"]["value"]["body"]["value"]
+            == wide
+        ), result
+        result = query("MATCH(a:D)-[r:R]->(b:D) RETURN r", 64 << 20)
+        assert (
+            result["rows"][0][0]["value"]["properties"]["value"]["body"]["value"]
+            == wide
+        ), result
+        call(
+            f"/tables/{name}/batch",
+            {
+                "inserts": {"d3": {"id": "d3", "body": None}, "d4": {"id": "d4"}},
+                "sync_level": "full_index",
+            },
+        )
+        result = query(
+            "MATCH(d:D) WHERE d.id IN ['d3','d4'] RETURN labels(d),d.body IS NULL ORDER BY d.id"
+        )
+        assert (
+            result["rows"]
+            == [
+                [
+                    {"type": "list", "value": [{"type": "string", "value": "D"}]},
+                    {"type": "boolean", "value": True},
+                ]
+            ]
+            * 2
+        ), result
+        username, password = name + "_reader", uuid.uuid4().hex
+        response = session.post(
+            server.url + f"/auth/v1/users/{username}",
+            json={
+                "password": password,
+                "initial_policies": [
+                    {"resource_type": "graph", "resource": name, "type": "read"},
+                    {"resource_type": "table", "resource": name, "type": "read"},
+                ],
+            },
+            timeout=45,
+        )
+        assert response.status_code in (200, 201), response.text
+        response = session.put(
+            server.url + f"/auth/v1/users/{username}/row-filters/{name}",
+            json={"term": {"id": "d2"}},
+            timeout=45,
+        )
+        assert response.status_code in (200, 201), response.text
+        with requests.Session() as reader:
+            reader.auth = (username, password)
+            for statement, expected in (
+                ("MATCH(d:D) WITH DISTINCT d RETURN count(*)", [[integer(1)]]),
+                (
+                    "MATCH(d:D) RETURN labels(d)",
+                    [
+                        [
+                            {
+                                "type": "list",
+                                "value": [
+                                    {"type": "string", "value": label}
+                                    for label in ["D", "Small"]
+                                ],
+                            }
+                        ]
+                    ],
+                ),
+                ("MATCH(a:D)-[r:R]->(b:D) RETURN count(r)", [[integer(0)]]),
+            ):
+                response = reader.post(
+                    base + f"/graphs/{name}/query",
+                    json={"query": statement, "limits": {"memory_bytes": 1 << 20}},
+                    timeout=45,
+                )
+                assert response.status_code == 200, response.text
+                assert response.json()["rows"] == expected, response.text
+    finally:
+        session.close()
+        server.stop()
