@@ -5425,6 +5425,8 @@ pub const HBCIndex = struct {
     deferred_node_keys: std.AutoHashMapUnmanaged(u128, DeferredNodeValue),
     deferred_oversized_leaves: std.AutoHashMapUnmanaged(u64, void),
     write_session_depth: usize = 0,
+    /// Bounded commits for bulk builds larger than one storage commit.
+    bulk_commit_rotation: vectorindex_hbc_index.BulkCommitRotation = .{},
     write_session_kind: ?WriteSessionKind = null,
     bulk_publication_may_have_mutated: bool = false,
     hilbert: ?vec.Hilbert,
@@ -6076,6 +6078,17 @@ pub const HBCIndex = struct {
         return self.write_session_depth != 0;
     }
 
+    /// Largest staged size one bulk-build commit should reach, or 0 when the
+    /// backend has no per-commit admission limit. A quarter of the LSM's
+    /// commit backlog leaves room for concurrent writers and metadata.
+    pub fn bulkCommitBudgetBytes(self: *const HBCIndex) u64 {
+        if (self.nativeHbcAuthoritative()) return 0;
+        return switch (self.env_owner) {
+            .lsm => |handle| @max(handle.backend.options.manifest_commit_backlog_bytes / 4, 1 << 20),
+            .native => 0,
+        };
+    }
+
     pub fn crossBatchPublicationActive(self: *const HBCIndex) bool {
         return self.write_session_depth != 0 and self.write_session_kind == .bulk_publication;
     }
@@ -6431,6 +6444,7 @@ pub const HBCIndex = struct {
                             .use_quantization = config.use_quantization,
                             .quantizer_seed = config.quantizer_seed,
                             .metric = @as(u8, @intCast(@backingInt(config.metric))),
+                            .quantization_bits = config.quantization_bits,
                         };
 
                         var meta_buf: [IndexMetadata.encoded_size]u8 = undefined;
@@ -6477,6 +6491,12 @@ pub const HBCIndex = struct {
         effective_config.leaf_size = metadata.leaf_size;
         effective_config.use_quantization = metadata.use_quantization;
         effective_config.quantizer_seed = metadata.quantizer_seed;
+        // The stored bit count wins, like the other quantizer settings.
+        effective_config.quantization_bits = metadata.quantization_bits;
+        if (effective_config.quantization_bits == 0 or effective_config.quantization_bits > 8) return error.Corrupted;
+        // Extended codes assume randomly rotated vectors.
+        if (effective_config.quantization_bits > 1 and !effective_config.use_random_ortho_trans)
+            return error.QuantizationBitsRequireRotation;
 
         const env_owner: EnvOwner = opened;
 
@@ -6488,6 +6508,8 @@ pub const HBCIndex = struct {
         );
         errdefer quantizer.deinit();
         quantizer.query_packing = .reduce;
+        // Every quantized set this index writes carries extended codes too.
+        quantizer.ex_bits = if (effective_config.quantization_bits > 1) effective_config.quantization_bits else 0;
         if (platform.env.getenv("ANTFLY_EXPERIMENT_QUERY_PACKING")) |mode| {
             if (std.mem.eql(u8, mode, "lanes")) quantizer.query_packing = .lanes;
             if (std.mem.eql(u8, mode, "reduce")) quantizer.query_packing = .reduce;
@@ -9264,7 +9286,7 @@ pub const HBCIndex = struct {
     }
 
     fn decodeExperimentalPostingMetadataForConfig(expected: IndexMetadata, encoded: []const u8) !IndexMetadata {
-        if (encoded.len != IndexMetadata.encoded_size and encoded.len != IndexMetadata.legacy_encoded_size)
+        if (encoded.len != IndexMetadata.encoded_size and encoded.len != IndexMetadata.topology_encoded_size and encoded.len != IndexMetadata.legacy_encoded_size)
             return error.CorruptedPostingMetadata;
         const metadata = IndexMetadata.decode(encoded);
         // The bootstrap metadata may itself have come from the same native
@@ -9276,7 +9298,8 @@ pub const HBCIndex = struct {
             metadata.leaf_size != expected.leaf_size or
             metadata.use_quantization != expected.use_quantization or
             metadata.quantizer_seed != expected.quantizer_seed or
-            metadata.metric != expected.metric)
+            metadata.metric != expected.metric or
+            metadata.quantization_bits != expected.quantization_bits)
         {
             return error.PostingCheckpointMetadataMismatch;
         }
@@ -17717,6 +17740,20 @@ pub const HBCIndex = struct {
     pub fn bulkBuildPreparedInputsTxn(self: *HBCIndex, txn: anytype, inputs: []const PreparedBulkBuildInput) !void {
         try self.captureExactVectorPreparedBulkBuild(inputs);
         try vectorindex_hbc_index.bulkBuildPreparedInputsTxn(self, txn, inputs);
+    }
+
+    /// Commit budget when a bulk build of `inputs` is too large for one
+    /// storage commit; null when the single-transaction path fits.
+    pub fn preparedBulkBuildCommitBudget(self: *HBCIndex, inputs: []const PreparedBulkBuildInput) ?u64 {
+        return vectorindex_hbc_index.preparedBulkBuildCommitBudget(self, inputs, .{});
+    }
+
+    /// Bulk build too large for one storage commit: owns a bulk-publication
+    /// session and stages the build in bounded commits (see
+    /// `preparedBulkBuildCommitBudget`).
+    pub fn bulkBuildPreparedInputsBounded(self: *HBCIndex, inputs: []const PreparedBulkBuildInput, budget: u64) !void {
+        try self.captureExactVectorPreparedBulkBuild(inputs);
+        try vectorindex_hbc_index.bulkBuildPreparedInputsBounded(self, inputs, .{}, budget, nowNs, elapsedSince);
     }
 
     pub fn bulkBuildPreparedInputsTxnOptions(
@@ -35475,4 +35512,374 @@ test "detached posting metadata batch survives mutations tombstones and index de
     try next.getManySorted(&.{ 1, 2, 3 }, &values);
     try std.testing.expectEqualStrings("replacement-a", values[0].?);
     try std.testing.expect(values[1] == null and values[2] == null);
+}
+
+fn multiBitTestVectors(alloc: Allocator, n: usize, dims: usize, seed: u64) ![]f32 {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rand = prng.random();
+    const centers = try alloc.alloc(f32, 24 * dims);
+    defer alloc.free(centers);
+    for (centers) |*c| c.* = rand.floatNorm(f32) * 2;
+    const out = try alloc.alloc(f32, n * dims);
+    for (0..n) |i| {
+        const c = rand.uintLessThan(usize, 24);
+        for (0..dims) |j| out[i * dims + j] = centers[c * dims + j] + rand.floatNorm(f32);
+    }
+    return out;
+}
+
+fn multiBitRecall(alloc: Allocator, idx: *HBCIndex, data: []const f32, queries: []const f32, dims: usize, refined: *u64) !f64 {
+    const k = 10;
+    var hits: usize = 0;
+    const nq = queries.len / dims;
+    for (0..nq) |qi| {
+        const q = queries[qi * dims ..][0..dims];
+        var best: [k]u64 = undefined;
+        var best_d: [k]f32 = @splat(std.math.inf(f32));
+        for (0..data.len / dims) |i| {
+            var d: f32 = 0;
+            for (data[i * dims ..][0..dims], q) |a, b| d += (a - b) * (a - b);
+            if (d >= best_d[k - 1]) continue;
+            var pos: usize = k - 1;
+            while (pos > 0 and best_d[pos - 1] > d) : (pos -= 1) {
+                best_d[pos] = best_d[pos - 1];
+                best[pos] = best[pos - 1];
+            }
+            best_d[pos] = d;
+            best[pos] = i + 1;
+        }
+        // A small candidate heap makes admission quality matter.
+        var profiled = try idx.searchProfiledRequest(.{ .query = q, .k = k, .rerank_factor = 2, .load_metadata = false });
+        defer profiled.results.deinit();
+        refined.* += profiled.profile.ex_refined_vectors;
+        for (profiled.results.getHits()) |h| {
+            if (std.mem.indexOfScalar(u64, &best, h.vector_id) != null) hits += 1;
+        }
+    }
+    _ = alloc;
+    return @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(nq * k));
+}
+
+test "hbc multi-bit codes refine leaf admission and survive reopen" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const dims = 64;
+    const n = 2400;
+    const data = try multiBitTestVectors(alloc, n, dims, 5);
+    defer alloc.free(data);
+    const queries = try multiBitTestVectors(alloc, 40, dims, 6);
+    defer alloc.free(queries);
+    const items = try alloc.alloc(BatchInsertItem, n);
+    defer alloc.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .vector_id = i + 1, .vector = data[i * dims ..][0..dims], .metadata = "" };
+
+    var recalls: [2]f64 = undefined;
+    for ([_]u8{ 1, 4 }, 0..) |bits, vi| {
+        var tp: TestPath = .{};
+        const path = tp.init();
+        defer tp.cleanup();
+        const cfg = HBCConfig{
+            .dims = dims,
+            .leaf_size = 64,
+            .branching_factor = 16,
+            .search_width = 48,
+            .use_quantization = true,
+            .rerank_policy = .boundary,
+            .use_random_ortho_trans = true,
+            .quantization_bits = bits,
+        };
+        {
+            var idx = try HBCIndex.open(alloc, path, cfg);
+            defer idx.close();
+            try idx.bulkBuildWithMetadata(items);
+            var refined: u64 = 0;
+            recalls[vi] = try multiBitRecall(alloc, &idx, data, queries, dims, &refined);
+            if (bits == 1) try std.testing.expectEqual(@as(u64, 0), refined) else try std.testing.expect(refined > 0);
+        }
+        if (bits > 1) {
+            // Persisted payloads carry the extended codes across reopen.
+            var reopened = try HBCIndex.open(alloc, path, cfg);
+            defer reopened.close();
+            var refined: u64 = 0;
+            const again = try multiBitRecall(alloc, &reopened, data, queries, dims, &refined);
+            try std.testing.expect(refined > 0);
+            try std.testing.expectApproxEqAbs(recalls[vi], again, 0.02);
+        }
+        if (bits > 1) {
+            // The stored bit count wins over a reopen config's.
+            var one_bit_cfg = cfg;
+            one_bit_cfg.quantization_bits = 1;
+            {
+                var reopened = try HBCIndex.open(alloc, path, one_bit_cfg);
+                defer reopened.close();
+                try std.testing.expectEqual(@as(u8, bits), reopened.config.quantization_bits);
+            }
+            // Extended codes need rotated vectors.
+            var unrotated = cfg;
+            unrotated.use_random_ortho_trans = false;
+            try std.testing.expectError(error.QuantizationBitsRequireRotation, HBCIndex.open(alloc, path, unrotated));
+        }
+    }
+    std.testing.expect(recalls[1] >= recalls[0]) catch |err| {
+        std.debug.print("1-bit recall={d:.3} 4-bit recall={d:.3}\n", .{ recalls[0], recalls[1] });
+        return err;
+    };
+}
+
+// Opt-in measurement: set ANTFLY_HBC_BENCH_DATA to an ann-benchmarks style
+// prefix (PREFIX.train.f32 / PREFIX.test.f32: u32 rows, u32 dims, f32s) and
+// optionally ANTFLY_HBC_BENCH_N (default 20000) and
+// ANTFLY_HBC_BENCH_QUERIES (default 100). Builds real HBC indexes at the
+// index manager's production defaults and compares quantization settings.
+test "hbc multi-bit quantization measurement on a dataset" {
+    const prefix = platform.env.getenv("ANTFLY_HBC_BENCH_DATA") orelse return error.SkipZigTest;
+    // A production-like allocator: page_allocator would turn every small
+    // allocation into a system call and distort timings.
+    const alloc = std.heap.smp_allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const n_limit: usize = if (platform.env.getenv("ANTFLY_HBC_BENCH_N")) |v| try std.fmt.parseInt(usize, v, 10) else 20_000;
+    const q_limit: usize = if (platform.env.getenv("ANTFLY_HBC_BENCH_QUERIES")) |v| try std.fmt.parseInt(usize, v, 10) else 100;
+    const Loaded = struct { rows: usize, dims: usize, data: []f32 };
+    const load = struct {
+        fn f(a: Allocator, i: std.Io, p: []const u8, part: []const u8, limit: usize) !Loaded {
+            const path = try std.fmt.allocPrint(a, "{s}.{s}.f32", .{ p, part });
+            defer a.free(path);
+            const raw = try std.Io.Dir.cwd().readFileAlloc(i, path, a, .limited(4 * 1024 * 1024 * 1024));
+            defer a.free(raw);
+            const rows = @min(std.mem.readInt(u32, raw[0..4], .little), limit);
+            const dims = std.mem.readInt(u32, raw[4..8], .little);
+            const out = try a.alloc(f32, rows * dims);
+            @memcpy(std.mem.sliceAsBytes(out), raw[8..][0 .. out.len * 4]);
+            for (0..rows) |r| {
+                const v = out[r * dims ..][0..dims];
+                var s: f32 = 0;
+                for (v) |x| s += x * x;
+                const norm = @sqrt(s);
+                if (norm > 0) for (v) |*x| {
+                    x.* /= norm;
+                };
+            }
+            return .{ .rows = rows, .dims = dims, .data = out };
+        }
+    }.f;
+    const data = try load(alloc, io, prefix, "train", n_limit);
+    defer alloc.free(data.data);
+    const queries = try load(alloc, io, prefix, "test", q_limit);
+    defer alloc.free(queries.data);
+    const d = data.dims;
+    const k = 10;
+    const truth = try alloc.alloc(u64, queries.rows * k);
+    defer alloc.free(truth);
+    for (0..queries.rows) |qi| {
+        const q = queries.data[qi * d ..][0..d];
+        var best_d: [k]f32 = @splat(std.math.inf(f32));
+        const best = truth[qi * k ..][0..k];
+        for (0..data.rows) |i| {
+            var dot: f32 = 0;
+            for (data.data[i * d ..][0..d], q) |a, b| dot += a * b;
+            const dist = 1 - dot;
+            if (dist >= best_d[k - 1]) continue;
+            var pos: usize = k - 1;
+            while (pos > 0 and best_d[pos - 1] > dist) : (pos -= 1) {
+                best_d[pos] = best_d[pos - 1];
+                best[pos] = best[pos - 1];
+            }
+            best_d[pos] = dist;
+            best[pos] = i + 1;
+        }
+    }
+    const items = try alloc.alloc(BatchInsertItem, data.rows);
+    defer alloc.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .vector_id = i + 1, .vector = data.data[i * d ..][0..d], .metadata = "" };
+
+    const Variant = struct { bits: u8, refine: @FieldType(HBCConfig, "quantization_refine") = .near_cutoff, margin: f32 = 2, policy: @FieldType(HBCConfig, "rerank_policy") = .boundary };
+    const variants = [_]Variant{
+        .{ .bits = 1 },
+        .{ .bits = 2 },
+        .{ .bits = 3 },
+        .{ .bits = 4, .margin = 1 },
+        .{ .bits = 4 },
+        .{ .bits = 4, .refine = .all },
+        .{ .bits = 8 },
+    };
+    std.debug.print("\nHBC rows={d} dims={d} queries={d} (leaf 168, branching 168, epsilon 7, boundary rerank, rotation on)\n", .{ data.rows, d, queries.rows });
+    std.debug.print("{s:>4} {s:>12} {s:>6} {s:>8} {s:>6} {s:>8} {s:>9} {s:>10} {s:>10} {s:>10} {s:>9}\n", .{ "bits", "refine", "margin", "rerank", "width", "factor", "recall@10", "scored/q", "refined/q", "reranked/q", "ms/q" });
+    for (variants) |variant| {
+        var tp: TestPath = .{};
+        const path = tp.init();
+        defer tp.cleanup();
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = @intCast(d),
+            .metric = .cosine,
+            .leaf_size = 168,
+            .branching_factor = 168,
+            .search_width = 1008,
+            .epsilon = 7,
+            .use_quantization = true,
+            .rerank_policy = variant.policy,
+            .use_random_ortho_trans = true,
+            .quantization_bits = variant.bits,
+            .quantization_refine = variant.refine,
+            .quantization_refine_margin = variant.margin,
+            .max_cached_nodes = 100_000,
+            .max_cached_vectors = 200_000,
+        });
+        defer idx.close();
+        const build_start = platform_time.monotonicNs();
+        try idx.bulkBuildWithMetadata(items);
+        std.debug.print("  build bits={d}: {d:.1}s\n", .{ variant.bits, @as(f64, @floatFromInt(platform_time.monotonicNs() - build_start)) / 1e9 });
+        // Warm caches so timings measure search, not first-touch loads.
+        for (0..@min(queries.rows, 20)) |qi| {
+            var warm = try idx.searchWithRequest(.{ .query = queries.data[qi * d ..][0..d], .k = k, .load_metadata = false });
+            warm.deinit();
+        }
+        for ([_]u32{ 128, 1008 }) |width| {
+            for ([_]usize{ 2, 8, 32 }) |factor| {
+                var hits: usize = 0;
+                var scored: u64 = 0;
+                var refined: u64 = 0;
+                var reranked: u64 = 0;
+                var leaf_ns: u64 = 0;
+                var rerank_ns: u64 = 0;
+                const t0 = platform_time.monotonicNs();
+                for (0..queries.rows) |qi| {
+                    var profiled = try idx.searchProfiledRequest(.{ .query = queries.data[qi * d ..][0..d], .k = k, .search_width = width, .rerank_factor = factor, .load_metadata = false });
+                    defer profiled.results.deinit();
+                    scored += profiled.profile.approx_vectors_scored;
+                    refined += profiled.profile.ex_refined_vectors;
+                    reranked += profiled.profile.reranked_vectors;
+                    leaf_ns += profiled.profile.leaf_score_ns;
+                    rerank_ns += profiled.profile.rerank_ns;
+                    const gt = truth[qi * k ..][0..k];
+                    for (profiled.results.getHits()) |h| {
+                        if (std.mem.indexOfScalar(u64, gt, h.vector_id) != null) hits += 1;
+                    }
+                }
+                const nq: f64 = @floatFromInt(queries.rows);
+                std.debug.print("{d:>4} {s:>12} {d:>6.1} {s:>8} {d:>6} {d:>8} {d:>9.3} {d:>10.0} {d:>10.0} {d:>10.1} {d:>9.2} leaf={d:.2}ms rerank={d:.2}ms\n", .{
+                    variant.bits,
+                    @tagName(variant.refine),
+                    variant.margin,
+                    @tagName(variant.policy),
+                    width,
+                    factor,
+                    @as(f64, @floatFromInt(hits)) / (nq * k),
+                    @as(f64, @floatFromInt(scored)) / nq,
+                    @as(f64, @floatFromInt(refined)) / nq,
+                    @as(f64, @floatFromInt(reranked)) / nq,
+                    @as(f64, @floatFromInt(platform_time.monotonicNs() - t0)) / 1e6 / nq,
+                    @as(f64, @floatFromInt(leaf_ns)) / 1e6 / nq,
+                    @as(f64, @floatFromInt(rerank_ns)) / 1e6 / nq,
+                });
+            }
+        }
+    }
+}
+
+test "hbc bulk build larger than one storage commit stages bounded commits" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const dims = 128;
+    const n = 6000; // ~3 MiB of raw vectors against a 1 MiB commit budget
+    const data = try multiBitTestVectors(alloc, n, dims, 21);
+    defer alloc.free(data);
+    const items = try alloc.alloc(BatchInsertItem, n);
+    defer alloc.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .vector_id = i + 1, .vector = data[i * dims ..][0..dims], .metadata = "doc" };
+    const cfg = HBCConfig{
+        .dims = dims,
+        .leaf_size = 64,
+        .branching_factor = 16,
+        .search_width = 64,
+        .use_quantization = true,
+        .use_random_ortho_trans = true,
+        .quantization_bits = 4,
+    };
+    const lsm: hbc_backend.LsmOptions = .{ .backend_options = .{ .manifest_commit_backlog_bytes = 2 * 1024 * 1024 } };
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, cfg, lsm);
+        defer idx.close();
+        try std.testing.expectEqual(@as(u64, 1 << 20), idx.bulkCommitBudgetBytes());
+        try idx.bulkBuildWithMetadata(items);
+        try std.testing.expectEqual(@as(u64, n), idx.stats().active_count);
+        try std.testing.expectEqual(@as(u64, 0), idx.bulk_commit_rotation.budget);
+        try std.testing.expect(idx.bulk_commit_rotation.commits >= 2);
+        // The session is closed and nothing is left staged.
+        try std.testing.expectEqual(@as(usize, 0), idx.write_session_depth);
+        var results = try idx.search(data[17 * dims ..][0..dims], 5);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(u64, 18), results.getHits()[0].vector_id);
+    }
+    // Reopen: the bulk-publish marker is cleared and the tree is complete.
+    var reopened = try HBCIndex.openWithLsmOptions(alloc, path, cfg, lsm);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, n), reopened.stats().active_count);
+    for ([_]usize{ 0, 2999, 5999 }) |i| {
+        var results = try reopened.search(data[i * dims ..][0..dims], 3);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(u64, i + 1), results.getHits()[0].vector_id);
+    }
+}
+
+test "hbc small bulk build keeps the single-commit path" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const dims = 32;
+    const n = 200;
+    const data = try multiBitTestVectors(alloc, n, dims, 22);
+    defer alloc.free(data);
+    const items = try alloc.alloc(BatchInsertItem, n);
+    defer alloc.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .vector_id = i + 1, .vector = data[i * dims ..][0..dims], .metadata = "" };
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = dims, .leaf_size = 32 });
+    defer idx.close();
+    try idx.bulkBuildWithMetadata(items);
+    try std.testing.expectEqual(@as(u64, 0), idx.bulk_commit_rotation.commits);
+    try std.testing.expectEqual(@as(u64, n), idx.stats().active_count);
+}
+
+test "hbc prepared bulk build chooses bounded commits only when needed" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const dims = 96;
+    const n = 8000;
+    const data = try multiBitTestVectors(alloc, n, dims, 23);
+    defer alloc.free(data);
+    const cfg = HBCConfig{ .dims = dims, .leaf_size = 64, .branching_factor = 16, .search_width = 64, .use_random_ortho_trans = true };
+    const lsm: hbc_backend.LsmOptions = .{ .backend_options = .{ .manifest_commit_backlog_bytes = 2 * 1024 * 1024 } };
+    var idx = try HBCIndex.openWithLsmOptions(alloc, path, cfg, lsm);
+    defer idx.close();
+    const transformed = try alloc.alloc(f32, n * dims);
+    defer alloc.free(transformed);
+    const inputs = try alloc.alloc(PreparedBulkBuildInput, n);
+    defer alloc.free(inputs);
+    for (inputs, 0..) |*input, i| {
+        const t = idx.transformVector(data[i * dims ..][0..dims], transformed[i * dims ..][0..dims]);
+        input.* = .{ .vector_id = i + 1, .vector = data[i * dims ..][0..dims], .transformed = t, .metadata = "k" };
+    }
+    // A small child fits one commit; the full set does not.
+    try std.testing.expect(idx.preparedBulkBuildCommitBudget(inputs[0..100]) == null);
+    const budget = idx.preparedBulkBuildCommitBudget(inputs) orelse return error.TestExpectedBudget;
+    try idx.bulkBuildPreparedInputsBounded(inputs, budget);
+    try std.testing.expect(idx.bulk_commit_rotation.commits >= 2);
+    try std.testing.expectEqual(@as(usize, 0), idx.write_session_depth);
+    try std.testing.expectEqual(@as(u64, n), idx.stats().active_count);
+    var results = try idx.search(data[4321 * dims ..][0..dims], 3);
+    defer results.deinit();
+    try std.testing.expectEqual(@as(u64, 4322), results.getHits()[0].vector_id);
 }

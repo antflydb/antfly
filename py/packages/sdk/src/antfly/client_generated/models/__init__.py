@@ -2022,6 +2022,7 @@ from .provenance_origin_trace_type_0_kind import ProvenanceOriginTraceType0Kind
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
+from .quantization_refine import QuantizationRefine
 from .query_admission_config import QueryAdmissionConfig
 from .query_builder_request import QueryBuilderRequest
 from .query_builder_request_constraints import QueryBuilderRequestConstraints
@@ -4328,6 +4329,7 @@ __all__ = (
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
+    "QuantizationRefine",
     "QueryAdmissionConfig",
     "QueryBuilderRequest",
     "QueryBuilderRequestConstraints",

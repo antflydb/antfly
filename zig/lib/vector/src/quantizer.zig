@@ -26,6 +26,7 @@ const Allocator = std.mem.Allocator;
 const rabitq = @import("rabitq.zig");
 const vec = @import("vector.zig");
 const proto = @import("proto.zig");
+const rqx = @import("rabitq_ex.zig");
 const go_rand = @import("go_rand.zig");
 
 /// Borrowed request-lifecycle signal for long quantizer scans. Keeping the
@@ -169,6 +170,11 @@ pub const RaBitQuantizer = struct {
     unbias: []f32,
     distance_metric: vec.DistanceMetric,
     alloc: Allocator,
+    /// When nonzero, quantize* also writes extended RaBitQ codes with this
+    /// many bits per dimension into the set's `ex_*` columns (see
+    /// `ExEstimator`). Callers should rotate vectors first, as the extended
+    /// codes assume a random rotation.
+    ex_bits: u8 = 0,
 
     /// Creates a new RaBitQ quantizer.
     ///
@@ -309,7 +315,7 @@ pub const RaBitQuantizer = struct {
 
         const centroid_copy = try self.alloc.dupe(f32, centroid);
 
-        return .{
+        var result: proto.RaBitQuantizedVectorSet = .{
             .metric = self.distance_metric,
             .centroid = centroid_copy,
             .codes = .{
@@ -323,6 +329,39 @@ pub const RaBitQuantizer = struct {
             .centroid_dot_products = centroid_dot_products,
             .centroid_norm = centroid_norm,
         };
+        if (self.ex_bits > 0) {
+            errdefer result.deinit(self.alloc);
+            try self.fillEx(&result, temp_diffs, 0, count);
+        }
+        return result;
+    }
+
+    /// Writes extended codes for rows `start..start + count` from their unit
+    /// residuals, growing the `ex_*` columns to `start + count` rows.
+    fn fillEx(self: *const RaBitQuantizer, qs: *proto.RaBitQuantizedVectorSet, units: []const f32, start: usize, count: usize) !void {
+        const codec = try rqx.Codec.init(self.dims, self.ex_bits, self.distance_metric);
+        const w = proto.RaBitQuantizedVectorSet.exWordsPerRow(self.dims, self.ex_bits);
+        const total = start + count;
+        qs.ex_codes = try resizeSlice(u64, self.alloc, qs.ex_codes, total * w);
+        qs.ex_factors = try resizeSlice(f32, self.alloc, qs.ex_factors, total * 2);
+        qs.ex_bits = self.ex_bits;
+        for (0..count) |i| {
+            const row = start + i;
+            const words = qs.ex_codes[row * w ..][0..w];
+            @memset(words, 0);
+            const code = std.mem.sliceAsBytes(words)[0..codec.codeBytes()];
+            const f = try codec.encodeUnit(self.alloc, units[i * self.dims ..][0..self.dims], code);
+            qs.ex_factors[row * 2] = f.inv;
+            qs.ex_factors[row * 2 + 1] = f.cos;
+        }
+    }
+
+    fn clearEx(self: *const RaBitQuantizer, qs: *proto.RaBitQuantizedVectorSet) void {
+        if (qs.ex_codes.len > 0) self.alloc.free(qs.ex_codes);
+        if (qs.ex_factors.len > 0) self.alloc.free(qs.ex_factors);
+        qs.ex_codes = &.{};
+        qs.ex_factors = &.{};
+        qs.ex_bits = 0;
     }
 
     pub fn quantizeInto(
@@ -366,6 +405,7 @@ pub const RaBitQuantizer = struct {
             self.dims,
             width,
         );
+        if (self.ex_bits > 0) try self.fillEx(qs, temp_diffs, 0, count) else self.clearEx(qs);
 
         if (self.distance_metric != .l2_squared) {
             qs.centroid_dot_products = try resizeSlice(f32, self.alloc, qs.centroid_dot_products, count);
@@ -392,6 +432,10 @@ pub const RaBitQuantizer = struct {
         const width = rabitq.codeWidth(self.dims);
         const old_count = qs.getCount();
         const new_count = old_count + count;
+        // Extend multi-bit codes only when every existing row has them;
+        // otherwise drop them so the set stays consistent (a refresh
+        // re-quantizes the whole set).
+        const extend_ex = self.ex_bits > 0 and (old_count == 0 or (qs.hasEx() and qs.ex_bits == self.ex_bits));
 
         qs.codes.data = try resizeSlice(u64, self.alloc, qs.codes.data, new_count * width);
         qs.codes.count = @intCast(new_count);
@@ -440,6 +484,7 @@ pub const RaBitQuantizer = struct {
             self.dims,
             width,
         );
+        if (extend_ex) try self.fillEx(qs, temp_diffs, old_count, count) else self.clearEx(qs);
     }
 
     /// Estimates distances from a query vector to all vectors in the quantized set.
@@ -833,6 +878,31 @@ pub const RaBitQuantizer = struct {
                 }
             },
         }
+    }
+};
+
+/// Scores rows of a set's extended (multi-bit) codes against one query,
+/// relative to the set's centroid. The query must be in the same (rotated)
+/// space the set was quantized in. Distances follow the set's metric and
+/// the 1-bit kernel's conventions; bounds are sized like the 1-bit ones.
+pub const ExEstimator = struct {
+    codec: rqx.Codec,
+    query: rqx.Codec.Query,
+
+    pub fn init(alloc: Allocator, qs: *const proto.RaBitQuantizedVectorSet, query_vector: []const f32) !ExEstimator {
+        if (!qs.hasEx()) return error.MissingExtendedCodes;
+        const codec = try rqx.Codec.init(qs.centroid.len, @intCast(qs.ex_bits), qs.metric);
+        return .{ .codec = codec, .query = try codec.prepare(alloc, qs.centroid, query_vector) };
+    }
+
+    pub fn deinit(self: *ExEstimator, alloc: Allocator) void {
+        self.query.deinit(alloc);
+        self.* = undefined;
+    }
+
+    pub fn estimate(self: *const ExEstimator, qs: *const proto.RaBitQuantizedVectorSet, i: usize) rqx.Estimate {
+        const x_dot_c: f32 = if (qs.metric != .l2_squared) qs.centroid_dot_products[i] else 0;
+        return self.codec.estimateParts(&self.query, qs.exCode(i), qs.centroid_distances[i], .{ .inv = qs.ex_factors[i * 2], .cos = qs.ex_factors[i * 2 + 1] }, x_dot_c);
     }
 };
 
@@ -1292,4 +1362,72 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
     var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
     for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
     return result;
+}
+
+test "RaBitQuantizer writes extended codes that survive append, refresh and encoding" {
+    const alloc = std.testing.allocator;
+    const d = 64;
+    var prng = std.Random.DefaultPrng.init(17);
+    const rand = prng.random();
+    const n = 120;
+    const vectors = try alloc.alloc(f32, n * d);
+    defer alloc.free(vectors);
+    for (vectors) |*v| v.* = rand.floatNorm(f32);
+    const centroid = try alloc.alloc(f32, d);
+    defer alloc.free(centroid);
+    @memset(centroid, 0.05);
+    const query = try alloc.alloc(f32, d);
+    defer alloc.free(query);
+    for (query) |*v| v.* = rand.floatNorm(f32);
+
+    var q = try RaBitQuantizer.init(alloc, d, 42, .l2_squared);
+    defer q.deinit();
+    q.ex_bits = 4;
+    // Quantize the first half, append the rest.
+    var set = try q.quantize(centroid, vectors[0 .. 60 * d], 60);
+    defer set.deinit(alloc);
+    try q.quantizeWithSet(&set, vectors[60 * d ..], 60);
+    try std.testing.expect(set.hasEx());
+
+    const bytes = try set.encode(alloc);
+    defer alloc.free(bytes);
+    var decoded = try proto.RaBitQuantizedVectorSet.decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expect(decoded.hasEx());
+    try std.testing.expectEqualSlices(u64, set.ex_codes, decoded.ex_codes);
+
+    // Extended estimates are far closer to exact distances than 1-bit ones.
+    const dist = try alloc.alloc(f32, n);
+    defer alloc.free(dist);
+    const bnd = try alloc.alloc(f32, n);
+    defer alloc.free(bnd);
+    try q.estimateDistances(&decoded, query, dist, bnd);
+    var ex = try ExEstimator.init(alloc, &decoded, query);
+    defer ex.deinit(alloc);
+    var err1: f32 = 0;
+    var err4: f32 = 0;
+    var bound1: f32 = 0;
+    var bound4: f32 = 0;
+    for (0..n) |i| {
+        var exact: f32 = 0;
+        for (vectors[i * d ..][0..d], query) |a, b| exact += (a - b) * (a - b);
+        const e = ex.estimate(&decoded, i);
+        err1 += @abs(dist[i] - exact);
+        err4 += @abs(e.distance - exact);
+        bound1 += bnd[i];
+        bound4 += e.bound;
+    }
+    try std.testing.expect(err4 * 3 < err1);
+    try std.testing.expect(bound4 * 3 < bound1);
+
+    // A refresh with a 1-bit quantizer drops the columns; appending to a
+    // set without them never produces partial columns.
+    q.ex_bits = 0;
+    try q.quantizeInto(&set, centroid, vectors, n);
+    try std.testing.expect(!set.hasEx() and set.ex_codes.len == 0);
+    q.ex_bits = 4;
+    try q.quantizeWithSet(&set, vectors[0..d], 1);
+    try std.testing.expect(!set.hasEx() and set.ex_codes.len == 0);
+    try q.quantizeInto(&set, centroid, vectors, n);
+    try std.testing.expect(set.hasEx());
 }

@@ -219,6 +219,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_derived_derived_worker;
     _ = @import("antfly_local_sources").storage_db_derived_index_generation_manifest;
     _ = @import("antfly_local_sources").storage_db_derived_index_repair_state;
+    _ = @import("antfly_local_sources").storage_db_derived_replay_budget;
     _ = @import("antfly_local_sources").storage_db_derived_io_threaded_runtime;
     _ = @import("antfly_local_sources").storage_db_derived_replay_source;
     _ = @import("antfly_local_sources").storage_db_derived_replay_stream;
@@ -398,6 +399,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_path_lock_wait;
     _ = @import("antfly_local_sources").storage_lite_paths;
     _ = @import("antfly_local_sources").storage_lite_read_workspace;
+    _ = @import("antfly_local_sources").storage_lite_reader_coordinator;
     _ = @import("antfly_local_sources").storage_lite_reader_epochs;
     _ = @import("antfly_local_sources").storage_lite_result_scratch;
     _ = @import("antfly_local_sources").storage_lite_reclamation;

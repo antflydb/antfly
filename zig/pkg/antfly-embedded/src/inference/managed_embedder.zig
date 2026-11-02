@@ -3194,9 +3194,31 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         try appendJsonString(alloc, &out, producer);
     }
 
+    try appendDenseQuantizationIfPresent(alloc, &out, root);
     try appendExecutionObjectIfPresent(alloc, &out, root);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+/// Copies the public dense `quantization_bits` (1..8) and
+/// `quantization_refine` into the internal HBC config, validating them.
+fn appendDenseQuantizationIfPresent(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    root: std.json.ObjectMap,
+) !void {
+    if (root.get("quantization_bits")) |value| {
+        if (value != .integer or value.integer < 1 or value.integer > 8) return error.InvalidCreateTableRequest;
+        const encoded = try std.fmt.allocPrint(alloc, ",\"quantization_bits\":{d}", .{value.integer});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    if (root.get("quantization_refine")) |value| {
+        if (value != .string or std.meta.stringToEnum(indexes_openapi.QuantizationRefine, value.string) == null)
+            return error.InvalidCreateTableRequest;
+        try out.appendSlice(alloc, ",\"quantization_refine\":");
+        try appendJsonString(alloc, out, value.string);
+    }
 }
 
 fn normalizeAntflyChunkerDefaultModelJson(
@@ -11774,6 +11796,33 @@ test "managed embedder cold activation precedes default probe and query inferenc
         }
         if (!case.bounded) try std.testing.expectEqual(@as(u32, 1), service.activations.load(.monotonic));
         try std.testing.expectEqual(@as(u32, if (case.bounded) 0 else 1), service.embeddings.load(.monotonic));
+    }
+}
+
+test "managed embedder forwards dense quantization settings" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","dimension":8,"external":true,"quantization_bits":4,"quantization_refine":"all"}
+    , .{});
+    defer parsed.deinit();
+    const config_json = try translateEmbeddingsIndexConfigJson(alloc, "dense_q", parsed.value);
+    defer alloc.free(config_json);
+    try ant_json.testing.expectSubsetJsonText(alloc,
+        \\{"quantization_bits":4,"quantization_refine":"all"}
+    , config_json);
+
+    for ([_][]const u8{
+        \\{"type":"embeddings","dimension":8,"external":true,"quantization_bits":9}
+        ,
+        \\{"type":"embeddings","dimension":8,"external":true,"quantization_refine":"some"}
+    }) |raw| {
+        var bad = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer bad.deinit();
+        // Rejected either here or by the generated config parser.
+        if (translateEmbeddingsIndexConfigJson(alloc, "dense_q", bad.value)) |unexpected| {
+            alloc.free(unexpected);
+            return error.TestUnexpectedResult;
+        } else |_| {}
     }
 }
 

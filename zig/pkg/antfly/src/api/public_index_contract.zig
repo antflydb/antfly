@@ -116,6 +116,8 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
             std.mem.eql(u8, field, "template") or
             std.mem.eql(u8, field, "distance_metric") or
             std.mem.eql(u8, field, "mem_only") or
+            std.mem.eql(u8, field, "quantization_bits") or
+            std.mem.eql(u8, field, "quantization_refine") or
             std.mem.eql(u8, field, "embedder") or
             std.mem.eql(u8, field, "summarizer") or
             std.mem.eql(u8, field, "chunker") or
@@ -433,6 +435,8 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
             std.mem.eql(u8, field, "top_k") or
             std.mem.eql(u8, field, "chunk_size"))
             isInteger(value)
+        else if (std.mem.eql(u8, field, "quantization_bits"))
+            value == .integer and value.integer >= 1 and value.integer <= 8
         else if (std.mem.eql(u8, field, "min_weight"))
             isNumber(value)
         else if (std.mem.eql(u8, field, "embedder") or

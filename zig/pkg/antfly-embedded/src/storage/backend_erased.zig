@@ -1096,8 +1096,16 @@ pub const NamespaceBatch = struct {
         put: *const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror!void,
+        staged_bytes: ?*const fn (*anyopaque) anyerror!u64 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    /// Bytes staged for commit admission, or null when the backend has no
+    /// such measure.
+    pub fn stagedBytes(self: *NamespaceBatch) !?u64 {
+        const staged = self.vtable.staged_bytes orelse return null;
+        return try BoundaryAbi.call("staged_bytes", self.boundary_dispatch, staged, .{self.ptr});
+    }
 
     pub fn abort(self: *NamespaceBatch) void {
         self.vtable.abort(self.allocator, self.ptr);
@@ -2143,8 +2151,15 @@ pub fn namespaceBatchFrom(
         fn delete(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8) anyerror!void {
             try unbox(ptr).handle.delete(try mapNamespace(namespace), key);
         }
+
+        pub fn stagedBytes(ptr: *anyopaque) anyerror!u64 {
+            const inner = &unbox(ptr).handle;
+            if (comptime @hasDecl(Handle, "stagedLogicalBytes")) return inner.stagedLogicalBytes();
+            return try inner.stagedBytes() orelse error.Unsupported;
+        }
     };
 
+    const has_staged = comptime @hasDecl(Handle, "stagedLogicalBytes") or @hasDecl(Handle, "stagedBytes");
     return .{
         .allocator = wrapper_box_allocator,
         .ptr = box_ptr,
@@ -2156,6 +2171,7 @@ pub fn namespaceBatchFrom(
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
+            .staged_bytes = if (has_staged) vt.stagedBytes else null,
         },
     };
 }

@@ -877,6 +877,7 @@ pub const ProvenanceEnvelope = types.ProvenanceEnvelope;
 pub const ProvenanceOrigin = types.ProvenanceOrigin;
 pub const PruneStats = types.PruneStats;
 pub const Pruner = types.Pruner;
+pub const QuantizationRefine = types.QuantizationRefine;
 pub const Query = types.Query;
 pub const QueryAdmissionConfig = types.QueryAdmissionConfig;
 pub const QueryBuilderRequest = types.QueryBuilderRequest;

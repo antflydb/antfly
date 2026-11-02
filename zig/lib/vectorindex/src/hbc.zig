@@ -43,6 +43,9 @@ pub const IndexMetadata = struct {
     topology_rebuild_algorithm: u8 = std.math.maxInt(u8),
     topology_vector_base_generation: u64 = 0,
     topology_vector_wal_mutation_sequence: u64 = 0,
+    /// RaBitQ bits per dimension (`HBCConfig.quantization_bits`). Encoded
+    /// only when above 1, so 1-bit indexes keep the previous byte layout.
+    quantization_bits: u8 = 1,
 
     pub fn encode(self: *const IndexMetadata, buf: []u8) []u8 {
         var pos: usize = 0;
@@ -67,6 +70,10 @@ pub const IndexMetadata = struct {
         pos += 1;
         writeU64LE(buf, &pos, self.topology_vector_base_generation);
         writeU64LE(buf, &pos, self.topology_vector_wal_mutation_sequence);
+        if (self.quantization_bits > 1) {
+            buf[pos] = self.quantization_bits;
+            pos += 1;
+        }
         return buf[0..pos];
     }
 
@@ -89,10 +96,11 @@ pub const IndexMetadata = struct {
         pos += 1;
         const projection_generation = readU64LE(data, &pos);
         const projection_config_hash = readU64LE(data, &pos);
-        const topology_rebuild_algorithm = if (data.len >= encoded_size) data[pos] else std.math.maxInt(u8);
-        if (data.len >= encoded_size) pos += 1;
-        const topology_vector_base_generation = if (data.len >= encoded_size) readU64LE(data, &pos) else 0;
-        const topology_vector_wal_mutation_sequence = if (data.len >= encoded_size) readU64LE(data, &pos) else 0;
+        const topology_rebuild_algorithm = if (data.len >= topology_encoded_size) data[pos] else std.math.maxInt(u8);
+        if (data.len >= topology_encoded_size) pos += 1;
+        const topology_vector_base_generation = if (data.len >= topology_encoded_size) readU64LE(data, &pos) else 0;
+        const topology_vector_wal_mutation_sequence = if (data.len >= topology_encoded_size) readU64LE(data, &pos) else 0;
+        const quantization_bits: u8 = if (data.len >= encoded_size) data[pos] else 1;
         return .{
             .version = version,
             .dims = dims,
@@ -111,6 +119,7 @@ pub const IndexMetadata = struct {
             .topology_rebuild_algorithm = topology_rebuild_algorithm,
             .topology_vector_base_generation = topology_vector_base_generation,
             .topology_vector_wal_mutation_sequence = topology_vector_wal_mutation_sequence,
+            .quantization_bits = quantization_bits,
         };
     }
 
@@ -131,7 +140,9 @@ pub const IndexMetadata = struct {
     }
 
     pub const legacy_encoded_size = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 1 + 8 + 1 + 8 + 1 + 8 + 8;
-    pub const encoded_size = legacy_encoded_size + 1 + 8 + 8;
+    pub const topology_encoded_size = legacy_encoded_size + 1 + 8 + 8;
+    /// Largest encoding (with `quantization_bits`); size buffers with this.
+    pub const encoded_size = topology_encoded_size + 1;
 };
 
 pub const Suffix = enum(u8) {
@@ -334,4 +345,20 @@ test "packed node v1 decodes with unknown covering radius" {
     try std.testing.expect(std.math.isNan(decoded.covering_radius));
     try std.testing.expectEqualSlices(u8, centroid, decoded.centroid_bytes);
     try std.testing.expectEqualSlices(u8, ids, decoded.ids_bytes);
+}
+
+test "index metadata encodes quantization bits only when above one" {
+    var buf: [IndexMetadata.encoded_size]u8 = undefined;
+    const one_bit = IndexMetadata{ .dims = 8, .branching_factor = 4, .leaf_size = 4 };
+    const one = one_bit.encode(&buf);
+    try std.testing.expectEqual(IndexMetadata.topology_encoded_size, one.len);
+    try std.testing.expectEqual(@as(u8, 1), IndexMetadata.decode(one).quantization_bits);
+    var four_bit = one_bit;
+    four_bit.quantization_bits = 4;
+    four_bit.topology_vector_base_generation = 7;
+    const four = four_bit.encode(&buf);
+    try std.testing.expectEqual(IndexMetadata.encoded_size, four.len);
+    const decoded = IndexMetadata.decode(four);
+    try std.testing.expectEqual(@as(u8, 4), decoded.quantization_bits);
+    try std.testing.expectEqual(@as(u64, 7), decoded.topology_vector_base_generation);
 }

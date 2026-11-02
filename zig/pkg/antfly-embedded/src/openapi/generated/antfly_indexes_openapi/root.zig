@@ -211,6 +211,7 @@ pub const PatternMatch = types.PatternMatch;
 pub const PatternStep = types.PatternStep;
 pub const PriorArtifactContext = types.PriorArtifactContext;
 pub const Pruner = types.Pruner;
+pub const QuantizationRefine = types.QuantizationRefine;
 pub const RelationalIndexBuildFailure = types.RelationalIndexBuildFailure;
 pub const RelationalIndexBuildState = types.RelationalIndexBuildState;
 pub const RelationalIndexConfig = types.RelationalIndexConfig;

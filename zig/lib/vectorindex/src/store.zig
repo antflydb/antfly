@@ -243,12 +243,53 @@ pub const NamespaceBatch = struct {
         put: *const fn (*anyopaque, Namespace, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,
+        staged_bytes: ?*const fn (*anyopaque) anyerror!?u64 = null,
     };
+
+    /// Bytes staged for the backend's commit admission, or null when the
+    /// backend does not measure them.
+    pub fn stagedBytes(self: *NamespaceBatch) !?u64 {
+        const staged = self.vtable.staged_bytes orelse return null;
+        return try staged(self.ptr);
+    }
 
     pub fn abort(self: *NamespaceBatch) void {
         self.vtable.abort(self.allocator, self.ptr);
         self.* = undefined;
     }
+
+    /// A closed batch: abort is a no-op and every other operation fails.
+    /// Holders that commit and reopen a batch in place store this when the
+    /// reopen fails, so their error-path abort stays safe.
+    pub fn inert(allocator: Allocator) NamespaceBatch {
+        return .{ .allocator = allocator, .ptr = @constCast(@as(*const anyopaque, &inert_vtable)), .vtable = &inert_vtable };
+    }
+
+    const inert_vtable: VTable = .{
+        .abort = struct {
+            fn f(_: Allocator, _: *anyopaque) void {}
+        }.f,
+        .commit = struct {
+            fn f(_: Allocator, _: *anyopaque) anyerror!void {
+                return error.BatchClosed;
+            }
+        }.f,
+        .get = struct {
+            fn f(_: *anyopaque, _: Namespace, _: []const u8) anyerror![]const u8 {
+                return error.BatchClosed;
+            }
+        }.f,
+        .put = struct {
+            fn f(_: *anyopaque, _: Namespace, _: []const u8, _: []const u8) anyerror!void {
+                return error.BatchClosed;
+            }
+        }.f,
+        .delete = struct {
+            fn f(_: *anyopaque, _: Namespace, _: []const u8) anyerror!void {
+                return error.BatchClosed;
+            }
+        }.f,
+    };
 
     pub fn commit(self: *NamespaceBatch) !void {
         try self.vtable.commit(self.allocator, self.ptr);
@@ -571,6 +612,10 @@ pub fn namespaceBatchFrom(
         fn delete(ptr: *anyopaque, namespace: Namespace, key: []const u8) anyerror!void {
             try unbox(ptr).handle.delete(try mapNamespace(namespace), key);
         }
+
+        pub fn stagedBytes(ptr: *anyopaque) anyerror!?u64 {
+            return try unbox(ptr).handle.stagedBytes();
+        }
     };
 
     return .{
@@ -584,6 +629,7 @@ pub fn namespaceBatchFrom(
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
+            .staged_bytes = if (@hasDecl(Handle, "stagedBytes")) vt.stagedBytes else null,
         },
     };
 }
