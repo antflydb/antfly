@@ -952,6 +952,8 @@ pub const Detail = enum(c_int) {
     ha_catalog_replication_sources_unsupported,
     // Append-only: numeric Detail values are part of the stable C ABI.
     embed_admission_refused,
+    lite_replay_backlog_exceeded,
+    invalid_native_replay_admission,
 };
 
 pub const Status = extern struct {
@@ -1829,6 +1831,8 @@ pub fn statusFromError(err: anyerror) Status {
         // identity (the enrichment retry-budget exemption) can tell them
         // apart by name.
         error.EmbedAdmissionRefused => status(.retryable, .embed_admission_refused),
+        error.LiteReplayBacklogExceeded => status(.retryable, .lite_replay_backlog_exceeded),
+        error.InvalidNativeReplayAdmission => status(.corrupt, .invalid_native_replay_admission),
         else => status(.internal, .none),
     };
 }
@@ -2720,6 +2724,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .runtime_stopping => "RuntimeStopping",
         .runtime_already_ready => "RuntimeAlreadyReady",
         .embed_admission_refused => "EmbedAdmissionRefused",
+        .lite_replay_backlog_exceeded => "LiteReplayBacklogExceeded",
+        .invalid_native_replay_admission => "InvalidNativeReplayAdmission",
     };
 }
 
@@ -3242,4 +3248,14 @@ test "reader failures preserve retry semantics and GCS failures preserve scope s
     inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
         try std.testing.expectEqual(expected, errorFromStatus(statusFromError(expected)));
     }
+}
+
+test "native replay capacity and damaged admission totals retain distinct boundary outcomes" {
+    const full = statusFromError(error.LiteReplayBacklogExceeded);
+    const corrupt = statusFromError(error.InvalidNativeReplayAdmission);
+    try std.testing.expectEqual(@backingInt(Code.retryable), full.code);
+    try std.testing.expectEqual(@backingInt(Code.corrupt), corrupt.code);
+    try std.testing.expectEqual(error.LiteReplayBacklogExceeded, errorFromStatus(full));
+    try std.testing.expectEqual(error.InvalidNativeReplayAdmission, errorFromStatus(corrupt));
+    try std.testing.expect(full.detail != corrupt.detail);
 }

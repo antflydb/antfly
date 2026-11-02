@@ -215,6 +215,9 @@ pub const CursorOptions = struct {
 /// evolving. Higher layers should only depend on capabilities they actively
 /// require.
 pub const Capabilities = struct {
+    /// Replay storage enforces a durable high-water mark. Namespaces without
+    /// consumers must also retire their journal through the normal safe fence.
+    bounded_replay_admission: bool = false,
     ordered_ranges: bool = true,
     reverse_ranges: bool = false,
     cursors: bool = true,

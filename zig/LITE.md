@@ -1199,7 +1199,9 @@ writable owners replace the generation before enabling the new protocol.
 Replay records and prepared transaction reservations charge the same atomic
 checkpoint as their primary effects. Default high-water marks are 16 MiB and
 4,096 record credits across all namespaces and hint lanes. Retirement returns
-credits; control-only changes and deletion remain admissible. An empty journal
+credits, including namespaces with no managed indexes. Those namespaces use the
+durable replay head with the same enrichment, resolver, replacement, repair and
+failed-index fences; they cannot strand producers at the watermark. Control-only changes and deletion remain admissible. An empty journal
 can accept one oversized atomic record, and an already-admitted distributed
 transaction can finish above the watermark rather than deadlocking recovery.
 Prepared votes reserve their future replay credits. Consumer work has reserved

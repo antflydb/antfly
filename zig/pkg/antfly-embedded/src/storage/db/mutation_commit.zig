@@ -5096,16 +5096,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
             if (ctx.repair_replay_mutex) |mutex| mutex.lockUncancelable(ctx.index_manager.checkpointIo());
             defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock(ctx.index_manager.checkpointIo());
-            if (!ctx.index_manager.hasManagedIndexes()) return;
+            const bounded_replay = ctx.store.runtime_store.capabilities().bounded_replay_admission;
+            if (!ctx.index_manager.hasManagedIndexes() and !bounded_replay) return;
 
             const managed_indexes = try ctx.index_manager.managedIndexes(ctx.alloc);
             defer {
                 for (managed_indexes) |index_ref| ctx.alloc.free(@constCast(index_ref.name));
                 ctx.alloc.free(managed_indexes);
             }
-            if (managed_indexes.len == 0) return;
+            if (managed_indexes.len == 0 and (!bounded_replay or ctx.index_manager.failedIndexLoadSummary().total != 0)) return;
 
-            var min_applied: u64 = std.math.maxInt(u64);
+            // A namespace with no managed consumers still has bounded native
+            // journal storage. Its durable head is eligible, subject to the
+            // same enrichment, resolver, replacement and repair-pin clamps.
+            var min_applied: u64 = if (managed_indexes.len == 0) ctx.store.lastReplaySequence(0) else std.math.maxInt(u64);
             for (managed_indexes) |index_ref| {
                 const applied = try loadManagedAppliedSequenceContext(
                     ctx.alloc,

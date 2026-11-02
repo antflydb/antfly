@@ -55338,7 +55338,11 @@ fn replayPendingDerivedBatches(
     progress_hook: ?ReplayProgressHook,
     options: DB.ReplayDrainOptions,
 ) !void {
-    if (!self.core.hasManagedIndexes()) return;
+    if (!self.core.hasManagedIndexes()) {
+        if (options.truncate_replay and self.core.store.runtime_store.capabilities().bounded_replay_admission)
+            try truncateReplayJournalIfSafe(self);
+        return;
+    }
 
     const dense_catch_up_watchdog_interval_ns = 5 * std.time.ns_per_s;
 

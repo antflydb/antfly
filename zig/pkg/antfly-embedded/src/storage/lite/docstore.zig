@@ -3010,8 +3010,9 @@ pub const Store = struct {
         .begin_batch_with_options = beginBatchWithOptions,
     });
 
-    pub fn capabilities(_: *Store) backend_types.Capabilities {
+    pub fn capabilities(self: *Store) backend_types.Capabilities {
         return .{
+            .bounded_replay_admission = self.file.header.indexed_reclamation and self.file.header.indexed_revision >= 8,
             .ordered_ranges = true,
             .reverse_ranges = true,
             .cursors = true,

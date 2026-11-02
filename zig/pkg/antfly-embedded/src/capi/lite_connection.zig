@@ -193,6 +193,14 @@ pub const PreparedPublication = struct {
             return;
         }
         if (self.catalog) |proof| if (proof.recovery_clean and probe.header.indexed_reclamation) {
+            if (self.snapshot_database.root_incarnation != self.incarnation or
+                !std.meta.eql(self.snapshot_database.core.identity_namespace, self.identity)) return error.EnrichmentSourceChanged;
+            // Check already-loaded name bindings without opening a runtime.
+            // The native proof below independently fences the durable catalog.
+            if (self.owner.current) |root| if (!std.mem.eql(u8, self.name, "default")) {
+                if (root.embedded_table_records.get(self.name)) |id|
+                    if (id != self.identity.table_id) return error.EnrichmentSourceChanged;
+            };
             try proof.verifyNative(probe);
             self.owner.publication_stats.storage_guard_validations +|= 1;
             return;
@@ -5275,40 +5283,43 @@ test "capi native replay publication guards preserve recovery and replacement fe
 
 test "capi native replay admission refuses a transform before commit and returns credit after drain" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
-    var fixture = try AdmissionFollowupFixture.init("durable-replay-transform", 1000, .batch);
-    defer fixture.deinit();
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
-    var output: h.capi.Buffer = .{};
-    defer api.antfly_buffer_free_zero(&output);
-    const seed = "{\"inserts\":{\"counter\":{\"body\":\"counter\",\"count\":0}},\"sync_level\":\"write\"}";
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice(seed), &output));
-    api.antfly_buffer_free_zero(&output);
-    {
-        var lease = try fixture.connection.acquire();
-        defer {
-            lease.close();
-            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    for ([_]bool{ false, true }) |indexed| {
+        var fixture = try AdmissionFollowupFixture.init("durable-replay-transform", 1000, .batch);
+        defer fixture.deinit();
+        if (indexed) try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"search\",\"type\":\"full_text\"}")));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+        var output: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&output);
+        const seed = "{\"inserts\":{\"counter\":{\"body\":\"counter\",\"count\":0}},\"sync_level\":\"write\"}";
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice(seed), &output));
+        api.antfly_buffer_free_zero(&output);
+        {
+            var lease = try fixture.connection.acquire();
+            defer {
+                lease.close();
+                fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            }
+            const file = &fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+            var state = (try file.replayAdmission()).?;
+            try std.testing.expect(state.records > 0);
+            state.limits.records = state.records;
+            try file.putDocument(native.replay_admission.key, &state.encode());
         }
-        const file = &fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
-        var state = (try file.replayAdmission()).?;
-        try std.testing.expect(state.records > 0);
-        state.limits.records = state.records;
-        try file.putDocument(native.replay_admission.key, &state.encode());
-    }
-    const increment = "{\"transforms\":[{\"key\":\"counter\",\"operations\":[{\"op\":\"$inc\",\"path\":\"count\",\"value\":1}]}],\"sync_level\":\"write\"}";
-    for (0..2) |_| {
-        try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_batch_json(fixture.id, .fromSlice(increment), &output));
+        const increment = "{\"transforms\":[{\"key\":\"counter\",\"operations\":[{\"op\":\"$inc\",\"path\":\"count\",\"value\":1}]}],\"sync_level\":\"write\"}";
+        for (0..2) |_| {
+            try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_batch_json(fixture.id, .fromSlice(increment), &output));
+            const raw = (try fixture.connection.owner.current.?.db.get(std.testing.allocator, "counter")).?;
+            defer std.testing.allocator.free(raw);
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("count").?.integer);
+        }
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(fixture.id));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice(increment), &output));
         const raw = (try fixture.connection.owner.current.?.db.get(std.testing.allocator, "counter")).?;
         defer std.testing.allocator.free(raw);
         var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
         defer parsed.deinit();
-        try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("count").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
     }
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(fixture.id));
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice(increment), &output));
-    const raw = (try fixture.connection.owner.current.?.db.get(std.testing.allocator, "counter")).?;
-    defer std.testing.allocator.free(raw);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
 }
