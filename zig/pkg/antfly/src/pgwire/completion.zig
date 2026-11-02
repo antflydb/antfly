@@ -2,7 +2,7 @@
 const std = @import("std");
 pub const max_outcomes = 64;
 pub const Outcome = struct { reference_id: ?[]const u8 = null, registration_node_id: ?u64 = null, registration_pending: bool = false, transaction_id: ?[]const u8 = null, ddl_receipt_json: ?[]const u8 = null };
-pub const Receipt = struct { version: u8 = 11, unknown: bool = false, outcomes: []const Outcome = &.{} };
+pub const Receipt = struct { version: u8 = 12, unknown: bool = false, outcomes: []const Outcome = &.{} };
 pub const Completion = struct {
     unknown: bool = false,
     join_begin: ?usize = null,

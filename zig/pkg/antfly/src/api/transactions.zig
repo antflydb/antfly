@@ -1050,8 +1050,8 @@ pub const Session = struct {
 pub const DurableSessionStore = struct {
     alloc: std.mem.Allocator,
     backend: Backend,
-    // Every write to this namespace shares one lock. Runtime batches are atomic
-    // but do not serialize read/modify/write snapshots, including proof retirement.
+    // Local facade state and fallback for providers whose write transactions
+    // already serialize internally. mutationMutex selects shared backend gates.
     mutation_mutex: std.atomic.Mutex = .unlocked,
     reserved_registrations: usize = 0,
     registration_issuer: ?u64 = null,
@@ -1063,11 +1063,39 @@ pub const DurableSessionStore = struct {
     fail_writes_for_test: bool = false,
     fail_lease_transition_after_session_write_for_test: bool = false,
 
+    fn writeSerialization(self: *const DurableSessionStore) backend_erased.WriteSerialization {
+        return switch (self.backend) {
+            .docstore => |store| store.writeSerialization(),
+            .runtime => |store| store.writeSerialization(),
+        };
+    }
+
+    pub fn supportsSharedMutations(self: *const DurableSessionStore) bool {
+        return self.writeSerialization() != .unsupported;
+    }
+
+    /// All read/modify/write operations on a shared runtime namespace use its
+    /// backend's gate. A configured Store.write_gate already surrounds writes,
+    /// so its caller retains only the local lock and avoids recursive locking.
+    pub fn mutationMutex(self: *DurableSessionStore) *std.atomic.Mutex {
+        switch (self.writeSerialization()) {
+            .gate => |gate| return gate,
+            .intrinsic, .unsupported => {},
+        }
+        return &self.mutation_mutex;
+    }
+
     // A facade owns one issuer for its entire lifetime. Sharing the physical
     // transaction store is supported; rebinding a live facade is not.
     pub fn bindRegistrationIssuer(self: *DurableSessionStore, issuer: u64) !void {
-        platform_sync.lockYielding(&self.mutation_mutex);
-        defer self.mutation_mutex.unlock();
+        // Anonymous node-local stores retain their exclusive-facade contract.
+        // Shared issuers must prove transaction-wide coordination before they
+        // can advertise SQL completion or allocate a durable consumer.
+        if (issuer != 0 and !self.supportsSharedMutations())
+            return error.CompletionOwnerUnavailable;
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         if (self.registration_issuer) |bound| {
             if (bound != issuer) return error.CompletionWrongOwner;
         } else {
@@ -1098,8 +1126,9 @@ pub const DurableSessionStore = struct {
     }
 
     pub fn save(self: *DurableSessionStore, session: Session, max_record_bytes: ?usize) !void {
-        platform_sync.lockYielding(&self.mutation_mutex);
-        defer self.mutation_mutex.unlock();
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         const key = try makeSessionKey(self.alloc, session.txn_id);
         defer self.alloc.free(key);
@@ -1137,8 +1166,9 @@ pub const DurableSessionStore = struct {
         require_expired: bool,
         max_record_bytes: ?usize,
     ) !bool {
-        platform_sync.lockYielding(&self.mutation_mutex);
-        defer self.mutation_mutex.unlock();
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         return switch (self.backend) {
             .docstore => |store| blk: {
@@ -1367,8 +1397,9 @@ pub const DurableSessionStore = struct {
         return @splat(0);
     }
     fn registrationMutation(self: *DurableSessionStore, action: RegistrationMutation) ![16]u8 {
-        platform_sync.lockYielding(&self.mutation_mutex);
-        defer self.mutation_mutex.unlock();
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         const result = switch (self.backend) {
             .docstore => |store| blk: {
@@ -1390,8 +1421,9 @@ pub const DurableSessionStore = struct {
         return result;
     }
     pub fn reserveRegistrations(self: *DurableSessionStore, count: usize) !void {
-        platform_sync.lockYielding(&self.mutation_mutex);
-        defer self.mutation_mutex.unlock();
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         const free = switch (self.backend) {
             .docstore => |store| blk: {
                 var txn = try store.beginReadTxn();
@@ -1408,8 +1440,9 @@ pub const DurableSessionStore = struct {
         self.reserved_registrations += count;
     }
     pub fn releaseRegistrations(self: *DurableSessionStore, count: usize) void {
-        platform_sync.lockYielding(&self.mutation_mutex);
-        defer self.mutation_mutex.unlock();
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         std.debug.assert(count <= self.reserved_registrations);
         self.reserved_registrations -= count;
     }
@@ -1449,8 +1482,9 @@ pub const DurableSessionStore = struct {
         };
     }
     pub fn registrationRecoveryPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: u64, limit: usize) !Outbox.RecoveryPage {
-        platform_sync.lockYielding(&self.mutation_mutex);
-        defer self.mutation_mutex.unlock();
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         return switch (self.backend) {
             .docstore => |store| blk: {
                 var txn = try store.beginReadTxn();
@@ -1492,8 +1526,9 @@ pub const DurableSessionStore = struct {
     }
     pub const CompletionMode = enum { pin, prepare, quiesce, abandon, forget };
     pub fn changeCompletionReference(self: *DurableSessionStore, id: [16]u8, reference: [16]u8, acknowledge: bool, retired_through: ?u64, mode: CompletionMode) !bool {
-        platform_sync.lockYielding(&self.mutation_mutex);
-        defer self.mutation_mutex.unlock();
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         return switch (self.backend) {
             .docstore => |store| blk: {
@@ -1606,8 +1641,9 @@ pub const DurableSessionStore = struct {
     }
 
     pub fn delete(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !void {
-        platform_sync.lockYielding(&self.mutation_mutex);
-        defer self.mutation_mutex.unlock();
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         const key = try makeSessionKey(self.alloc, txn_id);
         defer self.alloc.free(key);
@@ -1631,8 +1667,9 @@ pub const DurableSessionStore = struct {
     /// unexecuted transaction and detach its exact connection in the same
     /// native transaction. Neither side may become visible alone.
     pub fn deleteAndDetachConnection(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, connection_id: [32]u8, commit_settings: bool) !void {
-        platform_sync.lockYielding(&self.mutation_mutex);
-        defer self.mutation_mutex.unlock();
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         const key = try makeSessionKey(self.alloc, txn_id);
         defer self.alloc.free(key);
@@ -1848,8 +1885,9 @@ pub const DurableSessionStore = struct {
     /// Rechecks the current durable row under a write transaction before
     /// backfilling its index entry, avoiding stale audit results.
     pub fn refreshRecoveryIndex(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !void {
-        platform_sync.lockYielding(&self.mutation_mutex);
-        defer self.mutation_mutex.unlock();
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         const session_key = try makeSessionKey(self.alloc, txn_id);
         defer self.alloc.free(session_key);
         const recovery_key = try makeSessionRecoveryKey(self.alloc, txn_id);
@@ -2032,7 +2070,7 @@ pub const OpenedSessionStore = struct {
     }
 
     pub fn leaseStore(self: *OpenedSessionStore) *SessionLeaseStore {
-        self.lease.mutation_mutex = &self.durable.mutation_mutex;
+        self.lease.mutation_mutex = self.durable.mutationMutex();
         return &self.lease;
     }
 };
@@ -2055,11 +2093,15 @@ pub const SessionLeaseStore = struct {
         return .{
             .alloc = alloc,
             .backend = .{ .docstore = store },
+            .mutation_mutex = switch (store.writeSerialization()) {
+                .gate => |gate| gate,
+                .intrinsic, .unsupported => null,
+            },
         };
     }
 
     pub fn initFromDurable(durable: *DurableSessionStore) SessionLeaseStore {
-        return .{ .alloc = durable.alloc, .backend = durable.backend, .mutation_mutex = &durable.mutation_mutex };
+        return .{ .alloc = durable.alloc, .backend = durable.backend, .mutation_mutex = durable.mutationMutex() };
     }
 
     pub fn load(self: *const SessionLeaseStore, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?lease_mod.LeaseRecord {
@@ -7943,4 +7985,155 @@ test "SQL pgwire native commit rejection requires a fresh execution" {
     try std.testing.expectEqual(CommitRejection.none, classifyCommitRejection(fresh, error.CommitDecisionUnknown));
     const session: Session = .{ .txn_id = @splat(1), .owner_node_id = 0, .begin_timestamp = 1, .last_touched_timestamp = 1, .sync_level = .write, .commit_execution_started = true };
     try std.testing.expect(session.info().commit_execution_started);
+}
+
+test "durable session mutations publish only after persistence succeeds: shared runtime facades retain both consumers after terminal cleanup" {
+    const regression_allocator = std.testing.allocator;
+    const FixtureRun = struct {
+        fn run(a: std.mem.Allocator, memory: bool, configured_gate: bool, document_facades: bool) !void {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/shared-runtime-review", .{tmp.sub_path});
+            defer a.free(path);
+            var mem = mem_backend.Backend.init(a, .{});
+            defer mem.close();
+            var lsm = if (!memory) try @import("antfly_local_sources").storage_lsm_backend.Backend.open(a, path, .{}) else null;
+            defer if (lsm) |*backend| backend.close();
+            var runtime = if (lsm) |*backend| try backend.runtimeStore(a, .{ .name = "system/shared-completion" }) else try mem.runtimeStore(a, .{ .name = "system/shared-completion" });
+            var second_runtime = if (lsm) |*backend| try backend.runtimeStore(a, .{ .name = "system/shared-completion" }) else try mem.runtimeStore(a, .{ .name = "system/shared-completion" });
+            defer second_runtime.deinit();
+            if (configured_gate) second_runtime.write_gate = second_runtime.writeSerialization().gate;
+            // An erased wrapper must preserve whether its underlying callbacks already
+            // hold the gate; acquiring that gate twice would deadlock this case.
+            var wrapped_runtime = try backend_erased.storeFrom(a, second_runtime);
+            defer wrapped_runtime.deinit();
+            defer runtime.deinit();
+            var original_docs = if (document_facades) try docstore_mod.DocStore.openRuntime(a, &runtime) else null;
+            defer if (original_docs) |*docs| docs.close();
+            var original = if (original_docs) |*docs| DurableSessionStore.init(a, docs) else DurableSessionStore.initRuntime(a, &runtime);
+            var registry = SessionRegistry.init(&original);
+            defer registry.deinit(a);
+            const session = try registry.begin(a, .{}, 1);
+            var request = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{\"n\":1}}}}}");
+            defer request.deinit(a);
+            var staged = (try registry.cloneCommitRequest(a, session.txn_id, &request)).?;
+            staged.deinit(a);
+            _ = (try registry.markCommitExecutionStarted(a, session.txn_id)).?;
+            const Fixture = struct {
+                store: *backend_erased.Store,
+                first_read: std.Io.Event = .unset,
+                release_first: std.Io.Event = .unset,
+                second_started: std.Io.Event = .unset,
+                second_done: std.Io.Event = .unset,
+                const Outer = @This();
+                const Wrapped = struct {
+                    original: backend_erased.WriteTxn,
+                    fixture: *Outer,
+                    fn get(ptr: *anyopaque, key: []const u8) ![]const u8 {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        const result = self.original.get(key);
+                        if (std.mem.indexOf(u8, key, "\x00\x00__api_completion_consumers__:") != null) {
+                            self.fixture.first_read.set(std.testing.io);
+                            self.fixture.release_first.waitUncancelable(std.testing.io);
+                        }
+                        return result;
+                    }
+                    fn openCursor(_: std.mem.Allocator, ptr: *anyopaque) !backend_erased.Cursor {
+                        return @as(*@This(), @ptrCast(@alignCast(ptr))).original.openCursor();
+                    }
+                    fn put(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
+                        return @as(*@This(), @ptrCast(@alignCast(ptr))).original.put(key, value);
+                    }
+                    fn delete(ptr: *anyopaque, key: []const u8) !void {
+                        return @as(*@This(), @ptrCast(@alignCast(ptr))).original.delete(key);
+                    }
+                    fn commit(alloc: std.mem.Allocator, ptr: *anyopaque) !void {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        try self.original.commit();
+                        alloc.destroy(self);
+                    }
+                    fn abort(alloc: std.mem.Allocator, ptr: *anyopaque) void {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        self.original.abort();
+                        alloc.destroy(self);
+                    }
+                };
+                fn beginWrite(alloc: std.mem.Allocator, ptr: *anyopaque) !backend_erased.WriteTxn {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    const wrapped = try alloc.create(Wrapped);
+                    errdefer alloc.destroy(wrapped);
+                    wrapped.* = .{ .original = try self.store.beginWrite(), .fixture = self };
+                    return .{ .allocator = alloc, .ptr = wrapped, .vtable = &.{ .get = Wrapped.get, .put = Wrapped.put, .delete = Wrapped.delete, .commit = Wrapped.commit, .abort = Wrapped.abort, .open_cursor = Wrapped.openCursor } };
+                }
+                fn pin(store: *DurableSessionStore, id: [16]u8, reference: [16]u8, fctx: ?*@This()) !void {
+                    if (fctx) |f| f.second_started.set(std.testing.io);
+                    defer if (fctx) |f| f.second_done.set(std.testing.io);
+                    try store.pinCompletion(id, reference);
+                }
+            };
+            var fixture: Fixture = .{ .store = &runtime };
+            var vtable = runtime.vtable.*;
+            vtable.begin_write = Fixture.beginWrite;
+            var intercepted = runtime;
+            intercepted.ptr = &fixture;
+            intercepted.vtable = &vtable;
+            var first_docs = if (document_facades) try docstore_mod.DocStore.openRuntime(a, &intercepted) else null;
+            defer if (first_docs) |*docs| docs.close();
+            var second_docs = if (document_facades) try docstore_mod.DocStore.openRuntime(a, &wrapped_runtime) else null;
+            defer if (second_docs) |*docs| docs.close();
+            // Cross the document adapter and erasure boundary for the second
+            // facade, so coordination must survive every wrapper in the stack.
+            var erased_docs = if (second_docs) |*docs| try backend_erased.storeFrom(a, docs.backendStore()) else null;
+            defer if (erased_docs) |*store| store.deinit();
+            var first = if (first_docs) |*docs| DurableSessionStore.init(a, docs) else DurableSessionStore.initRuntime(a, &intercepted);
+            var second = if (erased_docs) |*store| DurableSessionStore.initRuntime(a, store) else DurableSessionStore.initRuntime(a, &wrapped_runtime);
+            try first.bindRegistrationIssuer(1);
+            try second.bindRegistrationIssuer(2);
+            const ref_a: [16]u8 = @splat(0x41);
+            const ref_b: [16]u8 = @splat(0x42);
+            var one = try std.testing.io.concurrent(Fixture.pin, .{ &first, session.txn_id, ref_a, @as(?*Fixture, null) });
+            defer {
+                fixture.release_first.set(std.testing.io);
+                one.cancel(std.testing.io) catch {};
+            }
+            fixture.first_read.waitUncancelable(std.testing.io);
+            var two = try std.testing.io.concurrent(Fixture.pin, .{ &second, session.txn_id, ref_b, @as(?*Fixture, &fixture) });
+            defer two.cancel(std.testing.io) catch {};
+            fixture.second_started.waitUncancelable(std.testing.io);
+            std.testing.io.sleep(.fromMilliseconds(50), .awake) catch {};
+            const escaped = fixture.second_done.isSet();
+            fixture.release_first.set(std.testing.io);
+            try one.await(std.testing.io);
+            try two.await(std.testing.io);
+            try std.testing.expect(!escaped);
+            _ = (try registry.recordTerminalAbort(a, session.txn_id)).?;
+            _ = try registry.cleanupExpired(a, std.math.maxInt(u64));
+            const settled_a = try original.completionReferenceSettled(session.txn_id, ref_a);
+            const settled_b = try original.completionReferenceSettled(session.txn_id, ref_b);
+            try std.testing.expect((try original.load(session.txn_id)) == null);
+            try std.testing.expect(settled_a and settled_b);
+            try std.testing.expect(try original.acknowledgeCompletion(session.txn_id, ref_a));
+            try std.testing.expect(try original.acknowledgeCompletion(session.txn_id, ref_b));
+        }
+    };
+    for ([_]bool{ false, true }) |document_facades| {
+        try FixtureRun.run(regression_allocator, true, false, document_facades);
+        try FixtureRun.run(regression_allocator, false, false, document_facades);
+        try FixtureRun.run(regression_allocator, false, true, document_facades);
+    }
+}
+
+test "durable session mutations publish only after persistence succeeds: shared completion rejects uncoordinated runtime providers" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "system/uncoordinated" });
+    defer runtime.deinit();
+    runtime.write_serialization = .unsupported;
+    var durable = DurableSessionStore.initRuntime(a, &runtime);
+    try std.testing.expectError(error.CompletionOwnerUnavailable, durable.bindRegistrationIssuer(1));
+    // Custom intrinsically serializable providers can explicitly declare that
+    // contract, and callers can supply Store.write_gate for other providers.
+    runtime.write_serialization = .intrinsic;
+    try durable.bindRegistrationIssuer(1);
 }

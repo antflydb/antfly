@@ -60959,7 +60959,7 @@ test "SQL pgwire native transaction proofs route to the original node after payl
                     defer identity.deinit(self.owner.alloc);
                     authenticated = identity.is_internal_service;
                 }
-                if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-SQL-Settlement")) owner_mode = std.mem.eql(u8, header.value, "owner-v11");
+                if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-SQL-Settlement")) owner_mode = std.mem.eql(u8, header.value, "owner-v12");
             }
             try std.testing.expect(authenticated and owner_mode);
             if (self.reject) return .{ .status = 503, .body = try alloc.dupe(u8, "busy") };

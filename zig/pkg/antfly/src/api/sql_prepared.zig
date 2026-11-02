@@ -182,6 +182,9 @@ pub fn closeForConnection(store: *transactions.DurableSessionStore, id: []const 
 }
 
 fn access(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: ?[32]u8) !void {
+    const mutation = store.mutationMutex();
+    @import("antfly_platform").sync.lockYielding(mutation);
+    defer mutation.unlock();
     if (store.fail_writes_for_test) return error.InjectedSessionStoreFailure;
     return switch (store.backend) {
         .docstore => |backend| blk: {

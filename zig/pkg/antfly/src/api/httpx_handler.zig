@@ -6911,7 +6911,7 @@ pub const AntflyApiHandler = struct {
     fn executeSQLModeOwned(self: *AntflyApiHandler, ctx: *httpx.Context, mode: SQLPreparedMode, resource_id: ?[]const u8, completion: *@import("../pgwire/completion.zig").Completion) !httpx.Response {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*value| value.deinit(self.api_server.alloc);
-        const owner_mode = if (ctx.header("X-Antfly-SQL-Settlement")) |mode_value| (std.mem.eql(u8, mode_value, "owner-v4") or std.mem.eql(u8, mode_value, "owner-v5") or std.mem.eql(u8, mode_value, "owner-v6") or std.mem.eql(u8, mode_value, "owner-v7") or std.mem.eql(u8, mode_value, "owner-v8") or std.mem.eql(u8, mode_value, "owner-v9") or std.mem.eql(u8, mode_value, "owner-v10") or std.mem.eql(u8, mode_value, "owner-v11")) else false;
+        const owner_mode = if (ctx.header("X-Antfly-SQL-Settlement")) |mode_value| (std.mem.eql(u8, mode_value, "owner-v4") or std.mem.eql(u8, mode_value, "owner-v5") or std.mem.eql(u8, mode_value, "owner-v6") or std.mem.eql(u8, mode_value, "owner-v7") or std.mem.eql(u8, mode_value, "owner-v8") or std.mem.eql(u8, mode_value, "owner-v9") or std.mem.eql(u8, mode_value, "owner-v10") or std.mem.eql(u8, mode_value, "owner-v11") or std.mem.eql(u8, mode_value, "owner-v12")) else false;
         if (owner_mode) {
             const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
             identity = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
@@ -6920,14 +6920,14 @@ pub const AntflyApiHandler = struct {
         // Connection qualification is read-only and never parses or executes
         // a client statement. The gateway probes the exact socket it will use.
         if (ctx.header("X-Antfly-SQL-Probe")) |version| {
-            if (!std.mem.eql(u8, version, "11")) return ctx.status(400).text("unsupported SQL completion probe");
+            if (!std.mem.eql(u8, version, "12")) return ctx.status(400).text("unsupported SQL completion probe");
             if (!@import("sql_completion.zig").capableJoined(self.api_server, ctx.io)) return ctx.status(503).text("durable SQL completion unavailable");
             var response = try ctx.status(204).text("");
-            try response.headers.set("X-Antfly-SQL-Capability", "11");
+            try response.headers.set("X-Antfly-SQL-Capability", "12");
             return response;
         }
         if (ctx.header("X-Antfly-SQL-Settlement")) |action| {
-            if (!owner_mode and !std.mem.eql(u8, action, "11") and !std.mem.eql(u8, action, "ack-v11") and !std.mem.eql(u8, action, "10") and !std.mem.eql(u8, action, "ack-v10") and !std.mem.eql(u8, action, "9") and !std.mem.eql(u8, action, "ack-v9") and !std.mem.eql(u8, action, "8") and !std.mem.eql(u8, action, "ack-v8") and !std.mem.eql(u8, action, "7") and !std.mem.eql(u8, action, "ack-v7") and !std.mem.eql(u8, action, "6") and !std.mem.eql(u8, action, "ack-v6") and !std.mem.eql(u8, action, "5") and !std.mem.eql(u8, action, "ack-v5") and !std.mem.eql(u8, action, "4") and !std.mem.eql(u8, action, "ack-v4") and !std.mem.eql(u8, action, "3") and !std.mem.eql(u8, action, "ack-v3")) return ctx.status(400).text("unsupported SQL settlement");
+            if (!owner_mode and !std.mem.eql(u8, action, "12") and !std.mem.eql(u8, action, "ack-v12") and !std.mem.eql(u8, action, "11") and !std.mem.eql(u8, action, "ack-v11") and !std.mem.eql(u8, action, "10") and !std.mem.eql(u8, action, "ack-v10") and !std.mem.eql(u8, action, "9") and !std.mem.eql(u8, action, "ack-v9") and !std.mem.eql(u8, action, "8") and !std.mem.eql(u8, action, "ack-v8") and !std.mem.eql(u8, action, "7") and !std.mem.eql(u8, action, "ack-v7") and !std.mem.eql(u8, action, "6") and !std.mem.eql(u8, action, "ack-v6") and !std.mem.eql(u8, action, "5") and !std.mem.eql(u8, action, "ack-v5") and !std.mem.eql(u8, action, "4") and !std.mem.eql(u8, action, "ack-v4") and !std.mem.eql(u8, action, "3") and !std.mem.eql(u8, action, "ack-v3")) return ctx.status(400).text("unsupported SQL settlement");
             if (!owner_mode and (identity == null or !http_server_mod.permissionsAllow(identity.?.permissions, .@"*", "*", .admin))) return ctx.status(403).text("settlement requires management authority");
             const encoded = (try ctx.body()) orelse return ctx.status(400).text("missing completion witness");
             if (encoded.len > 128 * 1024) return ctx.status(400).text("completion witness too large");
@@ -6968,7 +6968,7 @@ pub const AntflyApiHandler = struct {
                     if (job.acknowledge) job.acknowledged = @import("sql_completion.zig").acknowledge(job.server, job.alloc, job.receipt, context) catch false else job.remaining = @import("sql_completion.zig").remaining(job.server, job.alloc, job.receipt, context) catch null;
                 }
             };
-            var job = Probe{ .server = self.api_server, .alloc = ctx.allocator, .receipt = parsed_completion.value, .network = ctx.io, .acknowledge = std.mem.eql(u8, action, "ack-v11") or std.mem.eql(u8, action, "ack-v10") or std.mem.eql(u8, action, "ack-v9") or std.mem.eql(u8, action, "ack-v8") or std.mem.eql(u8, action, "ack-v7") or std.mem.eql(u8, action, "ack-v6") or std.mem.eql(u8, action, "ack-v5") or std.mem.eql(u8, action, "ack-v4") or std.mem.eql(u8, action, "ack-v3"), .owner_request = if (parsed_owner) |value| value.value else null };
+            var job = Probe{ .server = self.api_server, .alloc = ctx.allocator, .receipt = parsed_completion.value, .network = ctx.io, .acknowledge = std.mem.eql(u8, action, "ack-v12") or std.mem.eql(u8, action, "ack-v11") or std.mem.eql(u8, action, "ack-v10") or std.mem.eql(u8, action, "ack-v9") or std.mem.eql(u8, action, "ack-v8") or std.mem.eql(u8, action, "ack-v7") or std.mem.eql(u8, action, "ack-v6") or std.mem.eql(u8, action, "ack-v5") or std.mem.eql(u8, action, "ack-v4") or std.mem.eql(u8, action, "ack-v3"), .owner_request = if (parsed_owner) |value| value.value else null };
             var future = try io.concurrent(Probe.run, .{&job});
             job.done.waitUncancelable(ctx.io);
             @import("protected_future.zig").wait(io, &future);
@@ -21460,14 +21460,14 @@ test "SQL pgwire native capability requires durable transactions and metadata re
         fixture.ready = phase == 2;
         var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/sql");
         defer request.deinit();
-        try request.headers.set("X-Antfly-SQL-Probe", "11");
+        try request.headers.set("X-Antfly-SQL-Probe", "12");
         try request.headers.set("X-Antfly-SQL-Fence", "qualification");
         var ctx = httpx.Context.init(a, std.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executeSQLMode(&ctx, .statement, null);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, if (phase == 2) 204 else 503), response.status.code);
-        if (phase == 2) try std.testing.expectEqualStrings("11", response.headers.get("X-Antfly-SQL-Capability").?);
+        if (phase == 2) try std.testing.expectEqualStrings("12", response.headers.get("X-Antfly-SQL-Capability").?);
     }
     api.cfg.session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.node, .local_status = undefined, .node_base_uri = undefined } };
     // Outboxes stay node-owned even when transaction storage is shared.

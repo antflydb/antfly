@@ -355,7 +355,7 @@ fn pin(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, outcome: wir
     } else return error.InvalidArgument;
 }
 pub fn settled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, receipt: wire.Receipt, context: operation.RequestContext) !bool {
-    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10 and receipt.version != 11) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return false;
+    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10 and receipt.version != 11 and receipt.version != 12) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return false;
     for (receipt.outcomes) |outcome| {
         try context.ensureActive();
         const reference = try parseId(outcome.reference_id orelse return false);
@@ -392,7 +392,7 @@ pub fn settled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, rece
     return true;
 }
 pub fn acknowledge(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, receipt: wire.Receipt, context: operation.RequestContext) !bool {
-    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10 and receipt.version != 11) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return false;
+    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10 and receipt.version != 11 and receipt.version != 12) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return false;
     for (receipt.outcomes) |outcome| {
         try context.ensureActive();
         const reference = try parseId(outcome.reference_id orelse return false);
@@ -412,7 +412,7 @@ pub fn acknowledge(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
 }
 // A bounded probe can persist partial progress without discarding other owners.
 pub fn remaining(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, receipt: wire.Receipt, context: operation.RequestContext) !wire.Receipt {
-    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10 and receipt.version != 11) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return .{ .unknown = true, .outcomes = try alloc.dupe(wire.Outcome, receipt.outcomes) };
+    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10 and receipt.version != 11 and receipt.version != 12) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return .{ .unknown = true, .outcomes = try alloc.dupe(wire.Outcome, receipt.outcomes) };
     var pending: std.ArrayList(wire.Outcome) = .empty;
     errdefer pending.deinit(alloc);
     for (receipt.outcomes, 0..) |outcome, index| {
@@ -510,7 +510,7 @@ fn forwardOwner(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, req
     const auth = @import("internal_service_auth.zig");
     const token = try auth.tokenAlloc(alloc, .{ .secret = server.cfg.internal_service_secret orelse return error.CompletionOwnerUnavailable, .issuer = server.cfg.internal_service_issuer orelse return error.CompletionOwnerUnavailable }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
     defer alloc.free(token);
-    var response = try executor.execute(alloc, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = 1500, .headers = &.{ .{ .name = auth.header_name, .value = token }, .{ .name = "X-Antfly-SQL-Settlement", .value = "owner-v11" } } });
+    var response = try executor.execute(alloc, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = 1500, .headers = &.{ .{ .name = auth.header_name, .value = token }, .{ .name = "X-Antfly-SQL-Settlement", .value = "owner-v12" } } });
     defer response.deinit(alloc);
     if (response.status != 200) return error.CompletionOwnerUnavailable;
     var result = try std.json.parseFromSlice(struct { complete: bool }, alloc, response.body, .{});
@@ -528,6 +528,8 @@ pub fn ownerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
         if (node != local) return forwardOwner(server, alloc, request, node, forward);
     }
     const store = server.txn_sessions.durable orelse return error.DurabilityUnavailable;
+    if (server.txn_sessions.durable_scope == .cluster_shared and !store.supportsSharedMutations())
+        return error.CompletionOwnerUnavailable;
     return switch (request.action) {
         .forget => try store.changeCompletionReference(request.transaction_id, request.reference_id, false, if (request.managed) request.retired_through else null, .forget),
         .quiesce => if (try store.completionReferenceSettled(request.transaction_id, request.reference_id)) true else store.changeCompletionReference(request.transaction_id, request.reference_id, false, if (request.managed) request.retired_through else null, .quiesce),

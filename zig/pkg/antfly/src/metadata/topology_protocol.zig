@@ -108,8 +108,9 @@ const std = @import("std");
 /// Version 75 binds HTTP SQL handles to issuers and observes DDL submission.
 /// Version 76 requires attempt-aware commit proofs and joined connection refusals.
 /// Version 77 isolates issuer outboxes in shared transaction stores.
-pub const current_version: u16 = 77;
-pub const sql_completion_admission_version: u16 = 77;
+/// Version 78 requires backend-wide coordination of shared session mutations.
+pub const current_version: u16 = 78;
+pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
 pub const job_state_version: u16 = 59;
