@@ -33,6 +33,38 @@ pub const Policy = enum {
     external,
 };
 
+// `std.fmt.allocPrint(alloc, "{f}", ...)` goes through
+// `std.Io.Writer.Allocating`, which starts from a tiny capacity, grows the
+// buffer while writing, and then shrinks it back down in `toOwnedSlice` by
+// attempting a `remap` and falling back to alloc+copy+free when that remap
+// fails. The resize/remap outcome for that final shrink is not something
+// `std.testing.checkAllAllocationFailures` holds constant across its
+// repeated passes, so the exact number of allocator calls a grow-then-shrink
+// stringify performs is not guaranteed to match run to run, which can trip
+// `error.NondeterministicMemoryUsage` for callers that assign incarnations
+// through this module even though the function itself is pure. Measure the
+// exact output length first with a throwaway `Discarding` writer, then
+// allocate precisely once and format directly into that buffer with a
+// `Writer.fixed`, so there is never a grow-then-shrink step.
+fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var measure_buf: [256]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&measure_buf);
+    discarding.writer.print("{f}", .{std.json.fmt(value, .{})}) catch |err| switch (err) {
+        // Discarding.drain never reports a short write.
+        error.WriteFailed => unreachable,
+    };
+    const len = std.math.cast(usize, discarding.fullCount()) orelse return error.OutOfMemory;
+    const out = try alloc.alloc(u8, len);
+    errdefer alloc.free(out);
+    var fixed_writer = std.Io.Writer.fixed(out);
+    fixed_writer.print("{f}", .{std.json.fmt(value, .{})}) catch |err| switch (err) {
+        // The buffer was sized exactly for this output by the measuring pass above.
+        error.WriteFailed => unreachable,
+    };
+    std.debug.assert(fixed_writer.end == len);
+    return out;
+}
+
 pub fn parse(value: std.json.Value) !Policy {
     if (value != .string) return error.InvalidCoveragePolicy;
     if (std.mem.eql(u8, value.string, "strict")) return .strict;
@@ -91,7 +123,7 @@ fn newIncarnation(io: std.Io) !i64 {
 pub fn withFreshIncarnationAllocWithIo(alloc: std.mem.Allocator, io: std.Io, value: std.json.Value) ![]u8 {
     if (value != .object) return error.InvalidIndexConfig;
     try validateIndexConfig(value);
-    _ = value.object.get("type") orelse return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    _ = value.object.get("type") orelse return try stringifyJsonAlloc(alloc, value);
     return try withIncarnationAlloc(alloc, value, @intCast(try newIncarnation(io)));
 }
 
@@ -113,9 +145,9 @@ pub fn withIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value, cov
         .{},
     );
     defer cloned.deinit();
-    _ = cloned.value.object.get("type") orelse return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cloned.value, .{})});
+    _ = cloned.value.object.get("type") orelse return try stringifyJsonAlloc(alloc, cloned.value);
     try cloned.value.object.put(arena, incarnation_field, .{ .integer = @intCast(coverage_incarnation) });
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cloned.value, .{})});
+    return try stringifyJsonAlloc(alloc, cloned.value);
 }
 
 /// Canonicalizes trusted catalog input while preserving an incarnation already
@@ -124,7 +156,7 @@ pub fn withIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value, cov
 pub fn withIncarnationIfMissingAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     if (value != .object) return error.InvalidIndexConfig;
     try validateStoredIndexConfig(value);
-    if (incarnation(value) != null) return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    if (incarnation(value) != null) return try stringifyJsonAlloc(alloc, value);
     return try withFreshIncarnationAlloc(alloc, value);
 }
 
@@ -157,7 +189,7 @@ pub fn withMissingIncarnationsAlloc(alloc: std.mem.Allocator, indexes_json: []co
         } else try newIncarnation(io_impl.io());
         try config.object.put(arena, incarnation_field, .{ .integer = assigned });
     }
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
+    return try stringifyJsonAlloc(alloc, parsed.value);
 }
 
 test "coverage policy accepts only the public embeddings contract" {

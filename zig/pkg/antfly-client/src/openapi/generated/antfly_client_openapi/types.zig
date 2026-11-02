@@ -27819,11 +27819,33 @@ pub const InferenceBatchExecutionReport = struct {
     requested_items: i64,
     native_batches: i64,
     native_items: i64,
+    /// Largest successfully executed native decoder step observed by these items, including peers from other requests. Zero or absent means unobserved, one means singleton execution. This is measured at execution, never inferred from native_items or request cardinality.
+    max_native_step_items: ?i64 = null,
     serial_items: i64,
     /// Items rejected before model execution by validation, resolution, or admission.
     rejected_items: i64,
     fallback_items: i64,
     fallback_reason: OpenApiOptionalNullable([]const u8) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "requested_items", "requested_items", false },
+        .{ "native_batches", "native_batches", false },
+        .{ "native_items", "native_items", false },
+        .{ "max_native_step_items", "max_native_step_items", true },
+        .{ "serial_items", "serial_items", false },
+        .{ "rejected_items", "rejected_items", false },
+        .{ "fallback_items", "fallback_items", false },
+        .{ "fallback_reason", "fallback_reason", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -27833,6 +27855,10 @@ pub const InferenceBatchExecutionReport = struct {
         try jw.write(self.native_batches);
         try jw.objectField("native_items");
         try jw.write(self.native_items);
+        if (self.max_native_step_items) |value| {
+            try jw.objectField("max_native_step_items");
+            try jw.write(value);
+        }
         try jw.objectField("serial_items");
         try jw.write(self.serial_items);
         try jw.objectField("rejected_items");
@@ -41053,6 +41079,8 @@ pub const ModelRef = struct {
     kind: ModelKind,
     /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
     name: []const u8,
+    /// Keep a successfully preloaded model pinned against eviction. Set false to warm the ordinary evictable cache before serving; idle and model-count policy still apply.
+    pin: ?bool = null,
     backend: ?ModelBackend = null,
     format: ?ModelFormat = null,
     quantization: ?ModelQuantization = null,
@@ -41065,6 +41093,7 @@ pub const ModelRef = struct {
     pub const openApiFieldMetadata = .{
         .{ "kind", "kind", false },
         .{ "name", "name", false },
+        .{ "pin", "pin", true },
         .{ "backend", "backend", true },
         .{ "format", "format", true },
         .{ "quantization", "quantization", true },
@@ -41086,6 +41115,10 @@ pub const ModelRef = struct {
         try jw.write(self.kind);
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.pin) |value| {
+            try jw.objectField("pin");
+            try jw.write(value);
+        }
         if (self.backend) |value| {
             try jw.objectField("backend");
             try jw.write(value);

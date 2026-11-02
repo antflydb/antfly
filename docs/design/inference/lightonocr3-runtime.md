@@ -151,15 +151,22 @@ attention layers. Each recurrent layer retains its own state. Up to 128 physical
 rows use recurrent and attention packets of at most 64. Client concurrency,
 admitted live pages and physical GPU rows remain separate limits.
 
-The experimental `--decode-graph` switch replays two dependent decode tokens
-inside the reader epoch. It supports 2–64 pages, or up to 128 when the
+The native CUDA runtime automatically selects bounded two-token graph replay
+inside the reader epoch when its driver, artifacts, libraries, arithmetic and
+ownership support capture. `ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH=0` disables
+that selection; the benchmark `--decode-graph` switch explicitly requests it. It supports 2–64 pages, or up to 128 when the
 physical-128 reader mode is enabled. Eligibility and available memory determine
 whether a claim replays a graph. It retains the precision of the selected profile
 and independently admits graph metadata and scratch under operator limits.
 Benchmark with `--require-lighton-model-graph` to require actual replay.
+Omitting the profile wrapper's graph option preserves runtime selection; use
+`--decode-graph` or `--no-decode-graph` for an explicit comparison. The concurrency
+benchmark likewise leaves token-burst selection and width unset unless requested;
+`--no-gpu-token-burst` supplies the explicit single-step control.
 
-The DGX Spark presets enable four-token chains for pure decode cohorts through
-128 pages. `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST=0` restores single-step decoding;
+Reader profiles enable bounded four-token device chains for pure decode cohorts
+when the backend supplies the required kernels. The DGX Spark presets also allow
+through 128 pages. `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST=0` restores single-step decoding;
 widths 2–8 remain bounded by each page's original generation budget. Prepared
 vision features stay on GPU through prompt assembly.
 `ANTFLY_LIGHTONOCR3_DISABLE_DEVICE_VISION=1` restores the host feature handoff
