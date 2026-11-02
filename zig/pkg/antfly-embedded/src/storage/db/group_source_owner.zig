@@ -19,6 +19,7 @@ const work = @import("group_source_worker.zig");
 /// Namespace maintenance continuation belongs to the scheduling owner, not a reopened DB.
 /// Native Lite preserves group cursor/lease identity and replay feedback per table.
 pub const State = struct {
+    publication_overhead_ns: std.atomic.Value(u64) = .init(0),
     replay_retirement: @import("../docstore.zig").ReplayRetirement = .{},
     replay_budget: @import("derived/replay_budget.zig").Controller = .{},
     slice_mutex: std.atomic.Mutex = .unlocked,

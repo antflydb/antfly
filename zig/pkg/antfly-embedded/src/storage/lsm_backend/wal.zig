@@ -305,11 +305,15 @@ pub fn syncCurrentState(storage: storage_io.Storage, allocator: Allocator, root_
     const temp_allocator = allocator;
     const segment_path = try segmentPathAlloc(temp_allocator, root_dir, current.segment);
     defer temp_allocator.free(segment_path);
-    try storage.appendFileAbsolute(allocator, segment_path, "", true);
+    const native_barrier = storage.requiresForegroundPublication() and storage.vtable.sync_contents_absolute != null;
+    // Native catalog writes are already checkpointed. An empty append would
+    // publish a new index generation just to fsync unchanged bytes, invalidating
+    // detached inputs and rebuilding metadata caches. Use the actual barrier.
+    if (native_barrier) try storage.syncFileContentsAbsolute(segment_path) else try storage.appendFileAbsolute(allocator, segment_path, "", true);
 
     const index_path = try indexPathAlloc(temp_allocator, root_dir);
     defer temp_allocator.free(index_path);
-    try storage.appendFileAbsolute(allocator, index_path, "", true);
+    if (native_barrier) try storage.syncFileContentsAbsolute(index_path) else try storage.appendFileAbsolute(allocator, index_path, "", true);
     return .{ .segment_syncs = 1, .index_syncs = 1 };
 }
 

@@ -50,8 +50,12 @@ pub const Store = struct {
     allocator: Allocator,
     docs: *docstore.Store,
     namespace_prefix: []const u8,
+    read_snapshot: ?*docstore.Txn = null,
 
     const vtable: StorageIo.VTable = .{
+        .loaded_content_revision = loadedContentRevision,
+        .loaded_wal_metadata_revision = loadedWalMetadataRevision,
+        .acquire_read_snapshot = acquireReadSnapshot,
         .private_scratch_directory = privateScratchDirectory,
         .create_dir_path = createDirPath,
         .virtual_directories = true,
@@ -117,6 +121,58 @@ fn pinSnapshot(store: *docstore.Store) !docstore.Txn {
     return store.beginIndexRead();
 }
 
+const CatalogRead = struct {
+    owned: ?docstore.Txn = null,
+    borrowed: ?*docstore.Txn = null,
+    checkpoint: native.CheckpointSlot,
+    fn readFile(self: *@This()) !*native.NativeFile {
+        return if (self.borrowed) |snapshot| snapshot.readFile() else self.owned.?.readFile();
+    }
+    fn abort(self: *@This()) void {
+        if (self.owned) |*snapshot| snapshot.abort();
+    }
+};
+
+fn pinCatalogSnapshot(self: *Store) !CatalogRead {
+    if (self.read_snapshot) |snapshot| return .{ .borrowed = snapshot, .checkpoint = snapshot.checkpoint };
+    const snapshot = try self.docs.beginIndexRead();
+    return .{ .owned = snapshot, .checkpoint = snapshot.checkpoint };
+}
+
+fn acquireReadSnapshot(ptr: *anyopaque) !StorageIo.Lease {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    const State = struct {
+        adapter: Store,
+        snapshot: docstore.Txn,
+        const read_vtable: StorageIo.VTable = blk: {
+            var value = Store.vtable;
+            value.acquire_read_snapshot = null;
+            value.loaded_wal_metadata_revision = null;
+            value.open_immutable_source = null;
+            value.open_leased_immutable_source = null;
+            value.map_immutable_artifact = null;
+            break :blk value;
+        };
+        fn release(view: *anyopaque) void {
+            const adapter: *Store = @ptrCast(@alignCast(view));
+            const state: *@This() = @fieldParentPtr("adapter", adapter);
+            const allocator = adapter.allocator;
+            state.snapshot.abort();
+            allocator.destroy(state);
+        }
+    };
+    const state = try self.allocator.create(State);
+    errdefer self.allocator.destroy(state);
+    state.* = .{ .adapter = self.*, .snapshot = try self.docs.beginIndexRead() };
+    state.adapter.read_snapshot = &state.snapshot;
+    return .{ .view = .{ .ptr = &state.adapter, .vtable = &State.read_vtable }, .release = State.release };
+}
+
+fn validateWritePath(self: *Store, path: []const u8) !void {
+    if (self.read_snapshot != null) return error.ReadOnly;
+    return validateIndexPath(self, path);
+}
+
 fn pathContains(prefix: []const u8, path: []const u8) bool {
     if (prefix.len == 0) return true;
     if (!std.mem.startsWith(u8, path, prefix)) return false;
@@ -141,7 +197,7 @@ fn validateIndexPath(self: *const Store, path: []const u8) !void {
 fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -152,7 +208,7 @@ fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_by
 fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -255,7 +311,7 @@ fn mapImmutableArtifact(ptr: *anyopaque, allocator: Allocator, path: []const u8)
 fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -267,7 +323,7 @@ fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
 fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -282,7 +338,7 @@ fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8,
 
 fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, path);
+    try validateWritePath(self, path);
     try writeFileReserved(self, path, contents);
 }
 
@@ -308,29 +364,29 @@ fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void
 
 fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, path);
+    try validateWritePath(self, path);
     var mutation = CatalogWrite{ .kind = .append, .path = path, .value = contents };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, sync);
 }
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, path);
+    try validateWritePath(self, path);
     if (self.docs.read_only) return error.ReadOnly;
     return try NativeAtomicWriteSink.create(allocator, self, path);
 }
 
 fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, old_path);
-    try validateIndexPath(self, new_path);
+    try validateWritePath(self, old_path);
+    try validateWritePath(self, new_path);
     var mutation = CatalogWrite{ .kind = .rename, .path = old_path, .value = new_path };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, path);
+    try validateWritePath(self, path);
     var mutation = CatalogWrite{ .kind = .delete, .path = path };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
@@ -338,7 +394,7 @@ fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
-    try validateIndexPath(self, directory);
+    try validateWritePath(self, directory);
     const Context = struct {
         store: *Store,
         path: []const u8,
@@ -418,7 +474,7 @@ fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const 
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self);
     defer snapshot.abort();
     const file = try snapshot.readFile();
     const prefix = if (std.mem.eql(u8, directory, "/"))
@@ -452,7 +508,7 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    var snapshot = try pinSnapshot(self.docs);
+    var snapshot = try pinCatalogSnapshot(self);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
     const file = try snapshot.readFile();
@@ -497,6 +553,46 @@ fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
     // checkpoint. Syncing the container is therefore both the file-content
     // and logical-parent durability barrier.
     return try syncContentsAbsolute(ptr, path);
+}
+
+fn loadedWalMetadataRevision(ptr: *anyopaque, root_dir: []const u8) ?StorageIo.ContentRevision {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    if (self.read_snapshot != null) return null;
+    // Logical roots are short in normal use. A longer valid path safely falls
+    // back to TTL accounting rather than allocating scratch on every hot hit.
+    var buffer: [8192]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&buffer);
+    const wal_root = std.fs.path.join(scratch.allocator(), &.{ root_dir, "wal" }) catch return null;
+    const prefix = std.fmt.allocPrint(scratch.allocator(), "{s}{c}", .{ wal_root, std.fs.path.sep }) catch return null;
+    const legacy = std.fs.path.join(scratch.allocator(), &.{ root_dir, "wal.log" }) catch return null;
+    platform_sync.lockYielding(&self.docs.mutex);
+    defer self.docs.mutex.unlock();
+    const directory_revision = self.docs.file.loadedIndexPathRevision(prefix) orelse return null;
+    const legacy_revision = self.docs.file.loadedIndexPathRevision(legacy) orelse return null;
+    var input: [32]u8 = undefined;
+    @memcpy(input[0..16], &directory_revision);
+    @memcpy(input[16..32], &legacy_revision);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&input, &digest, .{});
+    return digest[0..16].*;
+}
+
+fn loadedContentRevision(ptr: *anyopaque) ?StorageIo.ContentRevision {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    if (self.read_snapshot) |snapshot| {
+        const identity = snapshot.checkpoint.logical.indexes;
+        return if (std.mem.allEqual(u8, &identity, 0)) null else identity;
+    }
+    // Copy only the loaded no-ABA identity; inspecting old unretained catalog
+    // pages or reacquiring path admission here would turn a cache hit into I/O.
+    self.docs.mutex.lock();
+    defer self.docs.mutex.unlock();
+    // Private staged roots are not a published logical view. Preserve the
+    // ordinary mutation/TTL rules until their enclosing transaction finishes.
+    if (self.docs.file.transaction_header != null) return null;
+    const identity = self.docs.file.activeCheckpoint().logical.indexes;
+    if (std.mem.allEqual(u8, &identity, 0)) return null;
+    return identity;
 }
 
 fn nowNs(ptr: *anyopaque) u64 {
@@ -941,6 +1037,93 @@ test "lite native index storage root identity is physical and namespaced" {
     );
     defer allocator.free(reopened_identity);
     try std.testing.expectEqualStrings(first_identity, reopened_identity);
+}
+
+test "lite native index storage content identity ignores primary writes and changes on index publication" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "index-content-identity.aflite");
+    defer allocator.free(path);
+    var docs = try docstore.Store.createWithOptions(allocator, path, .{ .exclusive = true, .no_sync = true, .reclamation = .{ .page_reuse = true } });
+    defer docs.close();
+    var indexes = Store.init(allocator, &docs);
+    const io = indexes.storage();
+    try writeFileAbsolute(&indexes, "segments/current", "one");
+    const first = io.loadedContentRevision() orelse return error.TestUnexpectedResult;
+    try docs.file.putDocument("row", "primary-only change");
+    try std.testing.expectEqualDeep(first, io.loadedContentRevision().?);
+    try writeFileAbsolute(&indexes, "segments/current", "two");
+    const second = io.loadedContentRevision().?;
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    try writeFileAbsolute(&indexes, "segments/current", "one");
+    const third = io.loadedContentRevision().?;
+    try std.testing.expect(!std.mem.eql(u8, &first, &third));
+    try docs.file.beginTransaction();
+    try std.testing.expect(io.loadedContentRevision() == null);
+    docs.file.abortTransaction();
+    try std.testing.expectEqualDeep(third, io.loadedContentRevision().?);
+}
+
+test "lite native index storage batches consistent metadata reads under one admission" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "index-metadata-batch.aflite");
+    defer allocator.free(path);
+    var docs = try docstore.Store.createWithOptions(allocator, path, .{ .exclusive = true, .no_sync = true });
+    defer docs.close();
+    // This probe owns admission; unrelated storage service must not call it.
+    docs.maintenance_cancel.request();
+    var indexes = Store.initWithNamespace(allocator, &docs, "/scope");
+    const io = indexes.storage();
+    try io.writeFileAbsolute("/scope/a", "old");
+    try io.writeFileAbsolute("/scope/b", "other");
+    const Probe = struct {
+        enters: usize = 0,
+        leaves: usize = 0,
+        refuse: bool = false,
+        fn enter(ptr: *anyopaque, scope: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(docstore.PublicationScope.index_read, scope);
+            if (self.refuse) return error.EnrichmentWaitCanceled;
+            self.enters += 1;
+        }
+        fn leave(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.leaves += 1;
+        }
+    };
+    var probe: Probe = .{};
+    docs.writer_admission = .{ .ptr = &probe, .enter = Probe.enter, .leave = Probe.leave };
+    docs.index_reads_require_admission = true;
+    defer {
+        docs.index_reads_require_admission = false;
+        docs.writer_admission = null;
+    }
+    var scope = (try io.acquireReadSnapshot()).?;
+    defer scope.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.enters);
+    try std.testing.expectEqual(probe.enters, probe.leaves);
+    try std.testing.expectEqual(@as(u64, 3), try scope.view.fileSize("/scope/a"));
+    try docs.file.putIndexCatalogRecord("/scope/a", "new value");
+    const old = try scope.view.readFileAlloc(allocator, "/scope/a", 100);
+    defer allocator.free(old);
+    try std.testing.expectEqualStrings("old", old);
+    const part = try scope.view.readFileRangeAlloc(allocator, "/scope/a", 1, 2);
+    defer allocator.free(part);
+    try std.testing.expectEqualStrings("ld", part);
+    const names = try scope.view.listFileNamesAlloc(allocator, "/scope");
+    defer StorageIo.freeFileNames(allocator, names);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqual(@as(usize, 1), probe.enters);
+    try std.testing.expectError(error.ReadOnly, scope.view.writeFileAbsolute("/scope/a", "bad"));
+    const current = try io.readFileAlloc(allocator, "/scope/a", 100);
+    defer allocator.free(current);
+    try std.testing.expectEqualStrings("new value", current);
+    try std.testing.expectEqual(@as(usize, 2), probe.enters);
+    probe.refuse = true;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, io.acquireReadSnapshot());
 }
 
 test "lite native index reads remain pinned while newer checkpoints publish" {
@@ -2742,4 +2925,103 @@ test "lite atomic publication returns owned immutable source without requiring m
     var bytes: [8]u8 = undefined;
     try source.readInto(0, &bytes);
     try std.testing.expectEqualStrings("original", &bytes);
+}
+
+test "lite wal accounting ignores unrelated immutable file churn" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "wal-accounting-churn.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var indexes = Store.init(a, &docs);
+    const storage = indexes.storage();
+    var backend = try @import("../lsm_backend.zig").Backend.open(a, "/wal-accounting", .{ .storage = storage, .flush_threshold = 1024, .wal_soft_limit_segments = 1000 });
+    defer backend.closePreservingWal();
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "document", "value");
+        try write.commit();
+    }
+    const Probe = struct {
+        reads: usize = 0,
+        fn enter(ptr: *anyopaque, scope: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (scope == .index_read) self.reads += 1;
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    var probe: Probe = .{};
+    docs.writer_admission = .{ .ptr = &probe, .enter = Probe.enter, .leave = Probe.leave };
+    defer docs.writer_admission = null;
+    docs.index_reads_require_admission = true;
+    defer docs.index_reads_require_admission = false;
+    {
+        var read = (try storage.acquireReadSnapshot()).?;
+        read.deinit();
+        try std.testing.expectEqual(@as(usize, 1), probe.reads);
+    }
+    _ = backend.maintenanceScore();
+    const warm_reads = probe.reads;
+    for (0..8) |i| {
+        var name: [96]u8 = undefined;
+        const file = try std.fmt.bufPrint(&name, "/wal-accounting/runs/unrelated-{d}.tbl", .{i});
+        try storage.writeFileAbsolute(file, "unrelated immutable table");
+        _ = backend.maintenanceScore();
+        try storage.deleteFileAbsolute(file);
+        _ = backend.maintenanceScore();
+    }
+    try std.testing.expectEqual(warm_reads, probe.reads);
+}
+
+test "lite wal metadata revisions invalidate mutations and foreign adoption" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "wal-revisions.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var indexes = Store.init(a, &docs);
+    const storage = indexes.storage();
+    try storage.writeFileAbsolute("/one/wal/index", "original");
+    try storage.writeFileAbsolute("/two/wal/index", "other");
+    const initial = storage.loadedWalMetadataRevision("/one").?;
+    const other = storage.loadedWalMetadataRevision("/two").?;
+    try storage.appendFileAbsolute(a, "/one/wal/index", "-append", false);
+    const appended = storage.loadedWalMetadataRevision("/one").?;
+    try std.testing.expect(!std.meta.eql(initial, appended));
+    try std.testing.expectEqualDeep(other, storage.loadedWalMetadataRevision("/two").?);
+    try storage.renameAbsolute("/one/wal/index", "/one/renamed");
+    const renamed = storage.loadedWalMetadataRevision("/one").?;
+    try std.testing.expect(!std.meta.eql(appended, renamed));
+    try storage.renameAbsolute("/one/renamed", "/one/wal/index");
+    try storage.deleteFileAbsolute("/one/wal/index");
+    try storage.writeFileAbsolute("/one/wal/index", "original");
+    const recreated = storage.loadedWalMetadataRevision("/one").?;
+    try std.testing.expect(!std.meta.eql(initial, recreated));
+    try storage.writeFileAbsolute("/one/wal.log", "legacy WAL");
+    const legacy = storage.loadedWalMetadataRevision("/one").?;
+    try std.testing.expect(!std.meta.eql(recreated, legacy));
+    try docs.file.beginTransaction();
+    try std.testing.expect(storage.loadedWalMetadataRevision("/one") == null);
+    try docs.file.putIndexCatalogRecord("/one/wal/index", "aborted");
+    docs.file.abortTransaction();
+    try std.testing.expect(storage.loadedWalMetadataRevision("/one") != null);
+    const restored = try storage.readFileAlloc(a, "/one/wal/index", 128);
+    defer a.free(restored);
+    try std.testing.expectEqualStrings("original", restored);
+    // A separate handle adopts unknown physical index changes conservatively,
+    // including changes outside its watched paths. It never reuses old tokens.
+    var captured = try native.NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+    defer captured.close();
+    const watched = captured.loadedIndexPathRevision("/one/wal/").?;
+    try storage.writeFileAbsolute("/unrelated/foreign", "changed");
+    try captured.adoptIndexPublicationHeader(docs.file.header);
+    try std.testing.expect(!std.meta.eql(watched, captured.loadedIndexPathRevision("/one/wal/").?));
+    const after_primary = storage.loadedWalMetadataRevision("/one").?;
+    try docs.file.putDocument("primary", "changed");
+    try std.testing.expectEqualDeep(after_primary, storage.loadedWalMetadataRevision("/one").?);
 }

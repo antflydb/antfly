@@ -967,13 +967,26 @@ const MainStoreOwner = union(enum) {
     mem: *mem_backend.Backend,
     lsm: lsm_backend.BackendHandle,
 
+    fn externallyPublishedWal(self: *const MainStoreOwner) bool {
+        return switch (self.*) {
+            .mem => false,
+            .lsm => |handle| handle.backend.options.wal_enabled and
+                if (handle.backend.storage) |storage| storage.requiresForegroundPublication() else false,
+        };
+    }
+
     fn close(self: *MainStoreOwner, alloc: Allocator) void {
         switch (self.*) {
             .mem => |backend| {
                 backend.close();
                 alloc.destroy(backend);
             },
-            .lsm => |*handle| handle.close(),
+            .lsm => |*handle| {
+                // These handles are reconstructible caches of committed WAL
+                // state. Cache teardown must not publish a new generation from
+                // replayed mutable state while a detached owner is computing.
+                if (self.externallyPublishedWal()) handle.closePreservingWal() else handle.close();
+            },
         }
         self.* = undefined;
     }
@@ -993,6 +1006,13 @@ const MainStoreOwner = union(enum) {
         switch (self.*) {
             .mem => {},
             .lsm => |*handle| try handle.backend.sync(force),
+        }
+    }
+
+    fn syncReplayState(self: *MainStoreOwner) !void {
+        switch (self.*) {
+            .mem => {},
+            .lsm => |*handle| try handle.backend.syncReplayState(),
         }
     }
 
@@ -1084,6 +1104,7 @@ pub const PersistentIndex = struct {
     segment_files: ?SegmentFileStore,
     retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
     retirement_reconcile_pending: bool = false,
+    deferred_retirement_maintenance: bool = false,
     active_rebuild_page: ?*RebuildPage = null,
     wal: wal_mod.WAL,
     committed_lsn: u64,
@@ -1377,14 +1398,14 @@ pub const PersistentIndex = struct {
             }
         }
         // Even an idempotent retry must finish a previously failed seal sync.
-        try self.main_store_owner.sync(true);
+        try self.syncMainReplayBoundary();
         if (already_covered) return;
-        try self.wal.sync(true);
+        if (self.deferred_retirement_maintenance) try self.wal.syncReplayState() else try self.wal.sync(true);
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
         try txn.put(.meta, projection_seal.metadata_key, &try next.encode());
         try txn.commit();
-        try self.main_store_owner.sync(true);
+        try self.syncMainReplayBoundary();
     }
 
     /// Physical segments, including fully-deleted segments, are projection
@@ -1504,8 +1525,11 @@ pub const PersistentIndex = struct {
             opened_main.owner.close(alloc);
         }
 
-        // Open namespaces eagerly on writable backends
-        if (!opts.read_only) {
+        const cache_lifecycle = opened_main.owner.externallyPublishedWal();
+        // Managed Native caches already recover committed namespaces from WAL.
+        // An empty setup commit can otherwise flush that recovered state and
+        // invalidate a concurrent detached publication merely by opening.
+        if (!opts.read_only and !cache_lifecycle) {
             var setup_txn = try MainTxn.open(&opened_main.store, false);
             errdefer setup_txn.abort();
             try setup_txn.commit();
@@ -1648,6 +1672,7 @@ pub const PersistentIndex = struct {
             .writer = writer,
             .main_store = opened_main.store,
             .main_store_owner = opened_main.owner,
+            .deferred_retirement_maintenance = cache_lifecycle,
             .segment_files = segment_files,
             .wal = wal,
             .committed_lsn = committed_lsn,
@@ -1679,7 +1704,9 @@ pub const PersistentIndex = struct {
         if (pi.segment_files) |*store| {
             pi.retired_segment_file_deleter = try RetiredSegmentFileDeleter.init(alloc, store);
             pi.writer.setRetiredSegmentCleanup(pi.retired_segment_file_deleter.?.cleanup());
-            if (!opts.read_only) pi.reconcileRetiredSegmentFilesLocked();
+            if (!opts.read_only) {
+                if (cache_lifecycle) pi.retirement_reconcile_pending = true else pi.reconcileRetiredSegmentFilesLocked();
+            }
         }
 
         return pi;
@@ -1696,7 +1723,7 @@ pub const PersistentIndex = struct {
     pub fn close(self: *PersistentIndex) void {
         self.lockStorage();
         self.writer.deinit();
-        self.flushCompletedRetirementMarkersLocked();
+        if (!self.deferred_retirement_maintenance) self.flushCompletedRetirementMarkersLocked();
         if (self.retired_segment_file_deleter) |deleter| {
             if (deleter.native_storage_lease == null) deleter.disarm();
         }
@@ -1935,7 +1962,7 @@ pub const PersistentIndex = struct {
     }
 
     pub fn lsmMaintenanceScore(self: *const PersistentIndex) u64 {
-        return self.main_store_owner.lsmMaintenanceScore();
+        return self.main_store_owner.lsmMaintenanceScore() +| @intFromBool(self.retirement_reconcile_pending);
     }
 
     pub fn lsmMaintenanceDebtHint(self: *const PersistentIndex) u64 {
@@ -1969,6 +1996,24 @@ pub const PersistentIndex = struct {
 
     pub fn snapshotLsmOpenStats(self: *const PersistentIndex) ?lsm_backend.Backend.OpenStats {
         return self.main_store_owner.snapshotLsmOpenStats();
+    }
+
+    fn syncMainReplayBoundary(self: *PersistentIndex) !void {
+        if (self.deferred_retirement_maintenance) try self.main_store_owner.syncReplayState() else try self.main_store_owner.sync(true);
+    }
+
+    /// Replay coverage needs durable effects, not a new immutable SST cut.
+    /// Physical snapshot capture still flushes its own exact checkpoint below.
+    pub fn syncAppliedReplayBoundary(self: *PersistentIndex) !void {
+        self.lockStorage();
+        defer self.unlockStorage();
+        if (self.deferred_retirement_maintenance) {
+            try self.main_store_owner.syncReplayState();
+            try self.wal.syncReplayState();
+        } else {
+            try self.main_store_owner.checkpointLsmWalAfterDurableBoundary();
+            try self.wal.checkpointLsmWalAfterDurableBoundary();
+        }
     }
 
     pub fn checkpointLsmWalAfterDurableBoundary(self: *PersistentIndex) !void {
@@ -2096,12 +2141,14 @@ pub const PersistentIndex = struct {
     pub fn runLsmMaintenanceStep(self: *PersistentIndex) !bool {
         self.lockStorage();
         defer self.unlockStorage();
+        if (self.deferred_retirement_maintenance) self.flushCompletedRetirementMarkersLocked();
         return try self.main_store_owner.runLsmMaintenanceStep();
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *PersistentIndex) !bool {
         self.lockStorage();
         defer self.unlockStorage();
+        if (self.deferred_retirement_maintenance) self.flushCompletedRetirementMarkersLocked();
         return try self.main_store_owner.runLsmMaintenanceStepBestEffort();
     }
 
@@ -6920,4 +6967,55 @@ test "empty lite persistent reopen preserves checkpoint" {
     defer reopened.close();
     try std.testing.expectEqualDeep(before, docs.file.activeCheckpoint());
     try std.testing.expectEqual(@as(u32, 0), reopened.snapshot().liveDocCount());
+}
+
+test "lite persistent cache lifecycle preserves replayed WAL without publication" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/persistent-cache.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var storage = lite_indexes.Store.init(a, &docs);
+    const opts = PersistentIndexOptions{ .path = "/lite-text", .io = std.testing.io, .main_lsm_options = .{ .flush_threshold = 1024 }, .main_lsm_storage = storage.storage(), .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true };
+    for ([_][]const u8{ "first", "replacement" }) |value| {
+        {
+            var index = try PersistentIndex.open(a, opts);
+            defer index.close();
+            var txn = try index.beginWriteMainTxn();
+            errdefer txn.abort();
+            try txn.put(.meta, "cache-lifecycle-fixture", value);
+            try txn.commit();
+            const before_sync = index.snapshotLsmWriteStats().?.flushes;
+            const before_barrier = docs.file.activeCheckpoint();
+            try index.syncAppliedReplayBoundary();
+            try std.testing.expectEqualDeep(before_barrier, docs.file.activeCheckpoint());
+            try index.publishProjectionSeal(.{ .root = 1, .namespace = @splat(1), .generation = 1, .config_hash = 1, .applied_sequence = if (std.mem.eql(u8, value, "first")) 1 else 2 });
+            try std.testing.expectEqual(before_sync, index.snapshotLsmWriteStats().?.flushes);
+        }
+        const before = docs.file.activeCheckpoint();
+        for (0..8) |_| {
+            {
+                var index = try PersistentIndex.open(a, opts);
+                defer index.close();
+                try std.testing.expectEqualDeep(before.logical, docs.file.activeCheckpoint().logical);
+                try std.testing.expectEqual(before.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
+                var txn = try index.beginReadMainTxn();
+                defer txn.abort();
+                try std.testing.expectEqualStrings(value, try txn.get(.meta, "cache-lifecycle-fixture"));
+                const seal = (try index.loadProjectionSeal(a)).?;
+                try std.testing.expectEqual(@as(u64, if (std.mem.eql(u8, value, "first")) 1 else 2), seal.applied_sequence);
+            }
+            // Includes teardown: replayed, already durable mutable WAL state
+            // must not be flushed as a new physical index generation.
+            // Immutable reader leases may publish separate catalog metadata.
+            try std.testing.expectEqualDeep(before.logical, docs.file.activeCheckpoint().logical);
+            try std.testing.expectEqual(before.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
+        }
+    }
 }

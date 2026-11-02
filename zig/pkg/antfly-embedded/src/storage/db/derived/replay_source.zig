@@ -66,6 +66,15 @@ pub const MatchingCursor = struct {
         };
     }
 
+    /// Collection owns its keys independently. A bounded one-window caller
+    /// can release the journal read generation before applying index effects.
+    pub fn releaseReadSnapshot(self: *MatchingCursor) void {
+        switch (self.state) {
+            .journal => {},
+            .primary_store => |*cursor| cursor.releaseReadSnapshot(),
+        }
+    }
+
     pub fn deinit(self: *MatchingCursor, alloc: Allocator) void {
         _ = alloc;
         switch (self.state) {
@@ -277,9 +286,16 @@ const PrimaryStoreMatchingCursor = struct {
     fallback_all: bool = false,
     hint_exhausted: bool = false,
 
-    pub fn deinit(self: *@This()) void {
+    fn releaseReadSnapshot(self: *@This()) void {
         if (self.cursor) |*cursor| cursor.close();
+        self.cursor = null;
         if (self.scan_txn) |*txn| txn.abort();
+        self.scan_txn = null;
+        self.entry = null;
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.releaseReadSnapshot();
         self.* = undefined;
     }
 

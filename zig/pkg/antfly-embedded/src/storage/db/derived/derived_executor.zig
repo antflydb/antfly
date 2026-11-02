@@ -217,6 +217,16 @@ const ManualWorker = struct {
     paused: bool = false,
 };
 
+fn replayWorkElapsedNs(wait: VisibilityWait, started: u64, waited_before: u64) u64 {
+    const elapsed = @import("antfly_platform").time.monotonicNs() -| started;
+    const publication_wait = if (wait.publication_overhead_ns) |counter| counter.load(.monotonic) -| waited_before else 0;
+    // Queueing, validation and the bounded prepared-publication hold are
+    // separate from input preparation. Charging fixed sync/publication cost to
+    // compute sizing creates smaller windows and still more publications.
+    // Payload collection, tokenization and encoding remain charged.
+    return elapsed -| publication_wait;
+}
+
 const ManualRuntime = struct {
     alloc: Allocator,
     replay_source: replay_source_mod.Source,
@@ -390,9 +400,11 @@ const ManualRuntime = struct {
         var budget = if (wait.replay_budget) |controller| controller.budget(lane) else @import("replay_budget.zig").Budget{};
         budget.records = @min(budget.records, wait.replay_record_cap);
         const started = @import("antfly_platform").time.monotonicNs();
+        const waited_before = if (wait.publication_overhead_ns) |counter| counter.load(.monotonic) else 0;
+        var pressure_failure = false;
         var completed = false;
-        defer if (!completed) if (wait.replay_budget) |controller| controller.observe(lane, budget, @import("antfly_platform").time.monotonicNs() -| started, 0, true);
-        const stats = try derived_worker.catchUpIndexWithOptions(
+        defer if (!completed) if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, started, waited_before), 0, pressure_failure);
+        const stats = derived_worker.catchUpIndexWithOptions(
             self.alloc,
             self.replay_source,
             worker.kind,
@@ -404,13 +416,17 @@ const ManualRuntime = struct {
                 .max_records_per_window = if (wait.replay_budget != null) budget.records else derived_worker.catch_up_max_records_per_window_default,
                 .max_chunk_bytes = if (wait.replay_budget != null) budget.bytes else derived_worker.catch_up_max_chunk_bytes_default,
                 .max_windows_per_call = if (wait.replay_budget != null) 1 else 0,
+                .release_read_snapshot_after_collect = wait.replay_budget != null,
                 .max_call_ns = if (wait.replay_budget != null) @import("replay_budget.zig").Controller.quantum_ns else 0,
                 .max_call_bytes = if (wait.replay_budget != null) budget.bytes else 0,
                 .target_sequence = if (wait.replay_budget != null) worker.target_sequence else 0,
             },
-        );
+        ) catch |err| {
+            pressure_failure = err == error.ResourceBudgetExceeded or err == error.OutOfMemory;
+            return err;
+        };
         completed = true;
-        if (wait.replay_budget) |controller| controller.observe(lane, budget, @import("antfly_platform").time.monotonicNs() -| started, stats.scanned_entries, false);
+        if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, started, waited_before), stats.scanned_entries, false);
         catch_up_open = false;
         return .{ .stats = stats, .token = token };
     }

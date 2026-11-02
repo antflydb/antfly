@@ -528,6 +528,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.FileBusy,
         error.TextMergeBackpressureTimeout,
         error.LiteRetirementBacklogExceeded,
+        error.LiteReplayBacklogExceeded,
         error.SourceFileChanged,
         error.PortableImportPublicationInProgress,
         error.PortableRuntimeActivationPending,

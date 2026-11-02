@@ -21,7 +21,7 @@ const std = h.std;
 const dependencies = h.antfly.capi_dependencies;
 const contract = dependencies.api_distributed_txn_contract;
 const catalog = dependencies.sql_catalog;
-const key = "\x00antfly/embedded/sql-commit/v1";
+pub const key = @import("../storage/lite/replay_admission.zig").coordinator_key;
 const Record = struct { id: h.db_mod.types.TxnId, timestamp: u64, tables: []const []const u8 };
 
 /// Serializes recovery with live preparation/decision and promotion's
@@ -143,6 +143,12 @@ fn commitLocked(handle: *h.Handle, requests: []const contract.TableCommitRequest
     defer handle.alloc.free(names);
     for (requests, names) |request, *name| name.* = request.table_name;
     const record: Record = .{ .id = id, .timestamp = now, .tables = names };
+    // Refuse a new coordinator before recording a decision when the journal
+    // is full. Once admitted, its bounded transaction must remain completable
+    // across every participant, even if the final replay record crosses the
+    // ordinary producer high-water mark. Recovery excludes a second producer.
+    if (handle.owned_lite_backend) |backend| if (backend.native_docstore) |native_store|
+        try native_store.file.requireReplayProducerCapacity();
     try store(handle, record);
     // Publish a native durable coordinator before preparing any participant.
     _ = try handle.db.beginTransactionScoped(id, now, now, names, true, true, null);

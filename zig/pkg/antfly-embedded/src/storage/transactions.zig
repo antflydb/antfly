@@ -54,7 +54,7 @@ const intent_locks_prefix = "\x00\x00__txn_intent_locks__:";
 // history uses TxnRecord.intents_resolved instead.
 const intent_keys_prefix = "\x00\x00__txn_intent_keys__:";
 const intent_members_prefix = "\x00\x00__txn_intent_members__:";
-const intent_admission_prefix = "\x00\x00__txn_intent_admission__:";
+const intent_admission_prefix = @import("lite/replay_admission.zig").reservation_prefix;
 const IntentAdmission = struct {
     count: u64 = 0,
     bytes: u64 = 0,

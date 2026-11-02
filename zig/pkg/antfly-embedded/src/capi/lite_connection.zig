@@ -58,6 +58,10 @@ const PublicationCatalog = struct {
         @import("../storage/db/resolver_projection.zig").epoch_key,
     };
     inode: u64,
+    metadata_identity: [16]u8,
+    sql_commit_fingerprint: ?[32]u8,
+    table_catalog_fingerprint: ?[32]u8,
+    recovery_clean: bool,
     paths: [metadata_keys.len][]const u8,
     fingerprints: [metadata_keys.len]?[32]u8,
 
@@ -70,7 +74,15 @@ const PublicationCatalog = struct {
             const namespace = try @import("../storage/lite/embedded_catalog.zig").namespaceAlloc(a, database.core.identity_namespace.table_id);
             break :prefix try backend.documentPrefixAlloc(a, namespace);
         };
-        var result: PublicationCatalog = .{ .inode = (try (try pin.readFile()).file.stat((try pin.readFile()).runtime())).inode, .paths = undefined, .fingerprints = undefined };
+        var result: PublicationCatalog = .{
+            .inode = (try (try pin.readFile()).file.stat((try pin.readFile()).runtime())).inode,
+            .metadata_identity = pin.checkpoint.logical.metadata,
+            .sql_commit_fingerprint = try pin.valueFingerprint(@import("sql_commit.zig").key),
+            .table_catalog_fingerprint = try pin.valueFingerprint(@import("../storage/lite/embedded_catalog.zig").key),
+            .recovery_clean = !root.sql_commit_recovery_needed and !root.sql_ddl_recovery_needed,
+            .paths = undefined,
+            .fingerprints = undefined,
+        };
         for (metadata_keys, 0..) |key, i| {
             result.paths[i] = try std.mem.concat(a, u8, &.{ prefix, key });
             result.fingerprints[i] = try pin.valueFingerprint(result.paths[i]);
@@ -85,6 +97,19 @@ const PublicationCatalog = struct {
         for (self.paths, self.fingerprints) |path, captured|
             if (!std.meta.eql(captured, try live.valueFingerprint(path))) return error.EnrichmentSourceChanged;
     }
+    /// The caller holds path admission, so native checkpoint reads cannot race
+    /// reuse or replacement. A no-ABA metadata cut plus the SQL decision witness
+    /// preserves the recovered catalog without constructing serving runtimes.
+    fn verifyNative(self: *PublicationCatalog, file: *native.NativeFile) !void {
+        if (!self.recovery_clean or !file.header.indexed_reclamation) return error.EnrichmentWaitCanceled;
+        if ((try file.file.stat(file.runtime())).inode != self.inode or
+            !std.mem.eql(u8, &self.metadata_identity, &file.activeCheckpoint().logical.metadata)) return error.EnrichmentSourceChanged;
+        if (!std.meta.eql(self.sql_commit_fingerprint, try file.documentFingerprintAtCheckpoint(file.activeCheckpoint(), @import("sql_commit.zig").key))) return error.EnrichmentSourceChanged;
+        if (!std.meta.eql(self.table_catalog_fingerprint, try file.documentFingerprintAtCheckpoint(file.activeCheckpoint(), @import("../storage/lite/embedded_catalog.zig").key))) return error.EnrichmentSourceChanged;
+        for (self.paths, self.fingerprints) |path, captured|
+            if (!std.meta.eql(captured, try file.documentFingerprintAtCheckpoint(file.activeCheckpoint(), path))) return error.EnrichmentSourceChanged;
+    }
+
     fn deinit(self: *PublicationCatalog) void {
         _ = self; // Paths are owned by the capture arena; no reader is retained.
     }
@@ -109,6 +134,10 @@ pub const PreparedPublication = struct {
     snapshot_root: *h.Handle,
     snapshot_database: *h.db_mod.DB,
     source_read: ?*SourceRead,
+    source_read_slot: ?*?SourceRead = null,
+    release_source_inputs: bool = false,
+    source_inputs_released: bool = false,
+    publication_overhead_ns: ?*std.atomic.Value(u64) = null,
     /// Exists only while one live writer fence excludes intervening commits.
     document_guards: ?*DocumentGuards = null,
     relational_rows: bool,
@@ -158,11 +187,16 @@ pub const PreparedPublication = struct {
     /// Storage publication only needs identity/catalog and physical-input
     /// fences. Opening a named table here reloads every index under the owner
     /// gate, once per output file, and can strand foreground admission.
-    fn validateStorageCurrent(self: *@This()) !void {
+    fn validateStorageCurrent(self: *@This(), probe: *native.NativeFile) !void {
         if (self.shadow_scopes.len != 0 or self.resolver_dependency != null) {
             _ = try self.current();
             return;
         }
+        if (self.catalog) |proof| if (proof.recovery_clean and probe.header.indexed_reclamation) {
+            try proof.verifyNative(probe);
+            self.owner.publication_stats.storage_guard_validations +|= 1;
+            return;
+        };
         const root = try self.owner.refresh();
         if (Owner.needsOutcomeReconciliation(root)) return error.EnrichmentWaitCanceled;
         // Reject stale captured catalogs before recovery can open a replacement
@@ -376,6 +410,10 @@ pub const PreparedPublication = struct {
         for (record.overwritten_doc_keys) |key| try self.guardDocument(database, key);
         for (record.changed_artifact_keys) |key| try self.guardReplayKey(database, key, inputs);
         for (artifact_keys) |key| try self.guardReplayKey(database, key, inputs);
+        const native_file = &self.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+        const old_consumer = native_file.replay_consumer_admission;
+        native_file.replay_consumer_admission = true;
+        defer native_file.replay_consumer_admission = old_consumer;
         const sequence = try apply(request, database);
         // The physical header alone does not update the detached DocStore's
         // committed/reserved sequence caches. Only mirror successful commits.
@@ -646,6 +684,7 @@ pub const Owner = struct {
     const MaintenanceSchedule = struct {
         shadow_next: bool = true,
         startup_replay_pending: bool = true,
+        replay_turns_since_artifacts: u8 = 0,
         source_recovery_next: bool = true,
         group_source_next: bool = true,
         // Separately allocated: table admission can grow the schedule map
@@ -717,6 +756,9 @@ pub const Owner = struct {
     current: ?*h.Handle = null,
     retired: std.ArrayList(*h.Handle) = .empty,
     maintenance_snapshot: ?*h.Handle = null,
+    // Only immutable index/cache state survives between bounded artifact slices.
+    // No primary read epoch or borrowed catalog proof is retained here.
+    maintenance_retained_logical: ?native.LogicalGenerations = null,
     maintenance_table_cursor: usize = 0,
     maintenance_round_pending: bool = false,
     maintenance_round_ttl_pending: bool = false,
@@ -735,6 +777,14 @@ pub const Owner = struct {
         rebased: u64 = 0,
         generated_attempts: u64 = 0,
         generated_refused: u64 = 0,
+        storage_guard_validations: u64 = 0,
+        serving_runtime_refreshes: u64 = 0,
+        replay_backlog: ?native.replay_admission.State = null,
+        replay_backpressure_waits: u64 = 0,
+        replay_index_groups: u64 = 0,
+        source_inputs_released: u64 = 0,
+        publication_hold_ns: u64 = 0,
+        replay_metadata_groups: u64 = 0,
         replay_attempts: u64 = 0,
         replay_refused: u64 = 0,
         maintenance_errors: u64 = 0,
@@ -834,6 +884,7 @@ pub const Owner = struct {
             }
         }
         const replacement = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, self.current);
+        self.publication_stats.serving_runtime_refreshes +|= 1;
         errdefer h.closeHandle(replacement);
         try self.bindGroupSourceState(replacement);
         if (self.current) |previous| {
@@ -1154,12 +1205,53 @@ pub const Owner = struct {
     // Primary transactions and index publications join the fair writer queue.
     // Their DB/index locks belong to the detached runtime; foreground refresh
     // opens a separate runtime. Reclamation admission yields on contention.
+    fn releasePreparedSourceInputs(ptr: *anyopaque) void {
+        const root: *h.Handle = @ptrCast(@alignCast(ptr));
+        const publication = root.maintenance_publication.?;
+        if (!publication.release_source_inputs) return;
+        const slot = publication.source_read_slot orelse return;
+        if (slot.*) |*read| {
+            read.abort();
+            slot.* = null;
+            publication.source_read = null;
+            root.owned_lite_backend.?.native_docstore.?.primary_reads_require_admission = true;
+            publication.source_inputs_released = true;
+        }
+    }
+
+    fn enterReplayIndexPublication(ptr: *anyopaque) !void {
+        const root: *h.Handle = @ptrCast(@alignCast(ptr));
+        try enterMaintenanceWriter(root, .index);
+        root.maintenance_owner.?.publication_stats.replay_index_groups +|= 1;
+        if (root.maintenance_publication.?.source_inputs_released) {
+            root.maintenance_owner.?.publication_stats.source_inputs_released +|= 1;
+            root.maintenance_publication.?.source_inputs_released = false;
+        }
+    }
+
+    fn enterReplayMetadataPublication(ptr: *anyopaque) !void {
+        const root: *h.Handle = @ptrCast(@alignCast(ptr));
+        try enterMaintenanceWriter(root, .primary);
+        root.maintenance_owner.?.publication_stats.replay_metadata_groups +|= 1;
+    }
+
+    fn recordMaintenanceAdmission(root: *h.Handle, started: i96) void {
+        const publication = root.maintenance_publication orelse return;
+        const counter = publication.publication_overhead_ns orelse return;
+        const elapsed = @max(0, std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds - started);
+        _ = counter.fetchAdd(@intCast(@min(elapsed, std.math.maxInt(u64))), .monotonic);
+    }
+
     fn enterMaintenanceWriter(ptr: *anyopaque, scope: PublicationScope) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         const self = root.maintenance_owner.?;
+        const admission_started = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
+        var count_admission = true;
+        defer if (count_admission) recordMaintenanceAdmission(root, admission_started);
         root.maintenance_admission_mutex.lockUncancelable(h.handleLockIo());
         defer root.maintenance_admission_mutex.unlock(h.handleLockIo());
         if (root.maintenance_writer_references != 0) {
+            count_admission = false; // Included in the outer publication's hold.
             root.maintenance_writer_references += 1;
             return;
         }
@@ -1179,15 +1271,19 @@ pub const Owner = struct {
             return error.EnrichmentWaitCanceled;
         };
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
-        var lease = (if (scope == .reclamation) native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) else self.acquireMaintenancePathLeaseAssumeLocked()) catch |err| switch (err) {
-            error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
-            else => return err,
+        var lease = blk: {
+            break :blk (if (scope == .reclamation) native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) else self.acquireMaintenancePathLeaseAssumeLocked()) catch |err| switch (err) {
+                error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
+                else => return err,
+            };
         };
         errdefer lease.close();
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
-        if ((try probe.file.stat(probe.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
+        const probe_inode = (try probe.file.stat(probe.runtime())).inode;
+        if (probe_inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
+        self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
         if (!std.meta.eql(probe.header, file.header) and scope == .allocator_service) {
             // Bounded allocator/orphan service computes no detached output.
             // Start it on the current ledger under the fair writer lease;
@@ -1199,7 +1295,7 @@ pub const Owner = struct {
         } else if (!std.meta.eql(probe.header, file.header)) {
             if (scope == .reclamation) return error.EnrichmentWaitCanceled;
             const publication = root.maintenance_publication orelse return error.EnrichmentWaitCanceled;
-            try publication.validateStorageCurrent();
+            try publication.validateStorageCurrent(&probe);
             // Rebase before opening a primary transaction as well as before
             // publishing immutable index bytes. Lease acquisition and replay
             // checkpoints must not require a quiet interval between capture
@@ -1224,6 +1320,11 @@ pub const Owner = struct {
         }
         // A changed tip invalidates a detached proof. Retry outside the gate
         // instead of falling back to a whole-file scan in this publication.
+        // Metadata-only validation need not open a serving runtime to donate
+        // an allocator. Rebase this writer's checked ledger against the exact
+        // admitted tip using the native certificate protocol.
+        if (scope != .reclamation and !file.free_pages_verified)
+            _ = try file.inheritAllocatorCertificate();
         if ((scope == .primary or scope == .index) and !file.free_pages_verified) {
             self.publication_stats.allocator_refusals +|= 1;
             return error.EnrichmentWaitCanceled;
@@ -1231,6 +1332,7 @@ pub const Owner = struct {
         if (scope == .allocator_service) self.publication_stats.allocator_service_admissions +|= 1;
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;
+        root.maintenance_publication_started_ns = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
     }
 
     fn leaveMaintenanceWriter(ptr: *anyopaque) void {
@@ -1243,6 +1345,16 @@ pub const Owner = struct {
         if (root.maintenance_writer_references != 0) return;
         var lease = root.maintenance_writer_lease.?;
         root.maintenance_writer_lease = null;
+        if (root.maintenance_publication_started_ns) |started| {
+            const held: u64 = @intCast(@max(0, std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds - started));
+            self.publication_stats.publication_hold_ns +|= held;
+            if (root.maintenance_publication) |publication| {
+                if (publication.publication_overhead_ns) |counter| {
+                    _ = counter.fetchAdd(held, .monotonic);
+                }
+            }
+            root.maintenance_publication_started_ns = null;
+        }
         // Admission alone is not a mutation. Reclamation probes also take
         // this lease; waking replay here makes each idle turn schedule itself.
         // Generated and replay publications notify at their commit boundary.
@@ -1280,14 +1392,32 @@ pub const Owner = struct {
     fn refreshMaintenanceSnapshot(self: *Owner, foreground: *h.Handle, need_database: bool) !*h.Handle {
         const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
         if (self.maintenance_snapshot) |snapshot| {
-            const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
-            if ((!need_database or snapshot.db_live) and std.meta.eql(file.header, captured.header) and
-                (try file.file.stat(file.runtime())).inode == (try captured.file.stat(captured.runtime())).inode)
+            const cached_store = snapshot.owned_lite_backend.?.native_docstore.?;
+            const captured = &cached_store.file;
+            const same_inode = (try file.file.stat(file.runtime())).inode == (try captured.file.stat(captured.runtime())).inode;
+            const logical = file.activeCheckpoint().logical;
+            const retained_inputs_match = if (self.maintenance_retained_logical) |expected|
+                snapshot.db_live and file.header.indexed_reclamation and captured.header.indexed_reclamation and
+                    !std.mem.allEqual(u8, &expected.metadata, 0) and !std.mem.allEqual(u8, &expected.indexes, 0) and
+                    std.mem.eql(u8, &expected.metadata, &logical.metadata) and std.mem.eql(u8, &expected.indexes, &logical.indexes)
+            else
+                false;
+            if (same_inode and (!need_database or snapshot.db_live) and
+                ((std.meta.eql(file.header, captured.header) and !snapshot.db_live) or retained_inputs_match))
             {
-                self.configureRetirementBudget(snapshot.owned_lite_backend.?.native_docstore.?);
+                // Primary commits do not invalidate immutable index continuations.
+                // Rebind before taking this turn's fresh primary read epoch; a
+                // changed catalog/index identity or inode always opens anew.
+                if (!std.meta.eql(file.header, captured.header)) try cached_store.refreshIndexPublicationCheckpoint(file.header);
+                try captured.inheritAllocatorVerification(file);
+                snapshot.sql_commit_recovery_needed = foreground.sql_commit_recovery_needed;
+                snapshot.sql_ddl_recovery_needed = foreground.sql_ddl_recovery_needed;
+                snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
+                self.configureRetirementBudget(cached_store);
                 return snapshot;
             }
         }
+        self.maintenance_retained_logical = null;
         var options = self.options;
         options.externally_locked = true;
         // Immutable artifact leases protect the exact input trees. A coarse
@@ -1616,6 +1746,16 @@ pub const Owner = struct {
         }
         self.maintenance_round_ttl_pending = self.maintenance_round_ttl_pending or ttl_more;
         const run_database = self.maintenance_pending;
+        const replay_debt = try foreground_file.replayAdmission();
+        const replay_urgent = if (replay_debt) |debt|
+            debt.records >= debt.limits.records / 2 or debt.bytes >= debt.limits.bytes / 2
+        else
+            false;
+        // Reserve source service under pressure without starving artifacts.
+        // Physical retirement still receives its bounded turn every cycle.
+        const artifact_due = !replay_urgent or schedule.replay_turns_since_artifacts >= 3;
+        schedule.replay_turns_since_artifacts = if (artifact_due) 0 else schedule.replay_turns_since_artifacts + 1;
+
         var turn_arena = std.heap.ArenaAllocator.init(alloc);
         defer turn_arena.deinit();
         const turn_alloc = turn_arena.allocator();
@@ -1664,12 +1804,20 @@ pub const Owner = struct {
         defer if (source_read) |*read| read.abort();
         var catalog = if (run_database) try PublicationCatalog.capture(turn_alloc, root, database) else null;
         defer if (catalog) |*proof| proof.deinit();
-        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
+        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .publication_overhead_ns = &group_state.publication_overhead_ns, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
+        const managed = try database.core.index_manager.managedIndexes(turn_alloc);
+        publication.source_read_slot = &source_read;
+        // Other consumers may still lazily read the source. Early release is
+        // explicit and enabled only when this turn has one text-only consumer.
+        publication.release_source_inputs = managed.len == 1 and managed[0].kind == .full_text and
+            database.enrichment_runtime == null and !database.hasConfiguredResolvers() and !database.hasPendingGraphReplacements();
         root.maintenance_references += 1;
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
         const store = root.owned_lite_backend.?.native_docstore.?;
+        store.file.replay_consumer_admission = true;
         const split_index_work = independent and store.file.header.indexed_reclamation;
+        defer store.primary_reads_require_admission = false;
         const foreground_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
         const maintenance_entry_header = store.file.header;
         if (run_database) if (database.enrichment_runtime) |runtime| {
@@ -1678,6 +1826,8 @@ pub const Owner = struct {
             runtime.generated_publication = .{ .ptr = &publication, .commit = PreparedPublication.commit, .heartbeat = PreparedPublication.heartbeat, .acquire_store = PreparedPublication.acquireStore };
         };
         database.borrowed_group_source_state = group_state;
+        if (run_database) database.async_context.replay_index_publication = .{ .ptr = root, .enter = enterReplayIndexPublication, .leave = leaveMaintenanceWriter, .inputs_complete = releasePreparedSourceInputs };
+        if (run_database) database.async_context.replay_metadata_publication = .{ .ptr = root, .enter = enterReplayMetadataPublication, .leave = leaveMaintenanceWriter };
         if (run_database) database.async_context.replay_publication = .{ .ptr = &publication, .publish = PreparedPublication.publishReplay };
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
         lease.close();
@@ -1699,6 +1849,7 @@ pub const Owner = struct {
             maintenance_error = err;
             break :blk false;
         } else false;
+        var retain_artifact_runtime = false;
         var pending = if (maintenance_error != null) true else if (run_database and !projected) database.runBackgroundTurnWithCancellation(cancellation, if (shadow_scopes.items.len != 0) .shadow else if (split_index_work) .replay else .complete) catch |err| blk: {
             maintenance_error = err;
             break :blk true;
@@ -1707,6 +1858,8 @@ pub const Owner = struct {
             runtime.dense_result_cache = null;
             runtime.generated_publication = null;
         };
+        if (run_database) database.async_context.replay_index_publication = null;
+        if (run_database) database.async_context.replay_metadata_publication = null;
         if (run_database) database.async_context.replay_publication = null;
         if (source_read) |*read| read.abort();
         source_read = null;
@@ -1731,11 +1884,12 @@ pub const Owner = struct {
                 };
             };
             pending = pending or retirement_more;
-            const more = database.runBackgroundTurnWithCancellation(cancellation, .artifacts) catch |err| blk: {
+            const more = if (artifact_due) database.runBackgroundTurnWithCancellation(cancellation, .artifacts) catch |err| blk: {
                 maintenance_error = err;
                 break :blk true;
-            };
+            } else database.core.index_manager.lsmMaintenanceScore() != 0;
             pending = pending or more;
+            retain_artifact_runtime = more and maintenance_error == null;
         }
         root.maintenance_publication = null;
         // No detached computation/publication can use the catalog now. Drop
@@ -1743,7 +1897,8 @@ pub const Owner = struct {
         // an obsolete reader fence throughout its own reuse/vacuum attempt.
         if (catalog) |*proof| proof.deinit();
         catalog = null;
-        if (independent and root.db_live) {
+        const retained_logical: ?native.LogicalGenerations = if (retain_artifact_runtime) store.file.activeCheckpoint().logical else null;
+        if (independent and root.db_live and !retain_artifact_runtime) {
             // End the input fences before reclamation. Keeping them in an
             // idle runtime would needlessly prevent in-place page service.
             @import("tables.zig").closeAll(root);
@@ -1759,6 +1914,7 @@ pub const Owner = struct {
 
         self.gate.mutex.lockUncancelable(io);
         defer self.gate.mutex.unlock(io);
+        self.maintenance_retained_logical = retained_logical;
         if (maintenance_error) |err| {
             self.publication_stats.maintenance_errors +|= 1;
             self.publication_stats.last_maintenance_error = @errorName(err);
@@ -4191,22 +4347,22 @@ test "capi native allocator proof issue1362 storage publication fences a named t
     const removed = root.embedded_tables.fetchRemove("numbers").?;
     defer root.embedded_tables.put(root.alloc, removed.key, removed.value) catch unreachable;
     const header = root.owned_lite_backend.?.native_docstore.?.file.header;
-    try publication.validateStorageCurrent();
+    try publication.validateStorageCurrent(&root.owned_lite_backend.?.native_docstore.?.file);
     try std.testing.expect(!root.embedded_tables.contains("numbers"));
     try std.testing.expectEqualDeep(header, root.owned_lite_backend.?.native_docstore.?.file.header);
     const id = root.embedded_table_records.getPtr("numbers").?;
     const original_id = id.*;
     id.* += 1;
-    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent());
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent(&root.owned_lite_backend.?.native_docstore.?.file));
     id.* = original_id;
     publication.incarnation +%= 1;
-    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent());
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent(&root.owned_lite_backend.?.native_docstore.?.file));
     publication.incarnation -%= 1;
     var txn = try database.core.store.beginWriteTxn();
     errdefer txn.abort();
     try txn.put(keys.public_schema_json_key, "{\"changed\":true}");
     try txn.commit();
-    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent());
+    try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateStorageCurrent(&root.owned_lite_backend.?.native_docstore.?.file));
     try std.testing.expect(!root.embedded_tables.contains("numbers"));
 }
 
@@ -5032,4 +5188,127 @@ test "capi native recovery agenda repeated compaction invalidates a clean metada
         try std.testing.expect(refreshed.sql_ddl_recovery_needed);
         try std.testing.expectError(error.SqlStatementReadUnavailable, @import("sql_ddl.zig").requireRecovered(refreshed, &refreshed.db, "default"));
     }
+}
+
+test "capi native artifact continuation survives primary writes and rejects changed inputs" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("artifact-continuation-rebase", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    var retained: *h.Handle = undefined;
+    var opened: u64 = undefined;
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const file = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+        try file.putIndexCatalogRecord("/continuation-test/input", "original");
+        retained = try owner.refreshMaintenanceSnapshot(owner.current.?, true);
+        owner.maintenance_retained_logical = retained.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().logical;
+        opened = owner.test_runtime_snapshot_opens;
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const resumed = try owner.refreshMaintenanceSnapshot(owner.current.?, true);
+        try std.testing.expectEqual(retained, resumed);
+        try std.testing.expectEqual(opened, owner.test_runtime_snapshot_opens);
+        try std.testing.expectEqualDeep(owner.current.?.owned_lite_backend.?.native_docstore.?.file.header, resumed.owned_lite_backend.?.native_docstore.?.file.header);
+        // A foreign physical index mutation fences cached input continuations.
+        try owner.current.?.owned_lite_backend.?.native_docstore.?.file.putIndexCatalogRecord("/continuation-test/input", "changed");
+        const replacement = try owner.refreshMaintenanceSnapshot(owner.current.?, true);
+        try std.testing.expectEqual(opened + 1, owner.test_runtime_snapshot_opens);
+        owner.maintenance_retained_logical = replacement.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().logical;
+        // Catalog changes also invalidate a cached DB, even on the same inode.
+        try owner.current.?.owned_lite_backend.?.native_docstore.?.file.putCatalogRecord("test/continuation-catalog", "changed");
+        _ = try owner.refreshMaintenanceSnapshot(owner.current.?, true);
+        try std.testing.expectEqual(opened + 2, owner.test_runtime_snapshot_opens);
+    }
+}
+
+test "capi native replay publication guards preserve recovery and replacement fences without runtime open" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("native-replay-publication-guard");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    const root = try api.openLiteHandleAllocWithRuntime(alloc, path, .{ .profile = .native, .externally_locked = true, .no_sync = true }, true, null, null);
+    defer h.closeHandle(root);
+    const store = root.owned_lite_backend.?.native_docstore.?;
+    store.maintenance_start_suppressed = true;
+    try @import("sql_commit.zig").recover(root);
+    try @import("sql_ddl.zig").recover(root);
+    var proof = try PublicationCatalog.capture(a, root, &root.db);
+    defer proof.deinit();
+    try std.testing.expect(proof.recovery_clean);
+    try store.file.putDocument("unrelated", "primary");
+    try store.file.putIndexCatalogRecord("/unrelated/index", "artifact");
+    try proof.verifyNative(&store.file);
+    // An unresolved SQL decision must fence the fast path even though it
+    // changes only primary identity, not the metadata identity.
+    try store.file.putDocument(@import("sql_commit.zig").key, "pending decision");
+    try std.testing.expectError(error.EnrichmentSourceChanged, proof.verifyNative(&store.file));
+    try store.file.deleteDocument(@import("sql_commit.zig").key);
+    try proof.verifyNative(&store.file);
+    try store.file.putDocument(@import("../storage/lite/embedded_catalog.zig").key, "changed mapping");
+    try std.testing.expectError(error.EnrichmentSourceChanged, proof.verifyNative(&store.file));
+    try store.file.deleteDocument(@import("../storage/lite/embedded_catalog.zig").key);
+    try proof.verifyNative(&store.file);
+    // Recovery markers and replacement generations carry fresh no-ABA cuts.
+    try store.file.putCatalogRecord("system/new-metadata", "changed");
+    try std.testing.expectError(error.EnrichmentSourceChanged, proof.verifyNative(&store.file));
+    var fresh = try PublicationCatalog.capture(a, root, &root.db);
+    defer fresh.deinit();
+    _ = try store.file.vacuum();
+    try std.testing.expectError(error.EnrichmentSourceChanged, fresh.verifyNative(&store.file));
+    proof.recovery_clean = false;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, proof.verifyNative(&store.file));
+}
+
+test "capi native replay admission refuses a transform before commit and returns credit after drain" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("durable-replay-transform", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&output);
+    const seed = "{\"inserts\":{\"counter\":{\"body\":\"counter\",\"count\":0}},\"sync_level\":\"write\"}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice(seed), &output));
+    api.antfly_buffer_free_zero(&output);
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const file = &fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+        var state = (try file.replayAdmission()).?;
+        try std.testing.expect(state.records > 0);
+        state.limits.records = state.records;
+        try file.putDocument(native.replay_admission.key, &state.encode());
+    }
+    const increment = "{\"transforms\":[{\"key\":\"counter\",\"operations\":[{\"op\":\"$inc\",\"path\":\"count\",\"value\":1}]}],\"sync_level\":\"write\"}";
+    for (0..2) |_| {
+        try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_batch_json(fixture.id, .fromSlice(increment), &output));
+        const raw = (try fixture.connection.owner.current.?.db.get(std.testing.allocator, "counter")).?;
+        defer std.testing.allocator.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("count").?.integer);
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(fixture.id));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice(increment), &output));
+    const raw = (try fixture.connection.owner.current.?.db.get(std.testing.allocator, "counter")).?;
+    defer std.testing.allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
 }

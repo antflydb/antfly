@@ -174,7 +174,18 @@ pub const ReplayPublication = struct {
     ) anyerror!u64,
 };
 
+/// Only bounded metadata publication belongs inside this admission. Index
+/// preparation, provider callbacks and physical checkpoint construction do not.
+pub const ReplayMetadataPublication = struct {
+    inputs_complete: ?*const fn (*anyopaque) void = null,
+    ptr: *anyopaque,
+    enter: *const fn (*anyopaque) anyerror!void,
+    leave: *const fn (*anyopaque) void,
+};
+
 pub const AsyncContext = struct {
+    replay_index_publication: ?ReplayMetadataPublication = null,
+    replay_metadata_publication: ?ReplayMetadataPublication = null,
     replay_publication: ?ReplayPublication = null,
     alloc: Allocator,
     io: ?std.Io = null,

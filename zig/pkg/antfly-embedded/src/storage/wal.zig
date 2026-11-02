@@ -189,7 +189,12 @@ const StoreOwner = union(enum) {
 
     fn close(self: *StoreOwner, _: Allocator) void {
         switch (self.*) {
-            .lsm => |*handle| handle.close(),
+            .lsm => |*handle| {
+                if (handle.backend.options.wal_enabled and if (handle.backend.storage) |storage| storage.requiresForegroundPublication() else false)
+                    handle.closePreservingWal()
+                else
+                    handle.close();
+            },
         }
         self.* = undefined;
     }
@@ -204,6 +209,12 @@ const StoreOwner = union(enum) {
     pub fn sync(self: *StoreOwner, force: bool) !void {
         switch (self.*) {
             .lsm => |*handle| try handle.backend.sync(force),
+        }
+    }
+
+    fn syncReplayState(self: *StoreOwner) !void {
+        switch (self.*) {
+            .lsm => |*handle| try handle.backend.syncReplayState(),
         }
     }
 
@@ -602,6 +613,17 @@ pub const WAL = struct {
 
     pub fn sync(self: *WAL, force: bool) !void {
         try self.store_owner.sync(force);
+    }
+
+    /// Drain admitted logical writes, then sync their physical WAL without
+    /// manufacturing an immutable SST generation for every replay watermark.
+    pub fn syncReplayState(self: *WAL) !void {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        while (self.coordinator_active or self.pending_head != null) {
+            self.completed.waitUncancelable(self.sync_io, &self.mutex);
+        }
+        try self.store_owner.syncReplayState();
     }
 
     /// Manifest the physical LSM generation which backs this logical WAL.

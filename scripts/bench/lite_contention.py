@@ -222,6 +222,7 @@ def seed(
                     ]
                 }
             )
+        db.run_until_idle()
         compact = db.compact()
         measurement_stats(db)
         print(
@@ -257,11 +258,21 @@ def native_worker(config, index, ready, start, results, finish=None):
             success, busy = [], []
             success_windows = [0] * max(1, math.ceil(config["seconds"] / 60))
             sequence = 0
+            visibility_samples = []
+            visibility_interval = config.get("visibility_interval", 0)
+            next_visibility = began + visibility_interval
+            text_payload = (
+                ("searchable churn alpha beta gamma delta " * 28)[:1024]
+                if config.get("text_payload") == "words"
+                else "v" * 1024
+            )
             last_write = None
             latest_churn_writes = {}
             while time.monotonic() < deadline:
                 key = f"worker-{index}-{sequence if config['workload'] == 'append' else sequence % 128}"
-                payload = {"inserts": {key: {"text": "v" * 1024, "sequence": sequence}}}
+                payload = {
+                    "inserts": {key: {"text": text_payload, "sequence": sequence}}
+                }
                 began_call = time.perf_counter_ns()
                 try:
                     db.batch_json(payload)
@@ -276,6 +287,33 @@ def native_worker(config, index, ready, start, results, finish=None):
                 except af.BusyError:
                     busy.append(time.perf_counter_ns() - began_call)
                 sequence += 1
+                if (
+                    index == 0
+                    and visibility_interval > 0
+                    and time.monotonic() >= next_visibility
+                ):
+                    observed = time.monotonic()
+                    try:
+                        state = db.pending_work_stats()
+                        visibility_samples.append(
+                            {
+                                "started_seconds": observed - began,
+                                "ended_seconds": time.monotonic() - began,
+                                "debt": state.get("index_replay_debt", []),
+                                "backlog": state.get("background_publications", {}).get(
+                                    "replay_backlog"
+                                ),
+                            }
+                        )
+                    except af.BusyError:
+                        visibility_samples.append(
+                            {
+                                "started_seconds": observed - began,
+                                "ended_seconds": time.monotonic() - began,
+                                "error": "Busy",
+                            }
+                        )
+                    next_visibility = time.monotonic() + visibility_interval
             ended = time.monotonic()
             # Preserve measured progress if a later diagnostic or close fails.
             # The terminal result remains an error and cannot pass qualification.
@@ -349,11 +387,13 @@ def native_worker(config, index, ready, start, results, finish=None):
                 "proof_observed_until": proof_observed_until,
                 "admission": admission,
                 "last_write": last_write,
+                "visibility_samples": visibility_samples,
                 # At most 128 keys per worker, including holes left by Busy.
                 "latest_churn_writes": list(latest_churn_writes.values()),
                 **usage,
             }
             if config.get("allocator_diagnostics", False):
+                result["background_publication_snapshot"] = final_stats
                 # Admission/status reads can perturb storage. Collect only
                 # after every timed worker and proof snapshot has finished.
                 result["allocator_diagnostics"] = (
@@ -522,10 +562,17 @@ def aggregate(workers: list[dict]) -> dict:
     ):
         result[field] = sum(row[field] for row in workers)
     if any("allocator_diagnostics" in row for row in workers):
+        result["per_worker_background_publication_snapshots"] = [
+            {"index": row["index"], **row.get("background_publication_snapshot", {})}
+            for row in workers
+        ]
         result["allocator_diagnostics_after_workload"] = [
             {"index": row["index"], **row.get("allocator_diagnostics", {})}
             for row in workers
         ]
+    result["visibility_samples"] = [
+        sample for row in workers for sample in row.get("visibility_samples", [])
+    ]
     return result
 
 
@@ -591,6 +638,8 @@ def native_cases(args):
                 "watchdog": args.watchdog,
                 "workload": args.workload,
                 "allocator_diagnostics": args.allocator_diagnostics,
+                "visibility_interval": getattr(args, "visibility_interval", 0),
+                "text_payload": getattr(args, "text_payload", "opaque"),
             }
             processes = [
                 context.Process(
@@ -757,6 +806,45 @@ def native_cases(args):
                 return
 
 
+def active_visibility_qualification(
+    samples: list[dict], seconds: float, maximum_seconds: float = 60
+) -> dict:
+    observed = [s for s in samples if "error" not in s and s.get("debt")]
+    if len(observed) < 2 or observed[-1]["ended_seconds"] < seconds - 15:
+        return {"passed": False, "reason": "insufficient_active_visibility_evidence"}
+    maximum_observed = 0.0
+    for sample in observed:
+        if sample["started_seconds"] > seconds - maximum_seconds:
+            continue  # Right-censored targets are checked by final catch-up.
+        for debt in sample["debt"]:
+            completed = next(
+                (
+                    later
+                    for later in observed
+                    if later["ended_seconds"] >= sample["ended_seconds"]
+                    and any(
+                        row["index_name"] == debt["index_name"]
+                        and row["applied_sequence"] >= debt["target_sequence"]
+                        for row in later["debt"]
+                    )
+                ),
+                None,
+            )
+            if completed is None:
+                return {
+                    "passed": False,
+                    "reason": "active_visibility_did_not_reach_prior_target",
+                }
+            upper_seconds = completed["ended_seconds"] - sample["started_seconds"]
+            maximum_observed = max(maximum_observed, upper_seconds)
+    return {
+        "passed": maximum_observed <= maximum_seconds,
+        "maximum_watermark_visibility_upper_seconds": maximum_observed,
+        "maximum_allowed_seconds": maximum_seconds,
+        "samples": len(observed),
+    }
+
+
 def sustained_qualification(row: dict, seconds: float) -> dict:
     """A surviving short run cannot qualify active-write storage or throughput.
 
@@ -795,14 +883,19 @@ def sustained_qualification(row: dict, seconds: float) -> dict:
         policy["minimum_growth_allowance_bytes"],
         initial * policy["maximum_tail_growth_fraction"],
     )
+    visibility = active_visibility_qualification(
+        row.get("visibility_samples", []), seconds
+    )
     return {
         "passed": row.get("status") == "ok"
+        and visibility["passed"]
         and growth <= allowance
         and fraction is not None
         and fraction >= policy["minimum_late_throughput_fraction"],
         "policy": policy,
         "minute_successful_calls": totals,
         "late_to_early_throughput_fraction": fraction,
+        "active_visibility": visibility,
         "tail_initial_file_bytes": initial,
         "tail_growth_bytes": growth,
         "tail_growth_allowance_bytes": allowance,
@@ -833,6 +926,13 @@ def main():
     parser.add_argument("--timeout-ms", type=int, default=1000)
     parser.add_argument("--seed-records", type=int, default=1024)
     parser.add_argument("--workload", choices=("append", "churn"), default="churn")
+    parser.add_argument(
+        "--visibility-interval",
+        type=float,
+        default=0,
+        help="sample index progress during writes; observations consume measured wall time",
+    )
+    parser.add_argument("--text-payload", choices=("opaque", "words"), default="opaque")
     parser.add_argument("--no-sync", action="store_true")
     parser.add_argument(
         "--allocator-diagnostics",
@@ -866,6 +966,10 @@ def main():
         )
     if args.mode == "native" and not args.library:
         parser.error("native mode requires --library")
+    if args.require_sustained and args.visibility_interval <= 0:
+        parser.error(
+            "--require-sustained requires --visibility-interval for active index progress evidence"
+        )
     if args.require_sustained and (
         args.mode != "native" or args.seconds < 600 or args.workload != "churn"
     ):

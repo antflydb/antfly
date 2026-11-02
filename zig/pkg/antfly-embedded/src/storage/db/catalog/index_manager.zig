@@ -9418,6 +9418,14 @@ pub const IndexManager = struct {
         return stats;
     }
 
+    pub fn syncAppliedReplayBoundaryForManagedIndex(self: *IndexManager, index_ref: ManagedIndexRef) !void {
+        if (index_ref.kind != .full_text) return self.checkpointLsmWalForManagedIndex(index_ref);
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const entry = self.textIndex(index_ref.name) orelse return error.IndexNotFound;
+        try entry.syncAppliedReplayBoundary();
+    }
+
     pub fn checkpointLsmWalForManagedIndex(self: *IndexManager, index_ref: ManagedIndexRef) !void {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();

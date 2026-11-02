@@ -936,12 +936,14 @@ pub const WriteOptions = struct {
 };
 
 const recovery_agenda = @import("recovery_agenda.zig");
+pub const replay_admission = @import("replay_admission.zig");
 
 pub const magic = "AFLITE\x03P";
 const unpacked_v3_magic = "AFLITE\x03N";
-const indexed_magic = "AFLITE\x07P";
+const previous_indexed_magic = "AFLITE\x07P";
+const indexed_magic = "AFLITE\x08P";
 pub const format_version: u32 = 3;
-pub const indexed_format_version: u32 = 7;
+pub const indexed_format_version: u32 = 8;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -3632,6 +3634,7 @@ pub const CreateOptions = struct {
 };
 
 pub const Header = struct {
+    indexed_revision: u32 = indexed_format_version,
     reader_epoch_namespace: [32]u8 = @splat(0),
     indexed_reclamation: bool = false,
     packed_records: bool = true,
@@ -4482,6 +4485,13 @@ test "lite header fingerprints cache unchanged state and fence every header fiel
             }
         } else {
             file.header = original;
+            if (comptime std.mem.eql(u8, field, "indexed_revision")) {
+                file.header.indexed_reclamation = true;
+                const indexed = NativeFile.fingerprintHeader(file.header);
+                file.header.indexed_revision = 7;
+                try std.testing.expect(!std.mem.eql(u8, &indexed, &file.headerFingerprint()));
+                continue;
+            }
             if (comptime Field == bool) {
                 @field(file.header, field) = !@field(original, field);
             } else if (comptime Field == [32]u8) {
@@ -4579,6 +4589,10 @@ pub const NativeFile = struct {
     reader_window_previous_frontier: ?u64 = null,
     header: Header,
     header_fingerprint_cache: HeaderFingerprintCache = .{},
+    // Runtime-local coherence for exact index paths and directory prefixes.
+    // Local mutations invalidate only watched ancestors; foreign adoption
+    // invalidates every watch. No allocator/catalog walk is required.
+    index_path_revisions: std.StringHashMapUnmanaged([16]u8) = .{},
     transaction_header: ?Header = null,
     // Lease-only metadata transactions may append without proving free-page
     // reuse. General mutations still validate before any physical reuse.
@@ -4595,6 +4609,12 @@ pub const NativeFile = struct {
     transaction_writes: ?*TransactionWrites = null,
     flushing_transaction: bool = false,
     transaction_pages: ?*PageAllocator = null,
+    /// Seeded only when initializing a legacy/missing durable aggregate.
+    replay_backlog_initial_limits: replay_admission.Limits = .{},
+    /// Background producers may use the reserved half-budget. Ordinary
+    /// metadata/deletes do not consume replay capacity at all.
+    replay_consumer_admission: bool = false,
+    replay_preflight_refused: bool = false,
     durable_header: ?Header = null,
     last_synced_header: ?Header = null,
     change_capture: ?*ChangeCapture = null,
@@ -4882,6 +4902,34 @@ pub const NativeFile = struct {
         self.externally_locked = true;
     }
 
+    pub fn loadedIndexPathRevision(self: *NativeFile, path: []const u8) ?[16]u8 {
+        if (!self.header.indexed_reclamation or self.transaction_header != null or self.checkpoint_publication_uncertain) return null;
+        const identity = self.activeCheckpoint().logical.indexes;
+        if (std.mem.allEqual(u8, &identity, 0)) return null;
+        if (self.index_path_revisions.getPtr(path)) |revision| {
+            if (std.mem.allEqual(u8, revision, 0)) revision.* = identity;
+            return revision.*;
+        }
+        const owned = self.allocator.dupe(u8, path) catch return null;
+        self.index_path_revisions.put(self.allocator, owned, identity) catch {
+            self.allocator.free(owned);
+            return null;
+        };
+        return identity;
+    }
+
+    fn noteIndexPathMutation(self: *NativeFile, key: []const u8) void {
+        if (self.index_path_revisions.getPtr(key)) |revision| revision.* = @splat(0);
+        for (key, 0..) |byte, i| if (byte == '/' or byte == '\\') {
+            if (self.index_path_revisions.getPtr(key[0 .. i + 1])) |revision| revision.* = @splat(0);
+        };
+    }
+
+    fn invalidateIndexPathRevisions(self: *NativeFile) void {
+        var it = self.index_path_revisions.valueIterator();
+        while (it.next()) |revision| revision.* = @splat(0);
+    }
+
     pub fn close(self: *NativeFile) void {
         std.debug.assert(self.reader_window_depth == 0);
         if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
@@ -4890,6 +4938,9 @@ pub const NativeFile = struct {
         const io = self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.page_cache.deinit(self.allocator);
+        var revisions = self.index_path_revisions.keyIterator();
+        while (revisions.next()) |key| self.allocator.free(key.*);
+        self.index_path_revisions.deinit(self.allocator);
         self.invalidateLedger();
         if (self.writer_lock_file) |lock_file| {
             lock_file.close(io);
@@ -4926,6 +4977,7 @@ pub const NativeFile = struct {
         if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain or
             self.header.page_size != header.page_size or self.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
         if (std.meta.eql(self.header, header)) return;
+        if (!std.mem.eql(u8, &self.activeCheckpoint().logical.indexes, &header.checkpoints[header.active_checkpoint].logical.indexes)) self.invalidateIndexPathRevisions();
         self.allocator_rebase_header = if (self.free_pages_verified and self.ledger != null) self.header else null;
         if (self.allocator_rebase_header == null) self.invalidateLedger();
         self.page_cache.clear(self.allocator);
@@ -6254,6 +6306,11 @@ pub const NativeFile = struct {
                 if (err == error.MaintenanceCanceled) return err;
                 return invalidCheck(report, issueForPageCheckError(err));
             };
+            if (try self.replayAdmission()) |expected| {
+                const actual = try self.scanReplayAdmissionWithCancel(cancel);
+                if (actual.bytes != expected.bytes or actual.records != expected.records)
+                    return invalidCheck(report, "replay_admission_mismatch");
+            }
             const live = try self.liveStats(cancel);
             var valid = report;
             valid.record_count = records;
@@ -6508,6 +6565,7 @@ pub const NativeFile = struct {
     /// source alive and unchanged throughout this call. No staged data enters
     /// the committed catalog until the final checkpoint publication.
     pub fn putIndexCatalogRecordFromFile(self: *NativeFile, key: []const u8, source: std.Io.File, len: usize, options: WriteOptions) !void {
+        self.noteIndexPathMutation(key);
         if (self.change_capture) |capture| capture.record(self.allocator, .index, key);
         if (self.read_only) return error.ReadOnly;
         if (key.len > catalog_key_len_mask or len > std.math.maxInt(u32)) return error.RecordTooLarge;
@@ -6662,6 +6720,7 @@ pub const NativeFile = struct {
     }
 
     fn putCatalogBatchForRoot(self: *NativeFile, root: CatalogRoot, mutations: []const CatalogMutation, options: WriteOptions) anyerror!void {
+        if (root == .index) for (mutations) |mutation| self.noteIndexPathMutation(mutation.key);
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
         for (mutations) |mutation| {
@@ -6876,6 +6935,7 @@ pub const NativeFile = struct {
     }
 
     fn appendCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, key: []const u8, suffix: []const u8) !void {
+        if (root == .index) self.noteIndexPathMutation(key);
         if (self.change_capture) |capture| capture.record(self.allocator, if (root == .metadata) .metadata else .index, key);
         if (self.read_only) return error.ReadOnly;
 
@@ -6948,6 +7008,10 @@ pub const NativeFile = struct {
     }
 
     fn renameCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, old_key: []const u8, new_key: []const u8) !void {
+        if (root == .index) {
+            self.noteIndexPathMutation(old_key);
+            self.noteIndexPathMutation(new_key);
+        }
         if (self.change_capture) |capture| {
             capture.record(self.allocator, if (root == .metadata) .metadata else .index, old_key);
             capture.record(self.allocator, if (root == .metadata) .metadata else .index, new_key);
@@ -7992,6 +8056,124 @@ pub const NativeFile = struct {
         try self.putDocumentBatch(&.{.{ .key = key, .is_delete = true }});
     }
 
+    /// Header-only lookup, including transaction-local pending mutations.
+    /// Admission never hydrates a retained multi-megabyte journal value.
+    fn documentLength(self: *NativeFile, key: []const u8) !?u64 {
+        const checkpoint = self.activeCheckpoint();
+        if (self.stagedEntry(.documents, key)) |entry| {
+            if (entry.is_delete) return null;
+            return if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+        }
+        const page = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return null;
+        var reader: ValuePageReader = undefined;
+        reader.init();
+        defer reader.deinit(self);
+        const payload = try reader.readPayload(self, checkpoint, page, 1, .document);
+        const entry = try decodeDocumentEntry(payload);
+        if (!std.mem.eql(u8, entry.key, key)) return error.InvalidDocumentIndex;
+        if (entry.is_delete) return null;
+        return if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+    }
+
+    /// Independent bootstrap/verification of the durable aggregate. Normal
+    /// mutations use point reads only; old files pay this migration once.
+    pub fn scanReplayAdmission(self: *NativeFile) !replay_admission.State {
+        return self.scanReplayAdmissionWithCancel(null);
+    }
+
+    fn scanReplayAdmissionWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !replay_admission.State {
+        var result: replay_admission.State = .{ .limits = self.replay_backlog_initial_limits };
+        var cursor = DocumentIndexCursor.init(self, self.activeCheckpoint());
+        defer cursor.deinit();
+        var next = try cursor.first();
+        while (next) |entry| {
+            var owned = entry;
+            defer owned.deinit(self.allocator);
+            if (cancel) |token| try token.check();
+            if (replay_admission.isTracked(entry.key)) if (try self.documentReplayCost(entry.key)) |cost|
+                try cost.add(&result);
+            next = try cursor.next();
+        }
+        return result;
+    }
+
+    pub fn replayAdmission(self: *NativeFile) !?replay_admission.State {
+        if (!self.header.indexed_reclamation or self.header.indexed_revision < 8) return null;
+        const raw = (try self.getDocumentAlloc(self.allocator, replay_admission.key)) orelse return null;
+        defer self.allocator.free(raw);
+        return try replay_admission.State.decode(raw);
+    }
+
+    fn documentReplayCost(self: *NativeFile, key: []const u8) !?replay_admission.Cost {
+        const length = (try self.documentLength(key)) orelse return null;
+        if (!replay_admission.isReservation(key)) return try replay_admission.cost(key, length, "");
+        if (length != 16 and length != 32) return error.InvalidNativeReplayAdmission;
+        const raw = (try self.getDocumentAlloc(self.allocator, key)) orelse return error.InvalidNativeReplayAdmission;
+        defer self.allocator.free(raw);
+        return try replay_admission.cost(key, length, raw);
+    }
+
+    pub fn requireReplayProducerCapacity(self: *NativeFile) !void {
+        if (try self.replayAdmission()) |state| {
+            if (state.records >= state.limits.records or state.bytes >= state.limits.bytes)
+                return error.LiteReplayBacklogExceeded;
+        }
+    }
+
+    fn stageReplayAdmission(self: *NativeFile, mutations: []const DocumentMutation) !void {
+        // Bootstrap excludes these not-yet-staged changes. Flush earlier
+        // pending mutations only on a legacy file without an aggregate.
+        const loaded = try self.replayAdmission();
+        const before = loaded orelse legacy: {
+            try self.flushTransactionWrites();
+            break :legacy try self.scanReplayAdmission();
+        };
+        var after = before;
+        var lengths: std.StringHashMapUnmanaged(?replay_admission.Cost) = .empty;
+        var resolves_reservation = false;
+        defer lengths.deinit(self.allocator);
+        for (mutations) |mutation| {
+            if (!replay_admission.isTracked(mutation.key)) continue;
+            const found = try lengths.getOrPut(self.allocator, mutation.key);
+            if (!found.found_existing) found.value_ptr.* = try self.documentReplayCost(mutation.key);
+            if (found.value_ptr.*) |debit| {
+                if (mutation.is_delete and replay_admission.isReservation(mutation.key)) resolves_reservation = true;
+                try debit.subtract(&after);
+            }
+            const next: ?replay_admission.Cost = if (mutation.is_delete) null else next: {
+                const length: u64 = if (mutation.external_value_root_page != 0) mutation.external_value_len else mutation.value.len;
+                var owned_descriptor: ?[]u8 = null;
+                defer if (owned_descriptor) |bytes| self.allocator.free(bytes);
+                if (replay_admission.isReservation(mutation.key) and mutation.external_value_root_page != 0) {
+                    if (length != 16 and length != 32) return error.InvalidNativeReplayAdmission;
+                    owned_descriptor = try self.readValuePagesAtCheckpointAlloc(self.allocator, mutation.external_value_root_page, length, self.activeCheckpoint());
+                }
+                break :next try replay_admission.cost(mutation.key, length, owned_descriptor orelse mutation.value);
+            };
+            found.value_ptr.* = next;
+            if (next) |credit| try credit.add(&after);
+        }
+        var limits = before.limits;
+        if (self.replay_consumer_admission) {
+            limits.bytes +|= limits.bytes / 2;
+            limits.records +|= limits.records / 2;
+        }
+        replay_admission.State.checkIncrease(before, after, limits) catch |err| {
+            // The root coordinator is durable and admitted before preparation.
+            // Its participant commits must finish after the decision; rejecting
+            // them could deadlock recovery ahead of the replay needed to free
+            // capacity. Only this one transaction may overdraw. Admission and
+            // recovery fence all subsequent producers until it is completed.
+            if (!resolves_reservation and (try self.documentLength(replay_admission.coordinator_key)) == null) {
+                if (loaded != null and self.transaction_writes == null and self.transaction_header != null and std.meta.eql(self.header, self.transaction_header.?))
+                    self.replay_preflight_refused = true;
+                return err;
+            }
+        };
+        if (loaded == null or before.bytes != after.bytes or before.records != after.records)
+            try self.putDocument(replay_admission.key, &after.encode());
+    }
+
     pub fn putDocumentBatch(self: *NativeFile, mutations: []const DocumentMutation) anyerror!void {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
@@ -8000,7 +8182,10 @@ pub const NativeFile = struct {
         // A standalone schema write also uses a transaction, so no crash can
         // expose recovery work without its agenda marker (or vice versa).
         if (self.header.indexed_reclamation and !self.flushing_transaction) {
-            const tracked = for (mutations) |mutation| {
+            const replay_tracked = self.header.indexed_revision >= 8 and for (mutations) |mutation| {
+                if (replay_admission.isTracked(mutation.key)) break true;
+            } else false;
+            const tracked = replay_tracked or for (mutations) |mutation| {
                 if (recovery_agenda.namespace(mutation.key) != null) break true;
             } else false;
             if (tracked and self.transaction_header == null) {
@@ -8010,6 +8195,7 @@ pub const NativeFile = struct {
                 try self.commitTransaction();
                 return;
             }
+            if (replay_tracked) try self.stageReplayAdmission(mutations);
             if (tracked) for (mutations) |mutation| {
                 const scope = recovery_agenda.namespace(mutation.key) orelse continue;
                 const marker = try std.mem.concat(self.allocator, u8, &.{ recovery_agenda.prefix, scope });
@@ -11443,6 +11629,7 @@ pub const NativeFile = struct {
         if (self.transaction_header != null) return error.TransactionAlreadyActive;
         if (self.checkpoint_publication_uncertain) return error.OutcomeUnknown;
         self.transaction_header = self.header;
+        self.replay_preflight_refused = false;
         self.artifact_lease_transaction = false;
         self.allocator_certificate_staged = false;
     }
@@ -11458,8 +11645,19 @@ pub const NativeFile = struct {
     pub fn abortTransaction(self: *NativeFile) void {
         defer self.artifact_lease_transaction = false;
         defer self.allocator_certificate_staged = false;
+        defer self.replay_preflight_refused = false;
+        const previous = self.transaction_header orelse {
+            self.invalidateLedger();
+            return;
+        };
+        // A preflight capacity refusal has neither staged nor written pages.
+        // Preserve its checked allocator instead of forcing a graph proof on
+        // the next retry merely because an empty transaction was opened.
+        if (self.replay_preflight_refused and self.transaction_writes == null and std.meta.eql(self.header, previous)) {
+            self.transaction_header = null;
+            return;
+        }
         self.invalidateLedger();
-        const previous = self.transaction_header orelse return;
         if (self.transaction_writes) |writes| writes.deinit(self.allocator);
         self.transaction_writes = null;
         self.header = previous;
@@ -11600,10 +11798,14 @@ pub const NativeFile = struct {
         if (!self.no_sync and self.transaction_header == null) try self.file.sync(self.runtimeIo());
     }
 
+    pub fn syncAlreadyComplete(self: *const NativeFile) bool {
+        if (self.transaction_header != null or self.checkpoint_publication_uncertain or self.durable_header != null) return false;
+        return if (self.last_synced_header) |synced| std.meta.eql(synced, self.header) else false;
+    }
+
     pub fn sync(self: *NativeFile) !void {
         if (self.transaction_header != null) return;
-        if (!self.checkpoint_publication_uncertain and self.durable_header == null)
-            if (self.last_synced_header) |synced| if (std.meta.eql(synced, self.header)) return;
+        if (self.syncAlreadyComplete()) return;
         try self.syncIfRequired();
         if (self.durable_header != null) try self.publishCheckpoint(self.activeCheckpoint());
         self.last_synced_header = self.header;
@@ -11635,6 +11837,7 @@ pub const NativeFile = struct {
         var encoded: [header_size]u8 = undefined;
         encodeHeader(&encoded, next);
         try self.file.writePositionalAll(self.runtimeIo(), &encoded, 0);
+        self.invalidateIndexPathRevisions();
         self.header = next;
         self.last_synced_header = null;
         self.allocator_verification_base = null;
@@ -11662,6 +11865,7 @@ pub const NativeFile = struct {
 
         std.mem.swap(std.Io.File, &self.file, &prepared.file);
         const retired_header = self.header;
+        self.invalidateIndexPathRevisions();
         self.header = prepared.header;
         prepared.header = retired_header;
         self.invalidateLedger();
@@ -12331,7 +12535,7 @@ pub fn inspectBytes(raw: []const u8) InspectReport {
     const active = header.checkpoints[header.active_checkpoint];
     return .{
         .valid = true,
-        .format_version = if (header.indexed_reclamation) indexed_format_version else format_version,
+        .format_version = if (header.indexed_reclamation) header.indexed_revision else format_version,
         .page_size = header.page_size,
         .active_checkpoint = header.active_checkpoint,
         .commit_sequence = active.commit_sequence,
@@ -12341,8 +12545,8 @@ pub fn inspectBytes(raw: []const u8) InspectReport {
 
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
-    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) indexed_magic else if (header.packed_records) magic else unpacked_v3_magic);
-    std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) indexed_format_version else format_version, .little);
+    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
+    std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) header.indexed_revision else format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
     out[active_checkpoint_offset] = header.active_checkpoint;
@@ -12360,12 +12564,13 @@ pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
 pub fn decodeHeader(raw: []const u8) !Header {
     if (raw.len < header_size) return error.TruncatedNativeHeader;
     const header_raw = raw[0..header_size];
-    const indexed_reclamation = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
+    const previous_indexed = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], previous_indexed_magic);
+    const indexed_reclamation = previous_indexed or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
     const has_packed_records = indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
     if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v3_magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    if (version != (if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
+    if (version != (if (previous_indexed) @as(u32, 7) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
@@ -12398,6 +12603,7 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const active_checkpoint = try selectActiveCheckpoint(checkpoints, valid_slots, active_hint);
 
     return .{
+        .indexed_revision = if (indexed_reclamation) version else indexed_format_version,
         .reader_epoch_namespace = if (indexed_reclamation) header_raw[reader_epoch_namespace_offset..][0..32].* else @splat(0),
         .packed_records = has_packed_records,
         .indexed_reclamation = indexed_reclamation,
@@ -21421,4 +21627,154 @@ test "lite logical generations vacuum images establish independent identities" {
     defer reopened.close();
     try std.testing.expectEqualDeep(second_ids, reopened.activeCheckpoint().logical);
     try std.testing.expect((try reopened.check()).valid);
+}
+
+test "lite native durable replay admission is atomic across namespaces reopen rollback and vacuum" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "durable-replay-budget.aflite");
+    defer a.free(path);
+    const first = "\x02\xfe12345678";
+    const second = "\x02db/embedded/tables/2\x00\x02\x0012345678";
+    const third = "\x02\x0112345678";
+    {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer file.close();
+        file.replay_backlog_initial_limits = .{ .bytes = 4096, .records = 2 };
+        try file.putDocumentBatch(&.{ .{ .key = first, .value = "journal one" }, .{ .key = second, .value = "journal two" }, .{ .key = "primary", .value = "committed" } });
+        const before = (try file.replayAdmission()).?;
+        try std.testing.expectEqual(@as(u64, 2), before.records);
+        try std.testing.expectError(error.LiteReplayBacklogExceeded, file.putDocumentBatch(&.{ .{ .key = third, .value = "refused" }, .{ .key = "primary", .value = "must not commit" } }));
+        const primary = (try file.getDocumentAlloc(a, "primary")).?;
+        defer a.free(primary);
+        try std.testing.expectEqualStrings("committed", primary);
+        try std.testing.expectEqualDeep(before, (try file.replayAdmission()).?);
+        try file.beginTransaction();
+        try file.deleteDocument(first);
+        try std.testing.expectEqual(@as(u64, 1), (try file.replayAdmission()).?.records);
+        file.abortTransaction();
+        try std.testing.expectEqualDeep(before, (try file.replayAdmission()).?);
+    }
+    var file = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer file.close();
+    try std.testing.expectEqual(@as(u64, 2), (try file.replayAdmission()).?.limits.records);
+    // Retirement is admitted at capacity; unrelated controls need no credit.
+    try file.putDocument("control", "still admitted");
+    try file.deleteDocument(first);
+    try file.putDocument(third, "reused credit");
+    try std.testing.expectEqual(@as(u64, 2), (try file.replayAdmission()).?.records);
+    // Last-write-wins updates debit the old charge exactly once per key.
+    try file.putDocumentBatch(&.{ .{ .key = third, .value = "larger intermediate value" }, .{ .key = third, .value = "x" } });
+    const before = (try file.replayAdmission()).?;
+    const scanned = try file.scanReplayAdmission();
+    try std.testing.expectEqual(before.bytes, scanned.bytes);
+    try std.testing.expectEqual(before.records, scanned.records);
+    _ = try file.vacuum();
+    try std.testing.expectEqualDeep(before, (try file.replayAdmission()).?);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native replay admission bootstrap counts legacy lanes and reserves consumer progress" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "legacy-replay-budget.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.replay_backlog_initial_limits = .{ .bytes = 4096, .records = 2 };
+    try file.putDocument("\x02\xfe12345678", "one");
+    // Simulate a file written before the durable aggregate was introduced.
+    try file.deleteDocument(replay_admission.key);
+    try file.putDocument("\x02\x0012345678", "two");
+    try std.testing.expectEqual(@as(u64, 2), (try file.replayAdmission()).?.records);
+    file.replay_consumer_admission = true;
+    try file.putDocument("\x02\x0112345678", "consumer reserve");
+    try std.testing.expectError(error.LiteReplayBacklogExceeded, file.putDocument("\x02\x0212345678", "reserve exhausted"));
+    file.replay_consumer_admission = false;
+    try std.testing.expectError(error.LiteReplayBacklogExceeded, file.putDocument("\x02\x0212345678", "producer refused"));
+    try file.deleteDocument("\x02\x0112345678");
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native replay admission finishes one admitted coordinator without fencing its recovery" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "coordinator-replay-credit.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.replay_backlog_initial_limits = .{ .bytes = 4096, .records = 1 };
+    try file.requireReplayProducerCapacity();
+    try file.putDocument(replay_admission.coordinator_key, "admitted coordinator");
+    try file.putDocument("\x02\xfe12345678", "first participant");
+    try file.putDocument("\x02\x0012345678", "second participant");
+    try file.deleteDocument(replay_admission.coordinator_key);
+    try std.testing.expectEqual(@as(u64, 2), (try file.replayAdmission()).?.records);
+    try std.testing.expectError(error.LiteReplayBacklogExceeded, file.requireReplayProducerCapacity());
+    try std.testing.expectError(error.LiteReplayBacklogExceeded, file.putDocument("\x02\x0112345678", "another producer"));
+    try file.deleteDocument("\x02\xfe12345678");
+    try file.deleteDocument("\x02\x0012345678");
+    try file.requireReplayProducerCapacity();
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native revision seven conversion fences old writers and bootstraps replay debt" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "revision-seven-upgrade.aflite");
+    defer a.free(path);
+    {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer file.close();
+        // An old writer's header and mutation policy retain revision 7.
+        file.header.indexed_revision = 7;
+        try file.putDocument("\x02\xfe12345678", "legacy journal");
+        try std.testing.expect((try file.replayAdmission()) == null);
+        var legacy_header: [header_size]u8 = undefined;
+        encodeHeader(&legacy_header, file.header);
+        try file.file.writePositionalAll(std.testing.io, &legacy_header, 0);
+    }
+    var file = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer file.close();
+    try std.testing.expectEqual(@as(u32, 7), file.header.indexed_revision);
+    _ = try file.vacuum();
+    try std.testing.expectEqual(indexed_format_version, file.header.indexed_revision);
+    try std.testing.expect((try file.replayAdmission()) == null);
+    try file.putDocument("\x02\x0012345678", "new writer");
+    try std.testing.expectEqual(@as(u64, 2), (try file.replayAdmission()).?.records);
+    var raw: [header_size]u8 = undefined;
+    encodeHeader(&raw, file.header);
+    try std.testing.expectEqualStrings("AFLITE\x08P", raw[0..8]);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native durable replay admission reserves prepared votes and resolves them at capacity" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "prepared-replay-reservation.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.replay_backlog_initial_limits = .{ .bytes = 8192, .records = 9 };
+    const reservation = replay_admission.reservation_prefix ++ "1234567890123456";
+    var descriptor: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, descriptor[0..8], 1, .little);
+    std.mem.writeInt(u64, descriptor[8..16], 100, .little);
+    try file.putDocument(reservation, &descriptor);
+    try std.testing.expectEqual(@as(u64, 9), (try file.replayAdmission()).?.records);
+    try std.testing.expectError(error.LiteReplayBacklogExceeded, file.putDocument("\x02\xfe12345678", "other producer"));
+    // The vote's record credits transfer atomically. Even an oversized
+    // decided effect must finish; a later producer waits for its retirement.
+    const effect: [16384]u8 = @splat('e');
+    try file.putDocumentBatch(&.{ .{ .key = reservation, .is_delete = true }, .{ .key = "\x02\xfe12345678", .value = &effect }, .{ .key = "primary", .value = "committed once" } });
+    try std.testing.expectEqual(@as(u64, 1), (try file.replayAdmission()).?.records);
+    try std.testing.expectError(error.LiteReplayBacklogExceeded, file.requireReplayProducerCapacity());
+    try file.deleteDocument("\x02\xfe12345678");
+    try std.testing.expectEqual(@as(u64, 0), (try file.replayAdmission()).?.records);
+    try std.testing.expect((try file.check()).valid);
 }

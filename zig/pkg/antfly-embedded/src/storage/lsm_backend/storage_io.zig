@@ -566,6 +566,7 @@ pub const FileTrailer = struct {
 /// that retain a Storage view itself must retain a NativeStorage.Lease and
 /// obtain the view from that lease.
 pub const Storage = struct {
+    pub const ContentRevision = [16]u8;
     pub const Trailer = FileTrailer;
 
     pub const Lease = struct {
@@ -583,6 +584,16 @@ pub const Storage = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
+        /// No-ABA identity of the loaded logical file view. Equal non-null
+        /// tokens permit owned metadata-cache reuse until local mutation or
+        /// external generation adoption. Providers without such a view return null.
+        loaded_content_revision: ?*const fn (*anyopaque) ?ContentRevision = null,
+        /// Narrow no-ABA identity for this root's primary/replay WAL metadata.
+        /// Unrelated immutable-file mutations must preserve a returned token.
+        loaded_wal_metadata_revision: ?*const fn (*anyopaque, []const u8) ?ContentRevision = null,
+        /// Short, consistent metadata read batch. The provider must outlive the
+        /// returned scope; callers release it before computation/publication.
+        acquire_read_snapshot: ?*const fn (*anyopaque) anyerror!Lease = null,
         /// Physical directory for private build files; null disables filesystem staging.
         private_scratch_directory: ?*const fn (*anyopaque) ?[]const u8 = null,
         /// Exact immutable native checkpoint, owned by the returned buffer.
@@ -929,6 +940,21 @@ pub const Storage = struct {
 
     pub fn nowNs(self: Storage) u64 {
         return self.vtable.now_ns(self.ptr);
+    }
+
+    pub fn acquireReadSnapshot(self: Storage) !?Lease {
+        const acquire = self.vtable.acquire_read_snapshot orelse return null;
+        return try BoundaryAbi.call("acquire_read_snapshot", self.boundary_dispatch, acquire, .{self.ptr});
+    }
+
+    pub fn loadedWalMetadataRevision(self: Storage, root_dir: []const u8) ?ContentRevision {
+        const revision = self.vtable.loaded_wal_metadata_revision orelse return self.loadedContentRevision();
+        return BoundaryAbi.call("loaded_wal_metadata_revision", self.boundary_dispatch, revision, .{ self.ptr, root_dir }) catch null;
+    }
+
+    pub fn loadedContentRevision(self: Storage) ?ContentRevision {
+        const revision = self.vtable.loaded_content_revision orelse return null;
+        return BoundaryAbi.call("loaded_content_revision", self.boundary_dispatch, revision, .{self.ptr}) catch null;
     }
 
     pub fn requiresForegroundPublication(self: Storage) bool {

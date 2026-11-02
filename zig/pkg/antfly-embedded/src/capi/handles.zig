@@ -82,6 +82,7 @@ pub const Handle = struct {
     lite_scheduling_owner: ?*@import("lite_connection.zig").Owner = null,
     maintenance_writer_lease: ?lite_backend.native.PathWriterLock = null,
     maintenance_writer_references: usize = 0,
+    maintenance_publication_started_ns: ?i96 = null,
     maintenance_admission_mutex: std.Io.Mutex = .init,
     embedded_path: ?[]u8 = null,
     embedded_open_options: db_mod.OpenOptions = .{},

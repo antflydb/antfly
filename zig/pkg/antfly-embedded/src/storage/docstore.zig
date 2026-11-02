@@ -453,7 +453,7 @@ fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []co
 
 /// Namespace-owned retirement continuation. No snapshot or borrowed key survives a turn.
 pub const ReplayRetirement = struct {
-    pub const max_keys = 256;
+    pub const max_keys = 4096;
     // Even a record copied into every lane must retire faster than bounded
     // replay creates journal debt once cleanup is outstanding.
     pub const record_cap = max_keys / (replay_hints.len + 1);
@@ -5329,12 +5329,13 @@ test "docstore replay retirement defers source work and bounds fair cleanup acro
     defer cleanupTmp(path);
     var store = try DocStore.open(alloc, path, .{});
     defer store.close();
+    const cutoff: u64 = ReplayRetirement.max_keys + 600;
     const hints = [_]u8{ internal_keys.replay_all_kind, replayHintOrdinal(.dense_vector) };
     {
         var batch = try store.beginWriteBatch();
         errdefer batch.abort();
         try batch.put(&internal_keys.replay_meta_init_key, "1");
-        for (1..602) |sequence| for (hints) |hint| {
+        for (1..cutoff + 2) |sequence| for (hints) |hint| {
             const key = internal_keys.replayEntryKey(hint, @intCast(sequence));
             try batch.put(&key, "payload");
         };
@@ -5343,11 +5344,11 @@ test "docstore replay retirement defers source work and bounds fair cleanup acro
     var state: ReplayRetirement = .{};
     store.deferred_replay_retirement = &state;
     defer store.deferred_replay_retirement = null;
-    try store.truncateReplayUpTo(alloc, 600);
+    try store.truncateReplayUpTo(alloc, cutoff);
     const first_key = internal_keys.replayEntryKey(hints[0], 1);
     const retained = try store.get(alloc, &first_key);
     alloc.free(retained);
-    try std.testing.expectEqual(@as(u64, 600), state.watermark);
+    try std.testing.expectEqual(cutoff, state.watermark);
     store.bounded_replay_retirement = true;
     const before_failure = state;
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
@@ -5356,25 +5357,25 @@ test "docstore replay retirement defers source work and bounds fair cleanup acro
     // Late consumers can lower the safe bound after source work finishes.
     for (0..(replay_hints.len + 1) * 5) |_| try store.truncateReplayUpTo(alloc, 300);
     try std.testing.expect(!state.runnable);
-    try std.testing.expectEqual(@as(u64, 600), state.watermark);
+    try std.testing.expectEqual(cutoff, state.watermark);
     for (hints) |hint| {
         const key = internal_keys.replayEntryKey(hint, 301);
         const value = try store.get(alloc, &key);
         alloc.free(value);
     }
     state.lane = replay_hints.len;
-    try store.truncateReplayUpTo(alloc, 600);
-    // A single turn deletes at most 256 rows in one lane.
-    const boundary = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 557);
+    try store.truncateReplayUpTo(alloc, cutoff);
+    // One bounded batch preserves the next eligible row for a later turn.
+    const boundary = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 301 + ReplayRetirement.max_keys);
     const value = try store.get(alloc, &boundary);
     alloc.free(value);
     try std.testing.expect(state.lane == 0);
-    for (0..(replay_hints.len + 1) * 5) |_| try store.truncateReplayUpTo(alloc, 600);
+    for (0..(replay_hints.len + 1) * 5) |_| try store.truncateReplayUpTo(alloc, cutoff);
     try std.testing.expectEqual(@as(u64, 0), state.watermark);
     for (hints) |hint| {
-        const retired = internal_keys.replayEntryKey(hint, 600);
+        const retired = internal_keys.replayEntryKey(hint, cutoff);
         try std.testing.expectError(error.NotFound, store.get(alloc, &retired));
-        const live = internal_keys.replayEntryKey(hint, 601);
+        const live = internal_keys.replayEntryKey(hint, cutoff + 1);
         const payload = try store.get(alloc, &live);
         alloc.free(payload);
     }

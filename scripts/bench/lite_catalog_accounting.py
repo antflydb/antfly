@@ -42,7 +42,7 @@ class CatalogAccounting:
         fcntl.flock(self.file, fcntl.LOCK_SH)
         self.data = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
         header = self.data[:4096]
-        if header[:6] != b"AFLITE" or header[6] not in (3, 4, 5, 6, 7):
+        if header[:6] != b"AFLITE" or header[6] not in (3, 4, 5, 6, 7, 8):
             raise ValueError("unsupported diagnostic file signature")
         self.version = struct.unpack_from("<I", header, 8)[0]
         if self.version != header[6]:
@@ -57,7 +57,9 @@ class CatalogAccounting:
         slots = []
         for i in range(2):
             raw = header[64 + i * 72 : 136 + i * 72]
-            extra = header[208 + i * 48 : 256 + i * 48] if self.version == 7 else b""
+            extra = (
+                header[208 + i * 48 : 256 + i * 48] if self.version in (7, 8) else b""
+            )
             checksum = struct.unpack_from("<I", raw, 64)[0]
             if checksum != zlib.crc32(raw[:64] + extra) and not (
                 self.version == 3 and checksum == 0

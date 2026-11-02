@@ -3568,6 +3568,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_prepare_ns, prepare_start_ns);
                         defer prepared_publication.deinit();
 
+                        // Input collection and segment construction finished
+                        // outside native writer admission. Publish this bounded
+                        // prepared chunk under one exact catalog/input fence.
+                        const native_publication = ctx.replay_index_publication;
+                        if (native_publication) |port| {
+                            if (write_end == collected.docs.items.len and !publication_context.chunk_backed and !ctx.relational_base_rows)
+                                if (port.inputs_complete) |release| release(port.ptr);
+                            try port.enter(port.ptr);
+                        }
+                        defer if (native_publication) |port| port.leave(port.ptr);
                         const apply_lock_wait_start_ns = monotonicTimeNs();
                         var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
                         if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_lock_wait_ns, apply_lock_wait_start_ns);

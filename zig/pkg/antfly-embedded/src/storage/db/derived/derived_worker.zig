@@ -122,6 +122,7 @@ pub const CatchUpOptions = struct {
     max_chunk_bytes: u64 = catch_up_max_chunk_bytes_default,
     max_items_per_window: usize = 0,
     max_windows_per_call: usize = 0,
+    release_read_snapshot_after_collect: bool = false,
     /// Cooperative publication quantum; expires only between complete chunks.
     max_call_ns: u64 = 0,
     max_call_bytes: u64 = 0,
@@ -356,6 +357,10 @@ pub fn catchUpIndexFromMatchingCursor(
 
         const collected_bytes = builder.tracked_bytes;
         const batch = try builder.finishBorrowed(chunk_stats.last_sequence);
+        if (options.release_read_snapshot_after_collect) {
+            std.debug.assert(options.max_windows_per_call == 1);
+            replay_cursor.releaseReadSnapshot();
+        }
         var window_open = false;
         errdefer if (window_open) {
             if (options.finish_window_fn) |finish_window| {

@@ -1482,6 +1482,7 @@ pub const Store = struct {
     /// Artifact-only detached work has no turn-wide primary pin. Each catalog
     /// lookup must refresh/validate under owner admission before pinning pages.
     index_reads_require_admission: bool = false,
+    primary_reads_require_admission: bool = false,
     artifact_cleanup_cursor: artifact_source.SweepCursor = .{},
     artifact_marker_sweep: artifact_source.MarkerSweep = .{},
     maintenance_policy: reclamation.Policy = .{},
@@ -1570,7 +1571,7 @@ pub const Store = struct {
         result.file.reserve_retirement_capacity = true;
         result.file.vacuum_target_indexed = opts.reclamation.page_reuse;
         if (!opts.read_only and !opts.externally_locked) {
-            if (opts.reclamation.page_reuse and !result.file.header.indexed_reclamation) {
+            if (opts.reclamation.page_reuse and (!result.file.header.indexed_reclamation or result.file.header.indexed_revision < native.indexed_format_version)) {
                 _ = try result.vacuumWithCancel(null);
             }
             result.maintainOnce(false) catch |err| result.recordMaintenanceError(err);
@@ -2112,7 +2113,7 @@ pub const Store = struct {
         // External owners also defer requested allocator-format conversion to
         // this detached maintenance turn. Vacuum uses the same short capture
         // and checked publication boundaries as an ordinary reclamation copy.
-        if (self.maintenance_policy.options.page_reuse and !self.file.header.indexed_reclamation) {
+        if (self.maintenance_policy.options.page_reuse and (!self.file.header.indexed_reclamation or self.file.header.indexed_revision < native.indexed_format_version)) {
             _ = try self.vacuumWithCancel(cancel);
             return;
         }
@@ -2840,6 +2841,14 @@ pub const Store = struct {
     /// admission, retirement service, or synthetic mutation transaction.
     pub fn syncIndexContents(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
+        // A completed checkpoint already covers every byte this wrapper
+        // published. Peer publication cannot undo its durability. Check before
+        // queuing for admission: validation may otherwise refresh a serving
+        // runtime merely to rediscover an already-complete barrier.
+        lockStore(self);
+        const complete = !self.secret_store_uncertain and self.file.syncAlreadyComplete();
+        self.mutex.unlock();
+        if (complete) return;
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .index);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
@@ -3244,6 +3253,9 @@ pub const Txn = struct {
 
     pub fn openReadWithPrefix(store: *Store, prefix: []const u8) !Txn {
         try validatePrefix(prefix);
+        const admission: ?WriterAdmission = if (store.primary_reads_require_admission) store.writer_admission orelse return error.EnrichmentWaitCanceled else null;
+        if (admission) |port| try port.enter(port.ptr, .index_read);
+        defer if (admission) |port| port.leave(port.ptr);
         if (store.read_only and !store.file.externally_locked) return .{ .allocator = store.allocator, .store = store, .prefix = prefix, .checkpoint = store.file.activeCheckpoint() };
         const io = store.file.runtime();
         store.generation_lock.lockSharedUncancelable(io);
@@ -11769,4 +11781,57 @@ test "lite reclamation issue1431 canceled automatic rewrites retry without file 
     defer a.free(value);
     try std.testing.expectEqualStrings("retained value", value);
     try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite completed index durability barrier avoids admission but uncertain barriers do not" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "completed-index-sync.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var indexes = @import("index_storage.zig").Store.init(a, &store);
+    try indexes.storage().writeFileAbsolute("/wal", "durable");
+    const Refuse = struct {
+        fn enter(_: *anyopaque, _: PublicationScope) !void {
+            return error.TestAdmissionRefused;
+        }
+        fn leave(_: *anyopaque) void {
+            @panic("refused admission must not leave");
+        }
+    };
+    store.writer_admission = .{ .ptr = &store, .enter = Refuse.enter, .leave = Refuse.leave };
+    defer store.writer_admission = null;
+    try store.syncIndexContents();
+    store.file.checkpoint_publication_uncertain = true;
+    defer store.file.checkpoint_publication_uncertain = false;
+    try std.testing.expectError(error.TestAdmissionRefused, store.syncIndexContents());
+}
+
+test "lite primary reads after detached source release require current admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "detached-primary-read.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const Refuse = struct {
+        fn enter(_: *anyopaque, scope: PublicationScope) !void {
+            try std.testing.expectEqual(PublicationScope.index_read, scope);
+            return error.EnrichmentWaitCanceled;
+        }
+        fn leave(_: *anyopaque) void {
+            @panic("refused admission must not leave");
+        }
+    };
+    store.writer_admission = .{ .ptr = &store, .enter = Refuse.enter, .leave = Refuse.leave };
+    defer store.writer_admission = null;
+    store.primary_reads_require_admission = true;
+    defer store.primary_reads_require_admission = false;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, store.beginRead());
+    try std.testing.expectError(error.EnrichmentWaitCanceled, Txn.openReadWithPrefix(&store, "\x02db/named\x00"));
 }

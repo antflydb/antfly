@@ -935,12 +935,16 @@ pub fn enterHandleWithIntent(ptr: ?*anyopaque, access: HandleAccess, intent: Sto
 /// refresh can proceed; close waits until preparation is freed as for any call.
 /// Ordinary exports release and recapture their pins between attempts.
 fn enterWithAdmissionRetry(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent, comptime retain_entry: bool) ?HandleGuard {
+    return enterWithAdmissionRetryDeadline(initial, ptr, access, intent, retain_entry, null);
+}
+
+fn enterWithAdmissionRetryDeadline(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent, comptime retain_entry: bool, shared_deadline: ?i96) ?HandleGuard {
     const connection = initial.lock_handle.lite_connection orelse return enterCapturedHandle(initial, access, intent, false);
     const timeout_ms = connection.options.busy_timeout_ms;
     if (timeout_ms == 0) return enterCapturedHandle(initial, access, intent, false);
     const io = handleLockIo();
     const started = std.Io.Clock.awake.now(io).nanoseconds;
-    const deadline = started + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    const deadline = shared_deadline orelse started + @as(i96, timeout_ms) * std.time.ns_per_ms;
     var entry = initial;
     var guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline);
     defer if (intent == .mutation and guard.entry_error == null) {
@@ -2881,6 +2885,16 @@ pub fn openLiteHandleAllocWithSharedInference(
         backend.native_docstore.?.maintenance_start_suppressed = true;
     }
 
+    if (create and resolved.profile == .native and backend.native_docstore.?.file.header.indexed_revision >= 8 and backend.native_docstore.?.file.header.indexed_reclamation) {
+        // A new file starts with known zero debt. Legacy files bootstrap once
+        // on their first replay mutation; normal commits never scan the file.
+        var initial = try backend.native_docstore.?.beginWrite();
+        errdefer initial.abort();
+        const empty_replay: lite_backend.native.replay_admission.State = .{};
+        try initial.put(lite_backend.native.replay_admission.key, &empty_replay.encode());
+        try initial.commit();
+    }
+
     backend.native_docstore.?.artifact_reader_fence = resolved.artifact_reader_fence;
     backend.native_docstore.?.file.reader_coordinator = resolved.reader_coordinator;
 
@@ -4685,6 +4699,41 @@ pub fn antfly_db_write_transaction(
     return .ok;
 }
 
+/// Retry only native replay capacity refusals known to precede primary
+/// commit. Registry/runtime/path access is released during sleep. Request data
+/// is caller-owned or allocated independently of a refreshed runtime.
+fn executeBatchWithReplayAdmissionRetry(ptr: ?*anyopaque, request: *anyopaque, apply: *const fn (*anyopaque, *Handle) anyerror!void) capi.ErrorCode {
+    var entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);
+    const timeout_ms = if (entry.lock_handle.lite_connection) |connection| connection.options.busy_timeout_ms else 0;
+    const io = handleLockIo();
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    var backoff: i96 = std.time.ns_per_ms;
+    while (true) {
+        const guard = enterWithAdmissionRetryDeadline(entry, ptr, .write, .mutation, false, deadline) orelse return capi.mapError(error.InvalidArgument);
+        var held = true;
+        defer if (held) guard.leave();
+        if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+        apply(request, guard.handle) catch |err| {
+            if (err == error.CommitVisibilityNotSatisfied)
+                return capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch");
+            if (err != error.LiteReplayBacklogExceeded or timeout_ms == 0) return capi.mapError(err);
+            const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+            if (remaining <= 0) return capi.mapError(err);
+            if (guard.connection) |connection| connection.owner.publication_stats.replay_backpressure_waits +|= 1;
+            guard.leave();
+            held = false;
+            io.sleep(.fromNanoseconds(@min(backoff, remaining)), .awake) catch |sleep_err| return capi.mapError(sleep_err);
+            // Do not reacquire an expired or canceled operation's admission.
+            if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return capi.mapError(error.LiteReplayBacklogExceeded);
+            entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);
+            capi.clearLastError();
+            backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
+            continue;
+        };
+        return .ok;
+    }
+}
+
 pub fn antfly_db_batch(
     handle_ptr: ?*anyopaque,
     writes_ptr: ?[*]const capi.WriteIntent,
@@ -4697,19 +4746,21 @@ pub fn antfly_db_batch(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_batch), .{ .name = "antfly_db_batch" }), .{ handle_ptr, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
-    defer guard.leave();
-    const handle = guard.handle;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": write and predicate pointers must not be null when their counts are nonzero");
-    batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return if (err == error.CommitVisibilityNotSatisfied)
-        capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch")
-    else
-        capi.mapError(err);
-    return .ok;
+    const Request = struct {
+        writes: ?[*]const capi.WriteIntent,
+        count: usize,
+        predicates: ?[*]const capi.VersionPredicate,
+        predicate_count: usize,
+        timestamp: u64,
+        sync: u8,
+        fn apply(raw: *anyopaque, handle: *Handle) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return batchInternal(handle, self.writes, self.count, self.predicates, self.predicate_count, self.timestamp, self.sync);
+        }
+    };
+    var request = Request{ .writes = writes_ptr, .count = write_count, .predicates = predicates_ptr, .predicate_count = predicate_count, .timestamp = timestamp_ns, .sync = sync_level };
+    return executeBatchWithReplayAdmissionRetry(handle_ptr, &request, Request.apply);
 }
 
 pub fn antfly_db_batch_json(
@@ -4720,25 +4771,19 @@ pub fn antfly_db_batch_json(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_batch_json), .{ .name = "antfly_db_batch_json" }), .{ handle_ptr, request_json, out_buf });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
-    if (guard.entry_error) |code| {
-        guard.leave();
-        return capi.ensureError(code, @src().fn_name);
-    }
-    defer guard.leave();
-    const handle = guard.handle;
-    var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
-    defer owned.deinit(handle.alloc);
-
-    handle.database().*.batch(owned.req) catch |err| return if (err == error.CommitVisibilityNotSatisfied)
-        capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch")
-    else
-        capi.mapError(err);
-    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err| return capi.mapError(err);
-    out_buf.* = .{
-        .ptr = response.ptr,
-        .len = response.len,
+    const a = std.heap.c_allocator;
+    var owned = batch_api.parseBatchRequest(a, request_json.bytes()) catch |err| return capi.mapError(err);
+    defer owned.deinit(a);
+    const Request = struct {
+        fn apply(raw: *anyopaque, handle: *Handle) !void {
+            const request: *@TypeOf(owned) = @ptrCast(@alignCast(raw));
+            try handle.database().*.batch(request.req);
+        }
     };
+    const code = executeBatchWithReplayAdmissionRetry(handle_ptr, &owned, Request.apply);
+    if (code != .ok) return code;
+    const response = batch_api.encodeBatchResponse(a, owned.result()) catch |err| return capi.mapError(err);
+    out_buf.* = .{ .ptr = response.ptr, .len = response.len };
     return .ok;
 }
 
@@ -5083,6 +5128,7 @@ pub fn pendingWorkStatsJson(handle: *Handle) !capi.Buffer {
     var output = try pendingNamespaceStatsValue(a, handle.database());
     const context = handle.lite_connection_context orelse if (handle.parent_handle) |parent| parent.lite_connection_context else null;
     if (context) |connection| {
+        connection.owner.publication_stats.replay_backlog = try connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file.replayAdmission();
         const stats = try std.json.Stringify.valueAlloc(a, connection.owner.publication_stats, .{});
         try output.object.put(a, "background_publications", try std.json.parseFromSliceLeaky(std.json.Value, a, stats, .{}));
     }

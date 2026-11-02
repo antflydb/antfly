@@ -42,6 +42,20 @@ class SustainedQualificationTests(unittest.TestCase):
         return {
             "status": "ok",
             "per_worker_success_windows": windows or [[100] * 10] * 8,
+            "visibility_samples": [
+                {
+                    "started_seconds": second,
+                    "ended_seconds": second + 0.1,
+                    "debt": [
+                        {
+                            "index_name": "text",
+                            "applied_sequence": second,
+                            "target_sequence": second + 1,
+                        }
+                    ],
+                }
+                for second in range(5, 600, 5)
+            ],
             "file_size_samples": [
                 {"elapsed_seconds": second, "file_bytes": size}
                 for second, size in sizes
@@ -61,6 +75,20 @@ class SustainedQualificationTests(unittest.TestCase):
     def test_accepts_bounded_active_growth_and_stable_throughput(self):
         row = self.sample([(180, 46_300_000), (400, 47_000_000), (599, 46_300_000)])
         self.assertTrue(bench.sustained_qualification(row, 600)["passed"])
+
+    def test_primary_throughput_and_integrity_do_not_qualify_a_stalled_index(self):
+        row = self.sample([(180, 46_300_000), (599, 46_300_000)])
+        for sample in row["visibility_samples"]:
+            sample["debt"][0]["applied_sequence"] = 1
+        self.assertFalse(bench.sustained_qualification(row, 600)["passed"])
+
+    def test_visibility_that_only_catches_up_after_the_deadline_cannot_qualify(self):
+        row = self.sample([(180, 46_300_000), (599, 46_300_000)])
+        for sample in row["visibility_samples"]:
+            sample["debt"][0]["applied_sequence"] = max(
+                0, sample["started_seconds"] - 120
+            )
+        self.assertFalse(bench.sustained_qualification(row, 600)["passed"])
 
     def test_short_or_incomplete_evidence_cannot_qualify(self):
         row = self.sample([(180, 46_300_000), (599, 46_300_000)])

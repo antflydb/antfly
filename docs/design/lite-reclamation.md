@@ -77,13 +77,13 @@ include diagnostic work and rolled-back allocation attempts. Benchmark collectio
 is opt-in with `--allocator-diagnostics` and happens after all timed work; status
 reads can themselves refresh runtimes, so they are not passive idle probes.
 
-The owner creates revision-7 files (`AFLITE\x07P`) by default. Writable revision-3
+The owner creates revision-8 files (`AFLITE\x08P`) by default. Writable revision-3 and revision-7
 owners migrate through an explicitly identified compact image and atomic generation
 adoption. Read-only opens preserve revision 3. Raw native format primitives retain
 their revision-3 default for compatibility; `CreateOptions.indexed_reclamation`
-selects revision 7. Revision-4, revision-5 and revision-6 prototypes are rejected rather than silently mixing reader protocols;
+selects revision 8. Revision-4, revision-5 and revision-6 prototypes are rejected rather than silently mixing reader protocols;
 these formats have not shipped. Older binaries reject the new signature. `page_reuse = false`
-opts out of creating/migrating revision 7; an existing revision-7 file still uses
+opts out of creating/migrating indexed files; an existing revision-7 file still uses
 its required ownership machinery.
 
 Each revision-7 recovery slot has three opaque 128-bit logical identities:
@@ -684,3 +684,18 @@ Namespace readiness distinguishes unfinished schema publication from published
 constraints awaiting activation. The former blocks admission. The latter remains
 on the recovery agenda while existing integrity guards permit repairs, including
 parent-table repairs needed to unblock dependent FK validation.
+
+Revision 8 retains the revision-7 physical reader and logical-identity contracts.
+It adds durable file-wide replay admission in the primary checkpoint: journal
+records and prepared-vote reservations consume shared byte and record credits,
+and deletion returns them atomically. Default limits are 16 MiB and 4,096 credits.
+A single oversized source operation may enter an empty journal, and previously
+admitted SQL decisions retain completion authority beyond the watermark. These
+exceptions prevent consumer/recovery deadlock; they are not a strict file-size
+limit. Consumer work has separate headroom. Writable revision-7 owners convert
+through generation replacement; read-only handles preserve their captured format.
+Older binaries reject revision 8 instead of silently corrupting admission totals.
+Legacy conversion initializes totals once on the first tracked mutation; ordinary
+writes update only changed replay keys. Explicit integrity independently rescans
+the totals. See the native throughput section in `zig/LITE.md` for publication
+grouping, source snapshot lifetimes and sustained qualification requirements.

@@ -8632,6 +8632,7 @@ pub const DB = struct {
                 error.WriterLocked,
                 error.FileBusy,
                 error.LiteRetirementBacklogExceeded,
+                error.LiteReplayBacklogExceeded,
                 error.SourceFileChanged,
                 error.GenerationTransitionActive,
                 error.IndexArtifactCleanupPending,
@@ -31939,6 +31940,7 @@ pub const DB = struct {
             return self.executor.waitForAllWithVisibilityWait(sequence, .{
                 .cancellation = options.cancellation,
                 .replay_budget = &state.replay_budget,
+                .publication_overhead_ns = &state.publication_overhead_ns,
                 .replay_record_cap = if (state.replay_retirement.watermark != 0) docstore_mod.ReplayRetirement.record_cap else 2048,
             });
         }
@@ -34202,15 +34204,11 @@ pub const DB = struct {
                 break :blk try self.core.index_manager.runTextMergeScheduler(1);
             };
             try ensureSnapshotActive(cancellation);
-            // Finish maintenance of these fixed captured index inputs before
-            // closing their runtime. Dropping it after one slice discards LSM
-            // continuations. This drain retains no primary history and cannot
-            // chase peer primary writes; changed index inputs refuse admission.
-            while (true) {
-                try ensureSnapshotActive(cancellation);
-                const progressed = if (try self.core.index_manager.runLsmObsoleteReclaimDue()) true else try self.core.index_manager.runLsmMaintenanceStep();
-                if (!progressed) break;
-            }
+            // One slice per turn. The Lite owner retains this runtime's owned
+            // index continuations across primary-only changes, then checks
+            // inode and no-ABA catalog/index identities before resuming it.
+            // Source epochs and catalog proofs always end within this turn.
+            _ = if (try self.core.index_manager.runLsmObsoleteReclaimDue()) true else try self.core.index_manager.runLsmMaintenanceStep();
             // Reclamation can finish during the backend unlock. Report debt,
             // not completed work, and clear hints left by that final slice.
             // Otherwise each fresh runtime's local cleanup schedules another
@@ -55318,7 +55316,7 @@ fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
 ) !void {
     for (updates) |update| {
         const cfg = index_manager.get(update.index_name) orelse continue;
-        try index_manager.checkpointLsmWalForManagedIndex(.{
+        try index_manager.syncAppliedReplayBoundaryForManagedIndex(.{
             .name = update.index_name,
             .kind = cfg.kind,
         });
@@ -61259,6 +61257,8 @@ fn flushPendingAppliedSequencesLocked(
     const save_ns = blk: {
         try lockApplySharedForPortableRuntimeAsync(ctx);
         defer ctx.apply_mutex.unlockShared();
+        var metadata_publication: ?@import("execution_resources.zig").ReplayMetadataPublication = null;
+        defer if (metadata_publication) |port| port.leave(port.ptr);
         var generic_updates = std.ArrayListUnmanaged(apply_state.AppliedSequenceUpdate).empty;
         defer generic_updates.deinit(ctx.alloc);
         try generic_updates.ensureTotalCapacity(ctx.alloc, enriched_updates.len);
@@ -61275,6 +61275,16 @@ fn flushPendingAppliedSequencesLocked(
             const posting_started = monotonicTimeNs();
             try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
             posting_publish_ns +|= elapsedSince(posting_started);
+            // Durable index effects are prepared before taking the short
+            // metadata lane. Native full-text seals, applied state and status
+            // then share one admission; every nested write remains durable.
+            const text_only = for (generic_updates.items) |update| {
+                if (ctx.index_manager.textIndexEntry(update.index_name) == null) break false;
+            } else true;
+            if (text_only) if (ctx.replay_metadata_publication) |port| {
+                try port.enter(port.ptr);
+                metadata_publication = port;
+            };
             const metadata_started = monotonicTimeNs();
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
             projection_metadata_ns +|= elapsedSince(metadata_started);
