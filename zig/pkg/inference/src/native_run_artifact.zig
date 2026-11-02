@@ -1173,7 +1173,7 @@ fn runPjrtHloArtifactFull(
     }
     const pipeline_stub = graph_mod.execution.Context{
         .allocator = allocator,
-        .gpt_config = gpt_config,
+        .gpt_config = &gpt_config,
         .cb = &cb,
     };
     const entry = try graph_mod.execution.ensureGraphEntry(
@@ -1527,7 +1527,7 @@ fn materializePartitionInputs(
 
     const pipeline_stub = graph_mod.execution.Context{
         .allocator = allocator,
-        .gpt_config = gpt_config,
+        .gpt_config = &gpt_config,
         .cb = &cb,
     };
     const entry = try graph_mod.execution.ensureGraphEntry(

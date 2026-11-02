@@ -9426,7 +9426,7 @@ pub const NativeGenerationPipeline = struct {
         return .{
             .allocator = self.allocator,
             .cb = &self.cb,
-            .gpt_config = self.gpt_config,
+            .gpt_config = &self.gpt_config,
             .weights = .{ .ptr = self, .get_fn = Adapter.get },
             .execution_control = self.execution_control,
             .model_dir = self.model_dir,
@@ -9443,64 +9443,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     pub fn graphWeight(self: *NativeGenerationPipeline, name: []const u8) !ops.CT {
-        const weight = if (self.gpt_config.weight_prefix.len != 0 and std.mem.startsWith(u8, name, "model."))
-            gpt_arch.getModelWeight(&self.cb, self.gpt_config, name)
-        else
-            self.cb.getWeight(name);
-        return weight catch |err| switch (err) {
-            error.MissingWeight, error.WeightNotFound => {
-                if (std.mem.eql(u8, name, "lm_head.weight")) {
-                    return switch (self.gpt_config.family) {
-                        .gpt2 => self.cb.getWeight("wte.weight"),
-                        .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .phi => gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config),
-                        else => self.cb.getWeight("model.embed_tokens.weight") catch try self.cb.getWeight("wte.weight"),
-                    };
-                }
-                var fallback_buf: [128]u8 = undefined;
-                if (self.graphOmittedVProjFallback(name, &fallback_buf)) |fallback_name| {
-                    return self.cb.getWeight(fallback_name);
-                }
-                if (self.graphOptionalRouterInputScale(name)) {
-                    const ones = try self.allocator.alloc(f32, self.gpt_config.hidden_size);
-                    defer self.allocator.free(ones);
-                    @memset(ones, 1.0);
-                    const shape = [_]i32{@intCast(self.gpt_config.hidden_size)};
-                    return self.cb.fromFloat32Shape(ones, &shape);
-                }
-                if (self.graphOptionalExpertOutputScale(name)) {
-                    const ones = try self.allocator.alloc(f32, self.gpt_config.num_local_experts);
-                    defer self.allocator.free(ones);
-                    @memset(ones, 1.0);
-                    const shape = [_]i32{@intCast(self.gpt_config.num_local_experts)};
-                    return self.cb.fromFloat32Shape(ones, &shape);
-                }
-                return err;
-            },
-            else => return err,
-        };
-    }
-
-    fn graphOptionalRouterInputScale(_: *NativeGenerationPipeline, name: []const u8) bool {
-        const prefix = "model.layers.";
-        const suffix = ".block_sparse_moe.gate.input_scale";
-        return std.mem.startsWith(u8, name, prefix) and std.mem.endsWith(u8, name, suffix);
-    }
-
-    fn graphOptionalExpertOutputScale(self: *NativeGenerationPipeline, name: []const u8) bool {
-        if (self.gpt_config.num_local_experts == 0) return false;
-        const prefix = "model.layers.";
-        const suffix = ".block_sparse_moe.expert_output_scale";
-        return std.mem.startsWith(u8, name, prefix) and std.mem.endsWith(u8, name, suffix);
-    }
-
-    fn graphOmittedVProjFallback(self: *NativeGenerationPipeline, name: []const u8, buf: *[128]u8) ?[]const u8 {
-        const prefix = "model.layers.";
-        const suffix = ".self_attn.v_proj.weight";
-        if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, suffix)) return null;
-        const layer_text = name[prefix.len .. name.len - suffix.len];
-        const layer = std.fmt.parseInt(usize, layer_text, 10) catch return null;
-        if (!self.gpt_config.layerOmitsVProj(layer)) return null;
-        return std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer}) catch null;
+        return gpt_arch.getTracedWeight(self.allocator, &self.cb, &self.gpt_config, name);
     }
 
     /// Speculative decoding: use `draft_pipeline` to propose `k` candidate

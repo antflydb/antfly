@@ -5734,7 +5734,7 @@ const DeepSeekV4DeviceFastPathTestBackend = struct {
     }
 };
 
-fn deinitDeepSeekV4TestWeightStore(allocator: std.mem.Allocator, store: *native_compute_mod.WeightStore) void {
+fn deinitDenseTestWeightStore(allocator: std.mem.Allocator, store: *native_compute_mod.WeightStore) void {
     native_compute_mod.deinitPrefetchQueue(store);
     var resident_it = store.resident_weights.iterator();
     while (resident_it.next()) |entry| {
@@ -5745,7 +5745,7 @@ fn deinitDeepSeekV4TestWeightStore(allocator: std.mem.Allocator, store: *native_
     store.lazy_weights.deinit(allocator);
 }
 
-fn putDeepSeekV4TestWeight(
+fn putDenseTestWeight(
     allocator: std.mem.Allocator,
     store: *native_compute_mod.WeightStore,
     name: []const u8,
@@ -5762,44 +5762,44 @@ fn putDeepSeekV4TestWeight(
 test "deepseek v4 compressed attention dispatches resident backend request and fails closed after device ownership" {
     const allocator = std.testing.allocator;
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    defer deinitDenseTestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
     defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &DeepSeekV4DeviceFastPathTestBackend.vtable };
 
-    try putDeepSeekV4TestWeight(allocator, &store, "model.layers.0.self_attn.compressor.kv_proj.weight", &.{ 2, 2 }, &.{
+    try putDenseTestWeight(allocator, &store, "model.layers.0.self_attn.compressor.kv_proj.weight", &.{ 2, 2 }, &.{
         1.0, 0.0,
         0.0, 1.0,
     });
-    try putDeepSeekV4TestWeight(allocator, &store, "model.layers.0.self_attn.compressor.gate_proj.weight", &.{ 1, 2 }, &.{
+    try putDenseTestWeight(allocator, &store, "model.layers.0.self_attn.compressor.gate_proj.weight", &.{ 1, 2 }, &.{
         0.5, -0.25,
     });
-    try putDeepSeekV4TestWeight(allocator, &store, "model.layers.0.self_attn.compressor.position_bias", &.{2}, &.{
+    try putDenseTestWeight(allocator, &store, "model.layers.0.self_attn.compressor.position_bias", &.{2}, &.{
         0.0, 0.0,
     });
-    try putDeepSeekV4TestWeight(allocator, &store, "model.layers.0.self_attn.compressor.kv_norm.weight", &.{2}, &.{
+    try putDenseTestWeight(allocator, &store, "model.layers.0.self_attn.compressor.kv_norm.weight", &.{2}, &.{
         1.0, 1.0,
     });
-    try putDeepSeekV4TestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.kv_proj.weight", &.{ 2, 2 }, &.{
+    try putDenseTestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.kv_proj.weight", &.{ 2, 2 }, &.{
         1.0, 0.0,
         0.0, 1.0,
     });
-    try putDeepSeekV4TestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.gate_proj.weight", &.{ 1, 2 }, &.{
+    try putDenseTestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.gate_proj.weight", &.{ 1, 2 }, &.{
         0.25, 0.75,
     });
-    try putDeepSeekV4TestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.position_bias", &.{2}, &.{
+    try putDenseTestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.position_bias", &.{2}, &.{
         0.0, 0.0,
     });
-    try putDeepSeekV4TestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.kv_norm.weight", &.{2}, &.{
+    try putDenseTestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.kv_norm.weight", &.{2}, &.{
         1.0, 1.0,
     });
-    try putDeepSeekV4TestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.q_b_proj.weight", &.{ 4, 2 }, &.{
+    try putDenseTestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.q_b_proj.weight", &.{ 4, 2 }, &.{
         1.0, 0.0,
         0.0, 1.0,
         0.5, 0.0,
         0.0, 0.5,
     });
-    try putDeepSeekV4TestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.weights_proj.weight", &.{ 2, 2 }, &.{
+    try putDenseTestWeight(allocator, &store, "model.layers.0.self_attn.compressor.indexer.weights_proj.weight", &.{ 2, 2 }, &.{
         1.0, 0.0,
         0.0, 1.0,
     });
@@ -12727,6 +12727,104 @@ fn attnOutputProject(
     }
 }
 
+/// Resolve traced parameter names with the checkpoint's tied heads, optional
+/// scales and omitted projections. Execution/task schedulers do not own these
+/// artifact conventions. Returned handles transfer to the caller.
+pub fn getTracedWeight(allocator: std.mem.Allocator, cb: *const ComputeBackend, config: *const Config, name: []const u8) !CT {
+    const weight = if (config.weight_prefix.len != 0 and std.mem.startsWith(u8, name, "model."))
+        getModelWeight(cb, config.*, name)
+    else
+        cb.getWeight(name);
+    return weight catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => {
+            if (std.mem.eql(u8, name, "lm_head.weight")) {
+                return switch (config.family) {
+                    .gpt2 => cb.getWeight("wte.weight"),
+                    .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .phi => getEmbeddingWeight(cb, config.*),
+                    else => cb.getWeight("model.embed_tokens.weight") catch try cb.getWeight("wte.weight"),
+                };
+            }
+            var fallback_buf: [128]u8 = undefined;
+            if (tracedOmittedValueProjection(config, name, &fallback_buf)) |fallback_name| {
+                return cb.getWeight(fallback_name);
+            }
+            if (tracedOptionalRouterScale(name)) {
+                const ones = try allocator.alloc(f32, config.hidden_size);
+                defer allocator.free(ones);
+                @memset(ones, 1.0);
+                const shape = [_]i32{@intCast(config.hidden_size)};
+                return cb.fromFloat32Shape(ones, &shape);
+            }
+            if (tracedOptionalExpertScale(config, name)) {
+                const ones = try allocator.alloc(f32, config.num_local_experts);
+                defer allocator.free(ones);
+                @memset(ones, 1.0);
+                const shape = [_]i32{@intCast(config.num_local_experts)};
+                return cb.fromFloat32Shape(ones, &shape);
+            }
+            return err;
+        },
+        else => return err,
+    };
+}
+
+fn tracedOptionalRouterScale(name: []const u8) bool {
+    const prefix = "model.layers.";
+    const suffix = ".block_sparse_moe.gate.input_scale";
+    return std.mem.startsWith(u8, name, prefix) and std.mem.endsWith(u8, name, suffix);
+}
+
+fn tracedOptionalExpertScale(config: *const Config, name: []const u8) bool {
+    if (config.num_local_experts == 0) return false;
+    const prefix = "model.layers.";
+    const suffix = ".block_sparse_moe.expert_output_scale";
+    return std.mem.startsWith(u8, name, prefix) and std.mem.endsWith(u8, name, suffix);
+}
+
+fn tracedOmittedValueProjection(config: *const Config, name: []const u8, buf: *[128]u8) ?[]const u8 {
+    const prefix = "model.layers.";
+    const suffix = ".self_attn.v_proj.weight";
+    if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, suffix)) return null;
+    const layer_text = name[prefix.len .. name.len - suffix.len];
+    const layer = std.fmt.parseInt(usize, layer_text, 10) catch return null;
+    if (!config.layerOmitsVProj(layer)) return null;
+    return std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer}) catch null;
+}
+
+test "traced weight adapter preserves tied heads optional scales and declared projection aliases" {
+    const a = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDenseTestWeightStore(a, &store);
+    var compute = native_compute_mod.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
+    try putDenseTestWeight(a, &store, "model.embed_tokens.weight", &.{ 1, 4 }, &.{ 1, 2, 3, 4 });
+    try putDenseTestWeight(a, &store, "model.layers.0.self_attn.k_proj.weight", &.{ 1, 4 }, &.{ 5, 6, 7, 8 });
+    try putDenseTestWeight(a, &store, "decoder.layers.0.norm.weight", &.{4}, &.{ 9, 10, 11, 12 });
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator, backend: *const ComputeBackend, config: *const Config, name: []const u8, expected_shape: []const i64, expected: []const f32) !void {
+            const tensor = try getTracedWeight(allocator, backend, config, name);
+            defer backend.free(tensor);
+            const shape = try backend.tensorShape(tensor, allocator);
+            defer allocator.free(shape);
+            const values = try backend.toFloat32(tensor, allocator);
+            defer allocator.free(values);
+            try std.testing.expectEqualSlices(i64, expected_shape, shape);
+            try std.testing.expectEqualSlices(f32, expected, values);
+        }
+    };
+    var config = Config{ .family = .llama, .hidden_size = 4, .num_local_experts = 3 };
+    try Check.run(a, &cb, &config, "lm_head.weight", &.{ 1, 4 }, &.{ 1, 2, 3, 4 });
+    try Check.run(a, &cb, &config, "model.layers.0.block_sparse_moe.gate.input_scale", &.{4}, &.{ 1, 1, 1, 1 });
+    try Check.run(a, &cb, &config, "model.layers.0.block_sparse_moe.expert_output_scale", &.{3}, &.{ 1, 1, 1 });
+    config.weight_prefix = "decoder";
+    try Check.run(a, &cb, &config, "model.layers.0.norm.weight", &.{4}, &.{ 9, 10, 11, 12 });
+    config = .{ .family = .gemma, .hidden_size = 4, .sliding_window = 64, .sliding_window_pattern = 1, .attention_k_eq_v = true, .global_head_dim = 4 };
+    try Check.run(a, &cb, &config, "model.layers.0.self_attn.v_proj.weight", &.{ 1, 4 }, &.{ 5, 6, 7, 8 });
+    config.attention_k_eq_v = false;
+    try std.testing.expectError(error.MissingWeight, getTracedWeight(a, &cb, &config, "model.layers.0.self_attn.v_proj.weight"));
+}
+
 // --- FFN weight helpers ---
 
 fn maybePrefixedModelName(config: Config, name: []const u8, buf: *[256]u8) ![]const u8 {
@@ -13474,7 +13572,7 @@ test "final logit softcap greedy argmax fast path policy is Gemma-only" {
 test "uniform batched RoPE restarts positions for each item" {
     const allocator = std.testing.allocator;
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    defer deinitDenseTestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
     defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
@@ -13510,12 +13608,12 @@ test "uniform batched RoPE restarts positions for each item" {
 test "Gemma 4 router independently RMS-normalizes and hidden-scales its source" {
     const allocator = std.testing.allocator;
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    defer deinitDenseTestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
     defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
 
-    try putDeepSeekV4TestWeight(
+    try putDenseTestWeight(
         allocator,
         &store,
         "model.layers.0.block_sparse_moe.gate.input_scale",
@@ -13549,7 +13647,7 @@ test "Gemma 4 router independently RMS-normalizes and hidden-scales its source" 
 test "Qwen3-VL attention requires and consumes explicit M-RoPE positions" {
     const allocator = std.testing.allocator;
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    defer deinitDenseTestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
     defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
@@ -13612,7 +13710,7 @@ test "Qwen3-VL attention requires and consumes explicit M-RoPE positions" {
 test "Qwen3-VL DeepStack adds features only to visual rows" {
     const allocator = std.testing.allocator;
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    defer deinitDenseTestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
     defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
@@ -13951,11 +14049,11 @@ test "Qwen3 prepared prefill rejects incompatible semantics masks and selected r
 test "Qwen3 reranker compact head scores unequal right-padded rows independently" {
     const allocator = std.testing.allocator;
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    defer deinitDenseTestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
     defer compute.deinit();
     const cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
-    try putDeepSeekV4TestWeight(allocator, &store, "cls.output.weight", &.{ 2, 2 }, &.{ 3, 5, 1, 2 });
+    try putDenseTestWeight(allocator, &store, "cls.output.weight", &.{ 2, 2 }, &.{ 3, 5, 1, 2 });
     const hidden = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 999, 999, 5, 6, 999, 999, 999, 999 }, &.{ 6, 2 });
     defer cb.free(hidden);
     const rows = try activeFinalRowIndices(i32, allocator, &.{ 1, 1, 0, 1, 0, 0 }, 2, 3);
@@ -14009,12 +14107,12 @@ test "Qwen3-VL reranker selects only right-padded final active rows" {
 test "Qwen3 reranker prefers converted two-row classifier head" {
     const allocator = std.testing.allocator;
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    defer deinitDenseTestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
     defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
 
-    try putDeepSeekV4TestWeight(
+    try putDenseTestWeight(
         allocator,
         &store,
         "cls.output.weight",
@@ -14060,7 +14158,7 @@ test "LightOnOCR3 DeltaNet gated norm uses its scale directly without a plus-one
 test "LightOnOCR3 batched DeltaNet projections match independent histories across decode and retirement" {
     const a = std.testing.allocator;
     var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
-    defer deinitDeepSeekV4TestWeightStore(a, &store);
+    defer deinitDenseTestWeightStore(a, &store);
     var compute = native_compute_mod.NativeCompute.init(a, &store, null);
     defer compute.deinit();
     const cb = compute.computeBackend();
@@ -14073,11 +14171,11 @@ test "LightOnOCR3 batched DeltaNet projections match independent histories acros
     }) |spec| {
         var values: [spec[1] * spec[2]]f32 = undefined;
         for (&values, 0..) |*value, idx| value.* = @sin(@as(f32, @floatFromInt(idx + 1))) * 0.2;
-        try putDeepSeekV4TestWeight(a, &store, prefix ++ spec[0], &.{ spec[1], spec[2] }, &values);
+        try putDenseTestWeight(a, &store, prefix ++ spec[0], &.{ spec[1], spec[2] }, &values);
     }
-    try putDeepSeekV4TestWeight(a, &store, prefix ++ "A_log", &.{1}, &.{-0.2});
-    try putDeepSeekV4TestWeight(a, &store, prefix ++ "dt_bias", &.{1}, &.{0.1});
-    try putDeepSeekV4TestWeight(a, &store, prefix ++ "norm.weight", &.{2}, &.{ 1, 0.8 });
+    try putDenseTestWeight(a, &store, prefix ++ "A_log", &.{1}, &.{-0.2});
+    try putDenseTestWeight(a, &store, prefix ++ "dt_bias", &.{1}, &.{0.1});
+    try putDenseTestWeight(a, &store, prefix ++ "norm.weight", &.{2}, &.{ 1, 0.8 });
     var caches: [4]Qwen35LinearCache = undefined;
     for (&caches) |*cache| cache.* = try Qwen35LinearCache.init(a, cfg);
     defer for (&caches) |*cache| cache.deinit();
@@ -14180,7 +14278,7 @@ test "LightOnOCR3 device recurrent cache omits CPU matrices and refuses host fal
     try std.testing.expect(cache.layerState(0) != null);
     try std.testing.expect(cache.layerState(3) == null);
     var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
-    defer deinitDeepSeekV4TestWeightStore(a, &store);
+    defer deinitDenseTestWeightStore(a, &store);
     var compute = native_compute_mod.NativeCompute.init(a, &store, null);
     defer compute.deinit();
     const cb = compute.computeBackend();
@@ -14266,7 +14364,7 @@ test "LightOnOCR3 packed query bounds reject empty zero overflowing and oversize
 test "LightOnOCR3 packed full attention preserves causal page boundaries" {
     const a = std.testing.allocator;
     var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
-    defer deinitDeepSeekV4TestWeightStore(a, &store);
+    defer deinitDenseTestWeightStore(a, &store);
     var compute = native_compute_mod.NativeCompute.init(a, &store, null);
     defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
@@ -14338,7 +14436,7 @@ test "LightOnOCR3 packed metadata rejects aliases and malformed later pages befo
 test "LightOnOCR3 packed decode attention grouping preserves independent KV writes" {
     const a = std.testing.allocator;
     var weights = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
-    defer deinitDeepSeekV4TestWeightStore(a, &weights);
+    defer deinitDenseTestWeightStore(a, &weights);
     var compute = native_compute_mod.NativeCompute.init(a, &weights, null);
     defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };

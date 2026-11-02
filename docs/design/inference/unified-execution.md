@@ -127,7 +127,10 @@ preparation API do not by themselves complete these remaining requirements:
   control and compiled-backend dependencies explicitly. Serving and offline
   compilation use that same typed contract instead of pipeline-shaped structs.
   Backend pointers are borrowed from their real owner; temporary context values
-  never become the owner of cached executors or physical bindings.
+  never become the owner of cached executors or physical bindings. Immutable
+  model configuration is borrowed, avoiding a full metadata copy per step;
+  cache keys hash its content rather than the pointer. Tied heads, optional
+  scales and omitted-projection aliases live in the architecture weight adapter.
   Embedding indices explicitly select host IDs or a resident tensor. Traced
   host-ID placeholders need no materialized tensor; imported integer tensors
   retain their resident fast path and exact integer fallback.

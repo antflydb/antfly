@@ -49,7 +49,7 @@ pub const Weights = struct {
 pub const Context = struct {
     allocator: std.mem.Allocator,
     cb: *const ops.ComputeBackend,
-    gpt_config: @import("../models/gpt.zig").Config,
+    gpt_config: *const @import("../models/gpt.zig").Config,
     weights: ?Weights = null,
     execution_control: ?InferenceExecutionControl = null,
     model_dir: ?[]const u8 = null,
@@ -152,7 +152,7 @@ fn compiledBackendAttachContext(
         .artifact_dir = pipeline.artifact_dir,
         .pjrt_client = pipeline.pjrt_client,
         .session = pipeline.session,
-        .gpt_config = pipeline.gpt_config,
+        .gpt_config = pipeline.gpt_config.*,
         .kv_dtype = pipeline.kv_dtype,
         .shared_moe_cache = pipeline.shared_moe_cache,
         .attention_mode = attention_mode,
@@ -403,7 +403,7 @@ fn graphCacheKey(
 ) cache_mod.CacheKey {
     const attn_mode = cacheAttentionMode(decode_context);
     return .{
-        .config_hash = cache_mod.hashConfigBytes(std.mem.asBytes(&pipeline.gpt_config)),
+        .config_hash = cache_mod.hashConfigBytes(std.mem.asBytes(pipeline.gpt_config)),
         .batch = @intCast(batch),
         // Key the shape actually traced. Bucketing is safe only when the
         // caller has padded the physical inputs to that bucket first.
@@ -458,7 +458,7 @@ pub fn ensureGraphEntry(
             var tc_cb = tc.backend();
             var trace_dc = decode_context.*;
             trace_dc.moe_runtime = null;
-            const dummy_logits = try gpt_arch.forward(&tc_cb, allocator, pipeline.gpt_config, input_ids, batch, seq_len, &trace_dc);
+            const dummy_logits = try gpt_arch.forward(&tc_cb, allocator, pipeline.gpt_config.*, input_ids, batch, seq_len, &trace_dc);
             defer allocator.free(dummy_logits);
             break :trace tc.extractGraph();
         };
@@ -835,7 +835,8 @@ test "cached decoder graph preparation reuses native and Metal executables acros
         var context = try contexts.BackendContext.init(a, kind, null);
         defer context.deinit(a);
         const cb = context.computeBackend();
-        const pipeline = Context{ .allocator = a, .cb = &cb, .gpt_config = .{} };
+        const config: @import("../models/gpt.zig").Config = .{};
+        const pipeline = Context{ .allocator = a, .cb = &cb, .gpt_config = &config };
         var cache = cache_mod.GraphCache.init(a);
         defer cache.deinitWithBackend(pipeline.cb);
         var graph = @import("ml").graph.Graph.init(a);
@@ -912,7 +913,8 @@ test "decoder graph cache owns tracing allocations and failed traces remain retr
             }
         };
         var fixture = Fixture{ .cb = &cb };
-        const pipeline = Context{ .allocator = request.allocator(), .cb = &cb, .weights = .{ .ptr = &fixture, .get_fn = Fixture.get }, .gpt_config = .{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .num_key_value_heads = 1, .intermediate_size = 8, .vocab_size = 8, .position_encoding = .rope, .norm_type = .rms_norm, .activation = .silu } };
+        const config: @import("../models/gpt.zig").Config = .{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .num_key_value_heads = 1, .intermediate_size = 8, .vocab_size = 8, .position_encoding = .rope, .norm_type = .rms_norm, .activation = .silu };
+        const pipeline = Context{ .allocator = request.allocator(), .cb = &cb, .weights = .{ .ptr = &fixture, .get_fn = Fixture.get }, .gpt_config = &config };
         var cache = cache_mod.GraphCache.init(a);
         defer cache.deinit();
         const decode_context = gpt_arch.DecodeContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
@@ -937,6 +939,13 @@ test "decoder graph cache owns tracing allocations and failed traces remain retr
         try std.testing.expect(entry.graph.nodeCount() > 0);
         try std.testing.expect(entry == try ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 1, &decode_context));
         try std.testing.expectEqual(@as(usize, 1), cache.count());
+        // A borrowed configuration's address is not its semantic cache key.
+        var equivalent_config = config;
+        var equivalent = pipeline;
+        equivalent.gpt_config = &equivalent_config;
+        try std.testing.expect(entry == try ensureGraphEntry(&equivalent, &cache, &.{0}, 1, 1, &decode_context));
+        equivalent_config.norm_eps *= 2;
+        try std.testing.expect(entry != try ensureGraphEntry(&equivalent, &cache, &.{0}, 1, 1, &decode_context));
         const first_ids: [12]i64 = @splat(0);
         const second_ids: [13]i64 = @splat(0);
         var prefill = gpt_arch.DecodeContext{ .attention_mode = .paged_prefill, .total_sequence_len = 12, .query_sequence_len = 12, .kv_sequence_len = 12 };
