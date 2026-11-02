@@ -7,7 +7,7 @@ on:
       step:
         type: choice
         default: memory-test
-        options: [products, opaque-pdf-session-test, opaque-pdf-consumer-compile, runtime-unit-enrichment_compute, memory-test, unit-storage-compile, architecture-probe-test, local-query-contract-test, local-query-owner-test, opaque-query-consumer-compile, opaque-query-owner-test, aggregation-plan-test, query-paging-test, mutation-plan-test, antfly-storage-owner-test, runtime-unit-local_query, runtime-unit-api_kernel, runtime-unit-storage-engine, runtime-unit-inference-core, runtime-archives, antfly]
+        options: [products, compiled-template-pdf-test, opaque-pdf-session-test, opaque-pdf-consumer-compile, runtime-unit-enrichment_compute, memory-test, unit-storage-compile, architecture-probe-test, local-query-contract-test, local-query-owner-test, opaque-query-consumer-compile, opaque-query-owner-test, aggregation-plan-test, query-paging-test, mutation-plan-test, antfly-storage-owner-test, runtime-unit-local_query, runtime-unit-api_kernel, runtime-unit-storage-engine, runtime-unit-inference-core, runtime-archives, antfly]
       optimize:
         type: choice
         default: debug
@@ -23,6 +23,10 @@ on:
         default: true
       time_report:
         description: Additional forced rebuild for compiler declaration and LLVM timings
+        type: boolean
+        default: false
+      shared_pdf_templates:
+        description: Route production template PDF helpers through the compiled media owner
         type: boolean
         default: false
       cli_optimize:
@@ -75,6 +79,7 @@ jobs:
           CLI_OPTIMIZE: ${{ inputs.cli_optimize }}
           BUILD_TARGET: ${{ inputs.target }}
           BUILD_STRIP: ${{ inputs.strip }}
+          SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
         run: |
           mkdir -p .benchmark-results/compile-costs
           {
@@ -84,7 +89,7 @@ jobs:
             git submodule status
             uname -a
             lscpu
-            printf 'step=%s\noptimize=%s\ncli_optimize=%s\ntarget=%s\nstrip=%s\ncpu=baseline\nmetal=false\ncuda=false\nsystem_blas=false\n' "$BUILD_STEP" "$BUILD_OPTIMIZE" "$CLI_OPTIMIZE" "$BUILD_TARGET" "$BUILD_STRIP"
+            printf 'step=%s\noptimize=%s\ncli_optimize=%s\ntarget=%s\nstrip=%s\ncpu=baseline\nmetal=false\ncuda=false\nsystem_blas=false\nshared_pdf_templates=%s\n' "$BUILD_STEP" "$BUILD_OPTIMIZE" "$CLI_OPTIMIZE" "$BUILD_TARGET" "$BUILD_STRIP" "$SHARED_PDF_TEMPLATES"
             cat /proc/meminfo
             cat /proc/self/cgroup
             zig env
@@ -96,10 +101,11 @@ jobs:
           CLI_OPTIMIZE: ${{ inputs.cli_optimize }}
           BUILD_TARGET: ${{ inputs.target }}
           BUILD_STRIP: ${{ inputs.strip }}
+          SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
         run: |
           steps=("$BUILD_STEP")
           if [ "$BUILD_STEP" = products ]; then steps=(antfly capi runtime-archives); fi
-          args=(build "${steps[@]}" "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all)
+          args=(build "${steps[@]}" "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all)
           if [ "$CLI_OPTIMIZE" != inherit ]; then args+=("-Dcli-optimize=$CLI_OPTIMIZE"); fi
           scripts/diagnose-zig-build-memory.sh --command --label build --no-stack-sample \
             --target "$BUILD_TARGET" --optimize "$BUILD_OPTIMIZE" --strip "$BUILD_STRIP" --install-step "$BUILD_STEP" -- \
@@ -111,8 +117,9 @@ jobs:
           CLI_OPTIMIZE: ${{ inputs.cli_optimize }}
           BUILD_TARGET: ${{ inputs.target }}
           BUILD_STRIP: ${{ inputs.strip }}
+          SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
         run: |
-          args=(build runtime-archives "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" -Dmetal=false -Dcuda=false -Dsystem-blas=false)
+          args=(build runtime-archives "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" -Dmetal=false -Dcuda=false -Dsystem-blas=false)
           if [ "$CLI_OPTIMIZE" != inherit ]; then args+=("-Dcli-optimize=$CLI_OPTIMIZE"); fi
           (cd zig && python3 tools/run_bounded_zig_build.py -- "${args[@]}")
           artifacts=()
@@ -120,14 +127,18 @@ jobs:
             owner=$(basename "$archive" .a)
             artifacts+=(--artifact "$owner=$archive")
           done
-          cuda_checks=()
+          owner_checks=()
           if [ "$BUILD_OPTIMIZE" = fast ]; then
-            cuda_checks+=(--forbid 'libantfly-inference-core=ops.cuda.cuda_compute.')
+            owner_checks+=(--forbid 'libantfly-inference-core=ops.cuda.cuda_compute.')
+          fi
+          if [ "$SHARED_PDF_TEMPLATES" = true ] && [ "$BUILD_OPTIMIZE" = fast ]; then
+            owner_checks+=(--forbid 'libantfly-runtime-api_kernel=jpeg2000.codestream.parseState')
+            owner_checks+=(--forbid 'libantfly-runtime-api_kernel=reader.Reader.decodeImageToRgbaGuardedAlloc')
           fi
           python3 scripts/report_zig_archive_work.py "${artifacts[@]}" \
             --forbid 'libantfly-runtime-local_query=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
             --forbid 'libantfly-storage-kernel=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
-            "${cuda_checks[@]}" \
+            "${owner_checks[@]}" \
             --output .benchmark-results/compile-costs/archive-work.json
       - name: Attribute linked symbols and embedded asset candidates
         if: ${{ success() && !inputs.strip && (inputs.step == 'products' || inputs.step == 'antfly') }}
@@ -166,11 +177,12 @@ jobs:
           CLI_OPTIMIZE: ${{ inputs.cli_optimize }}
           BUILD_TARGET: ${{ inputs.target }}
           BUILD_STRIP: ${{ inputs.strip }}
+          SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
         working-directory: zig
         run: |
           steps=("$BUILD_STEP")
           if [ "$BUILD_STEP" = products ]; then steps=(antfly capi runtime-archives); fi
-          args=(build "${steps[@]}" "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" -Dmetal=false -Dcuda=false -Dsystem-blas=false)
+          args=(build "${steps[@]}" "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" -Dmetal=false -Dcuda=false -Dsystem-blas=false)
           if [ "$CLI_OPTIMIZE" != inherit ]; then args+=("-Dcli-optimize=$CLI_OPTIMIZE"); fi
           python3 ../scripts/collect_zig_time_report.py \
             --output ../.benchmark-results/compile-costs/compiler-time-report.json -- \
@@ -192,6 +204,6 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: compile-costs-${{ inputs.step }}-${{ inputs.optimize }}-${{ inputs.target }}-strip-${{ inputs.strip }}-${{ inputs.cli_optimize }}
+          name: compile-costs-${{ inputs.step }}-${{ inputs.optimize }}-${{ inputs.target }}-strip-${{ inputs.strip }}-${{ inputs.cli_optimize }}-shared-pdf-${{ inputs.shared_pdf_templates }}
           path: .benchmark-results/compile-costs/
           if-no-files-found: error

@@ -17,12 +17,14 @@ rejected mutation outlining experiment are recorded in
 | P0 measurement tools | Both-product CPU profiling, tested Mach-O map reader, pinned compiler time-report collector, scoped Linux memory snapshots implemented; full baseline qualification and server map still pending |
 | P1a opaque PDF session | Retained state, stable allocator/deadline adapters, operation cancellation, directly charged PNG output and compiled source-free tests implemented |
 | Media build isolation | Fixed automatic storage/inference linking into media-only tests; provider/client/contract cache matrix passed |
-| P1b/P1c production migration | Template PDF defaults have a tested opt-in owner migration; [product screening is pending](history/template-pdf-owner-2026-11-02.md). Batch/raster/analysis contracts and remaining PDF/image callers/caches are open |
-| P2–P7 redesigns | Open, apart from the media cache matrix above; acceptance gates remain unchanged |
+| P1b/P1c production migration | [Opt-in template migration](history/template-pdf-owner-2026-11-02.md) passes native regressions: server −6.72 MB, library +347 KB. Remains off; no build-time/memory gain established. Batch/raster/analysis contracts and remaining PDF/image callers/caches are open |
+| P6 Q8K specialization | [Repeatable isolated loop screens](history/q8-projection-loops-2026-11-02.md) pass numerical checks and reduce estimated emitted work; mixed small-row timing prevents rollout |
+| P2–P5/P7 redesigns | Open, apart from the media cache matrix above; acceptance gates remain unchanged |
 
 P1a and the measurement tools do not establish smaller production binaries or
-faster complete builds. The native product regression passed; both installed product sizes remained
-unchanged. No whole-product size reduction or cold-build speedup is claimed.
+faster complete builds. The first-phase native product regression passed with
+both installed product sizes unchanged. The later opt-in template slice shrinks the server but grows the C
+library; it remains off by default. No cold-build speedup is claimed.
 
 ## Decision
 

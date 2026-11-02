@@ -1,7 +1,7 @@
 # Template PDF owner migration candidate
 
-Status: implemented behind `-Dshared-pdf-templates=true`; product-size screening
-pending. This is a P1b slice of [the production plan](../production-cost-plan.md),
+Status: implemented behind `-Dshared-pdf-templates=true`; native product
+regression passed, but library-size and compiler-memory gates did not improve. This is a P1b slice of [the production plan](../production-cost-plan.md),
 not completion of all PDF/image migration.
 
 The default production template backend delegates complete text extraction and
@@ -42,7 +42,7 @@ Focused verification so far:
   allocator admission/resizing/cleanup.
 - Formatting, licenses and the control source-catalog checker passed.
 
-The experiment remains off by default until both products have been screened.
+The experiment remains off by default because the screened C library grew.
 Prior native CPU artifacts at `f5c0c79fe8` were preserved and SHA256-verified under
 `.benchmark-results/compile-costs/baseline-f5c0c79fe8/` before the candidate run.
 The full first-phase baseline is 229,621,752 bytes for `antfly` and 80,026,400
@@ -55,3 +55,83 @@ Receipts are ignored under `.benchmark-results/compile-costs/`:
 An incorrectly rooted initial invocation had fixture lookup failures; its log
 is retained as `template-pdf-owner-test.log`, separately from the successful
 `template-pdf-owner-test-corrected.log`. Builds/tests must run from `zig/`.
+
+## Intermediate API-owner evidence
+
+The candidate API owner finished during the native product run. Its archive is
+69,847,696 bytes versus 71,874,888 for the preserved baseline. Estimated text
+symbol extents fell from 48,001,140 to 46,518,180 bytes; the codec category fell
+from 448,752 to 18,216 bytes. These archive figures are not final linked savings.
+
+The API archive no longer emits `jpeg2000.codestream.parseState` or
+`reader.Reader.decodeImageToRgbaGuardedAlloc`. Optional profiling-CI guards
+reject either symbol under `shared_pdf_templates=true` in Fast mode. Both guards
+passed the candidate and rejected the baseline, verifying that they detect the
+old implementation roots. The remaining consumers still need migration.
+
+The manual profiling workflow exposes `shared_pdf_templates` and
+`compiled-template-pdf-test`. It records the flag and forwards it consistently
+to the primary product build, archive attribution and separate forced compiler
+timing run; artifacts distinguish the selected variant.
+
+Receipts: `shared-template-api-comparison.json`, `shared-template-api-guards.json`
+and `shared-template-api-guards-negative.json` under the ignored measurement
+folder. The product run's production sources remain frozen at `e6809c355d`.
+
+
+## Full native product result
+
+The production sources at `e6809c355d` completed all 133 steps: server and CAPI,
+runtime archives, 57 storage-owner tests, three opaque-query tests, CAPI smoke
+and consumer linkage, the 134-function public export boundary, CLI smoke and
+linked-inference ABI integration. All passed. Ten HTTP query/deadline tests
+subsequently passed against the SHA-verified installed candidate in 21.94 seconds.
+
+| Installed stripped artifact | Baseline bytes | Candidate bytes | Change |
+| --- | ---: | ---: | ---: |
+| `antfly` | 229,621,752 | 222,902,216 | −6,719,536 (−2.93%) |
+| `libantfly.dylib` | 80,026,400 | 80,373,408 | +347,008 (+0.43%) |
+
+The candidate server is also 2,737,680 bytes below the older same-profile
+pre-query-owner baseline. These improvements require the opt-in flag; they are
+not default build results.
+
+Candidate SHA256:
+
+- Server: `c0dae706fdad3588f54e43cdd82db0e61de22fa056c0e7656a0a39b9f6815b33`.
+- Library: `556609305ee3f480aa5b23742fa0e1b474caa452a7512d849dd30df3357b441d`.
+
+The library's raw final-link map was copied only after its cached dylib matched
+the installed SHA256. Exact live atom attribution explains the growth:
+
+| CAPI text owner | Baseline bytes | Candidate bytes | Change |
+| --- | ---: | ---: | ---: |
+| Storage | 41,667,916 | 41,627,996 | −39,920 |
+| Inference | 23,297,164 | 23,297,164 | 0 |
+| Shared media | 1,568,996 | 1,916,092 | +347,096 |
+| Entire text section | 66,600,616 | 66,907,792 | +307,176 |
+
+Constants grow by 15,636 bytes and exception frames by 11,312 bytes; file layout
+and other sections account for the remaining file delta. Complete exact-profile
+rendering now remains live in the media owner, including render runs, vector
+text/font outlines, patterns and shading. Other storage PDF consumers still keep
+their renderer alive, so migrating template defaults alone adds retained code
+to the library. JPEG/JPEG2000/PDF image-decoder counts remain three each, with
+unchanged exact atom totals; nominal repeated-name extra text grows from
+3,848,196 to 4,103,924 bytes. This is a partial migration, not deduplication's exit.
+
+The profiled command took 2,816 seconds, with a sampled individual and same-poll
+aggregate compiler peak of 9.013 GiB in the API owner. Zig reported 14 minutes
+for the API compiler and 11 minutes for the CAPI storage engine. The earlier run
+took 2,856 seconds with different cached inputs and shared-host load; neither is
+a controlled cold-build comparison. No build-time or compiler-memory gain is
+established, and no scheduler reservation is lowered.
+
+Next: migrate the retained PDF analysis, batch/raster and fork-cache consumers
+before enabling this option by default. The library regression is a concrete
+reason to finish P1b, rather than infer success from the server-only size win.
+
+Additional receipts: `shared-template-pdf-products.{build.log,memory.json,rss.tsv}`,
+`shared-template-products.json`, `shared-template-libantfly.{map,json}`,
+`shared-template-api-artifacts.json`, and `shared-template-http-query.log` in the
+ignored measurement folder. The matching raw map is retained before cache GC.
