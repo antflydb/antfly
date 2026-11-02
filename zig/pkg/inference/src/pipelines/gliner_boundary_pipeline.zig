@@ -17,6 +17,7 @@
 //! come from one prepared batch. Results own their strings and coordinates;
 //! source-free enum values are explicit and never receive invented offsets.
 //! This module does not register a serving capability or qualify a backend.
+const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const compute = @import("../ops/ops.zig");
 const model = @import("../models/gliner_boundary.zig");
@@ -2248,7 +2249,7 @@ fn convertedCheckpointParity(comptime variant: []const u8, comptime environment:
         var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = case.text, .schema = &schema }}, .{});
         defer prepared.deinit();
         const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 120 * std.time.ns_per_s };
-        var managed = try factory.getManagedComputeBackend(session, a, null, control);
+        var managed = try compute_provider.acquire(session, a, null, control);
         defer managed.deinit();
         var result = switch (device_backend) {
             .native => blk: {

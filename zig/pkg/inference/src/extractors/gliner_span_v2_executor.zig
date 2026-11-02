@@ -23,6 +23,7 @@
 //! model temperature 1. Activation, thresholds, top_k and constraints are the
 //! shared boundary presentation.
 
+const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const wire = @import("extraction_v2.zig");
 const processor = @import("../pipelines/gliner_boundary_processor.zig");
@@ -890,7 +891,7 @@ fn testDecideParity(directory: []const u8, backend: enum { native, metal, cuda }
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 600 * std.time.ns_per_s };
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     const cb = &managed.backend;
 
@@ -1008,7 +1009,7 @@ test "gliner span v2 GLiNER2.5-Decide CountLSTM v1 entity head parity" {
         .deberta => |value| value,
         else => return error.TestUnexpectedResult,
     };
-    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    var managed = try compute_provider.acquire(session, a, null, null);
     defer managed.deinit();
     const cb = &managed.backend;
     // "My name is Clara and I live in Berkeley, California." with
@@ -1121,7 +1122,7 @@ test "gliner span v2 GLiNER2.5-Decide Metal latency profile" {
         var min_ns: u64 = std.math.maxInt(u64);
         for (0..iterations + 2) |iteration| {
             const start = nowNs();
-            var managed = try factory.getManagedComputeBackend(session, a, null, control);
+            var managed = try compute_provider.acquire(session, a, null, control);
             defer managed.deinit();
             // Measurement only: without execution control the encoder skips
             // its per-2-layer cancellation submit-and-wait.
@@ -1181,7 +1182,7 @@ test "gliner span v2 GLiNER2.5-Decide splits an over-budget prompt across sequen
     defer a.free(tokenizer_bytes);
     const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     defer tokenizer.tokenizer().deinitTokenizer();
-    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    var managed = try compute_provider.acquire(session, a, null, null);
     defer managed.deinit();
 
     const raw =
@@ -1253,7 +1254,7 @@ test "gliner span v2 GLiNER2.5-Decide execute serves the wire response and enfor
     defer a.free(tokenizer_bytes);
     const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     defer tokenizer.tokenizer().deinitTokenizer();
-    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    var managed = try compute_provider.acquire(session, a, null, null);
     defer managed.deinit();
 
     var request = try wire.parseJson(a,

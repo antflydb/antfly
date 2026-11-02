@@ -7766,59 +7766,21 @@ pub fn getComputeBackendBorrowingSharedProvider(session: Session, allocator: std
     return cb;
 }
 
-/// Direct compute paths bypass Session.runWithControl. This owner binds their
-/// cooperative checks and holds process protection from backend creation until
-/// backend cleanup completes, including on cancellation and constructor errors.
-pub const ManagedComputeBackend = struct {
-    backend: ops.ComputeBackend,
-    guard: @import("../execution_control.zig").UninterruptibleGuard,
-    owns_backend: bool = true,
-    workspace_borrow: ?boundary_resident.Workspace.Borrow = null,
+/// Compatibility names for the backend-owned request lifetime protocol.
+pub const ManagedComputeBackend = @import("../backends/compute_provider.zig").ManagedComputeBackend;
 
-    pub fn deinit(self: *ManagedComputeBackend) void {
-        if (!self.owns_backend) return;
-        self.owns_backend = false;
-        defer self.guard.deinit();
-        self.backend.deinit();
-        if (self.workspace_borrow) |*borrow| {
-            // A completed backend must have drained its frame and released all
-            // physical views. Reusing or unloading an aliased arena is unsafe.
-            // Preserve the established process-required fatal boundary without
-            // entering synchronous logging or C teardown on this impossible path.
-            borrow.finish() catch platform.inference_process_supervisor.restartWorker();
-        }
-        self.workspace_borrow = null;
-    }
-};
-
-pub fn getComputeBackendWithControl(
-    session: Session,
-    allocator: std.mem.Allocator,
-    control: ?InferenceExecutionControl,
-) !ManagedComputeBackend {
+pub fn getComputeBackendWithControl(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !ManagedComputeBackend {
     return getManagedComputeBackend(session, allocator, null, control);
 }
 
-/// Binds both request memory admission and cancellation to a direct model
-/// pipeline. Neither owner is stored on a shared native backend instance.
-pub fn getManagedComputeBackend(
-    session: Session,
-    allocator: std.mem.Allocator,
-    run_budget: ?*runtime.tier.memory.RunBudget,
-    control: ?InferenceExecutionControl,
-) !ManagedComputeBackend {
-    // An omitted cooperative control must not waive process isolation for a
-    // cached accelerator session. Unmanaged offline callers can explicitly use
-    // getComputeBackend; this owner always enforces the session's contract.
-    const effective = control orelse InferenceExecutionControl{};
-    try effective.check();
-    var guard = try effective.enterUninterruptible(session.interruption());
-    errdefer guard.deinit();
-    var cb = if (run_budget) |budget| try getComputeBackendWithBudget(session, allocator, budget) else try getComputeBackend(session, allocator);
-    errdefer cb.deinit();
-    cb.execution_control = control;
-    if (control) |active| try active.check();
-    return .{ .backend = cb, .guard = guard };
+pub fn getManagedComputeBackend(session: Session, allocator: std.mem.Allocator, run_budget: ?*runtime.tier.memory.RunBudget, control: ?InferenceExecutionControl) !ManagedComputeBackend {
+    return @import("../backends/compute_provider.zig").acquireWith(session, allocator, run_budget, control, acquireCompatibleComputeBackend);
+}
+
+fn acquireCompatibleComputeBackend(session: Session, allocator: std.mem.Allocator, options: @import("../backends/session.zig").ComputeBackendOptions) !ops.ComputeBackend {
+    if (session.compute_backend_provider != null) return session.acquireComputeBackend(allocator, options);
+    if (options.run_budget) |budget| return getComputeBackendWithBudget(session, allocator, budget);
+    return getComputeBackend(session, allocator);
 }
 
 /// Prepare immutable FP32 state before publishing a model or reporting an
@@ -8025,13 +7987,28 @@ pub fn getManagedGlinerBoundaryComputeBackend(
         try owner.workspace.install(&pending);
     }
     try effective.check();
-    managed.workspace_borrow = try owner.workspace.begin(runtime_identity, owner.generation);
+    var borrow = try owner.workspace.begin(runtime_identity, owner.generation);
+    managed.completion = .{
+        .ptr = borrow.workspace.?,
+        .generation = borrow.generation,
+        .epoch = borrow.epoch,
+        .finish_fn = finishBoundaryWorkspace,
+    };
     // Only this architecture's Metal constructor supplied this concrete CB.
     // The backend copies the borrow's generation/epoch and never finishes it.
     const compute: *MetalCompute = @ptrCast(@alignCast(managed.backend.ptr));
-    try compute.bindBoundaryWorkspace(&managed.workspace_borrow.?, plan.max_product_elements);
+    try compute.bindBoundaryWorkspace(&borrow, plan.max_product_elements);
     try effective.check();
     return managed;
+}
+
+fn finishBoundaryWorkspace(ptr: *anyopaque, generation: u64, epoch: u64) !void {
+    var borrow = boundary_resident.Workspace.Borrow{
+        .workspace = @ptrCast(@alignCast(ptr)),
+        .generation = generation,
+        .epoch = epoch,
+    };
+    try borrow.finish();
 }
 
 test "gliner boundary workspace plan separates persistent capacity from request ceiling" {

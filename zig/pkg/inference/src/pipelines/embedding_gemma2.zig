@@ -14,6 +14,7 @@
 // limitations under the License.
 
 //! Ordered text/image/audio/video groups, one embedding per group.
+const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const platform = @import("antfly_platform");
 const factory = @import("../architectures/session_factory.zig");
@@ -986,7 +987,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     var execution_waiter = Scheduler.Waiter{};
     try enterModel(session, lock, effective, &execution_waiter);
     defer leaveModel(lock, &execution_waiter);
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = idle_backend, .cb = &managed.backend, .control = effective, .owns_unstaged_provider = session.backend() == .metal and lock == null, .video_phases = video_phases, .composition_request = if (video_phases) try compositionRequest(execution_request, idle_backend, bounds.sequence) else null };
     lane.attach();
@@ -1212,7 +1213,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     try enterModel(session, lock, control, &execution_waiter);
     defer leaveModel(lock, &execution_waiter);
     if (session.backend() == .metal) options.video_coefficients = (try factory.videoPreparationContext(session, commands != 0)).coefficients;
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     var composition: ?VideoComposition = if (compact_policy and compactMediaEnabled(&managed.backend)) .{
         .tensor = (try managed.backend.allocUninitF32Shape(&.{ @intCast(total + items.len * 128), 512 })) orelse return error.ResidentImageOperationUnavailable,
@@ -1416,7 +1417,7 @@ pub fn embedGroupCohort(out: std.mem.Allocator, session: Session, tokenizer: Tok
     defer std.debug.assert(std.meta.eql(pool.snapshot(), media_admission.Resources{}));
     var guard = if (has_video) try control.enterUninterruptible(session.interruption()) else @import("../execution_control.zig").UninterruptibleGuard{};
     defer guard.deinit();
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = if (video_phases) idle_backend else device + retained, .cb = &managed.backend, .control = control, .video_phases = video_phases, .composition_request = if (video_phases) try compositionRequest(execution_request, idle_backend, retained_rows) else null };
     lane.attach();
@@ -2129,7 +2130,7 @@ fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, byte
     var execution_waiter = Scheduler.Waiter{};
     try enterModel(session, lock, effective, &execution_waiter);
     defer leaveModel(lock, &execution_waiter);
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
     defer if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS", false)) {
@@ -2303,7 +2304,7 @@ fn embedCudaGroup(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, 
     var execution_waiter = Scheduler.Waiter{};
     try enterModel(session, lock, effective, &execution_waiter);
     defer leaveModel(lock, &execution_waiter);
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
     const request = try cudaGroupRequest(group, options);
@@ -2995,7 +2996,7 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
         break :blk try admitWithVisionCacheReclaim(slot.session, request, slot.control);
     };
     defer permit.deinit();
-    var managed = try factory.getManagedComputeBackend(slot.session, a, null, slot.control);
+    var managed = try compute_provider.acquire(slot.session, a, null, slot.control);
     defer managed.deinit();
     const cb = &managed.backend;
     const before = MediaTransferSnapshot.init(cb);
@@ -3417,7 +3418,7 @@ fn consumePreparedMedia(slot: *PreparationSlot, tokenizer: Tokenizer, cfg: encod
         break :blk try admitWithVisionCacheReclaim(session, request, control);
     };
     defer permit.deinit();
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     const transfer_before = MediaTransferSnapshot.init(&managed.backend);
     defer observeResidentTransfers(&managed.backend, transfer_before, options);
@@ -3515,7 +3516,7 @@ fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer
     defer leaveModel(lock, &execution_waiter);
     var permit = try admitWithVisionCacheReclaim(session, request, control);
     defer permit.deinit();
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     const transfer_before = MediaTransferSnapshot.init(&managed.backend);
     defer observeResidentTransfers(&managed.backend, transfer_before, options);
@@ -3591,7 +3592,7 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
     defer leaveModel(lock, &execution_waiter);
     var permit = try admitWithVisionCacheReclaim(session, request, control);
     defer permit.deinit();
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     const transfer_before = MediaTransferSnapshot.init(&managed.backend);
     defer observeResidentTransfers(&managed.backend, transfer_before, options);
@@ -5068,7 +5069,7 @@ test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and
     defer session.close();
     // Test-only policy setup precedes all use; serving policies are immutable.
     {
-        var managed = try factory.getManagedComputeBackend(session, a, null, null);
+        var managed = try compute_provider.acquire(session, a, null, null);
         defer managed.deinit();
         const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
         compute.embedding_gemma2_policy.media_batch = true;
@@ -5093,7 +5094,7 @@ test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and
         a.free(actual.input_tokens);
     }
     {
-        var managed = try factory.getManagedComputeBackend(session, a, null, null);
+        var managed = try compute_provider.acquire(session, a, null, null);
         defer managed.deinit();
         const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
         try std.testing.expect(compute.embedding_gemma2_media_batches > 0);
@@ -5467,7 +5468,7 @@ pub fn qualifyVideoPhaseReclaim(a: std.mem.Allocator, source_session: Session, l
     var waiter = Scheduler.Waiter{};
     try enterModel(session, lock, control, &waiter);
     defer leaveModel(lock, &waiter);
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     var timing = MediaTimings{};
     var lane = StageLane{ .session = session, .gate = lock, .waiter = &waiter, .cb = &managed.backend, .control = control, .permit = &base, .idle_backend = 64 * 1024 * 1024, .video_phases = true, .timings = &timing };

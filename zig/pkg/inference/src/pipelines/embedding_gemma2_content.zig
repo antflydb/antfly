@@ -21,6 +21,7 @@
 //! embeddings are scaled by sqrt(512); projected media embeddings replace the
 //! placeholder rows after that lookup and are deliberately left unscaled.
 
+const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const tokenizer_mod = @import("inference_tokenizer");
 const ops = @import("../ops/ops.zig");
@@ -542,7 +543,7 @@ test "embeddinggemma2 CUDA resident ordered composition matches legacy BF16 boun
     const factory = @import("../architectures/session_factory.zig");
     const session = try factory.createCudaSession(a, model);
     defer session.close();
-    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    var managed = try compute_provider.acquire(session, a, null, null);
     defer managed.deinit();
     // Manual marker order intentionally differs from physical media order.
     const parts = [_]Part{ .{ .audio = .{ .bytes = audio_bytes } }, .{ .text = "first <|image|> then <|audio|> last" }, .{ .image = image_bytes } };

@@ -21,6 +21,7 @@
 
 const sequence_pool = @import("../execution/sequence_pool.zig");
 const text_inputs = @import("../execution/text_inputs.zig");
+const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const build_options = @import("build_options");
 const antfly_image = @import("antfly_image");
@@ -674,7 +675,7 @@ pub const EmbeddingPipeline = struct {
             if (self.session.backend() == .cuda) {
                 try self.lockExecution();
                 defer self.unlockExecution();
-                var managed = try session_factory.getComputeBackendWithControl(self.session, allocator, self.execution_control);
+                var managed = try compute_provider.acquireWithControl(self.session, allocator, self.execution_control);
                 defer managed.deinit();
                 const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
                 const request: @import("../backends/session.zig").RunRequest = .{ .batch = 1, .sequence = self.config.max_length, .workspace_bytes = 1536 * 1024 * 1024, .output_bytes = 768 * 4 };
@@ -695,7 +696,7 @@ pub const EmbeddingPipeline = struct {
         var prepared = prepare: {
             try self.lockExecution();
             defer self.unlockExecution();
-            var managed = try session_factory.getComputeBackendWithControl(self.session, allocator, self.execution_control);
+            var managed = try compute_provider.acquireWithControl(self.session, allocator, self.execution_control);
             defer managed.deinit();
             break :prepare try gemma2_content.prepare(&managed.backend, allocator, self.tok, self.config.text_prefix, parts, self.config.max_length, self.config.max_audio_decode_working_bytes, self.execution_control);
         };
@@ -1195,7 +1196,7 @@ pub const EmbeddingPipeline = struct {
             if (session_factory.getEmbeddingGemma2Config(self.session)) |cfg| {
                 const dimensions = self.config.embedding_gemma2_dimensions;
                 if (!@import("../architectures/embedding_gemma2.zig").validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
-                var managed = try session_factory.getManagedComputeBackend(self.session, alloc, null, self.execution_control);
+                var managed = try compute_provider.acquire(self.session, alloc, null, self.execution_control);
                 defer managed.deinit();
                 const mask = try alloc.alloc(i64, all_mask.len);
                 defer alloc.free(mask);
@@ -2823,7 +2824,7 @@ pub const EmbeddingPipeline = struct {
         batch: usize,
         seq_len: usize,
     ) !?[][]f32 {
-        var compute = try session_factory.getComputeBackendWithControl(self.session, self.allocator, self.execution_control);
+        var compute = try compute_provider.acquireWithControl(self.session, self.allocator, self.execution_control);
         defer compute.deinit();
         const cb = &compute.backend;
         if (cb.kind() != .metal) {

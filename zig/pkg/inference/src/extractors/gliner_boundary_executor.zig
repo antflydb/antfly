@@ -17,6 +17,7 @@
 //! Metal group compatible inputs into bounded physical batches; native retains
 //! its qualified serial request execution.
 //! Output is buffered atomically and independently bounded across all inputs.
+const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const wire = @import("extraction_v2.zig");
 const model = @import("../models/gliner_boundary.zig");
@@ -598,7 +599,7 @@ fn testPinnedSmallExecutor(directory: []const u8, converted: bool, metal: bool) 
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
-    var managed = try factory.getManagedComputeBackend(session, scratch, null, control);
+    var managed = try compute_provider.acquire(session, scratch, null, control);
     defer managed.deinit();
     const response = try execute(&managed.backend, scratch, &config, tokenizer.tokenizer(), &request, .{ .identity = try factory.getGlinerBoundaryIdentity(session), .control = control });
     defer scratch.free(response);
@@ -696,7 +697,7 @@ fn testWindowBatch(directory: []const u8, metal: bool) !void {
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
-    var managed = try factory.getManagedComputeBackend(session, scratch, null, control);
+    var managed = try compute_provider.acquire(session, scratch, null, control);
     defer managed.deinit();
     const options = Options{ .identity = identity, .control = control };
     const result = try execute(&managed.backend, scratch, &config, tokenizer.tokenizer(), &request, options);
@@ -1173,7 +1174,7 @@ test "CUDA boundary managed Multi-Decide batches windows and recovers after canc
     var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 256 * 1024 * 1024 };
     defer std.debug.assert(bounded.live == 0);
     const scratch = bounded.allocator();
-    var managed = try factory.getManagedComputeBackend(session, scratch, null, control);
+    var managed = try compute_provider.acquire(session, scratch, null, control);
     defer managed.deinit();
     const options = Options{ .identity = identity, .control = control };
     for ([_]usize{ 0, 2, 8, 32 }) |window_count| {

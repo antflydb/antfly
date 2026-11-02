@@ -26,6 +26,7 @@
 //   - tokenizer.json
 //   - config.json (model_type: florence2, etc.)
 
+const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -686,7 +687,7 @@ pub const ReadingPipeline = struct {
         if (incremental_admission and platform.env.getenvBool("ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX"))
             std.debug.print("FLORENCE2 cuda_incremental_admission_items={d}\n", .{batch});
 
-        var managed = try session_factory.getComputeBackendWithControl(self.vision_encoder, allocator, self.execution_control);
+        var managed = try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
         defer managed.deinit();
         const cb = &managed.backend;
 
@@ -1311,7 +1312,7 @@ pub const ReadingPipeline = struct {
             self.config.max_length,
         ));
 
-        var managed = try session_factory.getComputeBackendWithControl(self.vision_encoder, allocator, self.execution_control);
+        var managed = try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
         defer managed.deinit();
         const cb = &managed.backend;
 
@@ -1464,7 +1465,7 @@ pub const ReadingPipeline = struct {
             self.config.max_length,
         ));
 
-        var managed = try session_factory.getComputeBackendWithControl(self.vision_encoder, allocator, self.execution_control);
+        var managed = try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
         defer managed.deinit();
         const cb = &managed.backend;
 

@@ -15,6 +15,7 @@
 
 //! Admitted serial windows followed by document-global task decisions. Model
 //! tensors die after each window; only bounded scalar evidence survives.
+const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const wire = @import("extraction_v2.zig");
@@ -968,7 +969,7 @@ fn testPinnedSmallWindows(directory: []const u8, metal: bool) !void {
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     for (reference.value.cases) |case| {
         errdefer std.debug.print("long executor case: {s}\n", .{case.id});
@@ -1164,7 +1165,7 @@ test "gliner boundary long executor adaptive group shrink recovers from real enc
     defer a.free(tokenizer_bytes);
     const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     defer tokenizer.tokenizer().deinitTokenizer();
-    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    var managed = try compute_provider.acquire(session, a, null, null);
     defer managed.deinit();
 
     // 12 repeats of an 11-word sentence, windowed at word_words=20/overlap=2,
