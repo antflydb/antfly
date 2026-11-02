@@ -33,6 +33,7 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 const bert = @import("../models/bert.zig");
 const t5_mod = @import("../models/t5.zig");
 const gpt_mod = @import("../models/gpt.zig");
+const qwen35_execution = @import("qwen35_execution.zig");
 const embedding_gemma2_model = @import("../models/embedding_gemma2.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const whisper_mod = @import("../models/whisper.zig");
@@ -378,6 +379,17 @@ fn verifyGlinerDecisionSnapshot(bytes: []const u8, expected: ?gliner_decide_qual
         return error.GlinerDecisionArtifactMismatch;
 }
 
+fn validateSpecialtyWeightConfig(mf: *const manifest_mod.ModelManifest, store: tensor_store_mod.TensorStore, identity: ?gliner_decide_qualification.Identity) !void {
+    if (mf.gliner_specialty_artifact_hint == null or mf.gliner_specialty_profile != null) return;
+    // Hash outside discovery/request listing and before any encoder/head runs.
+    // Reuse an already captured identity when a modern declaration supplied it.
+    const weight = if (identity) |captured| captured.weight else blk: {
+        const reader = store.singleSafetensorsReader() orelse return;
+        break :blk gliner_decide_qualification.Digest.ofMapped(reader.file_bytes);
+    };
+    try gliner_specialty.requireKnownWeightConfig(weight, mf.gliner_span_config_digest);
+}
+
 fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: tensor_store_mod.TensorStore) !?gliner_decide_qualification.Identity {
     if (mf.gliner_architecture != .span or (!mf.gliner_span_declared and mf.gliner_specialty_profile == null)) return null;
     const family: gliner_decide_qualification.EncoderFamily = switch (mf.gliner_span_encoder_family) {
@@ -595,14 +607,14 @@ fn sessionPrefersImmutableGlinerF32Mps(
 }
 
 fn applyQualifiedGlinerSpecialtyExecutionPolicy(arch_config: *ArchConfig, profile: gliner_specialty.Profile) !void {
-    if (profile != .pii_multi) return;
+    if (profile != .pii) return;
     if (arch_config.* != .gliner) return error.UnsupportedGlinerSpecialtyArtifact;
     arch_config.gliner.metal_require_f32_weight_mirrors = true;
 }
 
 test "qualified PII specialty requires DeBERTa F32 mirrors without changing GLiGuard" {
     var pii = ArchConfig{ .gliner = .{} };
-    try applyQualifiedGlinerSpecialtyExecutionPolicy(&pii, .pii_multi);
+    try applyQualifiedGlinerSpecialtyExecutionPolicy(&pii, .pii);
     try std.testing.expect(pii.gliner.metal_require_f32_weight_mirrors);
 
     var guard = ArchConfig{ .gliner = .{} };
@@ -638,7 +650,7 @@ pub fn metalDebertaFastPathAdmissionAmounts(mf: manifest_mod.ModelManifest) runt
         .vocab_size = mf.bert_vocab_size,
         .max_position_embeddings = mf.max_position_embeddings,
         .num_labels = mf.num_labels,
-        .metal_require_f32_weight_mirrors = mf.gliner_specialty_profile == .pii_multi,
+        .metal_require_f32_weight_mirrors = mf.gliner_specialty_profile == .pii,
     }, gliner_deberta or mf.model_type == .reranker);
     return .{
         .backend_weight_bytes = reservation.persistent_bytes,
@@ -651,7 +663,7 @@ test "PII specialty Metal admission reserves required DeBERTa F32 mirrors" {
         .allocator = std.testing.allocator,
         .gliner_model_type = "gliner2",
         .gliner_span_encoder_family = .deberta,
-        .gliner_specialty_profile = .pii_multi,
+        .gliner_specialty_profile = .pii,
         .hidden_size = 768,
         .num_hidden_layers = 12,
         .num_attention_heads = 12,
@@ -979,6 +991,7 @@ fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []
     }
     const boundary_identity = if (arch_config == .gliner_boundary) try captureBoundaryIdentity(&mf, store) else null;
     const gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, store);
+    try validateSpecialtyWeightConfig(&mf, store, gliner_decision_identity);
     if (mf.gliner_specialty_profile) |profile| {
         const identity = gliner_decision_identity orelse return error.UnsupportedGlinerSpecialtyArtifact;
         if (try gliner_specialty.require(identity) != profile) return error.UnsupportedGlinerSpecialtyArtifact;
@@ -1901,6 +1914,8 @@ fn createCudaSessionWithRequiredProfile(
     gliner_precision: GlinerCudaPrecision,
 ) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    const load_started_ns = platform.time.monotonicNs();
+    defer std.log.info("inference_model_load backend=cuda phase=total elapsed_ms={d}", .{(platform.time.monotonicNs() -| load_started_ns) / std.time.ns_per_ms});
     try config.validate();
     if (config.mode.failClosed() and !load_context.allowsQualification()) {
         return error.KernelJitRequiredDynamicLoad;
@@ -1976,8 +1991,10 @@ fn createCudaSessionWithRequiredProfile(
 
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("cuda-session: create native session start path={s}", .{model_path});
+    const host_prepare_started_ns = platform.time.monotonicNs();
     var native_session = try createNativeSessionForCudaUpload(allocator, model_path, override, true);
     defer native_session.close();
+    std.log.info("inference_model_load backend=cuda phase=host_prepare elapsed_ms={d}", .{(platform.time.monotonicNs() -| host_prepare_started_ns) / std.time.ns_per_ms});
     if (debug_cuda_session) std.log.info("cuda-session: create native session done path={s}", .{model_path});
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
@@ -2012,6 +2029,7 @@ fn createCudaSessionWithRequiredProfile(
     );
 
     if (debug_cuda_session) std.log.info("cuda-session: init cuda compute start path={s}", .{model_path});
+    const device_init_started_ns = platform.time.monotonicNs();
     var cuda_compute = try cuda_compute_mod.CudaCompute.initWithKernelJitForScopeAndLoadContext(
         allocator,
         config,
@@ -2020,11 +2038,16 @@ fn createCudaSessionWithRequiredProfile(
         load_context,
     );
     errdefer cuda_compute.deinit();
+    std.log.info("inference_model_load backend=cuda phase=device_init elapsed_ms={d}", .{(platform.time.monotonicNs() -| device_init_started_ns) / std.time.ns_per_ms});
     if (debug_cuda_session) std.log.info("cuda-session: init cuda compute done path={s}", .{model_path});
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
-    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert;
+    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null;
+    cuda_compute.qualified_span_fp32 = model_manifest.gliner_specialty_profile != null;
+    if (model_manifest.gliner_specialty_profile) |profile| {
+        std.log.info("gliner_specialty_cuda_policy profile={s} weights=f32 attention=f32 diagnostic_overrides=ignored", .{@tagName(profile)});
+    }
     cuda_compute.gliner_encoder_attention = cuda_profile == .gliner25_modern_bert;
     cuda_compute.gliner_boundary_inference = cuda_profile == .gliner25_boundary;
     cuda_compute.gliner_mixed_attention = cuda_compute.gliner_encoder_attention and (gliner_precision == .fp16 or gliner_precision == .bf16);
@@ -2035,10 +2058,8 @@ fn createCudaSessionWithRequiredProfile(
         platform.env.getenvBoolDefault("ANTFLY_CUDA_GLINER_1B_Q8_F16_ATTENTION", true);
     cuda_compute.laya_optimizations = (cuda_profile == .laya or cuda_profile == .gliner25_modern_bert) and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true);
     cuda_compute.laya_fusion = cuda_compute.laya_optimizations and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_FUSION", true);
-    if (a4b_inference != null and
-        (cuda_compute.ctx.info.compute_major != 8 or cuda_compute.ctx.info.compute_minor != 9))
-    {
-        return error.A4bCudaUnsupportedDevice;
+    if (a4b_inference != null and !cuda_compute.kernels.hasGemma4A4BResidentQ4_0Primitives()) {
+        return error.A4bCudaKernelUnavailable;
     }
     cuda_compute.a4b_inference = a4b_inference;
     var resident_uploads: std.ArrayListUnmanaged(CudaResidentUpload) = .empty;
@@ -2079,6 +2100,7 @@ fn createCudaSessionWithRequiredProfile(
             return err;
         };
     }
+    std.log.info("inference_model_load backend=cuda phase=weight_upload weights={d} elapsed_ms={d}", .{ resident_uploads.items.len, (platform.time.monotonicNs() -| dense_upload_start_ns) / std.time.ns_per_ms });
     if (a4b_inference != null) {
         cuda_compute.noteA4bDenseUpload(
             platform.time.monotonicNs() -| dense_upload_start_ns,
@@ -2124,10 +2146,28 @@ fn createCudaSessionWithRequiredProfile(
     else
         runtime.tier.memory.Limits{};
     const decision_identity_handoff = unsealedGlinerDecisionIdentityHandoff(native_impl);
+    var resolved_arch_config = native_impl.arch_config;
+    const recurrent_execution: ?qwen35_execution.Decision = if (resolved_arch_config == .gpt and
+        resolved_arch_config.gpt.isQwen35() and resolved_arch_config.gpt.qwen35_has_linear_attention)
+    blk: {
+        const decision = qwen35_execution.apply(&resolved_arch_config.gpt, cuda_compute.ctx.info.compute_major, qwen35_execution.cudaCoreEnabled());
+        const placement_format = "inference recurrent placement backend=cuda placement={s} reason={s} compute={d}.{d}";
+        const placement_args = .{
+            @tagName(decision.placement), @tagName(decision.reason), cuda_compute.ctx.info.compute_major, cuda_compute.ctx.info.compute_minor,
+        };
+        // The native benchmark runner suppresses info logs. Keep its placement
+        // evidence explicit instead of inferring execution from a backend name.
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print(placement_format ++ "\n", placement_args)
+        else
+            std.log.info(placement_format, placement_args);
+        break :blk decision;
+    } else null;
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
-        .arch_config = native_impl.arch_config,
+        .arch_config = resolved_arch_config,
+        .recurrent_execution = recurrent_execution,
         .task = native_impl.task,
         .gliner_span_encoder_family = native_impl.gliner_span_encoder_family,
         .gliner_decision_identity = decision_identity_handoff.identity,
@@ -2661,6 +2701,7 @@ fn createGpuHostedSessionWithTaskOverride(
         }
         if (arch_config == .embedding_gemma2) try embedding_gemma2_arch.validateWeights(allocator, tensor_store.?, arch_config.embedding_gemma2);
         gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, tensor_store.?);
+        try validateSpecialtyWeightConfig(&mf, tensor_store.?, gliner_decision_identity);
         if (mf.gliner_specialty_profile) |profile| {
             const identity = gliner_decision_identity orelse return error.UnsupportedGlinerSpecialtyArtifact;
             if (try gliner_specialty.require(identity) != profile) return error.UnsupportedGlinerSpecialtyArtifact;
@@ -3236,6 +3277,10 @@ fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8
         cfg.classification_token_id = mf.gliner_token_c;
     if (mf.gliner_token_e != 0) cfg.entity_token_id = mf.gliner_token_e;
     if (mf.gliner_token_r != 0) cfg.relation_token_id = mf.gliner_token_r;
+
+    // Exact specialty markers come from the authenticated tokenizer snapshot.
+    // Do not reread an unpinned legacy override after capturing that identity.
+    if (mf.gliner_specialty_profile != null) return;
 
     const at_path = try std.fmt.allocPrint(allocator, "{s}/added_tokens.json", .{model_path});
     defer allocator.free(at_path);
@@ -7703,6 +7748,7 @@ const ArchSession = struct {
     video_coefficient_suspended: bool = false,
     allocator: std.mem.Allocator,
     arch_config: ArchConfig,
+    recurrent_execution: ?qwen35_execution.Decision = null,
     boundary_identity: ?boundary_bundle.Identity = null,
     gliner_decision_identity: ?gliner_decide_qualification.Identity = null,
     gliner_decision_identity_sealed: bool = false,
@@ -8395,6 +8441,14 @@ fn makeComputeBackend(
     };
 }
 
+/// The placement resolved at model load; read-only diagnostics never re-resolve
+/// mutable environment flags or alter an existing recurrent history.
+pub fn getRecurrentExecution(session: Session) ?qwen35_execution.Decision {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return self.recurrent_execution;
+}
+
 /// Get GPT config from a session, if it's a GPT model. Returns null for non-GPT architectures.
 pub fn getGptConfig(session: Session) ?gpt_mod.Config {
     if (session.vtable != &arch_vtable) return null;
@@ -8500,6 +8554,24 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
         .cuda => self.backend_data.cuda.compute.snapshotStats(),
         else => null,
     };
+}
+
+pub const CudaAllocationStats = struct {
+    limit: usize,
+    live: usize,
+    peak: usize,
+};
+
+/// Physical CUDA buffers owned by the session, including weights and cached
+/// temporaries. Peak spans the context lifetime; driver/library-private memory
+/// is outside this meter. Call while holding the session execution lock.
+pub fn getCudaAllocationStats(session: Session) ?CudaAllocationStats {
+    if (comptime !build_options.enable_cuda) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .cuda) return null;
+    const value = self.backend_data.cuda.compute.allocationStats();
+    return .{ .limit = value.limit, .live = value.live, .peak = value.peak };
 }
 
 /// Drain any buffered non-blocking CUDA op-profile events into the compute's

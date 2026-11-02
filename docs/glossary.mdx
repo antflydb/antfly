@@ -22,6 +22,8 @@ See: [Mirror a PostgreSQL Table](/docs/guides/cdc-replication) | [CDC design](ht
 
 The `document_extraction` asset producer downloads a document URL during enrichment and persists derived units such as PDF pages and chunks. Native text is extracted with no model. Scanned pages and images are read when the config's `ocr` block names a reader, such as [LightOnOCR-3](/docs/guides/models/lightonocr3); without one they report `ocr_not_configured`. Audio is transcribed when a `transcription` block names a `transcriber`. This durable ingestion path is distinct from [template](#templates) helpers such as `remoteMedia`, which prepare media for inference without persisting page artifacts.
 
+See: [Index PDFs and Scanned Documents](/docs/guides/index-documents)
+
 ### Enrichments, Artifacts & Asset Producers
 
 An **enrichment** is a named producer that generates and maintains **artifacts**, durable outputs attached to a document and exposed under `_artifacts`. Enrichment kinds are `chunk`, `asset`, and `embedding`. Summaries, extraction, OCR, transcription, and decisions are all `asset` artifacts made by an **asset producer** (`copy`, `generator`, `extractor`, `decision`, `reader`, `transcriber`, or [`document_extraction`](#document-extraction)), and indexes can consume artifact streams as sources.

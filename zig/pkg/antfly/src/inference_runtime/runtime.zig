@@ -320,8 +320,16 @@ test "structured extraction request selects the JSON interface" {
 
 fn runHelpRequested(args: *std.process.Args.Iterator) bool {
     var probe = args.*;
+    var saw_flag = false;
     while (probe.next()) |arg| {
-        if (isHelpArg(arg)) return true;
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+        if (std.mem.startsWith(u8, arg, "-")) {
+            saw_flag = true;
+            continue;
+        }
+        // `help` is a request only before any flag, never a flag value such
+        // as `--models-dir help`.
+        if (!saw_flag and std.mem.eql(u8, arg, "help")) return true;
     }
     return false;
 }
@@ -420,6 +428,7 @@ fn runConfiguredWarmModel(model: common_config.Config.InferenceConfig.WarmModelC
     return .{
         .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidArguments,
         .name = model.name,
+        .pin = model.pin,
         .backend = try parseOptionalBackendType(model.backend),
         .cuda_precision = if (model.cuda_precision) |value| switch (value) {
             .auto => .auto,
@@ -481,6 +490,7 @@ fn resolveRunModelSettings(alloc: std.mem.Allocator, config: ?*const common_conf
                 if (configured.kind != warm.kind or configured.backend != warm.backend) continue;
                 if (matched) return error.AmbiguousPreloadModelConfig;
                 matched = true;
+                warm.pin = configured.pin; // CLI identity flags do not specify retention.
                 warm.cuda_precision = warm.cuda_precision orelse configured.cuda_precision;
                 warm.residency_mode = warm.residency_mode orelse configured.residency_mode;
                 warm.memory_budget_mb = warm.memory_budget_mb orelse configured.memory_budget_mb;
@@ -844,7 +854,9 @@ pub fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.
     defer alloc.free(models);
 
     for (models) |m| {
-        std.debug.print("{s:<12} {s}\n", .{ @tagName(m.kind), m.name });
+        if (m.load_error) |err| {
+            std.debug.print("{s:<12} {s}  unusable: {s}\n", .{ @tagName(m.kind), m.name, @errorName(err) });
+        } else std.debug.print("{s:<12} {s}\n", .{ @tagName(m.kind), m.name });
     }
 }
 
@@ -1480,6 +1492,12 @@ test "inference runtime preserves effective process envelope provenance" {
             inferenceProcessMemoryLimitProvenance(case.source),
         );
     }
+}
+
+test "inference run treats help after a flag as its value" {
+    var argv = [_][*:0]const u8{ "--models-dir", "help" };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expect(!runHelpRequested(&args));
 }
 
 test "inference run detects trailing help without consuming arguments" {

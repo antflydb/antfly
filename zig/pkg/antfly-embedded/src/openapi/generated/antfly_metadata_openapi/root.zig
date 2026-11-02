@@ -212,6 +212,7 @@ pub const RelationalRowMutationRequest = types.RelationalRowMutationRequest;
 pub const RelationalRowQueryRequest = types.RelationalRowQueryRequest;
 pub const RenameCatalogResourceRequest = types.RenameCatalogResourceRequest;
 pub const RepairIssueListRequest = types.RepairIssueListRequest;
+pub const RepairRemainingFailure = types.RepairRemainingFailure;
 pub const RepairRunRequest = types.RepairRunRequest;
 pub const RepairTarget = types.RepairTarget;
 pub const ReplicationRoute = types.ReplicationRoute;

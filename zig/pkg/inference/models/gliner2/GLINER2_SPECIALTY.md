@@ -3,7 +3,10 @@
 The original FP32 specialty checkpoints use the existing DeBERTa/span runtime.
 Each profile authenticates its complete weights, tokenizer sidecars, geometry,
 and marker IDs at load time. The native CPU path supplies the reference for
-Metal qualification. CUDA is not qualified for these profiles.
+Metal qualification. The combined implementation also supports CUDA; see
+[SPECIALTY.md](SPECIALTY.md) for its strict-FP32 contract and GB10 evidence.
+The measurements below were collected on the original Metal branch; combining
+the implementations does not substitute for rerunning either hardware campaign.
 
 | Model | Revision | Public capability |
 | --- | --- | --- |

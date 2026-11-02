@@ -25,11 +25,20 @@ const native_spill_supported = @import("builtin").os.tag != .freestanding;
 pub const none = std.math.maxInt(u64);
 const frame_bytes = 25;
 const snappy = @import("../encoding/snappy.zig");
+const Quota = @import("antfly_platform").allocator.reclamation.Quota;
+const HostBudget = @import("../storage/resource_manager.zig").BudgetedAllocator;
 
 pub const Manager = struct {
+    const BudgetLink = struct { manager: *Manager, allocator: Allocator, hook: @import("memory_budget.zig").Reclaimer };
+    payload_budget_links: [32]BudgetLink = undefined,
+    payload_budget_count: usize = 0,
+    payload_cache_users: usize = 0,
     /// Scoped allocation owners retain the enclosing statement's disk and FD
     /// admission. Children close before this borrowed owner is destroyed.
     quota_parent: ?*Manager = null,
+    payload_cache_mutex: std.atomic.Mutex = .unlocked,
+    payload_caches: ?*PayloadCache = null,
+    payload_reclaim_cursor: ?*PayloadCache = null,
     execution_pages: ?*@import("execution_pager.zig").Pager = null,
     page_residency_bytes: usize = 4 * 1024 * 1024,
     patterns: std.ArrayList(*scalar.PatternSet) = .empty,
@@ -99,28 +108,224 @@ pub const Manager = struct {
         self.execution_pages = owner;
         return owner;
     }
+    fn cacheRoot(self: *Manager) *Manager {
+        var owner = self;
+        while (owner.quota_parent) |parent| owner = parent;
+        return owner;
+    }
+    fn registerPayloadCache(self: *Manager, cache: *PayloadCache) void {
+        const root = self.cacheRoot();
+        @import("antfly_platform").sync.lockYielding(&root.payload_cache_mutex);
+        defer root.payload_cache_mutex.unlock();
+        cache.next_cache = root.payload_caches;
+        root.payload_caches = cache;
+        self.payload_cache_users += 1;
+        if (self.payload_cache_users == 1) self.registerPayloadBudgets();
+    }
+    fn unregisterPayloadCache(self: *Manager, cache: *PayloadCache) void {
+        const root = self.cacheRoot();
+        @import("antfly_platform").sync.lockYielding(&root.payload_cache_mutex);
+        defer root.payload_cache_mutex.unlock();
+        var link = &root.payload_caches;
+        while (link.*) |current| {
+            if (current == cache) {
+                link.* = current.next_cache;
+                if (root.payload_reclaim_cursor == cache) root.payload_reclaim_cursor = current.next_cache;
+                cache.next_cache = null;
+                self.payload_cache_users -= 1;
+                if (self.payload_cache_users == 0) {
+                    for (self.payload_budget_links[0..self.payload_budget_count]) |*link_| {
+                        if (@import("memory_budget.zig").parentAllocator(link_.allocator) != null) {
+                            const budget: *@import("memory_budget.zig") = @ptrCast(@alignCast(link_.allocator.ptr));
+                            budget.unregisterReclaimer(&link_.hook);
+                        } else if (Quota.owner(link_.allocator)) |owner| {
+                            owner.residency.unregister(&link_.hook);
+                        } else HostBudget.reclamationLayer(link_.allocator).?.owner.residency.unregister(&link_.hook);
+                    }
+                    self.payload_budget_count = 0;
+                }
+                return;
+            }
+            link = &current.next_cache;
+        }
+        unreachable;
+    }
+    fn reclaimPayloadCache(self: *Manager) bool {
+        return self.reclaimPayloadCacheFor(null);
+    }
+    fn reclaimPayloadCacheFor(self: *Manager, budget: ?Allocator) bool {
+        const root = self.cacheRoot();
+        // Budget hooks hold their own lifetime lock. Registration takes this
+        // directory lock first, so callbacks must never wait for it in reverse.
+        if (!root.payload_cache_mutex.tryLock()) return false;
+        defer root.payload_cache_mutex.unlock();
+        const first = root.payload_reclaim_cursor orelse root.payload_caches orelse return false;
+        var current = first;
+        while (true) {
+            const next = current.next_cache orelse root.payload_caches.?;
+            if ((budget == null or containsAllocator(current.manager.?.alloc, budget.?)) and current.evict()) {
+                root.payload_reclaim_cursor = next;
+                return true;
+            }
+            current = next;
+            if (current == first) return false;
+        }
+    }
+    fn allocatorParent(a: Allocator) ?Allocator {
+        if (Quota.owner(a)) |owner| return owner.backing;
+        if (@import("memory_budget.zig").parentAllocator(a)) |parent| return parent;
+        if (parentAllocator(a)) |parent| return parent;
+        if (HostBudget.reclamationLayer(a)) |layer| return layer.backing;
+        return @import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a);
+    }
+    fn containsAllocator(a: Allocator, budget: Allocator) bool {
+        var current = a;
+        for (0..32) |_| {
+            if (current.ptr == budget.ptr and (@import("memory_budget.zig").parentAllocator(current) != null or HostBudget.reclamationLayer(current) != null or Quota.owner(current) != null)) return true;
+            current = allocatorParent(current) orelse return false;
+        }
+        return false;
+    }
+    fn reclaimBudget(raw: *anyopaque) bool {
+        const link: *BudgetLink = @ptrCast(@alignCast(raw));
+        return link.manager.reclaimPayloadCacheFor(link.allocator);
+    }
+    fn registerPayloadBudgets(self: *Manager) void {
+        var current = self.alloc;
+        for (0..32) |_| {
+            const sql = @import("memory_budget.zig").parentAllocator(current) != null;
+            const host = HostBudget.reclamationLayer(current);
+            const quota = Quota.owner(current);
+            if (sql or host != null or quota != null) {
+                const link = &self.payload_budget_links[self.payload_budget_count];
+                link.* = .{ .manager = self, .allocator = current, .hook = .{ .ptr = link, .reclaim = reclaimBudget } };
+                self.payload_budget_count += 1;
+                if (sql) {
+                    const budget: *@import("memory_budget.zig") = @ptrCast(@alignCast(current.ptr));
+                    budget.registerReclaimer(&link.hook);
+                } else if (quota) |owner| {
+                    owner.residency.register(&link.hook);
+                } else host.?.owner.residency.register(&link.hook);
+            }
+            current = allocatorParent(current) orelse return;
+        }
+    }
+    fn reclaimableAllocator(a: Allocator) bool {
+        const Budget = @import("memory_budget.zig");
+        var current = a;
+        for (0..32) |_| {
+            if (Budget.parentAllocator(current)) |parent| {
+                const budget: *Budget = @ptrCast(@alignCast(current.ptr));
+                if (budget.monotonic) return false;
+                current = parent;
+                continue;
+            }
+            if (parentAllocator(current)) |parent| {
+                current = parent;
+                continue;
+            }
+            if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(current)) |parent| {
+                current = parent;
+                continue;
+            }
+            if (Quota.owner(current)) |owner| {
+                current = owner.backing;
+                continue;
+            }
+            if (HostBudget.reclamationLayer(current)) |layer| {
+                current = layer.backing;
+                continue;
+            }
+            const reclaimed = @import("antfly_platform").allocator.reclaimingScratch(current);
+            if (reclaimed.ptr != current.ptr or reclaimed.vtable != current.vtable) return false;
+            if (comptime !@import("builtin").single_threaded) if (current.vtable == std.heap.smp_allocator.vtable) return true;
+            if (current.vtable == std.heap.page_allocator.vtable) return true;
+            if (comptime @import("builtin").link_libc) if (current.vtable == std.heap.c_allocator.vtable) return true;
+            if (comptime @import("builtin").is_test) if (current.vtable == std.testing.allocator.vtable) return true;
+            return false;
+        }
+        return false;
+    }
+    /// Walk known allocator wrappers before entering their locks. Outer budget
+    /// admission can then reclaim a nested manager's idle payloads safely.
+    pub fn prepareAllocator(a: Allocator, growth: usize) void {
+        const Budget = @import("memory_budget.zig");
+        if (!Budget.AllocationGuard.allowed() or growth == 0) return;
+        var current = a;
+        for (0..32) |_| {
+            if (parentAllocator(current) != null) {
+                const manager: *Manager = @ptrCast(@alignCast(current.ptr));
+                manager.prepareAllocationFor(a, growth);
+                current = manager.alloc;
+                continue;
+            }
+            if (Budget.parentAllocator(current)) |parent| {
+                const budget: *Budget = @ptrCast(@alignCast(current.ptr));
+                budget.preflight(a, growth);
+                current = parent;
+                continue;
+            }
+            if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(current)) |parent| {
+                current = parent;
+                continue;
+            }
+            if (Quota.owner(current)) |owner| {
+                owner.prepare(growth);
+                current = owner.backing;
+                continue;
+            }
+            if (HostBudget.reclamationLayer(current)) |layer| {
+                layer.owner.prepareAllocation(growth);
+                current = layer.backing;
+                continue;
+            }
+            const reclaimed = @import("antfly_platform").allocator.reclaimingScratch(current);
+            if (reclaimed.ptr == current.ptr and reclaimed.vtable == current.vtable) return;
+            current = reclaimed;
+        }
+    }
+    fn prepareAllocationFor(self: *Manager, a: Allocator, growth: usize) void {
+        if (!@import("memory_budget.zig").AllocationGuard.allowed()) return;
+        while (true) {
+            const available = @import("memory_budget.zig").headroom(a) orelse return;
+            if (growth <= available or !self.reclaimPayloadCache()) return;
+        }
+    }
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *Manager = @ptrCast(@alignCast(raw));
+        prepareAllocator(self.allocator(), len);
+        @import("memory_budget.zig").AllocationGuard.enter(&self.allocation_mutex);
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.allocationLock();
         defer self.allocation_mutex.unlock();
         return self.alloc.rawAlloc(len, alignment, ra);
     }
     fn resizeAllocation(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *Manager = @ptrCast(@alignCast(raw));
+        prepareAllocator(self.allocator(), len -| bytes.len);
+        @import("memory_budget.zig").AllocationGuard.enter(&self.allocation_mutex);
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.allocationLock();
         defer self.allocation_mutex.unlock();
         return self.alloc.rawResize(bytes, alignment, len, ra);
     }
     fn remapAllocation(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *Manager = @ptrCast(@alignCast(raw));
+        prepareAllocator(self.allocator(), len -| bytes.len);
+        @import("memory_budget.zig").AllocationGuard.enter(&self.allocation_mutex);
+        defer @import("memory_budget.zig").AllocationGuard.leave();
         self.allocationLock();
         defer self.allocation_mutex.unlock();
         return self.alloc.rawRemap(bytes, alignment, len, ra);
     }
     fn freeAllocation(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *Manager = @ptrCast(@alignCast(raw));
-        self.allocationLock();
-        defer self.allocation_mutex.unlock();
+        const Guard = @import("memory_budget.zig").AllocationGuard;
+        const reuse = Guard.reuse(&self.allocation_mutex);
+        Guard.enter(&self.allocation_mutex);
+        defer Guard.leave();
+        if (!reuse) self.allocationLock();
+        defer if (!reuse) self.allocation_mutex.unlock();
         self.alloc.rawFree(bytes, alignment, ra);
     }
     fn increment(self: *Manager, comptime field: []const u8, value: anytype) void {
@@ -232,6 +437,7 @@ pub const Manager = struct {
         return .{ .manager = self, .file = file, .id = self.sequence };
     }
     pub fn deinit(self: *Manager) void {
+        std.debug.assert(self.payload_cache_users == 0 and self.payload_budget_count == 0);
         if (self.execution_pages) |owner| {
             owner.deinit();
             self.allocator().destroy(owner);
@@ -750,16 +956,63 @@ fn jsonNumber(bytes: []const u8) bool {
     }
     return at == bytes.len;
 }
+// Stable subscriptions only publish atomic byte deltas. They never allocate,
+// acquire cache/allocator locks, or borrow a movable hash-map entry.
+const RetainedSubscription = struct {
+    next: ?*RetainedSubscription = null,
+    pending: *std.atomic.Value(usize),
+    initial: usize = 0,
+};
 const JsonOwner = struct {
+    retention_mutex: std.atomic.Mutex = .unlocked,
+    retained_capacity: std.atomic.Value(usize) = .init(0),
+    subscribers: ?*RetainedSubscription = null,
     arena: std.heap.ArenaAllocator,
     mutex: std.atomic.Mutex = .unlocked,
-    // Only consumers crossing a scalar/text boundary allocate cache records.
-    // Keys borrow validated, immutable ranges owned by the enclosing block.
     cached: std.AutoHashMapUnmanaged(usize, *FrozenJson) = .empty,
+    fn retentionLock(self: *JsonOwner) void {
+        @import("antfly_platform").sync.lockYielding(&self.retention_mutex);
+    }
+    // Called while the JSON mutation mutex is held, including failed partial
+    // allocations. The separate lifetime lock never encloses allocation/free.
+    fn publishCapacity(self: *JsonOwner) void {
+        const capacity = self.arena.queryCapacity();
+        if (capacity == self.retained_capacity.load(.acquire)) return;
+        self.retentionLock();
+        defer self.retention_mutex.unlock();
+        const previous = self.retained_capacity.swap(capacity, .acq_rel);
+        std.debug.assert(capacity >= previous);
+        var link = self.subscribers;
+        while (link) |current| : (link = current.next) {
+            _ = current.pending.fetchAdd(capacity - previous, .release);
+        }
+    }
+    fn subscribe(self: *JsonOwner, link: *RetainedSubscription) usize {
+        self.retentionLock();
+        defer self.retention_mutex.unlock();
+        link.initial = self.retained_capacity.load(.acquire);
+        link.next = self.subscribers;
+        self.subscribers = link;
+        return link.initial;
+    }
+    fn unsubscribe(self: *JsonOwner, link: *RetainedSubscription) usize {
+        self.retentionLock();
+        defer self.retention_mutex.unlock();
+        var cursor = &self.subscribers;
+        while (cursor.*) |current| {
+            if (current == link) {
+                cursor.* = current.next;
+                return self.retained_capacity.load(.acquire) - link.initial;
+            }
+            cursor = &current.next;
+        }
+        unreachable;
+    }
     fn get(self: *JsonOwner, bytes: []const u8, lossless: bool) !*FrozenJson {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         if (self.cached.get(@intFromPtr(bytes.ptr))) |entry| return entry;
+        defer self.publishCapacity();
         const a = self.arena.allocator();
         const entry = try a.create(FrozenJson);
         entry.* = .{ .owner = self, .bytes = bytes, .lossless = lossless };
@@ -767,6 +1020,7 @@ const JsonOwner = struct {
         return entry;
     }
     fn deinit(self: *JsonOwner) void {
+        std.debug.assert(self.subscribers == null);
         self.arena.deinit();
     }
 };
@@ -792,6 +1046,7 @@ const FrozenJson = struct {
         self.lock();
         defer self.owner.mutex.unlock();
         if (self.value == null) {
+            defer self.owner.publishCapacity();
             var decoder: Decoder = .{ .validated_json = true, .a = self.owner.arena.allocator(), .bytes = self.bytes };
             self.value = try decoder.json(0);
         }
@@ -804,6 +1059,7 @@ const FrozenJson = struct {
         self.lock();
         defer self.owner.mutex.unlock();
         if (self.text == null) {
+            defer self.owner.publishCapacity();
             const work = @import("memory_budget.zig").reclaimingAllocator(self.owner.arena.allocator());
             var output: std.Io.Writer.Allocating = .init(work);
             defer output.deinit();
@@ -1213,7 +1469,7 @@ fn appendColumnarBatchVersionMode(output_alloc: Allocator, scratch: Allocator, b
     const pa = physical_arena.allocator();
     const physical = try pa.alloc(?@import("execution_batch.zig").PhysicalColumn, values.width());
     for (physical, 0..) |*view, column| view.* = try values.physicalColumn(pa, column);
-    try Sequential.encodeBatchColumns(&encoder, values, physical, 0, values.len());
+    try Sequential.encodeBatchColumns(&encoder, values, physical, 0, values.len(), false);
 }
 /// Payload bytes and decoded metadata borrow the caller's page arena. Fetch
 /// authenticated artifact bytes into that same arena before decoding, so no
@@ -1256,6 +1512,7 @@ fn decodeColumnarBlockManaged(a: Allocator, cache_backing: ?Allocator, bytes: []
     for (values) |*column| column.* = try Sequential.EncodedColumn.decode(&decoder, count);
     for (keys) |*column| column.* = try Sequential.EncodedColumn.decode(&decoder, count);
     if (decoder.position != bytes.len) return error.InvalidSqlSpill;
+    if (decoder.json_owner) |owner| owner.publishCapacity();
     return .{ .values = values, .keys = keys, .ordinals = ordinals, .json_owner = decoder.json_owner };
 }
 
@@ -1294,7 +1551,10 @@ pub const CachePressure = struct {
             const shared = @import("memory_budget.zig").headroom(self.manager.alloc);
             const local = if (self.backing) |backing| @import("memory_budget.zig").headroom(backing) else null;
             const available = @min(shared orelse std.math.maxInt(usize), local orelse std.math.maxInt(usize));
-            if (growth <= available or !self.evict(self.context)) break;
+            if (growth <= available) break;
+            if (self.evict(self.context)) continue;
+            if (@import("memory_budget.zig").AllocationGuard.allowed() and growth > (shared orelse std.math.maxInt(usize)) and self.manager.reclaimPayloadCache()) continue;
+            break;
         }
     }
     pub fn allocator(self: *CachePressure) Allocator {
@@ -2132,6 +2392,14 @@ pub const Sequential = struct {
     /// Encode borrowed columns synchronously. Neither payloads nor row arrays
     /// enter the per-run staging arena; physical dictionary values stay borrowed.
     pub fn appendBatch(self: *Sequential, values: @import("execution_batch.zig").Batch, keys: @import("execution_batch.zig").Batch, ordinals: []const u64) !void {
+        return self.appendBatchMode(values, keys, ordinals, false);
+    }
+    // Merge scatters gather only the column currently being encoded. Holding
+    // every gathered column at once would make scratch grow with row width.
+    fn appendMergeBatch(self: *Sequential, values: @import("execution_batch.zig").Batch, keys: @import("execution_batch.zig").Batch, ordinals: []const u64) !void {
+        return self.appendBatchMode(values, keys, ordinals, true);
+    }
+    fn appendBatchMode(self: *Sequential, values: @import("execution_batch.zig").Batch, keys: @import("execution_batch.zig").Batch, ordinals: []const u64, comptime gather_columns: bool) !void {
         if (values.len() != keys.len() or values.len() != ordinals.len) return error.InvalidSqlSpill;
         try self.flush();
         var physical_arena = std.heap.ArenaAllocator.init(self.file.manager.allocator());
@@ -2141,11 +2409,11 @@ pub const Sequential = struct {
         const physical_values = try pa.alloc(?Physical, values.width());
         const physical_keys = try pa.alloc(?Physical, keys.width());
         for (physical_values, 0..) |*view, column| {
-            view.* = try values.physicalColumn(pa, column);
+            view.* = if (gather_columns) null else try values.physicalColumn(pa, column);
             if (view.*) |native| try native.validate();
         }
         for (physical_keys, 0..) |*view, column| {
-            view.* = try keys.physicalColumn(pa, column);
+            view.* = if (gather_columns) null else try keys.physicalColumn(pa, column);
             if (view.*) |native| try native.validate();
         }
         var begin: usize = 0;
@@ -2173,14 +2441,14 @@ pub const Sequential = struct {
             try encoder.word(values.width());
             try encoder.word(keys.width());
             for (ordinals[begin..end]) |ordinal| try encoder.word(ordinal);
-            try encodeBatchColumns(&encoder, values, physical_values, begin, end);
-            try encodeBatchColumns(&encoder, keys, physical_keys, begin, end);
+            try encodeBatchColumns(&encoder, values, physical_values, begin, end, gather_columns);
+            try encodeBatchColumns(&encoder, keys, physical_keys, begin, end, gather_columns);
             try self.writeEncoded(bytes.items);
             self.size += end - begin;
             begin = end;
         }
     }
-    fn encodeBatchColumns(encoder: *Encoder, batch: @import("execution_batch.zig").Batch, physical_columns: []const ?@import("execution_batch.zig").PhysicalColumn, begin: usize, end: usize) !void {
+    fn encodeBatchColumns(encoder: *Encoder, batch: @import("execution_batch.zig").Batch, physical_columns: []const ?@import("execution_batch.zig").PhysicalColumn, begin: usize, end: usize, comptime gather_columns: bool) !void {
         var scratch = std.heap.ArenaAllocator.init(encoder.scratch orelse encoder.a);
         defer scratch.deinit();
         const temporary = scratch.allocator();
@@ -2201,6 +2469,11 @@ pub const Sequential = struct {
             }
             if (!column_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
             const column_alloc = column_scratch.allocator();
+            if (gather_columns) if (try selected.physicalColumn(column_alloc, column)) |native| {
+                try native.validate();
+                try encodeNativeColumn(encoder, native);
+                continue;
+            };
             var frozen: [256]?@import("execution_batch.zig").FrozenJson = undefined;
             var encoded: [256]?[]const u8 = undefined;
             var has_encoded = false;
@@ -2833,6 +3106,75 @@ pub const Sequential = struct {
             dictionary: Dictionary,
         },
         const SharedColumn = struct { base: EncodedColumn, bodies: []?*OwnedBlock };
+        fn nativeTag(self: EncodedColumn) ?u8 {
+            const wire_kind = switch (self.values) {
+                .fixed => |v| v.kind,
+                .dictionary => |v| v.kind,
+                .texts => |v| if (v.decimal) return null else @as(u8, 5),
+                else => return null,
+            };
+            return switch (wire_kind) {
+                1, 2, 3, 5 => wire_kind,
+                else => null,
+            };
+        }
+        fn nativeValue(self: EncodedColumn, comptime T: type, row: usize) T {
+            return switch (self.values) {
+                .fixed => |v| if (T == bool) v.bytes[v.positions[row]] == 1 else if (T == i64 or T == f64) @bitCast(std.mem.readInt(u64, v.bytes[@as(usize, v.positions[row]) * 8 ..][0..8], .little)) else unreachable,
+                .dictionary => |v| if (T == []const u8) v.texts[v.indices[row]] else if (T == bool) v.bytes[v.indices[row]] == 1 else @bitCast(std.mem.readInt(u64, v.bytes[@as(usize, v.indices[row]) * 8 ..][0..8], .little)),
+                .texts => |v| if (T == []const u8) v.values[row] else unreachable,
+                else => unreachable,
+            };
+        }
+        /// Gather primitive wire lanes without Datum reconstruction or payload
+        /// copies. Heterogeneous JSON, decimal and shared columns decline before
+        /// allocating; the existing scalar/frozen codec remains authoritative.
+        fn gatherPhysical(a: Allocator, columns: []const *const EncodedColumn, rows: []const usize) !?@import("execution_batch.zig").PhysicalColumn {
+            if (columns.len != rows.len or rows.len > 256) return error.InvalidSqlSpill;
+            if (rows.len == 0) return null;
+            const wire_kind = columns[0].nativeTag() orelse return null;
+            for (columns, rows) |column, row| {
+                if (column.nativeTag() != wire_kind) return null;
+                const count = switch (column.values) {
+                    .fixed => |v| v.positions.len,
+                    .dictionary => |v| v.indices.len,
+                    .texts => |v| v.values.len,
+                    else => unreachable,
+                };
+                if (row >= count) return error.InvalidSqlSpill;
+                if (((column.flags[row / 4] >> @as(u3, @intCast(row % 4 * 2))) & 3) > 1) return null;
+            }
+            const nulls = try a.alloc(u8, rows.len);
+            errdefer a.free(nulls);
+            for (columns, rows, nulls) |column, row, *flag| flag.* = @intFromBool(column.isSqlNull(row));
+            switch (wire_kind) {
+                inline 1, 2, 3, 5 => |kind| {
+                    const T = switch (kind) {
+                        1 => bool,
+                        2 => i64,
+                        3 => f64,
+                        5 => []const u8,
+                        else => unreachable,
+                    };
+                    const values = try a.alloc(T, rows.len);
+                    for (columns, rows, nulls, values) |column, row, flag, *value| value.* = if (flag != 0) (if (T == bool) false else if (T == []const u8) "" else 0) else column.nativeValue(T, row);
+                    return .{ .vector = .{ .name = "", .values = switch (kind) {
+                        1 => .{ .bool = values },
+                        2 => .{ .i64 = values },
+                        3 => .{ .f64 = values },
+                        5 => .{ .bytes = values },
+                        else => unreachable,
+                    }, .nulls = .{ .bytes = nulls } }, .range = .{ .count = rows.len }, .kind = switch (kind) {
+                        1 => .boolean,
+                        2 => .integer,
+                        3 => .number,
+                        5 => .string,
+                        else => unreachable,
+                    }, .element = if (kind == 3) .float64 else null };
+                },
+                else => unreachable,
+            }
+        }
         fn isSqlNull(self: EncodedColumn, index: usize) bool {
             if (self.values == .dynamic) {
                 const dynamic = self.values.dynamic;
@@ -3027,14 +3369,14 @@ pub const Sequential = struct {
         /// Include separately owned lazy DOM/text caches in retention policy.
         /// The page's immutable metadata arena has one owner; cache publication
         /// synchronizes through JsonOwner just as scalar/text access does.
+        fn immutableRetainedBytes(self: *const OwnedBlock) usize {
+            return @sizeOf(OwnedBlock) +| self.arena.queryCapacity() +| self.dependencies.capacity *| @sizeOf(*OwnedBlock);
+        }
         fn ownRetainedBytes(self: *const OwnedBlock) usize {
-            var bytes = @sizeOf(OwnedBlock) +| self.arena.queryCapacity();
-            if (self.encoded) |encoded| if (encoded.json_owner) |owner| {
-                while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
-                defer owner.mutex.unlock();
-                bytes +|= owner.arena.queryCapacity();
-            };
-            return bytes +| self.dependencies.capacity *| @sizeOf(*OwnedBlock);
+            return self.immutableRetainedBytes() +| if (self.encoded) |encoded|
+                (if (encoded.json_owner) |owner| owner.retained_capacity.load(.acquire) else 0)
+            else
+                0;
         }
         pub fn retainedBytes(self: *const OwnedBlock) usize {
             var bytes = self.ownRetainedBytes();
@@ -3090,12 +3432,7 @@ pub const Sequential = struct {
                     const columns = if (view.keys) encoded.keys else encoded.values;
                     if (column >= columns.len) return error.InvalidSqlSpill;
                     const stored = columns[column];
-                    const wire_tag = switch (stored.values) {
-                        .fixed => |v| v.kind,
-                        .dictionary => |v| v.kind,
-                        .texts => |v| if (v.decimal) return null else @as(u8, 5),
-                        else => return null,
-                    };
+                    const wire_tag = stored.nativeTag() orelse return null;
                     for (0..encoded.count()) |row_index| {
                         const flag = (stored.flags[row_index / 4] >> @as(u3, @intCast(row_index % 4 * 2))) & 3;
                         if (flag > 1) return null;
@@ -3438,6 +3775,7 @@ pub const Sequential = struct {
             decoder.json_consumption = .scalar;
             for (keys) |*column| column.* = try EncodedColumn.decode(&decoder, count_rows);
             if (decoder.position != payload.len) return error.InvalidSqlSpill;
+            if (decoder.json_owner) |json_owner| json_owner.publishCapacity();
             owner.encoded = .{ .values = values, .keys = keys, .ordinals = ordinals, .json_owner = decoder.json_owner };
             physical.* += header.len + len;
         }
@@ -3665,12 +4003,450 @@ fn nativeRowsEqual(a: Allocator, batch: @import("execution_batch.zig").Batch, le
     return true;
 }
 
+/// Optional immutable payload residency. Roots have an intrusive LRU; the owner
+/// graph accounts shared bodies once. All metadata and bytes use the statement
+/// allocator. Other operators can reclaim idle roots before required allocation.
+const PayloadCache = struct {
+    const Block = Sequential.OwnedBlock;
+    const Entry = struct { offset: u64, block: *Block, previous: ?*Entry = null, next: ?*Entry = null };
+    const Owner = struct { block: *Block, references: usize = 1, bytes: usize, subscription: ?*RetainedSubscription = null, previous_same: ?*Block = null, next_same: ?*Block = null };
+    // Allocated only for sustained cache thrashing. A fixed-size, aging
+    // frequency sketch admits a newcomer only when it is more useful than the
+    // LRU victim. Ties keep resident roots, making cyclic scans scan-resistant.
+    // The sketch is charged with cache metadata and retired with the last root.
+    const Frequency = struct {
+        counters: []u8,
+        width: usize,
+        samples: usize = 0,
+        sample_limit: usize,
+        fn create(a: Allocator, entries: usize) !*Frequency {
+            const width = std.math.ceilPowerOfTwo(usize, @max(1024, entries *| 2)) catch return error.OutOfMemory;
+            const self = try a.create(Frequency);
+            errdefer a.destroy(self);
+            self.* = .{ .counters = try a.alloc(u8, std.math.mul(usize, width, 4) catch return error.OutOfMemory), .width = width, .sample_limit = @max(64, entries *| 10) };
+            @memset(self.counters, 0);
+            return self;
+        }
+        fn deinit(self: *Frequency, a: Allocator) void {
+            a.free(self.counters);
+            a.destroy(self);
+        }
+        fn hash(offset: u64) u64 {
+            return std.hash.Wyhash.hash(0, std.mem.asBytes(&offset));
+        }
+        fn record(self: *@This(), offset: u64) void {
+            if (self.samples == self.sample_limit) {
+                for (self.counters) |*count| count.* >>= 1;
+                self.samples /= 2;
+            }
+            self.samples += 1;
+            var bits = hash(offset);
+            for (0..4) |lane| {
+                const count = &self.counters[lane * self.width + @as(usize, @intCast(bits & (self.width - 1)))];
+                count.* = @min(15, count.* + 1);
+                bits = std.math.rotr(u64, bits, @as(u6, @intCast(@ctz(self.width))));
+            }
+        }
+        fn estimate(self: *const @This(), offset: u64) u8 {
+            var value: u8 = 15;
+            var bits = hash(offset);
+            for (0..4) |lane| {
+                value = @min(value, self.counters[lane * self.width + @as(usize, @intCast(bits & (self.width - 1)))]);
+                bits = std.math.rotr(u64, bits, @as(u6, @intCast(@ctz(self.width))));
+            }
+            return value;
+        }
+    };
+    manager: ?*Manager = null,
+    metadata_backing: ?Allocator = null,
+    registered: bool = false,
+    next_cache: ?*PayloadCache = null,
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: std.AutoHashMapUnmanaged(u64, *Entry) = .empty,
+    owners: std.AutoHashMapUnmanaged(*Block, Owner) = .empty,
+    addresses: std.AutoHashMapUnmanaged(u64, *Block) = .empty,
+    oldest: ?*Entry = null,
+    newest: ?*Entry = null,
+    bytes: usize = 0,
+    pending_growth: std.atomic.Value(usize) = .init(0),
+    metadata_bytes: usize = 0,
+    // Recognized refundable owners bound residency by live byte admission.
+    // Explicit caps remain useful for controls; opaque owners stay conservative.
+    max_bytes: usize = std.math.maxInt(usize),
+    max_entries: usize = std.math.maxInt(usize),
+    reserve: usize = 0,
+    denied: bool = false,
+    accesses: usize = 0,
+    consecutive_misses: usize = 0,
+    consecutive_hits: usize = 0,
+    frequency: ?*Frequency = null,
+    admission_rejections: usize = 0,
+    fn lock(self: *PayloadCache) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+    }
+    fn bind(self: *PayloadCache, manager: *Manager) void {
+        if (self.manager != null) return;
+        self.manager = manager;
+        self.metadata_backing = @import("memory_budget.zig").reclaimingAllocator(manager.alloc);
+        self.registered = Manager.reclaimableAllocator(manager.alloc);
+        if (self.registered) manager.registerPayloadCache(self);
+    }
+    fn allocator(self: *PayloadCache) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = noResize, .remap = noRemap, .free = free } };
+    }
+    fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PayloadCache = @ptrCast(@alignCast(raw));
+        const manager = self.manager.?;
+        Manager.prepareAllocator(self.metadata_backing.?, len +| self.reserve);
+        if (@import("memory_budget.zig").headroom(self.metadata_backing.?)) |available| if (len +| self.reserve > available) {
+            self.denied = true;
+            return null;
+        };
+        @import("memory_budget.zig").AllocationGuard.enter(&manager.allocation_mutex);
+        defer @import("memory_budget.zig").AllocationGuard.leave();
+        manager.allocationLock();
+        defer manager.allocation_mutex.unlock();
+        const result = self.metadata_backing.?.rawAlloc(len, alignment, ra) orelse return null;
+        self.metadata_bytes += len;
+        return result;
+    }
+    fn noResize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn noRemap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(raw: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *PayloadCache = @ptrCast(@alignCast(raw));
+        self.metadata_bytes -= buffer.len;
+        const Guard = @import("memory_budget.zig").AllocationGuard;
+        const manager = self.manager.?;
+        const reuse = Guard.reuse(&manager.allocation_mutex);
+        Guard.enter(&manager.allocation_mutex);
+        defer @import("memory_budget.zig").AllocationGuard.leave();
+        if (!reuse) manager.allocationLock();
+        defer if (!reuse) manager.allocation_mutex.unlock();
+        self.metadata_backing.?.rawFree(buffer, alignment, ra);
+    }
+    fn target(self: *const PayloadCache) usize {
+        if (!self.registered) return @min(self.max_bytes, 64 * 1024);
+        const owned = self.bytes +| self.pending_growth.load(.acquire) +| self.metadata_bytes;
+        const available = @import("memory_budget.zig").headroom(self.manager.?.alloc) orelse return @min(self.max_bytes, 64 * 1024);
+        // Equal-pressure readers converge on a fair share while leaving a
+        // comparable amount for required operators and output descriptors.
+        return @min(self.max_bytes, (available +| owned) / 2 -| self.reserve);
+    }
+    fn modeThreshold(self: *const PayloadCache) usize {
+        return @max(16, self.entries.count() *| 2);
+    }
+    fn entryLimit(self: *const PayloadCache, bytes: usize) usize {
+        // Metadata is admitted and charged separately. This count bound scales
+        // with the same byte allowance and stops pathological tiny roots.
+        return @min(self.max_entries, if (self.registered) @max(4, bytes / 256) else @as(usize, 4));
+    }
+    fn ownerLimit(self: *const PayloadCache) usize {
+        return if (self.registered) @max(4096, self.target() / 128) else 4096;
+    }
+    fn clearFrequency(self: *PayloadCache) void {
+        if (self.frequency) |frequency| frequency.deinit(self.allocator());
+        self.frequency = null;
+        self.consecutive_misses = 0;
+        self.consecutive_hits = 0;
+    }
+    fn applyGrowth(self: *PayloadCache) void {
+        self.bytes +|= self.pending_growth.swap(0, .acq_rel);
+    }
+    fn addOwner(self: *PayloadCache, block: *Block) anyerror!void {
+        const offset = block.physical_offset orelse return error.InvalidSqlSpill;
+        if (self.owners.getPtr(block)) |owner| {
+            owner.references += 1;
+            return;
+        }
+        if (self.owners.count() >= self.ownerLimit()) return error.SqlPayloadCacheFull;
+        // Cached block descriptors/dependencies are immutable. Only their
+        // separately synchronized JSON owner can grow after adoption.
+        const own_bytes = block.immutableRetainedBytes();
+        var subscription: ?*RetainedSubscription = null;
+        if (block.encoded) |encoded| if (encoded.json_owner != null) {
+            subscription = try self.allocator().create(RetainedSubscription);
+            subscription.?.* = .{ .pending = &self.pending_growth };
+        };
+        errdefer if (subscription) |link| self.allocator().destroy(link);
+        const previous = self.addresses.get(offset);
+        try self.owners.put(self.allocator(), block, .{ .block = block, .bytes = own_bytes, .next_same = previous });
+        self.addresses.put(self.allocator(), offset, block) catch |err| {
+            _ = self.owners.remove(block);
+            return err;
+        };
+        if (previous) |prior| self.owners.getPtr(prior).?.previous_same = block;
+        self.bytes +|= own_bytes;
+        if (subscription) |link| {
+            const capacity = block.encoded.?.json_owner.?.subscribe(link);
+            const record = self.owners.getPtr(block).?;
+            record.bytes += capacity;
+            record.subscription = link;
+            self.bytes += capacity;
+            subscription = null;
+        }
+        var added: usize = 0;
+        errdefer {
+            for (block.dependencies.items[0..added]) |body| self.removeOwner(body);
+            self.removeRecord(block);
+        }
+        for (block.dependencies.items) |body| {
+            try self.addOwner(body);
+            added += 1;
+        }
+    }
+    fn removeRecord(self: *PayloadCache, block: *Block) void {
+        const owner = self.owners.get(block).?;
+        const growth = if (owner.subscription) |link| block.encoded.?.json_owner.?.unsubscribe(link) else 0;
+        self.applyGrowth();
+        if (owner.subscription) |link| self.allocator().destroy(link);
+        if (owner.previous_same) |prior| self.owners.getPtr(prior).?.next_same = owner.next_same else if (owner.next_same) |next| self.addresses.getPtr(block.physical_offset.?).?.* = next else _ = self.addresses.remove(block.physical_offset.?);
+        if (owner.next_same) |next| self.owners.getPtr(next).?.previous_same = owner.previous_same;
+        self.bytes -= owner.bytes + growth;
+        _ = self.owners.remove(block);
+    }
+    fn removeOwner(self: *PayloadCache, block: *Block) void {
+        const owner = self.owners.getPtr(block).?;
+        owner.references -= 1;
+        if (owner.references != 0) return;
+        self.removeRecord(block);
+        for (block.dependencies.items) |body| self.removeOwner(body);
+    }
+    fn unlink(self: *PayloadCache, entry: *Entry) void {
+        if (entry.previous) |prior| prior.next = entry.next else self.oldest = entry.next;
+        if (entry.next) |next| next.previous = entry.previous else self.newest = entry.previous;
+    }
+    fn touch(self: *PayloadCache, entry: *Entry) void {
+        if (self.newest == entry) return;
+        self.unlink(entry);
+        self.append(entry);
+    }
+    fn append(self: *PayloadCache, entry: *Entry) void {
+        entry.previous = self.newest;
+        entry.next = null;
+        if (self.newest) |prior| prior.next = entry else self.oldest = entry;
+        self.newest = entry;
+    }
+    fn evictLocked(self: *PayloadCache) bool {
+        const Guard = @import("memory_budget.zig").AllocationGuard;
+        if (self.registered) Guard.beginReclaim();
+        defer if (self.registered) Guard.endReclaim();
+        const entry = self.oldest orelse {
+            const freed = self.metadata_bytes != 0;
+            self.clearFrequency();
+            self.entries.deinit(self.allocator());
+            self.entries = .empty;
+            self.owners.deinit(self.allocator());
+            self.owners = .empty;
+            self.addresses.deinit(self.allocator());
+            self.addresses = .empty;
+            return freed;
+        };
+        self.unlink(entry);
+        _ = self.entries.remove(entry.offset);
+        self.removeOwner(entry.block);
+        entry.block.release();
+        self.allocator().destroy(entry);
+        if (self.oldest == null) {
+            std.debug.assert(self.owners.count() == 0 and self.bytes == 0);
+            self.clearFrequency();
+            self.entries.deinit(self.allocator());
+            self.entries = .empty;
+            self.owners.deinit(self.allocator());
+            self.owners = .empty;
+            self.addresses.deinit(self.allocator());
+            self.addresses = .empty;
+        }
+        return true;
+    }
+    // Reclamation holds a directory/budget callback lifetime lock. Never wait
+    // for another thread's allocator mutex: it may itself be preflighting.
+    // Pre-acquire every known free path, then reuse these locks for teardown.
+    const FreeLocks = struct {
+        held: [128]*std.atomic.Mutex = undefined,
+        count: usize = 0,
+        fn take(self: *FreeLocks, mutex: *std.atomic.Mutex) bool {
+            const Guard = @import("memory_budget.zig").AllocationGuard;
+            if (Guard.held(mutex)) return true;
+            if (self.count == self.held.len or !Guard.allowed() or !mutex.tryLock()) return false;
+            self.held[self.count] = mutex;
+            self.count += 1;
+            Guard.enter(mutex);
+            return true;
+        }
+        fn allocator(self: *FreeLocks, a: Allocator) bool {
+            var current = a;
+            for (0..32) |_| {
+                if (Manager.parentAllocator(current)) |parent| {
+                    const manager: *Manager = @ptrCast(@alignCast(current.ptr));
+                    if (!self.take(&manager.allocation_mutex)) return false;
+                    current = parent;
+                } else if (@import("memory_budget.zig").parentAllocator(current)) |parent| {
+                    const budget: *@import("memory_budget.zig") = @ptrCast(@alignCast(current.ptr));
+                    if (!self.take(&budget.mutex)) return false;
+                    current = parent;
+                } else if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(current)) |parent| {
+                    const locked: *@import("parallel_scheduler.zig").LockedAllocator = @ptrCast(@alignCast(current.ptr));
+                    if (!self.take(locked.shared_mutex orelse &locked.mutex)) return false;
+                    current = parent;
+                } else if (Quota.owner(current)) |owner| {
+                    if (!self.take(&owner.mutex)) return false;
+                    current = owner.backing;
+                } else if (HostBudget.reclamationLayer(current)) |layer| {
+                    if (!self.take(layer.mutex)) return false;
+                    current = layer.backing;
+                } else return Manager.reclaimableAllocator(current);
+            }
+            return false;
+        }
+        fn block(self: *FreeLocks, value: *Block) bool {
+            if (!self.allocator(value.a) or !self.allocator(value.arena.child_allocator)) return false;
+            if (value.encoded) |encoded| if (encoded.json_owner) |owner| if (!self.allocator(owner.arena.child_allocator)) return false;
+            for (value.dependencies.items) |body| if (!self.block(body)) return false;
+            return true;
+        }
+        fn deinit(self: *FreeLocks) void {
+            while (self.count != 0) {
+                self.count -= 1;
+                @import("memory_budget.zig").AllocationGuard.leave();
+                self.held[self.count].unlock();
+            }
+        }
+    };
+    fn evict(self: *PayloadCache) bool {
+        const Guard = @import("memory_budget.zig").AllocationGuard;
+        if (!Guard.allowed() or (!self.registered and Guard.active())) return false;
+        if (!self.mutex.tryLock()) return false;
+        defer self.mutex.unlock();
+        var locks: FreeLocks = .{};
+        defer locks.deinit();
+        if (self.registered) {
+            if (!locks.take(&self.manager.?.allocation_mutex) or !locks.allocator(self.metadata_backing.?)) return false;
+            if (self.oldest) |entry| if (!locks.block(entry.block)) return false;
+        }
+        return self.evictLocked();
+    }
+    fn trim(self: *PayloadCache) void {
+        // A required indivisible block may exceed the optional target. Keep
+        // at most that one owner; shared allocation pressure can reclaim it.
+        while (self.entries.count() > 1 and self.bytes +| self.metadata_bytes > self.target()) _ = self.evictLocked();
+    }
+    fn get(self: *PayloadCache, offset: u64, reserve: usize) ?*Block {
+        self.lock();
+        defer self.mutex.unlock();
+        self.reserve = reserve;
+        self.accesses +%= 1;
+        if (self.frequency) |frequency| frequency.record(offset);
+        const block = if (self.entries.get(offset)) |entry| entry.block else self.addresses.get(offset) orelse {
+            self.consecutive_hits = 0;
+            self.consecutive_misses = @min(self.modeThreshold(), self.consecutive_misses +| 1);
+            if (self.accesses % 64 == 0) {
+                self.applyGrowth();
+                self.trim();
+            }
+            return null;
+        };
+        self.consecutive_misses = 0;
+        if (self.frequency != null) {
+            self.consecutive_hits += 1;
+            // Recover ordinary LRU adaptation after a fitting hot set settles.
+            // Oversized cyclic sets cannot sustain twice-capacity hit runs.
+            if (self.consecutive_hits >= self.modeThreshold()) self.clearFrequency();
+        }
+        block.retain();
+        if (self.entries.get(offset)) |entry| self.touch(entry);
+        self.applyGrowth();
+        self.trim();
+        return block;
+    }
+    fn estimate(self: *PayloadCache, offset: u64) ?usize {
+        self.lock();
+        defer self.mutex.unlock();
+        const block = self.addresses.get(offset) orelse return null;
+        self.applyGrowth();
+        return block.retainedBytes();
+    }
+    fn insert(self: *PayloadCache, block: *Block, reserve: usize) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        self.reserve = reserve;
+        self.denied = false;
+        if (self.max_entries == 0 or self.max_bytes == 0) return;
+        const target_bytes = self.target();
+        const limit = self.entryLimit(target_bytes);
+        // A full cache alone is not evidence of thrashing: fitting phases
+        // routinely replace each other. Require a miss run longer than twice
+        // residency before enabling frequency admission, and leave it again
+        // after a sustained hit run. Both thresholds are bounded by root slots.
+        if (self.registered and self.max_bytes > 64 * 1024 and target_bytes >= 64 * 1024 and self.entries.count() > 1 and
+            (self.frequency != null or self.consecutive_misses >= self.modeThreshold()) and
+            (self.entries.count() >= limit or block.retainedBytes() > target_bytes -| (self.bytes +| self.metadata_bytes)))
+        {
+            if (self.frequency == null) {
+                const frequency = Frequency.create(self.allocator(), self.entries.count()) catch |err| {
+                    if (err == error.OutOfMemory and self.denied) return;
+                    return err;
+                };
+                var entries = self.entries.keyIterator();
+                while (entries.next()) |offset| frequency.record(offset.*);
+                frequency.record(block.physical_offset.?);
+                self.frequency = frequency;
+            }
+            if (self.frequency.?.estimate(block.physical_offset.?) <= self.frequency.?.estimate(self.oldest.?.offset)) {
+                self.admission_rejections +|= 1;
+                return;
+            }
+        }
+        // Drain published growth in constant time. Immutable primitive owners
+        // need no revisits, regardless of residency or row count.
+        self.applyGrowth();
+        self.trim();
+        while (self.entries.count() >= self.entryLimit(self.target())) _ = self.evictLocked();
+        self.adopt(block) catch |err| {
+            // Optional descriptor admission can decline without poisoning the
+            // required row. Genuine allocator and integrity failures propagate.
+            if (err == error.SqlPayloadCacheFull or (err == error.OutOfMemory and self.denied)) {
+                if (self.oldest == null) _ = self.evictLocked();
+                return;
+            }
+            return err;
+        };
+        self.trim();
+    }
+    fn adopt(self: *PayloadCache, block: *Block) !void {
+        const entry = try self.allocator().create(Entry);
+        errdefer self.allocator().destroy(entry);
+        try self.addOwner(block);
+        errdefer self.removeOwner(block);
+        entry.* = .{ .offset = block.physical_offset.?, .block = block };
+        try self.entries.put(self.allocator(), entry.offset, entry);
+        block.retain();
+        self.append(entry);
+    }
+    fn deinit(self: *PayloadCache) void {
+        const manager = self.manager orelse return;
+        if (self.registered) manager.unregisterPayloadCache(self);
+        self.lock();
+        defer self.mutex.unlock();
+        while (self.evictLocked()) {}
+        self.entries.deinit(self.allocator());
+        self.entries = .empty;
+        self.owners.deinit(self.allocator());
+        self.owners = .empty;
+        self.addresses.deinit(self.allocator());
+        self.addresses = .empty;
+        std.debug.assert(self.metadata_bytes == 0);
+    }
+};
+
 /// Independent read state over sealed payload pages. Closing a reader releases
 /// its cache/buffer only; the enclosing sort/cursor owns the shared file.
 pub const PayloadReader = struct {
     pages: JoinPayloads,
-    cache: [4]?struct { offset: u64, block: *Sequential.OwnedBlock, used: u64 } = @splat(null),
-    clock: u64 = 0,
+    cache: PayloadCache = .{},
     reads: usize = 0,
     window_reductions: usize = 0,
     reserve_bytes: usize = 0,
@@ -3699,29 +4475,12 @@ pub const PayloadReader = struct {
         return .{ .pages = pages };
     }
     pub fn deinit(self: *PayloadReader) void {
-        for (&self.cache) |*entry| if (entry.*) |cached| {
-            cached.block.release();
-            entry.* = null;
-        };
+        self.cache.deinit();
         self.pages.file.manager.allocator().free(self.pages.file.read_buffer);
     }
     fn evict(raw: *anyopaque) bool {
         const self: *PayloadReader = @ptrCast(@alignCast(raw));
-        var oldest: ?usize = null;
-        for (self.cache, 0..) |entry, index| if (entry) |cached| {
-            if (oldest == null or cached.used < self.cache[oldest.?].?.used) oldest = index;
-        };
-        const index = oldest orelse return false;
-        self.cache[index].?.block.release();
-        self.cache[index] = null;
-        return true;
-    }
-    fn retained(self: *const PayloadReader) usize {
-        var bytes: usize = 0;
-        for (self.cache) |entry| if (entry) |cached| {
-            bytes +|= cached.block.retainedBytes();
-        };
-        return bytes;
+        return self.cache.evict();
     }
     fn resolveBody(raw: *anyopaque, offset: u64) anyerror!*Sequential.OwnedBlock {
         const self: *PayloadReader = @ptrCast(@alignCast(raw));
@@ -3734,35 +4493,15 @@ pub const PayloadReader = struct {
         return self.readWindow(reference) catch |err| return if (err == error.SqlPayloadWindowFull) error.SqlProgramLimitExceeded else err;
     }
     fn readWindow(self: *PayloadReader, reference: Reference) anyerror!Payload {
+        self.cache.bind(self.pages.file.manager);
         self.pages.resolver = .{ .ptr = self, .read = resolveBody };
-        self.clock +|= 1;
-        // On misses keep existing owners until decode admission needs them:
-        // a new parent may reuse a body already leased by a cached parent.
-        const known = for (self.cache) |entry| {
-            if (entry) |cached| if (cached.offset == reference.offset) break true;
-        } else false;
-        // Include growth of lazy scalar caches since the preceding pull.
-        while (known and self.retained() > 64 * 1024) {
-            var same: bool = true;
-            for (self.cache) |entry| if (entry) |cached| {
-                if (cached.offset != reference.offset) same = false;
-            };
-            if (same or !evict(self)) break;
+        if (self.cache.get(reference.offset, self.reserve_bytes)) |block| {
+            if (reference.index >= block.count()) {
+                block.release();
+                return error.InvalidSqlSpill;
+            }
+            return .{ .block = block, .index = reference.index };
         }
-        for (&self.cache) |*entry| if (entry.*) |*cached| if (cached.offset == reference.offset) {
-            if (reference.index >= cached.block.count()) return error.InvalidSqlSpill;
-            cached.used = self.clock;
-            cached.block.retain();
-            return .{ .block = cached.block, .index = reference.index };
-        };
-        for (&self.cache) |*entry| if (entry.*) |*cached| {
-            for (cached.block.dependencies.items) |body| if (body.physical_offset == reference.offset) {
-                if (reference.index >= body.count()) return error.InvalidSqlSpill;
-                cached.used = self.clock;
-                body.retain();
-                return .{ .block = body, .index = reference.index };
-            };
-        };
         var pressure: CachePressure = .{ .manager = self.pages.file.manager, .context = self, .evict = evict, .bounded = true, .reserve = self.reserve_bytes };
         const block = self.pages.readWithPressure(reference.offset, &pressure) catch |err| {
             if (err == error.OutOfMemory and pressure.denied) return error.SqlPayloadWindowFull;
@@ -3771,27 +4510,13 @@ pub const PayloadReader = struct {
         errdefer block.release();
         if (reference.index >= block.count()) return error.InvalidSqlSpill;
         self.reads += 1;
-        while (block.retainedBytes() +| self.retained() > 64 * 1024) if (!evict(self)) break;
-        var slot: ?usize = null;
-        for (self.cache, 0..) |entry, i| if (entry == null) {
-            slot = i;
-            break;
-        };
-        if (slot == null) {
-            _ = evict(self);
-            for (self.cache, 0..) |entry, i| if (entry == null) {
-                slot = i;
-                break;
-            };
-        }
-        self.cache[slot.?] = .{ .offset = reference.offset, .block = block, .used = self.clock };
-        block.retain();
+        try self.cache.insert(block, self.reserve_bytes);
         return .{ .block = block, .index = reference.index };
     }
     /// Advisory wire-based estimate. Actual allocations and retained page
     /// bytes are authoritative; gatherForDelivery can shorten a cold-page window.
     pub fn estimate(self: *PayloadReader, offset: u64) !usize {
-        for (self.cache) |entry| if (entry) |cached| if (cached.offset == offset) return cached.block.retainedBytes();
+        if (self.cache.manager != null) if (self.cache.estimate(offset)) |bytes| return bytes;
         var pressure: CachePressure = .{ .manager = self.pages.file.manager, .context = self, .evict = evict };
         if (self.pages.file.read_buffer.len == 0) pressure.prepare(@max(1, self.pages.file.buffer_bytes orelse self.pages.file.manager.buffer_bytes));
         var header: [17]u8 = undefined;
@@ -3825,7 +4550,10 @@ pub const PayloadReader = struct {
         }
     };
     pub fn target(self: *PayloadReader, byte_limit: usize) usize {
-        var limit = @min(@max(1, byte_limit), 128 * 1024);
+        return self.targetBounded(byte_limit, 128 * 1024);
+    }
+    fn targetBounded(self: *PayloadReader, byte_limit: usize, preferred_bytes: usize) usize {
+        var limit = @min(@max(1, byte_limit), preferred_bytes);
         if (@import("memory_budget.zig").headroom(self.pages.file.manager.alloc)) |available| limit = @min(limit, available);
         return limit;
     }
@@ -3909,13 +4637,16 @@ pub const PayloadReader = struct {
     // shrinks. Native/replay delivery has no such backlog. Account for the
     // caller's fixed backlog separately from each candidate's output arrays.
     fn gatherForDelivery(self: *PayloadReader, storage: []Payload, references: []const Reference, byte_limit: usize, output_row_bytes: usize, extra_bytes: usize, backlog_bytes: usize) !Gathered {
-        if (references.len > 64 or storage.len < references.len) return error.InvalidSqlLimit;
+        return self.gatherBounded(64, storage, references, byte_limit, 128 * 1024, output_row_bytes, extra_bytes, backlog_bytes);
+    }
+    fn gatherBounded(self: *PayloadReader, comptime capacity: usize, storage: []Payload, references: []const Reference, byte_limit: usize, preferred_bytes: usize, output_row_bytes: usize, extra_bytes: usize, backlog_bytes: usize) !Gathered {
+        if (references.len > capacity or storage.len < references.len) return error.InvalidSqlLimit;
         var count = references.len;
         const previous_reserve = self.reserve_bytes;
         defer self.reserve_bytes = previous_reserve;
         while (true) {
             self.reserve_bytes = previous_reserve + backlog_bytes + count * output_row_bytes + extra_bytes;
-            const gathered = self.gather(storage[0..count], references[0..count], byte_limit) catch |err| {
+            const gathered = self.gather(capacity, storage[0..count], references[0..count], byte_limit, preferred_bytes) catch |err| {
                 if (err != error.SqlPayloadWindowFull) return err;
                 if (count <= 1) return error.SqlProgramLimitExceeded;
                 self.window_reductions += 1;
@@ -3943,8 +4674,8 @@ pub const PayloadReader = struct {
     const Gathered = struct { storage: []Payload, count: usize };
     // Preserve a completed rank prefix instead of discarding decoded pages
     // when allocation/byte admission ends a physically ordered gather early.
-    fn completedPrefix(output: []Payload, order: []const usize, done: usize) ?Gathered {
-        var ready: [64]bool = @splat(false);
+    fn completedPrefix(comptime capacity: usize, output: []Payload, order: []const usize, done: usize) ?Gathered {
+        var ready: [capacity]bool = @splat(false);
         for (order[0..done]) |index| ready[index] = true;
         var count: usize = 0;
         while (count < output.len and ready[count]) count += 1;
@@ -3952,7 +4683,7 @@ pub const PayloadReader = struct {
         for (order[0..done]) |index| if (index >= count) output[index].release();
         return .{ .storage = output, .count = count };
     }
-    fn ownerBytes(block: *Sequential.OwnedBlock, owners: *[128]*Sequential.OwnedBlock, count: *usize) usize {
+    fn ownerBytes(block: *Sequential.OwnedBlock, owners: []*Sequential.OwnedBlock, count: *usize) usize {
         for (owners[0..count.*]) |prior| if (prior == block) return 0;
         // Overflow falls back to conservative accounting, never undercounting.
         if (count.* < owners.len) {
@@ -3963,9 +4694,9 @@ pub const PayloadReader = struct {
         for (block.dependencies.items) |body| bytes +|= ownerBytes(body, owners, count);
         return bytes;
     }
-    fn gather(self: *PayloadReader, output: []Payload, references: []const Reference, byte_limit: usize) !Gathered {
-        std.debug.assert(output.len == references.len and references.len <= 64);
-        var order: [64]usize = undefined;
+    fn gather(self: *PayloadReader, comptime capacity: usize, output: []Payload, references: []const Reference, byte_limit: usize, preferred_bytes: usize) !Gathered {
+        std.debug.assert(output.len == references.len and references.len <= capacity);
+        var order: [capacity]usize = undefined;
         for (order[0..references.len], 0..) |*index, i| index.* = i;
         std.mem.sort(usize, order[0..references.len], references, struct {
             fn less(refs: []const Reference, left: usize, right: usize) bool {
@@ -3976,19 +4707,19 @@ pub const PayloadReader = struct {
         errdefer for (order[0..done]) |index| output[index].release();
         var bytes: usize = 0;
         var previous: ?u64 = null;
-        var owners: [128]*Sequential.OwnedBlock = undefined;
+        var owners: [capacity * 2]*Sequential.OwnedBlock = undefined;
         var owner_count: usize = 0;
-        const target_bytes = self.target(byte_limit);
+        const target_bytes = self.targetBounded(byte_limit, preferred_bytes);
         for (order[0..references.len]) |index| {
             const payload = self.readWindow(references[index]) catch |err| {
-                if (err == error.SqlPayloadWindowFull) if (completedPrefix(output, order[0..references.len], done)) |prefix_| return prefix_;
+                if (err == error.SqlPayloadWindowFull) if (completedPrefix(capacity, output, order[0..references.len], done)) |prefix_| return prefix_;
                 return err;
             };
             if (previous == null or previous.? != references[index].offset) {
                 const cost = ownerBytes(payload.block, &owners, &owner_count);
                 if (done != 0 and cost > target_bytes -| bytes) {
                     payload.release();
-                    if (completedPrefix(output, order[0..references.len], done)) |prefix_| return prefix_;
+                    if (completedPrefix(capacity, output, order[0..references.len], done)) |prefix_| return prefix_;
                     return error.SqlPayloadWindowFull;
                 }
                 bytes +|= cost;
@@ -4840,15 +5571,33 @@ pub const Sort = struct {
             const location = self.locations[row];
             return if (location.block.encoded) |block| block.encodedJson(location.row, column, self.keys) else null;
         }
-        fn batch(self: *@This()) @import("execution_batch.zig").Batch {
+        fn physical(raw: *anyopaque, a: Allocator, column: usize) anyerror!?@import("execution_batch.zig").PhysicalColumn {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.locations.len > 64) return error.InvalidSqlSpill;
+            var columns: [64]*const Sequential.EncodedColumn = undefined;
+            var rows: [64]usize = undefined;
+            for (self.locations, columns[0..self.locations.len], rows[0..self.locations.len]) |location, *source, *row| {
+                const encoded = location.block.encoded orelse return null;
+                const fields = if (self.keys) encoded.keys else encoded.values;
+                if (column >= fields.len) return error.InvalidSqlSpill;
+                source.* = &fields[column];
+                row.* = location.row;
+            }
+            return Sequential.EncodedColumn.gatherPhysical(a, columns[0..self.locations.len], rows[0..self.locations.len]);
+        }
+        fn batch(self: *@This(), comptime native: bool) @import("execution_batch.zig").Batch {
             const block = self.locations[0].block;
-            return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .width = if (self.keys) block.keyWidth() else block.width(), .count = self.locations.len } };
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_physical = if (native) physical else null, .read_frozen = frozen, .read_json = json, .width = if (self.keys) block.keyWidth() else block.width(), .count = self.locations.len } };
         }
         fn write(locations: []const Location, ordinals: []const u64, output: *Sequential) !void {
             if (locations.len == 0) return;
             var values: MergeRows = .{ .locations = locations, .keys = false };
             var keys: MergeRows = .{ .locations = locations, .keys = true };
-            try output.appendBatch(values.batch(), keys.batch(), ordinals);
+            // Native gather amortizes column scratch over a useful tile.
+            // Tiny boundary flushes retain the scalar path without allocating
+            // physical descriptors or attempting a gather for every column.
+            if (locations.len < 16) return output.appendBatch(values.batch(false), keys.batch(false), ordinals);
+            try output.appendMergeBatch(values.batch(true), keys.batch(true), ordinals);
         }
     };
     fn mergeMany(self: *Sort, inputs: []const *Sequential) !Sequential {
@@ -5086,6 +5835,25 @@ pub const Sort = struct {
         key_index: ?usize = null,
         values: ?*const @import("typed_store.zig").Store = null,
         keys: ?*const @import("typed_store.zig").Store = null,
+        pub fn width(self: RowLease) usize {
+            return if (self.block) |block| block.width() else if (self.values) |values| values.columns.len else self.row.values.len;
+        }
+        pub fn keyWidth(self: RowLease) usize {
+            return if (self.key_block) |block| block.keyWidth() else if (self.keys) |keys| keys.columns.len else if (self.block) |block| block.keyWidth() else self.row.keys.len;
+        }
+        /// Publication quanta account for frozen JSON without building a DOM.
+        pub fn cellBytes(self: RowLease, column: usize) !usize {
+            if (self.block) |block| {
+                if (block.encoded) |encoded| {
+                    if (try encoded.frozenJson(self.index, column, false)) |value| return @sizeOf(Datum) +| value.bytes.len;
+                    if (try encoded.encodedJson(self.index, column, false)) |value| return @sizeOf(Datum) +| value.len;
+                }
+            } else if (self.values) |values| {
+                if (try values.frozenJson(self.index, column)) |value| return @sizeOf(Datum) +| value.bytes.len;
+                if (try values.encodedJson(self.index, column)) |value| return @sizeOf(Datum) +| value.len;
+            }
+            return operators.datumBytes(try self.cell(column));
+        }
         pub fn cell(self: RowLease, column: usize) !Datum {
             return if (self.block) |block| block.cell(self.index, column) else if (self.values) |values| values.cell(values.a, self.index, column) else self.row.values[column];
         }
@@ -5351,14 +6119,69 @@ pub const Sort = struct {
             self.a.free(self.rows);
         }
     };
+    /// Keyed direct-sort batches share delivery's physical admission policy.
+    /// A productive prefix is returned before the next block needs more room;
+    /// no failed hydration can consume an unread indirect reference. Resident
+    /// rows borrow typed stores: retain the sort until the returned page releases.
+    fn nextDirectPageLeased(self: *Sort, comptime capacity: usize, maximum: usize, byte_limit: usize) anyerror!Page {
+        var rows: [capacity]RowLease = undefined;
+        var count: usize = 0;
+        errdefer for (rows[0..count]) |lease| lease.release();
+        var owners: [capacity * 2]*Sequential.OwnedBlock = undefined;
+        var owner_count: usize = 0;
+        var retained: usize = 0;
+        var logical: usize = 0;
+        while (count < @min(maximum, rows.len)) {
+            var pressure: CachePressure = .{ .manager = self.manager, .context = self, .evict = keepCollectedPayloads, .bounded = true, .reserve = (count + 1) * @sizeOf(RowLease) + @sizeOf(PageView) };
+            if (!pressure.admit(0)) {
+                if (count == 0) return error.SqlProgramLimitExceeded;
+                break;
+            }
+            const lease = (self.nextLeasedWithPressure(&pressure) catch |err| {
+                if (err != error.OutOfMemory or !pressure.denied) return err;
+                if (count == 0) return error.SqlProgramLimitExceeded;
+                break;
+            }) orelse break;
+            rows[count] = lease;
+            count += 1;
+            for (0..lease.width()) |column| logical +|= try lease.cellBytes(column);
+            for (0..lease.keyWidth()) |column| logical +|= try operators.datumBytes(try lease.keyCell(column));
+            for ([_]?*Sequential.OwnedBlock{ lease.block, lease.key_block }) |optional| if (optional) |block| {
+                const known = for (owners[0..owner_count]) |prior| {
+                    if (prior == block) break true;
+                } else false;
+                if (!known) {
+                    owners[owner_count] = block;
+                    owner_count += 1;
+                    retained +|= block.retainedBytes() +| @sizeOf(Sequential.OwnedBlock);
+                }
+            };
+            if (logical >= byte_limit or retained +| count * @sizeOf(RowLease) +| @sizeOf(PageView) >= byte_limit) break;
+        }
+        const stable = self.manager.allocator();
+        const output = try stable.dupe(RowLease, rows[0..count]);
+        errdefer stable.free(output);
+        const view = try stable.create(PageView);
+        view.* = .{ .rows = output };
+        return .{ .rows = output, .a = stable, .values = view.batch(if (count == 0) 0 else rows[0].width()) };
+    }
     pub fn nextPageLeased(self: *Sort, maximum: usize, byte_limit: usize) anyerror!Page {
-        if (maximum == 0) return error.InvalidSqlLimit;
+        return self.nextKeyedPageLeased(64, maximum, byte_limit, 128 * 1024);
+    }
+    /// Publication keeps larger caller-bounded packs when memory permits,
+    /// sharing delivery's admission and unread-reference backlog machinery.
+    pub fn nextPublicationPageLeased(self: *Sort, maximum: usize, byte_limit: usize) anyerror!Page {
+        return self.nextKeyedPageLeased(256, maximum, byte_limit, byte_limit);
+    }
+    fn nextKeyedPageLeased(self: *Sort, comptime capacity: usize, maximum: usize, byte_limit: usize, preferred_bytes: usize) anyerror!Page {
+        if (maximum == 0 or byte_limit == 0) return error.InvalidSqlLimit;
         try self.finishDelivery(@sizeOf(RowLease) + @sizeOf(PageView));
+        if (self.order_sort == null) return self.nextDirectPageLeased(capacity, maximum, byte_limit);
         const reader = try self.payloadReader();
-        const limit = reader.target(byte_limit);
-        var keys: [64]?RowLease = @splat(null);
+        const limit = reader.targetBounded(byte_limit, preferred_bytes);
+        var keys: [capacity]?RowLease = @splat(null);
         defer for (keys) |lease| if (lease) |value| value.release();
-        var references: [64]PayloadReader.Reference = undefined;
+        var references: [capacity]PayloadReader.Reference = undefined;
         var count: usize = 0;
         var bytes: usize = 0;
         const logical_rows = @max(1, byte_limit / @max(1, self.max_payload_bytes));
@@ -5391,8 +6214,8 @@ pub const Sort = struct {
         }
         const pending = count + self.deferred_count - self.deferred_index;
         const backlog_bytes = if (pending > self.deferred_references.len) pending * @sizeOf(?RowLease) else 0;
-        var storage: [64]PayloadReader.Payload = undefined;
-        const gathered = try reader.gatherForDelivery(&storage, references[0..count], byte_limit, @sizeOf(RowLease), @sizeOf(PageView), backlog_bytes);
+        var storage: [capacity]PayloadReader.Payload = undefined;
+        const gathered = try reader.gatherBounded(capacity, &storage, references[0..count], byte_limit, preferred_bytes, @sizeOf(RowLease), @sizeOf(PageView), backlog_bytes);
         const payloads = gathered.storage[0..gathered.count];
         errdefer for (payloads) |payload| payload.release();
         const stable = self.manager.allocator();
@@ -5412,10 +6235,13 @@ pub const Sort = struct {
     }
     const PageView = struct {
         rows: []const RowLease,
+        fn batch(self: *@This(), width: usize) @import("execution_batch.zig").Batch {
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .read_identity = identity, .read_dictionary = dictionary, .count = self.rows.len, .width = width } };
+        }
         fn shared(self: *const @This()) bool {
             if (self.rows.len == 0) return false;
-            for (self.rows) |row| if (row.block != self.rows[0].block) return false;
-            return true;
+            for (self.rows) |row| if (row.block != self.rows[0].block or row.values != self.rows[0].values) return false;
+            return self.rows[0].block != null or self.rows[0].values != null;
         }
         fn cell(raw: *anyopaque, _: Allocator, row: usize, column: usize) anyerror!Datum {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -5424,25 +6250,29 @@ pub const Sort = struct {
         fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const lease = self.rows[row];
-            return lease.block.?.encoded.?.frozenJson(lease.index, column, false);
+            if (lease.block) |block| return if (block.encoded) |encoded| encoded.frozenJson(lease.index, column, false) else null;
+            return if (lease.values) |values| values.frozenJson(lease.index, column) else null;
         }
         fn json(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const lease = self.rows[row];
-            return lease.block.?.encoded.?.encodedJson(lease.index, column, false);
+            if (lease.block) |block| return if (block.encoded) |encoded| encoded.encodedJson(lease.index, column, false) else null;
+            return if (lease.values) |values| values.encodedJson(lease.index, column) else null;
         }
         fn identity(raw: *anyopaque, row: usize, column: usize) anyerror!?u64 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!self.shared()) return null;
             const lease = self.rows[row];
-            return lease.block.?.encoded.?.dictionaryIdentity(lease.index, column, false);
+            if (lease.block) |block| return if (block.encoded) |encoded| encoded.dictionaryIdentity(lease.index, column, false) else null;
+            return if (lease.values) |values| values.dictionaryId(lease.index, column) else null;
         }
         fn dictionary(raw: *anyopaque, a: Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!self.shared()) return null;
             const Batch = @import("execution_batch.zig").Batch;
             const source = try a.create(Batch);
-            source.* = try self.rows[0].block.?.batch(a, false);
+            const first = self.rows[0];
+            source.* = if (first.block) |block| try block.batch(a, false) else .{ .retained = .{ .store = first.values.?, .count = first.values.?.len } };
             const indices = try a.alloc(usize, self.rows.len);
             for (indices, self.rows) |*index, row| index.* = row.index;
             return (try source.select(a, indices)).dictionaryColumn(a, column);
@@ -9397,4 +10227,429 @@ test "SQL scoped spill owners share disk and descriptor admission and unwind" {
     try std.testing.expectError(error.SqlProgramLimitExceeded, parent.create());
     try std.testing.expectError(error.SqlProgramLimitExceeded, child.create());
     try std.testing.expectEqual(@as(usize, 64), parent.files);
+}
+
+test "SQL adaptive payload cache counts shared bodies and aliases and unwinds metadata failures" {
+    const Harness = struct {
+        fn check(_: *anyopaque) !void {}
+        fn block(a: Allocator, offset: u64) !*Sequential.OwnedBlock {
+            const value = try a.create(Sequential.OwnedBlock);
+            value.* = .{ .a = a, .arena = .init(a), .physical_offset = offset };
+            errdefer value.release();
+            _ = try value.arena.allocator().alloc(u8, 4096);
+            return value;
+        }
+        fn run(backing: Allocator) !void {
+            var budget: @import("memory_budget.zig") = .{ .backing = backing, .limit = 4 << 20 };
+            defer std.debug.assert(budget.live == 0);
+            var marker: u8 = 0;
+            var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = check };
+            defer manager.deinit();
+            const a = manager.allocator();
+            const first = try block(a, 9);
+            defer first.release();
+            const alias = try block(a, 9);
+            defer alias.release();
+            const left = try block(a, 10);
+            defer left.release();
+            const right = try block(a, 11);
+            defer right.release();
+            const third = try block(a, 12);
+            defer third.release();
+            for ([_]*Sequential.OwnedBlock{ left, right, third }, [_]*Sequential.OwnedBlock{ first, first, alias }) |parent, body| {
+                try parent.dependencies.append(a, body);
+                body.retain();
+            }
+            var cache: PayloadCache = .{};
+            cache.bind(&manager);
+            defer cache.deinit();
+            try cache.insert(left, 0);
+            try cache.insert(right, 0);
+            try cache.insert(third, 0);
+            try std.testing.expectEqual(@as(usize, 3), cache.entries.count());
+            try std.testing.expectEqual(@as(usize, 5), cache.owners.count());
+            try std.testing.expectEqual(@as(usize, 4), cache.addresses.count());
+            try std.testing.expectEqual(first.ownRetainedBytes() + alias.ownRetainedBytes() + left.ownRetainedBytes() + right.ownRetainedBytes() + third.ownRetainedBytes(), cache.bytes);
+            const held = cache.get(9, 0).?;
+            defer held.release();
+            try std.testing.expect(held == alias);
+            try std.testing.expect(cache.evict());
+            try std.testing.expect(cache.evict());
+            try std.testing.expectEqual(@as(usize, 2), cache.owners.count());
+            const remaining = cache.get(9, 0).?;
+            remaining.release();
+            try std.testing.expect(cache.evict());
+            try std.testing.expectEqual(@as(usize, 0), cache.metadata_bytes);
+            try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL adaptive payload cache resists cyclic scans adapts to hot sets and refunds its sketch" {
+    const Harness = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(backing: Allocator) !void {
+            var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 4 << 20 };
+            defer std.debug.assert(budget.live == 0);
+            var marker: u8 = 0;
+            var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = check };
+            defer manager.deinit();
+            const a = manager.allocator();
+            var cache: PayloadCache = .{ .max_bytes = 128 * 1024, .max_entries = 8 };
+            cache.bind(&manager);
+            // Inject metadata failures without turning the required block
+            // allocator into an intentionally opaque (nonadaptive) owner.
+            cache.metadata_backing = backing;
+            defer cache.deinit();
+            var blocks: [32]*Sequential.OwnedBlock = undefined;
+            var count: usize = 0;
+            defer for (blocks[0..count]) |block| block.release();
+            for (&blocks, 0..) |*block, offset| {
+                block.* = try a.create(Sequential.OwnedBlock);
+                block.*.* = .{ .a = a, .arena = .init(a), .physical_offset = offset };
+                count += 1;
+                _ = try block.*.arena.allocator().alloc(u8, 4096);
+            }
+            var hits: usize = 0;
+            for (0..16) |_| for (blocks, 0..) |block, offset| {
+                if (cache.get(offset, 0)) |held| {
+                    hits += 1;
+                    held.release();
+                } else try cache.insert(block, 0);
+            };
+            try std.testing.expect(hits > 64);
+            try std.testing.expect(cache.admission_rejections > 64);
+            try std.testing.expect(cache.frequency != null);
+            try std.testing.expect(cache.entries.count() <= 8);
+            // A new hot block must displace the old working set after aging;
+            // equal-frequency scan resistance must not freeze residency.
+            for (0..256) |_| {
+                if (cache.get(31, 0)) |held| held.release() else try cache.insert(blocks[31], 0);
+            }
+            const hot = cache.get(31, 0) orelse return error.TestExpectedHotAdmission;
+            hot.release();
+            try std.testing.expect(cache.frequency == null);
+            // Successive fitting hot sets must warm on their first pass. A
+            // frequency sketch must not keep the previous phase resident.
+            for (0..3) |phase| {
+                var misses: usize = 0;
+                for (0..16) |_| for (blocks[phase * 8 ..][0..8]) |block| {
+                    if (cache.get(block.physical_offset.?, 0)) |held| held.release() else {
+                        misses += 1;
+                        try cache.insert(block, 0);
+                    }
+                };
+                try std.testing.expect(misses <= 8);
+                try std.testing.expect(cache.frequency == null);
+            }
+            // The fault wrapper is opaque to shared reclamation; direct owner
+            // teardown still retires all metadata through its original path.
+            cache.lock();
+            while (cache.evictLocked()) {}
+            cache.mutex.unlock();
+            try std.testing.expect(cache.frequency == null);
+            try std.testing.expectEqual(@as(usize, 0), cache.metadata_bytes);
+            try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL adaptive payload cache returns idle sibling capacity to required scoped allocations" {
+    for (0..5) |backing_kind| for (0..5) |mode| {
+        const host_backed = backing_kind == 1 or backing_kind >= 3;
+        const quota_backed = backing_kind >= 2;
+        if (backing_kind == 0 and mode == 4) continue;
+        const Hook = struct {
+            fn check(_: *anyopaque) !void {}
+        };
+        var resources = @import("../storage/resource_manager.zig").ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 512 << 10 } });
+        defer resources.deinit(std.testing.allocator);
+        var quota = Quota.init(std.testing.allocator, 512 << 10);
+        defer quota.deinit();
+        var host = HostBudget.initReclaiming(&resources, .sql_execution_working_set, if (backing_kind == 4) quota.allocator() else std.testing.allocator, 1);
+        host.credit_quantum = 1;
+        defer host.deinit();
+        if (backing_kind == 3) quota.backing = host.threadSafeAllocator();
+        const backing = if (backing_kind == 4 or backing_kind == 1) host.threadSafeAllocator() else if (quota_backed) quota.allocator() else std.testing.allocator;
+        var budget: @import("memory_budget.zig") = .{ .backing = backing, .limit = 512 << 10 };
+        defer std.debug.assert(budget.live == 0);
+        var marker: u8 = 0;
+        var shared_backing: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = budget.allocator() };
+        var manager: Manager = .{ .alloc = if (mode == 3) shared_backing.allocator() else budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = Hook.check };
+        defer manager.deinit();
+        var nested: @import("memory_budget.zig") = .{ .backing = manager.allocator(), .limit = 512 << 10 };
+        defer std.debug.assert(nested.live == 0);
+        var scoped = if (mode == 3) Manager{ .alloc = nested.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = Hook.check } else manager.scoped(nested.allocator());
+        defer scoped.deinit();
+        var first: PayloadCache = .{};
+        var second: PayloadCache = .{};
+        second.bind(&scoped);
+        defer second.deinit();
+        first.bind(&manager);
+        defer first.deinit();
+        try std.testing.expect(first.registered and second.registered);
+        if (host_backed) try std.testing.expect(host.residency.active());
+        if (quota_backed) try std.testing.expect(quota.residency.active());
+        for ([_]*PayloadCache{ &first, &second }, 0..) |cache, offset| {
+            const a = cache.manager.?.allocator();
+            const block = try a.create(Sequential.OwnedBlock);
+            block.* = .{ .a = a, .arena = .init(a), .physical_offset = offset };
+            defer block.release();
+            _ = try block.arena.allocator().alloc(u8, 32 << 10);
+            const rows = try block.arena.allocator().alloc(Row, 1);
+            rows[0] = .{ .values = &.{}, .keys = &.{}, .ordinal = 42 };
+            block.rows = rows;
+            try cache.insert(block, 0);
+        }
+        const pinned = first.get(0, 0).?;
+        defer pinned.release();
+        var region = std.heap.ArenaAllocator.init(budget.allocator());
+        defer region.deinit();
+        var locked_region: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = region.allocator(), .shared_mutex = if (mode == 3) &shared_backing.mutex else null };
+        const remaining: usize = if (mode == 3) 40 << 10 else 8 << 10;
+        const ballast_allocator = if (mode == 4) backing else budget.allocator();
+        const ballast = try ballast_allocator.alloc(u8, @import("memory_budget.zig").headroom(ballast_allocator).? - remaining);
+        defer ballast_allocator.free(ballast);
+        const required_allocator = switch (mode) {
+            0 => nested.allocator(),
+            1 => budget.allocator(),
+            4 => backing,
+            else => locked_region.allocator(),
+        };
+        const required = block: {
+            // A busy reader must not make another operator wait for its cache lock.
+            first.lock();
+            defer first.mutex.unlock();
+            // A sibling can be preflighting while holding its allocator lock.
+            // Reclamation must skip it rather than wait under a budget hook.
+            second.manager.?.allocationLock();
+            const skipped = !second.evict();
+            second.manager.?.allocation_mutex.unlock();
+            try std.testing.expect(skipped);
+            break :block try required_allocator.alloc(u8, 32 << 10);
+        };
+        defer required_allocator.free(required);
+        if (mode == 3) try std.testing.expect(region.queryCapacity() > remaining);
+        try std.testing.expectEqual(@as(u64, 42), pinned.rows[0].ordinal);
+        try std.testing.expectEqual(@as(usize, 0), second.entries.count());
+        try std.testing.expect(!budget.isLocallyExhausted());
+        if (host_backed) try std.testing.expect(!host.denied());
+        if (quota_backed) try std.testing.expect(!quota.limit_exceeded and quota.live_bytes <= quota.max_live_bytes);
+        try std.testing.expect(budget.live <= budget.limit);
+    };
+}
+
+test "SQL adaptive payload cache keeps region allocators outside shared reclamation" {
+    var region = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer region.deinit();
+    var budget: @import("memory_budget.zig") = .{ .backing = region.allocator(), .limit = 1 << 20 };
+    var marker: u8 = 0;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var locked: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = region.allocator() };
+    try std.testing.expect(!Manager.reclaimableAllocator(locked.allocator()));
+    var cache: PayloadCache = .{};
+    cache.bind(&manager);
+    defer cache.deinit();
+    try std.testing.expect(!cache.registered);
+    try std.testing.expect(manager.payload_caches == null);
+    try std.testing.expectEqual(@as(usize, 64 << 10), cache.target());
+}
+
+test "SQL typed spill merge gathers primitive dictionaries preserves SQL null and declines JSON null and decimals" {
+    const C = Sequential.EncodedColumn;
+    const a = std.testing.allocator;
+    var integer_bytes: [16]u8 = undefined;
+    std.mem.writeInt(u64, integer_bytes[0..8], @bitCast(@as(i64, 9007199254740993)), .little);
+    std.mem.writeInt(u64, integer_bytes[8..16], @bitCast(@as(i64, -17)), .little);
+    const flags = [_]u8{0b00010000};
+    const indices = [_]u16{ 0, 1, 0 };
+    const integer: C = .{ .flags = &flags, .values = .{ .dictionary = .{ .kind = 2, .size = 2, .bytes = &integer_bytes, .indices = &indices } } };
+    const text: C = .{ .flags = &flags, .values = .{ .dictionary = .{ .kind = 5, .size = 2, .texts = &.{ "first", "second" }, .indices = &indices } } };
+    const floating: C = .{ .flags = &.{0}, .values = .{ .fixed = .{ .kind = 3, .positions = &.{0}, .bytes = &.{ 0, 0, 0, 0, 0, 0, 0, 0x80 } } } };
+    const boolean: C = .{ .flags = &flags, .values = .{ .dictionary = .{ .kind = 1, .size = 2, .bytes = &.{ 1, 0 }, .indices = &indices } } };
+    const Probe = struct {
+        fn run(alloc: Allocator, col: *const C) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const view = (try C.gatherPhysical(arena.allocator(), &.{ col, col, col, col }, &.{ 1, 2, 0, 1 })).?;
+            try view.validate();
+            for ([_]usize{ 1, 2, 0, 1 }, 0..) |row, i| {
+                const expected = try col.cell(row);
+                const actual = try view.cell(i);
+                try std.testing.expectEqual(expected.sql_null, actual.sql_null);
+                if (!expected.sql_null) switch (expected.value) {
+                    .integer => |v| try std.testing.expectEqual(v, actual.value.integer),
+                    .string => |v| try std.testing.expectEqualStrings(v, actual.value.string),
+                    .bool => |v| try std.testing.expectEqual(v, actual.value.bool),
+                    else => return error.UnexpectedDatum,
+                };
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Probe.run, .{&integer});
+    try Probe.run(a, &text);
+    try Probe.run(a, &boolean);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const float_view = (try C.gatherPhysical(arena.allocator(), &.{&floating}, &.{0})).?;
+    try std.testing.expectEqual(@as(u64, 0x8000000000000000), @as(u64, @bitCast((try float_view.cell(0)).value.float)));
+    const json_null: C = .{ .flags = &.{2}, .values = .{ .texts = .{ .values = &.{""}, .decimal = false } } };
+    const decimal: C = .{ .flags = &.{0}, .values = .{ .texts = .{ .values = &.{"9007199254740993.1250"}, .decimal = true } } };
+    var no_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expect(try C.gatherPhysical(no_allocations.allocator(), &.{&json_null}, &.{0}) == null);
+    try std.testing.expect(try C.gatherPhysical(no_allocations.allocator(), &.{&decimal}, &.{0}) == null);
+    try std.testing.expect(try C.gatherPhysical(no_allocations.allocator(), &.{ &text, &integer }, &.{ 0, 0 }) == null);
+    try std.testing.expectError(error.InvalidSqlSpill, C.gatherPhysical(a, &.{&integer}, &.{3}));
+}
+
+test "SQL adaptive payload cache grows beyond legacy ceilings and refunds required pressure" {
+    const a = std.testing.allocator;
+    var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 128 << 20 };
+    defer std.debug.assert(budget.live == 0);
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = Check.call, .async_writes = false };
+    defer manager.deinit();
+    var pages = try JoinPayloads.init(&manager);
+    defer pages.close();
+    const body = try a.alloc(u8, 16 * 1024);
+    defer a.free(body);
+    @memset(body, 'x');
+    var offsets_: [1100]u64 = undefined;
+    for (&offsets_, 0..) |*offset, i| {
+        std.mem.writeInt(u64, body[0..8], i, .little);
+        const cells = [_]Datum{Datum.json(.{ .string = body })};
+        offset.* = try pages.appendBatch(.{ .rows = &.{&cells} });
+    }
+    try pages.file.seal();
+    var reader = PayloadReader.init(&pages);
+    defer reader.deinit();
+    for (offsets_, 0..) |offset, i| {
+        const payload = try reader.read(.{ .offset = offset, .index = 0 });
+        defer payload.release();
+        try std.testing.expectEqual(i, std.mem.readInt(u64, (try payload.block.cell(0, 0)).value.string[0..8], .little));
+    }
+    try std.testing.expect(reader.cache.entries.count() > 1024);
+    try std.testing.expect(reader.cache.bytes > 16 << 20);
+    const reads = reader.reads;
+    for (offsets_, 0..) |_, i| {
+        const payload = try reader.read(.{ .offset = offsets_[offsets_.len - 1 - i], .index = 0 });
+        payload.release();
+    }
+    try std.testing.expectEqual(reads, reader.reads);
+    const required = try budget.allocator().alloc(u8, 120 << 20);
+    defer budget.allocator().free(required);
+    try std.testing.expect(reader.cache.entries.count() < offsets_.len);
+    try std.testing.expect(budget.live <= budget.limit);
+}
+
+test "SQL adaptive payload cache publishes shared lazy growth and unlinks every owner under faults" {
+    const Check = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(a: Allocator) !void {
+            var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 4 << 20 };
+            defer std.debug.assert(budget.live == 0);
+            var marker: u8 = 0;
+            var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &marker, .checkpoint = checkpoint, .async_writes = false };
+            defer manager.deinit();
+            var pages = try JoinPayloads.init(&manager);
+            defer pages.close();
+            var values: [128]std.json.Value = undefined;
+            for (&values, 0..) |*value, i| value.* = .{ .integer = @intCast(i) };
+            const cells = [_]Datum{Datum.json(.{ .array = std.json.Array.fromOwnedSlice(a, &values) })};
+            const offset = try pages.appendBatch(.{ .rows = &.{ &cells, &cells } });
+            try pages.file.seal();
+            const block = try pages.read(offset);
+            defer block.release();
+            try std.testing.expect(block.encoded.?.json_owner != null);
+            const alias = try manager.allocator().create(Sequential.OwnedBlock);
+            alias.* = .{ .a = manager.allocator(), .arena = .init(manager.allocator()), .physical_offset = offset + 1 };
+            defer alias.release();
+            try alias.dependencies.append(manager.allocator(), block);
+            block.retain();
+            var left: PayloadCache = .{};
+            left.bind(&manager);
+            defer left.deinit();
+            var right: PayloadCache = .{};
+            right.bind(&manager);
+            defer right.deinit();
+            try left.insert(block, 0);
+            try left.insert(alias, 0);
+            try right.insert(block, 0);
+            const before = block.ownRetainedBytes();
+            _ = try block.cell(0, 0);
+            try std.testing.expect(block.ownRetainedBytes() > before);
+            left.applyGrowth();
+            right.applyGrowth();
+            try std.testing.expectEqual(block.ownRetainedBytes() + alias.ownRetainedBytes(), left.bytes);
+            try std.testing.expectEqual(block.ownRetainedBytes(), right.bytes);
+            try std.testing.expect(left.evict());
+            try std.testing.expectEqual(block.ownRetainedBytes() + alias.ownRetainedBytes(), left.bytes);
+            try std.testing.expect(left.evict());
+            try std.testing.expectEqual(@as(usize, 0), left.bytes);
+            _ = try block.cell(1, 0);
+            right.applyGrowth();
+            try std.testing.expectEqual(block.ownRetainedBytes(), right.bytes);
+            try std.testing.expectEqual(@as(usize, 0), left.pending_growth.load(.acquire));
+        }
+    };
+    try Check.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Check.run, .{});
+}
+
+test "SQL adaptive payload cache lazy growth publication retires concurrent subscribers before return" {
+    const State = struct {
+        owner: JsonOwner = .{ .arena = .init(std.testing.allocator) },
+        entered: std.Io.Event = .unset,
+        fn run(self: *@This()) !void {
+            self.entered.set(std.testing.io);
+            for (0..128) |_| {
+                while (!self.owner.mutex.tryLock()) std.atomic.spinLoopHint();
+                {
+                    defer self.owner.mutex.unlock();
+                    _ = try self.owner.arena.allocator().alloc(u8, 512);
+                    self.owner.publishCapacity();
+                }
+                try std.testing.io.sleep(.fromNanoseconds(1), .awake);
+            }
+        }
+    };
+    var state: State = .{};
+    defer state.owner.deinit();
+    var permanent: std.atomic.Value(usize) = .init(0);
+    var link: RetainedSubscription = .{ .pending = &permanent };
+    _ = state.owner.subscribe(&link);
+    var linked = true;
+    defer {
+        if (linked) _ = state.owner.unsubscribe(&link);
+    }
+    var task = try std.testing.io.concurrent(State.run, .{&state});
+    defer _ = task.cancel(std.testing.io) catch {};
+    try state.entered.wait(std.testing.io);
+    for (0..512) |_| {
+        var pending: std.atomic.Value(usize) = .init(0);
+        var temporary: RetainedSubscription = .{ .pending = &pending };
+        _ = state.owner.subscribe(&temporary);
+        const growth = state.owner.unsubscribe(&temporary);
+        // Unsubscribe is a lifetime fence, not just removal from a snapshot.
+        // This stack counter can immediately be reused by the next subscriber.
+        try std.testing.expectEqual(growth, pending.load(.acquire));
+    }
+    try task.await(std.testing.io);
+    const capacity = state.owner.retained_capacity.load(.acquire);
+    try std.testing.expect(capacity > 0);
+    try std.testing.expectEqual(capacity, permanent.load(.acquire));
+    try std.testing.expectEqual(capacity, state.owner.unsubscribe(&link));
+    linked = false;
 }

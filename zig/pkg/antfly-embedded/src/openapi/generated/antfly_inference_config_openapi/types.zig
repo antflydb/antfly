@@ -1268,6 +1268,12 @@ pub const ModelFormat = enum {
 pub const ModelInfo = struct {
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
     qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Whether this artifact can run in the current build. `incompatible` artifacts are rejected before load; a model whose directory cannot be read is listed as `incompatible` with `error` set.
+    compatibility: ?[]const u8 = null,
+    /// False when this deployment rejects public execution (`public_inference_enabled: false`); the model is installed and listed, but public calls return 403. Omitted when it can be invoked.
+    invocable: ?bool = null,
+    /// Why the model is unusable, set when its directory could not be read. Other models still list.
+    @"error": ?std.json.Value = null,
     /// List of capabilities this model supports (omitted when empty)
     capabilities: ?[]const []const u8 = null,
     /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
@@ -1276,6 +1282,9 @@ pub const ModelInfo = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "qualified_limits", "qualified_limits", true },
+        .{ "compatibility", "compatibility", true },
+        .{ "invocable", "invocable", true },
+        .{ "error", "error", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
     };
@@ -1292,6 +1301,18 @@ pub const ModelInfo = struct {
         try jw.beginObject();
         if (self.qualified_limits) |value| {
             try jw.objectField("qualified_limits");
+            try jw.write(value);
+        }
+        if (self.compatibility) |value| {
+            try jw.objectField("compatibility");
+            try jw.write(value);
+        }
+        if (self.invocable) |value| {
+            try jw.objectField("invocable");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
             try jw.write(value);
         }
         if (self.capabilities) |value| {
@@ -1387,6 +1408,8 @@ pub const ModelRef = struct {
     kind: ModelKind,
     /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
     name: []const u8,
+    /// Keep a successfully preloaded model pinned against eviction. Set false to warm the ordinary evictable cache before serving; idle and model-count policy still apply.
+    pin: ?bool = null,
     backend: ?ModelBackend = null,
     format: ?ModelFormat = null,
     quantization: ?ModelQuantization = null,
@@ -1399,6 +1422,7 @@ pub const ModelRef = struct {
     pub const openApiFieldMetadata = .{
         .{ "kind", "kind", false },
         .{ "name", "name", false },
+        .{ "pin", "pin", true },
         .{ "backend", "backend", true },
         .{ "format", "format", true },
         .{ "quantization", "quantization", true },
@@ -1420,6 +1444,10 @@ pub const ModelRef = struct {
         try jw.write(self.kind);
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.pin) |value| {
+            try jw.objectField("pin");
+            try jw.write(value);
+        }
         if (self.backend) |value| {
             try jw.objectField("backend");
             try jw.write(value);
@@ -1538,7 +1566,7 @@ pub const ReadRequest = struct {
     images: ?[]const ImageURL = null,
     /// Optional task prompt for document understanding models. - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
     prompt: ?[]const u8 = null,
-    /// Maximum tokens to generate
+    /// Maximum output tokens per page. When omitted, the selected reader model supplies its default, bounded by deployment limits. Explicit values override the model default and must fit model and server limits.
     max_tokens: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

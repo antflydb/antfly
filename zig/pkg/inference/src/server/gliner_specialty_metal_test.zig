@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Exact-artifact native/Metal qualification for the legacy GLiNER2 specialty
 //! profiles. This suite is deliberately opt-in: it hard-links the original
@@ -536,7 +548,7 @@ fn verifyIdentity(node: *Node, directory: []const u8, backend: Backend, profile:
     const span_config = try factory.getGlinerSpanConfig(handle.get().session);
     switch (span_config) {
         .deberta => |config| try std.testing.expectEqual(
-            profile == .pii_multi,
+            profile == .pii,
             config.metal_require_f32_weight_mirrors,
         ),
         .modern_bert => return error.SpecialtyExpectedDebertaRuntime,
@@ -814,7 +826,7 @@ fn directPiiParity(a: Allocator, node: *Node, directory: []const u8, cases: []co
         const head_a = head_scratch.allocator();
 
         const head_capture = case.object.get("heads").?.array.items[0].object;
-        const context = NumericContext{ .backend = backend, .profile = .pii_multi, .case_id = case.object.get("id").?.string };
+        const context = NumericContext{ .backend = backend, .profile = .pii, .case_id = case.object.get("id").?.string };
         const predicted_count: usize = @intCast(head_capture.get("predicted_count").?.integer);
         const hidden = try span_executor.encodeSample(&managed.backend, a, config, sample);
         defer managed.backend.free(hidden);
@@ -1239,7 +1251,7 @@ fn runBackend(a: Allocator, backend: Backend, root: []const u8, pii_dir: []const
         // the final span scores; GRU and encoder stay resident in both cases.
         if (backend == .metal)
             try std.testing.expectEqual(before.to_host_device_calls + 1 + @intFromBool(predicted_count != 0), metal.memoryStatsSnapshot().to_host_device_calls);
-        const context = NumericContext{ .backend = backend, .profile = .pii_multi, .case_id = case.object.get("id").?.string };
+        const context = NumericContext{ .backend = backend, .profile = .pii, .case_id = case.object.get("id").?.string };
         try expectPiiOracle(outputs.pii[i], case, context, oracle_tolerance);
         if (native) |expected| try compareEnvelope(expected.pii[i], outputs.pii[i], oracle_tolerance);
     }
@@ -1247,7 +1259,7 @@ fn runBackend(a: Allocator, backend: Backend, root: []const u8, pii_dir: []const
         try qualifyDefaultByteOffsets(a, transport, case, oracle_tolerance);
         break;
     };
-    try verifyIdentity(&node, pii_dir, backend, .pii_multi);
+    try verifyIdentity(&node, pii_dir, backend, .pii);
     try directPiiParity(a, &node, pii_dir, pii_cases, backend, oracle_tolerance);
     var pii_boundary_schema = try piiSchema(a, pii_cases[0].object.get("labels").?);
     defer pii_boundary_schema.deinit();

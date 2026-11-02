@@ -929,7 +929,7 @@ fn countLstmForwardFromCt(
 
 /// CountLSTM (v1) forward pass (count=1 at inference time):
 /// projector(concat([GRU(pos[0], h_0=label), label])), projector = 2H→4H→H.
-/// Metal keeps the position-zero GRU and projector resident; other backends
+/// Metal and CUDA keep the position-zero GRU and projector resident; other backends
 /// and later count positions retain the reference host fallback.
 fn countLstmV1ForwardFromCt(
     cb: *const ComputeBackend,
@@ -998,6 +998,19 @@ pub fn countLstmV1AtStep(
     defer cb.free(cat_ct);
 
     return countLstmV1Project(cb, cat_ct, num_labels, H);
+}
+
+pub fn countLstmV1SlotZeroResident(
+    cb: *const ComputeBackend,
+    label_ct: CT,
+    num_labels: usize,
+    H: usize,
+) !?CT {
+    const gru_ct = (try cb.glinerLabelGru(label_ct, num_labels, H, false)) orelse return null;
+    defer cb.free(gru_ct);
+    const cat_ct = try cb.concat(gru_ct, label_ct, num_labels, H, H);
+    defer cb.free(cat_ct);
+    return try countLstmV1Project(cb, cat_ct, num_labels, H);
 }
 
 fn countLstmV1Project(cb: *const ComputeBackend, cat_ct: CT, num_labels: usize, H: usize) !CT {
@@ -1572,4 +1585,28 @@ test "getSpanInfo derives width from span_idx layout" {
     try std.testing.expectEqual(@as(usize, 2), info.max_width);
     try std.testing.expectEqualSlices(u32, &.{ 0, 0, 1, 1, 2, 2 }, info.start_indices);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1, 2, 2, 0 }, info.end_indices);
+}
+
+test "GLiNER GRU residual native CountLSTM v1 slot zero preserves direct state" {
+    const a = std.testing.allocator;
+    var store = try ContextualHeadFixture.init(a);
+    defer store.deinitOwned();
+    try ContextualHeadFixture.linear(&store, "count_embed.projector.0", 8, 4, 0);
+    try ContextualHeadFixture.linear(&store, "count_embed.projector.2", 2, 8, 0);
+    const bias = store.resident_weights.getPtr("count_embed.gru.bias_ih_l0").?.tensor.asFloat32Mut();
+    bias[2] = -100;
+    bias[3] = -100;
+    bias[4] = 0.25541282;
+    bias[5] = 0.25541282;
+    var compute = ContextualHeadFixture.native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const labels = try cb.fromFloat32Shape(&.{ 16777216, -16777216, 2, -3 }, &.{ 2, 2 });
+    defer cb.free(labels);
+    try std.testing.expect((try countLstmV1SlotZeroResident(&cb, labels, 2, 2)) == null);
+    const projected = try countLstmV1AtStep(&cb, a, labels, 2, 2, 0);
+    defer cb.free(projected);
+    const got = try cb.toFloat32(projected, a);
+    defer a.free(got);
+    for (got) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.25), value, 0.000001);
 }

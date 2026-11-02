@@ -81,7 +81,7 @@ pub const TableSchema = struct {
             for (conditions, where) |condition, *target| target.* = .{
                 .field = condition.column,
                 .op = nativeEnum(relational_native.RelationalCheckOp, condition.op),
-                .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
+                .value_json = if (condition.value.valueOrNull()) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
                 .collation = condition.collation,
             };
             definition.* = .{
@@ -146,7 +146,7 @@ pub const TableSchema = struct {
             for (conditions, where) |condition, *target| target.* = .{
                 .field = condition.column,
                 .op = nativeEnum(relational_native.RelationalCheckOp, condition.op),
-                .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
+                .value_json = if (condition.value.valueOrNull()) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
                 .collation = condition.collation,
             };
             definition.* = .{ .name = declaration.name, .keys = keys, .include_columns = declaration.include_columns orelse &.{}, .where = where, .owner_kind = .table, .owner_name = relational_native.relational_table_index_owner_name, .access_method = .ordered_tuple };
@@ -2706,7 +2706,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
                 (try names.getOrPut(alloc, check.name)).found_existing)
                 return error.InvalidSchemaUpdateRequest;
             if (check.expression != null) {
-                if (check.column != null or check.op != null or check.value != null or check.collation != null) return error.InvalidSchemaUpdateRequest;
+                if (check.column != null or check.op != null or check.value.isPresent() or check.collation != null) return error.InvalidSchemaUpdateRequest;
             } else {
                 const column_name: []const u8 = check.column orelse "";
                 if (check.op == null or column_name.len == 0) return error.InvalidSchemaUpdateRequest;

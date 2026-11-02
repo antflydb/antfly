@@ -16,7 +16,8 @@
 
 """Bounded native GPU qualification; does not provision, scale, or deploy pools.
 
-Requires canonical candidate policies: output=512 tokens/item, input=8192
+Requires canonical candidate policies: reader output=512 tokens/item by default
+ (override with --reader-max-output-tokens), generator output=512, input=8192
  tokens/item, decoded pixels=4,000,000/batch, max dimension=2048, request
  concurrency=1. Rejection fixtures stay below endpoint/model hard limits.
 """
@@ -27,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import re
 import struct
 import threading
 import time
@@ -69,7 +71,7 @@ class Probe:
         self.timeout = timeout
         self.results = []
 
-    def request(self, url, path, body=None):
+    def request(self, url, path, body=None, *, parse_json=True):
         headers = {"Content-Type": "application/json"}
         token = os.environ.get("ANTFLY_INFERENCE_TOKEN")
         if token:
@@ -81,10 +83,30 @@ class Probe:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return response.status, json.load(response)
+                return response.status, json.load(
+                    response
+                ) if parse_json else response.read(1024 * 1024).decode()
         except urllib.error.HTTPError as error:
             # Record synthetic inference results only; never record headers or token.
-            return error.code, json.loads(error.read(65536))
+            raw = error.read(65536)
+            return error.code, json.loads(raw) if parse_json else raw.decode()
+
+    def recurrent_placement(self, url):
+        status, metrics = self.request(url, "/metrics", parse_json=False)
+        assert status == 200, "recurrent placement metrics unavailable"
+        placement = {}
+        for kind in ("cuda", "host"):
+            values = re.findall(
+                rf"^antfly_inference_recurrent_{kind}_models[ \t]+([^\s]+)[ \t]*$",
+                metrics,
+                re.MULTILINE,
+            )
+            assert len(values) == 1, "missing or ambiguous recurrent placement gauge"
+            placement[kind] = float(values[0])
+        assert placement == {"cuda": 1, "host": 0}, (
+            f"expected one resident CUDA recurrent model without host fallback: {placement}"
+        )
+        return placement
 
     def instances(self, url, model):
         status, body = self.request(url, "/models/instances")
@@ -124,6 +146,11 @@ class Probe:
             "status": status,
             "text": text,
             "instances": self.instances(url, body["model"]),
+            **(
+                {"recurrent_placement": self.recurrent_placement(url)}
+                if path == "/read"
+                else {}
+            ),
         }
 
     def rejected(self, url, path, body, expected_code):
@@ -178,6 +205,7 @@ class Probe:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reader-url")
+    parser.add_argument("--reader-max-output-tokens", type=int, default=512)
     parser.add_argument("--generator-url")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--report", type=Path, required=True)
@@ -188,6 +216,10 @@ def main():
         / "pkg/inference/src/models/testdata/lightonocr3/invoice.png",
     )
     args = parser.parse_args()
+    if not 1 <= args.reader_max_output_tokens < 8192:
+        parser.error(
+            "reader output ceiling must be 1..8191 so its rejection fixture stays within the endpoint limit"
+        )
     if not (args.reader_url or args.generator_url) or not 1 <= args.timeout <= 300:
         parser.error(
             "provide at least one pool URL and a timeout between 1 and 300 seconds"
@@ -196,7 +228,7 @@ def main():
     if args.reader_url:
         body = {
             "images": [{"url": image_url(args.invoice.read_bytes())}],
-            "max_tokens": 512,
+            "max_tokens": args.reader_max_output_tokens,
         }
         # Exercise cold/request-time loads, repeated work, and both switch directions.
         for model in [READERS[0], READERS[1], READERS[1], READERS[0]]:
@@ -214,7 +246,7 @@ def main():
             lambda: probe.rejected(
                 args.reader_url,
                 "/read",
-                dict(request, max_tokens=513),
+                dict(request, max_tokens=args.reader_max_output_tokens + 1),
                 "OUTPUT_TOKEN_LIMIT_EXCEEDED",
             ),
         )

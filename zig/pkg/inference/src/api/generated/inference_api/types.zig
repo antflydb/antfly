@@ -129,11 +129,33 @@ pub const BatchExecutionReport = struct {
     requested_items: i64,
     native_batches: i64,
     native_items: i64,
+    /// Largest successfully executed native decoder step observed by these items, including peers from other requests. Zero or absent means unobserved, one means singleton execution. This is measured at execution, never inferred from native_items or request cardinality.
+    max_native_step_items: ?i64 = null,
     serial_items: i64,
     /// Items rejected before model execution by validation, resolution, or admission.
     rejected_items: i64,
     fallback_items: i64,
     fallback_reason: OpenApiOptionalNullable([]const u8) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "requested_items", "requested_items", false },
+        .{ "native_batches", "native_batches", false },
+        .{ "native_items", "native_items", false },
+        .{ "max_native_step_items", "max_native_step_items", true },
+        .{ "serial_items", "serial_items", false },
+        .{ "rejected_items", "rejected_items", false },
+        .{ "fallback_items", "fallback_items", false },
+        .{ "fallback_reason", "fallback_reason", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -143,6 +165,10 @@ pub const BatchExecutionReport = struct {
         try jw.write(self.native_batches);
         try jw.objectField("native_items");
         try jw.write(self.native_items);
+        if (self.max_native_step_items) |value| {
+            try jw.objectField("max_native_step_items");
+            try jw.write(value);
+        }
         try jw.objectField("serial_items");
         try jw.write(self.serial_items);
         try jw.objectField("rejected_items");
@@ -3263,6 +3289,12 @@ pub const ModelInfo = struct {
     model_revision: ?[]const u8 = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
     qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Whether this artifact can run in the current build. `incompatible` artifacts are rejected before load; a model whose directory cannot be read is listed as `incompatible` with `error` set.
+    compatibility: ?[]const u8 = null,
+    /// False when this deployment rejects public execution (`public_inference_enabled: false`); the model is installed and listed, but public calls return 403. Omitted when it can be invoked.
+    invocable: ?bool = null,
+    /// Why the model is unusable, set when its directory could not be read. Other models still list.
+    @"error": ?std.json.Value = null,
     /// List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring.
     capabilities: ?[]const []const u8 = null,
     /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
@@ -3275,6 +3307,9 @@ pub const ModelInfo = struct {
         .{ "dense_output", "dense_output", true },
         .{ "model_revision", "model_revision", true },
         .{ "qualified_limits", "qualified_limits", true },
+        .{ "compatibility", "compatibility", true },
+        .{ "invocable", "invocable", true },
+        .{ "error", "error", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
     };
@@ -3307,6 +3342,18 @@ pub const ModelInfo = struct {
         }
         if (self.qualified_limits) |value| {
             try jw.objectField("qualified_limits");
+            try jw.write(value);
+        }
+        if (self.compatibility) |value| {
+            try jw.objectField("compatibility");
+            try jw.write(value);
+        }
+        if (self.invocable) |value| {
+            try jw.objectField("invocable");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
             try jw.write(value);
         }
         if (self.capabilities) |value| {
@@ -3556,7 +3603,7 @@ pub const ModelRef = struct {
 };
 
 pub const ModelsResponse = struct {
-    /// Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
+    /// Whether public inference execution is enabled on this deployment. When false, locally installed models are still listed with `invocable: false` and remote upstreams are not probed. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
     public_inference_enabled: ?bool = null,
     /// OpenAI-compatible response object type.
     object: []const u8,
@@ -4108,7 +4155,7 @@ pub const ReadRequest = struct {
     images: ?[]const ImageURL = null,
     /// Optional task prompt for document understanding models. - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
     prompt: ?[]const u8 = null,
-    /// Maximum tokens to generate
+    /// Maximum output tokens per page. When omitted, the selected reader model supplies its default, bounded by deployment limits. Explicit values override the model default and must fit model and server limits.
     max_tokens: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

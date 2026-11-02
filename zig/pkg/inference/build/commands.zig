@@ -42,7 +42,8 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
         .name = "antfly-inference-bench-server",
         // Retain video codec compiler headroom and main's larger Darwin Metal
         // allowance for the production prepared-pipeline benchmark.
-        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 12) * 1024 * 1024 * 1024,
+        .max_rss = std.math.mul(usize, b.option(usize, "bench-server-compile-memory-mb", "Declared HTTP benchmark server compiler memory bound in MiB") orelse
+            (@as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 12) * 1024), 1024 * 1024) catch @panic("benchmark server compiler memory bound overflows"),
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/benchmark_server.zig"),
             .target = ctx.target,

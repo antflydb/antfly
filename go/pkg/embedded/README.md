@@ -216,8 +216,9 @@ publish new commits. Schema or index changes wait for in-flight calls. `Close` w
 
 Multiple writable Lite connections may remain open, including across processes.
 Native operations queue within a process and take a kernel writer lease across
-processes. `OpenOptions.BusyTimeout` waits for a competing operation rather than
-for another handle to close. Connection lifetimes are independent.
+processes. `OpenOptions.BusyTimeout` retries admission while another process
+holds the writer lease or advances the allocator checkpoint. This admission
+retry never replays a mutation body. Connection lifetimes are independent.
 
 Use `BeginTransaction`, `WriteTransaction`, `ResolveTransaction`,
 `TransactionStatus`, and `CommitVersion` when an embedded application needs the

@@ -230,7 +230,9 @@ for the full C ABI contract.
 Multiple writable Lite connections may remain open, including across processes.
 Native operations queue within a process and take a kernel writer lease across
 processes. Pass `busy_timeout=<seconds or datetime.timedelta>` to `create()`/`open()`
-to wait for a competing operation. Closing one connection leaves others usable.
+to retry admission while another process holds the writer lease or advances the
+allocator checkpoint. This admission retry never replays a mutation body.
+Closing one connection leaves others usable.
 
 ## Graph edges and index readiness
 

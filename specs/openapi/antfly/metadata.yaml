@@ -3779,6 +3779,36 @@ components:
           description: Effective repair limit.
         result:
           $ref: "#/components/schemas/TableRepairRunResult"
+        remaining_failures:
+          type: array
+          description: Documents that still fail after this pass, grouped by error code with the next step. Omitted for control passes.
+          items:
+            $ref: "#/components/schemas/RepairRemainingFailure"
+        remaining_failures_truncated:
+          type: boolean
+          description: Whether more repair issues exist than the summary scanned.
+    RepairRemainingFailure:
+      type: object
+      description: A group of documents whose repair still fails with the same error.
+      required: [error_code, count, attempts, transient, hint]
+      properties:
+        error_code:
+          type: string
+          description: Error recorded for the documents, for example `ModelNotFound`.
+        count:
+          type: integer
+          format: uint64
+          description: Number of documents in this group.
+        attempts:
+          type: integer
+          format: uint64
+          description: Highest repair attempt count among the group's documents.
+        transient:
+          type: boolean
+          description: Whether the error is temporary (admission refusal, rate limit). Repair retries these within a job; running repair again usually succeeds.
+        hint:
+          type: string
+          description: What to do next.
     TableRepairJobStartRequest:
       type: object
       description: Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair.
@@ -3868,8 +3898,13 @@ components:
           description: Table being repaired.
         phase:
           type: string
-          enum: [queued, running, succeeded, failed, cancelled]
-          description: Lifecycle phase of the repair job.
+          enum: [queued, running, succeeded, completed_with_failures, failed, cancelled]
+          description: |
+            Lifecycle phase of the repair job. `completed_with_failures` means every
+            pass ran but some documents still fail; `remaining_failures` says why
+            and what to do, and running repair again retries them. `failed` means
+            the job itself could not run, for example an invalid request or a
+            stale control fence.
         repair_status:
           type: string
           enum: [in_progress, complete, debt_remaining, stopped]
@@ -3924,6 +3959,14 @@ components:
           type: integer
           format: uint64
           description: Unix epoch milliseconds when the job is eligible for cleanup.
+        remaining_failures:
+          type: array
+          description: Documents that still fail, grouped by error code with the next step. Present on finished repair jobs that are not controls, read from the current repair issues.
+          items:
+            $ref: "#/components/schemas/RepairRemainingFailure"
+        remaining_failures_truncated:
+          type: boolean
+          description: Whether more repair issues exist than the summary scanned.
     DocumentArtifactReprocessResponse:
       type: object
       required:
@@ -12461,7 +12504,7 @@ paths:
       operationId: ingestLakeChanges
       tags: [table_management]
       summary: ingestLakeChanges
-      description: Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table admin permission and iceberg_writer policy.
+      description: Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table write permission without a row filter and iceberg_writer policy. Catalog initialization, file commits and maintenance require table admin permission.
       requestBody:
         required: true
         content:

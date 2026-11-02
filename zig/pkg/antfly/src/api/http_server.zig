@@ -2037,6 +2037,11 @@ pub const StatusSource = struct {
         free_routing_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
+        /// Whether this backend can ever replicate a non-empty
+        /// `replication_sources` definition right now (an HA hot-standby
+        /// primary cannot). `null` means the backend has no such
+        /// restriction — cluster mode and every existing fixture.
+        replication_sources_supported: ?*const fn (ptr: *anyopaque) anyerror!bool = null,
         publish_vector_migration_table: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         begin_vector_migration_command: ?*const fn (ptr: *anyopaque, table_name: []const u8) anyerror!void = null,
         end_vector_migration_command: ?*const fn (ptr: *anyopaque, table_name: []const u8) void = null,
@@ -2212,6 +2217,13 @@ pub const StatusSource = struct {
     pub fn replaceTableDefinition(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const fn_ptr = self.vtable.replace_table_definition orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("replace_table_definition", self.boundary_dispatch, fn_ptr, .{ self.ptr, expected, replacement });
+    }
+
+    /// Defaults to true: only a backend with a real restriction (standalone
+    /// bound to an HA hot-standby primary) sets the vtable capability.
+    pub fn replicationSourcesSupported(self: StatusSource) !bool {
+        const fn_ptr = self.vtable.replication_sources_supported orelse return true;
+        return try BoundaryAbi.call("replication_sources_supported", self.boundary_dispatch, fn_ptr, .{self.ptr});
     }
 
     pub fn lakeIndexLifecycleAuthority(self: *const StatusSource, request: api_operation.RequestContext) ?@import("lake_index_reader_lease.zig").Authority {
@@ -8478,7 +8490,7 @@ pub const ApiHttpServer = struct {
         request: AuthenticatedRequest,
         permission: kernel_abi.InferencePermission,
     ) !kernel_abi.AuthorizationDecision {
-        if (permission == .write and !self.publicInferenceEnabled()) return .forbidden;
+        if (permission == .write and !self.publicInferenceEnabled()) return .public_inference_disabled;
         if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null and
             request.trusted_principal == null)
             return .allowed;
@@ -14612,6 +14624,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.Timeout => return error.Timeout,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.DocumentArtifactPublicationFailed => return error.DocumentArtifactPublicationFailed,
@@ -21904,7 +21917,7 @@ pub const ApiHttpServer = struct {
     pub fn executeMemoryService(self: *ApiHttpServer, space: []const u8, input: @import("memory.zig").Request, borrowed_identity: ?AuthenticatedIdentity, borrowed_context: api_operation.RequestContext) !contextual_operations.OwnedResponse {
         return self.executeMemoryServiceInner(space, input, borrowed_identity, borrowed_context) catch |err| {
             const status_code = @import("memory.zig").status(err);
-            return contextual_operations.jsonWithStatus(status_code, try std.json.Stringify.valueAlloc(self.alloc, .{ .code = @errorName(err), .@"error" = @errorName(err), .retryable = status_code == 503 or status_code == 429 }, .{}), false);
+            return contextual_operations.jsonWithStatus(status_code, try std.json.Stringify.valueAlloc(self.alloc, .{ .code = @errorName(err), .@"error" = @import("memory.zig").errorMessage(err), .retryable = status_code == 503 or status_code == 429 }, .{}), false);
         };
     }
     fn executeMemoryServiceInner(self: *ApiHttpServer, space: []const u8, input: @import("memory.zig").Request, borrowed_identity: ?AuthenticatedIdentity, borrowed_context: api_operation.RequestContext) !contextual_operations.OwnedResponse {
@@ -23470,6 +23483,7 @@ pub const ApiHttpServer = struct {
             .force = parsed.value.force,
             .control = control,
             .repair_id = repair_id,
+            .operator_initiated = control == null,
         }) catch |err| switch (err) {
             error.InvalidArgument => return try publicOperationTextResponse(self.alloc, 400, "invalid repair request"),
             error.StaleIndexRepairControl => return try publicOperationTextResponse(self.alloc, 409, "repair changed; refresh and retry"),
@@ -23479,11 +23493,19 @@ pub const ApiHttpServer = struct {
             },
         }) orelse return try publicOperationTextResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
+        var summary_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer summary_arena.deinit();
+        const remaining: ?repair_jobs.RemainingFailures = if (control == null)
+            try self.remainingRepairFailures(summary_arena.allocator(), table_name, parsed.value.index, if (target == .artifact) parsed.value.kind else null)
+        else
+            null;
         const response_body = try std.json.Stringify.valueAlloc(self.alloc, .{
             .table = table_name,
             .target = @tagName(target),
             .limit = limit,
             .result = result,
+            .remaining_failures = if (remaining) |value| value.groups else null,
+            .remaining_failures_truncated = if (remaining) |value| value.truncated else null,
         }, .{ .emit_null_optional_fields = false });
         return .{ .status = 200, .body = response_body, .json = true };
     }
@@ -23852,6 +23874,7 @@ pub const ApiHttpServer = struct {
             .repair_job_id = running_state.job_id,
             .repair_attempt_id = running_state.attempt_id,
             .repair_job_created_at_ms = running_state.created_at_millis,
+            .operator_initiated = running_state.control == null,
         }, .{
             .cancel_check = .{
                 .ptr = &cancel_probe,
@@ -25008,11 +25031,50 @@ pub const ApiHttpServer = struct {
         });
     }
 
+    const repair_summary_issue_limit: u32 = 500;
+
+    /// Documents that still fail, grouped by error code with a next step.
+    /// Allocates in `arena`. A failed listing yields an empty summary rather
+    /// than failing the repair response.
+    fn remainingRepairFailures(
+        self: *ApiHttpServer,
+        arena: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: ?[]const u8,
+        kind: ?db_mod.types.ArtifactRepairKind,
+    ) !repair_jobs.RemainingFailures {
+        const source = self.table_writes orelse return .{};
+        const listed = (source.listArtifactRepairIssues(arena, table_name, .{
+            .target = .artifact,
+            .artifact_kind = kind,
+            .index_name = index_name,
+            .limit = repair_summary_issue_limit,
+        }) catch |err| {
+            std.log.warn("repair failure summary unavailable table={s} err={s}", .{ table_name, @errorName(err) });
+            return .{};
+        }) orelse return .{};
+        return try repair_jobs.remainingFailuresAlloc(arena, listed.issues, listed.has_more);
+    }
+
     fn catalogJobResponse(self: *ApiHttpServer, comptime State: type, status: u16, encoded: []const u8) !public_table_http.OwnedResponse {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var state = try std.json.parseFromSliceLeaky(State, a, encoded, .{ .ignore_unknown_fields = true });
+        if (comptime State == repair_jobs.JobState) {
+            if (state.control == null and repair_jobs.isTerminalPhase(state.phase)) {
+                // Live from the repair issues, which stay the source of truth
+                // after the job finishes.
+                const remaining = try self.remainingRepairFailures(
+                    a,
+                    state.table_name,
+                    state.index,
+                    if (std.mem.eql(u8, state.target, "artifact")) state.kind else null,
+                );
+                state.remaining_failures = remaining.groups;
+                state.remaining_failures_truncated = remaining.truncated;
+            }
+        }
         var names = RestoreCatalogNames{ .source = self.source, .arena = a };
         const target = try system_catalog.Target.parse(try names.resolve(state.table_name));
         state.table_name = try target.displayNameAlloc(a);
@@ -28449,7 +28511,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: Authorizat
         if (std.mem.indexOfScalar(u8, remainder, '/')) |separator| {
             const suffix = remainder[separator + 1 ..];
             if (std.mem.eql(u8, suffix, "lake/catalog") or std.mem.eql(u8, suffix, "lake/changes") or std.mem.eql(u8, suffix, "lake/maintenance") or std.mem.eql(u8, suffix, "lake/commits") or std.mem.startsWith(u8, suffix, "lake/commits/")) {
-                if (isReadMethod(method) or method == .POST) return try tablePermission(alloc, remainder[0..separator], if (isReadMethod(method)) .read else .admin);
+                if (isReadMethod(method) or method == .POST) return try tablePermission(alloc, remainder[0..separator], if (isReadMethod(method)) .read else if (std.mem.eql(u8, suffix, "lake/changes")) .write else .admin);
             }
         }
     }
@@ -28823,6 +28885,42 @@ test "internal service credentials cannot authorize public inference routes" {
         kernel_abi.AuthorizationDecision.forbidden,
         try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .write),
     );
+}
+
+test "httpx inference gateway authorization tells disabled public inference apart from missing permission" {
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const secret = "inference-policy-test-secret";
+    const now_seconds: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = secret,
+        .issuer = "cluster-a",
+        .subject = "node:7",
+    }, now_seconds);
+    defer alloc.free(token);
+    for ([_]struct { config: []const u8, expected: kernel_abi.AuthorizationDecision }{
+        // The deployment fence runs first and names itself.
+        .{ .config = "{\"public_inference\":{\"enabled\":false}}", .expected = .public_inference_disabled },
+        // With the fence open, a caller without inference write stays forbidden.
+        .{ .config = "{\"public_inference\":{\"enabled\":true}}", .expected = .forbidden },
+    }) |case| {
+        var config = try common_config.Config.parseFromSlice(alloc, case.config);
+        defer config.deinit();
+        var server = ApiHttpServer.init(alloc, .{
+            .node_config = &config,
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "cluster-a",
+        }, FakeSource.iface(), null, null);
+        defer server.deinit();
+        try std.testing.expectEqual(case.expected, try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .write));
+    }
 }
 
 test "api http server validates dedicated internal service runtime credentials" {
@@ -29825,6 +29923,7 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
 }
 
 pub fn normalizeQueryOperationalError(err: anyerror) ?anyerror {
+    if (public_table_http.queryCancellationError(err)) |operation| return operation;
     if (err == error.ValueSearchRequiresScan or err == error.ValueSearchLimitExceeded or err == error.MetricNotReady or err == error.MetricStale or err == error.DecisionLimitExceeded) return err;
     if (normalizeQueryEmbeddingOperationalError(err)) |normalized| return normalized;
     return switch (reranking_runtime.normalizeOperationalError(err)) {

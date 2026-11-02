@@ -41,7 +41,7 @@ pub const Buffer = struct {
         try cancellation.check();
         var working_set = try lake_build_limits.WorkingSetAllocator.init(alloc, limits);
         return captureBoundedAlloc(working_set.allocator(), source, limits, cancellation) catch |err| {
-            if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarReplayBudgetExceeded;
+            if (err == error.OutOfMemory and working_set.limitExceeded()) return error.LakeSidecarReplayBudgetExceeded;
             return err;
         };
     }

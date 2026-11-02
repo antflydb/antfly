@@ -1039,6 +1039,9 @@ pub const BatchExecutionOptions = struct {
     snapshot_mutation: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease = null,
     wait_for_sync_level: bool = true,
     visibility_completion: ?*BatchVisibilityCompletion = null,
+    /// Internal progress marker; set only after the primary store accepts the
+    /// write. Visibility admission errors must not invite replay of transforms.
+    primary_committed: ?*bool = null,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
@@ -2151,6 +2154,13 @@ pub const ArtifactRepairCompletionState = struct {
     epoch: u64 = 0,
     completed_sequence: u64 = 0,
     pending_issues: u64 = 0,
+    /// Operator-submitted replay, observed without executing providers under
+    /// the managed request's group-operation guard. Survives owner restart.
+    queued_sequence: u64 = 0,
+    queued_job_id: u64 = 0,
+    /// A terminally unhealthy artifact reached index publication. In
+    /// particular, partial OCR can publish chunks without failing replay.
+    failed_sequence: u64 = 0,
 };
 
 pub const ManagedIndexBatchApplicability = enum {

@@ -55,6 +55,11 @@ pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local
         error.LakeIndexReaderLeaseExpired, error.NativeLakeTextCacheBusy, error.NativeLakeRuntimeCacheBusy, error.LakeSnapshotReadLeaseExpired, error.LakeSnapshotRetired, error.LakeOverlayCoverageUnavailable => error.StorageReadTemporarilyUnavailable,
         error.NativeLakeTextCorpusTooLarge, error.LakeOverlayTooLarge, error.ArtifactReadBudgetExceeded => error.QueryCandidateBudgetExceeded,
         error.IndexNotFound => error.InvalidQueryRequest,
+        error.Canceled => canceled: {
+            // Recover the request deadline after a provider-only boolean adapter.
+            try request.ensureActive();
+            break :canceled error.Canceled;
+        },
         else => err,
     };
 }
@@ -247,7 +252,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     defer pattern_programs.deinit();
     var effective = req;
     effective.text_pattern_programs = &pattern_programs;
-    effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
+    effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled, .check_fn = Execution.highlightCheckpoint };
     const has_vectors = build_recent or effective.dense != null or effective.sparse != null or effective.dense_queries.len != 0 or effective.sparse_queries.len != 0;
     const has_text = for (owner.declarations) |declaration| {
         if (declaration.artifact.kind == .text_segment) break true;
@@ -410,11 +415,14 @@ const Execution = struct {
     hydration_ns: u64 = 0,
     use_stored_highlights: bool = false,
     highlight_index: ?[]const u8 = null,
-    highlight_locations: std.StringHashMapUnmanaged(StoredHighlightLocation) = .empty,
+    highlight_locations: std.StringHashMapUnmanaged(StoredTextLocation) = .empty,
     text_stores_source: std.StringHashMapUnmanaged(bool) = .empty,
     highlight_pins: std.ArrayList(search.PinnedTextSource) = .empty,
     delivery_pin: ?search.PinnedTextSource = null,
+    delivery_locations: @import("lake_text_delivery.zig").Locations = .empty,
+    delivery_index: ?[]const u8 = null,
     highlight_queries: ?[]const search.HighlightQuery = null,
+    prepared_highlights: ?search.PreparedHighlights = null,
     arena: A,
     result_allocator: A = std.heap.page_allocator,
     navigation: ?*@import("lake_source_navigation.zig").Resolver = null,
@@ -841,10 +849,12 @@ const Execution = struct {
     }
 
     fn deinit(self: *Execution) void {
+        if (self.prepared_highlights) |*prepared| prepared.deinit();
         self.ordinal_live_rows.deinit(self.result_allocator);
         if (self.vector_include_provider) |*provider| provider.deinit();
         if (self.vector_exclude_provider) |*provider| provider.deinit();
         self.highlight_locations.deinit(self.arena);
+        self.delivery_locations.deinit(self.arena);
         for (self.highlight_pins.items) |*pin| pin.deinit();
         if (self.delivery_pin) |*pin| pin.deinit();
         for (self.runtimes.items) |runtime| runtime.release();
@@ -976,7 +986,7 @@ const Execution = struct {
     fn highlightPlan(self: *Execution, name: ?[]const u8, text: types.TextQuery) !?HighlightPlan {
         const selected = (try self.textDeclaration(name)) orelse return null;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
-        const token: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
+        const token: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, token, corpus.loadDirectory);
         defer metadata.release();
         const root = metadata.value.root;
@@ -1021,7 +1031,7 @@ const Execution = struct {
         }
         const selected = (try self.textDeclaration(name)) orelse return null;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics, .lazy_lineage = self.lazy_lineage };
-        const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
+        const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
         const root = metadata.value.root;
@@ -1095,6 +1105,13 @@ const Execution = struct {
         defer self.active_text = previous;
         return acquire(self, name);
     }
+    fn highlightCheckpoint(raw: *const anyopaque) anyerror!void {
+        const self: *const Execution = @ptrCast(@alignCast(raw));
+        try self.context.ensureActive();
+    }
+    fn highlightControl(self: *Execution) @import("antfly_cancellation").CancellationToken {
+        return .{ .ptr = self, .check_fn = highlightCheckpoint };
+    }
     fn attachHighlights(self: *Execution, a: A, req: types.SearchRequest, result: *types.SearchResult) !void {
         const options = req.highlight orelse return;
         if (req.defer_hierarchy_child_hydration or result.hits.len == 0) return;
@@ -1104,6 +1121,10 @@ const Execution = struct {
         try self.context.ensureActive();
         try self.planHighlights(req);
         if (self.highlight_queries.?.len == 0) return;
+        // One immutable routing plan for the request, including every streamed
+        // result batch. It borrows this Execution's request-lifetime context.
+        if (self.prepared_highlights == null) self.prepared_highlights = try search.PreparedHighlights.initControlled(self.arena, options, self.highlight_queries.?, self.highlightControl());
+        const prepared = &self.prepared_highlights.?;
         // Highlight the original source even when result shaping projected it
         // away. Hydration keeps the same snapshot, deletes and reader lease.
         var sources: ?[]?[]u8 = null;
@@ -1112,14 +1133,21 @@ const Execution = struct {
             a.free(items);
         };
         if (self.use_stored_highlights) {
-            if (self.highlight_locations.count() != 0) {
-                var prepared = try search.PreparedHighlights.init(a, options, self.highlight_queries.?);
-                defer prepared.deinit();
-                try self.attachLocatedHighlights(a, &prepared, result.hits);
-            } else {
-                var prepared = try search.PreparedHighlights.init(a, options, self.highlight_queries.?);
-                defer prepared.deinit();
-                try self.attachPinnedHighlights(a, &prepared, result.hits);
+            const fields = try self.highlightHydrationFields(a, prepared);
+            defer a.free(fields);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            var all_covered = true;
+            for (result.hits) |*hit| {
+                try self.context.ensureActive();
+                const value = (try projectedHighlightSource(&scratch, hit, fields)) orelse {
+                    all_covered = false;
+                    continue;
+                };
+                try prepared.attachValue(a, scratch.allocator(), hit, value);
+            }
+            if (!all_covered) {
+                if (self.highlight_locations.count() != 0) try self.attachLocatedHighlights(a, prepared, result.hits) else try self.attachPinnedHighlights(a, prepared, result.hits);
             }
             try self.context.ensureActive();
             return;
@@ -1129,10 +1157,12 @@ const Execution = struct {
             for (result.hits, keys) |hit, *key| key.* = hit.id;
             sources = try loadManySelected(self, a, keys, self.hydration_fields);
         }
-        try search.attachHighlightsWithIndexQueries(a, options, self.highlight_queries.?, result.hits, sources);
+        try search.attachPreparedHighlights(a, prepared, result.hits, sources);
         try self.context.ensureActive();
     }
     fn attachPinnedHighlights(self: *Execution, a: A, prepared: *const search.PreparedHighlights, hits: []types.SearchHit) !void {
+        const fields = try self.highlightHydrationFields(a, prepared);
+        defer a.free(fields);
         if (self.highlight_pins.items.len == 0) {
             var pin = if (self.delivery_pin) |*ranked| try ranked.clone() else (try self.acquireForText(self.highlight_index, self.highlight_queries.?[0].query)) orelse return error.InvalidNativeLakeTextCorpus;
             errdefer pin.deinit();
@@ -1164,34 +1194,88 @@ const Execution = struct {
                 return left.ordinal < right.ordinal;
             }
         }.less);
-        var cursor = local.segment.SegmentReader.StoredDocCursor.init(a);
-        defer cursor.deinit();
-        var segment_index: usize = 0;
-        var lower: u32 = 0;
-        for (winners) |winner| {
-            try self.context.ensureActive();
-            while (segment_index < pin.snapshot.segments.len and winner.ordinal - lower >= pin.snapshot.segments[segment_index].reader.doc_count) {
-                lower = try std.math.add(u32, lower, pin.snapshot.segments[segment_index].reader.doc_count);
-                segment_index += 1;
+        try self.attachHighlightRows(a, prepared, pin.snapshot, hits, winners, fields, false);
+    }
+    /// A compact permutation and row-type values are retained; hidden bodies
+    /// are borrowed one field/row at a time from the field-major hydrator.
+    fn attachHighlightRows(self: *Execution, a: A, prepared: *const search.PreparedHighlights, snapshot: *const local.index.IndexSnapshot, hits: []types.SearchHit, winners: anytype, fields: []const []const u8, comptime located: bool) !void {
+        const Hydrator = @import("lake_index_source_projection.zig").Hydrator;
+        const Consumer = struct {
+            execution: *Execution,
+            prepared: *const search.PreparedHighlights,
+            allocator: A,
+            metadata: A,
+            hits: []types.SearchHit,
+            winners: @TypeOf(winners),
+            types: []?std.json.Value,
+            skip: []bool,
+            output: []search.PreparedHighlights.Accumulator,
+            fn doc(raw: *anyopaque, i: usize) u32 {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                return if (located) value.winners[i].location.document else value.winners[i].ordinal;
             }
-            if (segment_index == pin.snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
-            const segment = try pin.snapshot.readSegment(segment_index);
-            const doc = (try cursor.get(&segment.reader, winner.ordinal - lower)) orelse return error.InvalidNativeLakeTextCorpus;
-            _ = input.reset(.retain_capacity);
-            try self.attachStoredSnippet(a, input.allocator(), prepared, hits[winner.index .. winner.index + 1], doc);
-        }
+            fn key(raw: *anyopaque, scratch: A, i: usize) ![]const u8 {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                return nativeKey(value.execution, scratch, value.hits[value.winners[i].index].id);
+            }
+            fn check(raw: *anyopaque) !void {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                try value.execution.context.ensureActive();
+            }
+            fn text(raw: *anyopaque, scratch: A, i: usize, field: []const u8, source: local.section_source_column.Text) !bool {
+                const consumer: *@This() = @ptrCast(@alignCast(raw));
+                if (consumer.skip[i]) return true;
+                try consumer.execution.context.ensureActive();
+                return consumer.prepared.appendStoredSourceField(consumer.allocator, scratch, &consumer.output[i], consumer.types[i], field, source);
+            }
+            fn accept(raw: *anyopaque, scratch: A, i: usize, field: []const u8, value: std.json.Value) !void {
+                const consumer: *@This() = @ptrCast(@alignCast(raw));
+                if (consumer.skip[i]) return;
+                // Matching can cost more than decoding; retain a checkpoint
+                // for each borrowed value, independently of hydration tiles.
+                try consumer.execution.context.ensureActive();
+                var source: std.json.Value = .{ .object = .empty };
+                if (std.mem.eql(u8, field, "_type")) {
+                    consumer.types[i] = try local.storage_db_types.cloneJsonValue(consumer.metadata, value);
+                } else if (consumer.types[i]) |kind| try source.object.put(scratch, "_type", kind);
+                try source.object.put(scratch, field, value);
+                try consumer.prepared.appendSourceField(consumer.allocator, scratch, &consumer.output[i], source, field);
+            }
+        };
+        var metadata = std.heap.ArenaAllocator.init(a);
+        defer metadata.deinit();
+        const types_ = try metadata.allocator().alloc(?std.json.Value, winners.len);
+        @memset(types_, null);
+        const skip = try metadata.allocator().alloc(bool, winners.len);
+        for (winners, skip) |winner, *value| value.* = hits[winner.index].highlights.len != 0;
+        const output = try a.alloc(search.PreparedHighlights.Accumulator, winners.len);
+        defer a.free(output);
+        @memset(output, .{});
+        defer for (output) |*item| item.deinit(a);
+        var consumer: Consumer = .{ .execution = self, .prepared = prepared, .allocator = a, .metadata = metadata.allocator(), .hits = hits, .winners = winners, .types = types_, .skip = skip, .output = output };
+        var hydrator = Hydrator.init(a);
+        defer hydrator.deinit();
+        try hydrator.visitRows(a, snapshot, .{ .ptr = &consumer, .len = winners.len, .document = Consumer.doc, .key = Consumer.key, .checkpoint = Consumer.check }, fields, .{ .ptr = &consumer, .accept = Consumer.accept, .text = Consumer.text });
+        for (winners, skip, output) |winner, skipped, *item| if (!skipped) {
+            hits[winner.index].highlights = try item.finish(a);
+            prepared.orderFields(&hits[winner.index]);
+        };
     }
-    fn attachStoredSnippet(self: *Execution, a: A, scratch: A, prepared: *const search.PreparedHighlights, hit: []types.SearchHit, doc: local.segment.SegmentReader.StoredDocRef) !void {
-        const expected = try nativeKey(self, scratch, hit[0].id);
-        if (!std.mem.eql(u8, doc.id, expected)) return error.InvalidNativeLakeTextCorpus;
-        const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, doc.data, .{ .parse_numbers = false });
-        if (value != .object) return error.InvalidNativeLakeTextCorpus;
-        try prepared.attachValue(a, scratch, &hit[0], value);
+    fn highlightHydrationFields(self: *Execution, a: A, prepared: *const search.PreparedHighlights) ![]const []const u8 {
+        var fields: std.ArrayList([]const u8) = .empty;
+        errdefer fields.deinit(a);
+        try appendHydrationPath(a, self.table, &fields, "_type");
+        if (prepared.source_fields) |paths| {
+            for (paths) |path| try appendHydrationPath(a, self.table, &fields, path);
+        } else for (self.table.columns) |column| try appendHydrationPath(a, self.table, &fields, column.path);
+        return fields.toOwnedSlice(a);
     }
-    /// Sort a compact permutation, retaining result order and only one reader
-    /// and decoded stored block. Hidden source is released after each snippet.
+    /// Group a compact permutation under one pack pin at a time. Four field
+    /// cursors bound decoding; each hidden field value is released immediately.
     fn attachLocatedHighlights(self: *Execution, a: A, prepared: *const search.PreparedHighlights, hits: []types.SearchHit) !void {
-        const Winner = struct { index: usize, location: StoredHighlightLocation };
+        const fields = try self.highlightHydrationFields(a, prepared);
+        defer a.free(fields);
+        const Winner = struct { index: usize, location: StoredTextLocation };
         const winners = try a.alloc(Winner, hits.len);
         defer a.free(winners);
         for (hits, winners, 0..) |hit, *winner, index| winner.* = .{ .index = index, .location = self.highlight_locations.get(hit.id) orelse return error.InvalidNativeLakeTextCorpus };
@@ -1203,8 +1287,6 @@ const Execution = struct {
         }.less);
         var reader_arena = std.heap.ArenaAllocator.init(a);
         defer reader_arena.deinit();
-        var input = std.heap.ArenaAllocator.init(a);
-        defer input.deinit();
         var begin: usize = 0;
         while (begin < winners.len) {
             try self.context.ensureActive();
@@ -1221,18 +1303,7 @@ const Execution = struct {
             };
             defer pin.deinit();
             if (pin.snapshot.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
-            const segment = try pin.snapshot.readSegment(0);
-            var cursor = local.segment.SegmentReader.StoredDocCursor.init(a);
-            defer cursor.deinit();
-            for (winners[begin..end], begin..) |winner, position| {
-                for (winners[position..@min(end, position + 4)]) |upcoming| try pin.snapshot.prefetchStoredDoc(upcoming.location.document);
-                try self.context.ensureActive();
-                _ = input.reset(.retain_capacity);
-                const ia = input.allocator();
-                const page = hits[winner.index .. winner.index + 1];
-                const doc = (try cursor.get(&segment.reader, winner.location.document)) orelse return error.InvalidNativeLakeTextCorpus;
-                try self.attachStoredSnippet(a, ia, prepared, page, doc);
-            }
+            try self.attachHighlightRows(a, prepared, pin.snapshot, hits, winners[begin..end], fields, true);
             begin = end;
         }
     }
@@ -1252,6 +1323,52 @@ const Execution = struct {
             hit.source_value = null;
         }
     }
+    fn storedDeliveryUseful(self: *const Execution, prefetched: ?*const search.PinnedTextSource) bool {
+        // Coverage may be inspected while any pin is live. Retention requires
+        // an outer-wave pin; a child contributes only copied pack/doc locators.
+        const pin = prefetched orelse return false;
+        if (pin.stored_projection_fields.len == 0) return false;
+        const wanted = self.hydration_fields orelse return true;
+        for (wanted) |field| for (pin.stored_projection_fields) |available| {
+            if (std.mem.eql(u8, field, available)) return true;
+        };
+        return false;
+    }
+    const PackSource = struct {
+        owner: *Execution,
+        root: corpus.Root,
+        artifact: local.serverless_manifest_artifact_ref.ArtifactRef,
+        cached: @import("lake_index_aggregate_artifact.zig").CachedRead,
+        token: @import("antfly_cancellation").CancellationToken,
+        fn open(raw: *anyopaque, id: [32]u8) !?search.PinnedTextSource {
+            const source: *@This() = @ptrCast(@alignCast(raw));
+            const owner = source.owner;
+            try owner.context.ensureActive();
+            return try owner.server.lake_text_corpora.acquireSelected(owner.server.embedding_provider_runtime.io, owner.store.artifactStore(), source.artifact, source.root, owner.schema_json, source.cached, owner.context, source.token, &.{id});
+        }
+    };
+    fn hydrateLocatedTyped(self: *Execution, a: A, hits: []types.SearchHit) !bool {
+        const name = self.delivery_index orelse return false;
+        for (hits) |hit| if (!self.delivery_locations.contains(hit.id)) return false;
+        const declaration = (try self.textDeclaration(name)) orelse return false;
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics, .lazy_lineage = true };
+        const token: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
+        const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), declaration.artifact, token, corpus.loadDirectory);
+        defer metadata.release();
+        const root = metadata.value.root;
+        if (!std.mem.eql(u8, &root.domain, &self.domain) or !@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, declaration.binding)) return error.InvalidNativeLakeTextCorpus;
+        var factory: PackSource = .{ .owner = self, .root = root, .artifact = declaration.artifact, .cached = cached, .token = token };
+        const Hydrate = struct {
+            fn apply(raw: *anyopaque, alloc: A, selected: @import("lake_text_delivery.zig").Selection, pin: ?*const search.PinnedTextSource) !void {
+                const owner: *Execution = @ptrCast(@alignCast(raw));
+                const keys = try alloc.alloc([]const u8, selected.len());
+                defer alloc.free(keys);
+                for (keys, 0..) |*key, i| key.* = selected.at(i).id;
+                try owner.hydrateTypedSelection(alloc, selected, keys, pin);
+            }
+        };
+        return @import("lake_text_delivery.zig").run(a, self.context.io, hits, &self.delivery_locations, .{ .ptr = &factory, .open = PackSource.open }, .{ .ptr = self, .apply = Hydrate.apply });
+    }
     fn hydrateTyped(self: *Execution, a: A, req: types.SearchRequest, hits: []types.SearchHit) !void {
         if (hits.len == 0) return;
         const started = @import("antfly_platform").time.monotonicNs();
@@ -1264,6 +1381,9 @@ const Execution = struct {
         var pin: ?*const search.PinnedTextSource = null;
         const one_text_source = (req.full_text != null and req.full_text_queries.len == 0) or (req.full_text == null and req.full_text_queries.len == 1);
         if (one_text_source and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.dense == null and req.sparse == null) {
+            if (self.delivery_index != null and self.delivery_locations.count() != 0) {
+                if (try self.hydrateLocatedTyped(a, hits)) return;
+            }
             const bound = for (hits) |hit| {
                 if (hit.native_text_doc_id == null) break false;
             } else true;
@@ -1274,13 +1394,35 @@ const Execution = struct {
         try self.hydrateTypedFromSource(a, hits, keys, pin);
     }
     fn hydrateTypedFromSource(self: *Execution, a: A, hits: []types.SearchHit, keys: []const []const u8, pin: ?*const search.PinnedTextSource) !void {
-        if (self.overlay == null and (pin == null or pin.?.stored_projection_fields.len == 0)) {
-            const columns = try loadSelected(types.ColumnSource, self, a, keys, self.hydration_fields);
+        return self.hydrateTypedSelection(a, .{ .hits = hits }, keys, pin);
+    }
+    fn identityColumns(self: *Execution, a: A, hits: @import("lake_text_delivery.zig").Selection) ![]?types.ColumnSource {
+        const page = try types.ColumnSourcePage.native(a, &.{"_id"}, hits.len());
+        defer page.release();
+        for (0..hits.len()) |i| {
+            try self.context.ensureActive();
+            try page.setNative(i, 0, .{ .string = try publicKey(self, page.arena.allocator(), hits.at(i).id) });
+        }
+        try page.finishNative();
+        const sources = try a.alloc(?types.ColumnSource, hits.len());
+        for (sources, 0..) |*source, i| source.* = page.row(i);
+        return sources;
+    }
+    fn hydrateTypedSelection(self: *Execution, a: A, hits: @import("lake_text_delivery.zig").Selection, keys: []const []const u8, pin: ?*const search.PinnedTextSource) !void {
+        std.debug.assert(hits.len() == keys.len);
+        const identity_only = if (self.hydration_fields) |paths| paths.len == 1 and std.mem.eql(u8, paths[0], "_id") else false;
+        if (self.overlay == null and (identity_only or pin == null or pin.?.stored_projection_fields.len == 0)) {
+            const columns = if (identity_only) try self.identityColumns(a, hits) else physical: {
+                const started = @import("antfly_platform").time.monotonicNs();
+                defer self.server.lake_query_metrics.record(.hydration_source, started);
+                break :physical try loadSelected(types.ColumnSource, self, a, keys, self.hydration_fields);
+            };
             defer {
                 for (columns) |value| if (value) |owned| owned.deinit();
                 a.free(columns);
             }
-            for (hits, columns) |*hit, *value| {
+            for (columns, 0..) |*value, index| {
+                const hit = hits.at(index);
                 if (hit.stored_data) |bytes| a.free(bytes);
                 hit.stored_data = null;
                 if (hit.source_value) |*source| types.deinitJsonValue(a, source);
@@ -1304,27 +1446,92 @@ const Execution = struct {
             fields = plan.parquet;
             stored_fields = plan.sidecar;
         };
+        if (self.overlay == null and stored_fields.len != 0) {
+            const started = @import("antfly_platform").time.monotonicNs();
+            defer self.server.lake_query_metrics.record(.hydration_native, started);
+            const Rows = struct {
+                owner: *Execution,
+                hits: @import("lake_text_delivery.zig").Selection,
+                fn doc(raw: *anyopaque, i: usize) u32 {
+                    return @as(*@This(), @ptrCast(@alignCast(raw))).hits.at(i).native_text_doc_id.?;
+                }
+                fn key(raw: *anyopaque, alloc: A, i: usize) ![]const u8 {
+                    const value: *@This() = @ptrCast(@alignCast(raw));
+                    return nativeKey(value.owner, alloc, value.hits.at(i).id);
+                }
+                fn check(raw: *anyopaque) !void {
+                    try @as(*@This(), @ptrCast(@alignCast(raw))).owner.context.ensureActive();
+                }
+            };
+            var rows: Rows = .{ .owner = self, .hits = hits };
+            var hydrator = projection.Hydrator.init(a);
+            defer hydrator.deinit();
+            const native = try hydrator.columnRows(a, pin.?.snapshot, .{ .ptr = &rows, .len = hits.len(), .document = Rows.doc, .key = Rows.key, .checkpoint = Rows.check }, stored_fields);
+            defer native.release();
+            const physical = if (fields.?.len != 0) physical: {
+                const before = @import("antfly_platform").time.monotonicNs();
+                defer self.server.lake_query_metrics.record(.hydration_source, before);
+                const virtual_only = fields.?.len == 1 and std.mem.eql(u8, fields.?[0], "_id");
+                break :physical if (virtual_only) try self.identityColumns(a, hits) else try loadSelected(types.ColumnSource, self, a, keys, fields);
+            } else null;
+            defer if (physical) |values| {
+                for (values) |value| if (value) |row| row.deinit();
+                a.free(values);
+            };
+            const page = if (physical) |values| try types.ColumnSourcePage.join(a, self.hydration_fields orelse all: {
+                const names = try self.arena.alloc([]const u8, self.table.columns.len);
+                for (names, self.table.columns) |*name, column| name.* = column.path;
+                break :all names;
+            }, values, native) else native;
+            defer if (physical != null) page.release();
+            for (0..hits.len()) |i| {
+                const hit = hits.at(i);
+                if (hit.stored_data) |bytes| a.free(bytes);
+                hit.stored_data = null;
+                if (hit.source_value) |*value| types.deinitJsonValue(a, value);
+                hit.source_value = null;
+                std.debug.assert(hit.column_source == null);
+                hit.column_source = page.row(i);
+            }
+            return;
+        }
         const values = if (stored_fields.len != 0 and fields.?.len == 0) empty: {
-            const rows = try a.alloc(?std.json.Value, hits.len);
+            const rows = try a.alloc(?std.json.Value, hits.len());
             @memset(rows, std.json.Value{ .object = .empty });
             break :empty rows;
-        } else try loadSelected(std.json.Value, self, a, keys, fields);
+        } else physical: {
+            const started = @import("antfly_platform").time.monotonicNs();
+            defer self.server.lake_query_metrics.record(.hydration_source, started);
+            break :physical try loadSelected(std.json.Value, self, a, keys, fields);
+        };
         defer {
             for (values) |*value| if (value.*) |*owned| types.deinitJsonValue(a, owned);
             a.free(values);
         }
         var hydrator = projection.Hydrator.init(a);
         defer hydrator.deinit();
-        if (stored_fields.len != 0) for (hits, values, 0..) |hit, *value, position| {
-            try self.context.ensureActive();
-            // Keep a small lookahead through the current snapshot's bounded
-            // source queue. Required reads still authenticate and report errors.
-            for (hits[position..@min(hits.len, position + 4)]) |upcoming| try pin.?.snapshot.prefetchStoredDoc(upcoming.native_text_doc_id.?);
-            const key = try nativeKey(self, a, hit.id);
-            defer a.free(key);
-            if (value.*) |*row| try hydrator.append(a, pin.?.snapshot, hit.native_text_doc_id.?, key, stored_fields, row) else return error.StoredDocMissing;
-        };
-        for (hits, values) |*hit, *value| {
+        if (stored_fields.len != 0) {
+            const started = @import("antfly_platform").time.monotonicNs();
+            defer self.server.lake_query_metrics.record(.hydration_native, started);
+            const Rows = struct {
+                owner: *Execution,
+                hits: @import("lake_text_delivery.zig").Selection,
+                fn doc(raw: *anyopaque, i: usize) u32 {
+                    return @as(*@This(), @ptrCast(@alignCast(raw))).hits.at(i).native_text_doc_id.?;
+                }
+                fn key(raw: *anyopaque, alloc: A, i: usize) ![]const u8 {
+                    const rows: *@This() = @ptrCast(@alignCast(raw));
+                    return nativeKey(rows.owner, alloc, rows.hits.at(i).id);
+                }
+                fn check(raw: *anyopaque) !void {
+                    try @as(*@This(), @ptrCast(@alignCast(raw))).owner.context.ensureActive();
+                }
+            };
+            var rows: Rows = .{ .owner = self, .hits = hits };
+            try hydrator.appendRows(a, pin.?.snapshot, .{ .ptr = &rows, .len = hits.len(), .document = Rows.doc, .key = Rows.key, .checkpoint = Rows.check }, stored_fields, values);
+        }
+        for (values, 0..) |*value, index| {
+            const hit = hits.at(index);
             // Residual predicate evaluation may have temporarily loaded source.
             // Final projected columns replace it after all filtering/ranking.
             if (hit.stored_data) |bytes| a.free(bytes);
@@ -1340,7 +1547,12 @@ const Execution = struct {
         const projected = (try projectionColumns(self.arena, self.table, req)) orelse return null;
         var fields: std.ArrayList([]const u8) = .empty;
         try fields.appendSlice(self.arena, projected);
-        for (req.order_by) |order| try appendHydrationPath(self.arena, self.table, &fields, order.field);
+        for (req.order_by) |order| {
+            // Hit identity already supplies this sort key; loading a virtual
+            // source column would make wildcard payloads depend on ordering.
+            if (std.mem.eql(u8, order.field, "_id")) continue;
+            try appendHydrationPath(self.arena, self.table, &fields, order.field);
+        }
         const options = req.highlight orelse return fields.items;
         if (req.full_text == null and req.full_text_queries.len == 0) return fields.items;
         try self.planHighlights(req);
@@ -1383,7 +1595,7 @@ const Execution = struct {
         const self = from(raw);
         try self.resolveOverlayPhysical();
         var request = self.request;
-        request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+        request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = &.{}, .primary_order = true, .after = options.primary_key_start_after, .before = options.primary_key_stop_before, .limit = 256 }, request, self.source);
         defer cursor.close(cursor.ptr);
         var manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.context.io.?, .context = self, .checkpoint = scanCheckpoint };
@@ -1827,7 +2039,7 @@ const Execution = struct {
     // highlights and text components of hybrid/composed retrieval share the same
     // bounded coordinator. The composed owner retains fusion and source leases;
     // source-dependent transforms run once on the global candidate pool.
-    fn predicatePacks(self: *Execution, root: corpus.Root, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, json: []const u8) !?[]const [32]u8 {
+    fn predicatePacks(self: *Execution, root: corpus.Root, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, json: []const u8, candidate_limit: usize) !?[]const [32]u8 {
         if (root.source_routes_version != 1) return null;
         var budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 16 * 1024 * 1024 };
         var arena = std.heap.ArenaAllocator.init(budget.allocator());
@@ -1835,7 +2047,7 @@ const Execution = struct {
         const a = arena.allocator();
         const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
         var allowance: local.serverless_query_lake_serving.ServingSource.TranslationAllowance = .{};
-        var candidates = (try resolver.selectiveCandidates(a, json, if (self.relocated()) 4096 else std.math.maxInt(usize), &allowance)) orelse return null;
+        var candidates = (try resolver.selectiveCandidates(a, json, if (self.relocated()) @min(4096, candidate_limit) else candidate_limit, &allowance)) orelse return null;
         defer candidates.deinit();
         const tree = @import("../serverless/graph_segment/page_tree.zig");
         var store = self.store.artifactStore();
@@ -1853,7 +2065,7 @@ const Execution = struct {
         return try self.arena.dupe([32]u8, selected);
     }
 
-    fn pagedText(self: *Execution, a: A, input: types.SearchRequest, text: types.TextQuery) anyerror!?types.SearchResult {
+    fn pagedText(self: *Execution, a: A, input: types.SearchRequest, text: types.TextQuery, attempt: *OrderedAttempt) anyerror!?types.SearchResult {
         var req = input;
         // Public limit=0 requests also ask for an exact count. Do not turn a
         // source transform's candidate pool into a count-only execution.
@@ -1881,7 +2093,7 @@ const Execution = struct {
         } else return null;
         try self.bindIndex(selected.name);
         var cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
-        const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
+        const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
         const root = metadata.value.root;
@@ -1924,6 +2136,39 @@ const Execution = struct {
             if (std.mem.eql(u8, field.field, "_score")) break false;
         } else true);
         defer if (ordering) |*order| order.deinit(a);
+        const native_window = root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes;
+        if (native_window and req.filter_query_json.len == 0 and ordering != null and ordering.?.hasNativePrimaryOrder()) return null;
+        if (ordering) |order| {
+            // An ordered row index can stop after the winning prefix. Retain
+            // that global seek instead of scanning every window's doc values.
+            _ = plan.reset(.retain_capacity);
+            const scan = self.orderedTextScan(plan.allocator(), order.effective.req) catch |err| switch (err) {
+                error.OutOfMemory => return null,
+                else => return err,
+            };
+            if (scan) |candidate| {
+                const compatible = @import("lake_index_sql_rows.zig").hasOrderedPredicatePlan(plan.allocator(), self.table, candidate) catch |err| switch (err) {
+                    error.OutOfMemory => return null,
+                    else => return err,
+                };
+                if (compatible and self.overlay == null and !req.count_only and !req.evaluation_matches and root.source_routes_version == 1) {
+                    attempt.start();
+                    defer attempt.finish();
+                    const ordered = self.orderedPagedText(a, order.effective.req, text, root, selected.name, cached, cancellation, order, candidate, attempt) catch |err| switch (err) {
+                        error.OutOfMemory, error.NativeLakeTextCacheBusy, error.ArtifactReadBudgetExceeded => null,
+                        else => return err,
+                    };
+                    if (ordered) |result| return result;
+                    // A consumed optional prefix has already spent this query's
+                    // ordered probe allowance. Window planning and the final
+                    // collector must not reopen the same skewed prefix.
+                    if (attempt.scanned != 0) attempt.prefer_text_candidates = true;
+                }
+            }
+        }
+        // A text-driven plan must not enumerate a broad metadata selection
+        // after declining the ordered driver. Native filters still apply.
+        if (attempt.prefer_text_candidates and native_window) return null;
         const pack_proof_mod = @import("lake_index_pack_proof.zig");
         var pack_proof: ?*pack_proof_mod = null;
         defer if (pack_proof) |proof| proof.deinit();
@@ -1942,8 +2187,8 @@ const Execution = struct {
                 else => return err,
             };
         }
-        const predicate_selection = if ((!stream_predicate or self.relocated()) and req.filter_query_json.len != 0)
-            self.predicatePacks(root, cached, cancellation, req.filter_query_json) catch |err| switch (err) {
+        const predicate_selection = if (!attempt.prefer_text_candidates and (!stream_predicate or self.relocated()) and req.filter_query_json.len != 0)
+            self.predicatePacks(root, cached, cancellation, req.filter_query_json, packSelectionLimit(req)) catch |err| switch (err) {
                 error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.QueryCandidateBudgetExceeded => null,
                 else => return err,
             }
@@ -1951,28 +2196,6 @@ const Execution = struct {
             null;
         const small_window = pack_proof == null and pack_probe == null and predicate_selection == null and root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes;
         if (root.segment_count == 0 or (small_window and (ordering == null or ordering.?.hasNativePrimaryOrder()))) return null;
-        if (ordering) |order| {
-            // An ordered row index can stop after the winning prefix. Retain
-            // that global seek instead of scanning every window's doc values.
-            _ = plan.reset(.retain_capacity);
-            const scan = self.orderedTextScan(plan.allocator(), order.effective.req) catch |err| switch (err) {
-                error.OutOfMemory => return null,
-                else => return err,
-            };
-            if (scan) |candidate| {
-                const compatible = @import("lake_index_sql_rows.zig").hasOrderedPredicatePlan(plan.allocator(), self.table, candidate) catch |err| switch (err) {
-                    error.OutOfMemory => return null,
-                    else => return err,
-                };
-                if (compatible and self.overlay == null and !req.count_only and !req.evaluation_matches and root.source_routes_version == 1) {
-                    const ordered = self.orderedPagedText(a, order.effective.req, text, root, selected.name, cached, cancellation, order, candidate) catch |err| switch (err) {
-                        error.OutOfMemory, error.NativeLakeTextCacheBusy, error.ArtifactReadBudgetExceeded => null,
-                        else => return err,
-                    };
-                    if (ordered) |result| return result;
-                }
-            }
-        }
         // An archive fitting one admission window can still have millions of
         // rows. Preserve its global ordered seek before choosing whole-window
         // collection; admission size is not an ordered-index cost estimate.
@@ -2212,7 +2435,8 @@ const Execution = struct {
             total +|= page.total_hits;
             for (page.hits) |hit| {
                 const ordinal = std.math.add(u64, window.doc_offset, hit.native_text_doc_id orelse return error.InvalidNativeLakeTextCorpus) catch return error.InvalidNativeLakeTextCorpus;
-                const location = if (self.use_stored_highlights) try storedHighlightLocation(child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus, window.identities, hit.native_text_doc_id.?) else null;
+                const native_delivery = self.overlay == null and !recent_window and self.storedDeliveryUseful(if (child.delivery_pin) |*pin| pin else null);
+                const location = if (self.use_stored_highlights or native_delivery) try storedTextLocation(child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus, window.identities, hit.native_text_doc_id.?) else null;
                 const identities: ?*const @import("lake_index_text_predicate.zig").Identities = if (ordering == null and !recent_window) archive: {
                     const pin = child.delivery_pin orelse return error.InvalidNativeLakeTextCorpus;
                     break :archive @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus));
@@ -2250,7 +2474,9 @@ const Execution = struct {
         if (sorted_reader) |value| if (value.pruned) {
             relation = .gte;
         };
-        var result: types.SearchResult = .{ .alloc = a, .hits = try winners.finishLocated(paging.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena), .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
+        var result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
+        errdefer result.deinit();
+        try self.finishPagedWinners(&result, &winners, paging.offset, selected.name, false);
         if (req.profile) {
             result.sort_profile = profiled.sort_profile orelse .{};
             result.sort_profile_storage = profiled.sort_profile_storage;
@@ -2267,17 +2493,68 @@ const Execution = struct {
     /// A skewed prefix abandons this optional plan and returns to bounded text
     /// windows. Full tuple order proves when later rows cannot change top-K.
     /// Query-local membership is independent of each ordered candidate page.
-    /// Only immutable bitmap data survives a child execution; source pins and
-    /// provider callbacks never enter this memo. Four entries share 8 MiB.
+    /// Bitmap data and root-owned posting probes survive child executions.
+    /// Only outer-query shared pins may enter this four-entry, 8 MiB memo.
     const OrderedMembership = struct {
         const Bitmap = local.encoding_roaring.RoaringBitmap;
         const Patterns = local.search_query.PatternMembership;
-        const Entry = struct { id: [32]u8, bitmap: ?Bitmap = null, patterns: *Patterns, used: u64 };
+        const Probe = local.search_query.ExactPredicateProbe;
+        const ProbeState = struct {
+            program: local.search_query.PredicateProbePlan,
+            pin: search.PinnedTextSource,
+            cursors: [4]?struct { ordinal: usize, probe: *Probe } = @splat(null),
+            next: usize = 0,
+            fn deinit(self: *@This(), a: A) void {
+                for (self.cursors) |cursor| if (cursor) |held| held.probe.destroy();
+                self.pin.deinit();
+                a.destroy(self);
+            }
+            fn select(self: *@This(), a: A, docs: []const u32, allowed: []bool) !bool {
+                @memset(allowed, false);
+                var position: usize = 0;
+                var base: u32 = 0;
+                for (self.pin.snapshot.segments, 0..) |_, ordinal| {
+                    var lease = try self.pin.snapshot.leaseSegment(ordinal);
+                    defer lease.deinit();
+                    const segment = lease.entry;
+                    const end = try std.math.add(u32, base, segment.reader.doc_count);
+                    defer base = end;
+                    const first = position;
+                    while (position < docs.len and docs[position] < end) : (position += 1) {}
+                    if (first == position) continue;
+                    const probe = for (self.cursors) |cursor| {
+                        if (cursor) |held| if (held.ordinal == ordinal) break held.probe;
+                    } else blk: {
+                        const created = (try Probe.create(a, &self.program, self.pin.snapshot, ordinal, base)) orelse return false;
+                        if (self.cursors[self.next]) |held| held.probe.destroy();
+                        self.cursors[self.next] = .{ .ordinal = ordinal, .probe = created };
+                        self.next = (self.next + 1) % self.cursors.len;
+                        break :blk created;
+                    };
+                    var at = first;
+                    while (at < position) {
+                        const stop = @min(position, at + 64);
+                        var local_docs: [64]u32 = undefined;
+                        for (docs[at..stop], local_docs[0 .. stop - at]) |doc, *local_doc| local_doc.* = doc - base;
+                        try probe.containsMany(local_docs[0 .. stop - at], allowed[at..stop]);
+                        segment.shared.lockDeletionShared();
+                        for (local_docs[0 .. stop - at], allowed[at..stop]) |doc, *keep| if (segment.shared.deleted) |deleted| {
+                            if (deleted.contains(doc)) keep.* = false;
+                        };
+                        segment.shared.unlockDeletionShared();
+                        at = stop;
+                    }
+                }
+                return position == docs.len;
+            }
+        };
+        const Entry = struct { id: [32]u8, bitmap: ?Bitmap = null, patterns: *Patterns, probe: ?*ProbeState = null, probe_declined: bool = false, bitmap_declined: bool = false, used: u64 };
         budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator), .limit = 8 * 1024 * 1024 },
         entries: [4]?Entry = @splat(null),
         tick: u64 = 0,
         hits: usize = 0,
         builds: usize = 0,
+        cancellation: @import("antfly_cancellation").CancellationToken = .none,
         fn evict(self: *@This()) bool {
             return self.evictExcept(null);
         }
@@ -2289,6 +2566,7 @@ const Execution = struct {
             };
             const index = oldest orelse return false;
             if (self.entries[index].?.bitmap) |*bitmap| bitmap.deinit();
+            if (self.entries[index].?.probe) |probe| probe.deinit(self.budget.allocator());
             self.entries[index].?.patterns.deinit();
             self.budget.allocator().destroy(self.entries[index].?.patterns);
             self.entries[index] = null;
@@ -2321,51 +2599,105 @@ const Execution = struct {
             }
             return result;
         }
-        fn get(self: *@This(), id: [32]u8, snapshot: *const local.index.IndexSnapshot, plan: *const local.search_search.TextNavigationPlan, token: @import("antfly_cancellation").CancellationToken) !?*const Bitmap {
+        fn admitEntry(self: *@This(), id: [32]u8, token: @import("antfly_cancellation").CancellationToken) !?*Entry {
             try token.check();
             self.tick +|= 1;
-            for (&self.entries) |*entry| if (entry.*) |*held| if (std.mem.eql(u8, &held.id, &id)) {
+            for (&self.entries) |*slot| if (slot.*) |*held| if (std.mem.eql(u8, &held.id, &id)) {
                 held.used = self.tick;
                 self.hits += 1;
-                return if (held.bitmap) |*bitmap| bitmap else null;
+                return held;
             };
             while (true) {
-                var free: ?usize = null;
-                for (self.entries, 0..) |entry, i| if (entry == null) {
-                    free = i;
-                    break;
-                };
-                if (free == null) {
-                    _ = self.evict();
+                const free = for (self.entries, 0..) |value, i| {
+                    if (value == null) break i;
+                } else {
+                    if (!self.evict()) return null;
                     continue;
-                }
+                };
                 const patterns = self.budget.allocator().create(Patterns) catch {
                     if (!self.evict()) return null;
                     continue;
                 };
                 patterns.* = Patterns.init(self.budget.allocator(), 8 * 1024 * 1024);
-                const index = free.?;
-                self.entries[index] = .{ .id = id, .patterns = patterns, .used = self.tick };
+                self.entries[free] = .{ .id = id, .patterns = patterns, .used = self.tick };
+                return &self.entries[free].?;
+            }
+        }
+        fn get(self: *@This(), id: [32]u8, snapshot: *const local.index.IndexSnapshot, plan: *const local.search_search.TextNavigationPlan, token: @import("antfly_cancellation").CancellationToken) !?*const Bitmap {
+            const held = (try self.admitEntry(id, token)) orelse return null;
+            if (held.bitmap_declined) return null;
+            if (held.bitmap == null) {
+                const protected = for (&self.entries, 0..) |*slot, i| {
+                    if (slot.*) |*entry| if (entry == held) break i;
+                } else unreachable;
                 while (true) {
-                    const bitmap = self.build(snapshot, plan, token, patterns) catch |err| {
+                    held.bitmap = self.build(snapshot, plan, token, held.patterns) catch |err| {
                         if (err != error.OutOfMemory) return err;
-                        if (!self.evictExcept(index)) return null;
-                        continue;
+                        // Previous children have joined. Reclaim their optional
+                        // state before abandoning reuse for the current pack.
+                        if (self.evictExcept(protected)) continue;
+                        // A pack that cannot fit even after eviction should not
+                        // repeat a failed full bitmap build on every tiny page.
+                        held.bitmap_declined = true;
+                        return null;
                     };
-                    self.entries[index].?.bitmap = bitmap;
                     self.builds += 1;
-                    return &self.entries[index].?.bitmap.?;
+                    break;
                 }
             }
+            return &held.bitmap.?;
+        }
+        /// Only root-owned prefetched pins enter this memo. Their shared owner,
+        /// read capability and compiled program outlive every child arena.
+        fn filter(self: *@This(), id: [32]u8, pin: search.PinnedTextSource, plan: *const local.search_search.TextNavigationPlan, docs: *std.ArrayList(u32), token: @import("antfly_cancellation").CancellationToken) !bool {
+            const held = (try self.admitEntry(id, token)) orelse return false;
+            if (held.bitmap == null and !held.probe_declined and (held.probe != null or docs.items.len *| 16 < pin.snapshot.liveDocCount())) {
+                if (held.probe == null) {
+                    if (try local.search_query.PredicateProbePlan.compile(plan.membership.withControl(.{ .cancellation = token }))) |program| {
+                        const probe = self.budget.allocator().create(ProbeState) catch return false;
+                        errdefer self.budget.allocator().destroy(probe);
+                        probe.* = .{ .program = program, .pin = try pin.clone() };
+                        held.probe = probe;
+                    } else held.probe_declined = true;
+                }
+                if (held.probe) |probe| {
+                    var allowed: [256]bool = undefined;
+                    const complete = if (docs.items.len > allowed.len) false else probe.select(self.budget.allocator(), docs.items, allowed[0..docs.items.len]) catch |err| {
+                        if (err != error.OutOfMemory) return err;
+                        probe.deinit(self.budget.allocator());
+                        held.probe = null;
+                        held.probe_declined = true;
+                        return false;
+                    };
+                    if (complete) {
+                        var count: usize = 0;
+                        for (docs.items, allowed[0..docs.items.len]) |doc, keep| if (keep) {
+                            docs.items[count] = doc;
+                            count += 1;
+                        };
+                        docs.shrinkRetainingCapacity(count);
+                        return true;
+                    }
+                    probe.deinit(self.budget.allocator());
+                    held.probe = null;
+                    held.probe_declined = true;
+                }
+            }
+            const bitmap = (try self.get(id, pin.snapshot, plan, token)) orelse return false;
+            var count: usize = 0;
+            for (docs.items) |doc| if (bitmap.contains(doc)) {
+                docs.items[count] = doc;
+                count += 1;
+            };
+            docs.shrinkRetainingCapacity(count);
+            return true;
         }
         fn patternCache(self: *@This(), id: [32]u8) ?*Patterns {
             for (self.entries) |entry| if (entry) |held| if (std.mem.eql(u8, &held.id, &id)) return held.patterns;
             return null;
         }
     };
-    fn orderedPagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery, root: corpus.Root, name: []const u8, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, ordering: local.storage_db_query_search_exec.SearchHitOrder, scan: local.sql_catalog.Scan) !?types.SearchResult {
-        var predicate = (try @import("lake_index_sql_rows.zig").tryOpenOrderedPredicate(a, self.server, self.table, scan, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc, .filter_query_json = req.filter_query_json })) orelse return null;
-        defer predicate.deinit();
+    fn orderedPagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery, root: corpus.Root, name: []const u8, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, ordering: local.storage_db_query_search_exec.SearchHitOrder, scan: local.sql_catalog.Scan, attempt: *OrderedAttempt) !?types.SearchResult {
         var preparation_arena = std.heap.ArenaAllocator.init(a);
         defer preparation_arena.deinit();
         const pa = preparation_arena.allocator();
@@ -2378,13 +2710,26 @@ const Execution = struct {
             else => return err,
         };
         defer if (prepared) |held| held.deinit();
-        var membership: OrderedMembership = .{};
+        if (prepared) |held| {
+            const count = held.plan.?.candidateUpperBound();
+            const goal = @as(usize, req.offset) +| req.limit;
+            if (!local.storage_db_query_search_exec.preferOrderedCandidates(count, root.collection.?.documents, goal)) {
+                attempt.prefer_text_candidates = true;
+                return null;
+            }
+        }
+        var predicate = (try @import("lake_index_sql_rows.zig").tryOpenOrderedPredicate(a, self.server, self.table, scan, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc, .filter_query_json = req.filter_query_json })) orelse return null;
+        defer predicate.deinit();
+        var membership: OrderedMembership = .{ .cancellation = token };
         defer membership.deinit();
         const paging = local.storage_db_query_control_contract.componentPaging(req);
         const target = @as(usize, paging.offset) + paging.limit;
         var order = ordering;
         var winners = PagedWinners.initOrdered(a, target, &order);
         defer winners.deinit();
+        var retained_delivery: ?search.PinnedTextSource = null;
+        defer if (retained_delivery) |*pin| pin.deinit();
+        var retained_pack: ?[32]u8 = null;
         var budget: local.sql_memory_budget = .{ .backing = a, .limit = 16 * 1024 * 1024 };
         var scratch = std.heap.ArenaAllocator.init(budget.allocator());
         defer scratch.deinit();
@@ -2397,6 +2742,9 @@ const Execution = struct {
         var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = root.domain, .artifacts = &store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
         var page_cache: tree.Cache = .{ .alloc = budget.allocator(), .underlying = pages.store() };
         defer page_cache.deinit();
+        const PackWave = @import("lake_text_pack_wave.zig");
+        const declaration = (try self.textDeclaration(name)) orelse return null;
+        var pack_source: PackSource = .{ .owner = self, .root = root, .artifact = declaration.artifact, .cached = cached, .token = token };
         var scanned: usize = 0;
         var total: u32 = 0;
         var complete = false;
@@ -2410,12 +2758,14 @@ const Execution = struct {
             try self.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
             const sa = scratch.allocator();
-            const refs = try predicate.next(sa, @min(@min(256, page_goal), probe_limit - scanned));
+            const page_refs = try predicate.nextOrdered(sa, @min(@min(256, page_goal), probe_limit - scanned));
+            const refs = page_refs.rows;
             if (refs.len == 0) {
                 complete = true;
                 break;
             }
             scanned += refs.len;
+            attempt.scanned +|= refs.len;
             var selected: std.AutoHashMapUnmanaged([32]u8, std.ArrayList(local.storage_rowsource_types.RowRef)) = .empty;
             for (refs) |ref| if (try @import("lake_index_source_routes.zig").lookup(sa, page_cache.store(), root, store, cached, token, &live, try self.toIndex(sa, ref))) |id| {
                 const entry = try selected.getOrPut(sa, id);
@@ -2424,41 +2774,67 @@ const Execution = struct {
             };
             var child_arena = std.heap.ArenaAllocator.init(a);
             defer child_arena.deinit();
-            var segments = selected.iterator();
-            while (segments.next()) |entry| {
-                _ = child_arena.reset(.retain_capacity);
-                const ca = child_arena.allocator();
-                var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = ca, .result_allocator = ca, .navigation = self.navigation, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = &.{entry.key_ptr.*}, .candidate_rows = entry.value_ptr.items, .ordered_membership = if (prepared != null) &membership else null };
-                defer child.deinit();
-                var request = retrievalRequest(req);
-                // These exact physical rows already satisfy the entire filter
-                // under this cursor's publication lease. Keep every residual
-                // predicate unless the cursor attests this exact expression.
-                if (predicate.provesFilter(request.filter_query_json)) request.filter_query_json = "";
-                request.index_name = name;
-                request.text_navigation_plan = if (prepared) |held| held.plan else null;
-                request.offset = 0;
-                request.limit = std.math.cast(u32, target +| @intFromBool(!predicate.complete_order)) orelse return error.QueryCandidateBudgetExceeded;
-                request.include_stored = false;
-                request.highlight = null;
-                var page = try searchText(&child, ca, request, text);
-                defer page.deinit();
-                total +|= page.total_hits;
-                exact = exact and page.total_hits_relation == .exact;
-                for (page.hits) |hit| {
-                    const location = if (self.use_stored_highlights) try storedHighlightLocation(child.delivery_pin.?, &.{entry.key_ptr.*}, hit.native_text_doc_id.?) else null;
-                    try winners.addLocated(hit, 0, location);
+            const pack_ids = try sa.alloc([32]u8, selected.count());
+            var segments = selected.keyIterator();
+            for (pack_ids) |*id| id.* = segments.next().?.*;
+            var pack_position: usize = 0;
+            while (pack_position < pack_ids.len) {
+                const pack_end = @min(pack_ids.len, pack_position + PackWave.width);
+                var wave = PackWave.init(.{ .ptr = &pack_source, .open = PackSource.open }, self.context.io, pack_ids[pack_position..pack_end]);
+                defer wave.deinit();
+                wave.start();
+                for (pack_ids[pack_position..pack_end], 0..) |id, pack_offset| {
+                    try self.context.ensureActive();
+                    const prefetched = try wave.get(pack_offset);
+                    _ = child_arena.reset(.retain_capacity);
+                    const ca = child_arena.allocator();
+                    var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = ca, .result_allocator = ca, .navigation = self.navigation, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = &.{id}, .prefetched_archive = prefetched, .candidate_rows = selected.get(id).?.items, .ordered_membership = if (prepared != null and prefetched != null) &membership else null };
+                    defer child.deinit();
+                    var request = retrievalRequest(req);
+                    // These exact physical rows already satisfy the entire filter
+                    // under this cursor's publication lease. Keep every residual
+                    // predicate unless the cursor attests this exact expression.
+                    if (predicate.provesFilter(request.filter_query_json)) request.filter_query_json = "";
+                    request.index_name = name;
+                    request.text_navigation_plan = if (prepared) |held| held.plan else null;
+                    request.offset = 0;
+                    request.limit = std.math.cast(u32, target +| @intFromBool(!predicate.complete_order)) orelse return error.QueryCandidateBudgetExceeded;
+                    request.include_stored = false;
+                    request.highlight = null;
+                    var page = try searchText(&child, ca, request, text);
+                    defer page.deinit();
+                    try attempt.observe(page.sort_profile);
+                    total +|= page.total_hits;
+                    exact = exact and page.total_hits_relation == .exact;
+                    const admissions = winners.admissions;
+                    const useful_delivery = self.storedDeliveryUseful(prefetched);
+                    const located_delivery = self.storedDeliveryUseful(if (child.delivery_pin) |*pin| pin else null);
+                    for (page.hits) |hit| {
+                        const location = if (self.use_stored_highlights or located_delivery) try storedTextLocation(child.delivery_pin.?, &.{id}, hit.native_text_doc_id.?) else null;
+                        try winners.addLocated(hit, 0, location);
+                    }
+                    // The last admitted winner belongs to the only possible
+                    // common winning pack. Retain one pin, never one per hit.
+                    if (useful_delivery and winners.admissions != admissions) {
+                        const pin = try prefetched.?.clone();
+                        if (retained_delivery) |*old| old.deinit();
+                        retained_delivery = pin;
+                        retained_pack = id;
+                    }
                 }
-                // The row cursor guarantees primary order even when logical
-                // IDs or extra index keys prevent a complete public tie seek.
-                // A strictly worse primary hit proves traversal crossed the
-                // entire winning boundary group. Finish this physical page
-                // before stopping; later improvements only strengthen proof.
-                if (!predicate.complete_order and winners.heap.items.len == target and target != 0) {
-                    for (page.hits) |hit| if (order.comparePrimary(hit, winners.heap.peek().?.hit) == (if (partial_before) std.math.Order.lt else .gt)) {
-                        crossed_primary_boundary = true;
-                        break;
-                    };
+                pack_position = pack_end;
+            }
+            if (page_refs.exhausted) {
+                complete = true;
+                break;
+            }
+            // Every reference in this physical page has been processed. Its
+            // last metadata key proves the primary boundary even when later
+            // rows do not match text or a retained residual predicate.
+            if (!predicate.complete_order and winners.heap.items.len == target and target != 0) {
+                if (page_refs.boundary) |boundary| {
+                    const cutoff = winners.heap.peek().?.hit.sort_values;
+                    crossed_primary_boundary = try boundary.compare(sa, cutoff[0 .. cutoff.len - 1]) == (if (partial_before) std.math.Order.lt else .gt);
                 }
             }
             if (winners.heap.items.len == target and (predicate.complete_order or crossed_primary_boundary)) break;
@@ -2466,15 +2842,57 @@ const Execution = struct {
         if (!complete and (winners.heap.items.len < target or (!predicate.complete_order and !crossed_primary_boundary))) return null;
         var result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = total, .total_hits_relation = if (complete and exact) .exact else .gte, .ordered_window_complete = true };
         errdefer result.deinit();
-        if (req.profile) try result.setOwnedSortProfile(.{ .selection_reason = "bounded_ordered_lake_index", .candidate_source = "ordered_lake_index", .ordered_scanned_count = scanned, .selected_count = winners.heap.items.len -| paging.offset });
+        if (req.profile) try result.setOwnedSortProfile(.{ .selection_reason = "bounded_ordered_lake_index", .candidate_source = "ordered_lake_index", .selected_count = winners.heap.items.len -| paging.offset });
         // Publish borrowed highlight keys only after every other allocation has
         // succeeded; an optional-plan fallback must leave no dangling keys.
-        result.hits = try winners.finishLocated(paging.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena);
+        const native_delivery = if (retained_pack) |pack| winners.restoreNativeDocuments(pack) else false;
+        try self.finishPagedWinners(&result, &winners, paging.offset, name, native_delivery);
+        if (self.delivery_pin) |*old| old.deinit();
+        self.delivery_pin = if (native_delivery) retained_delivery else null;
+        if (native_delivery) retained_delivery = null;
         return result;
+    }
+    fn finishPagedWinners(self: *Execution, result: *types.SearchResult, winners: *PagedWinners, offset: usize, name: []const u8, native_delivery: bool) !void {
+        const delivery = @import("lake_text_delivery.zig");
+        var located: delivery.Locations = .empty;
+        defer located.deinit(self.arena);
+        result.hits = try winners.finishLocated(offset, if (self.use_stored_highlights or (!native_delivery and self.overlay == null)) &located else null, self.arena);
+        const grouped = !native_delivery and self.overlay == null and result.hits.len != 0 and located.count() == result.hits.len;
+        var owned: delivery.Locations = .empty;
+        defer owned.deinit(self.arena);
+        if (grouped or self.use_stored_highlights) {
+            try owned.ensureUnusedCapacity(self.arena, std.math.cast(u32, located.count()) orelse return error.QueryCandidateBudgetExceeded);
+            for (result.hits) |hit| if (located.get(hit.id)) |location| {
+                // Result transforms may retire/reorder hits. Request-owned keys
+                // keep both delivery and highlight evidence independent of that.
+                owned.putAssumeCapacity(try self.arena.dupe(u8, hit.id), location);
+            };
+        }
+        if (self.use_stored_highlights) try self.highlight_locations.ensureUnusedCapacity(self.arena, std.math.cast(u32, owned.count()) orelse return error.QueryCandidateBudgetExceeded);
+        // No fallible work remains after either map becomes visible.
+        if (self.use_stored_highlights) {
+            var entries = owned.iterator();
+            while (entries.next()) |entry| self.highlight_locations.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        self.delivery_locations.deinit(self.arena);
+        self.delivery_locations = if (grouped) owned else .empty;
+        if (grouped) owned = .empty;
+        self.delivery_index = if (grouped) name else null;
+        if (!native_delivery) {
+            if (self.delivery_pin) |*pin| pin.deinit();
+            self.delivery_pin = null;
+        }
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         const self = from(raw);
-        if (try self.pagedText(a, req, text)) |result| return result;
+        var attempt = OrderedAttempt.init(a, req.profile);
+        defer attempt.deinit();
+        if (try self.pagedText(a, req, text, &attempt)) |page_| {
+            var page = page_;
+            errdefer page.deinit();
+            try attempt.attach(&page, page.sort_profile != null and std.mem.eql(u8, page.sort_profile.?.selection_reason, "bounded_ordered_lake_index"));
+            return page;
+        }
         const previous_text = self.active_text;
         self.active_text = text;
         defer self.active_text = previous_text;
@@ -2508,20 +2926,50 @@ const Execution = struct {
             var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
             defer live.deinit(a);
             const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
-            const membership = if (self.ordered_membership) |memo| if (req.text_navigation_plan) |plan| try memo.get(self.forced_selection.?[0], candidate_pin.?.snapshot, plan, .{ .ptr = self, .is_cancelled_fn = canceled }) else null else null;
-            if (self.ordered_membership) |memo| effective.text_pattern_membership = memo.patternCache(self.forced_selection.?[0]);
             for (rows) |row| if (try identities.ordinal(a, &live, self.store.artifactStore(), cached, row)) |number| {
-                if (membership == null or membership.?.contains(number)) try numbers.append(a, number);
+                try numbers.append(a, number);
             };
             std.mem.sort(u32, numbers.items, {}, struct {
                 fn less(_: void, left: u32, right: u32) bool {
                     return left < right;
                 }
             }.less);
+            if (self.ordered_membership) |memo| if (req.text_navigation_plan) |plan| {
+                // The prefetch pin is rooted in the outer execution, including
+                // its cancellation/read capability. Never retain a child pin.
+                if (try memo.filter(self.forced_selection.?[0], self.prefetched_archive.?.*, plan, &numbers, memo.cancellation)) {
+                    native_filter.membership = .{ .snapshot = candidate_pin.?.snapshot, .plan = plan, .selection = numbers.items };
+                }
+                effective.text_pattern_membership = memo.patternCache(self.forced_selection.?[0]);
+            };
             native_filter.include = if (numbers.items.len == 0) .none else .{ .doc_nums = numbers.items };
             effective.resolved_text_doc_filter = &native_filter;
         }
-        return search.searchTextQuery(a, effective, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquireForRanking, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .open_native_tie_order = NativeTies.open, .native_count_visibility_exact = true, .project_key = publicKey, .project_doc_num = publicDocNum, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
+        var result = try search.searchTextQuery(a, effective, text, .{
+            .ctx = raw,
+            .exact_doc_id_filters = true,
+            .acquire_text_source = acquireForRanking,
+            .resolve_indexed_filter = resolveIndexedFilter,
+            // The global cost decision also governs the final collector: a broad
+            // filter must not reopen the declined metadata-order prefix there.
+            .open_ordered_candidates = if (attempt.prefer_text_candidates) null else openOrderedTextCandidates,
+            .open_native_tie_order = NativeTies.open,
+            .native_count_visibility_exact = true,
+            .project_key = publicKey,
+            .project_doc_num = publicDocNum,
+            .native_key = nativeKey,
+            .filter_candidate_presence = true,
+            .text_index_entry = noLocal,
+            .text_index_is_chunk_backed = chunkBacked,
+            .search_match_all = matchAll,
+            .project_stored_search = project,
+            .load_stored = loadOne,
+            .load_projected_documents = loadProjected,
+            .postprocess = postprocess,
+        });
+        errdefer result.deinit();
+        try attempt.attach(&result, false);
+        return result;
     }
     fn dispatchText(raw: ?*anyopaque, a: A, req: types.SearchRequest) !types.SearchResult {
         return search.searchText(a, req, .{ .ctx = raw, .func = searchText });
@@ -3184,17 +3632,8 @@ const Execution = struct {
             for (keys, 0..) |key, position| {
                 if (overlay.row(key)) |row| {
                     if (T == types.ColumnSource) return error.UnsupportedSqlExecution;
-                    var image: std.json.Value = .{ .object = .empty };
+                    var image = try overlaySource(a, self.table, row, key, selected_fields);
                     defer types.deinitJsonValue(a, &image);
-                    var fields = row.object.iterator();
-                    while (fields.next()) |field| {
-                        const include = if (selected_fields) |selected| for (selected) |path| {
-                            if (std.mem.eql(u8, path, field.key_ptr.*)) break true;
-                        } else false else true;
-                        if (include) try image.object.put(a, try a.dupe(u8, field.key_ptr.*), try types.cloneJsonValue(a, field.value_ptr.*));
-                    }
-                    try image.object.put(a, try a.dupe(u8, "_id"), .{ .string = try a.dupe(u8, key) });
-                    try image.object.put(a, try a.dupe(u8, "_type"), .{ .string = try a.dupe(u8, "row") });
                     if (T == std.json.Value) result[position] = try types.cloneJsonValue(a, image) else result[position] = try std.json.Stringify.valueAlloc(a, image, .{});
                     recent += 1;
                 } else {
@@ -3261,7 +3700,7 @@ const Execution = struct {
                     break :all all_fields;
                 };
                 var request = self.request;
-                request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+                request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
                 const covered = @import("lake_index_sql_rows.zig").gatherCovering(a, self.server, self.table, self.source, request, .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context }, refs, fields) catch |err| switch (err) {
                     error.SqlMemoryLimitExceeded, error.ArtifactReadBudgetExceeded => null,
                     else => return err,
@@ -3425,6 +3864,24 @@ fn requiresEncodedSource(req: types.SearchRequest) bool {
 
 /// Compile public include patterns to physical dependencies once per hydration
 /// call. Exclusion-only projections still mean the complete source document.
+/// Borrow already returned small columns for one row. Large scalar fields
+/// keep the persisted-offset path; hidden dependencies retain field-major I/O.
+fn projectedHighlightSource(scratch: *std.heap.ArenaAllocator, hit: *const types.SearchHit, fields: []const []const u8) !?std.json.Value {
+    _ = scratch.reset(.retain_capacity);
+    const from_columns = hit.source_value == null;
+    if (from_columns) if (hit.column_source) |source| for (fields) |field| {
+        if (std.mem.indexOfScalar(u8, field, '.') == null) if (source.textLength(field)) |length| {
+            if (length >= local.section_source_column.offset_min_bytes) return null;
+        };
+    };
+    const value = hit.source_value orelse if (hit.column_source) |source| try source.valueForProjection(scratch, .{ .fields = fields, .include_all_fields = false }) else return null;
+    for (fields) |field| {
+        const found = local.api_json_helpers.extractJsonPathValue(value, field) orelse return null;
+        if (from_columns and std.mem.indexOfScalar(u8, field, '.') == null and found == .string and found.string.len >= local.section_source_column.offset_min_bytes) return null;
+    }
+    return value;
+}
+
 fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequest) !?[]const []const u8 {
     // Deferred wire projection does not require unrelated physical columns.
     // Consumers without an explicit dependency contract retain full source.
@@ -3435,15 +3892,28 @@ fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequ
     for (req.fields) |field| if (field.len == 0 or field[0] != '-') {
         positive = true;
     };
-    if (req.fields.len != 0 and !positive) return null;
     var names: std.ArrayList([]const u8) = .empty;
-    for (table.columns) |column| for (req.fields) |pattern| {
-        if (pattern.len == 0 or pattern[0] == '-') continue;
-        if (projectionMayUse(pattern, column.path)) {
-            try names.append(a, column.path);
-            break;
-        }
-    };
+    for (table.columns) |column| {
+        const selected = if (!positive) req.fields.len != 0 else for (req.fields) |pattern| {
+            if (pattern.len == 0 or pattern[0] == '-') continue;
+            if (projectionMayUse(pattern, column.path)) break true;
+        } else false;
+        if (!selected) continue;
+        // A descendant exclusion cannot remove its containing JSON root: the
+        // projector still needs that root to preserve object/null semantics.
+        const excluded = for (req.fields) |pattern| {
+            if (pattern.len < 2 or pattern[0] != '-') continue;
+            const path = pattern[1..];
+            // Nested masks retain physical roots so the final projector can
+            // distinguish an empty object from an absent parent.
+            if (std.mem.indexOfScalar(u8, path, '.') != null) continue;
+            if (std.mem.eql(u8, path, "*") or std.mem.eql(u8, path, column.path) or (column.path.len > path.len and std.mem.startsWith(u8, column.path, path) and column.path[path.len] == '.')) break true;
+        } else false;
+        if (!excluded) try names.append(a, column.path);
+    }
+    // Virtual identity is opt-in. Wildcards enumerate physical source columns;
+    // _type retains its stored value only when declared in that source.
+    for (req.fields) |field| if (std.mem.eql(u8, field, "_id")) try appendHydrationPath(a, table, &names, field);
     // Scalar outputs are independent of the public source mask. Bind once
     // through the same admitted program and include every potential operand;
     // archive column hydration remains a conservative provider fallback.
@@ -3456,7 +3926,42 @@ fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequ
     }
     return names.items;
 }
+// Source metadata follows the same contract for accepted rows and archive
+// columns: identity is virtual/explicit, and type is actual declared data.
+fn overlaySource(a: A, table: local.sql_catalog.Table, row: std.json.Value, key: []const u8, selected_fields: ?[]const []const u8) !std.json.Value {
+    var image: std.json.Value = .{ .object = .empty };
+    errdefer types.deinitJsonValue(a, &image);
+    const has_type = for (table.columns) |column| {
+        if (std.mem.eql(u8, column.name, "_type") or std.mem.eql(u8, column.path, "_type")) break true;
+    } else false;
+    var fields = row.object.iterator();
+    while (fields.next()) |field| {
+        if (std.mem.eql(u8, field.key_ptr.*, "_id") or (!has_type and std.mem.eql(u8, field.key_ptr.*, "_type"))) continue;
+        const include = if (selected_fields) |selected| for (selected) |path| {
+            if (std.mem.eql(u8, path, field.key_ptr.*)) break true;
+        } else false else true;
+        if (include) try cloneSourceField(a, &image, field.key_ptr.*, field.value_ptr.*);
+    }
+    if (selected_fields) |selected| for (selected) |path| if (std.mem.eql(u8, path, "_id")) {
+        try cloneSourceField(a, &image, "_id", .{ .string = key });
+        break;
+    };
+    return image;
+}
+fn cloneSourceField(a: A, target: *std.json.Value, name: []const u8, value: std.json.Value) !void {
+    const owned_name = try a.dupe(u8, name);
+    errdefer a.free(owned_name);
+    var owned_value = try types.cloneJsonValue(a, value);
+    errdefer types.deinitJsonValue(a, &owned_value);
+    try target.object.put(a, owned_name, owned_value);
+}
+
 fn appendHydrationPath(a: A, table: local.sql_catalog.Table, fields: *std.ArrayList([]const u8), path: []const u8) !void {
+    if (std.mem.eql(u8, path, "_id")) {
+        for (fields.items) |field| if (std.mem.eql(u8, field, path)) return;
+        try fields.append(a, path);
+        return;
+    }
     for (table.columns) |column| {
         if (!projectionMayUse(path, column.path)) continue;
         const present = for (fields.items) |field| {
@@ -3572,7 +4077,13 @@ test "external lake hydration projection narrows includes and retains exclusion 
     } };
     const fields = (try projectionColumns(arena.allocator(), table, .{ .fields = &.{ "amount", "nested.*", "-body" } })).?;
     try std.testing.expectEqualSlices([]const u8, &.{ "amount", "nested.value" }, fields);
-    try std.testing.expect((try projectionColumns(arena.allocator(), table, .{ .fields = &.{"-body"} })) == null);
+    try std.testing.expectEqualSlices([]const u8, &.{ "amount", "nested.value" }, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{"-body"} })).?);
+    try std.testing.expectEqualSlices([]const u8, &.{ "amount", "nested.value" }, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{ "*", "-body" } })).?);
+    try std.testing.expectEqualSlices([]const u8, &.{ "amount", "body" }, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{ "*", "-nested" } })).?);
+    try std.testing.expectEqualSlices([]const u8, &.{ "amount", "body", "nested.value" }, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{ "*", "-nested.value" } })).?);
+    const root_table: local.sql_catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{.{ .name = "nested", .path = "nested", .type = .json }} };
+    try std.testing.expectEqualSlices([]const u8, &.{"nested"}, (try projectionColumns(arena.allocator(), root_table, .{ .fields = &.{ "*", "-nested.private" } })).?);
+    try std.testing.expectEqualSlices([]const u8, &.{ "amount", "_id" }, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{ "amount", "_id", "_type" } })).?);
     try std.testing.expect((try projectionColumns(arena.allocator(), table, .{})) == null);
     try std.testing.expectEqual(@as(usize, 0), (try projectionColumns(arena.allocator(), table, .{ .include_all_fields = false })).?.len);
     try std.testing.expectEqualSlices([]const u8, &.{"amount"}, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{"amount"}, .defer_stored_projection = true })).?);
@@ -3645,7 +4156,7 @@ test "external lake stored highlights read authenticated native source without P
     var status_token: u8 = 0;
     var server = server_api.ApiHttpServer.init(a, .{}, .{ .ptr = &status_token, .vtable = &.{ .status = undefined } }, null, null);
     defer server.deinit();
-    var owner: Execution = .{ .server = &server, .table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{} }, .source = &source, .store = &store, .domain = root.domain, .declarations = &.{}, .context = .{}, .request = .{}, .schema_json = schema_json, .arena = ca, .use_stored_highlights = true };
+    var owner: Execution = .{ .server = &server, .table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{ .{ .name = "body", .path = "body", .type = .string }, .{ .name = "label", .path = "label", .type = .string } } }, .source = &source, .store = &store, .domain = root.domain, .declarations = &.{}, .context = .{}, .request = .{}, .schema_json = schema_json, .arena = ca, .use_stored_highlights = true };
     defer owner.deinit();
     owner.declarations = &.{declaration};
     owner.use_stored_highlights = false;
@@ -3701,7 +4212,7 @@ test "external lake stored highlights read authenticated native source without P
     try owner.highlight_locations.put(ca, id, .{ .segment = segment, .document = 1 });
     var invalid_hits = [_]types.SearchHit{.{ .id = id, .score = 1 }};
     var invalid: types.SearchResult = .{ .alloc = a, .hits = &invalid_hits, .total_hits = 1, .graph_results = &.{} };
-    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &invalid));
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &invalid));
     try std.testing.expectEqual(@as(usize, 0), invalid_hits[0].highlights.len);
     owner.context.deadline_ns = 0;
     try std.testing.expectError(error.DeadlineExceeded, owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &grouped));
@@ -3767,24 +4278,38 @@ test "external lake typed sidecar hydration skips Parquet and owns final source 
     try writer.addSegmentWithId(1, bytes);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    var owner: Execution = undefined;
-    owner.navigation = null;
-    owner.arena = arena.allocator();
-    owner.context = .{ .io = std.testing.io };
-    owner.hydration_fields = &.{"body"};
-    owner.result_allocator = a;
+    var server: server_api.ApiHttpServer = undefined;
+    server.lake_query_metrics = .{};
+    var owner: Execution = .{
+        .server = &server,
+        .table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{.{ .name = "body", .path = "body", .type = .string }} },
+        .source = undefined,
+        .store = undefined,
+        .domain = @splat(0),
+        .declarations = &.{},
+        .request = .{},
+        .schema_json = "{}",
+        .arena = arena.allocator(),
+        .context = .{ .io = std.testing.io },
+        .hydration_fields = &.{"body"},
+        .result_allocator = a,
+    };
     // No public/native row mapping or source reader exists. A successful
     // result proves the covered body did not open a Parquet hydration cursor.
-    owner.files = .empty;
-    owner.private_files = .empty;
-    owner.private_digests = .empty;
     const pin: search.PinnedTextSource = .{ .snapshot = writer.snapshot(), .name = "body", .text_analysis = .{}, .runtime_schema = null, .stored_projection_fields = &.{"body"} };
     var hits = [_]types.SearchHit{.{ .id = try a.dupe(u8, key), .native_text_doc_id = 0 }};
     defer hits[0].deinit(a);
     try owner.hydrateTypedFromSource(a, &hits, &.{key}, &pin);
-    try std.testing.expectEqualStrings("a needle in the source", hits[0].source_value.?.object.get("body").?.string);
-    try std.testing.expect(hits[0].source_value.?.object.get("unused") == null);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const source = try hits[0].column_source.?.value(&scratch);
+    try std.testing.expectEqualStrings("a needle in the source", source.object.get("body").?.string);
+    try std.testing.expect(source.object.get("unused") == null);
+    try std.testing.expect(hits[0].source_value == null);
     try std.testing.expect(hits[0].stored_data == null);
+    // The wire owner releases column leases before the provider callback.
+    hits[0].column_source.?.deinit();
+    hits[0].column_source = null;
     Execution.releaseDelivery(&owner, &hits);
     try std.testing.expect(hits[0].source_value == null);
 }
@@ -4192,8 +4717,8 @@ test "external lake sparse predicate planning preflights effective windows and p
 
 /// Global score ties use the immutable corpus ordinal, never the physical file
 /// name or a window-local doc number. Retains only offset + limit owned hits.
-const StoredHighlightLocation = struct { segment: [32]u8, document: u32 };
-fn storedHighlightLocation(pin: search.PinnedTextSource, ids: []const [32]u8, document: u32) !StoredHighlightLocation {
+const StoredTextLocation = @import("lake_text_delivery.zig").Location;
+fn storedTextLocation(pin: search.PinnedTextSource, ids: []const [32]u8, document: u32) !StoredTextLocation {
     if (pin.snapshot.segments.len != ids.len) return error.InvalidNativeLakeTextCorpus;
     var lower: u32 = 0;
     const admitted = if (pin.provider_metadata) |raw| @as(*const @import("lake_index_text_predicate.zig").Identities, @ptrCast(@alignCast(raw))).segment_ids else &.{};
@@ -4224,6 +4749,61 @@ fn mergeWindowProfile(target: *types.SortProfile, source: types.SortProfile) voi
     }
 }
 
+/// Optional pack enumeration is planning, not a matching-row API limit. Broad
+/// filters retain native membership after this bounded driver is declined.
+fn packSelectionLimit(req: types.SearchRequest) usize {
+    if (req.count_only or req.evaluation_matches) return std.math.maxInt(usize);
+    const paging = local.storage_db_query_control_contract.componentPaging(req);
+    const goal = @as(usize, paging.offset) +| paging.limit;
+    return @min(65536, @max(4096, goal *| 64));
+}
+
+/// One invocation owns all profile strings and abandoned-plan accounting.
+/// Elapsed attempt time includes preparation and child execution exactly once;
+/// the fallback's own collector time is added only after that attempt ends.
+const OrderedAttempt = struct {
+    held: types.SearchResult,
+    enabled: bool,
+    started: ?u64 = null,
+    elapsed_us: u64 = 0,
+    scanned: u64 = 0,
+    attempted: bool = false,
+    prefer_text_candidates: bool = false,
+    fn init(a: A, enabled: bool) OrderedAttempt {
+        return .{ .held = .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, .enabled = enabled };
+    }
+    fn deinit(self: *OrderedAttempt) void {
+        self.held.deinit();
+    }
+    fn start(self: *OrderedAttempt) void {
+        if (!self.enabled) return;
+        self.attempted = true;
+        self.started = @import("antfly_platform").time.monotonicNs();
+    }
+    fn finish(self: *OrderedAttempt) void {
+        if (self.started) |started| self.elapsed_us +|= (@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_us;
+        self.started = null;
+    }
+    fn observe(self: *OrderedAttempt, profile: ?types.SortProfile) !void {
+        if (!self.enabled) return;
+        if (profile) |value| {
+            if (self.held.sort_profile == null) try self.held.setOwnedSortProfile(value) else mergeWindowProfile(&self.held.sort_profile.?, value);
+        }
+    }
+    fn attach(self: *OrderedAttempt, result: *types.SearchResult, complete: bool) !void {
+        if (!self.enabled or !self.attempted) return;
+        const final_profile = result.sort_profile;
+        var profile = self.held.sort_profile orelse final_profile orelse types.SortProfile{};
+        if (!complete and self.held.sort_profile != null) if (final_profile) |value| mergeWindowProfile(&profile, value);
+        profile.total_us = self.elapsed_us +| (if (!complete and final_profile != null) final_profile.?.total_us else 0);
+        profile.ordered_scanned_count +|= self.scanned;
+        profile.selected_count = result.hits.len;
+        profile.candidate_source = if (complete) "ordered_lake_index" else if (self.scanned != 0) "ordered_lake_index_then_text_windows" else if (final_profile) |value| value.candidate_source else "none";
+        profile.selection_reason = if (complete) "bounded_ordered_lake_index" else if (final_profile) |value| value.selection_reason else "ordered_lake_index_fallback";
+        try result.setOwnedSortProfile(profile);
+    }
+};
+
 fn scoreFrontierEligible(req: types.SearchRequest, ordering: ?*const local.storage_db_query_search_exec.SearchHitOrder) bool {
     if (req.count_only or req.distributed_text_stats.len != 0 or req.search_before.len != 0) return false;
     const effective = if (ordering) |order| order.effective.req else return true;
@@ -4235,7 +4815,7 @@ const PagedWinners = struct {
         hit: types.SearchHit,
         ordinal: u64,
         position: ?@import("lake_index_text_directory.zig").Position = null,
-        highlight: ?StoredHighlightLocation = null,
+        highlight: ?StoredTextLocation = null,
         fn worst(ordering: ?*const local.storage_db_query_search_exec.SearchHitOrder, l: Winner, r: Winner) std.math.Order {
             if (ordering) |typed| {
                 const compared = typed.compare(l.hit, r.hit);
@@ -4288,10 +4868,10 @@ const PagedWinners = struct {
     fn add(self: *PagedWinners, hit: types.SearchHit, ordinal: u64) !void {
         return self.addLocated(hit, ordinal, null);
     }
-    fn addLocated(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, highlight: ?StoredHighlightLocation) !void {
+    fn addLocated(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, highlight: ?StoredTextLocation) !void {
         return self.addWinner(hit, ordinal, null, highlight);
     }
-    fn addWindowHit(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, identities: ?*const @import("lake_index_text_predicate.zig").Identities, recent: bool, highlight: ?StoredHighlightLocation) !void {
+    fn addWindowHit(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, identities: ?*const @import("lake_index_text_predicate.zig").Identities, recent: bool, highlight: ?StoredTextLocation) !void {
         if (self.heap.context != null) return self.addLocated(hit, ordinal, highlight);
         const doc = hit.native_text_doc_id orelse return error.InvalidNativeLakeTextCorpus;
         const position: @import("lake_index_text_directory.zig").Position = if (recent)
@@ -4300,10 +4880,10 @@ const PagedWinners = struct {
             try (identities orelse return error.InvalidNativeLakeTextCorpus).logicalPosition(doc);
         return self.addPositioned(hit, position, highlight);
     }
-    fn addPositioned(self: *PagedWinners, hit: types.SearchHit, position: @import("lake_index_text_directory.zig").Position, highlight: ?StoredHighlightLocation) !void {
+    fn addPositioned(self: *PagedWinners, hit: types.SearchHit, position: @import("lake_index_text_directory.zig").Position, highlight: ?StoredTextLocation) !void {
         return self.addWinner(hit, 0, position, highlight);
     }
-    fn addWinner(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, position: ?@import("lake_index_text_directory.zig").Position, highlight: ?StoredHighlightLocation) !void {
+    fn addWinner(self: *PagedWinners, hit: types.SearchHit, ordinal: u64, position: ?@import("lake_index_text_directory.zig").Position, highlight: ?StoredTextLocation) !void {
         if (self.limit == 0) return;
         if (!std.math.isFinite(hit.score orelse 0)) return error.InvalidNativeLakeTextCorpus;
         if (self.heap.context) |order| try order.validate(hit);
@@ -4324,10 +4904,22 @@ const PagedWinners = struct {
         self.admissions +|= 1;
         self.peak = @max(self.peak, self.heap.items.len);
     }
+    /// Native ordinals become usable again only with one retained pack pin.
+    /// Validate the complete heap before changing any hit, including OFFSET
+    /// entries, so a mixed/unlocated result cannot inherit an unrelated source.
+    fn restoreNativeDocuments(self: *PagedWinners, pack: [32]u8) bool {
+        if (self.heap.items.len == 0) return false;
+        for (self.heap.items) |winner| {
+            const location = winner.highlight orelse return false;
+            if (!std.mem.eql(u8, &location.segment, &pack)) return false;
+        }
+        for (self.heap.items) |*winner| winner.hit.native_text_doc_id = winner.highlight.?.document;
+        return true;
+    }
     fn finish(self: *PagedWinners, offset: usize) ![]types.SearchHit {
         return self.finishLocated(offset, null, self.a);
     }
-    fn finishLocated(self: *PagedWinners, offset: usize, locations: ?*std.StringHashMapUnmanaged(StoredHighlightLocation), metadata: A) ![]types.SearchHit {
+    fn finishLocated(self: *PagedWinners, offset: usize, locations: ?*std.StringHashMapUnmanaged(StoredTextLocation), metadata: A) ![]types.SearchHit {
         const count = self.heap.items.len;
         const skip = @min(offset, count);
         if (locations) |map| try map.ensureUnusedCapacity(metadata, std.math.cast(u32, count - skip) orelse return error.QueryCandidateBudgetExceeded);
@@ -4425,7 +5017,7 @@ test "external lake paged stored highlights retain only returned winner location
     var heap = PagedWinners.init(a, 2);
     defer heap.deinit();
     for ([_][]const u8{ "a", "b", "c" }, 0..) |id, ordinal| try heap.addLocated(.{ .id = @constCast(id), .score = @floatFromInt(3 - ordinal) }, ordinal, .{ .segment = @splat(@intCast(ordinal)), .document = @intCast(ordinal + 7) });
-    var locations: std.StringHashMapUnmanaged(StoredHighlightLocation) = .empty;
+    var locations: std.StringHashMapUnmanaged(StoredTextLocation) = .empty;
     defer locations.deinit(a);
     const hits = try heap.finishLocated(1, &locations, a);
     defer a.free(hits);
@@ -5082,6 +5674,219 @@ test "external lake relocation key projection releases intermediate references" 
     defer a.free(native);
 }
 
+test "external lake bounded window profiles retain declined ordered work and own labels" {
+    const a = std.testing.allocator;
+    var attempt = OrderedAttempt.init(a, true);
+    defer attempt.deinit();
+    attempt.attempted = true;
+    attempt.scanned = 1024;
+    attempt.elapsed_us = 400;
+    {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        try attempt.observe(.{ .plan = try scratch.allocator().dupe(u8, "native_doc_values_top_n"), .candidate_count = 64, .native_doc_value_hit_count = 64, .total_us = 200, .window_capacity = 21 });
+    }
+    var result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 64, .sort_profile = .{ .plan = "native_doc_values_top_n", .selection_reason = "bounded_best_first_sort", .candidate_count = 64, .ordered_scanned_count = 3, .total_us = 100, .window_capacity = 20 } };
+    defer result.deinit();
+    try attempt.attach(&result, false);
+    const profile = result.sort_profile.?;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("ordered_lake_index_then_text_windows", profile.candidate_source);
+    try std.testing.expectEqual(@as(u64, 1027), profile.ordered_scanned_count);
+    try std.testing.expectEqual(@as(u64, 128), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 500), profile.total_us);
+    try std.testing.expectEqual(@as(usize, 21), profile.window_capacity);
+    try std.testing.expect(result.sort_profile_storage != null);
+}
+
+test "external lake metadata navigation sparse ordered pages reuse exact batch probes without whole segment bitmaps" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var overlay: overlay_api.Overlay = .{ .pending = .{ .lsn = 1, .key_fields = &.{"id"}, .changes = &.{} }, .key_filter = "" };
+    for (0..128) |i| {
+        const key = try std.fmt.allocPrint(sa, "wal1:{d:0>4}", .{i});
+        const value = if (i % 7 == 0) "{\"body\":\"rare common\"}" else "{\"body\":\"common\"}";
+        try overlay.rows.put(sa, key, try std.json.parseFromSliceLeaky(std.json.Value, sa, value, .{}));
+    }
+    var pin = try (try overlay.recent(a, "text", .{}, null, "body", .{})).share(a);
+    defer pin.deinit();
+    const Stats = struct {
+        fn average(raw: *anyopaque, field: []const u8) f32 {
+            return @as(*local.index.IndexSnapshot, @ptrCast(@alignCast(raw))).textAvgDocLen(field);
+        }
+        fn frequencies(raw: *anyopaque, out: A, field: []const u8, terms: []const []const u8, result: []u32) !void {
+            try @as(*local.index.IndexSnapshot, @ptrCast(@alignCast(raw))).termDocFreqs(out, field, terms, result);
+        }
+    };
+    const query: local.search_search.SearchQuery = .{ .bool_query = .{ .must = &.{.{ .term = .{ .field = "body", .term = "common" } }}, .should = &.{.{ .term = .{ .field = "body", .term = "rare" } }}, .min_should = 1 } };
+    const plan = (try local.search_search.TextNavigationPlan.prepare(a, query, .{ .ptr = pin.snapshot, .count = pin.snapshot.scoringDocCount(), .average = Stats.average, .frequencies = Stats.frequencies }, .{})).?;
+    defer plan.deinit();
+    var memo: Execution.OrderedMembership = .{ .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 } };
+    defer memo.deinit();
+    var expected: Execution.OrderedMembership = .{ .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 } };
+    defer expected.deinit();
+    const bitmap = (try expected.get(@splat(1), pin.snapshot, plan, .none)).?;
+    for ([_][4]u32{ .{ 0, 1, 7, 14 }, .{ 21, 22, 28, 63 }, .{ 1, 2, 3, 4 } }) |page| {
+        var docs: std.ArrayList(u32) = .empty;
+        defer docs.deinit(a);
+        try docs.appendSlice(a, &page);
+        try std.testing.expect(try memo.filter(@splat(1), pin, plan, &docs, .none));
+        var wanted: std.ArrayList(u32) = .empty;
+        defer wanted.deinit(a);
+        for (page) |doc| if (bitmap.contains(doc)) try wanted.append(a, doc);
+        try std.testing.expectEqualSlices(u32, wanted.items, docs.items);
+    }
+    try std.testing.expectEqual(@as(usize, 0), memo.builds);
+    try std.testing.expect(memo.entries[0].?.probe != null);
+    try std.testing.expect(memo.hits >= 2);
+}
+
+test "external lake bounded window profiles native winner delivery binds one stored pack after replacement" {
+    const a = std.testing.allocator;
+    var execution: Execution = undefined;
+    const pin: search.PinnedTextSource = .{ .snapshot = undefined, .name = "pack", .text_analysis = .{}, .runtime_schema = null, .stored_projection_fields = &.{"body"} };
+    execution.hydration_fields = &.{"id"};
+    try std.testing.expect(!execution.storedDeliveryUseful(&pin));
+    execution.hydration_fields = &.{"body"};
+    try std.testing.expect(execution.storedDeliveryUseful(&pin));
+    try std.testing.expect(!execution.storedDeliveryUseful(null));
+    execution.hydration_fields = null;
+    try std.testing.expect(execution.storedDeliveryUseful(&pin));
+    var ids = [_][1]u8{ .{'a'}, .{'b'}, .{'c'}, .{'d'} };
+    var winners = PagedWinners.init(a, 3);
+    defer winners.deinit();
+    try winners.addLocated(.{ .id = &ids[0], .score = 1, .native_text_doc_id = 99 }, 0, .{ .segment = @splat(1), .document = 7 });
+    try winners.addLocated(.{ .id = &ids[1], .score = 1, .native_text_doc_id = 99 }, 1, .{ .segment = @splat(1), .document = 8 });
+    try winners.addLocated(.{ .id = &ids[2], .score = 0, .native_text_doc_id = 99 }, 2, .{ .segment = @splat(2), .document = 7 });
+    try std.testing.expect(!winners.restoreNativeDocuments(@splat(1)));
+    for (winners.heap.items) |winner| try std.testing.expect(winner.hit.native_text_doc_id == null);
+    try winners.addLocated(.{ .id = &ids[3], .score = 2 }, 3, .{ .segment = @splat(1), .document = 9 });
+    try std.testing.expect(!winners.restoreNativeDocuments(@splat(2)));
+    try std.testing.expect(winners.restoreNativeDocuments(@splat(1)));
+    for (winners.heap.items) |winner| try std.testing.expectEqual(winner.highlight.?.document, winner.hit.native_text_doc_id.?);
+}
+
+test "external lake bounded window profiles bitmap admission evicts older packs and retries without dropping the current entry" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var overlay: overlay_api.Overlay = .{ .pending = .{ .lsn = 1, .key_fields = &.{"id"}, .changes = &.{} }, .key_filter = "" };
+    for (0..128) |i| {
+        const key = try std.fmt.allocPrint(sa, "wal1:{d:0>4}", .{i});
+        const value = if (i % 7 == 0) "{\"body\":\"rare common\"}" else "{\"body\":\"common\"}";
+        try overlay.rows.put(sa, key, try std.json.parseFromSliceLeaky(std.json.Value, sa, value, .{}));
+    }
+    var pin = try (try overlay.recent(a, "text", .{}, null, "body", .{})).share(a);
+    defer pin.deinit();
+    const Stats = struct {
+        fn average(raw: *anyopaque, field: []const u8) f32 {
+            return @as(*local.index.IndexSnapshot, @ptrCast(@alignCast(raw))).textAvgDocLen(field);
+        }
+        fn frequencies(raw: *anyopaque, out: A, field: []const u8, terms: []const []const u8, result: []u32) !void {
+            try @as(*local.index.IndexSnapshot, @ptrCast(@alignCast(raw))).termDocFreqs(out, field, terms, result);
+        }
+    };
+    const query: local.search_search.SearchQuery = .{ .bool_query = .{ .must = &.{.{ .term = .{ .field = "body", .term = "common" } }}, .should = &.{.{ .term = .{ .field = "body", .term = "rare" } }}, .min_should = 1 } };
+    const plan = (try local.search_search.TextNavigationPlan.prepare(a, query, .{ .ptr = pin.snapshot, .count = pin.snapshot.scoringDocCount(), .average = Stats.average, .frequencies = Stats.frequencies }, .{})).?;
+    defer plan.deinit();
+    var memo: Execution.OrderedMembership = .{ .budget = .{ .backing = a, .limit = 256 * 1024 } };
+    defer memo.deinit();
+    const resident = (try memo.get(@splat(1), pin.snapshot, plan, .none)).?;
+    // Model a different, dense resident serving pack under the same query.
+    try @constCast(resident).addRange(0, 65536);
+    const padding = try memo.budget.allocator().alloc(u8, memo.budget.limit - memo.budget.live - @sizeOf(Execution.OrderedMembership.Patterns) - 32);
+    defer memo.budget.allocator().free(padding);
+    const next = try memo.get(@splat(2), pin.snapshot, plan, .none);
+    try std.testing.expect(next != null);
+    try std.testing.expect(memo.entries[0] == null);
+    try std.testing.expect(memo.entries[1].?.bitmap != null);
+    memo.entries[1].?.bitmap.?.deinit();
+    memo.entries[1].?.bitmap = null;
+    {
+        const pressure = try memo.budget.allocator().alloc(u8, memo.budget.limit - memo.budget.live);
+        defer memo.budget.allocator().free(pressure);
+        try std.testing.expect((try memo.get(@splat(2), pin.snapshot, plan, .none)) == null);
+    }
+    try std.testing.expect(memo.entries[1].?.bitmap_declined);
+    try std.testing.expect((try memo.get(@splat(2), pin.snapshot, plan, .none)) == null);
+}
+
+test "external lake bounded window profiles cost declines retain preparation time without claiming ordered traversal" {
+    const a = std.testing.allocator;
+    var attempt = OrderedAttempt.init(a, true);
+    defer attempt.deinit();
+    attempt.attempted = true;
+    attempt.elapsed_us = 100;
+    var result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 64, .sort_profile = .{ .candidate_source = "text_postings", .candidate_count = 64, .total_us = 200 } };
+    defer result.deinit();
+    try attempt.attach(&result, false);
+    try std.testing.expectEqualStrings("text_postings", result.sort_profile.?.candidate_source);
+    try std.testing.expectEqual(@as(u64, 0), result.sort_profile.?.ordered_scanned_count);
+    try std.testing.expectEqual(@as(u64, 300), result.sort_profile.?.total_us);
+}
+
+test "external lake bounded window profiles final locators survive result retirement and allocation faults" {
+    const Run = struct {
+        fn run(a: A) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var execution: Execution = undefined;
+            execution.arena = arena.allocator();
+            execution.overlay = null;
+            execution.use_stored_highlights = true;
+            execution.highlight_locations = .empty;
+            execution.delivery_locations = .empty;
+            execution.delivery_index = null;
+            execution.delivery_pin = null;
+            var winners = PagedWinners.init(std.testing.allocator, 2);
+            defer winners.deinit();
+            var ids = [_][1]u8{ .{'a'}, .{'b'} };
+            try winners.addLocated(.{ .id = &ids[0], .score = 2 }, 0, .{ .segment = @splat(1), .document = 7 });
+            try winners.addLocated(.{ .id = &ids[1], .score = 1 }, 1, .{ .segment = @splat(2), .document = 9 });
+            var result: types.SearchResult = .{ .alloc = std.testing.allocator, .hits = &.{}, .total_hits = 2 };
+            {
+                defer result.deinit();
+                execution.finishPagedWinners(&result, &winners, 0, "text", false) catch |err| {
+                    try std.testing.expect(execution.delivery_index == null);
+                    try std.testing.expectEqual(@as(u32, 0), execution.highlight_locations.count());
+                    return err;
+                };
+            }
+            try std.testing.expectEqual(@as(u32, 7), execution.delivery_locations.get("a").?.document);
+            try std.testing.expectEqual(@as(u32, 9), execution.highlight_locations.get("b").?.document);
+            try std.testing.expectEqualStrings("text", execution.delivery_index.?);
+        }
+    };
+    try Run.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
+}
+
+test "external lake highlight projection reuses small column leases and keeps large fields on offset vectors" {
+    const a = std.testing.allocator;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for ([_]usize{ 32, 8192 }) |size| {
+        const page = try local.storage_db_column_source.Page.native(a, &.{"body"}, 1);
+        defer page.release();
+        const text = try page.arena.allocator().alloc(u8, size);
+        @memset(text, 'x');
+        try page.setNative(0, 0, .{ .string = text });
+        try page.finishNative();
+        var hit: types.SearchHit = .{ .id = try a.dupe(u8, "row"), .column_source = page.row(0) };
+        defer hit.deinit(a);
+        const found = try projectedHighlightSource(&scratch, &hit, &.{"body"});
+        if (size <= 4096) {
+            try std.testing.expectEqual(size, found.?.object.get("body").?.string.len);
+            try std.testing.expectEqual(@intFromPtr(text.ptr), @intFromPtr(found.?.object.get("body").?.string.ptr));
+        } else try std.testing.expect(found == null);
+        try std.testing.expect((try projectedHighlightSource(&scratch, &hit, &.{"missing"})) == null);
+    }
+}
+
 test "external lake scalar outputs hydrate dependencies independently of the public source mask" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5096,10 +5901,78 @@ test "external lake scalar outputs hydrate dependencies independently of the pub
     try std.testing.expectEqual(@as(usize, 2), both.len);
     try std.testing.expectEqualStrings("visible", both[0]);
     try std.testing.expectEqualStrings("hidden", both[1]);
+    req.fields = &.{ "*", "-hidden", "-unused" };
+    try std.testing.expectEqualSlices([]const u8, &.{ "visible", "hidden" }, (try projectionColumns(a, table, req)).?);
     req.fields = &.{};
     const hidden = (try projectionColumns(a, table, req)).?;
     try std.testing.expectEqual(@as(usize, 1), hidden.len);
     try std.testing.expectEqualStrings("hidden", hidden[0]);
     req.field_projection_json = "{\"fields\":[{\"name\":\"one\",\"expression\":{\"literal\":1}}]}";
     try std.testing.expectEqual(@as(usize, 0), (try projectionColumns(a, table, req)).?.len);
+}
+
+test "external lake highlight projected dependencies avoid unrelated JSON decoding" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 40001);
+    defer a.free(payload);
+    payload[0] = '[';
+    for (0..20000) |i| {
+        payload[1 + i * 2] = '0';
+        payload[2 + i * 2] = if (i == 19999) ']' else ',';
+    }
+    const page = try local.storage_db_column_source.Page.copy(a, .{
+        .snapshot = .{ .table_id = "docs", .snapshot_id = "one" },
+        .row_refs = &.{.{ .relational_key = "row" }},
+        .columns = &.{.{ .name = "payload", .values = .{ .json = &.{payload} } }},
+    }, &.{0});
+    defer page.release();
+    var hit: types.SearchHit = .{ .id = try a.dupe(u8, "row"), .column_source = page.row(0) };
+    defer hit.deinit(a);
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 64 * 1024 };
+    var scratch = std.heap.ArenaAllocator.init(budget.allocator());
+    defer scratch.deinit();
+    const selected = try hit.column_source.?.valueForProjection(&scratch, .{ .fields = @as([]const []const u8, &.{"body"}), .include_all_fields = false });
+    try std.testing.expectEqual(@as(usize, 0), selected.object.count());
+    try std.testing.expect((try projectedHighlightSource(&scratch, &hit, &.{"body"})) == null);
+    std.debug.print("PROJECTION_DEPENDENCY_PROBE unrelated_json_bytes={d} budget={d} selected=success helper=declined_without_decoding\n", .{ payload.len, budget.limit });
+}
+
+test "external lake covering and overlay source metadata preserve physical types and explicit identity under OOM" {
+    const a = std.testing.allocator;
+    const table: local.sql_catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{
+        .{ .name = "id", .path = "id", .type = .integer },
+        .{ .name = "_type", .path = "_type", .type = .string },
+    } };
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":1,\"_id\":\"private\",\"_type\":null}", .{});
+    defer parsed.deinit();
+    const Scenario = struct {
+        fn run(alloc: A, declared: local.sql_catalog.Table, source: std.json.Value) !void {
+            var physical = try overlaySource(alloc, declared, source, "public", null);
+            defer types.deinitJsonValue(alloc, &physical);
+            try std.testing.expect(physical.object.get("_type").? == .null);
+            try std.testing.expect(!physical.object.contains("_id"));
+            var plain = declared;
+            plain.columns = declared.columns[0..1];
+            var wildcard = try overlaySource(alloc, plain, source, "public", null);
+            defer types.deinitJsonValue(alloc, &wildcard);
+            try std.testing.expectEqual(@as(usize, 1), wildcard.object.count());
+            var explicit = try overlaySource(alloc, plain, source, "public", &.{ "id", "_id", "_type" });
+            defer types.deinitJsonValue(alloc, &explicit);
+            try std.testing.expectEqual(@as(usize, 2), explicit.object.count());
+            try std.testing.expectEqualStrings("public", explicit.object.get("_id").?.string);
+        }
+    };
+    try Scenario.run(a, table, parsed.value);
+    try std.testing.checkAllAllocationFailures(a, Scenario.run, .{ table, parsed.value });
+}
+
+test "external lake hydration projection keeps virtual identity sorting outside wildcard source" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var owner: Execution = .{ .server = undefined, .source = undefined, .store = undefined, .domain = @splat(0), .declarations = &.{}, .context = .{}, .request = .{}, .schema_json = "", .arena = arena.allocator(), .table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{
+        .{ .name = "id", .path = "id", .type = .integer },
+        .{ .name = "body", .path = "body", .type = .string },
+    } } };
+    const fields = (try owner.planHydration(.{ .fields = &.{ "*", "-body" }, .order_by = &.{.{ .field = "_id" }} })).?;
+    try std.testing.expectEqualSlices([]const u8, &.{"id"}, fields);
 }

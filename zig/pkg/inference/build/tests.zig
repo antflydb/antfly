@@ -37,14 +37,16 @@ pub fn create(ctx: Context) Suite {
     // Native CPU Debug peaked at 12,070,764,544 bytes with cold compiler
     // caches. 12,672 MiB retains 10% headroom rounded up to 128 MiB.
     // Accelerator and other-host reservations retain their existing profiles.
-    const native_cpu_debug = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
-        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and
+    const native_cpu = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and
         !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
     const tests = b.addTest(.{
         // Zig 0.17's focused CUDA serving suite reached 19.57 GB on aarch64
         // Linux. Reserve 24 GiB so the scheduler admits its measured compiler
         // footprint and leaves room for the socket/reference coverage.
-        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        // The focused native CPU ReleaseFast suite peaked at 10,032,644,096
+        // bytes. Its old 9 GiB declaration rejected a successful compilation.
+        .max_rss = if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -121,6 +123,9 @@ pub fn create(ctx: Context) Suite {
     if (ctx.backend.enable_system_blas) {
         runtime_build.configureSystemBlas(b, tests.root_module, ctx.target, ctx.backend.blas_root);
     }
+    // No-copy host buffer wrapping can succeed even for misaligned pointers
+    // on some devices. Exercise the copied-output fallback deterministically.
+    if (ctx.backend.enable_metal) tests.root_module.addCMacro("ANTFLY_METAL_TEST_FORCE_HOST_OUTPUT_COPY", "1");
     runtime_build.configureMetal(b, tests.root_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
     runtime_build.configureCudaVideo(b, tests.root_module, ctx.target, ctx.backend.enable_cuda, ctx.paths);
     tests.root_module.link_libc = ctx.backend.link_libc;

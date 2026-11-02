@@ -1,5 +1,5 @@
 {
   "provider": "antfly",
   "model": "lightonai/LightOnOCR-3-4B:safetensors@b71010f095dc3735de7ee6b9969bff8f8f50b39a",
-  "max_tokens": 512
+  "max_tokens": 2048
 }

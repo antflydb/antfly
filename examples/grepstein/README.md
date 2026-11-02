@@ -186,11 +186,22 @@ OCR and model-switching qualification for both 4B and 0.8B. Those checks establi
 runtime compatibility; corpus coverage and text quality still require a representative
 PDF pilot before backfill. Its native `/read` contract uses
 an image-only prompt; the extraction producer sends no prompt to readers.
-The profile requests at most 512 output tokens per page; truncated OCR returns
-an error instead of publishing incomplete text. Dense pages can need a separate
-larger-budget workflow and a separately qualified serving policy. Do not count
-failed or truncated pages as searchable. Use `zig/tools/qualify_reader_generator_pools.py`
-for native execution checks when changing the runtime or serving policy.
+The profile requests at most 2048 output tokens per page. A cached dense DOJ
+page exceeded the earlier 512-token allowance; both reader checkpoints completed
+it at 2048 and retained the checked page-tail text. This is a bounded sample,
+not a completeness guarantee for every page. The serving policy must permit
+`resources.inference.request_limits.max_output_tokens_per_item: 2048` and at
+least 12 `resources.inference.admission.max_work_units` for one image-only
+request. Keep request concurrency at one while qualifying the intended GPU and
+memory limits. The deployed 512-token/eight-unit policy needs a separately
+reviewed update before this profile can be used there.
+Truncated OCR returns an error instead of publishing incomplete text. Do not
+count failed or truncated pages as searchable. Complete the
+[release qualification](../../docs/design/inference/grepstein-release-qualification.md)
+before backfill or enrichment. `zig/tools/qualify_reader_generator_pools.py`
+uses a 512-token reader policy by default; pass
+`--reader-max-output-tokens 2048` to check the larger serving ceiling and its
+exact rejection boundary. Its synthetic pass does not establish corpus coverage.
 The LightOnOCR models return
 Markdown, including table structure, through the same native reader API.
 Set `ANTFLY_INFERENCE_URL` to a server-reachable inference root or `/ai/v1` URL;

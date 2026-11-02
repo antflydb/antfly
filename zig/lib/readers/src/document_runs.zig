@@ -255,6 +255,27 @@ pub const Store = struct {
         }
         return error.DocumentRunBusy;
     }
+    /// Work refused before dispatch (temporary resource or capacity admission)
+    /// never ran, so its reservation is refunded in full instead of being kept
+    /// as uncertain spend. Repeated refusals therefore cannot exhaust the
+    /// document budget. Missing intents are already settled; this is idempotent.
+    pub fn releaseReservation(self: Store, a: A, lease: Lease, key: Digest, now_ms: u64) !void {
+        for (0..16) |_| {
+            var record = try self.current(a, lease, now_ms);
+            const index = for (record.pending, 0..) |intent, i| {
+                if (intent.attempt == lease.attempt and std.mem.eql(u8, &intent.nonce, &lease.nonce) and std.mem.eql(u8, &intent.key, &key)) break i;
+            } else return;
+            const pending = try a.alloc(Reservation, record.pending.len - 1);
+            @memcpy(pending[0..index], record.pending[0..index]);
+            @memcpy(pending[index..], record.pending[index + 1 ..]);
+            const expected = record.version();
+            record.used = try record.used.minus(record.pending[index].upper);
+            record.pending = pending;
+            record.revision = std.math.add(u64, record.revision, 1) catch return error.InvalidDocumentCheckpoint;
+            if (try self.cas_fn(self.ptr, expected, record)) return;
+        }
+        return error.DocumentRunBusy;
+    }
     /// A native batch reports aggregate usage. Transfer its token upper bounds
     /// to the first stage atomically before dispatch, preserving the total
     /// charge and each item's independent call/output reservations.
@@ -702,6 +723,18 @@ pub const CostReceipt = struct { key: Digest, measured: Measurement };
 /// payloads are immutable; successful stages replay without invoking providers.
 /// A failed or ambiguous dispatch remains charged and cannot be retried by the
 /// same attempt. The scheduler must acquire a new lease to retry that work.
+/// Refusals raised by admission before any model work starts. Their
+/// reservations are refunded rather than charged as uncertain spend.
+pub fn isPreDispatchRefusal(err: anyerror) bool {
+    return switch (err) {
+        error.ResourceTemporarilyUnavailable,
+        error.InferenceCapacityUnavailable,
+        error.QueueFull,
+        => true,
+        else => false,
+    };
+}
+
 pub const Session = struct {
     allocator: A,
     store: Store,
@@ -942,6 +975,24 @@ pub const Session = struct {
         const io = self.io orelse return error.DocumentStageInFlight;
         try io.sleep(.fromMilliseconds(10), .awake);
     }
+    /// Undo a reservation whose work was refused before dispatch: refund the
+    /// durable charge and local call/meter accounting, and forget the stage so
+    /// a later retry dispatches it again.
+    fn released(self: *Session, stage: Digest, upper: Charge) void {
+        self.settleMeter(stage, 0);
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        // On storage failure the intent stays pending and handoff recovers it
+        // as uncertainty, exactly like an abandoned reservation.
+        self.store.releaseReservation(scratch.allocator(), self.lease, stage, self.clock.now()) catch {
+            self.failed(stage);
+            return;
+        };
+        if (upper.calls != 0) _ = self.remaining_calls.fetchAdd(upper.calls, .monotonic);
+        self.lock();
+        _ = self.stages.remove(stage);
+        self.mutex.unlock();
+    }
     fn failed(self: *Session, stage: Digest) void {
         self.lock();
         const slot = self.stages.getPtr(stage) orelse {
@@ -1037,12 +1088,21 @@ pub const Session = struct {
             self.mutex.unlock();
             break;
         }
-        errdefer self.failed(stage);
+        var cleanup_stage = true;
+        errdefer if (cleanup_stage) self.failed(stage);
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         const work = scratch.allocator();
         try self.reserve(stage, upper);
         const output: Output = invoke(context, work) catch |err| {
+            if (isPreDispatchRefusal(err)) {
+                // released() retires this worker's slot and handles storage
+                // failures itself. A replacement can claim the same key as
+                // soon as it is removed; unwinding must not fail that worker.
+                cleanup_stage = false;
+                self.released(stage, upper);
+                return err;
+            }
             self.settleMeter(stage, null);
             return err;
         };
@@ -1789,6 +1849,106 @@ test "document durable admission never waits for failed or untracked reservation
         try std.testing.expectEqual(upper, reclaimed.used);
         try std.testing.expectEqual(upper, reclaimed.uncertain);
     }
+}
+
+test "document refused worker cleanup preserves a replacement stage" {
+    const a = std.testing.allocator;
+    var memory = TestStore{ .a = a };
+    defer memory.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const store = memory.interface();
+    const identity: Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "race", .owner = "alice", .identity = identity, .limits = .{ .calls = 1, .tokens = 10 }, .inputs = &.{} });
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 1;
+        }
+    };
+    const Hook = struct {
+        session: ?*Session = null,
+        armed: bool = false,
+        retried: bool = false,
+        fn allocator(self: *@This()) A {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = A.noResize, .remap = A.noRemap, .free = free } };
+        }
+        fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            return std.testing.allocator.rawAlloc(len, alignment, ret);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Schedule another worker after released() removes the old slot,
+            // while its scratch arena unwinds, before execute's errdefer runs.
+            if (self.armed and !self.session.?.stages.contains(@splat(1))) {
+                self.armed = false;
+                self.session.?.beginIntent(@splat(1), .{ .calls = 1, .tokens = 10 }) catch unreachable;
+                self.retried = true;
+            }
+            std.testing.allocator.rawFree(bytes, alignment, ret);
+        }
+        fn busy(self: *@This(), _: A) !Session.Output {
+            self.armed = true;
+            return error.QueueFull;
+        }
+    };
+    var hook = Hook{};
+    const lease = try store.claim(work, "race", "alice", identity, 1, 10);
+    var session = try Session.init(hook.allocator(), store, lease, identity, .{ .now_fn = Clock.now }, 16, 32768);
+    defer session.deinit();
+    hook.session = &session;
+    try std.testing.expectError(error.QueueFull, session.execute(work, @splat(1), .{ .calls = 1, .tokens = 10 }, 0, &hook, Hook.busy));
+    try std.testing.expect(hook.retried);
+    const after = try store.load(work, "race", "alice");
+    try std.testing.expectEqual(@as(usize, 1), after.pending.len);
+    try std.testing.expectEqual(Charge{}, after.uncertain);
+    try std.testing.expect(!session.stages.get(@splat(1)).?.failed);
+    _ = try session.commitIntent(work, @splat(1), .{ .calls = 1, .tokens = 3 }, "", "");
+}
+
+test "document durable refusals before dispatch refund their reservation" {
+    const a = std.testing.allocator;
+    var memory = TestStore{ .a = a };
+    defer memory.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const store = memory.interface();
+    const identity: Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    // Room for exactly one call: three refusals must not spend it.
+    try store.create(.{ .run_id = "busy", .owner = "alice", .identity = identity, .limits = .{ .calls = 1, .tokens = 10, .pixels = 3, .output_bytes = 4 }, .inputs = &.{} });
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 1;
+        }
+    };
+    const lease = try store.claim(work, "busy", "alice", identity, 1, 10);
+    var session = try Session.init(a, store, lease, identity, .{ .now_fn = Clock.now }, 16, 32768);
+    defer session.deinit();
+    const upper: Charge = .{ .calls = 1, .tokens = 10, .output_bytes = 4 };
+    const Provider = struct {
+        fn busy(_: void, _: A) !Session.Output {
+            return error.ResourceTemporarilyUnavailable;
+        }
+        fn ok(_: void, _: A) !Session.Output {
+            return .{ .bytes = "done", .actual = .{ .calls = 1, .tokens = 3, .output_bytes = 4 } };
+        }
+        fn timeout(_: void, _: A) !Session.Output {
+            return error.Timeout;
+        }
+    };
+    for (0..3) |_| try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.execute(work, @splat(1), upper, 16, {}, Provider.busy));
+    const refunded = try store.load(work, "busy", "alice");
+    try std.testing.expectEqual(Charge{}, refunded.used);
+    try std.testing.expectEqual(Charge{}, refunded.uncertain);
+    try std.testing.expectEqual(@as(usize, 0), refunded.pending.len);
+    // The same stage dispatches once admission succeeds.
+    const result = try session.execute(work, @splat(1), upper, 16, {}, Provider.ok);
+    try std.testing.expectEqualStrings("done", result.bytes);
+    // Work that may have run is still charged as uncertain spend.
+    try std.testing.expectError(error.Timeout, session.execute(work, @splat(2), .{ .tokens = 1 }, 16, {}, Provider.timeout));
+    const after = try store.load(work, "busy", "alice");
+    try std.testing.expectEqual(@as(u64, 1), after.uncertain.tokens);
 }
 
 test "document durable admission still waits for live work to reconcile its upper bound" {

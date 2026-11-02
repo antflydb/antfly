@@ -307,14 +307,36 @@ def worker(args):
         save()
         if args.warmup_requests:
             warmed = generate([conversation(i) for i in range(args.warmup_requests)])
-            assert all(
+            warmup_parity = all(
                 o.outputs[0].text == references[i % len(images)]["text"]
                 for i, o in enumerate(warmed)
-            ), "Warmup output differs from serial reference"
+            )
+            # Keep failure evidence in this already-private report. Otherwise
+            # the strict assertion discards the very outputs needed to tell a
+            # formatting variation from a content or batching defect.
+            report["warmup"] = dict(
+                serial_reference_parity=warmup_parity,
+                outputs=[
+                    dict(
+                        request_index=i,
+                        image_index=i % len(images),
+                        text=o.outputs[0].text,
+                        finish_reason=o.outputs[0].finish_reason,
+                        completion_tokens=len(o.outputs[0].token_ids),
+                    )
+                    for i, o in enumerate(warmed)
+                ],
+            )
+            save()
+            assert warmup_parity, "Warmup output differs from serial reference"
             report["warmup_completed"] = len(warmed)
             save()
+        measured_parity = True
         for round_index in range(args.rounds):
-            measure_round(
+            # Retain every requested diagnostic round even when a batch
+            # differs from its serial reference. Qualification still fails
+            # below; no timing sample can turn that mismatch into success.
+            measured_parity &= measure_round(
                 args,
                 conversation,
                 generate,
@@ -328,6 +350,9 @@ def worker(args):
         assert (
             len(media_ids)
             == len(images) + args.warmup_requests + args.requests * args.rounds
+        )
+        assert measured_parity, (
+            "A concurrent page differs from its fresh serial reference"
         )
         report["status"] = "ok"
         report["hardware_after"] = hardware()
@@ -383,9 +408,9 @@ def measure_round(
         ],
     )
     report["results"].append(result)
-    assert parity, "A concurrent page differs from its fresh serial reference"
     save()
     print(json.dumps({k: v for k, v in result.items() if k != "outputs"}), flush=True)
+    return parity
 
 
 def main():

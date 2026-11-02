@@ -238,9 +238,10 @@ close completes in bounded time.
 
 Multiple writable Lite connections may remain open, including across processes.
 Connections queue within a process; a kernel writer lease serializes complete
-native operations across processes. `OpenOptions::busy_timeout` waits for an
-operation holding that lease, like `sqlite3_busy_timeout`. Closing a connection
-does not close another connection to the same file.
+native operations across processes. `OpenOptions::busy_timeout` retries admission
+while another process holds the writer lease or advances the allocator checkpoint,
+like `sqlite3_busy_timeout`. This admission retry never replays a mutation body.
+Closing a connection does not close another connection to the same file.
 
 ## API surface
 

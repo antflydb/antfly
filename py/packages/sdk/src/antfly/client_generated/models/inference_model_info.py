@@ -6,11 +6,13 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.inference_model_info_compatibility import InferenceModelInfoCompatibility
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
     from ..models.inference_model_info_dense_output import InferenceModelInfoDenseOutput
+    from ..models.inference_model_info_error import InferenceModelInfoError
     from ..models.inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
     from ..models.inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 
@@ -41,6 +43,15 @@ class InferenceModelInfo:
             including backend, supported features and min/max geometry.
             Runtime admission revalidates artifact identity and resource limits.
             Omitted for artifacts without a qualification receipt.
+        compatibility (InferenceModelInfoCompatibility | Unset): Whether this artifact can run in the current build.
+            `incompatible`
+            artifacts are rejected before load; a model whose directory cannot
+            be read is listed as `incompatible` with `error` set.
+        invocable (bool | Unset): False when this deployment rejects public execution
+            (`public_inference_enabled: false`); the model is installed and
+            listed, but public calls return 403. Omitted when it can be invoked.
+        error (InferenceModelInfoError | Unset): Why the model is unusable, set when its directory could not be read.
+            Other models still list.
         capabilities (list[str] | Unset): List of capabilities this model supports (omitted when empty). For rerankers,
             `late_interaction` or `colbert` selects native MaxSim token scoring.
         inputs (list[str] | Unset): List of input modalities this model accepts, such as `text`, `image`, or `audio`
@@ -51,6 +62,9 @@ class InferenceModelInfo:
     dense_output: InferenceModelInfoDenseOutput | Unset = UNSET
     model_revision: str | Unset = UNSET
     qualified_limits: InferenceModelInfoQualifiedLimits | Unset = UNSET
+    compatibility: InferenceModelInfoCompatibility | Unset = UNSET
+    invocable: bool | Unset = UNSET
+    error: InferenceModelInfoError | Unset = UNSET
     capabilities: list[str] | Unset = UNSET
     inputs: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -74,6 +88,16 @@ class InferenceModelInfo:
         if not isinstance(self.qualified_limits, Unset):
             qualified_limits = self.qualified_limits.to_dict()
 
+        compatibility: str | Unset = UNSET
+        if not isinstance(self.compatibility, Unset):
+            compatibility = self.compatibility.value
+
+        invocable = self.invocable
+
+        error: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.error, Unset):
+            error = self.error.to_dict()
+
         capabilities: list[str] | Unset = UNSET
         if not isinstance(self.capabilities, Unset):
             capabilities = self.capabilities
@@ -95,6 +119,12 @@ class InferenceModelInfo:
             field_dict["model_revision"] = model_revision
         if qualified_limits is not UNSET:
             field_dict["qualified_limits"] = qualified_limits
+        if compatibility is not UNSET:
+            field_dict["compatibility"] = compatibility
+        if invocable is not UNSET:
+            field_dict["invocable"] = invocable
+        if error is not UNSET:
+            field_dict["error"] = error
         if capabilities is not UNSET:
             field_dict["capabilities"] = capabilities
         if inputs is not UNSET:
@@ -106,6 +136,7 @@ class InferenceModelInfo:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
         from ..models.inference_model_info_dense_output import InferenceModelInfoDenseOutput
+        from ..models.inference_model_info_error import InferenceModelInfoError
         from ..models.inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
         from ..models.inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 
@@ -140,6 +171,22 @@ class InferenceModelInfo:
         else:
             qualified_limits = InferenceModelInfoQualifiedLimits.from_dict(_qualified_limits)
 
+        _compatibility = d.pop("compatibility", UNSET)
+        compatibility: InferenceModelInfoCompatibility | Unset
+        if isinstance(_compatibility, Unset):
+            compatibility = UNSET
+        else:
+            compatibility = InferenceModelInfoCompatibility(_compatibility)
+
+        invocable = d.pop("invocable", UNSET)
+
+        _error = d.pop("error", UNSET)
+        error: InferenceModelInfoError | Unset
+        if isinstance(_error, Unset):
+            error = UNSET
+        else:
+            error = InferenceModelInfoError.from_dict(_error)
+
         capabilities = cast(list[str], d.pop("capabilities", UNSET))
 
         inputs = cast(list[str], d.pop("inputs", UNSET))
@@ -150,6 +197,9 @@ class InferenceModelInfo:
             dense_output=dense_output,
             model_revision=model_revision,
             qualified_limits=qualified_limits,
+            compatibility=compatibility,
+            invocable=invocable,
+            error=error,
             capabilities=capabilities,
             inputs=inputs,
         )

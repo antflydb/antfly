@@ -461,6 +461,7 @@ pub fn errorDetails(err: anyerror) ?ErrorDetails {
         // UnsupportedGlinerBoundaryRuntime arm below (an unreviewed identity,
         // backend, feature, or malformed table) so the response names the
         // dimension instead of reporting a generic unsupported feature.
+        error.UnsupportedGlinerSpecialtyArtifact => .{ .status = 400, .code = "INVALID_MODEL", .message = "GLiNER specialty artifacts must match the qualified FP32 checkpoint and provenance" },
         error.UnsupportedGlinerDecisionGeometry => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER decision extraction exceeds the qualified item, sequence or token limit" },
         error.GlinerBoundaryRequestItemsLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified request_items (batch size) limit" },
         error.GlinerBoundaryDocumentBytesLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified document_bytes limit" },
@@ -478,6 +479,12 @@ pub fn errorDetails(err: anyerror) ?ErrorDetails {
         error.ExtractionRegexLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "regex validation exceeds its configured compilation or execution limit" },
         else => null,
     };
+}
+
+test "specialty artifact rejection is an invalid model client error" {
+    const details = errorDetails(error.UnsupportedGlinerSpecialtyArtifact) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 400), details.status);
+    try std.testing.expectEqualStrings("INVALID_MODEL", details.code);
 }
 
 test "span v2 feature rejections are client errors" {

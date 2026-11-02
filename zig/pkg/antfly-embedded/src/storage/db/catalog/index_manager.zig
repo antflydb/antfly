@@ -12959,9 +12959,15 @@ pub const IndexManager = struct {
         if (kind != .string or !std.mem.eql(u8, kind.string, "extractor")) return;
         const config = producer.get("config") orelse return;
         if (config != .object) return;
-        const method = config.object.get("method") orelse return;
-        const policy = config.object.get("probabilities") orelse return;
-        if (method == .string and std.mem.eql(u8, method.string, "generated") and policy == .string and std.mem.eql(u8, policy.string, "verdict_only")) return error.InvalidResolverConfig;
+        // The provider short form normalizes to the generated form and may
+        // imply verdict-only probabilities.
+        const generated_extraction = @import("antfly_structured").extraction;
+        const config_json = try std.json.Stringify.valueAlloc(self.alloc, config, .{});
+        defer self.alloc.free(config_json);
+        if (!try generated_extraction.isGenerated(self.alloc, config_json)) return;
+        var generated = generated_extraction.parse(self.alloc, config_json) catch return;
+        defer generated.deinit();
+        if (generated.value.probabilities == .verdict_only) return error.InvalidResolverConfig;
     }
 
     /// Import immutable policy once into this owner's allocator. Transient

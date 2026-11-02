@@ -1,6 +1,7 @@
 ---
 title: AWS Bedrock
 description: Bedrock embeddings and Converse generation in Antfly
+order: 10
 ---
 
 The `bedrock` provider calls Amazon Bedrock in your AWS account.
@@ -40,6 +41,47 @@ instance role. `region` defaults to `AWS_REGION`, then
   }
 }
 ```
+
+## Extraction
+
+Use `bedrock` as an extraction provider: name the model and the schema, and
+Antfly runs a generated extractor on that model. As an `extractor` producer on an
+enrichment:
+
+```json
+{
+  "type": "extractor",
+  "config": {
+    "provider": "bedrock",
+    "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "region": "us-east-1",
+    "schema": {
+      "entities": ["person", "company"],
+      "relations": [{"type": "works_for"}]
+    }
+  }
+}
+```
+
+The schema takes `entities` and `relations`. Admitted model families: Anthropic Claude 3 and later model IDs and cross-region inference profiles. Claude Opus 5.5, Sonnet 5.5, and Fable 5.1 use Converse JSON-schema output because those models reject forced tool selection. Other admitted Claude models use a forced Converse tool call.
+Other models, and task variants such as audio, image, search, or embedding
+models, are rejected when the config is saved. Scores are verdict-only.
+
+To set instructions, output mode, probabilities, or batching, use the
+generated form instead, which takes the same generator config under
+`generator`:
+
+```json
+{
+  "method": "generated",
+  "generator": {"provider": "bedrock", "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "region": "us-east-1"},
+  "probabilities": "verdict_only",
+  "instructions": "Only extract people named in the signature block.",
+  "schema": {"entities": ["person"]}
+}
+```
+
+The generated form, with `inputs` added, is also what `/ai/v1/extract` accepts.
 
 ## Related
 

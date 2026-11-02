@@ -1,4 +1,5 @@
 """Reject false-positive oracle results without loading a model or a GPU."""
+
 import copy
 import json
 from pathlib import Path
@@ -13,27 +14,47 @@ import qualify_metal_http as gate
 class OracleComparison(unittest.TestCase):
     def setUp(self):
         self.guard = {
-            "id": "guard", "heads": [
-                {"task": "first", "labels": ["safe", "unsafe"],
-                 "probabilities": {"values": [0.1, 0.9]}},
-                {"task": "second", "labels": ["a", "b"],
-                 "probabilities": {"values": [0.8, 0.7]}},
-            ], "presented_output": {"second": ["a", "b"], "first": "unsafe"},
+            "id": "guard",
+            "heads": [
+                {
+                    "task": "first",
+                    "labels": ["safe", "unsafe"],
+                    "probabilities": {"values": [0.1, 0.9]},
+                },
+                {
+                    "task": "second",
+                    "labels": ["a", "b"],
+                    "probabilities": {"values": [0.8, 0.7]},
+                },
+            ],
+            "presented_output": {"second": ["a", "b"], "first": "unsafe"},
         }
-        self.guard_row = {"classifications": [
-            {"name": "first", "label": "unsafe", "score": 0.9},
-            {"name": "second", "label": "a", "score": 0.8},
-            {"name": "second", "label": "b", "score": 0.7},
-        ]}
-        self.pii = {"id": "unicode", "labels": ["person"], "text": "José José",
-                    "presented_output": {"entities": {"person": [
+        self.guard_row = {
+            "classifications": [
+                {"name": "first", "label": "unsafe", "score": 0.9},
+                {"name": "second", "label": "a", "score": 0.8},
+                {"name": "second", "label": "b", "score": 0.7},
+            ]
+        }
+        self.pii = {
+            "id": "unicode",
+            "labels": ["person"],
+            "text": "José José",
+            "presented_output": {
+                "entities": {
+                    "person": [
                         {"text": "José", "start": 0, "end": 4, "confidence": 0.9},
                         {"text": "José", "start": 5, "end": 9, "confidence": 0.8},
-                    ]}}}
-        self.pii_row = {"entities": [
-            {"label": "person", "text": "José", "start": 0, "end": 4, "score": 0.9},
-            {"label": "person", "text": "José", "start": 5, "end": 9, "score": 0.8},
-        ]}
+                    ]
+                }
+            },
+        }
+        self.pii_row = {
+            "entities": [
+                {"label": "person", "text": "José", "start": 0, "end": 4, "score": 0.9},
+                {"label": "person", "text": "José", "start": 5, "end": 9, "score": 0.8},
+            ]
+        }
 
     def test_capture_object_key_sorting_does_not_define_api_task_order(self):
         self.assertEqual(0, gate.compare_row("gliguard", self.guard, self.guard_row))
@@ -62,7 +83,9 @@ class OracleComparison(unittest.TestCase):
         row = copy.deepcopy(self.pii_row)
         row["entities"][0]["end"] = 5
         row["entities"][1].update(start=6, end=11)
-        self.assertEqual(0, gate.compare_row("pii_multi", self.pii, row, byte_offsets=True))
+        self.assertEqual(
+            0, gate.compare_row("pii_multi", self.pii, row, byte_offsets=True)
+        )
         with self.assertRaises(RuntimeError):
             gate.compare_row("pii_multi", self.pii, self.pii_row, byte_offsets=True)
 
@@ -83,17 +106,27 @@ class OracleComparison(unittest.TestCase):
             gate.compare_row("gliguard", self.guard, self.guard_row)
 
     def test_ragged_batch_retains_required_shared_schema(self):
-        case = {"id": "one", "text": "hello", "heads": [
-            {"task": "safety", "labels": ["safe", "unsafe"], "multi_label": False, "threshold": 0.5}
-        ]}
+        case = {
+            "id": "one",
+            "text": "hello",
+            "heads": [
+                {
+                    "task": "safety",
+                    "labels": ["safe", "unsafe"],
+                    "multi_label": False,
+                    "threshold": 0.5,
+                }
+            ],
+        }
         body = gate.ragged_guard_body([case])
         self.assertEqual(gate.guard_schema(case), body["schema"])
         self.assertEqual(9, len(body["inputs"]))
         self.assertTrue(all("schema" in row for row in body["inputs"]))
 
     def test_entity_thresholds_use_public_entity_definitions(self):
-        schema = gate.pii_schema({"labels": ["person", "email"],
-                                  "entity_thresholds": {"person": 0.9}})
+        schema = gate.pii_schema(
+            {"labels": ["person", "email"], "entity_thresholds": {"person": 0.9}}
+        )
         self.assertEqual(["person", "email"], schema["entities"])
         self.assertEqual({"person": {"threshold": 0.9}}, schema["entity_definitions"])
 
@@ -117,7 +150,9 @@ class OracleComparison(unittest.TestCase):
         costs = {"a": 2, "token": 3, "hello": 2}
 
         def endpoint(_url, _path, body):
-            tokens = 40 + sum(costs[word] for word in body["inputs"][0]["content"].split())
+            tokens = 40 + sum(
+                costs[word] for word in body["inputs"][0]["content"].split()
+            )
             probes.append(tokens)
             if tokens > 512:
                 return 413, {"error": "EXTRACTION_LIMIT_EXCEEDED"}, 0.001
@@ -132,17 +167,28 @@ class OracleComparison(unittest.TestCase):
         catalog = {"extractors": {}}
         for profile, name in gate.MODELS.items():
             catalog["extractors"][name] = {
-                "capabilities": ["extraction"] if profile == "pii_multi" else
-                    ["classification", "zero_shot", "multi_label"],
-                "inputs": ["text"], "inference_capabilities": {
-                    "task": "extract", "input_modalities": ["text"],
-                    "batch": {"max_items": 128}, "result_cardinality": "one_per_item"}}
+                "capabilities": ["extraction"]
+                if profile == "pii_multi"
+                else ["classification", "zero_shot", "multi_label"],
+                "inputs": ["text"],
+                "inference_capabilities": {
+                    "task": "extract",
+                    "input_modalities": ["text"],
+                    "batch": {"max_items": 128},
+                    "result_cardinality": "one_per_item",
+                },
+            }
         gate.verify_catalog(catalog)
         for mutate in (
-                lambda info: info["capabilities"].append("embedding"),
-                lambda info: info["inference_capabilities"]["batch"].update(max_items=1),
-                lambda info: info["inference_capabilities"]["input_modalities"].append("image"),
-                lambda info: info["inference_capabilities"].update(result_cardinality="one_per_request")):
+            lambda info: info["capabilities"].append("embedding"),
+            lambda info: info["inference_capabilities"]["batch"].update(max_items=1),
+            lambda info: info["inference_capabilities"]["input_modalities"].append(
+                "image"
+            ),
+            lambda info: info["inference_capabilities"].update(
+                result_cardinality="one_per_request"
+            ),
+        ):
             changed = copy.deepcopy(catalog)
             mutate(changed["extractors"][gate.MODELS["pii_multi"]])
             with self.assertRaises(RuntimeError):
@@ -152,10 +198,18 @@ class OracleComparison(unittest.TestCase):
         row = copy.deepcopy(self.pii_row)
         row["id"] = self.pii["id"]
         success = (200, {"data": [row]}, 0.01, {})
-        busy = (503, {"error": "MODEL_RESOURCE_BUSY",
-                      "message": "insufficient inference capacity is currently available",
-                      "reason": "inference_capacity", "retryable": True, "retry_after_ms": 1000},
-                0.001, {"retry-after": "1"})
+        busy = (
+            503,
+            {
+                "error": "MODEL_RESOURCE_BUSY",
+                "message": "insufficient inference capacity is currently available",
+                "reason": "inference_capacity",
+                "retryable": True,
+                "retry_after_ms": 1000,
+            },
+            0.001,
+            {"retry-after": "1"},
+        )
         return success, busy
 
     def test_concurrent_backpressure_retries_only_after_both_initial_calls_drain(self):
@@ -183,14 +237,23 @@ class OracleComparison(unittest.TestCase):
 
         with patch.object(gate, "http_with_headers", side_effect=endpoint) as raw:
             with gate.ThreadPoolExecutor(max_workers=1) as driver:
-                pending = driver.submit(gate.concurrent_requests, "http://unused", "pii_multi", self.pii)
+                pending = driver.submit(
+                    gate.concurrent_requests, "http://unused", "pii_multi", self.pii
+                )
                 try:
                     self.assertTrue(busy_sent.wait(3))
                     self.assertFalse(retry_started.wait(0.1))
                 finally:
                     allow_success.set()
                 report = pending.result(timeout=3)
-        self.assertEqual((1, 1, 1), (report["initial_successes"], report["initial_busy"], report["retry_successes"]))
+        self.assertEqual(
+            (1, 1, 1),
+            (
+                report["initial_successes"],
+                report["initial_busy"],
+                report["retry_successes"],
+            ),
+        )
         self.assertEqual(3, raw.call_count)
 
     def test_concurrent_rejections_cannot_hide_failure_or_stalled_progress(self):
@@ -202,8 +265,15 @@ class OracleComparison(unittest.TestCase):
             (503, dict(busy[1], retry_after_ms=1000.0), busy[2], busy[3]),
         ]
         for bad in invalid:
-            with self.subTest(response=bad), patch.object(gate, "http_with_headers", side_effect=[success, bad]) as raw:
-                with self.assertRaisesRegex(RuntimeError, "unexpected concurrent rejection"):
+            with (
+                self.subTest(response=bad),
+                patch.object(
+                    gate, "http_with_headers", side_effect=[success, bad]
+                ) as raw,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "unexpected concurrent rejection"
+                ):
                     gate.concurrent_requests("http://unused", "pii_multi", self.pii)
                 self.assertEqual(2, raw.call_count)
         with patch.object(gate, "http_with_headers", return_value=busy):
@@ -215,13 +285,18 @@ class OracleComparison(unittest.TestCase):
 
     def test_concurrent_transport_errors_propagate(self):
         success, _ = self.concurrent_responses()
-        with patch.object(gate, "http_with_headers", side_effect=[OSError("lost socket"), success]):
+        with patch.object(
+            gate, "http_with_headers", side_effect=[OSError("lost socket"), success]
+        ):
             with self.assertRaisesRegex(OSError, "lost socket"):
                 gate.concurrent_requests("http://unused", "pii_multi", self.pii)
 
     def test_late_resource_failure_or_server_exit_cannot_pass(self):
         for failure in ("resource", "crash"):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 output = Path(directory)
                 inspecting_log = threading.Event()
                 terminated = threading.Event()
@@ -265,27 +340,39 @@ class OracleComparison(unittest.TestCase):
                         self.assertTrue(terminated.wait(3))
                     else:
                         process.returncode = 3
-                    return "\n".join("selected backend metal for /models/" + name
-                                     for name in gate.MODELS.values())
+                    return "\n".join(
+                        "selected backend metal for /models/" + name
+                        for name in gate.MODELS.values()
+                    )
 
-                with (patch.object(gate.socket, "socket") as sockets,
-                      patch.object(gate, "ProcessGroupPhysicalMemorySampler") as physical,
-                      patch.object(gate.subprocess, "Popen", return_value=process),
-                      patch.object(gate, "group_rss_mib", side_effect=rss),
-                      patch.object(gate, "memory_free_percent", return_value=80),
-                      patch.object(gate, "swapout_bytes", return_value=0),
-                      patch.object(gate, "terminate_group", side_effect=terminate),
-                      patch.object(gate, "http", return_value=(200, {}, 0.001)),
-                      patch.object(gate, "verify_catalog"),
-                      patch.object(gate, "exercise", side_effect=exercise),
-                      patch.object(Path, "read_text", read_log)):
-                    sockets.return_value.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 18090)
+                with (
+                    patch.object(gate.socket, "socket") as sockets,
+                    patch.object(gate, "ProcessGroupPhysicalMemorySampler") as physical,
+                    patch.object(gate.subprocess, "Popen", return_value=process),
+                    patch.object(gate, "group_rss_mib", side_effect=rss),
+                    patch.object(gate, "memory_free_percent", return_value=80),
+                    patch.object(gate, "swapout_bytes", return_value=0),
+                    patch.object(gate, "terminate_group", side_effect=terminate),
+                    patch.object(gate, "http", return_value=(200, {}, 0.001)),
+                    patch.object(gate, "verify_catalog"),
+                    patch.object(gate, "exercise", side_effect=exercise),
+                    patch.object(Path, "read_text", read_log),
+                ):
+                    sockets.return_value.__enter__.return_value.getsockname.return_value = (
+                        "127.0.0.1",
+                        18090,
+                    )
                     physical.return_value.snapshot.return_value = {
-                        "live_processes": 2, "observed_process_identities": 2,
+                        "live_processes": 2,
+                        "observed_process_identities": 2,
                         "conservative_summed_identity_peak_bound_bytes": 100 * 1024**2,
                     }
-                    with self.assertRaisesRegex(RuntimeError, "production cleanup failed"):
-                        gate.run_lane(Path("/unused/server"), output, output, {}, "default", 25)
+                    with self.assertRaisesRegex(
+                        RuntimeError, "production cleanup failed"
+                    ):
+                        gate.run_lane(
+                            Path("/unused/server"), output, output, {}, "default", 25
+                        )
                 receipt = json.loads((output / "default-receipt.json").read_text())
                 self.assertFalse(receipt["passed"])
                 self.assertTrue(receipt["cleanup_errors"])

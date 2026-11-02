@@ -235,6 +235,7 @@ pub const Provider = struct {
         const control = RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation);
         try control.check(self.http.io);
         const body = try converse.requestJsonAlloc(alloc, messages, .{
+            .streaming = true,
             .max_tokens = self.max_tokens,
             .temperature = self.temperature,
             .top_p = self.top_p,
@@ -834,7 +835,7 @@ pub fn testConverseSignedRequest() !void {
         .method = .POST,
         .path = "/proxy/model/vision-model/converse",
         .assert_request = Check.request,
-        .respond = .{ .body = "{\"output\":{\"message\":{\"role\":\"assistant\",\"content\":[{\"text\":\"saw sheets\"}]}},\"stopReason\":\"end_turn\",\"usage\":{\"inputTokens\":2,\"outputTokens\":1,\"totalTokens\":3}}" },
+        .respond = .{ .body = "{\"metrics\":{\"latencyMs\":1},\"output\":{\"message\":{\"role\":\"assistant\",\"content\":[{\"text\":\"saw sheets\"}]}},\"stopReason\":\"end_turn\",\"usage\":{\"inputTokens\":2,\"outputTokens\":1,\"totalTokens\":3}}" },
     }});
     defer server.deinit();
     const endpoint = try std.fmt.allocPrint(alloc, "{s}/proxy", .{server.baseUrl()});

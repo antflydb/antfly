@@ -639,6 +639,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     generating_mod.addImport("antfly-json", json_mod);
     generating_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    generating_mod.addAnonymousImport("anthropic_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig") });
     const chunking_mod = b.createModule(.{
         .root_source_file = b.path("lib/chunking/src/mod.zig"),
         .target = target,
@@ -689,6 +690,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     extracting_mod.addImport("httpx", httpx_mod);
     extracting_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+    extracting_mod.addAnonymousImport("fastino_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/fastino_api/root.zig") });
 
     // --- Inference backend detection (must precede module creation) ---
     structured_mod.addImport("antfly_generating", generating_mod);
@@ -1048,6 +1050,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    inference_bedrock_mod.addAnonymousImport("bedrock_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/bedrock_api/root.zig") });
     inference_bedrock_mod.addImport("antfly_cancellation", cancellation_mod);
     inference_bedrock_mod.addImport("httpx", httpx_mod);
     inference_bedrock_mod.addImport("antfly_hash", hash_mod);

@@ -160,6 +160,15 @@ SOURCE_MODULES = {
     "cloudflare_api": (
         "zig/pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig",
     ),
+    "bedrock_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/bedrock_api/root.zig",
+    ),
+    "anthropic_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/anthropic_api/root.zig",
+    ),
+    "fastino_api": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/fastino_api/root.zig",
+    ),
     "antfly_structured": ("zig/lib/structured/root.zig",),
     "antfly_decision_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",
@@ -242,6 +251,7 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_middleware_openapi/root.zig",
     ),
     "antfly_pdf": ("zig/lib/pdf/src/mod.zig",),
+    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_platform": ("zig/lib/platform/src/root.zig",),
     "antfly_provider_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_provider_openapi/root.zig",

@@ -29,6 +29,7 @@ const std = @import("std");
 const is_freestanding = @import("builtin").os.tag == .freestanding;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
+const qwen35_execution = @import("qwen35_execution.zig");
 const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 const ops = @import("../ops/ops.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
@@ -6412,9 +6413,13 @@ fn decoderBlockImpl(
     // Q, K, V projections
     const attn_qkv_started_at = monotonicNowNs();
     if (config.layerUsesQwen35LinearAttention(layer)) {
-        const attn_out = try qwen35LinearAttention(cb, allocator, config, normed, batch, query_seq_len, layer, decode_context, &name_buf);
-        defer cb.free(attn_out);
-        const attn_res = try cb.add(attn_out, hidden);
+        const fuse_residual = if (comptime build_options.enable_cuda)
+            trace_sink == null and config.hasQwen35VisionArchitectureContract() and @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnProjectionResidualEnabled(cb)
+        else
+            false;
+        const attn_out = try qwen35LinearAttentionWithResidual(cb, allocator, config, normed, batch, query_seq_len, layer, decode_context, &name_buf, if (fuse_residual) hidden else null);
+        defer if (!fuse_residual) cb.free(attn_out);
+        const attn_res = if (fuse_residual) attn_out else try cb.add(attn_out, hidden);
         errdefer cb.free(attn_res);
 
         compute_region_scope.deinit();
@@ -6599,6 +6604,8 @@ fn decoderBlockImpl(
         k: CT,
         v_omitted: bool = false,
         v: CT,
+        prepared_rope: bool = false,
+        gate_sigmoid: bool = false,
     };
     const projected: AttentionProjectionSet = if (fused_qkv_override_active) blk: {
         const fused_qkv = layer0_fused_qkv_override.?;
@@ -6678,11 +6685,8 @@ fn decoderBlockImpl(
             })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, @intCast(q_projection_dim), layer, "q", &name_buf)
         else
             try attnProject(cb, allocator, config, normed, total, hidden_size, @intCast(q_projection_dim), layer, "q", &name_buf);
-        const q, const q_gate: ?CT = if (q_projection_dim == q_dim) .{ q_projected, null } else split_q: {
-            defer cb.free(q_projected);
-            const split = try cb.splitPerHeadGate(q_projected, total, num_heads, head_dim);
-            break :split_q .{ split.query, split.gate };
-        };
+        var q_projected_owned = true;
+        defer if (q_projected_owned) cb.free(q_projected);
         const k: CT, const v_omitted_local: bool, const v_local: CT = if (shares_kv)
             .{ try createZeroCT(cb, allocator, total * kv_dim), false, try createZeroCT(cb, allocator, total * kv_dim) }
         else if (attn_k_slot != null and attn_v_slot != null and (config.family == .qwen3 or config.family == .qwen3_vl)) blk_kv: {
@@ -6740,6 +6744,25 @@ fn decoderBlockImpl(
                     return err,
                 else => return err,
             };
+        };
+        errdefer cb.free(k);
+        errdefer if (!v_omitted_local) cb.free(v_local);
+        if (comptime @import("build_options").enable_cuda) {
+            if (trace_sink == null and !shares_kv and !v_omitted_local and q_projection_dim == q_dim * 2 and
+                !config.layerUsesSlidingAttention(layer))
+            {
+                if (try tryLightOnAttentionInputs(cb, allocator, config, q_projected, k, total, num_heads, num_kv_heads, head_dim, layer, decode_context)) |prepared| {
+                    cb.free(k);
+                    break :blk .{ .q = prepared.query, .k = prepared.key, .q_gate = prepared.gate, .v = v_local, .prepared_rope = true, .gate_sigmoid = true };
+                }
+            }
+        }
+        const q, const q_gate: ?CT = if (q_projection_dim == q_dim) transfer_q: {
+            q_projected_owned = false;
+            break :transfer_q .{ q_projected, null };
+        } else split_q: {
+            const split = try cb.splitPerHeadGate(q_projected, total, num_heads, head_dim);
+            break :split_q .{ split.query, split.gate };
         };
         break :blk .{ .q = q, .q_gate = q_gate, .k = k, .v_omitted = v_omitted_local, .v = v_local };
     };
@@ -6800,7 +6823,7 @@ fn decoderBlockImpl(
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "k_raw", layer, K, num_kv_heads * head_dim);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "v_norm", layer, V_normed, num_kv_heads * head_dim);
 
-    var qk_already_roped = false;
+    var qk_already_roped = projected.prepared_rope;
     var fused_q_rope: ?CT = null;
     var fused_k_rope: ?CT = null;
     if (!shares_kv and config.family == .gemma and config.position_encoding == .rope and batch == 1) fused_blk: {
@@ -6820,7 +6843,9 @@ fn decoderBlockImpl(
         qk_already_roped = true;
     }
 
-    const Q_attn = if (fused_q_rope) |roped_q|
+    const Q_attn = if (projected.prepared_rope)
+        Q
+    else if (fused_q_rope) |roped_q|
         roped_q
     else if (try maybeApplyQKHeadNorm(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, &name_buf)) |normed_q|
         normed_q
@@ -6829,7 +6854,9 @@ fn decoderBlockImpl(
     defer if (Q_attn != Q) cb.free(Q_attn);
 
     // Shared KV layers skip K head norm (K is read from the donor layer's cache).
-    const K_attn = if (fused_k_rope) |roped_k|
+    const K_attn = if (projected.prepared_rope)
+        K
+    else if (fused_k_rope) |roped_k|
         roped_k
     else if (!shares_kv)
         if (try maybeApplyQKHeadNorm(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, &name_buf)) |normed_k|
@@ -7077,8 +7104,8 @@ fn decoderBlockImpl(
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-raw", attn_out, num_heads * head_dim);
         const gated_attn_out = if (q_gate) |gate| blk_gate: {
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "gate", gate, num_heads * head_dim);
-            const sigmoid_gate = try cb.sigmoid(gate);
-            defer cb.free(sigmoid_gate);
+            const sigmoid_gate = if (projected.gate_sigmoid) gate else try cb.sigmoid(gate);
+            defer if (sigmoid_gate != gate) cb.free(sigmoid_gate);
             break :blk_gate try cb.multiply(attn_out, sigmoid_gate);
         } else attn_out;
         defer if (gated_attn_out != attn_out) cb.free(gated_attn_out);
@@ -7103,6 +7130,18 @@ fn decoderBlockImpl(
 
         // Output projection
         const attn_out_proj_started_at = monotonicNowNs();
+        if (comptime build_options.enable_cuda) {
+            if (trace_sink == null and config.hasQwen35VisionArchitectureContract() and @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnProjectionResidualEnabled(cb)) {
+                const output_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.o_proj.weight", .{layer});
+                const output_weight = try getModelWeight(cb, config, output_name);
+                defer cb.free(output_weight);
+                if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnProjectionResidual(cb, attn_proj_input, output_weight, hidden, total, num_heads * head_dim, hidden_size)) |fused| {
+                    debug_timing_stats.attention_out_proj_nanos += @intCast(monotonicNowNs() - attn_out_proj_started_at);
+                    debug_timing_stats.attention_nanos += @intCast(monotonicNowNs() - attn_started_at);
+                    break :blk fused;
+                }
+            }
+        }
         const proj = if (attn_out_proj_linear_slot != null)
             (try cb.decoderRuntimeApplyLinear(&.{
                 .slot = attn_out_proj_linear_slot.?,
@@ -7609,6 +7648,45 @@ pub fn debugGemmaFfnPostNorm(
     buf: *[256]u8,
 ) !CT {
     return applyGemmaFfnPostNorm(cb, allocator, config, hidden, layer, buf);
+}
+
+fn tryLightOnAttentionInputs(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    query_gate: CT,
+    key: CT,
+    rows: usize,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    layer: usize,
+    dc: ?*const DecodeContext,
+) !?@import("../ops/cuda/cuda_compute.zig").CudaCompute.LightOnAttentionInputs {
+    const cuda = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+    if (cb.kind() != .cuda or !config.hasQwen35VisionArchitectureContract() or
+        !cuda.lightOnProjectionResidualEnabled(cb) or head_dim != 256 or config.norm_eps != 1e-6 or
+        config.layerRopeActiveDim(layer) != 64 or config.layerRopeEffectiveTheta(layer) != 10000000 or
+        config.rope_freq_scale != 1 or !std.mem.eql(u32, &config.mrope_section, &.{ 11, 11, 10 })) return null;
+    const positions = if (dc) |context| context.mrope_positions orelse return null else return null;
+    var buf: [256]u8 = undefined;
+    const q_name = std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_norm.weight", .{layer}) catch return error.NameTooLong;
+    const q_base = getModelWeight(cb, config, q_name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => return null,
+        else => return err,
+    };
+    defer cb.free(q_base);
+    const k_name = std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.k_norm.weight", .{layer}) catch return error.NameTooLong;
+    const k_base = getModelWeight(cb, config, k_name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => return null,
+        else => return err,
+    };
+    defer cb.free(k_base);
+    const qw = try maybeAdjustNormWeight(cb, allocator, config, q_base, head_dim);
+    defer if (qw != q_base) cb.free(qw);
+    const kw = try maybeAdjustNormWeight(cb, allocator, config, k_base, head_dim);
+    defer if (kw != k_base) cb.free(kw);
+    return cuda.lightOnAttentionInputs(cb, query_gate, key, qw, kw, positions, rows, heads, kv_heads);
 }
 
 pub fn maybeApplyQKHeadNorm(
@@ -8472,6 +8550,33 @@ pub fn qwen35LinearAttention(
     decode_context: ?*const DecodeContext,
     name_buf: *[256]u8,
 ) !CT {
+    return qwen35LinearAttentionWithResidual(cb, allocator, config, input, physical_batch, seq_len, layer, decode_context, name_buf, null);
+}
+
+fn qwen35OutputProjection(cb: *const ComputeBackend, core: CT, weight: CT, residual: ?CT, rows: usize, in_dim: usize, hidden: usize) !CT {
+    if (residual) |prior| {
+        if (comptime build_options.enable_cuda) {
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnProjectionResidual(cb, core, weight, prior, rows, in_dim, hidden)) |fused| return fused;
+        }
+        const projected = try cb.linearNoBias(core, weight, rows, in_dim, hidden);
+        defer cb.free(projected);
+        return cb.add(projected, prior);
+    }
+    return cb.linearNoBias(core, weight, rows, in_dim, hidden);
+}
+
+fn qwen35LinearAttentionWithResidual(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input: CT,
+    physical_batch: usize,
+    seq_len: usize,
+    layer: usize,
+    decode_context: ?*const DecodeContext,
+    name_buf: *[256]u8,
+    residual: ?CT,
+) !CT {
     const packed_lengths = if (decode_context) |dc| dc.packed_query_lengths else null;
     if (packed_lengths) |lengths| {
         if (physical_batch != 1 or try packedQueryRowCount(lengths) != seq_len) return error.InvalidPackedQueryShape;
@@ -8575,7 +8680,7 @@ pub fn qwen35LinearAttention(
                 const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
                 const out_weight = try getModelWeight(cb, config, out_name);
                 defer cb.free(out_weight);
-                return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+                return qwen35OutputProjection(cb, core, out_weight, residual, total, value_dim, hidden_size);
             };
         }
     }
@@ -8627,7 +8732,7 @@ pub fn qwen35LinearAttention(
                 const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
                 const out_weight = try getModelWeight(cb, config, out_name);
                 defer cb.free(out_weight);
-                return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+                return qwen35OutputProjection(cb, core, out_weight, residual, total, value_dim, hidden_size);
             };
         }
     }
@@ -8664,7 +8769,7 @@ pub fn qwen35LinearAttention(
                 const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
                 const out_weight = try getModelWeight(cb, config, out_name);
                 defer cb.free(out_weight);
-                return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+                return qwen35OutputProjection(cb, core, out_weight, residual, total, value_dim, hidden_size);
             };
         }
     }
@@ -8674,7 +8779,7 @@ pub fn qwen35LinearAttention(
         const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
         const out_weight = try getModelWeight(cb, config, out_name);
         defer cb.free(out_weight);
-        return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+        return qwen35OutputProjection(cb, core, out_weight, residual, total, value_dim, hidden_size);
     }
     if (packed_lengths == null and batch == 1) {
         const state = if (decode_context) |dc| if (dc.qwen35_linear_cache) |cache| cache.layerState(layer) else null else null;
@@ -8683,7 +8788,7 @@ pub fn qwen35LinearAttention(
         const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
         const out_weight = try getModelWeight(cb, config, out_name);
         defer cb.free(out_weight);
-        return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+        return qwen35OutputProjection(cb, core, out_weight, residual, total, value_dim, hidden_size);
     }
     // Batch the weight-heavy projections; each page keeps its own DeltaNet
     // history. Device row slices and core assembly never read state to the host.
@@ -8709,7 +8814,6 @@ pub fn qwen35LinearAttention(
     }
     if (comptime build_options.enable_cuda) {
         if (cb.kind() == .cuda and config.qwen35_device_only_state and
-            platform.env.getenvBool("TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE") and
             key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4)
         {
             var resident_states = true;
@@ -8779,7 +8883,7 @@ pub fn qwen35LinearAttention(
     const out_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
     const out_w = try getModelWeight(cb, config, out_w_name);
     defer cb.free(out_w);
-    return cb.linearNoBias(assembled.?, out_w, total, value_dim, hidden_size);
+    return qwen35OutputProjection(cb, assembled.?, out_w, residual, total, value_dim, hidden_size);
 }
 
 // Dense projections already span the complete packed tensor. Warm adjacent
@@ -8974,31 +9078,38 @@ fn qwen35ProjectedCore(
     const conv_kernel: usize = @intCast(config.qwen35_linear_conv_kernel_dim);
     const total = seq_len;
     if (comptime build_options.enable_cuda) {
-        if (cb.kind() == .cuda and (getenvBool("TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE") or
+        if (cb.kind() == .cuda and (config.qwen35_device_only_state or
             (maybe_state != null and (maybe_state.?.cuda_device.initialized or maybe_state.?.cuda_device.failed))))
         {
-            if (maybe_state) |state| {
-                if (state.initialized and !state.cuda_device.initialized) return error.CudaRecurrentStateMigrationUnavailable;
-                if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.qwen35LinearCore(cb, &state.cuda_device, .{
-                    .device_state_admitted = state.device_only,
-                    .destination = destination,
-                    .mixed = mixed,
-                    .z = z,
-                    .beta = beta_proj,
-                    .a = a_proj,
-                    .conv_weight = conv_w,
-                    .a_log = a_log_w,
-                    .dt_bias = dt_bias_w,
-                    .norm_weight = norm_w,
-                    .seq_len = seq_len,
-                    .key_heads = key_heads,
-                    .value_heads = value_heads,
-                    .dim = key_head_dim,
-                    .value_dim = value_head_dim,
-                    .conv_kernel = conv_kernel,
-                    .eps = config.norm_eps,
-                })) |core| return core;
-            }
+            // Session.run, comparison tools and other full-prefix forwards
+            // have no decode cache. Give that invocation a fresh device owner;
+            // unlike cached histories it has no caller-owned persistent lease.
+            var temporary_state: Qwen35LinearLayerState = undefined;
+            const state = maybe_state orelse state: {
+                temporary_state = .{ .device_only = true };
+                break :state &temporary_state;
+            };
+            defer if (maybe_state == null) temporary_state.deinit(allocator);
+            if (state.initialized and !state.cuda_device.initialized) return error.CudaRecurrentStateMigrationUnavailable;
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.qwen35LinearCore(cb, &state.cuda_device, .{
+                .device_state_admitted = maybe_state != null and state.device_only,
+                .destination = destination,
+                .mixed = mixed,
+                .z = z,
+                .beta = beta_proj,
+                .a = a_proj,
+                .conv_weight = conv_w,
+                .a_log = a_log_w,
+                .dt_bias = dt_bias_w,
+                .norm_weight = norm_w,
+                .seq_len = seq_len,
+                .key_heads = key_heads,
+                .value_heads = value_heads,
+                .dim = key_head_dim,
+                .value_dim = value_head_dim,
+                .conv_kernel = conv_kernel,
+                .eps = config.norm_eps,
+            })) |core| return core;
         }
     }
     if (comptime build_options.enable_metal) {
@@ -9753,6 +9864,12 @@ pub fn applyPreparedAttention(
     attention.skip_kv_write = skip_kv_write;
     attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
     if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
+    if (config.hasQwen35VisionArchitectureContract() and attention.sliding_window == 0) {
+        if (decode_context) |dc| if (dc.packed_query_lengths) |lengths| {
+            if (batch != 1 or try packedQueryRowCount(lengths) != attention.query_sequence_len) return error.InvalidPackedQueryShape;
+            return runPackedQwenAttention(cb, Q, K, V, attention, .{}, lengths, num_heads, num_kv_heads, head_dim, dc);
+        };
+    }
     if (attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
         const gqa_started_at = monotonicNowNs();
         const result = try cb.gqaCausalAttention(Q, K, V, null, batch, attention.query_sequence_len, num_heads, num_kv_heads, head_dim);
@@ -14661,4 +14778,140 @@ fn checkCudaPackedRecurrent(ragged: bool, fused_decode: bool) !void {
         if (ragged) try std.testing.expectEqual(@as(usize, 3), compute.lighton_recurrent.ragged_batch_calls);
         try std.testing.expectEqual(@as(usize, if (fused_decode) 3 else 0), compute.lighton_recurrent.fused_decode_calls);
     }
+}
+
+test "LightOnOCR3 default CUDA dispatch keeps admitted recurrent histories on device" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    if (!qwen35_execution.cudaCoreEnabled()) return error.SkipZigTest;
+    const cuda = @import("../ops/cuda/cuda_compute.zig");
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_][]const u8{ @embedFile("../models/testdata/lightonocr3/config.json"), @embedFile("../models/testdata/lightonocr3/config-4b.json") }) |json| {
+        var cfg = try gpt_config.parseConfig(a, json);
+        const decision = qwen35_execution.apply(&cfg, compute.ctx.info.compute_major, qwen35_execution.cudaCoreEnabled());
+        try std.testing.expectEqual(.cuda, decision.placement);
+        var controller = runtime.tier.memory.AdmissionController{};
+        defer controller.deinit();
+        const limits = runtime.tier.memory.Limits{ .backend_limit_bytes = 128 * 1024 * 1024 };
+        const state_bytes = try runtime.tier.memory.gptRecurrentBackendStateBytes(.cuda, cfg);
+        var lease = try controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = state_bytes }, false);
+        defer lease.release();
+        compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = limits, .check_live_memory = false };
+        defer compute.ctx.video_cache_budget.admission = null;
+        var cache = try Qwen35LinearCache.init(a, cfg);
+        defer cache.deinit();
+        try std.testing.expectEqual(@as(usize, 0), cache.layers[0].conv.len);
+        try std.testing.expectEqual(@as(usize, 0), cache.layers[0].recurrent.len);
+        const kh: usize = cfg.qwen35_linear_num_key_heads;
+        const vh: usize = cfg.qwen35_linear_num_value_heads;
+        const channels = (2 * kh + vh) * 128;
+        const width = vh * 128;
+        const counts = [_]usize{ 3 * channels, 3 * width, 3 * vh, 3 * vh, channels * 4, vh, vh, 128 };
+        var tensors: [8]CT = undefined;
+        var loaded: usize = 0;
+        defer for (tensors[0..loaded]) |t| cb.free(t);
+        for (counts, 0..) |count, i| {
+            const values = try a.alloc(f32, count);
+            defer a.free(values);
+            @memset(values, if (i == 7) 1 else 0);
+            tensors[i] = try cb.fromFloat32(values);
+            loaded += 1;
+        }
+        const before = compute.stats.d2h_bytes;
+        const output = try qwen35ProjectedCore(&cb, a, cfg, tensors[0], tensors[1], tensors[2], tensors[3], tensors[4], tensors[5], tensors[6], tensors[7], &cache.layers[0], 3, null);
+        defer cb.free(output);
+        try std.testing.expect(cache.layers[0].cuda_device.initialized);
+        try std.testing.expectEqual(before, compute.stats.d2h_bytes);
+        try std.testing.expectEqual(state_bytes, controller.snapshot().backend_scratch_bytes);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (actual) |value| try std.testing.expectEqual(@as(f32, 0), value);
+    }
+}
+
+test "LightOnOCR3 CUDA uncached hidden and logits forwards own admitted temporary recurrence" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const cuda = @import("../ops/cuda/cuda_compute.zig");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const Fixture = struct {
+        fn weight(c: *cuda.CudaCompute, name: []const u8, shape: []const i64, norm: bool) !void {
+            var count: usize = 1;
+            for (shape) |dim| count *= @intCast(dim);
+            const values = try a.alloc(f32, count);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = if (norm) 1 else @sin(@as(f32, @floatFromInt(i + 1)) * 0.17) * 0.1;
+            var tensor = try Tensor.initFloat32(a, name, shape, values);
+            defer tensor.deinit();
+            const key = try a.dupe(u8, name);
+            errdefer a.free(key);
+            try c.insertWeightFromTensor(key, &tensor);
+        }
+    };
+    var cfg = Config{ .family = .qwen3_5, .hidden_size = 4, .intermediate_size = 8, .vocab_size = 8, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .max_position_embeddings = 64, .position_encoding = .rope, .norm_type = .rms_norm, .activation = .silu, .qwen35_has_linear_attention = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 128, .qwen35_linear_value_head_dim = 128, .qwen35_linear_conv_kernel_dim = 4 };
+    try std.testing.expectEqual(.cuda, qwen35_execution.apply(&cfg, compute.ctx.info.compute_major, true).placement);
+    inline for (.{
+        .{ "model.embed_tokens.weight", 8, 4 },
+        .{ "lm_head.weight", 8, 4 },
+        .{ "model.layers.0.linear_attn.in_proj_qkv.weight", 384, 4 },
+        .{ "model.layers.0.linear_attn.in_proj_z.weight", 128, 4 },
+        .{ "model.layers.0.linear_attn.in_proj_b.weight", 1, 4 },
+        .{ "model.layers.0.linear_attn.in_proj_a.weight", 1, 4 },
+        .{ "model.layers.0.linear_attn.conv1d.weight", 384, 4 },
+        .{ "model.layers.0.linear_attn.out_proj.weight", 4, 128 },
+        .{ "model.layers.0.mlp.gate_proj.weight", 8, 4 },
+        .{ "model.layers.0.mlp.up_proj.weight", 8, 4 },
+        .{ "model.layers.0.mlp.down_proj.weight", 4, 8 },
+    }) |spec| try Fixture.weight(&compute, spec[0], &.{ spec[1], spec[2] }, false);
+    inline for (.{ "model.norm.weight", "model.layers.0.input_layernorm.weight", "model.layers.0.post_attention_layernorm.weight" }) |name|
+        try Fixture.weight(&compute, name, &.{4}, true);
+    try Fixture.weight(&compute, "model.layers.0.linear_attn.norm.weight", &.{128}, true);
+    try Fixture.weight(&compute, "model.layers.0.linear_attn.A_log", &.{1}, false);
+    try Fixture.weight(&compute, "model.layers.0.linear_attn.dt_bias", &.{1}, false);
+
+    var controller = runtime.tier.memory.AdmissionController{};
+    defer controller.deinit();
+    const limits = runtime.tier.memory.Limits{ .backend_limit_bytes = 16 * 1024 * 1024 };
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = limits, .check_live_memory = false };
+    defer compute.ctx.video_cache_budget.admission = null;
+    const ids = [_]i64{ 1, 3, 2 };
+    // The same null-context entry points used by Session.run and compare-generate.
+    const hidden = try hiddenForward(&cb, a, cfg, &ids, 1, ids.len, null);
+    defer a.free(hidden);
+    try std.testing.expectEqual(@as(usize, ids.len * cfg.hidden_size), hidden.len);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+    const logits = try forward(&cb, a, cfg, &ids, 1, ids.len, null);
+    defer a.free(logits);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+    const repeated = try forward(&cb, a, cfg, &ids, 1, ids.len, null);
+    defer a.free(repeated);
+    try std.testing.expectEqualSlices(f32, logits, repeated);
+    var nonzero = false;
+    for (logits) |value| {
+        try std.testing.expect(std.math.isFinite(value));
+        nonzero = nonzero or @abs(value) > 1e-6;
+    }
+    try std.testing.expect(nonzero);
+
+    {
+        var lease = try controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = try runtime.tier.memory.gptRecurrentBackendStateBytes(.cuda, cfg) }, false);
+        defer lease.release();
+        var cache = try Qwen35LinearCache.init(a, cfg);
+        defer cache.deinit();
+        const context = DecodeContext{ .total_sequence_len = ids.len, .query_sequence_len = ids.len, .kv_sequence_len = 0, .qwen35_linear_cache = &cache };
+        const cached = try forward(&cb, a, cfg, &ids, 1, ids.len, &context);
+        defer a.free(cached);
+        try std.testing.expectEqualSlices(f32, logits, cached);
+    }
+
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 1;
+    const downloads = compute.stats.d2h_bytes;
+    try std.testing.expectError(error.ResourceLimitExceeded, forward(&cb, a, cfg, &ids, 1, ids.len, null));
+    try std.testing.expectEqual(downloads, compute.stats.d2h_bytes);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
 }

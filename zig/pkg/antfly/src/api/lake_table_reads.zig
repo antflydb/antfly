@@ -67,7 +67,7 @@ pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("antfl
             .is_not_null => .is_not_null,
             else => continue,
         };
-        var value = condition.value orelse .null;
+        var value = condition.value.valueOrNull() orelse .null;
         if (value == .string and (try table.column(condition.column)).type == .integer) value = .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidQueryRequest };
         try pushed.append(a, .{ .column = condition.column, .op = op, .value = value });
     }
@@ -118,9 +118,9 @@ fn normalizeConditions(a: std.mem.Allocator, table: catalog.Table, input: []cons
     const result = try a.dupe(Condition, input);
     for (result) |*condition| {
         const kind = (try table.column(condition.column)).type;
-        var value = condition.value orelse .null;
+        var value = condition.value.valueOrNull() orelse .null;
         if (value == .string and kind == .integer) value = .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidQueryRequest };
-        condition.value = if (condition.op == .is_null or condition.op == .is_not_null) .null else try @import("antfly_local_sources").sql_lake_values.comparisonValue(a, value, kind);
+        condition.value = if (condition.op == .is_null or condition.op == .is_not_null) .null_value else .{ .value = try @import("antfly_local_sources").sql_lake_values.comparisonValue(a, value, kind) };
     }
     return result;
 }
@@ -132,7 +132,7 @@ fn matchesNormalized(a: std.mem.Allocator, row: catalog.Row, table: catalog.Tabl
         const stored = try row.cell(condition.column);
         const kind = (try table.column(condition.column)).type;
         const cell: @import("antfly_local_sources").sql_scalar.Datum = .{ .value = try @import("antfly_local_sources").sql_lake_values.comparisonValue(a, stored.value, kind), .sql_null = stored.sql_null };
-        const operand = condition.value orelse .null;
+        const operand = condition.value.valueOrNull() orelse .null;
         const match = switch (condition.op) {
             .is_null => cell.sql_null,
             .is_not_null => !cell.sql_null,
@@ -168,11 +168,12 @@ test "lake SQL public rows datetime equality and distinct predicates share norma
     const table: catalog.Table = .{ .id = 1, .physical_name = "events", .schema_version = 1, .columns = &.{.{ .name = "ts", .path = "ts", .type = .datetime }} };
     const row: catalog.Row = .{ .id = "row", .version = 0, .value = .{ .object = object }, .sql_nulls = &.{false} };
     const conditions = [_]@import("antfly_metadata_openapi").types.RelationalRowCondition{
-        .{ .column = "ts", .op = .eq, .value = .{ .string = "1970-01-01T00:59:59.999999999+01:00" } },
-        .{ .column = "ts", .op = .is_not_distinct, .value = .{ .integer = -1 } },
+        .{ .column = "ts", .op = .eq, .value = .{ .value = .{ .string = "1970-01-01T00:59:59.999999999+01:00" } } },
+        .{ .column = "ts", .op = .is_not_distinct, .value = .{ .value = .{ .integer = -1 } } },
     };
     try std.testing.expect(try matches(a, row, table, &conditions));
     const null_row: catalog.Row = .{ .id = "null", .version = 0, .value = .{ .object = std.json.ObjectMap.empty } };
     try std.testing.expect(try matches(a, null_row, table, &.{.{ .column = "ts", .op = .is_not_distinct }}));
+    try std.testing.expect(try matches(a, null_row, table, &.{.{ .column = "ts", .op = .is_not_distinct, .value = .null_value }}));
     try std.testing.expect(!try matches(a, null_row, table, &conditions));
 }

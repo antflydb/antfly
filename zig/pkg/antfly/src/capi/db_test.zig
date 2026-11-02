@@ -6914,8 +6914,8 @@ test "capi native bounded admission coalesces allocator proof outside publicatio
     };
     var probe = Probe{ .owner = owner, .path = path, .second = second };
     defer if (probe.worker) |worker| worker.join();
-    owner.test_capacity_wait = .{ .ptr = &probe, .notify = Probe.onWait };
-    defer owner.test_capacity_wait = null;
+    owner.test_allocator_wait = .{ .ptr = &probe, .notify = Probe.onWait };
+    defer owner.test_allocator_wait = null;
     owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
     defer owner.test_after_allocator_capture = null;
     {
@@ -7220,6 +7220,9 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
         }
         const manager = owner.current.?.db.core.index_manager;
         std.debug.print("idle maintenance did not settle: debt={f} lsm_hint={d} lsm_score={d} stats={f}\n", .{ std.json.fmt(debts, .{}), manager.lsmMaintenanceDebtHint(), manager.lsmMaintenanceScore(), std.json.fmt(owner.publication_stats, .{}) });
+        for (manager.text_indexes.items) |entry| {
+            std.debug.print("idle index={s} maintenance={f}\n", .{ entry.config.name, std.json.fmt(entry.persistent.snapshotLsmMaintenanceStats(), .{}) });
+        }
     }
     try std.testing.expect(settled);
     owner.wake.reset();

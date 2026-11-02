@@ -43,7 +43,7 @@ export interface paths {
         put?: never;
         /**
          * ingestLakeChanges
-         * @description Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table admin permission and iceberg_writer policy.
+         * @description Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table write permission without a row filter and iceberg_writer policy. Catalog initialization, file commits and maintenance require table admin permission.
          */
         post: operations["ingestLakeChanges"];
         delete?: never;
@@ -8816,6 +8816,29 @@ export interface components {
              */
             limit: number;
             result: components["schemas"]["TableRepairRunResult"];
+            /** @description Documents that still fail after this pass, grouped by error code with the next step. Omitted for control passes. */
+            remaining_failures?: components["schemas"]["RepairRemainingFailure"][];
+            /** @description Whether more repair issues exist than the summary scanned. */
+            remaining_failures_truncated?: boolean;
+        };
+        /** @description A group of documents whose repair still fails with the same error. */
+        RepairRemainingFailure: {
+            /** @description Error recorded for the documents, for example `ModelNotFound`. */
+            error_code: string;
+            /**
+             * Format: uint64
+             * @description Number of documents in this group.
+             */
+            count: number;
+            /**
+             * Format: uint64
+             * @description Highest repair attempt count among the group's documents.
+             */
+            attempts: number;
+            /** @description Whether the error is temporary (admission refusal, rate limit). Repair retries these within a job; running repair again usually succeeds. */
+            transient: boolean;
+            /** @description What to do next. */
+            hint: string;
         };
         /** @description Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair. */
         TableRepairJobStartRequest: {
@@ -8882,10 +8905,14 @@ export interface components {
             /** @description Table being repaired. */
             table_name: string;
             /**
-             * @description Lifecycle phase of the repair job.
+             * @description Lifecycle phase of the repair job. `completed_with_failures` means every
+             *     pass ran but some documents still fail; `remaining_failures` says why
+             *     and what to do, and running repair again retries them. `failed` means
+             *     the job itself could not run, for example an invalid request or a
+             *     stale control fence.
              * @enum {string}
              */
-            phase: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+            phase: "queued" | "running" | "succeeded" | "completed_with_failures" | "failed" | "cancelled";
             /**
              * @description User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
              * @enum {string}
@@ -8936,6 +8963,10 @@ export interface components {
              * @description Unix epoch milliseconds when the job is eligible for cleanup.
              */
             expires_at_millis: number;
+            /** @description Documents that still fail, grouped by error code with the next step. Present on finished repair jobs that are not controls, read from the current repair issues. */
+            remaining_failures?: components["schemas"]["RepairRemainingFailure"][];
+            /** @description Whether more repair issues exist than the summary scanned. */
+            remaining_failures_truncated?: boolean;
         };
         DocumentArtifactReprocessResponse: {
             /**
@@ -23644,8 +23675,9 @@ export interface components {
              */
             prompt?: string;
             /**
-             * @description Maximum tokens to generate
-             * @default 256
+             * @description Maximum output tokens per page. When omitted, the selected reader
+             *     model supplies its default, bounded by deployment limits. Explicit
+             *     values override the model default and must fit model and server limits.
              * @example 256
              */
             max_tokens?: number;
@@ -24133,6 +24165,25 @@ export interface components {
             qualified_limits?: {
                 [key: string]: unknown;
             };
+            /**
+             * @description Whether this artifact can run in the current build. `incompatible`
+             *     artifacts are rejected before load; a model whose directory cannot
+             *     be read is listed as `incompatible` with `error` set.
+             * @enum {string}
+             */
+            compatibility?: "compatible" | "unknown" | "incompatible";
+            /**
+             * @description False when this deployment rejects public execution
+             *     (`public_inference_enabled: false`); the model is installed and
+             *     listed, but public calls return 403. Omitted when it can be invoked.
+             */
+            invocable?: boolean;
+            /** @description Why the model is unusable, set when its directory could not be read. Other models still list. */
+            error?: {
+                /** @description Error identifier, for example `MissingGlinerSpanEncoderConfig`. */
+                code: string;
+                message: string;
+            };
             /** @description List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring. */
             capabilities?: string[];
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
@@ -24148,7 +24199,7 @@ export interface components {
             usage: components["schemas"]["DecisionUsage"];
         };
         InferenceModelsResponse: {
-            /** @description Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
+            /** @description Whether public inference execution is enabled on this deployment. When false, locally installed models are still listed with `invocable: false` and remote upstreams are not probed. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
             public_inference_enabled?: boolean;
             /**
              * @description OpenAI-compatible response object type.
@@ -24749,6 +24800,13 @@ export interface components {
             requested_items: number;
             native_batches: number;
             native_items: number;
+            /**
+             * @description Largest successfully executed native decoder step observed by these
+             *     items, including peers from other requests. Zero or absent means
+             *     unobserved, one means singleton execution. This is measured at
+             *     execution, never inferred from native_items or request cardinality.
+             */
+            max_native_step_items?: number;
             serial_items: number;
             /** @description Items rejected before model execution by validation, resolution, or admission. */
             rejected_items: number;
@@ -30496,6 +30554,11 @@ export interface components {
              * @example antflydb/gemma-e2b
              */
             name: string;
+            /**
+             * @description Keep a successfully preloaded model pinned against eviction. Set false to warm the ordinary evictable cache before serving; idle and model-count policy still apply.
+             * @default true
+             */
+            pin?: boolean;
             backend?: components["schemas"]["ModelBackend"];
             format?: components["schemas"]["ModelFormat"];
             quantization?: components["schemas"]["ModelQuantization"];

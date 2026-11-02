@@ -179,11 +179,22 @@ pub fn inspectColumnChunkResourceUsage(column_chunk_bytes: []const u8) !ColumnCh
     return usage;
 }
 
+/// Uncompressed bytes borrow the encoded input for this decoding scope.
+/// Only decompressed storage is owned. Final vectors/dictionaries must own
+/// their values independently before the caller releases its encoded lease.
 pub const PagePayload = struct {
-    bytes: []u8,
+    bytes: []const u8,
+    owned: bool = true,
+
+    /// Transfer decompressed storage or copy a borrowed input into a retained
+    /// page owner. Synchronous vector decoding does not need this promotion.
+    pub fn intoOwned(self: PagePayload, alloc: Allocator) !PagePayload {
+        if (self.owned) return self;
+        return .{ .bytes = try alloc.dupe(u8, self.bytes) };
+    }
 
     pub fn deinit(self: PagePayload, alloc: Allocator) void {
-        alloc.free(self.bytes);
+        if (self.owned) alloc.free(self.bytes);
     }
 };
 
@@ -444,6 +455,9 @@ pub fn scanPackedByteArraysAlloc(a: Allocator, chunk: []const u8, compression: C
         defer payload.deinit(a);
         cursor += parsed.header.compressed_page_size;
         var page = try packedBytePage(a, parsed.header, payload.bytes, optional);
+        // The page's string slices, null mask and byte buffers already have
+        // independent ownership. A single-page cursor adopts all three arrays.
+        if (cursor == chunk.len and values.capacity == 0 and nulls.capacity == 0 and buffers.capacity == 0) return page;
         var retained = false;
         defer if (!retained) page.deinit(a);
         try values.ensureUnusedCapacity(a, page.values.len);
@@ -608,6 +622,9 @@ pub fn scanPlainBoolColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         const page_values = try decodePlainBoolAlloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.appendSlice(alloc, page_values);
     }
@@ -633,6 +650,9 @@ pub fn scanPlainF32AsF64ColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         const page_values = try decodePlainF32AsF64Alloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.appendSlice(alloc, page_values);
     }
@@ -658,6 +678,9 @@ pub fn scanPlainI32AsI64ColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         const page_values = try decodePlainI32AsI64Alloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.appendSlice(alloc, page_values);
     }
@@ -683,6 +706,9 @@ pub fn scanPlainI64ColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         const page_values = try decodePlainI64Alloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.appendSlice(alloc, page_values);
     }
@@ -708,6 +734,9 @@ pub fn scanPlainInt96TimestampNsColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         const page_values = try decodePlainInt96TimestampNsAlloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.appendSlice(alloc, page_values);
     }
@@ -733,6 +762,9 @@ pub fn scanPlainF64ColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         const page_values = try decodePlainF64Alloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.appendSlice(alloc, page_values);
     }
@@ -1052,6 +1084,9 @@ pub fn scanDictionaryI32AsI64ColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         const page_values = try decodeDictionaryI64DataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.appendSlice(alloc, page_values);
     }
@@ -1104,6 +1139,9 @@ pub fn scanOptionalDictionaryI32AsI64ColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         var page_values = try decodeOptionalDictionaryI64V2HybridLevelsAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -1162,6 +1200,9 @@ pub fn scanDictionaryI64ColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         const page_values = try decodeDictionaryI64DataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.appendSlice(alloc, page_values);
     }
@@ -1211,6 +1252,9 @@ pub fn scanDictionaryF64ColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         const page_values = try decodeDictionaryF64DataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.appendSlice(alloc, page_values);
     }
@@ -1260,6 +1304,9 @@ pub fn scanDictionaryF32AsF64ColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         const page_values = try decodeDictionaryF64DataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.appendSlice(alloc, page_values);
     }
@@ -1312,6 +1359,9 @@ pub fn scanOptionalDictionaryI64ColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         var page_values = try decodeOptionalDictionaryI64V2HybridLevelsAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -1909,6 +1959,9 @@ pub fn scanOptionalPlainI64ColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         var page_values = try decodeOptionalPlainI64V2HybridLevelsAlloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -1946,6 +1999,9 @@ pub fn scanOptionalPlainInt96TimestampNsColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         var page_values = try decodeOptionalPlainInt96TimestampNsV2HybridLevelsAlloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -1990,6 +2046,9 @@ pub fn scanOptionalPlainI32AsI64ColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         var page_values = try decodeOptionalPlainI32V2HybridLevelsAsI64Alloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -2154,6 +2213,9 @@ pub fn scanOptionalPlainBoolColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         var page_values = try decodeOptionalPlainBoolV2HybridLevelsAlloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -2191,6 +2253,9 @@ pub fn scanOptionalPlainF32AsF64ColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         var page_values = try decodeOptionalPlainF32V2HybridLevelsAsF64Alloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -2228,6 +2293,9 @@ pub fn scanOptionalPlainF64ColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         var page_values = try decodeOptionalPlainF64V2HybridLevelsAlloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -2289,6 +2357,9 @@ pub fn scanOptionalDictionaryF64ColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         var page_values = try decodeOptionalDictionaryF64V2HybridLevelsAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -2350,6 +2421,9 @@ pub fn scanOptionalDictionaryF32AsF64ColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         var page_values = try decodeOptionalDictionaryF64V2HybridLevelsAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer page_values.deinit(alloc);
         try values.appendSlice(alloc, page_values.values);
         try nulls.appendSlice(alloc, page_values.nulls);
@@ -2476,6 +2550,9 @@ pub fn scanPlainByteArrayColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         const page_values = try decodePlainByteArraysAlloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.ensureUnusedCapacity(alloc, page_values.len);
         for (page_values) |value| {
@@ -2517,6 +2594,9 @@ pub fn scanOptionalPlainByteArrayColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         const page_values = try decodeOptionalPlainByteArraysV2HybridLevelsAlloc(alloc, parsed.header, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer {
             alloc.free(page_values.values);
             alloc.free(page_values.nulls);
@@ -2843,6 +2923,9 @@ pub fn scanPlainFixedLenByteArrayColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         const page_values = try decodePlainFixedLenByteArraysAlloc(alloc, parsed.header, payload.bytes, type_length);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.ensureUnusedCapacity(alloc, page_values.len);
         for (page_values) |value| {
@@ -2878,6 +2961,9 @@ pub fn scanOptionalPlainFixedLenByteArrayColumnChunkAlloc(
         defer payload.deinit(alloc);
 
         const page_values = try decodeOptionalPlainFixedLenByteArraysV2HybridLevelsAlloc(alloc, parsed.header, payload.bytes, type_length);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer {
             alloc.free(page_values.values);
             alloc.free(page_values.nulls);
@@ -2947,6 +3033,9 @@ pub fn scanDictionaryFixedLenByteArrayColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         const page_values = try decodeDictionaryByteArrayDataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.ensureUnusedCapacity(alloc, page_values.len);
         for (page_values) |value| {
@@ -3007,6 +3096,9 @@ pub fn scanOptionalDictionaryFixedLenByteArrayColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         const page_values = try decodeOptionalDictionaryByteArrayDataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer {
             alloc.free(page_values.values);
             alloc.free(page_values.nulls);
@@ -3074,6 +3166,9 @@ pub fn scanDictionaryByteArrayColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         const page_values = try decodeDictionaryByteArrayDataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer alloc.free(page_values);
         try values.ensureUnusedCapacity(alloc, page_values.len);
         for (page_values) |value| {
@@ -3139,6 +3234,9 @@ pub fn scanOptionalDictionaryByteArrayColumnChunkAllocCached(
         defer payload.deinit(alloc);
 
         const page_values = try decodeOptionalDictionaryByteArrayDataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        // An independently framed page already owns the final typed vector.
+        // Transfer it directly; only multi-page chunks need aggregation.
+        if (cursor == column_chunk_bytes.len and values.capacity == 0) return page_values;
         defer {
             alloc.free(page_values.values);
             alloc.free(page_values.nulls);
@@ -3184,7 +3282,7 @@ pub fn decodePagePayloadAlloc(
         (header.page_type != .data_page_v2 or header.data_is_compressed);
     if (!values_are_compressed) {
         if (compressed_payload.len != expected_len) return error.InvalidParquetPage;
-        return .{ .bytes = try alloc.dupe(u8, compressed_payload) };
+        return .{ .bytes = compressed_payload, .owned = false };
     }
 
     const decoded_values = try decodeCompressedExactAlloc(
@@ -4953,15 +5051,17 @@ test "parquet compact strings use page buffers preserve null prefixes and unwind
     const chunk = try std.mem.concat(a, u8, &.{ physical_header.items, payload, physical_header.items, payload });
     defer a.free(chunk);
     const ChunkCheck = struct {
-        fn run(alloc: Allocator, bytes: []const u8) !void {
+        fn run(alloc: Allocator, bytes: []const u8, pages: usize) !void {
             var decoded = (try scanPackedByteArraysAlloc(alloc, bytes, .uncompressed, true)).?;
             defer decoded.deinit(alloc);
-            try std.testing.expectEqual(@as(usize, 2), decoded.buffers.len);
-            try std.testing.expectEqual(@as(usize, 8), decoded.values.len);
-            try std.testing.expectEqualStrings("abx", decoded.values[7]);
+            try std.testing.expectEqual(pages, decoded.buffers.len);
+            try std.testing.expectEqual(pages * 4, decoded.values.len);
+            try std.testing.expectEqualStrings("abx", decoded.values[decoded.values.len - 1]);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, ChunkCheck.run, .{chunk});
+    try std.testing.checkAllAllocationFailures(a, ChunkCheck.run, .{ chunk, @as(usize, 2) });
+    const single = chunk[0 .. physical_header.items.len + payload.len];
+    try std.testing.checkAllAllocationFailures(a, ChunkCheck.run, .{ single, @as(usize, 1) });
     const nulls_only: Header = .{ .page_type = .data_page_v2, .encoding = .delta_byte_array, .compressed_page_size = 2, .uncompressed_page_size = 2, .value_count = 8, .definition_level_bytes = 2, .data_payload_offset = 2 };
     var empty = try packedBytePage(a, nulls_only, &.{ 16, 0 }, true);
     defer empty.deinit(a);
@@ -4973,4 +5073,56 @@ test "parquet compact strings use page buffers preserve null prefixes and unwind
     const invalid = try std.mem.concat(a, u8, &.{ payload[0..6], invalid_prefix, length, "abcx" });
     defer a.free(invalid);
     try std.testing.expectError(error.InvalidParquetPage, packedBytePage(a, header, invalid, true));
+}
+
+// The encoded lease is already admitted separately. Decoding needs only its
+// final vector: neither a payload copy nor a chunk aggregation buffer can fit.
+test "parquet single page transfers final typed vector within exact live budget" {
+    const a = std.testing.allocator;
+    const count = 8192;
+    const payload = try a.alloc(u8, count * 8);
+    defer a.free(payload);
+    for (0..count) |i| std.mem.writeInt(i64, payload[i * 8 ..][0..8], -@as(i64, @intCast(i)), .little);
+    var header = try buildDataPageHeaderFixture(a, count, @intCast(payload.len));
+    defer header.deinit(a);
+    const chunk = try std.mem.concat(a, u8, &.{ header.items, payload });
+    defer a.free(chunk);
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = payload.len };
+    const values = try scanPlainI64ColumnChunkAlloc(budget.allocator(), chunk, .uncompressed);
+    defer budget.allocator().free(values);
+    for (values, 0..) |value, i| try std.testing.expectEqual(-@as(i64, @intCast(i)), value);
+    try std.testing.expectEqual(payload.len, budget.live);
+    try std.testing.expectEqual(payload.len, budget.peak);
+    std.debug.print("SINGLE_PAGE_VECTOR rows={} retained={} peak={}\n", .{ count, budget.live, budget.peak });
+}
+
+test "external lake Parquet payload borrows uncompressed leases and owns decompression" {
+    const a = std.testing.allocator;
+    var input = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 };
+    var header: Header = .{ .page_type = .data_page, .value_count = 1, .encoding = .plain, .compressed_page_size = 8, .uncompressed_page_size = 8 };
+    var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const raw = try decodePagePayloadAlloc(failure.allocator(), header, .uncompressed, &input);
+    try std.testing.expect(!raw.owned);
+    try std.testing.expectEqual(@intFromPtr(&input), @intFromPtr(raw.bytes.ptr));
+    raw.deinit(failure.allocator());
+    // The physical codec may be Snappy while a V2 page stores its data plain.
+    header.page_type = .data_page_v2;
+    header.data_is_compressed = false;
+    const plain_v2 = try decodePagePayloadAlloc(failure.allocator(), header, .snappy, &input);
+    try std.testing.expect(!plain_v2.owned);
+    plain_v2.deinit(failure.allocator());
+    header.page_type = .data_page;
+    header.data_is_compressed = true;
+    const compressed = try snappy.encode(a, &input);
+    defer a.free(compressed);
+    header.compressed_page_size = @intCast(compressed.len);
+    const decoded = try decodePagePayloadAlloc(a, header, .snappy, compressed);
+    defer decoded.deinit(a);
+    try std.testing.expect(decoded.owned);
+    try std.testing.expectEqualSlices(u8, &input, decoded.bytes);
+    // Final values have independent ownership before an encoded lease expires.
+    const values = try decodePlainI64Alloc(a, header, raw.bytes);
+    defer a.free(values);
+    @memset(&input, 255);
+    try std.testing.expectEqual(@as(i64, 7), values[0]);
 }

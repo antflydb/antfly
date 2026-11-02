@@ -1,17 +1,17 @@
 {
-  "version": "v0.3.0-rc.6",
-  "source_commit": "d35a1ef33ef01482e593f892e3f534b780cc19bc",
-  "image": "ghcr.io/antflydb/antfly@sha256:5aae5bf2b8cc79fd0a7280760a14229f34826396be2bc5aad792573c4082cbb8",
+  "version": "v0.3.0-rc.8",
+  "source_commit": "f91c9c0e4682a3ff20e39fce9a44d67b658a7b55",
+  "image": "ghcr.io/antflydb/antfly@sha256:1b5fefd63d0b62832b4eb922f9d60c500a90e18094b2046c8c3b16fa1d469a8b",
   "libraries": {
     "amd64": {
-      "name": "antfly-embedded_0.3.0-rc.6_Linux_x86_64_gnu.tar.gz",
-      "sha256": "ecc58911858725cda15eefec18a0de1ed7120ea7e5106120363e453cfb4a2dbf",
-      "size": 50785897
+      "name": "antfly-embedded_0.3.0-rc.8_Linux_x86_64_gnu.tar.gz",
+      "sha256": "47d0bb23fdcfc1916f89373d099f0ba9ffe37ae665c145b32d3c4adb339878d8",
+      "size": 47156174
     },
     "arm64": {
-      "name": "antfly-embedded_0.3.0-rc.6_Linux_arm64_gnu.tar.gz",
-      "sha256": "d177bb5e89ccc4144d8cce515743bf9b1d1171cdf67e6612aa3e504bcce751d8",
-      "size": 48752818
+      "name": "antfly-embedded_0.3.0-rc.8_Linux_arm64_gnu.tar.gz",
+      "sha256": "48a3ddc5bb78d4e9731aaf4bf662f110e28297ecfcc32812090dd43fc815468c",
+      "size": 45101060
     }
   }
 }

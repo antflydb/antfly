@@ -39,12 +39,21 @@ const embedding_gemma2_model_training_filters = [_][]const u8{
 // their general dependencies (tensor, execution control, registries, etc.).
 // Use the same selectors on both sides so ownership cannot drift.
 pub const inference_overlap_filters: []const []const u8 = &([_][]const u8{
+    "finetune.peft.test.",
     "finetune.train.train_gliner2_autodiff.test.",
     "finetune.tools.eval_gliner2_autodiff_adapter.test.",
     "finetune.tools.eval_gliner2_autodiff_adapter_dataset.test.",
 } ++ embedding_gemma2_graph_filters ++ embedding_gemma2_job_filters ++ embedding_gemma2_model_training_filters);
 
 pub const specs = [_]common.TestSpec{
+    .{
+        .step_name = "test-peft",
+        .isolated = true,
+        .root_source_file = "src/test_peft.zig",
+        .filters = &.{"finetune.peft.test."},
+        .description = "Run PEFT adapter registry, checkpoint and JSON encoding tests",
+        .native_link = .no_accel,
+    },
     .{
         .step_name = "test-embedding-gemma2-graph",
         .isolated = true,

@@ -37,7 +37,11 @@ _darwin = _load_sampler_module()
 
 def parse_process_group_listing(listing: str, process_group: int) -> list[int]:
     """Parse ``ps -axo pgid=,pid=`` and return unique members of ``pgid``."""
-    if isinstance(process_group, bool) or not isinstance(process_group, int) or process_group <= 0:
+    if (
+        isinstance(process_group, bool)
+        or not isinstance(process_group, int)
+        or process_group <= 0
+    ):
         raise ValueError("process group must be a positive integer")
     members = []
     seen = set()
@@ -139,7 +143,9 @@ class ProcessGroupPhysicalMemorySampler:
     @staticmethod
     def _validated_sample(sampled, pid: int) -> tuple[int, int, int, int]:
         if not isinstance(sampled, dict) or sampled.get("pid") != pid:
-            raise RuntimeError(f"physical-memory sample identity mismatch for pid {pid}")
+            raise RuntimeError(
+                f"physical-memory sample identity mismatch for pid {pid}"
+            )
         start = _counter(sampled, "start_abstime")
         if start == 0:
             raise RuntimeError(f"missing process start identity for pid {pid}")
@@ -256,7 +262,8 @@ class ProcessGroupPhysicalMemorySampler:
             self._identity_kernel_maxima.get(identity, 0) for identity in identities
         )
         sampled_current_sum = sum(
-            self._identity_sampled_current_maxima.get(identity, 0) for identity in identities
+            self._identity_sampled_current_maxima.get(identity, 0)
+            for identity in identities
         )
         conservative = sum(
             max(
@@ -281,4 +288,3 @@ class ProcessGroupPhysicalMemorySampler:
             "conservative_summed_lifetime_max_phys_footprint_bytes": conservative,
             "bound_semantics": self.bound_semantics,
         }
-

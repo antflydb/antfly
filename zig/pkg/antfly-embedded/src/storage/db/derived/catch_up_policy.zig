@@ -77,6 +77,8 @@ pub const RecoverableRetryCounters = struct {
         switch (err) {
             error.WriterLocked, error.WouldBlock, error.FileBusy => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
+            error.CapacityUnavailable,
+            error.CapacityObservationStale,
             error.PostingWalTooLarge,
             error.PostingRowBackpressure,
             error.PersistentDescriptorAdmissionExhausted,
@@ -112,6 +114,8 @@ pub fn isRecoverableAdmissionError(err: anyerror) bool {
         error.WouldBlock,
         error.FileBusy,
         error.ResourceBudgetExceeded,
+        error.CapacityUnavailable,
+        error.CapacityObservationStale,
         error.PostingWalTooLarge,
         error.PostingRowBackpressure,
         error.PersistentDescriptorAdmissionExhausted,
@@ -516,6 +520,12 @@ test "issue1015 transient storage contention uses bounded recoverable backoff" {
     }
     try std.testing.expectEqual(@as(u64, 3), counters.snapshot().writer_locked);
     try std.testing.expectEqual(@as(u64, 3), manager.derivedRecoverableRetryStats().writer_locked);
+    for ([_]anyerror{ error.CapacityUnavailable, error.CapacityObservationStale }) |err| {
+        try std.testing.expect(isRecoverableAdmissionError(err));
+        _ = recordRecoverableRetry(&counters, &manager, &backoff, err);
+    }
+    try std.testing.expectEqual(@as(u64, 2), counters.snapshot().resource_budget);
+    try std.testing.expectEqual(@as(u64, 2), manager.derivedRecoverableRetryStats().resource_budget);
     for (0..300) |_| try std.testing.expect(backoff.nextDelayNs() <= 250 * std.time.ns_per_ms);
     try std.testing.expect(!isRecoverableAdmissionError(error.InvalidData));
     try std.testing.expect(!isRecoverableAdmissionError(error.OutOfMemory));

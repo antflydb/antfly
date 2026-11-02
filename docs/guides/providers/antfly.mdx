@@ -1,6 +1,7 @@
 ---
 title: Antfly
 description: The built-in inference runtime, which runs every component locally beside the database
+order: 1
 ---
 
 The `antfly` provider is Antfly's own inference runtime. In `antfly standalone`
@@ -14,13 +15,13 @@ configured.
 
 | Component | Inputs | Recommended model |
 |---|---|---|
-| Embedder | Text, images, audio (model-dependent) | `BAAI/bge-small-en-v1.5` for text, `antflydb/clipclap` for text, image, and audio |
+| Embedder | Text, images, audio (model-dependent) | [`google/embeddinggemma-2:bf16-safetensors-bundle-v1`](/docs/guides/models/embeddinggemma2) for text and images, `antflydb/clipclap` for text, image, and audio |
 | Reranker | Text | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` |
 | Chunker | Text | `fixed_bert` (built in) |
 | Reader | Images and documents | [`lightonai/LightOnOCR-3-0.8B`](/docs/guides/models/lightonocr3) |
 | Transcriber | Audio | `openai/whisper-small`; `openai/whisper-tiny` for clean dictation |
 | Generator | Text, images, audio, video (model-dependent) | `ggml-org/gemma-4-E4B-it-GGUF` |
-| Extractor | Text | `antflydb/gliner2-base-v1` |
+| Extractor | Text | `fastino/gliner2.5-base-v1` |
 | Decider | Text | [Laya](/docs/guides/models/laya) typed decisions, or [EmbeddingGemma 2](/docs/guides/models/embeddinggemma2) similarity |
 
 Images and audio reach a generator when the model ships a vision or audio

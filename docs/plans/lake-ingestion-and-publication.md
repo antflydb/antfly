@@ -559,9 +559,12 @@ cutover guarantee before its underlying protocol is qualified.
 
 The native row ingress is `POST /db/v1/tables/{tableName}/lake/changes`.
 It is available for a current-snapshot Iceberg binding with `iceberg_writer`
-and either managed or REST catalog authority. It requires table admin permission
-and independent Antfly artifact storage with `storage.primary`; lake read
+and either managed or REST catalog authority. It requires table write permission
+without a row filter, plus independent Antfly artifact storage with `storage.primary`; lake read
 credentials alone cannot authorize ingestion or publication writes.
+Catalog initialization, file commits and maintenance still require table admin
+permission. CDC admission does not evaluate per-row write policies, so a filtered
+writer or administrator cannot use this endpoint to bypass those policies.
 
 A transaction supplies `batch_id`, `source`, `epoch`, `checkpoint`, optional
 `expected_checkpoint`, `key_fields`, and an ordered `changes` array. Each change

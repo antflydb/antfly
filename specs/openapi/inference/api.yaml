@@ -3004,10 +3004,12 @@ components:
           example: What type of document is this?
         max_tokens:
           type: integer
-          description: Maximum tokens to generate
+          description: |
+            Maximum output tokens per page. When omitted, the selected reader
+            model supplies its default, bounded by deployment limits. Explicit
+            values override the model default and must fit model and server limits.
           minimum: 1
-          maximum: 1024
-          default: 256
+          maximum: 8192
           example: 256
     TextRegion:
       type: object
@@ -3805,6 +3807,30 @@ components:
             including backend, supported features and min/max geometry.
             Runtime admission revalidates artifact identity and resource limits.
             Omitted for artifacts without a qualification receipt.
+        compatibility:
+          type: string
+          enum: [compatible, unknown, incompatible]
+          description: |
+            Whether this artifact can run in the current build. `incompatible`
+            artifacts are rejected before load; a model whose directory cannot
+            be read is listed as `incompatible` with `error` set.
+        invocable:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: |
+            False when this deployment rejects public execution
+            (`public_inference_enabled: false`); the model is installed and
+            listed, but public calls return 403. Omitted when it can be invoked.
+        error:
+          type: object
+          description: Why the model is unusable, set when its directory could not be read. Other models still list.
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Error identifier, for example `MissingGlinerSpanEncoderConfig`.
+            message:
+              type: string
         capabilities:
           type: array
           items:
@@ -3845,7 +3871,7 @@ components:
         public_inference_enabled:
           x-go-type-skip-optional-pointer: false
           type: boolean
-          description: Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
+          description: "Whether public inference execution is enabled on this deployment. When false, locally installed models are still listed with `invocable: false` and remote upstreams are not probed. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy."
         object:
           type: string
           enum:
@@ -4794,6 +4820,14 @@ components:
         native_items:
           type: integer
           minimum: 0
+        max_native_step_items:
+          type: integer
+          minimum: 0
+          description: |
+            Largest successfully executed native decoder step observed by these
+            items, including peers from other requests. Zero or absent means
+            unobserved, one means singleton execution. This is measured at
+            execution, never inferred from native_items or request cardinality.
         serial_items:
           type: integer
           minimum: 0
