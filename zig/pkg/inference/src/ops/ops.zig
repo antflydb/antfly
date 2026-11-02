@@ -5875,7 +5875,10 @@ pub const ComputeBackend = struct {
         if (self.vtable.debugTimingSnapshot) |op| {
             return op(self.ptr);
         }
-        if (self.kind() == .native) return .{ .runtime = .{ .counters = .{ .kernel_dispatches = 0, .graph_submissions = 0, .frame_submissions = 0, .synchronizations = 0, .physical_allocations = 0, .physical_frees = 0 }, .memory = .{ .scope = .backend_device_buffers, .live_bytes = 0, .lifetime_peak_bytes = 0 } } };
+        // A CPU backend still dispatches kernels and allocates host storage.
+        // Without instrumentation those measurements are unknown, not zero.
+        // Only device submissions/synchronizations are structurally absent.
+        if (self.kind() == .native) return .{ .runtime = .{ .counters = .{ .graph_submissions = 0, .frame_submissions = 0, .synchronizations = 0 } } };
         return .{};
     }
 
@@ -6911,4 +6914,23 @@ test "MTP shared verify decision covers correction bonus EOS and checked geometr
     request.draft_tokens = fake[0..std.math.maxInt(usize)];
     request.rows = std.math.maxInt(usize);
     try std.testing.expectError(error.InvalidTensorShape, request.verifyLength());
+}
+
+test "native runtime telemetry does not report unmeasured host work as zero" {
+    const Probe = struct {
+        fn kind(_: *anyopaque) BackendKind {
+            return .native;
+        }
+    };
+    var marker: u8 = 0;
+    var vtable: ComputeBackend.VTable = undefined;
+    vtable.backendKind = Probe.kind;
+    vtable.debugTimingSnapshot = null;
+    const backend = ComputeBackend{ .ptr = &marker, .vtable = &vtable };
+    const snapshot = backend.debugTimingSnapshot().runtime;
+    try std.testing.expectEqual(@as(?u64, null), snapshot.counters.kernel_dispatches);
+    try std.testing.expectEqual(@as(?u64, null), snapshot.counters.physical_allocations);
+    try std.testing.expectEqual(@as(?u64, null), snapshot.counters.physical_frees);
+    try std.testing.expectEqual(@as(?u64, null), snapshot.memory.live_bytes);
+    try std.testing.expectEqual(@as(?u64, 0), snapshot.counters.graph_submissions);
 }
