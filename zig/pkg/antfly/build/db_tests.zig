@@ -277,6 +277,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "document extraction generated OCR rejects malformed envelopes before apply",
         "document extraction generated OCR applies unit updates transactionally",
         "document extraction generated OCR retries only uniformly admission denied batches",
+        "document extraction missing model and truncated OCR are actionable terminal unit failures",
         "asset batch fallback isolates malformed envelope and preserves typed mixed results",
         "asset batch fallback keeps the logical request retry budget",
         "document-wide OCR resource failure preserves units and marks pending pages",
