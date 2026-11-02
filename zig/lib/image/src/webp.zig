@@ -835,7 +835,7 @@ fn vp8PlanesToRgbaAlloc(alloc: Allocator, planes: Vp8FramePlanes) !DecodedImage 
 
     var y_pos: usize = 0;
     while (y_pos < height) : (y_pos += 1) {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         var x: usize = 0;
         while (x < width) : (x += 1) {
             const y_index = y_pos * planes.y_stride + x;
@@ -1114,7 +1114,7 @@ fn vp8ApplyLoopFilter(planes: *Vp8FramePlanes, syntax: Vp8FirstPartitionSyntax, 
 
     var mb_y: usize = 0;
     while (mb_y < grid_height) : (mb_y += 1) {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         var mb_x: usize = 0;
         while (mb_x < grid_width) : (mb_x += 1) {
             const info = infos[mb_y * grid_width + mb_x];
@@ -1169,7 +1169,7 @@ fn assembleVp8KeyframePlanes(
 
     var mb_y: usize = 0;
     while (mb_y < grid_height) : (mb_y += 1) {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         const row_partition = try vp8TokenPartitionForRow(@intCast(mb_y), control.syntax.token_partition_count);
         var left_luma4_modes = @as([4]Vp8Luma4Mode, @splat(.dc));
         var left_token_context = Vp8MacroblockTokenContext{};
@@ -3277,7 +3277,7 @@ fn decodeVp8lEntropyImage(alloc: Allocator, reader: *BitReader, width: u32, heig
     var next_control_pixel: usize = 0;
     while (pixel_index < pixel_count) {
         if (pixel_index >= next_control_pixel) {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             next_control_pixel = pixel_index +| 4096;
         }
         const group = try prefix_groups.groupForPixel(pixel_index, width);
@@ -5583,7 +5583,7 @@ pub const Vp8Decoder = struct {
         return total;
     }
     pub fn decode(self: *Vp8Decoder, a: Allocator, payload: []const u8, limits: DecodeLimits) !Vp8FramePlanes {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         if (payload.len < 3) return error.WebpDecodeFailed;
         const tag = @as(u32, payload[0]) | (@as(u32, payload[1]) << 8) | (@as(u32, payload[2]) << 16);
         const key = tag & 1 == 0;
@@ -5676,7 +5676,7 @@ pub const Vp8Decoder = struct {
             planes = try vp8VideoReconstruct(a, frame, syntax, entropy, &reader, token_slices[0..partitions], map, self.references, reference_probs, sign_bias, mv_probs, y_probs, uv_probs, &mode_counts, &split_counts);
         }
         errdefer planes.deinit(a);
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         // Reference-copy commands precede refresh commands. ALTREF copy is
         // applied before GOLDEN copy, which may name the newly copied ALTREF.
         var sources: [3]?Vp8FramePlanes = self.references;
@@ -5704,7 +5704,7 @@ pub const Vp8Decoder = struct {
         // No operation after this checkpoint may fail: references, entropy and
         // segmentation commit together, preserving retry after allocation or
         // cancellation failure even when several old slots share a picture.
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         vp8ReleaseReferences(a, self.references, retained);
         a.free(self.segments);
         if (refreshed) |picture| self.reference_copy_bytes +|= picture.y.len + picture.u.len + picture.v.len;
@@ -5907,7 +5907,7 @@ fn vp8VideoReconstruct(a: Allocator, frame: Vp8FrameHeader, syntax: Vp8FirstPart
     for (partitions, 0..) |p, i| tokens[i] = Vp8BoolReader.init(p);
     const matrices = vp8BuildSegmentQuantMatrices(syntax);
     for (0..grid.height) |y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         var left = Vp8MacroblockTokenContext{};
         for (0..width) |x| {
             const index = y * width + x;

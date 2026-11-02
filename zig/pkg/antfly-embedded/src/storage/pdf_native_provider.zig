@@ -38,11 +38,13 @@ const OptionLease = struct {
     io: ?@TypeOf(@as(c.native.IoBorrow, undefined).receive() catch unreachable) = null,
     // The native I/O receiver lives at this stable address through all workers.
     host_failure: c.Failure = .{},
+    image_control: ?c.work.Control = null,
+    worker_failure: ?c.Failure = null,
     fn init(options: c.Options) !OptionLease {
         return .{ .options = options, .io = if (options.executor_io) |io| try io.receive() else null };
     }
     fn get(self: *OptionLease) pdf.PageRenderBatchOptions {
-        var result: pdf.PageRenderBatchOptions = .{};
+        var result: pdf.PageRenderBatchOptions = .{ .image_control = self.image_control, .failure_identity_out = &self.worker_failure };
         inline for (@typeInfo(c.Options).@"struct".field_names) |name| {
             if (comptime !std.mem.eql(u8, name, "executor") and !std.mem.eql(u8, name, "executor_io") and !std.mem.eql(u8, name, "fork_template"))
                 @field(result, name) = @field(self.options, name);
@@ -63,7 +65,8 @@ const OptionLease = struct {
         return result.value;
     }
     fn failure(self: *OptionLease, err: anyerror) c.Failure {
-        return if (err == error.PdfNativeExecutorFailure and self.host_failure.ptr != null) self.host_failure else .init(@errorName(err));
+        if (self.worker_failure) |identity| return identity;
+        return if (err == error.PdfNativeExecutorFailure and self.host_failure.ptr != null) self.host_failure else c.work.failure(err);
     }
 };
 fn plansLocal(a: A, plans: []const c.Plan) ![]pdf.PreparedPageRenderPlan {
@@ -152,8 +155,9 @@ pub const Ops = struct {
     pub fn raster(a: A, doc: *c.Document, page: usize, dpi: u16, pixels: u64, dimension: u32, profile: pdf.RenderProfile) !pdf.RenderedPageRaster {
         return pdf.renderParsedPageRasterAdaptiveWithProfileAlloc(a, &reader(doc).value, page, dpi, pixels, dimension, profile);
     }
-    pub fn batchPng(a: A, doc: *c.Document, plans: ?[]const c.Plan, requests: []const pdf.PageRenderRequest, options: c.Options) !c.PngBatch {
+    pub fn batchPng(a: A, doc: *c.Document, plans: ?[]const c.Plan, requests: []const pdf.PageRenderRequest, options: c.Options, image_control: c.work.Control) !c.PngBatch {
         var lease = try OptionLease.init(options);
+        lease.image_control = image_control;
         const local = if (plans) |values| try plansLocal(a, values) else null;
         defer if (local) |values| a.free(values);
         var batch = (if (local) |values| pdf.renderPreparedPagesBatchAlloc(a, &reader(doc).value, values, lease.get()) else pdf.renderParsedPagesBatchAlloc(a, &reader(doc).value, requests, lease.get())) catch |err| return .{ .results = &.{}, .failure = lease.failure(err) };
@@ -168,8 +172,9 @@ pub const Ops = struct {
         }
         return .{ .results = results, .requested_parallelism = batch.requested_parallelism, .peak_launched_workers = batch.peak_launched_workers, .peak_parallelism = batch.peak_parallelism, .peak_admitted_pixels = batch.peak_admitted_pixels, .peak_admitted_bytes = batch.peak_admitted_bytes, .peak_worker_scratch_bytes = batch.peak_worker_scratch_bytes, .thread_spawn_fallbacks = batch.thread_spawn_fallbacks };
     }
-    pub fn batchRaster(a: A, doc: *c.Document, plans: ?[]const c.Plan, requests: []const pdf.PageRenderRequest, options: c.Options) !c.RasterBatch {
+    pub fn batchRaster(a: A, doc: *c.Document, plans: ?[]const c.Plan, requests: []const pdf.PageRenderRequest, options: c.Options, image_control: c.work.Control) !c.RasterBatch {
         var lease = try OptionLease.init(options);
+        lease.image_control = image_control;
         const local = if (plans) |values| try plansLocal(a, values) else null;
         defer if (local) |values| a.free(values);
         var batch = (if (local) |values| pdf.renderPreparedPagesRasterBatchAlloc(a, &reader(doc).value, values, lease.get()) else pdf.renderParsedPagesRasterBatchAlloc(a, &reader(doc).value, requests, lease.get())) catch |err| return .{ .results = &.{}, .failure = lease.failure(err) };
@@ -185,14 +190,32 @@ pub const Ops = struct {
         return .{ .results = results, .requested_parallelism = batch.requested_parallelism, .peak_launched_workers = batch.peak_launched_workers, .peak_parallelism = batch.peak_parallelism, .peak_admitted_pixels = batch.peak_admitted_pixels, .peak_admitted_bytes = batch.peak_admitted_bytes, .peak_worker_scratch_bytes = batch.peak_worker_scratch_bytes, .thread_spawn_fallbacks = batch.thread_spawn_fallbacks };
     }
 };
+const WorkReceiver = struct {
+    borrowed: c.WorkBorrow,
+    fn check(context: ?*const anyopaque) anyerror!void {
+        const self: *const WorkReceiver = @ptrCast(@alignCast(context.?));
+        const identity = self.borrowed.check_fn.?(self.borrowed.context);
+        if (identity.ptr == null) return;
+        // Reader fallback must treat every control failure as terminal. Keep
+        // the original name/token beside the local cancellation marker.
+        const err = error.Canceled;
+        c.work.recordFailure(err, identity);
+        return err;
+    }
+};
 fn Bridge(comptime name: []const u8) type {
     return struct {
-        fn invoke(raw: *const anyopaque, output: *anyopaque) callconv(.c) void {
+        fn invoke(raw: *const anyopaque, output: *anyopaque, borrowed: c.WorkBorrow) callconv(.c) void {
+            const receiver: WorkReceiver = .{ .borrowed = borrowed };
+            const control: c.work.Control = if (borrowed.check_fn != null) .{ .context = &receiver, .check_fn = WorkReceiver.check } else .{};
+            const is_batch = comptime std.mem.eql(u8, name, "batchPng") or std.mem.eql(u8, name, "batchRaster");
+            const scope: ?c.work.Scope = if (is_batch) null else c.work.Scope.enter(control);
+            defer if (scope) |value| value.deinit();
             const args: *const c.Args(name) = @ptrCast(@alignCast(raw));
             const out: *c.Wire(name) = @ptrCast(@alignCast(output));
-            const result = @call(.auto, @field(Ops, name), args.*);
+            const result = @call(.auto, @field(Ops, name), if (is_batch) args.* ++ .{control} else args.*);
             const value = if (@typeInfo(@TypeOf(result)) == .error_union) result catch |err| {
-                out.* = .{ .failure = .init(@errorName(err)) };
+                out.* = .{ .failure = c.work.failure(err) };
                 return;
             } else result;
             out.* = .{ .value = value };
@@ -205,5 +228,5 @@ fn Bridge(comptime name: []const u8) type {
 }
 pub fn exportOperations() void {
     inline for (@typeInfo(c.Methods).@"struct".field_names) |name|
-        @export(&Bridge(name).get, .{ .name = "antfly_pdf_native_" ++ name ++ "_v1", .visibility = .hidden });
+        @export(&Bridge(name).get, .{ .name = "antfly_pdf_native_" ++ name ++ "_v2", .visibility = .hidden });
 }

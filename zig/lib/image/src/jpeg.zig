@@ -1000,7 +1000,7 @@ fn decodeProgressiveDcInterleavedScan(
     const total_mcus = mcu_cols * mcu_rows;
 
     for (0..mcu_rows) |mcu_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..mcu_cols) |mcu_x| {
             for (scan_components) |scan_component| {
                 for (0..scan_component.component.vertical_sampling) |block_row| {
@@ -1085,7 +1085,7 @@ fn decodeProgressiveDcSingleComponentScanMapped(
     const total_blocks = actual_blocks_x * actual_blocks_y;
 
     for (0..actual_blocks_y) |block_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             if (successive_high == 0) {
@@ -1128,7 +1128,7 @@ fn decodeProgressiveAcScanMapped(
     const total_blocks = actual_blocks_x * actual_blocks_y;
     var restart_index: u8 = 0;
     for (0..actual_blocks_y) |block_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             processed_blocks += 1;
@@ -1174,7 +1174,7 @@ fn refineProgressiveAcScanMapped(
     const total_blocks = actual_blocks_x * actual_blocks_y;
     var restart_index: u8 = 0;
     for (0..actual_blocks_y) |block_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             processed_blocks += 1;
@@ -1738,7 +1738,7 @@ fn decodeRgbaPureZigArithmeticProgressive(
 
     if (structure.info.component_count == 1) {
         for (0..progressive.component_blocks_y[0]) |block_y| {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             for (0..progressive.component_blocks_x[0]) |block_x| {
                 const block_index = block_y * progressive.component_blocks_x[0] + block_x;
                 const spatial = dequantizeAndInverseDctWithSamplePrecision(
@@ -1762,7 +1762,7 @@ fn decodeRgbaPureZigArithmeticProgressive(
         );
         defer freeComponentSamplePlanes(alloc, &component_planes);
         for (0..progressive.mcu_rows) |mcu_y| {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             for (0..progressive.mcu_cols) |mcu_x| {
                 for (0..structure.info.component_count) |frame_index| {
                     const component = structure.info.components[frame_index];
@@ -2060,7 +2060,7 @@ fn decodeArithmeticProgressiveDcInterleavedScan(
     const total_mcus = mcu_cols * mcu_rows;
 
     for (0..mcu_rows) |mcu_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..mcu_cols) |mcu_x| {
             for (scan_components) |scan_component| {
                 for (0..scan_component.component.vertical_sampling) |block_row| {
@@ -2140,7 +2140,7 @@ fn decodeArithmeticProgressiveDcSingleComponentScanMapped(
     var dummy_ac_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_ac_stat_bins]u8);
 
     for (0..actual_blocks_y) |block_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             if (successive_high == 0) {
@@ -2200,7 +2200,7 @@ fn decodeArithmeticProgressiveAcScanMapped(
     var dc_contexts = @as([max_components]u8, @splat(0));
 
     for (0..actual_blocks_y) |block_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             try decodeArithmeticProgressiveAcFirst(
@@ -2256,7 +2256,7 @@ fn refineArithmeticProgressiveAcScanMapped(
     var dc_contexts = @as([max_components]u8, @splat(0));
 
     for (0..actual_blocks_y) |block_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             try refineArithmeticProgressiveAc(
@@ -2322,7 +2322,7 @@ fn decodeRgbaPureZigArithmeticSequential(
         var mcus_decoded: usize = 0;
 
         for (0..blocks_y) |block_y| {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             for (0..blocks_x) |block_x| {
                 const coeffs = try decodeArithmeticSequentialBlock(
                     &decoder,
@@ -2380,7 +2380,7 @@ fn decodeRgbaPureZigArithmeticSequential(
         defer freeComponentSamplePlanes(alloc, &component_planes);
 
         for (0..mcu_rows) |mcu_y| {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             for (0..mcu_cols) |mcu_x| {
                 for (0..structure.info.component_count) |frame_index| {
                     const component = structure.info.components[frame_index];
@@ -2670,7 +2670,7 @@ fn decodeRgbaPureZigGrayscaleBaseline(
     const total_mcus = blocks_x * blocks_y;
 
     for (0..blocks_y) |block_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..blocks_x) |block_x| {
             const block = try decodeBaselineBlock(&reader, dc_table, ac_table, dc_predictor);
             dc_predictor = block.dc_predictor;
@@ -2757,7 +2757,7 @@ fn decodeRgbaPureZigColorBaseline(
     defer freeComponentSamplePlanes(alloc, &component_planes);
 
     for (0..blocks_y) |mcu_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..blocks_x) |mcu_x| {
             for (0..structure.info.component_count) |frame_index| {
                 const component = structure.info.components[frame_index];
@@ -2858,7 +2858,7 @@ fn preprocessClipChwPureZigColorBaselineInto(
     defer freeComponentSamplePlanes(alloc, &component_planes);
 
     for (0..blocks_y) |mcu_y| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         for (0..blocks_x) |mcu_x| {
             for (0..structure.info.component_count) |frame_index| {
                 const component = structure.info.components[frame_index];
@@ -3090,7 +3090,7 @@ fn decodeRgbaPureZigProgressive(
 
     if (structure.info.component_count == 1) {
         for (0..progressive.component_blocks_y[0]) |block_y| {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             for (0..progressive.component_blocks_x[0]) |block_x| {
                 const block_index = block_y * progressive.component_blocks_x[0] + block_x;
                 const spatial = dequantizeAndInverseDctWithSamplePrecision(
@@ -3114,7 +3114,7 @@ fn decodeRgbaPureZigProgressive(
         );
         defer freeComponentSamplePlanes(alloc, &component_planes);
         for (0..progressive.mcu_rows) |mcu_y| {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             for (0..progressive.mcu_cols) |mcu_x| {
                 for (0..structure.info.component_count) |frame_index| {
                     const component = structure.info.components[frame_index];

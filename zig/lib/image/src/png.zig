@@ -397,7 +397,7 @@ pub fn decodeRgba(alloc: Allocator, png_bytes: []const u8) !DecodedImage {
     var decompress: std.compress.flate.Decompress = .init(&in, .zlib, &.{});
     var decompressed_len: usize = 0;
     while (true) {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         decompressed_len += decompress.reader.stream(&writer, .limited(16 * 1024)) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return error.PngDecodeFailed,
@@ -491,7 +491,7 @@ fn decodeNonInterlacedRgba(
     @memset(prev_row, 0);
 
     for (0..@as(usize, height)) |row| {
-        try @import("work_control.zig").check();
+        try @import("image_work_control").check();
         const raw_start = row * (stride + 1);
         const filter_type = raw[raw_start];
         const filtered = raw[raw_start + 1 .. raw_start + 1 + stride];
@@ -540,7 +540,7 @@ fn decodeAdam7Rgba(
         defer alloc.free(row_rgba);
 
         for (0..pass_height) |row| {
-            try @import("work_control.zig").check();
+            try @import("image_work_control").check();
             if (raw_offset + 1 + pass_stride > raw.len) return error.PngDecodeFailed;
             const filter_type = raw[raw_offset];
             raw_offset += 1;

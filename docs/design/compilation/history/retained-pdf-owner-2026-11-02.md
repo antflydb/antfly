@@ -20,13 +20,25 @@ one hidden accessor per complete operation. Unused accessors can be discarded
 at final link. A global function table would retain every renderer operation in
 each product and is intentionally avoided.
 
-Error integers never cross archives. Scalar errors, prepared-plan failures,
+Foreign error integers are never interpreted. Scalar errors, prepared-plan failures,
 per-page failures and executor failures travel as static error-name borrows.
 Caller-only errors survive in the caller's operation-local executor slot or
 original failed-plan slot, including errors absent from the shared registry.
 Already-failed plans remain ordered slots and never launch rendering work.
 The provider does not root a global error-name decoder just to mark those slots.
 The existing versioned `IoBorrow` translates the compatibility IO executor.
+
+Decoder controls cross the native endpoint as an explicit synchronous borrow.
+The provider uses a terminal cancellation marker internally so parser fallbacks
+cannot swallow a caller's control error. Its static error name and opaque
+origin-scoped token accompany the failure. Only the original module recognizes
+the domain address and restores that token to its own error value; foreign
+modules decode names. Workers retain the identity before their TLS scope ends. The joined
+coordinator returns terminal identity through an explicit operation-local output
+borrow before unwinding the scalar cancellation result. CPU workers install the borrowed control themselves, so the coordinator
+keeps no thread-local scope installed across a compatibility I/O suspension.
+The image control is one named module per compiler owner, shared with codecs;
+its interface does not import any decoder implementation.
 
 Reader/fork state and all scratch/results use the original allocator value and
 vtable, including resize/remap. No stack-backed allocator adapter is retained.
@@ -50,14 +62,17 @@ DTOs. This module imports only `std`; neither the contract nor facade imports
 the reader/renderer implementation. Transient render-font references are opaque
 and cleared before render runs escape the provider. Shape/pattern/shading enums
 have stable names so native layout fingerprints do not depend on compiler-local
-anonymous enum IDs. The private storage descriptor version is 31; public CAPI
+anonymous enum IDs. The private storage descriptor version is 32 (native PDF endpoint v2); public CAPI
 signatures and durable JSON/record formats are unchanged.
 
 ## Focused qualification
 
-- Seven compiled owner/client tests passed in Debug and Fast, without skips or
+- Nine compiled owner/client tests passed in Debug and Fast, without skips or
   leaks. They cover retained analysis, fork instantiation, prepared PNG/raster
   batches, full backend factories, adaptive outputs and GPU-preparation runs.
+- Decoder controls retain caller-only error identity through direct calls,
+  thread workers, compatibility IO and fixed executors. A restart JPEG fixture
+  proves cancellation after decoding has started; a subsequent call recovers.
 - Exhaustive allocator failure injection exercises open, analysis, fork/child
   creation, plan preparation, rendering and metadata/payload cleanup.
 - Fixed-executor tests preserve direct concurrent output and caller-only error

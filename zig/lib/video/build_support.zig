@@ -14,6 +14,14 @@
 // limitations under the License.
 
 const std = @import("std");
+fn standaloneImageModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: ?std.builtin.Optimize) *std.Build.Module {
+    const mode = optimize orelse .debug;
+    const hash = b.createModule(.{ .root_source_file = root.path(b, "../hash/src/mod.zig"), .target = target, .optimize = mode });
+    const image = b.createModule(.{ .root_source_file = root.path(b, "../image/src/mod.zig"), .target = target, .optimize = mode });
+    image.addImport("antfly_hash", hash);
+    image.addImport("image_work_control", b.createModule(.{ .root_source_file = root.path(b, "../image/src/work_control.zig"), .target = target, .optimize = mode }));
+    return image;
+}
 pub const SharedModules = struct { media: *std.Build.Module, image: *std.Build.Module };
 fn configure(b: *std.Build, module: *std.Build.Module, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, shared: ?SharedModules) void {
     if (shared) |existing| {
@@ -21,11 +29,7 @@ fn configure(b: *std.Build, module: *std.Build.Module, root: std.Build.LazyPath,
     } else {
         @import("antfly_media").support.attach(b, module, root.path(b, "../media"));
     }
-    module.addImport("antfly_image", if (shared) |existing| existing.image else b.createModule(.{
-        .root_source_file = root.path(b, "../image/src/mod.zig"),
-        .target = target,
-        .optimize = module.optimize,
-    }));
+    module.addImport("antfly_image", if (shared) |existing| existing.image else standaloneImageModule(b, root, target, module.optimize));
     if (target.result.os.tag != .macos) return;
     module.link_libc = true;
     @import("antfly_platform").addMacosSdkPaths(b, module, target);
@@ -64,7 +68,7 @@ pub fn addTests(b: *std.Build, root: std.Build.LazyPath, target: std.Build.Resol
     b.step("install-video-tests", "Install portable qualification tests for execution on another host").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "video-tests" }).step);
     const fuzz_module = b.createModule(.{ .root_source_file = root.path(b, "video_fuzz_root.zig"), .target = target, .optimize = optimize });
     fuzz_module.addImport("antfly_media", b.createModule(.{ .root_source_file = root.path(b, "../media/src/mod.zig"), .target = target, .optimize = optimize }));
-    fuzz_module.addImport("antfly_image", b.createModule(.{ .root_source_file = root.path(b, "../image/src/mod.zig"), .target = target, .optimize = optimize }));
+    fuzz_module.addImport("antfly_image", standaloneImageModule(b, root, target, optimize));
     const fuzz_filter = b.option([]const u8, "video-fuzz-filter", "Run fuzz targets matching substring");
     const fuzz_tests = b.addTest(.{ .root_module = fuzz_module, .use_llvm = true, .filters = if (fuzz_filter) |value| &.{value} else &.{} });
     b.step("fuzz-video", "Run portable H.264/VP9/AV1 coverage-guided fuzz targets without platform shims").dependOn(&b.addRunArtifact(fuzz_tests).step);
@@ -86,7 +90,7 @@ pub fn addTests(b: *std.Build, root: std.Build.LazyPath, target: std.Build.Resol
 pub fn addImportCheck(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) void {
     const shared = SharedModules{
         .media = b.createModule(.{ .root_source_file = root.path(b, "../media/src/mod.zig"), .target = target, .optimize = optimize }),
-        .image = b.createModule(.{ .root_source_file = root.path(b, "../image/src/mod.zig"), .target = target, .optimize = optimize }),
+        .image = standaloneImageModule(b, root, target, optimize),
     };
     const consumer = b.createModule(.{ .root_source_file = root.path(b, "video_import_test_root.zig"), .target = target, .optimize = optimize });
     consumer.addImport("antfly_media", shared.media);

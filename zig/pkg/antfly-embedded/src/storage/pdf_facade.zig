@@ -211,6 +211,7 @@ const OptionLease = struct {
         return .{ .value = result };
     }
     fn decode(self: *OptionLease, failure: c.Failure) ?anyerror {
+        if (failure.localError()) |err| return err;
         const ptr = failure.ptr orelse return null;
         const name = ptr[0..failure.len];
         if (self.last_error) |err| if (std.mem.eql(u8, name, @errorName(err))) return err;

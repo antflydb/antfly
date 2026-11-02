@@ -207,6 +207,10 @@ jobs:
         if: ${{ success() && inputs.step == 'compiled-pdf-native-test' }}
         run: |
           python3 zig/tools/check_media_owner_cache.py --retained --report .benchmark-results/compile-costs/pdf-retained-cache.json
+      - name: Compare retained PDF GPU scene preparation
+        if: ${{ success() && inputs.step == 'compiled-pdf-native-test' }}
+        run: |
+          python3 zig/tools/check_pdf_gpu_scene_transport.py --report .benchmark-results/compile-costs/pdf-gpu-scene-transport.json
       - name: Verify architecture provider and consumer cache isolation
         if: ${{ success() && inputs.step == 'architecture-probe-test' }}
         run: |

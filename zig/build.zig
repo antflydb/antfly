@@ -694,6 +694,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = .fast,
     });
+    webp_codec_mod.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
     webp_bench_mod.addImport("antfly_webp", webp_codec_mod);
     const webp_bench = b.addExecutable(.{ .name = "lib-image-webp-bench", .root_module = webp_bench_mod });
     b.step("lib-image-webp-bench", "Build the bounded WebP decode batch benchmark").dependOn(&b.addInstallArtifact(webp_bench, .{}).step);

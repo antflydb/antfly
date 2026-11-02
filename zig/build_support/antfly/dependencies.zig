@@ -778,6 +778,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const inference_optimize = b.option(std.lang.Optimize, "inference-optimize", "Optimization mode for the model execution graph (defaults to the product mode)") orelse optimize;
     const engine_error_names = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine_errors.zig"), .target = target, .optimize = optimize });
     const pdf_native_contract = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/pdf_native_contract.zig"), .target = target, .optimize = optimize });
+    pdf_native_contract.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
     pdf_native_contract.addImport("pdf_values", pdf_mod.import_table.get("pdf_values").?);
     pdf_native_contract.addImport("antfly_runtime_abi", runtime_abi_mod);
     pdf_native_contract.addImport("engine_errors", engine_error_names);

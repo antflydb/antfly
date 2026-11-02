@@ -14,16 +14,25 @@
 // limitations under the License.
 
 //! Private same-compiler PDF operations. Reader/fork implementations never
-//! cross this contract; transported errors are names, never Zig error numbers.
+//! cross this contract; errors carry names and opaque origin-scoped tokens.
 const std = @import("std");
 pub const pdf = @import("pdf_values");
 pub const native = @import("antfly_runtime_abi").native_abi;
-/// Static provider error-name borrow. No error-set integers cross an endpoint.
-pub const Failure = extern struct {
-    ptr: ?[*]const u8 = null,
-    len: usize = 0,
-    pub fn init(name: []const u8) Failure {
-        return .{ .ptr = name.ptr, .len = name.len };
+pub const work = @import("image_work_control");
+pub const Failure = work.Failure;
+pub const WorkBorrow = extern struct {
+    context: ?*const anyopaque = null,
+    check_fn: ?*const fn (?*const anyopaque) callconv(.c) Failure = null,
+};
+const WorkLease = struct {
+    control: work.Control,
+    fn check(context: ?*const anyopaque) callconv(.c) Failure {
+        const self: *const WorkLease = @ptrCast(@alignCast(context.?));
+        self.control.check() catch |err| return work.failure(err);
+        return .{};
+    }
+    fn borrow(self: *const WorkLease) WorkBorrow {
+        return if (self.control.check_fn == null) .{} else .{ .context = self, .check_fn = check };
     }
 };
 pub fn Outcome(comptime T: type) type {
@@ -162,9 +171,9 @@ pub fn Wire(comptime name: []const u8) type {
 }
 pub fn signature(comptime name: []const u8) native.CallContract {
     @setEvalBranchQuota(100_000);
-    return .of("pdf_native_v1." ++ name, Function(name), Args(name), Wire(name));
+    return .of("pdf_native_v2." ++ name, Function(name), Args(name), Wire(name));
 }
-const layout_types = .{ pdf.reader.PageRenderRuns, pdf.reader.ImageRun, pdf.reader.ShadingRun, pdf.reader.PatternRun, pdf.GraphicsMatrix, pdf.SharedImageRgba, pdf.ShadingKind, pdf.PatternKind, pdf.PatternMode, pdf.FillRule, pdf.BlendMode, pdf.PageRotation, pdf.reader.ShapeRun, pdf.reader.ShapeKind, pdf.reader.ShapeLineCap, pdf.reader.ShapeLineJoin, Options, Executor, Plan, PngBatch, RasterBatch, PngResult, RasterResult, pdf.PreparedPageRenderPlan, @FieldType(pdf.PreparedPageRenderPlan, "_geometry"), pdf.PageRenderRequest, pdf.PageRenderGeometry, pdf.RenderedPagePng, pdf.RenderedPageRaster, pdf.reader.PageTextAnalysis, pdf.reader.TextRun, pdf.reader.PageRenderDiagnostics, Probe, Limits, Box, A.VTable, pdf.RenderProfile, pdf.RenderQuality, pdf.PixelFormat, pdf.RenderBatchOutputKind };
+const layout_types = .{ Failure, WorkBorrow, work.Control, pdf.reader.PageRenderRuns, pdf.reader.ImageRun, pdf.reader.ShadingRun, pdf.reader.PatternRun, pdf.GraphicsMatrix, pdf.SharedImageRgba, pdf.ShadingKind, pdf.PatternKind, pdf.PatternMode, pdf.FillRule, pdf.BlendMode, pdf.PageRotation, pdf.reader.ShapeRun, pdf.reader.ShapeKind, pdf.reader.ShapeLineCap, pdf.reader.ShapeLineJoin, Options, Executor, Plan, PngBatch, RasterBatch, PngResult, RasterResult, pdf.PreparedPageRenderPlan, @FieldType(pdf.PreparedPageRenderPlan, "_geometry"), pdf.PageRenderRequest, pdf.PageRenderGeometry, pdf.RenderedPagePng, pdf.RenderedPageRaster, pdf.reader.PageTextAnalysis, pdf.reader.TextRun, pdf.reader.PageRenderDiagnostics, Probe, Limits, Box, A.VTable, pdf.RenderProfile, pdf.RenderQuality, pdf.PixelFormat, pdf.RenderBatchOutputKind };
 pub const layouts = blk: {
     @setEvalBranchQuota(100_000);
     var result: [layout_types.len]native.TypeContract = undefined;
@@ -172,24 +181,26 @@ pub const layouts = blk: {
     break :blk result;
 };
 pub const Endpoint = extern struct {
-    version: u32 = 1,
+    version: u32 = 2,
     contract: native.CallContract,
     layout: [layouts.len]native.TypeContract = layouts,
-    invoke: *const fn (*const anyopaque, *anyopaque) callconv(.c) void,
+    invoke: *const fn (*const anyopaque, *anyopaque, WorkBorrow) callconv(.c) void,
 };
 pub fn validate(comptime name: []const u8, endpoint: *const Endpoint) !void {
-    if (endpoint.version != 1 or !endpoint.contract.matches(signature(name))) return error.InvalidArgument;
+    if (endpoint.version != 2 or !endpoint.contract.matches(signature(name))) return error.InvalidArgument;
     for (endpoint.layout, layouts, 0..) |actual, expected, index| if (!actual.matches(expected)) {
         std.debug.print("PDF native layout mismatch op={s} index={d} actual={any} expected={any}\n", .{ name, index, actual, expected });
         return error.InvalidArgument;
     };
 }
 pub fn call(comptime name: []const u8, args: Args(name)) !Value(name) {
-    const getter = @extern(*const fn () callconv(.c) *const Endpoint, .{ .name = "antfly_pdf_native_" ++ name ++ "_v1" });
+    const getter = @extern(*const fn () callconv(.c) *const Endpoint, .{ .name = "antfly_pdf_native_" ++ name ++ "_v2" });
     const endpoint = getter();
     try validate(name, endpoint);
     var out: Wire(name) = undefined;
-    endpoint.invoke(&args, &out);
+    const lease: WorkLease = .{ .control = work.current() };
+    endpoint.invoke(&args, &out, lease.borrow());
+    if (out.failure.localError()) |err| return err;
     if (out.failure.ptr) |ptr| return @import("engine_errors").fromName(ptr[0..out.failure.len]);
     return out.value;
 }

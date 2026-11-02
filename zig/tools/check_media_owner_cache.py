@@ -69,6 +69,8 @@ def main():
                 "provider": "pkg/antfly-embedded/src/storage/pdf_native_provider.zig",
                 "reader": "lib/pdf/src/reader.zig",
                 "renderer": "lib/pdf/src/render.zig",
+                "decoder": "lib/image/src/jpeg.zig",
+                "control": "lib/image/src/work_control.zig",
                 "client": "pkg/antfly-embedded/src/storage/pdf_facade.zig",
                 "contract": "lib/pdf/src/values.zig",
                 "protocol": "pkg/antfly-embedded/src/storage/pdf_native_contract.zig",
@@ -163,10 +165,19 @@ def main():
             expected = dict(
                 provider="success"
                 if phase
-                in ("initial", "provider", "reader", "renderer", "contract", "protocol")
+                in (
+                    "initial",
+                    "provider",
+                    "reader",
+                    "renderer",
+                    "decoder",
+                    "control",
+                    "contract",
+                    "protocol",
+                )
                 else "cached",
                 client="success"
-                if phase in ("initial", "client", "contract", "protocol")
+                if phase in ("initial", "client", "control", "contract", "protocol")
                 else "cached",
             )
             row.update(compilers=actual, expected=expected)

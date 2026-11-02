@@ -1277,7 +1277,23 @@ test "document namespace indexing restores scoped bindings and cleans up large n
             try std.testing.expectEqualStrings("VisibleSupportedTail", text);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{xml.written()});
+    // In-place scratch growth can depend on the backing address chosen for a
+    // prior trial. Force all growth through allocation so every failure index
+    // is deterministic and every induced OOM must propagate without leaks.
+    const NoGrowth = struct {
+        backing: A,
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.backing.rawAlloc(len, alignment, ra);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.backing.rawFree(bytes, alignment, ra);
+        }
+    };
+    var no_growth = NoGrowth{ .backing = std.testing.allocator };
+    const failing_backing: A = .{ .ptr = &no_growth, .vtable = &.{ .alloc = NoGrowth.alloc, .free = NoGrowth.free, .resize = A.noResize, .remap = A.noRemap } };
+    try std.testing.checkAllAllocationFailures(failing_backing, Case.run, .{xml.written()});
 }
 
 test "document boolean attributes decode visibility consistently without allocation" {

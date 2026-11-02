@@ -241,7 +241,10 @@ pub fn create(config: Config) Graph {
     };
     const hash_mod = shared.hash orelse createSharedModule(config, "lib/hash/src/mod.zig");
     const image_mod = shared.image orelse createSharedModule(config, "lib/image/src/mod.zig");
-    if (shared.image == null) image_mod.addImport("antfly_hash", hash_mod);
+    if (shared.image == null) {
+        image_mod.addImport("antfly_hash", hash_mod);
+        image_mod.addImport("image_work_control", createSharedModule(config, "lib/image/src/work_control.zig"));
+    }
     const prometheus_mod = shared.prometheus;
     const structlog_mod = shared.structlog;
     const jinja_mod = shared.jinja orelse b.dependency("jinja", .{
@@ -470,7 +473,8 @@ pub fn create(config: Config) Graph {
         const fonts = b.createModule(.{ .root_source_file = files.add("pdf_standard_fonts.zig", pdf_standard_fonts_source), .target = target, .optimize = optimize });
         const font = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/font/src/mod.zig")), .target = target, .optimize = optimize });
         const pdf = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/mod.zig")), .target = target, .optimize = optimize });
-        pdf.addImport("pdf_values", b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/values.zig")), .target = target, .optimize = optimize }));
+        const values = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/values.zig")), .target = target, .optimize = optimize });
+        pdf.addImport("pdf_values", values);
         pdf.addImport("antfly_image", image_mod);
         pdf.addImport("antfly_hash", hash_mod);
         pdf.addImport("antfly_font", font);

@@ -74,6 +74,12 @@ pub const default_render_bytes_per_pixel_reserve = @import("pdf_values").default
 pub const RenderScratchGrowth = @import("pdf_values").RenderScratchGrowth;
 
 pub const PageRenderBatchOptions = struct {
+    /// Borrowed synchronous decoder control. Each CPU worker installs this
+    /// scope itself; the coordinator never retains TLS over an I/O wait.
+    image_control: ?image.work_control.Control = null,
+    /// Optional terminal worker identity borrow, written only by the joined
+    /// coordinator before returning its scalar failure. No worker retains it.
+    failure_identity_out: ?*?image.work_control.Failure = null,
     max_batch_pages: usize = 8,
     max_parallel_pages: usize = 1,
     max_inflight_pixels: u64 = 50_000_000,
@@ -1415,6 +1421,8 @@ const PageRenderWorker = struct {
     rendered_png: ?RenderedPagePng = null,
     rendered_raster: ?RenderedPageRaster = null,
     failure: ?anyerror = null,
+    failure_identity: ?image.work_control.Failure = null,
+    image_control: image.work_control.Control = .{},
     render_elapsed_ns: u64 = 0,
     thread: ?std.Thread = null,
     wave_control: *RenderWaveControl = undefined,
@@ -1466,6 +1474,8 @@ const PageRenderWorker = struct {
         self.rendered_png = null;
         self.rendered_raster = null;
         self.failure = null;
+        self.failure_identity = null;
+        self.image_control = image.work_control.current();
         self.render_elapsed_ns = 0;
         self.task_configured = true;
     }
@@ -1513,6 +1523,8 @@ const PageRenderWorker = struct {
     }
 
     fn runWithScratch(self: *PageRenderWorker, backing: Allocator) void {
+        const image_scope = image.work_control.Scope.enter(self.image_control);
+        defer image_scope.deinit();
         std.debug.assert(self.task_configured);
         if (!self.scratch_initialized) {
             self.scratch_budget = .{
@@ -1574,6 +1586,7 @@ const PageRenderWorker = struct {
             error.RenderWorkerMemoryLimitExceeded
         else
             err;
+        self.failure_identity = image.work_control.failure(self.failure.?);
         if (self.failure.? == error.OutOfMemory or self.failure.? == error.Canceled)
             self.wave_control.stop();
     }
@@ -1781,6 +1794,7 @@ fn renderParsedPageWorkBatchAlloc(
     prepared_plans: ?[]const PreparedPageRenderPlan,
     options: PageRenderBatchOptions,
 ) !(if (output_kind == .png) RenderedPageBatch else RenderedPageRasterBatch) {
+    if (options.failure_identity_out) |identity| identity.* = null;
     if (options.max_batch_pages == 0 or options.max_parallel_pages == 0 or
         options.max_inflight_pixels == 0 or options.max_inflight_bytes == 0 or
         (output_kind == .png and options.max_retained_png_bytes == 0) or
@@ -1944,6 +1958,7 @@ fn renderParsedPageWorkBatchAlloc(
                 max_retained_output_bytes,
                 &compatibility_session,
             );
+            workers[i].image_control = options.image_control orelse image.work_control.current();
             initialized_workers += 1;
         }
 
@@ -1985,7 +2000,21 @@ fn renderParsedPageWorkBatchAlloc(
         for (wave[0..wave_len], workers[0..wave_len]) |candidate, *worker| {
             results[candidate.request_index].render_elapsed_ns = worker.render_elapsed_ns;
             if (worker.failure) |err| {
-                if (err == error.OutOfMemory or err == error.Canceled) return err;
+                if (err == error.OutOfMemory or err == error.Canceled) {
+                    if (options.failure_identity_out) |identity| {
+                        // Wave cancellation may make an earlier lane fail
+                        // before the lane that reported the original error.
+                        for (workers[0..wave_len]) |*lane| {
+                            if (lane.failure) |lane_error| {
+                                if (lane_error == err and lane.failure_identity != null) {
+                                    identity.* = lane.failure_identity;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    return err;
+                }
                 results[candidate.request_index].failure = err;
                 continue;
             }

@@ -186,3 +186,120 @@ test "compiled PDF native backend factories and direct adaptive outputs" {
     defer runs.deinit(a);
     try std.testing.expect(runs.page_box.max_x > runs.page_box.min_x);
 }
+
+test "compiled PDF native decoder cancellation retains caller error identity on all worker paths" {
+    const a = std.testing.allocator;
+    const bytes = try jpegFixture(a);
+    defer a.free(bytes);
+    var doc = try pdf.reader.Reader.init(a, bytes);
+    defer doc.deinit();
+    const Control = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn check(ptr: ?*const anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr.?)));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return error.PdfCallerOnlyDecoderStopped;
+        }
+        fn run(_: *anyopaque, contexts: []const *anyopaque, operation: *const fn (*anyopaque, std.mem.Allocator) void, _: usize) anyerror!pdf.PageRenderExecutor.BatchStats {
+            for (contexts) |context| operation(context, std.heap.page_allocator);
+            return .{ .peak_parallelism = contexts.len };
+        }
+    };
+    var control: Control = .{};
+    const request: pdf.PageRenderRequest = .{ .page_number = 1, .requested_dpi = 72, .max_dimension = 64 };
+    {
+        const scope = c.work.Scope.enter(.{ .context = &control, .check_fn = Control.check });
+        defer scope.deinit();
+        try std.testing.expectError(error.PdfCallerOnlyDecoderStopped, pdf.renderParsedPagePngAlloc(a, &doc, 1, 72, 1_000_000));
+        for (0..3) |mode| {
+            var options: pdf.PageRenderBatchOptions = .{ .max_parallel_pages = 2 };
+            if (mode == 1) options.executor_io = std.testing.io;
+            if (mode == 2) options.executor = .{ .ptr = &control, .concurrent_capacity = 2, .run_batch_fn = Control.run };
+            try std.testing.expectError(error.PdfCallerOnlyDecoderStopped, pdf.renderParsedPagesBatchAlloc(a, &doc, &.{ request, request }, options));
+        }
+    }
+    try std.testing.expect(control.calls.load(.monotonic) >= 4);
+    const recovered = try pdf.renderParsedPagePngAlloc(a, &doc, 1, 72, 1_000_000);
+    defer a.free(recovered);
+    try std.testing.expect(recovered.len > 0);
+    // A token from a different module is never converted to a local error.
+    const foreign: c.Failure = .{ .ptr = "Canceled".ptr, .len = "Canceled".len, .origin = &control, .token = std.math.maxInt(usize) };
+    try std.testing.expect(foreign.localError() == null);
+}
+
+fn jpegFixture(alloc: std.mem.Allocator) ![]u8 {
+    const jpeg_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "testdata/image/jpeg/restart/gray-16x16-rst1.jpg", alloc, .limited(1024 * 1024));
+    defer alloc.free(jpeg_bytes);
+
+    const content = "q\n16 0 0 16 0 0 cm\n/Im0 Do\nQ\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 32 32] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ jpeg_bytes.len, jpeg_bytes },
+        ),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |obj_src, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, obj_src);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 6\n0000000000 65535 f \n");
+    for (offsets) |off| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    return sample;
+}
+
+test "compiled PDF native JPEG inner-loop control survives analysis and raster workers" {
+    const a = std.testing.allocator;
+    const bytes = try jpegFixture(a);
+    defer a.free(bytes);
+    const Control = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fail_after: usize = std.math.maxInt(usize),
+        fn check(ptr: ?*const anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr.?)));
+            if (self.calls.fetchAdd(1, .monotonic) >= self.fail_after) return error.PdfCallerOnlyJpegDeadline;
+        }
+    };
+    var control: Control = .{};
+    const scope = c.work.Scope.enter(.{ .context = &control, .check_fn = Control.check });
+    defer scope.deinit();
+    var doc = try pdf.reader.Reader.init(a, bytes);
+    defer doc.deinit();
+    var good = try doc.extractPageRenderRunsForRasterAlloc(1, 32, 32);
+    defer good.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), good.image_runs.len);
+    const baseline_checks = control.calls.load(.monotonic);
+    try std.testing.expect(baseline_checks >= 2);
+    control.calls.store(0, .monotonic);
+    control.fail_after = 1;
+    // A fresh owner avoids the successful decoded-image cache.
+    var cancelled = try pdf.reader.Reader.init(a, bytes);
+    defer cancelled.deinit();
+    try std.testing.expectError(error.PdfCallerOnlyJpegDeadline, cancelled.extractPageRenderRunsForRasterAlloc(1, 32, 32));
+    try std.testing.expect(control.calls.load(.monotonic) > 1);
+    control.calls.store(0, .monotonic);
+    control.fail_after = 0;
+    var worker = try pdf.reader.Reader.init(a, bytes);
+    defer worker.deinit();
+    const request: pdf.PageRenderRequest = .{ .page_number = 1, .requested_dpi = 72, .max_dimension = 32 };
+    try std.testing.expectError(error.PdfCallerOnlyJpegDeadline, pdf.renderParsedPagesRasterBatchAlloc(a, &worker, &.{request}, .{}));
+}
