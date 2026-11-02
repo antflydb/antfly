@@ -19,9 +19,9 @@ import{prepareExport,publishExport}from'./prepare-export.mjs';
 import{walkOtlp}from'./otlp-chunks.mjs';
 import{diagnosticPrefix}from'./diagnostic-scope.mjs';
 import{exportAdmission,diagnosticWrites}from'./diagnostic-memory.mjs';
-import{diagnosticStorage,diagnosticFailureResponse}from'./diagnostic-storage.mjs';
+import{diagnosticStorage,diagnosticFailureResponse}from'./diagnostic-memory.mjs';
 import{resourceFailureCode}from'../performance.mjs';
-import{readBody}from'./logpush-probe-collector.mjs';import{fetchObserver,observerScopes}from'./paired-observer.mjs';
+import{readBody}from'./export-collector.mjs';import{fetchObserver,observerScopes}from'./paired-observer.mjs';
 export function partitionExport(envelopes,signal){
  const groupKey=signal==='traces'?'resourceSpans':'resourceLogs',scopeKey=signal==='traces'?'scopeSpans':'scopeLogs',itemKey=signal==='traces'?'spans':'logRecords',pieces=[];let records=0,resources=0;
  if(!Array.isArray(envelopes)||envelopes.length>256)throw Error('ReceiverEnvelopeBudgetExceeded');

@@ -74,7 +74,7 @@ test('counter failures retain only fixed actionable categories without provider 
 
 
 test('telemetry capability preflight is read-only, scoped and never retains destination credentials',async()=>{
- const{telemetryJobTemplate,inspectTelemetryCapabilities}=await import('../qualification/telemetry-capabilities.mjs'),template=telemetryJobTemplate([run]),secret='private-token-and-destination-secret';
+ const{telemetryJobTemplate,inspectTelemetryCapabilities}=await import('../qualification/independent-counters.mjs'),template=telemetryJobTemplate([run]),secret='private-token-and-destination-secret';
  assert.equal(template.enabled,false);assert.equal(template.output_options.sample_rate,1);assert.equal(template.destination_conf,undefined);
  const result=await inspectTelemetryCapabilities([run],secret,{fetch:async(url,options)=>{assert.equal(options.headers.Authorization,'Bearer '+secret);assert.equal(options.method,undefined);return Response.json({success:true,result:url.endsWith('/fields')?Object.fromEntries(template.output_options.field_names.map(k=>[k,'type'])):[{...template,id:1,enabled:true,destination_conf:'r2://private-bucket?secret-access-key='+secret}]});}});
  assert.equal(result.configuration_inspectable,true);assert.equal(result.existing_jobs[0].exact_scope,true);assert.equal(result.delivery_contract_qualified,false);assert.ok(!JSON.stringify(result).includes(secret));assert.ok(!JSON.stringify(result).includes('private-bucket'));

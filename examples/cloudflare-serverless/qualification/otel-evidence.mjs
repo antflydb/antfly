@@ -15,7 +15,7 @@
 
 // OTLP/JSON boundary. Preserve provider identities, never arbitrary attributes,
 // headers, URLs, exception messages, or log bodies. Unknown data cannot qualify.
-import{resourceLogFailure}from'./resource-events.mjs';
+import{resourceLogFailure}from'./diagnostic-memory.mjs';
 import{parseDiagnosticJson}from'./diagnostic-memory.mjs';
 import{requestAttemptUuid,portableAttemptIdentity}from'./attempt-token.mjs';
 import {resourceFailureCode} from '../performance.mjs';

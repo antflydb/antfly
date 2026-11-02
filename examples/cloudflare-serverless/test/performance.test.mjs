@@ -573,7 +573,7 @@ test('native inline read views avoid metadata pages across logical storage ident
 });
 
 test('metadata activation qualifies full compact and observation binaries beyond legacy root limits',async()=>{
- const{verifyInlineMetadataReaders}=await import('../qualification/metadata-compatibility.mjs'),[compact,observe]=await Promise.all(['antfly-serverless-compact.wasm','antfly-serverless-observe.wasm'].map(async name=>WebAssembly.compile(await readFile(new URL('../dist/'+name,import.meta.url)))));
+ const{verifyInlineMetadataReaders}=await import('../qualification/wal-compatibility.mjs'),[compact,observe]=await Promise.all(['antfly-serverless-compact.wasm','antfly-serverless-observe.wasm'].map(async name=>WebAssembly.compile(await readFile(new URL('../dist/'+name,import.meta.url)))));
  const result=await verifyInlineMetadataReaders(module,compact,observe);assert.equal(result.format,3);assert.equal(result.readers,3);assert.equal(result.physical_row_reads,0);assert.ok(result.root_bytes>4096&&result.root_bytes<=12288);await assert.rejects(verifyInlineMetadataReaders(module,compact),/ReaderCoverageRequired/);
 });
 

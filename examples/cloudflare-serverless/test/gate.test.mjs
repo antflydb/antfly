@@ -117,7 +117,7 @@ test('fixed-arrival driver drains in-flight work before reporting a monitor fail
 });
 
 test('capacity summaries distinguish scheduled delay, execution and retries',async()=>{
- const{summarizeWorkload}=await import('../qualification/workload-summary.mjs');
+ const{summarizeWorkload}=await import('../qualification/phase-attribution.mjs');
  const result=summarizeWorkload({samples:[{tenant:'a',phase:'read',ms:1000,execution_ms:600,scheduling_delay_ms:400,attempts:2}],errors:[],resource_errors:[]});
  assert.equal(result.phases.read.p95_ms,1000);assert.equal(result.phases.read.execution_p95_ms,600);assert.equal(result.phases.read.scheduling_delay_p95_ms,400);assert.equal(result.phases.read.retried,1);assert.equal(result.tenants.a.read.samples,1);
 });

@@ -80,10 +80,9 @@ Unknown/colliding routes are rejected; Queue and cron dispatch stay scoped.
 This is storage routing, with no cross-tenant transactions. End-user identity
 and authorization must be enforced by the app before selecting a route.
 
-`qualification/performance.mjs RUN_JSON HTTPS_ORIGIN` records 100 warm fenced
-reads and eight concurrent writers. Run again with `--reopen` after replacing
-the coordinator namespace against the same R2 data. Reports include retries
-and exact-body/count checks, not just successful-attempt timings.
+Use `npm run qualify -- local ...` for local serving measurements and the manual
+paired hosted procedure below for deployed latency and recovery. Neither replaces
+the full acceptance gate.
 
 ## Build and test
 
@@ -348,7 +347,7 @@ for persistence, concurrency, overflow, collection, and measurement contracts.
 hint, with `RUNTIME_GENERATION` selecting fresh compute identities while keeping
 R2 storage identity. Hints are not evidence of physical colocation. The opt-in,
 authenticated `QUALIFICATION_PLACEMENT_PROBE=true` endpoint and
-`qualification/probe-placement.mjs` measure role-to-storage/RPC latency. Probe
+`npm run qualify -- hosted placement ...` measure role-to-storage/RPC latency. Probe
 identities are warmed and cannot serve as physical-cold qualification samples.
 
 With publication continuations enabled, `publish` returns `job_id`, `phase`,
@@ -596,12 +595,21 @@ The current references are [architecture](../../docs/design/cloudflare-serverles
 They describe the current implementation; per-commit trials are retained in Git
 history and local reports rather than additional design documents.
 
-Use `qualification/read-state-latency.mjs` for local serving comparisons and
-`qualification/r2-scale.mjs` for bounded native/R2 scale fixtures. Use the
-independent HTTP runner and eight-role observer for short hosted comparisons,
-then the original gate runner only after warm prerequisites pass. Full gate
-thresholds and source/control verification remain unchanged. Run the dedicated-client command manually from a clean checkout on a separate
-machine; no CI registration or repository secrets are required.
+Use one maintained entry point:
+
+```sh
+npm run qualify -- --help
+npm run qualify -- local --twofold --only=serving-durable,serving-resident --documents=512 --delay=20 --setup-delay=0 --rounds=8 --offered-reads=128 --offered-rps=16 --offered-write-every=16 --out=dist/qualification/local-forward
+```
+
+The [operator guide](../../docs/design/cloudflare-independent-http.md) covers both
+local orders, warm/cold/burst/mixed scenarios and the single paired hosted path.
+`hosted` provides scoped stack/observer lifecycle, independent execution and closure,
+then the original full gate. `contracts` covers engine/ANN, native, S3/GCS and R2
+scale checks. `analyze` reads evidence offline; `artifacts` previews local retention.
+Run the dedicated hosted client manually from a clean checkout on a separate
+machine; no CI registration or repository secrets are required. Acceptance limits,
+source/control verification and deployment cleanup checks remain unchanged.
 
 The disk-backed local bucket avoids retaining large emulated R2 payloads in host
 RAM. Use it for large fixture runs; fixture storage is outside WASM memory metrics.

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import{test}from'node:test';import assert from'node:assert/strict';import{evaluateDestinationHistory,startDestinationMonitor}from'../qualification/destination-history.mjs';
+import{test}from'node:test';import assert from'node:assert/strict';import{evaluateDestinationHistory,startDestinationMonitor}from'../qualification/provider-account-api.mjs';
 const scope={id:'observer-test',captureId:crypto.randomUUID(),from:120000,to:180000};
 const status=at=>({id:scope.id,observation_capture_id:scope.captureId,at,destinations:['logs','traces'].map(signal=>({signal,enabled:true,dataset:'opentelemetry-'+signal,last_complete:new Date(at).toISOString(),last_error:''}))});
 const samples=()=>[120000,150000,180000,210000].map(at=>({requested_at:at,at:at+100,status:status(at)}));

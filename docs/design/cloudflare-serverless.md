@@ -103,7 +103,7 @@ checksums, sizes, ranges and conditions. Missing hints fall back to authoritativ
 lookup. Existing root/frame and request ceilings remain enforced. Byte admission
 bounds active responses and retained transcripts; namespace fairness prevents a
 large dependency from starving indefinitely. Current variant sets and activation
-checks are in `qualification/read-state-latency.mjs`.
+checks are in `npm run qualify -- local ...`.
 
 `RESIDENT_DURABLE_BOOTSTRAP` additionally uses provider-local opaque Antfly state
 under `serialized-owner-v3`. This is a distinct durable/authority protocol, not

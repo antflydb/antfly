@@ -24,7 +24,7 @@ import{createHash}from'node:crypto';
 import{sanitizeTailEvent}from'./metrics-tail.mjs';
 import{assertGateRun}from'./gate-scope.mjs';
 import{resourceFailureCode}from'../performance.mjs';
-import{resourceLogFailure}from'./resource-events.mjs';
+import{resourceLogFailure}from'./diagnostic-memory.mjs';
 const roles=['app','writer','reader','builder'];
 export class DiagnosticCoverage{
  constructor(runs){this.ioLifecycles=new WeakMap();this.streams=runs.flatMap(run=>roles.map(role=>({run:run.id,role,connected:false,active_connections:0,replica_disconnects:0,gap:false,events:0,resource_failures:0,gap_reasons:{}})));}

@@ -107,3 +107,35 @@ export class DiagnosticResponseAdmission {
  }
 }
 export const diagnosticReadResponses=new DiagnosticResponseAdmission({pollMs:1});
+
+
+import{resourceFailureCode}from'../performance.mjs';
+
+const identities=new WeakMap();
+export const diagnosticBucketIdentity=bucket=>identities.get(bucket)??bucket;
+const components=new Set(['export-receiver','tail-observer','evidence-reader']);
+export function diagnosticStorage(env,component,{emit=value=>console.error(JSON.stringify(value))}={}){
+ if(!components.has(component))throw Error('TelemetryDiagnosticComponentInvalid');
+ const wrapped={...env},aliases=new Map();
+ for(const [binding,storage]of[['LOGS','proof'],['ARCHIVE','archive']]){
+  const bucket=env[binding];if(!bucket)continue;
+  if(aliases.has(bucket)){wrapped[binding]=aliases.get(bucket);continue;}
+  wrapped[binding]=Object.fromEntries(['get','put','head','list','delete'].map(op=>[op,async(...args)=>{try{return await bucket[op](...args);}catch(error){const failure_code=resourceFailureCode(error);if(failure_code)try{emit({event:'antfly.resource_failure',failure_code,boundary:'r2-binding',component,storage,op});}catch{}throw error;}}]));aliases.set(bucket,wrapped[binding]);identities.set(wrapped[binding],diagnosticBucketIdentity(bucket));
+ }
+ return wrapped;
+}
+export function diagnosticFailureResponse(error,fallback){
+ const failure_code=resourceFailureCode(error),code=/^(?:Observer|Telemetry)[A-Za-z]+$/.test(error?.message??'')?error.message:fallback;
+ return Response.json({error:code,...(failure_code?{failure_code}:{})},{status:503,...(failure_code?{headers:{'X-Antfly-Resource-Failure':failure_code}}:{})});
+}
+
+// Recovered failures still disqualify a window. Keep this identical for live,
+// canonical and persisted evidence; a final outcome of "ok" cannot erase them.
+export function resourceLogFailure(value){
+ if(!value||typeof value!=='object')return null;
+ for(const item of[value,...(Array.isArray(value.errors)?value.errors:[])]){
+  for(const key of['failure_code','error','error_message','message']){const code=resourceFailureCode(item?.[key]);if(code)return code;}
+  if(item?.resource_limit==='memory')return'MemoryLimitExceeded';if(item?.resource_limit==='cpu')return'CPULimitExceeded';
+ }
+ if(value.physical?.resource_failures>0||value.physical?.edge_cache_resource_errors>0)return'ResourceFailureObserved';return null;
+}

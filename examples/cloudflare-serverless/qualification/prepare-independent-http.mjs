@@ -14,7 +14,7 @@
 // limitations under the License.
 
 import{observerScopes}from'./paired-observer.mjs';
-import{readFile,writeFile,mkdir}from'node:fs/promises';import{resolve,join}from'node:path';import{execFileSync}from'node:child_process';import{assertObservationRun,verifyObservationRun}from'./observation-runs.mjs';
+import{readFile,writeFile,mkdir}from'node:fs/promises';import{resolve,join}from'node:path';import{execFileSync}from'node:child_process';import{assertObservationRun,verifyObservationRun}from'./gate-provenance.mjs';
 const[action,baselinePath,candidatePath,output]=process.argv.slice(2);if(!['pair','plan'].includes(action)||!baselinePath||!candidatePath||!output)throw Error('UsageIndependentPairOrPlanBaselineCandidateOutput');
 const runs=await Promise.all([baselinePath,candidatePath].map(async p=>JSON.parse(await readFile(resolve(p)))));for(const r of runs){assertObservationRun(r);if(r.deleted||!r.deployed||(await verifyObservationRun(r)).length)throw Error('IndependentSealedPairRequired');}if(runs[0].account!==runs[1].account||runs[0].id===runs[1].id||runs[0].profile!=='approved-control'||runs[1].profile!=='durable-candidate')throw Error('IndependentPairMismatch');
 let value;if(action==='pair')value={schema:1,kind:'independent-http-pair',account:runs[0].account,baseline:resolve(baselinePath),candidate:resolve(candidatePath)};

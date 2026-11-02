@@ -136,3 +136,39 @@ export function reconcileCounterPopulations(run,role,rows,counter,timeframe){
  if(rows.some(row=>!covered.has(row.event_type)))failures.push('InvocationPopulationUncovered');
  return[...new Set(failures)];
 }
+
+
+// Read-only capability inspection. Configuration is never delivery proof.
+
+const requiredFields=['Event','EventTimestampMs','EventType','Exceptions','Logs','Outcome','ScriptName','ScriptVersion'];
+const fixedCodes=value=>(Array.isArray(value?.errors)?value.errors:[]).slice(0,16).map(e=>e.code).filter(Number.isSafeInteger);
+export function telemetryJobTemplate(runs){
+ for(const run of runs)assertGateRun(run);
+ if(!runs.length||new Set(runs.map(r=>r.account)).size!==1)throw Error('TelemetryScopeMismatch');
+ const names=[...new Set(runs.flatMap(r=>r.services.map(s=>s.name)))].sort();
+ return{name:'antfly-1278-qualification',dataset:'workers_trace_events',enabled:false,filter:JSON.stringify({where:{key:'ScriptName',operator:'in',value:names}}),output_options:{field_names:[...requiredFields,'CPUTimeMs','WallTimeMs'],sample_rate:1}};
+}
+export async function inspectTelemetryCapabilities(runs,token,{fetch:request=fetch}={}){
+ const proposal=telemetryJobTemplate(runs),account=runs[0].account;
+ if(typeof token!=='string'||token.length<20||token.length>4096)throw Error('TelemetryCredentialInvalid');
+ const results=[];let fields=[],jobs=[];
+ for(const path of ['logpush/datasets/workers_trace_events/fields','logpush/jobs']){
+  let response,value;
+  try{
+   response=await request('https://api.cloudflare.com/client/v4/accounts/'+account+'/'+path,{headers:{Authorization:'Bearer '+token},signal:AbortSignal.timeout(30000)});
+   let bytes=0;const parts=[];for await(const part of response.body){bytes+=part.byteLength;if(bytes>65536)throw Error('TelemetryCapabilityResponseExceeded');parts.push(part);}
+   value=JSON.parse(Buffer.concat(parts));
+  }catch(error){results.push({path,error:error.message==='TelemetryCapabilityResponseExceeded'?error.message:'TelemetryCapabilityReadFailed'});continue;}
+  const success=response.ok&&value.success===true;
+  results.push({path,status:response.status,success,error_codes:fixedCodes(value)});
+  if(!success)continue;
+  if(path.endsWith('/fields'))fields=Object.keys(value.result??{}).filter(k=>requiredFields.includes(k));
+  else if(Array.isArray(value.result))for(const job of value.result){
+   if(job.dataset!=='workers_trace_events'||!Number.isSafeInteger(job.id))continue;
+   let scoped=false;try{const filter=JSON.parse(job.filter);scoped=JSON.stringify(filter)===proposal.filter;}catch{}
+   // Never retain destination URLs, credentials, filters or provider text.
+   jobs.push({id:job.id,enabled:job.enabled===true,exact_scope:scoped,sample_rate:Number.isFinite(job.output_options?.sample_rate)?job.output_options.sample_rate:null,required_fields:requiredFields.every(k=>job.output_options?.field_names?.includes(k)),destination_type:typeof job.destination_conf==='string'&&job.destination_conf.startsWith('r2://')?'r2':'other'});
+  }
+ }
+ return{schema:1,qualification:false,read_only:true,results,required_fields:requiredFields,available_required_fields:fields,existing_jobs:jobs,configuration_inspectable:results.length===2&&results.every(r=>r.success),delivery_contract_qualified:false,proposal,limitations:['Export permissions and field availability do not prove complete invocation delivery.','Fetch, Durable Object RPC, quiet populations, unique identities, late failures and delivery settlement need real fixtures.','No job, destination, plan, credential or Worker was changed.']};
+}

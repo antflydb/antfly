@@ -23,7 +23,7 @@ const encoder=new TextEncoder(),uuid=value=>typeof value==='string'&&/^[a-f0-9]{
 const fail=code=>{throw Error(code);};
 async function hash(bytes){return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),b=>b.toString(16).padStart(2,'0')).join('');}
 const identity=async value=>typeof value==='string'&&value.length>0&&value.length<=256?hash(encoder.encode(value)):null;
-export async function sanitizeLogpushProbe(row,source){
+export async function sanitizeProviderEvent(row,source){
  if(row.ScriptName!==source)fail('TelemetrySourceMismatch');
  const timestamp=typeof row.EventTimestampMs==='string'&&/^\d{4}-/.test(row.EventTimestampMs)?Date.parse(row.EventTimestampMs):row.EventTimestampMs;
  if(!Number.isSafeInteger(timestamp)||timestamp<0)fail('TelemetryTimestampInvalid');
@@ -82,17 +82,12 @@ export default {async fetch(request,env){
    }
    if(env.WINDOWED_EVIDENCE==='true')fail('TelemetryCanonicalOtelRequired');
    if(lines.length>1000)fail('TelemetryRecordBudgetExceeded');
-   const rows=[];for(const line of lines){if(encoder.encode(line).byteLength>256*1024)fail('TelemetryRecordBudgetExceeded');let row;try{row=parseDiagnosticJson(line);}catch{fail('TelemetryJsonInvalid');}rejectionShape={json_type:row===null?'null':Array.isArray(row)?'array':typeof row,content:row?.content==='tests'?'tests':row?.content==='test'?'test':row&&Object.hasOwn(row,'content')?'other':'absent',has_script_name:typeof row?.ScriptName==='string',keys:row&&typeof row==='object'?Object.keys(row).filter(key=>['content','test','filename','ScriptName','Event','Logs'].includes(key)):[],key_count:row&&typeof row==='object'?Object.keys(row).length:0};rows.push(await sanitizeLogpushProbe(row,env.SOURCE_WORKER));}
+   const rows=[];for(const line of lines){if(encoder.encode(line).byteLength>256*1024)fail('TelemetryRecordBudgetExceeded');let row;try{row=parseDiagnosticJson(line);}catch{fail('TelemetryJsonInvalid');}rejectionShape={json_type:row===null?'null':Array.isArray(row)?'array':typeof row,content:row?.content==='tests'?'tests':row?.content==='test'?'test':row&&Object.hasOwn(row,'content')?'other':'absent',has_script_name:typeof row?.ScriptName==='string',keys:row&&typeof row==='object'?Object.keys(row).filter(key=>['content','test','filename','ScriptName','Event','Logs'].includes(key)):[],key_count:row&&typeof row==='object'?Object.keys(row).length:0};rows.push(await sanitizeProviderEvent(row,env.SOURCE_WORKER));}
    const digest=await hash(bytes),value=JSON.stringify({schema:1,qualification:false,received_at:Date.now(),raw_batch_sha256:digest,rows});if(encoder.encode(value).byteLength>4*1024*1024)fail('TelemetrySanitizedBudgetExceeded');
    await env.LOGS.put(prefix+'batches/'+digest+'.json',value,{onlyIf:{etagDoesNotMatch:'*'},httpMetadata:{contentType:'application/json'}});
    return Response.json({stored:true,records:rows.length,qualification:false});
   }
   if(path==='/counter-witness'&&request.method==='POST'){const input=parseDiagnosticJson(new TextDecoder().decode(await readBody(request)));if(!uuid(input.id)||!env.COUNTER)fail('TelemetryWitnessInvalid');return Response.json(await env.COUNTER.witness(input.id));}
-  if(path==='/exercise'&&request.method==='POST'){
-   const input=parseDiagnosticJson(new TextDecoder('utf-8',{fatal:true}).decode(await readBody(request))),count=input.count??8;if(!Number.isInteger(count)||count<1||count>32)fail('TelemetryProbeBudgetInvalid');
-   const expected=[];for(let i=0;i<count;i++){const id=crypto.randomUUID(),response=await env.FIXTURE.fetch('https://probe.invalid/?nonce='+id,{method:'POST',headers:{Authorization:'Bearer '+env.API_TOKEN}});if(!response.ok)fail('TelemetryProbeFailed');const value=await response.json();if(value.id!==id||!uuid(value.rpc))fail('TelemetryProbeIdentityInvalid');expected.push(value);}
-   const id=crypto.randomUUID();await env.LOGS.put(prefix+'plans/'+id+'.json',JSON.stringify({id,expected}),{onlyIf:{etagDoesNotMatch:'*'}});return Response.json({qualification:false,id,expected});
-  }
   if(path==='/page'&&request.method==='POST'){
    const input=parseDiagnosticJson(new TextDecoder().decode(await readBody(request)));
    if(Object.keys(input).some(k=>k!=='cursor')||input.cursor!=null&&(typeof input.cursor!=='string'||input.cursor.length>4096))fail('TelemetryCursorInvalid');

@@ -20,9 +20,11 @@ resource ceilings, batching policy and native algorithms. Actor admission remain
 one active job, eight pending jobs/four MiB/one MiB per job, with 30-second deadlines.
 Mutation admission remains sixteen pending jobs/four MiB/one MiB per request; groups
 have sixteen callers/768 KiB/1,024 records, a two-ms window and five-second aging.
-The caller patch and machine-readable hashes remain under `qualification/` because
-control verification and safe local artifact retention depend on their provenance.
-They are not permission to modify a frozen control or repair failed results.
+The current approved revision and original module hashes are pinned in
+`qualification/approved-control.json`. Historical correction patches, machine-local
+paths and incident reports remain in Git history and retained artifact storage;
+they are not maintained operator inputs. Retention still protects both exact
+control modules. Neither a rebuild nor a new source SHA replaces those bytes.
 
 `qualification/gate-policy.mjs` is the executable policy. It requires:
 
@@ -48,28 +50,45 @@ it does not relax the other requirements or produce a final pass.
 Tenfold cold and twofold warm/burst/mixed improvement are separate design goals.
 Report them separately from absolute limits and paired non-regression.
 
-## Retained tooling
+## Maintained commands
 
-Use one primary path per task:
+Run from `examples/cloudflare-serverless`. One entry point exposes the maintained
+local, hosted, analysis and contract capabilities:
 
-- `read-state-latency.mjs`: local actual-workerd serving comparisons and inline profiles.
-- `cold-pilot.mjs`: bounded sealed control/candidate stack lifecycle for short HTTP trials.
-- `prepare-independent-http.mjs`, `independent-http-trial.mjs`,
-  `reconcile-independent-http.mjs`: public plan, dedicated external client and offline closure.
-- `paired-observer-lifecycle.mjs`: eight-role observation/export lifecycle and positive witnesses.
-- `prepare-gate.mjs`, `gate-lifecycle.mjs`, `run-gate.mjs`, `evaluate-gate.mjs`:
-  original full-gate preparation, bounded operations, execution and evaluation.
-- `platform-baseline-lifecycle.mjs`: isolated primitive/pressure diagnosis, not an Antfly gate.
-- `provider-contracts.mjs`, native tests, `r2-scale.mjs` and ANN fixtures:
-  separate provider, scale and quality qualification.
-- `prune-local-artifacts.py`: dry-run-first local artifact retention; never credential discovery.
+```sh
+npm run qualify -- --help
+npm run qualify -- local --twofold --only=serving-durable,serving-resident --documents=512 --delay=20 --setup-delay=0 --rounds=8 --offered-reads=128 --offered-rps=16 --offered-write-every=16 --out=dist/qualification/local-forward
+```
 
-Shared modules implement workload scheduling, transport, source sealing, error
-classification, collection, independent coverage, source/API scoping and cleanup.
-Their small modules and regression tests are maintained implementation dependencies,
-not separate experiment entry points. Superseded one-off programs and chronological
-design reports are not maintained in the current tree. Git history preserves source;
-local failed evidence remains immutable and rebuilds are not assumed byte-identical.
+Repeat the local command with `--reverse` and a fresh output directory for the
+other order. This is a workerd diagnostic with injected binding delay, not a
+hosted gate or the approved historical control. Warm, mixed, burst and cold
+scenarios share this runner (`--model=fixed-bursty`, `--cold-restart` and
+`--cold-startup`); retain their different population/identity limitations.
+
+| Command after `npm run qualify --` | Purpose |
+| --- | --- |
+| `local ...` | Local workerd workloads, latency and request profiles |
+| `hosted stack ...`, `observer ...`, `pair ...`, `plan ...`, `run ...`, `reconcile ...` | One paired hosted procedure, from scoped preparation through independent closure |
+| `hosted gate-prepare ...`, `gate-lifecycle ...`, `gate-run ...`, `gate-evaluate ...` | Original three-trial acceptance gate |
+| `hosted evidence ...`, `corpus ...`, `delivery ...`, `placement ...` | Evidence, fresh corpora and bounded operator support |
+| `analyze ...` or `analyze --native ...` | Offline same-request and received-native attribution |
+| `contracts engine ...`, `embeddings ...`, `native ...`, `providers ...`, `scale ...` | Shared engine/ANN fixtures, native API lifecycle, S3/GCS contracts and R2 scale |
+| `artifacts ...` | Dry-run-first retention; explicit `--apply` preserves exact control payloads |
+
+Lifecycle actions retain their scope, seal, retirement, drain and absence checks.
+The CLI passes argument arrays directly, preserves failures/signals and never
+runs a shell. Help and route validation perform no deployment or credential I/O.
+Real-provider contracts and hosted lifecycle actions can create paid resources;
+use them only for the named disposable scope. Qualification stays manual, outside CI.
+
+Reusable modules provide scheduling, validation, source sealing, bounded export
+ingestion, accounting and cleanup. Retain regression tests for those active
+contracts. Fault-evidence checks reference the active observer access/retirement
+boundary tests. Old single-worker runners, platform-baseline/SQLite-soak experiments,
+persisted-query probes and their isolated fixture tests are removed. Their source
+remains in Git history; generated reports, failed evidence, traces and sealed
+payloads remain outside tracked source. Do not add a per-commit report archive.
 
 ## Short rehearsal before the gate
 
@@ -79,7 +98,7 @@ from its separate clean checkout and retained original modules; create the candi
 from the reviewed current source. Both have equal corpus size and unchanged ceilings.
 Do not reuse consumed execution IDs or reserved cold epochs.
 
-From `examples/cloudflare-serverless`, `cold-pilot.mjs prepare ACCOUNT_ID
+From `examples/cloudflare-serverless`, `qualify.mjs hosted stack prepare ACCOUNT_ID
 --documents=512` prepares the candidate; add `--control-source=CONTROL_EXAMPLE_DIR`
 for the exact approved control. Add `--phase-profile` on the candidate only. Prepare emits the scoped `run.json` path. Run
 `seal`, then `deploy` and the explicitly authorized disposable `upload-token` action
@@ -87,8 +106,8 @@ with that manifest. These create paid resources; preparation/sealing alone are l
 The lifecycle removes queues/triggers/AI bindings for this bounded diagnostic.
 
 ```sh
-node qualification/prepare-independent-http.mjs pair BASELINE_RUN CANDIDATE_RUN PAIR_JSON
-node qualification/paired-observer-lifecycle.mjs prepare PAIR_JSON 1 --windowed-evidence
+node qualification/qualify.mjs hosted pair BASELINE_RUN CANDIDATE_RUN PAIR_JSON
+node qualification/qualify.mjs hosted observer prepare PAIR_JSON 1 --windowed-evidence
 ```
 
 Using the emitted observer manifest, seal/deploy it, install its authorized new token,
@@ -97,8 +116,8 @@ roles with positive readiness witnesses before workload admission. Seed both equ
 corpora after attachment, verify versions/receipts, then export the fresh public plan:
 
 ```sh
-node qualification/prepare-independent-http.mjs plan BASELINE_RUN CANDIDATE_RUN PUBLIC_PLAN --observer=OBSERVER_RUN
-node qualification/monitor-independent-delivery.mjs OBSERVER_RUN DELIVERY_HISTORY
+node qualification/qualify.mjs hosted plan BASELINE_RUN CANDIDATE_RUN PUBLIC_PLAN --observer=OBSERVER_RUN
+node qualification/qualify.mjs hosted delivery OBSERVER_RUN DELIVERY_HISTORY
 ```
 
 The initial independent profile offers 256 reads at 32 reads/s, with a write every
@@ -120,7 +139,7 @@ in process memory; Wrangler deployment authentication is unchanged. Never instal
 the account credential as a Worker application secret or include it in reports.
 
 ```sh
-node qualification/independent-http-trial.mjs --plan=PUBLIC_PLAN --out=FRESH_RESULT_DIRECTORY --claims=PERSISTENT_CLAIM_DIRECTORY --dedicated-client
+node qualification/qualify.mjs hosted run --plan=PUBLIC_PLAN --out=FRESH_RESULT_DIRECTORY --claims=PERSISTENT_CLAIM_DIRECTORY --dedicated-client
 ```
 
 `--dedicated-client` records the operator's declaration that the load generator is
@@ -142,7 +161,7 @@ Keep provider delivery monitoring active from before readiness through settlemen
 After execution, join its final poll and run:
 
 ```sh
-node qualification/reconcile-independent-http.mjs FRESH_RESULT_DIRECTORY/report.json DELIVERY_HISTORY CLOSURE_JSON
+node qualification/qualify.mjs hosted reconcile FRESH_RESULT_DIRECTORY/report.json DELIVERY_HISTORY CLOSURE_JSON
 ```
 
 Both orders must meet numeric limits and paired non-regression with complete

@@ -15,7 +15,7 @@
 
 import{diagnosticPrefix}from'./diagnostic-scope.mjs';
 import{diagnosticAdmission}from'./diagnostic-memory.mjs';
-import{diagnosticStorage}from'./diagnostic-storage.mjs';
+import{diagnosticStorage}from'./diagnostic-memory.mjs';
 import{resourceFailureCode}from'../performance.mjs';
 import{fetchObserver,persistObserverTail}from'./paired-observer.mjs';
 export default{async fetch(request,env){if(!env.API_TOKEN||request.headers.get('Authorization')!=='Bearer '+env.API_TOKEN)return new Response('unauthorized',{status:401});env=diagnosticStorage(env,'tail-observer');try{return await diagnosticAdmission.run(()=>fetchObserver(request,env),{signal:request.signal});}catch(error){await tailRejected(env,error);return Response.json({error:'ObserverAdmissionFailed'},{status:503});}},tail(events,env,ctx){env=diagnosticStorage(env,'tail-observer');ctx.waitUntil(persistObserverTail(events,env).catch(async(error)=>{await tailRejected(env,error);throw Error('ObserverTailFailed');}));}};

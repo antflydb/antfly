@@ -14,7 +14,7 @@
 // limitations under the License.
 
 import{test}from'node:test';import assert from'node:assert/strict';
-import collector,{sanitizeLogpushProbe}from'../qualification/logpush-probe-collector.mjs';import{Bucket}from'./object-fixture.mjs';
+import collector,{sanitizeProviderEvent}from'../qualification/export-collector.mjs';import{Bucket}from'./object-fixture.mjs';
 const source='antfly-1278-telemetry-fixture-source',token='disposable-local-fixture-only',id=crypto.randomUUID(),capture=crypto.randomUUID();
 const row=()=>({ScriptName:source,EventTimestampMs:1234,EventType:'fetch',Entrypoint:'default',Outcome:'ok',ScriptVersion:{id},CPUTimeMs:1,WallTimeMs:10,Event:{request:{headers:{Authorization:'secret-must-not-persist','cf-ray':'a'.repeat(16)},url:'https://private.invalid'},requestId:'private-request-id'},Logs:[{timestamp:1234,message:[JSON.stringify({event:'antfly.qualification_probe',id,kind:'fetch',phase:'late'}),'secret-must-not-persist']}],Exceptions:[]});
 const env=()=>({API_TOKEN:token,CAPTURE_ID:capture,SOURCE_WORKER:source,LOGS:new Bucket()});
@@ -31,15 +31,17 @@ test('Logpush gzip validation and source boundaries cannot create unscoped durab
  assert.equal((await collector.fetch(request('/ingest','{invalid'),e)).status,400);assert.equal((await collector.fetch(request('/ingest','x'.repeat(6*1024*1024+1)),e)).status,413);assert.equal(e.LOGS.objects.size,3);assert.ok([...e.LOGS.objects.keys()].every(key=>key.startsWith('probe-v1/'+capture+'/rejections/')));
 });
 test('Logpush preserves late resource codes and marks unknown invocation schemas as unknown',async()=>{
- const value=row();value.EventType='new-unknown-type';value.Logs.push({message:[JSON.stringify({event:'antfly.resource_failure',failure_code:'SQLITE_NOMEM secret-must-not-persist'})]});const safe=await sanitizeLogpushProbe(value,source);assert.equal(safe.event_type,'unknown');assert.ok(JSON.stringify(safe).includes('SQLITE_NOMEM'));assert.ok(!JSON.stringify(safe).includes('secret-must-not-persist'));
+ const value=row();value.EventType='new-unknown-type';value.Logs.push({message:[JSON.stringify({event:'antfly.resource_failure',failure_code:'SQLITE_NOMEM secret-must-not-persist'})]});const safe=await sanitizeProviderEvent(value,source);assert.equal(safe.event_type,'unknown');assert.ok(JSON.stringify(safe).includes('SQLITE_NOMEM'));assert.ok(!JSON.stringify(safe).includes('secret-must-not-persist'));
 });
-test('probe plans require exact private-source replies and drain only the owned capture prefix',async()=>{
- const e=env();e.FIXTURE={fetch:async url=>Response.json({id:new URL(url).searchParams.get('nonce'),rpc:crypto.randomUUID()})};const exercise=await(await collector.fetch(request('/exercise',JSON.stringify({count:2})),e)).json();assert.equal(exercise.expected.length,2);await e.LOGS.put('unrelated','keep');assert.equal((await(await collector.fetch(request('/drain','{}'),e)).json()).deleted,1);assert.equal((await(await collector.fetch(request('/drain','{}'),e)).json()).done,true);assert.ok(e.LOGS.objects.has('unrelated'));
+test('collector cleanup drains only its owned capture prefix',async()=>{
+ const e=env(),prefix='probe-v1/'+capture+'/';await e.LOGS.put(prefix+'owned','{}');await e.LOGS.put('unrelated','keep');
+ assert.equal((await(await collector.fetch(request('/drain','{}'),e)).json()).deleted,1);
+ assert.equal((await(await collector.fetch(request('/drain','{}'),e)).json()).done,true);assert.ok(e.LOGS.objects.has('unrelated'));
+ assert.equal((await collector.fetch(request('/exercise','{}'),e)).status,404);
 });
-
 test('retirement closes ingestion and execution while retaining authenticated drain',async()=>{const e=env();e.RETIRE_MODE='true';assert.equal((await collector.fetch(request('/ingest',JSON.stringify(row())),e)).status,410);assert.equal((await collector.fetch(request('/exercise','{}'),e)).status,410);assert.equal((await collector.fetch(request('/drain','{}'),e)).status,200);assert.equal(e.LOGS.objects.size,0);});
 
-test('Logpush Pascal-case metadata retains only safe versions, schema keys and hashed identities',async()=>{const value=row();value.ScriptVersion={ID:id,Message:'secret-must-not-persist'};value.Event={Request:{Headers:{'cf-ray':'private-ray'}},RpcMethod:'secret-must-not-persist',RequestID:'private-request-id',RayID:'private-ray-id'};const safe=await sanitizeLogpushProbe(value,source);assert.equal(safe.version_id,id);assert.deepEqual(safe.event_keys,['RayID','Request','RequestID','RpcMethod']);assert.equal(safe.unknown_event_keys,0);assert.match(safe.identity_candidates.request_ray_id_sha256,/^[a-f0-9]{64}$/);assert.ok(!JSON.stringify(safe).includes('secret-must-not-persist'));assert.ok(!JSON.stringify(safe).includes('private-ray'));});
+test('Logpush Pascal-case metadata retains only safe versions, schema keys and hashed identities',async()=>{const value=row();value.ScriptVersion={ID:id,Message:'secret-must-not-persist'};value.Event={Request:{Headers:{'cf-ray':'private-ray'}},RpcMethod:'secret-must-not-persist',RequestID:'private-request-id',RayID:'private-ray-id'};const safe=await sanitizeProviderEvent(value,source);assert.equal(safe.version_id,id);assert.deepEqual(safe.event_keys,['RayID','Request','RequestID','RpcMethod']);assert.equal(safe.unknown_event_keys,0);assert.match(safe.identity_candidates.request_ray_id_sha256,/^[a-f0-9]{64}$/);assert.ok(!JSON.stringify(safe).includes('secret-must-not-persist'));assert.ok(!JSON.stringify(safe).includes('private-ray'));});
 
 test('bounded telemetry pages preserve native cursors across byte-limited pages and owned prefixes',async()=>{
  const e=env(),prefix='probe-v1/'+capture+'/';for(let i=0;i<40;i++)await e.LOGS.put(prefix+String(i).padStart(3,'0'),JSON.stringify({i,padding:'x'.repeat(i<3?1500000:1)}));await e.LOGS.put('unrelated','secret');

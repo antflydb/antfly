@@ -15,7 +15,7 @@
 
 // Versioned proof projection. Verbose sanitized data is archived separately;
 // resource/unknown errors, truncation and physical I/O lifetimes stay canonical.
-import{diagnosticBucketIdentity}from'./diagnostic-storage.mjs';
+import{diagnosticBucketIdentity}from'./diagnostic-memory.mjs';
 import{parseDiagnosticJson}from'./diagnostic-memory.mjs';
 const enc=new TextEncoder();
 export const canonicalLayout='window-v1';

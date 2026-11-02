@@ -174,9 +174,7 @@ def main():
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = QUAL / ("local-retention-" + timestamp)
     output.mkdir(parents=True, exist_ok=False)
-    control = json.loads(
-        (BASE / "qualification/caller-control-correctness-evidence.json").read_text()
-    )
+    control = json.loads((BASE / "qualification/approved-control.json").read_text())
     control_hashes = control["native_sha256"]
     # Use retained manifests to find one copy of each exact approved control module.
     copies = {}

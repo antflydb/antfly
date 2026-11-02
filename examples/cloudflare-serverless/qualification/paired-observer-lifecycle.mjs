@@ -16,7 +16,7 @@
 // Owned, diagnostic-only observer lifecycle. Existing sealed application
 // modules are never rebuilt or edited when attaching observation metadata.
 import{readFile,writeFile,mkdir,readdir,appendFile,unlink,copyFile}from'node:fs/promises';import{resolve,dirname,basename}from'node:path';import{spawn,execFileSync}from'node:child_process';import{createHash,randomBytes}from'node:crypto';import{assertGateRun}from'./gate-scope.mjs';import{verifySealedRun}from'./gate-provenance.mjs';import{readCounterToken}from'./independent-counters.mjs';
-import{assertObservationRun,verifyObservationRun}from'./observation-runs.mjs';import{providerAccountApi}from'./provider-account-api.mjs';
+import{assertObservationRun,verifyObservationRun}from'./gate-provenance.mjs';import{providerAccountApi}from'./provider-account-api.mjs';
 const cwd=resolve(import.meta.dirname,'..'),cli=resolve(cwd,'node_modules/wrangler/bin/wrangler.js'),json=async p=>JSON.parse(await readFile(p)),save=(p,v)=>writeFile(p,JSON.stringify(v,null,2),{mode:0o600}),sha=b=>createHash('sha256').update(b).digest('hex');
 const[action,path,trialText,mode]=process.argv.slice(2);
 if(mode&&mode!=='--windowed-evidence'||mode&&action!=='prepare')throw Error('ObserverModeInvalid');

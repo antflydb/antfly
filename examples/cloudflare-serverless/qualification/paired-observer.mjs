@@ -17,7 +17,7 @@
 // or database storage bindings are installed here. Source routing is allowlisted.
 import{diagnosticPrefix}from'./diagnostic-scope.mjs';
 import{parseDiagnosticJson,tailAdmission,diagnosticWrites,reserveTailInput}from'./diagnostic-memory.mjs';
-import collector,{readBody}from'./logpush-probe-collector.mjs';
+import collector,{readBody}from'./export-collector.mjs';
 import{prepareTailDelivery,publishTailDelivery,counterWitness}from'./tail-counter.mjs';
 const uuid=v=>typeof v==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(v);
 export function observerScopes(env){

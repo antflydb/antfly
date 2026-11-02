@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import{observerScopes}from'./paired-observer.mjs';import{reconcileObserverSource,observerDiagnosticsComplete}from'./paired-observer-client.mjs';import{evaluateDestinationHistory}from'./destination-history.mjs';
+import{observerScopes}from'./paired-observer.mjs';import{reconcileObserverSource,observerDiagnosticsComplete}from'./paired-observer-client.mjs';import{evaluateDestinationHistory}from'./provider-account-api.mjs';
 // Recompute canonical/native proofs for every role. Complete client responses
 // or a successful ingestion acknowledgement never stand in for service coverage.
 export async function closeIndependentEvidence({observer,reports,health,history,first,second,witnesses,started_at,finished_at}){

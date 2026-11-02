@@ -18,7 +18,7 @@ import{drainBucket}from'./drain-bucket.mjs';
 import{quiesceQueueMaintenance}from'./queue-quiescence.mjs';
 import{verifySealedRun,assertUnusedRecovery,runtimePlacement}from'./gate-provenance.mjs';
 import{verifyWalTailReaders}from'./wal-compatibility.mjs';
-import{verifyInlineMetadataReaders}from'./metadata-compatibility.mjs';
+import{verifyInlineMetadataReaders}from'./wal-compatibility.mjs';
 import{isDeepStrictEqual}from'node:util';
 import {readFile,writeFile,appendFile,mkdir,readdir,unlink,rm} from 'node:fs/promises';
 import {resolve} from 'node:path';

@@ -17,7 +17,7 @@ import{readFile,writeFile,mkdir,appendFile,readdir,unlink,rm}from'node:fs/promis
 import{resolve,join}from'node:path';import{createHash,randomBytes}from'node:crypto';
 import{spawn,execFileSync}from'node:child_process';import assert from'node:assert/strict';
 import{tailFrames}from'./metrics-tail.mjs';
-import{seedIndependentCorpus}from'./corpus.mjs';import{verifyObservationRun}from'./observation-runs.mjs';
+import{seedIndependentCorpus}from'./corpus.mjs';import{verifyObservationRun}from'./gate-provenance.mjs';
 const[action,path]=process.argv.slice(2),root=process.cwd(),cli=resolve('node_modules/wrangler/bin/wrangler.js'),roles=['writer','reader','builder','app'];
 const save=run=>writeFile(join(run.dir,'run.json'),JSON.stringify(run,null,2));
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');

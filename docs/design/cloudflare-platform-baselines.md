@@ -157,8 +157,9 @@ current Mac reached a one-minute load average around 110 during validation, so
 the 512-document timing comparison is deferred until a quieter run; correctness
 test durations are not latency benchmark populations.
 
-Current validation passes all 631 Node tests, 20 R2 workerd checks and 18
-qualification workerd checks. Epoch setup drains `has_more` before requiring
+The consolidated tooling passes 615 Node tests and the full 63-case workerd
+suite, including the 20 R2 and 18 qualification cases. Retired fixture tests cover
+only the removed diagnostic programs. Epoch setup drains `has_more` before requiring
 published indexes; existing query/fencing assertions remain intact. These checks
 include simulated slow-storage capacity recovery,
 publication failure/retry through HTTP and Queue, exact count/body verification,
@@ -234,7 +235,7 @@ these small local populations, so increasing kernel capacity is not justified by
 this evidence.
 
 Run a short 512-document comparison on the current source before longer tests.
-For local diagnosis use `read-state-latency.mjs`, separate fresh output directories,
+For local diagnosis use `npm run qualify -- local ...`, separate fresh output directories,
 explicit variant flags, both orders and complete phase profiles. An incumbent
 resident variant is not the approved historical control. Avoid overlapping builds
 or latency workloads. Preserve negative results and verify actual activation.

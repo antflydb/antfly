@@ -14,7 +14,7 @@
 // limitations under the License.
 
 import{test}from'node:test';import assert from'node:assert/strict';
-import{applicationTracePhases,profilePrivateRecords}from'../qualification/private-phase-profile.mjs';
+import{applicationTracePhases,profilePrivateRecords}from'../qualification/phase-attribution.mjs';
 const record=(logs,extra={})=>({event:{outcome:'ok',cpuTime:2,wallTime:20,logs:[{message:logs.map(v=>JSON.stringify(v))}],...extra}});
 test('private phase profiling follows application traces without inventing provider identities',()=>{
  const app={...record([{event:'antfly.trace',scope:'http',trace_id:'logical-write'}]),attempt_id_sha256:'attempt'},mapping=applicationTracePhases([app],new Map([['attempt',{phase:'write'}]]));
@@ -35,7 +35,7 @@ test('CLI profiles hash-verified driver captures and rejects changed private evi
  const{mkdtemp,mkdir,writeFile,readFile,rm}=await import('node:fs/promises'),{resolve,join}=await import('node:path'),{spawnSync}=await import('node:child_process'),{createHash}=await import('node:crypto'),{attemptIdentity}=await import('../qualification/invocation-accounting.mjs');
  const root=resolve('dist/private-profile-tests');await mkdir(root,{recursive:true});const dir=await mkdtemp(join(root,'case-')),id='00000000-0000-4000-8000-000000000001',app={...record([{event:'antfly.trace',scope:'http',trace_id:'logical-write'}]),attempt_id_sha256:attemptIdentity(id)},base={execution_id:'synthetic',sides:[{run:'synthetic',invocation_ledger:{attempts:[{id,phase:'write'}]}}],captures:[]};
  try{for(const role of['app','writer','reader','builder']){const records=role==='app'?[app]:role==='writer'?[record([{event:'antfly.trace',trace_id:'logical-write',scope:'wal',spans:[{name:'native_wal_plan',duration_ms:21}]}])]:[],path=join(dir,role+'.json'),bytes=JSON.stringify({objects:[{value:{source:'provider-tail-dispatch',records}}]});await writeFile(path,bytes);base.captures.push({source:role==='app'?'synthetic':'synthetic-'+role,path,pass:0,sha256:createHash('sha256').update(bytes).digest('hex')});}
-  const report=join(dir,'report.json'),output=join(dir,'profile.json'),cli=resolve('qualification/profile-paired-rehearsal.mjs');await writeFile(report,JSON.stringify(base));const run=out=>spawnSync(process.execPath,[cli,report,dir,out,'--all-roles'],{encoding:'utf8'});const done=run(output);assert.equal(done.status,0,done.stderr);const profile=JSON.parse(await readFile(output));assert.equal(profile.qualification,false);assert.equal(profile.sides[0].private_roles.writer.metrics['write/trace:wal/native_wal_plan'].p95,21);
+  const report=join(dir,'report.json'),output=join(dir,'profile.json'),cli=resolve('qualification/analyze-request-phases.mjs');await writeFile(report,JSON.stringify(base));const run=out=>spawnSync(process.execPath,[cli,'--native',report,dir,out,'--all-roles'],{encoding:'utf8'});const done=run(output);assert.equal(done.status,0,done.stderr);const profile=JSON.parse(await readFile(output));assert.equal(profile.qualification,false);assert.equal(profile.sides[0].private_roles.writer.metrics['write/trace:wal/native_wal_plan'].p95,21);
   await writeFile(join(dir,'writer.json'),'changed evidence');const changed=run(join(dir,'changed.json'));assert.notEqual(changed.status,0);assert.match(changed.stderr,/RehearsalCaptureHashChanged/);
  }finally{await rm(dir,{recursive:true,force:true});}
 });

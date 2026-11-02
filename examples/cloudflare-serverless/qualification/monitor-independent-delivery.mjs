@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import{open}from'node:fs/promises';import{resolve}from'node:path';import{startDestinationMonitor}from'./destination-history.mjs';
+import{open}from'node:fs/promises';import{resolve}from'node:path';import{startDestinationMonitor}from'./provider-account-api.mjs';
 // Run locally beside the remote client. Only sanitized account delivery status
 // is persisted; account authorization remains in Wrangler's local login flow.
 const[manifest,output]=process.argv.slice(2);if(!manifest||!output)throw Error('UsageObserverManifestDeliveryHistoryOutput');const path=resolve(output),samples=[];let handle=await open(path,'wx',0o600),stopping;

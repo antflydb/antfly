@@ -17,7 +17,7 @@
 // Parallel gets stay within the existing 32-object / 4 MiB page bounds.
 import{diagnosticPrefix}from'./diagnostic-scope.mjs';
 import{diagnosticAdmission,diagnosticReadResponses}from'./diagnostic-memory.mjs';
-import{diagnosticStorage,diagnosticFailureResponse}from'./diagnostic-storage.mjs';
+import{diagnosticStorage,diagnosticFailureResponse}from'./diagnostic-memory.mjs';
 import{observerScopes}from'./paired-observer.mjs';
 import{readCanonicalWindow}from'./canonical-window-reader.mjs';
 export default{async fetch(request,env){
