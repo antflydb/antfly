@@ -95,24 +95,27 @@ Current rebuilt full/compact/observe module SHA-256 values are:
 
 The preceding integration passed 623 JavaScript tests, 209 object-store checks
 (two provider skips), 96 graph/page, 16 read-state, 14 publication/plan, 27 native
-host contracts and six actual-workerd checks. Rebuilt-module validation is kept
-separate from that earlier source and from latency evidence.
+host contracts and six actual-workerd checks. Current rebuilt-module validation passes all 625 JavaScript tests and 27 native
+host contracts. The actual-workerd comparison below exercises reconstruction and
+concurrent reads/writes on those exact rebuilt modules; it does not rerun every
+earlier native/provider suite.
 The approved control remains immutable; rebuilt modules do not replace its bytes.
 
-The short local comparison before the latest main merge completed both execution orders, four tenants of 512 documents, 20 ms injected storage delay and
+The current short local comparison completed both execution orders on the rebuilt
+modules above, four tenants of 512 documents, 20 ms injected storage delay and
 zero-delay setup. It offered 128 reads at 16 reads/s with one write per sixteen
 reads, per case, using fresh stores and required fences plus latest-read checks.
 
 | Local p95, ms, both orders | Resident incumbent | Durable cold pipeline |
 | --- | ---: | ---: |
-| Read | 66.1–66.5 | 40.1 |
-| Write | 371.2–374.5 | 187.9–189.6 |
-| Reconstructed read | 411.1–424.7 | 198.7–201.2 |
+| Read | 68.4–69.0 | 39.1–40.0 |
+| Write | 372.1–378.9 | 182.6–186.0 |
+| Reconstructed read | 400.7–407.7 | 180.1–180.7 |
 
 Four cases contain 512 measured reads, 32 writes and 48 separate reconstruction
 reads. All 544 mixed requests have valid HTTP/owner profiles. Exact body/fence/count,
 module/bundle hashes, activation, physical settlement and error-history guards pass.
-No offered failures occur; maximum dispatch lag is below 1.9 ms. Batching stays off.
+No offered failures occur; maximum dispatch lag is below 3 ms. Batching stays off.
 These are small emulator populations, with only eight writes/case and twelve cold
 cohort members/case, not independent physical cold boots. They compare the current
 resident incumbent with the durable pipeline, **not approved control c44896ac8c**.
@@ -120,7 +123,7 @@ They do not replace hosted qualification or establish a statistical SLO. Reports
 and negative earlier runs remain under local `dist/qualification/`.
 
 Same-request profiles identify the local tail reduction: the incumbent's slowest
-reads spend 118–287 ms in owner admission. The durable candidate's slowest reads
+reads spend 121–291 ms in owner admission. The durable candidate's slowest reads
 instead mostly contain one 23–27 ms immutable dependency wave. This supports the
 existing owner/cold-pipeline path for the next hosted comparison; it is not proof
 that the historical hosted tail has the same cause. Kernel queue p95 is zero in
