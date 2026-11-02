@@ -30,21 +30,23 @@ const CurrentLease = struct {
     expires_at_unix_ns: u64,
     released: bool,
     body_carries_coordination_etag: bool,
-    etag: []u8,
+    revision: objectstore.ObjectRevision,
 
     pub fn deinit(self: *CurrentLease, alloc: Allocator) void {
         if (self.owner_id) |owner_id| alloc.free(owner_id);
-        alloc.free(self.etag);
+        var owned = self.revision;
+        owned.deinit(alloc);
         self.* = undefined;
     }
 };
 
 const CurrentFenceFloor = struct {
     value: u64,
-    etag: []u8,
+    revision: objectstore.ObjectRevision,
 
     pub fn deinit(self: *CurrentFenceFloor, alloc: Allocator) void {
-        alloc.free(self.etag);
+        var owned = self.revision;
+        owned.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -131,10 +133,8 @@ pub const ObjectWorkLeaseStore = struct {
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
         defer self.alloc.free(content_type);
 
-        var result = self.client.putObject(self.bucket, key, payload, .{
+        var result = self.client.compareAndPut(self.bucket, key, payload, if (current) |value| value.revision else null, .{
             .content_type = content_type,
-            .if_none_match = current == null,
-            .if_match_etag = if (current) |value| value.etag else null,
         }) catch |err| switch (err) {
             error.PreconditionFailed => return null,
             else => {
@@ -229,9 +229,8 @@ pub const ObjectWorkLeaseStore = struct {
         defer self.alloc.free(payload);
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
         defer self.alloc.free(content_type);
-        var result = self.client.putObject(self.bucket, key, payload, .{
+        var result = self.client.compareAndPut(self.bucket, key, payload, current.revision, .{
             .content_type = content_type,
-            .if_match_etag = current.etag,
         }) catch |err| switch (err) {
             error.PreconditionFailed => return error.WorkLeaseLost,
             else => {
@@ -271,9 +270,8 @@ pub const ObjectWorkLeaseStore = struct {
         defer self.alloc.free(payload);
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, released_record);
         defer self.alloc.free(content_type);
-        var result = self.client.putObject(self.bucket, key, payload, .{
+        var result = self.client.compareAndPut(self.bucket, key, payload, current.revision, .{
             .content_type = content_type,
-            .if_match_etag = current.etag,
         }) catch |err| switch (err) {
             error.PreconditionFailed => return false,
             else => {
@@ -286,12 +284,12 @@ pub const ObjectWorkLeaseStore = struct {
     }
 
     fn readCurrentAlloc(self: *ObjectWorkLeaseStore, key: []const u8) !?CurrentLease {
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer result.deinit(self.alloc);
-        const etag = result.metadata.etag orelse return error.MissingLeaseObjectEtag;
+        const revision = result.metadata.writeRevision() orelse return error.MissingLeaseObjectEtag;
         const trimmed = std.mem.trim(u8, result.body, " \t\r\n");
         var record: head_coordination.Record = undefined;
         var owner_id: ?[]u8 = null;
@@ -324,7 +322,7 @@ pub const ObjectWorkLeaseStore = struct {
             }
         }
         errdefer if (owner_id) |owned| self.alloc.free(owned);
-        const owned_etag = try self.alloc.dupe(u8, etag);
+        const owned_revision = try revision.clone(self.alloc);
         return .{
             .head_version = record.head_version,
             .owner_id = owner_id,
@@ -332,7 +330,7 @@ pub const ObjectWorkLeaseStore = struct {
             .expires_at_unix_ns = record.expires_at_unix_ns,
             .released = record.released,
             .body_carries_coordination_etag = head_coordination.hasPayloadFingerprint(result.body),
-            .etag = owned_etag,
+            .revision = owned_revision,
         };
     }
 
@@ -361,10 +359,8 @@ pub const ObjectWorkLeaseStore = struct {
                 return error.LeaseFencingTokenExhausted;
             const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{proposed});
             defer self.alloc.free(payload);
-            var result = self.client.putObject(self.bucket, key, payload, .{
+            var result = self.client.compareAndPut(self.bucket, key, payload, if (current) |value| value.revision else null, .{
                 .content_type = "text/plain",
-                .if_none_match = current == null,
-                .if_match_etag = if (current) |value| value.etag else null,
             }) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => {
@@ -396,10 +392,8 @@ pub const ObjectWorkLeaseStore = struct {
             }
             const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{minimum});
             defer self.alloc.free(payload);
-            var result = self.client.putObject(self.bucket, key, payload, .{
+            var result = self.client.compareAndPut(self.bucket, key, payload, if (current) |value| value.revision else null, .{
                 .content_type = "text/plain",
-                .if_none_match = current == null,
-                .if_match_etag = if (current) |value| value.etag else null,
             }) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => {
@@ -417,15 +411,15 @@ pub const ObjectWorkLeaseStore = struct {
     }
 
     fn readFenceFloorAlloc(self: *ObjectWorkLeaseStore, key: []const u8) !?CurrentFenceFloor {
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer result.deinit(self.alloc);
-        const etag = result.metadata.etag orelse return error.MissingLeaseObjectEtag;
+        const revision = result.metadata.writeRevision() orelse return error.MissingLeaseObjectEtag;
         return .{
             .value = try std.fmt.parseInt(u64, std.mem.trim(u8, result.body, " \t\r\n"), 10),
-            .etag = try self.alloc.dupe(u8, etag),
+            .revision = try revision.clone(self.alloc),
         };
     }
 
@@ -865,4 +859,38 @@ test "serverless active pre-floor lease seeds rollback-safe fencing epoch" {
 
     const replacement = (try leases.provider().acquire("docs", "new-worker", 101, 10)).?;
     try std.testing.expect(replacement.fencing_token > active.fencing_token);
+}
+
+test "serverless upload identities reuse a fresh lease while cutover still rejects takeover" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var leases = try ObjectWorkLeaseStore.initWithClient(a, memory.client(), "test", "scope");
+    defer leases.deinit();
+    const provider = leases.provider();
+    var held = (try work_lease.acquireHeld(provider, std.testing.io, "docs", "original", std.time.ns_per_hour)).?;
+    var client = memory.client();
+    var before = try client.getObject("test", "scope/docs/HEAD", .{});
+    defer before.deinit(a);
+    const guard = held.guard();
+    for (0..16) |_| try std.testing.expectEqual(held.acquisition.fencing_token, (try guard.uploadFence("docs")).?.fencing_token);
+    var after = try client.getObject("test", "scope/docs/HEAD", .{});
+    defer after.deinit(a);
+    try std.testing.expectEqualStrings(before.metadata.etag.?, after.metadata.etag.?);
+    try std.testing.expectError(error.WorkLeaseNamespaceMismatch, guard.uploadFence("other"));
+    _ = try guard.preparePublication("docs");
+    var renewed = try client.getObject("test", "scope/docs/HEAD", .{});
+    defer renewed.deinit(a);
+    try std.testing.expect(!std.mem.eql(u8, after.metadata.etag.?, renewed.metadata.etag.?));
+    const replacement = (try provider.acquire("docs", "replacement", held.acquisition.expires_at_unix_ns + 1, std.time.ns_per_hour)).?;
+    try std.testing.expect(replacement.fencing_token > held.acquisition.fencing_token);
+    // A token may still identify orphan uploads. It grants no cutover authority.
+    _ = try guard.uploadFence("docs");
+    try std.testing.expectError(error.WorkLeaseLost, guard.preparePublication("docs"));
+    var progress_impl = try @import("../catalog/object_progress_store.zig").ObjectProgressStore.initWithClient(a, memory.client(), "test", "scope");
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    try std.testing.expectError(error.WorkLeaseLost, progress.compareAndSwapHeadFenced("docs", null, 1, .{ .owner_id = held.owner_id, .fencing_token = held.acquisition.fencing_token }));
+    held.released = true;
+    try std.testing.expectError(error.WorkLeaseLost, guard.uploadFence("docs"));
 }

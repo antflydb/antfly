@@ -16,10 +16,17 @@
 const std = @import("std");
 
 pub const runtime = @import("runtime.zig");
+pub const live_view = @import("live_view.zig");
+pub const live_overlay = @import("live_overlay.zig");
+pub const ServingShard = @import("serving_shard.zig").Shard;
+pub const ReadStateCache = @import("read_state_cache.zig").Cache;
+pub const live_session = @import("live_session.zig");
+pub const LiveSession = live_session.Session;
 pub const materializer = @import("materializer.zig");
 pub const request = @import("request.zig");
 pub const plan = @import("plan.zig");
 pub const cache = @import("cache.zig");
+pub const exact_scan = @import("exact_scan.zig");
 pub const indexed_reader = @import("indexed_reader.zig");
 pub const document_facts_reader = @import("document_facts_reader.zig");
 pub const graph_reader = @import("graph_reader.zig");
@@ -292,12 +299,16 @@ pub const materializeDocumentsOverBaseAlloc = materializer.materializeOverBaseAl
 pub const freeMaterializedDocuments = materializer.freeDocuments;
 
 test "serverless query module compiles" {
+    _ = live_view;
+    _ = live_overlay;
+    _ = live_session;
     _ = runtime;
     _ = materializer;
     _ = request;
     _ = plan;
     _ = cache;
     _ = indexed_reader;
+    _ = exact_scan;
     _ = graph_reader;
     _ = lake_rows;
     _ = lake_explain;

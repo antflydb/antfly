@@ -31,12 +31,37 @@ pub const ReadCache = struct {
     read: *const fn (*anyopaque, std.mem.Allocator, *artifacts.ArtifactStore, refs.ArtifactRef, u64, usize, [32]u8, CancellationToken, *u64) anyerror![]u8,
 };
 
+/// One request-owned small physical block. Never shared with parallel workers
+/// or retained beyond the caller's native memory reservation.
+pub const PackReadCache = struct {
+    allocator: ?std.mem.Allocator = null,
+    entry: ?struct { allocator: std.mem.Allocator, domain: [32]u8, attempt: [16]u8, digest: [32]u8, bytes: []u8 } = null,
+    directory: ?struct { allocator: std.mem.Allocator, bytes: []u8 } = null,
+    pub fn clearPack(self: *@This()) void {
+        if (self.entry) |value| value.allocator.free(value.bytes);
+        self.entry = null;
+    }
+    pub fn clearDirectory(self: *@This()) void {
+        if (self.directory) |value| value.allocator.free(value.bytes);
+        self.directory = null;
+    }
+    pub fn deinit(self: *@This()) void {
+        self.clearPack();
+        self.clearDirectory();
+    }
+};
+
 pub const PageStore = struct {
+    pack_cache: ?*PackReadCache = null,
+    inline_page: ?struct { ref: tree.Ref, bytes: []const u8 } = null,
     domain: [32]u8 = @splat(0),
     prefix_keys: bool = false,
-    /// Native lake publication forests opt in; graph topology/facts retain
+    value_prefix: ?tree.ValuePrefix = null,
+    /// Native publication forests opt in; legacy topology/facts retain
     /// their standalone object reclamation path.
     pack_pages: bool = false,
+    /// A bounded query may coalesce requested packed ranges without threads.
+    coalesce_reads: bool = false,
     attempt: [16]u8 = @splat(0),
     artifacts: *artifacts.ArtifactStore,
     cancellation: CancellationToken = .none,
@@ -60,7 +85,7 @@ pub const PageStore = struct {
     }
 
     pub fn store(self: *PageStore) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .decoded_page = if (self.read_cache != null and self.read_cache.?.decoded_read != null) .{ .ptr = self, .read = readDecoded } else null, .ptr = self, .get = get, .read_many = if (self.io != null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
+        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .value_prefix = self.value_prefix, .decoded_page = if (self.read_cache != null and self.read_cache.?.decoded_read != null) .{ .ptr = self, .read = readDecoded } else null, .ptr = self, .get = get, .read_many = if (self.io != null or self.coalesce_reads or (self.read_cache != null and (self.read_cache.?.decoded_many != null or self.read_cache.?.read_many != null))) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null or self.artifacts.vtable.put_scoped_many != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
     }
 
     pub fn namespaceDomain(namespace: []const u8) [32]u8 {
@@ -145,6 +170,39 @@ pub const PageStore = struct {
         return bytes;
     }
     fn read(self: *PageStore, alloc: std.mem.Allocator, ref: tree.Ref, id: []const u8) ![]u8 {
+        if (self.inline_page) |page| if (page.ref.eql(ref)) {
+            try self.cancellation.check();
+            try artifacts.chargeReadBudget(self.remaining_read_bytes, ref.bytes);
+            return alloc.dupe(u8, page.bytes);
+        };
+        if (self.pack_cache) |cache| if (ref.pack) |location| {
+            try self.cancellation.check();
+            if (cache.entry) |entry| if (entry.bytes.len == location.bytes and std.mem.eql(u8, &entry.domain, &self.domain) and std.mem.eql(u8, &entry.attempt, &ref.attempt) and std.mem.eql(u8, &entry.digest, &location.digest)) {
+                try artifacts.chargeReadBudget(self.remaining_read_bytes, ref.bytes);
+                return alloc.dupe(u8, entry.bytes[location.offset..][0..ref.bytes]);
+            };
+            const owner = cache.allocator orelse alloc;
+            const headroom = @import("../build/lake_build_limits.zig").WorkingSetAllocator.cacheHeadroom(owner) orelse std.math.maxInt(usize);
+            // Physical-block caching is optional. Leave room for the selected
+            // page and its decoder; the 128 KiB point lane must use ranges
+            // instead of failing an allocation for unrelated sibling pages.
+            const workspace = @as(usize, location.bytes) +| ref.bytes +| tree.readWorkspace(ref);
+            if (location.bytes <= tree.Forest.max_bytes + tree.max_write_batch * 4096 and location.bytes <= self.remaining_read_bytes.* and workspace <= headroom) {
+                const bytes = if (self.read_cache) |shared|
+                    try shared.read(shared.ptr, owner, self.artifacts, .{ .kind = .graph_segment, .artifact_id = id, .checksum = id[7..71], .byte_len = location.bytes }, 0, location.bytes, location.digest, self.cancellation, self.remaining_read_bytes)
+                else block: {
+                    try artifacts.chargeReadBudget(self.remaining_read_bytes, location.bytes);
+                    break :block try self.artifacts.getRangeAllocWithCancellationUsingAllocator(owner, id, 0, location.bytes, self.cancellation);
+                };
+                errdefer owner.free(bytes);
+                if (bytes.len != location.bytes) return error.ArtifactIntegrityMismatch;
+                try artifacts.validatePayloadSha256WithCancellation(bytes, id[7..71], self.cancellation);
+                const page = try alloc.dupe(u8, bytes[location.offset..][0..ref.bytes]);
+                cache.clearPack();
+                cache.entry = .{ .allocator = owner, .domain = self.domain, .attempt = ref.attempt, .digest = location.digest, .bytes = bytes };
+                return page;
+            }
+        };
         if (self.read_cache) |cache| return cache.read(cache.ptr, alloc, self.artifacts, .{
             .kind = .graph_segment,
             .artifact_id = id,
@@ -157,6 +215,11 @@ pub const PageStore = struct {
 
     fn readDecoded(raw: *anyopaque, a: std.mem.Allocator, ref: tree.Ref) !tree.NavigationPage {
         const self: *PageStore = @ptrCast(@alignCast(raw));
+        if ((ref.pack != null and self.pack_cache != null) or (if (self.inline_page) |page| page.ref.eql(ref) else false)) {
+            var plain = self.store();
+            plain.decoded_page = null;
+            return tree.readNavigationPage(a, plain, ref);
+        }
         const cache = self.read_cache.?;
         return cache.decoded_read.?(cache.ptr, a, self.artifacts, self.domain, ref, self.cancellation, self.remaining_read_bytes);
     }
@@ -164,7 +227,7 @@ pub const PageStore = struct {
     fn readMany(raw: *anyopaque, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.NavigationPage) !void {
         const self: *PageStore = @ptrCast(@alignCast(raw));
         if (refs_.len != output.len or refs_.len > tree.max_read_batch) return error.InvalidGraphPage;
-        if (self.read_phase != null) return self.readPublication(a, refs_, output);
+        if (self.read_phase != null) return self.readCoalesced(a, refs_, output);
         if (self.read_cache) |cache| if (cache.decoded_many) |many| return many(cache.ptr, a, self.artifacts, self.domain, refs_, output, self.cancellation, self.remaining_read_bytes);
         var bytes: u64 = 0;
         for (refs_) |ref| {
@@ -190,6 +253,7 @@ pub const PageStore = struct {
                 return;
             }
         };
+        if (self.coalesce_reads or self.io == null) return self.readCoalesced(a, refs_, output);
         try artifacts.chargeReadBudget(self.remaining_read_bytes, bytes);
         // A wave reserves its total read budget before workers start. Each
         // worker owns counters; a cached reader callback only borrows metadata.
@@ -200,6 +264,8 @@ pub const PageStore = struct {
             budgets[i] = ref.bytes;
             copies[i] = self.*;
             copies[i].io = null;
+            copies[i].pack_cache = null;
+            copies[i].inline_page = null;
             copies[i].remaining_read_bytes = &budgets[i];
             stores_[i] = copies[i].store();
         }
@@ -208,9 +274,9 @@ pub const PageStore = struct {
 
     /// The coordinator owns phase transitions and counters. Workers receive
     /// immutable ranges and a locked allocator, never the mutable phase/cache.
-    fn readPublication(self: *PageStore, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.NavigationPage) !void {
+    fn readCoalesced(self: *PageStore, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.NavigationPage) !void {
         try self.cancellation.check();
-        if (self.read_cache != null) {
+        if (self.read_cache != null and self.read_phase != null) {
             var initialized: usize = 0;
             errdefer for (output[0..initialized]) |*page| page.deinit(a);
             for (refs_, output) |ref, *page| {
@@ -277,28 +343,36 @@ pub const PageStore = struct {
         if (self.streaming) self.remaining_read_bytes.* = @as(u64, tree.max_page_bytes) * refs_.len;
         try artifacts.chargeReadBudget(self.remaining_read_bytes, bytes);
         defer for (jobs[0..count]) |job| if (job.bytes) |data| a.free(data);
-        const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
-        var allocations: scheduler.LockedAllocator = .{ .backing = a };
-        var backend = self.artifacts.*;
-        backend.io_phase = null;
-        const phase = self.read_phase.?;
-        const width = @max(1, @min(tree.max_read_batch, phase.max_parallel));
-        var begin: usize = 0;
-        while (begin < count) {
-            try self.cancellation.check();
-            const end = @min(count, begin + width);
-            try phase.begin(phase.ptr, end - begin);
-            var guard: artifacts.IoGuard = .{ .phase = phase };
-            defer guard.abort();
-            var group: std.Io.Group = .init;
-            for (jobs[begin..end]) |*job| group.async(phase.io, Job.run, .{ job, &backend, allocations.allocator(), self.domain, self.cancellation });
-            group.await(phase.io) catch |err| {
-                group.cancel(phase.io);
-                return guard.failed(err);
-            };
-            for (jobs[begin..end]) |job| if (job.failure) |err| return guard.failed(err);
-            try guard.finish();
-            begin = end;
+        if (self.read_phase) |_| {
+            const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
+            var allocations: scheduler.LockedAllocator = .{ .backing = a };
+            var backend = self.artifacts.*;
+            backend.io_phase = null;
+            const phase = self.read_phase.?;
+            const width = @max(1, @min(tree.max_read_batch, phase.max_parallel));
+            var begin: usize = 0;
+            while (begin < count) {
+                try self.cancellation.check();
+                const end = @min(count, begin + width);
+                try phase.begin(phase.ptr, end - begin);
+                var guard: artifacts.IoGuard = .{ .phase = phase };
+                defer guard.abort();
+                var group: std.Io.Group = .init;
+                for (jobs[begin..end]) |*job| group.async(phase.io, Job.run, .{ job, &backend, allocations.allocator(), self.domain, self.cancellation });
+                group.await(phase.io) catch |err| {
+                    group.cancel(phase.io);
+                    return guard.failed(err);
+                };
+                for (jobs[begin..end]) |job| if (job.failure) |err| return guard.failed(err);
+                try guard.finish();
+                begin = end;
+            }
+        } else {
+            for (jobs[0..count]) |*job| {
+                try self.cancellation.check();
+                Job.run(job, self.artifacts, a, self.domain, self.cancellation);
+                if (job.failure) |err| return err;
+            }
         }
         try self.cancellation.check();
         var initialized: usize = 0;
@@ -389,9 +463,13 @@ pub const PageStore = struct {
         var results: [tree.max_write_batch]artifacts.ArtifactMetadata = undefined;
         for (writes, contents[0..writes.len]) |write, *bytes_| bytes_.* = write.bytes;
         var backend = self.artifacts.*;
-        if (backend.upload_scope) |scope| {
-            if (!std.mem.eql(u8, &scope.domain, &self.domain) or !std.mem.eql(u8, &scope.attempt, &self.attempt)) return error.InvalidArtifactUploadScope;
-        } else backend.upload_scope = .{ .domain = self.domain, .attempt = self.attempt };
+        const scope: artifacts.UploadScope = .{ .domain = self.domain, .attempt = self.attempt };
+        if (backend.upload_scope) |authority| {
+            if (!std.mem.eql(u8, &authority.domain, &scope.domain) or authority.fencingToken() != scope.fencingToken()) return error.InvalidArtifactUploadScope;
+        }
+        // A publication can own separate family nonces under the same fence.
+        // Match putScoped's authority check and upload using the page identity.
+        backend.upload_scope = scope;
         try backend.putBatchWithCancellation(self.io, contents[0..writes.len], results[0..writes.len], self.cancellation);
         defer for (results[0..writes.len]) |*metadata| metadata.deinit(self.artifacts.allocator);
         for (writes, results[0..writes.len]) |write, metadata| {
@@ -1577,7 +1655,7 @@ test "serverless navigation packed builders release every failed allocation" {
             try std.testing.expectEqual(@as(u64, 80), count);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "external lake publication miss waves coalesce packs bound fanout and drain failures" {
@@ -1678,4 +1756,51 @@ test "external lake publication miss waves coalesce packs bound fanout and drain
     try std.testing.expectError(error.Canceled, pages.store().read_many.?.read(&pages, a, &roots, &output));
     try std.testing.expect(!phase.active);
     try std.testing.expectEqual(@as(usize, 0), phase.reading.load(.acquire));
+}
+
+test "serverless serial query ranges coalesce packed pages and reject corruption without partial ownership" {
+    const a = std.testing.allocator;
+    var fixture: TestArtifacts = .{ .memory = .{ .alloc = a } };
+    defer fixture.memory.deinit();
+    var backend = fixture.capability();
+    var reads: u64 = 4 * 1024 * 1024;
+    var writes: u64 = 4 * 1024 * 1024;
+    var pages = PageStore{ .domain = @splat(9), .attempt = @splat(1), .artifacts = &backend, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .coalesce_reads = true };
+    var roots: [4]tree.Ref = undefined;
+    for (&roots, 0..) |*root, i| {
+        const key: [1]u8 = .{@intCast('a' + i)};
+        root.* = (try tree.apply(a, pages.store(), null, &.{.{ .key = &key, .value = "payload" }})).?;
+    }
+    for (0..2) |pair| {
+        var pack: [2]tree.Write = undefined;
+        for (&pack, 0..) |*write, i| {
+            const ref = roots[pair * 2 + i];
+            write.* = .{ .ref = ref, .bytes = fixture.memory.pages.get(TestArtifacts.address(&try PageStore.identity(pages.domain, ref))).? };
+        }
+        try PageStore.packMany(&pages, &pack);
+        for (pack, 0..) |write, i| roots[pair * 2 + i] = write.ref;
+    }
+    const requested = [_]tree.Ref{ roots[3], roots[0], roots[2], roots[1], roots[0] };
+    const Run = struct {
+        fn run(alloc: std.mem.Allocator, source: *artifacts.ArtifactStore, refs_: []const tree.Ref) !void {
+            var remaining: u64 = 4 * 1024 * 1024;
+            var none: u64 = 0;
+            var store_ = PageStore{ .domain = @splat(9), .artifacts = source, .remaining_read_bytes = &remaining, .remaining_write_bytes = &none, .coalesce_reads = true };
+            const capability = store_.store().read_many.?;
+            var output: [5]tree.NavigationPage = undefined;
+            try capability.read(capability.ptr, alloc, refs_, &output);
+            defer for (&output) |*page| page.deinit(alloc);
+            for (refs_, output) |ref, page| try std.testing.expect(page.ref.eql(ref));
+        }
+    };
+    const before = fixture.memory.reads;
+    try Run.run(a, &backend, &requested);
+    try std.testing.expectEqual(@as(usize, 2), fixture.memory.reads - before);
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{ &backend, &requested });
+    const id = try PageStore.identity(pages.domain, roots[0]);
+    const damaged = fixture.memory.pages.get(TestArtifacts.address(&id)).?;
+    const saved = damaged[0];
+    damaged[0] ^= 1;
+    defer damaged[0] = saved;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, Run.run(a, &backend, &requested));
 }

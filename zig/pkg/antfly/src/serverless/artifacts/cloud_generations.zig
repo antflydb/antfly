@@ -104,7 +104,7 @@ const Navigation = struct {
     cache_bytes: usize = 0,
     clock: u64 = 0,
     flights: [32]?[32]u8 = @splat(null),
-    coalesced_waits: std.atomic.Value(u64) = .init(0),
+    coalesced_waits: @import("antfly_platform").atomic.Value(u64) = .init(0),
     cache_allocator: A = std.heap.page_allocator,
     cache_limit: usize = 8 * 1024 * 1024,
     fn freeCached(self: *Navigation, value: Reader.Cached) void {
@@ -136,7 +136,7 @@ pub const NavigationPool = struct {
     entries: [8]?Entry = @splat(null),
     mu: std.atomic.Mutex = .unlocked,
     clock: u64 = 0,
-    budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 64 * 1024 * 1024 },
+    budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(if (@import("builtin").os.tag == .freestanding) std.heap.wasm_allocator else std.heap.smp_allocator), .limit = 64 * 1024 * 1024 },
     pub fn acquire(self: *NavigationPool, scope: [32]u8) !*NavigationOwner {
         lock(&self.mu);
         defer self.mu.unlock();
