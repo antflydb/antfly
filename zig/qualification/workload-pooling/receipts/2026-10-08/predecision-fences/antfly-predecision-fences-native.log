@@ -1,0 +1,64 @@
+antfly-http-cleanup-owner-test
++- run test http-cleanup-owner-tests w
+H2 stream handler error: error.DeadlineExceeded
+failed command: /private/tmp/antfly-parent-phase-focused-cache/o/751a25450998d94b819c63dd0eb849a9/http-cleanup-owner-tests --cache-dir=/private/tmp/antfly-parent-phase-focused-cache --seed=0x99f7302e --listen=-
+
+antfly-inference-worker-owner-handoff-test
++- run test inference-worker-owner-handoff-tests w
+REAL_SINK transport=h1 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=4 ends=4
+REAL_SINK await peer EOF
+REAL_SINK transport=h1 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=4 ends=4
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=87 ends=87
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=84 ends=84
+REAL_SINK await peer EOF
+failed command: /private/tmp/antfly-parent-phase-focused-cache/o/536fe3ba70182ef403817bee9bff2367/inference-worker-owner-handoff-tests --cache-dir=/private/tmp/antfly-parent-phase-focused-cache --seed=0x99f7302e --listen=-
+
+Build Summary: 29/29 steps succeeded; 41/41 tests passed
+antfly-http-cleanup-owner-test success
++- run test http-cleanup-owner-tests 2 pass (2 total) 371ms MaxRSS:2M
+   +- compile test http-cleanup-owner-tests safe native success 10s MaxRSS:488M
+      +- WriteFile macos-sdk-libc.txt cached
+antfly-inference-owner-handoff-test success
++- run test inference-owner-handoff-tests 24 pass (24 total) 123ms MaxRSS:2M
+   +- compile test inference-owner-handoff-tests safe native success 9s MaxRSS:434M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 2 pass (2 total) 1s MaxRSS:6M
+   +- compile test inference-worker-owner-handoff-tests safe native success 9s MaxRSS:505M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-sql-write-team-test success
++- run test sql-write-team-tests 6 pass (6 total) 118ms MaxRSS:2M
+   +- compile test sql-write-team-tests safe native success 8s MaxRSS:443M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-completion-task-test success
++- run test completion-task-tests 3 pass (3 total) 365ms MaxRSS:2M
+   +- compile test completion-task-tests safe native success 8s MaxRSS:486M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-table-write-execution-contract-test success
++- run test table-write-execution-contract-tests 4 pass (4 total) 115ms MaxRSS:6M
+   +- compile test table-write-execution-contract-tests safe native success 10s MaxRSS:583M
+      +- WriteFile macos-sdk-libc.txt (reused)
+      +- options cached
+      +- options cached
+      +- options cached
+      +- WriteFile tokenizer.json cached
+      +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf cached
+      +- options cached
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached
+         +- compile exe patch_sentencepiece_proto safe native cached 41ms MaxRSS:31M
+         |  +- WriteFile macos-sdk-libc.txt (reused)
+         +- run exe protoc-zig (sentencepiece_proto_raw) cached
+         |  +- compile exe protoc-zig safe native cached 41ms MaxRSS:31M
+         |     +- WriteFile macos-sdk-libc.txt (reused)
+         +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+

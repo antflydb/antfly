@@ -71,10 +71,10 @@ pub const Managed = struct {
         try self.context.ensureActive();
         var client = self.client;
         client.allocator = a;
-        return client.getObject(self.bucket, key_, .{ .max_response_bytes = limit, .cancellation = self.token() }) catch |err| switch (err) {
+        return self.context.objectCall(storage.Client.getObject, .{ &client, self.bucket, key_, storage.GetOptions{ .max_response_bytes = limit, .cancellation = types.providerCancellation(&self.context) } }, client.allocator) catch |err| switch (err) {
             error.ObjectNotFound, error.FileNotFound => null,
             else => {
-                try self.context.ensureActive();
+                try self.context.checkLifetime();
                 return err;
             },
         };

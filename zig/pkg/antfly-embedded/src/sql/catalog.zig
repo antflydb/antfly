@@ -456,8 +456,12 @@ pub const ColumnPage = struct {
     /// Declared NUMERIC reads fixed coefficients directly. Raw callers retain
     /// the established exact string contract for detected decimal columns.
     pub fn typedCell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8, numeric: bool) !Row.Cell {
+        return self.typedCellControlled(alloc, row, name, numeric, null);
+    }
+    pub fn typedCellControlled(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8, numeric: bool, control: ?@import("operator_work.zig").Control) !Row.Cell {
+        try @import("operator_work.zig").metadataPoll(control);
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
-        if (numeric and self.native == null) if (self.batch.findColumn(name)) |column| {
+        if (numeric and self.native == null) if (try self.findColumnControlled(name, control)) |column| {
             const index = self.selection[row];
             if (index >= self.batch.rowCount() or index >= column.rowCount()) return error.InvalidSqlBackendResponse;
             if (column.values == .decimal128 and !column.nulls.isNull(index)) {
@@ -471,39 +475,57 @@ pub const ColumnPage = struct {
                 return @import("scalar.zig").Datum.typedNumeric(value);
             }
         };
-        return self.cell(alloc, row, name);
+        return self.cellControlled(alloc, row, name, control);
     }
     pub fn frozenJson(self: ColumnPage, row: usize, name: []const u8) !?@import("execution_batch.zig").FrozenJson {
+        return self.frozenJsonControlled(row, name, null);
+    }
+    pub fn frozenJsonControlled(self: ColumnPage, row: usize, name: []const u8, control: ?@import("operator_work.zig").Control) !?@import("execution_batch.zig").FrozenJson {
+        try @import("operator_work.zig").metadataPoll(control);
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         if (self.native) |native| {
-            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) return native.values.frozenJson(self.selection[row], ordinal);
+            for (native.names, 0..) |column, ordinal| if (try @import("operator_work.zig").equalMetadataBytes(control, column, name)) return native.values.frozenJsonControlled(self.selection[row], ordinal, control);
         }
         return null;
     }
     pub fn encodedJson(self: ColumnPage, row: usize, name: []const u8) !?[]const u8 {
+        return self.encodedJsonControlled(row, name, null);
+    }
+    pub fn encodedJsonControlled(self: ColumnPage, row: usize, name: []const u8, control: ?@import("operator_work.zig").Control) !?[]const u8 {
+        try @import("operator_work.zig").metadataPoll(control);
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         if (self.native) |native| {
-            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) return native.values.encodedJson(self.selection[row], ordinal);
+            for (native.names, 0..) |column, ordinal| if (try @import("operator_work.zig").equalMetadataBytes(control, column, name)) return native.values.encodedJsonControlled(self.selection[row], ordinal, control);
         }
         return null;
     }
     pub fn cell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8) !Row.Cell {
+        return self.cellControlled(alloc, row, name, null);
+    }
+    pub fn cellControlled(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8, control: ?@import("operator_work.zig").Control) !Row.Cell {
+        try @import("operator_work.zig").metadataPoll(control);
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         const index = self.selection[row];
         if (self.native) |native| {
             if (index >= native.values.len() or native.names.len != native.values.width()) return error.InvalidSqlBackendResponse;
-            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) {
-                const value = try native.values.cell(alloc, index, ordinal);
+            for (native.names, 0..) |column, ordinal| if (try @import("operator_work.zig").equalMetadataBytes(control, column, name)) {
+                const value = try native.values.cellControlled(alloc, index, ordinal, control);
                 return value;
             };
             return .{ .value = .null, .sql_null = true };
         }
         if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
-        if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.rowRef(index)) }, .sql_null = false };
-        const column = self.batch.findColumn(name) orelse return .{ .value = .null, .sql_null = true };
+        if (try @import("operator_work.zig").equalMetadataBytes(control, name, "_id")) {
+            try @import("operator_work.zig").poll(control);
+            return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.rowRef(index)) }, .sql_null = false };
+        }
+        const column = (try self.findColumnControlled(name, control)) orelse return .{ .value = .null, .sql_null = true };
         if (column.nulls.isNull(index)) return .{ .value = .null, .sql_null = true };
         const value: std.json.Value = switch (column.values) {
-            .encoded => |values| try values.at(index),
+            .encoded => |values| blk: {
+                try @import("operator_work.zig").poll(control);
+                break :blk try values.at(index);
+            },
             .dictionary_i64 => |values| .{ .integer = values.at(index) },
             .dictionary_f64 => |values| .{ .float = values.at(index) },
             .i64 => |values| .{ .integer = values[index] },
@@ -511,11 +533,20 @@ pub const ColumnPage = struct {
             .bool => |values| .{ .bool = values[index] },
             .bytes => |values| .{ .string = values[index] },
             .dictionary_bytes => |values| .{ .string = values.at(index) },
-            .json => |values| try std.json.parseFromSliceLeaky(std.json.Value, alloc, values[index], .{ .allocate = .alloc_always, .parse_numbers = false }),
-            .decimal128 => |values| .{ .string = try values.text(alloc, index) },
+            .json => |values| try @import("controlled_json_text.zig").parseLeaky(alloc, values[index], control),
+            .decimal128 => |values| blk: {
+                try @import("operator_work.zig").poll(control);
+                break :blk .{ .string = try values.text(alloc, index) };
+            },
             .vector_f32 => return error.UnsupportedSqlExecution,
         };
         return .{ .value = value, .sql_null = false };
+    }
+    pub fn findColumnControlled(self: ColumnPage, name: []const u8, control: ?@import("operator_work.zig").Control) !?@import("../storage/rowsource/types.zig").ColumnVector {
+        for (self.batch.columns) |column| {
+            if (try @import("operator_work.zig").equalMetadataBytes(control, column.name, name)) return column;
+        }
+        return null;
     }
 };
 
@@ -667,9 +698,74 @@ pub const Cursor = struct {
     /// Provider estimate of retained metadata per ordered child. Planning
     /// limits fan-out before cloning a large immutable inventory.
     ordered_split_bytes: usize = 0,
+    /// Explicit capability for an exclusively owned scan child. The provider
+    /// replaces mutable parent callbacks with this worker's independent CPU/IO
+    /// receiver and closes the cursor before that receiver physically retires.
+    bind_execution: ?*const fn (*anyopaque, *@import("../common/runnable_scheduler.zig").Execution) anyerror!void = null,
+    /// Temporary coordinator attachment. The provider owns independent mutable
+    /// receiver state, joins speculative work on release, and never retains a
+    /// request execution between pulls (a named portal may outlive that call).
+    coordinator_execution: ?struct {
+        bind: *const fn (*anyopaque, *@import("../common/runnable_scheduler.zig").Execution) anyerror!void,
+        release: *const fn (*anyopaque) void,
+    } = null,
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,
+    fn attach(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution) !bool {
+        const owner = execution orelse return false;
+        const capability = self.coordinator_execution orelse return false;
+        try capability.bind(self.ptr, owner);
+        return true;
+    }
+    fn detach(self: Cursor, attached: bool) void {
+        if (attached) self.coordinator_execution.?.release(self.ptr);
+    }
+    pub fn nextFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, limit: u32) !Page {
+        const attached = try self.attach(execution);
+        const result = self.next(self.ptr, alloc, limit);
+        self.detach(attached);
+        if (attached) execution.?.checkpoint() catch |err| {
+            if (result) |page| page.deinit() else |_| {}
+            return err;
+        };
+        return result;
+    }
+    pub fn columnsFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, limit: u32) !ColumnPage {
+        const attached = try self.attach(execution);
+        const result = self.next_columns.?(self.ptr, alloc, limit);
+        self.detach(attached);
+        if (attached) try execution.?.checkpoint();
+        return result;
+    }
+    pub fn splitFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, maximum: usize, comptime ordered: bool) !?[]Cursor {
+        return self.splitWith(execution, alloc, maximum, if (ordered) self.split_ordered.? else self.split_scan.?);
+    }
+    pub fn splitOrderedFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, maximum: usize, batch: bool) !?[]Cursor {
+        return self.splitWith(execution, alloc, maximum, if (batch) self.split_ordered_batch.? else self.split_ordered.?);
+    }
+    fn splitWith(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, maximum: usize, split: *const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor) !?[]Cursor {
+        const attached = try self.attach(execution);
+        const result = split(self.ptr, alloc, maximum);
+        self.detach(attached);
+        if (attached) execution.?.checkpoint() catch |err| {
+            if (result) |cursors| {
+                if (cursors) |owned| {
+                    for (owned) |cursor| cursor.close(cursor.ptr);
+                    alloc.free(owned);
+                }
+            } else |_| {}
+            return err;
+        };
+        return result;
+    }
+    pub fn countFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution) !?u64 {
+        const attached = try self.attach(execution);
+        const result = self.count_rows.?(self.ptr);
+        self.detach(attached);
+        if (attached) try execution.?.checkpoint();
+        return result;
+    }
 };
 
 /// Planning-only metadata. Estimates may be stale and never establish an
@@ -799,6 +895,12 @@ pub const FinalGroupRequest = struct {
 };
 
 pub const AggregatePartialCursor = struct {
+    /// Pages are borrowed from this cursor or allocated in the caller's page
+    /// arena. Failed authority never publishes them; the caller unwinds its arena.
+    coordinator_execution: ?struct {
+        bind: *const fn (*anyopaque, *@import("../common/runnable_scheduler.zig").Execution) anyerror!void,
+        release: *const fn (*anyopaque) void,
+    } = null,
     /// Providers may prove a unique complete cohort before the first pull.
     /// Slots refer to the requested recipe, independent of physical order.
     final_group_proof: ?struct { count: u64, slots: []const u16 } = null,
@@ -815,6 +917,15 @@ pub const AggregatePartialCursor = struct {
     ptr: *anyopaque,
     next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!?[]const @import("operators.zig").GroupResult,
     close: *const fn (*anyopaque) void,
+    pub fn nextFor(self: AggregatePartialCursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, maximum: u32) !?[]const @import("operators.zig").GroupResult {
+        const capability = self.coordinator_execution;
+        const attached = execution != null and capability != null;
+        if (attached) try capability.?.bind(self.ptr, execution.?);
+        const result = self.next(self.ptr, alloc, maximum);
+        if (attached) capability.?.release(self.ptr);
+        if (attached) try execution.?.checkpoint();
+        return result;
+    }
 };
 
 pub const Backend = struct {
@@ -826,6 +937,18 @@ pub const Backend = struct {
     scalar_control: ?struct { ptr: ?*anyopaque, checkpoint: *const fn (?*anyopaque) anyerror!void } = null,
     supports_search_relations: bool = false,
     execution_io: ?std.Io = null,
+    /// Independent scheduler children for pure kernels over immutable columns.
+    /// This does not enable concurrent access to this backend's mutable state.
+    cpu_scope: ?@import("parallel_scheduler.zig").ExecutionScope = null,
+    /// Inline coordinator kernels may checkpoint without allowing child tasks.
+    /// Keep serial/session-affine frontends independent of fan-out capability.
+    coordinator_scope: ?@import("parallel_scheduler.zig").CoordinatorScope = null,
+    /// Serial spill I/O is independent of parallel compute ownership. A
+    /// scheduled single-worker adapter can retain spilling without launching
+    /// children that share its mutable execution capsule.
+    spill_io: ?std.Io = null,
+    /// Single-worker execution handoff around private spill file I/O.
+    spill_wait: ?@import("execution_wait.zig").Boundary = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     ptr: *anyopaque,

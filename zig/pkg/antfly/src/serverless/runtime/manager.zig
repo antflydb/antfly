@@ -102,6 +102,8 @@ pub const ManagedRuntime = struct {
     work_lease_owner_id: ?[]u8 = null,
     work_lease_ttl_ns: u64 = 30 * std.time.ns_per_s,
     work_cost_port: ?RuntimeWorkCostPort = null,
+    runnable_slots: usize = 1,
+    runnable_scheduler: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Scheduler = null,
 
     pub fn init(
         alloc: Allocator,
@@ -208,46 +210,69 @@ pub const ManagedRuntime = struct {
         pass.cooperative = cancellation;
         var bridge = maintenance_cancellation.GraphBridge{ .maintenance = pass };
         try pass.check();
-        try lockAtomicWithCancellation(&self.run_mu, bridge.token());
+        const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        if (self.runnable_scheduler) |scheduler| {
+            const token = bridge.token();
+            execution.startWithSlots(scheduler, .{
+                .io = self.io,
+                .cancellation = .{ .ptr = token.ptr.?, .requested = token.is_cancelled_fn.? },
+                .retained_bytes = @sizeOf(Runnable.Execution) + catalog_mod.CatalogService.Scope.retained_bytes,
+            }, .background, 1) catch |err| {
+                try pass.check();
+                return err;
+            };
+            try pass.check();
+            pass.execution = &execution;
+        }
+        try pass.lock(&self.run_mu);
         defer self.run_mu.unlock();
+
+        var metadata_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = pass };
+        var metadata_scope: catalog_mod.CatalogService.Scope = .{};
+        const catalog = if (pass.execution != null) metadata_scope.bind(self.catalog, metadata_bridge.readContext()) else self.catalog;
 
         var stats = RuntimeRunStats{};
         if (self.cfg.publish_enabled) {
             try self.chargeWork(.publish_round, 1);
-            const publish_stats = try self.publisher.runOnceWithCancellation(bridge.token());
+            const publish_stats = try self.publisher.runOnceWithMaintenance(pass);
             stats.published_namespaces = publish_stats.published_namespaces;
             stats.publish_budget_rejected_namespaces = publish_stats.budget_rejected_namespaces;
             stats.publish_head_conflicts = publish_stats.head_conflicts;
             stats.work_lease_conflicts += publish_stats.lease_conflicts;
             stats.work_lease_takeovers += publish_stats.lease_takeovers;
         }
-        try self.cancellationCheckpoint();
+        try pass.ownerCheckpoint();
 
-        const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
-        defer self.catalog.freeNamespaces(self.alloc, namespaces);
+        const namespaces = try catalog.listNamespacesAlloc(self.alloc);
+        defer catalog.freeNamespaces(self.alloc, namespaces);
 
         for (namespaces) |namespace| {
             try cancellation.check();
-            try self.cancellationCheckpoint();
-            const policy = self.catalog.getPolicy(namespace.name) catch |err| switch (err) {
+            try pass.ownerCheckpoint();
+            const policy = catalog.getPolicy(namespace.name) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
-            var status = self.catalog.buildStatus(namespace.name) catch |err| switch (err) {
+            var status = catalog.buildStatusUntil(namespace.name, pass) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
             defer status.deinit(self.alloc);
-            if (!try self.enrichNamespaceWithStatus(namespace.name, policy, status, cancellation, &stats)) continue;
+            if (!try self.enrichNamespaceWithStatus(namespace.name, policy, status, cancellation, pass.execution, catalog, &stats)) continue;
 
             if (self.compactor) |*compactor| {
-                try self.cancellationCheckpoint();
+                try pass.ownerCheckpoint();
                 if (self.cfg.compaction_enabled) {
                     if (status.compaction_recommended) {
+                        var lease_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = pass };
                         var held_lease: ?build_mod.work_lease.HeldLease = null;
                         if (self.work_lease_provider) |provider| {
+                            lease_bridge.maintenance = pass.withContext(provider.context);
+                            const scoped_provider = provider.withContext(lease_bridge.readContext());
                             held_lease = try build_mod.work_lease.acquireHeld(
-                                provider,
+                                scoped_provider,
                                 self.io,
                                 namespace.name,
                                 self.work_lease_owner_id orelse return error.MissingLeaseOwner,
@@ -269,7 +294,7 @@ pub const ManagedRuntime = struct {
                         else
                             null;
                         const compaction_cancellation = if (held_lease) |*lease|
-                            lease.cancellation(pass)
+                            try lease.cancellation(pass)
                         else
                             pass;
                         try self.chargeWork(.compaction_round, 1);
@@ -296,7 +321,7 @@ pub const ManagedRuntime = struct {
             }
 
             if (self.cfg.prune_enabled) {
-                try self.cancellationCheckpoint();
+                try pass.ownerCheckpoint();
                 try self.chargeWork(.prune_round, 1);
                 var result = self.pruner.pruneNamespaceUntil(
                     namespace.name,
@@ -329,17 +354,31 @@ pub const ManagedRuntime = struct {
         namespace: []const u8,
         cancellation: CancellationToken,
     ) !RuntimeRunStats {
+        return self.runNamespaceMaterializationWithExecution(namespace, cancellation, null);
+    }
+
+    pub fn runNamespaceMaterializationWithExecution(
+        self: *ManagedRuntime,
+        namespace: []const u8,
+        cancellation: CancellationToken,
+        execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution,
+    ) !RuntimeRunStats {
         if (!self.supportsSynchronousMaterialization()) return error.MaterializationUnavailable;
         if (namespace.len == 0) return error.InvalidNamespace;
-        try cancellation.check();
-        try lockAtomicWithCancellation(&self.run_mu, cancellation);
+        var pass = self.cancellationToken();
+        pass.cooperative = cancellation;
+        pass.execution = execution;
+        try pass.lock(&self.run_mu);
         defer self.run_mu.unlock();
 
-        const policy = try self.catalog.getPolicy(namespace);
-        var status = try self.catalog.buildStatus(namespace);
+        var metadata_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = pass };
+        var metadata_scope: catalog_mod.CatalogService.Scope = .{};
+        const catalog = if (execution != null) metadata_scope.bind(self.catalog, metadata_bridge.readContext()) else self.catalog;
+        const policy = try catalog.getPolicy(namespace);
+        var status = try catalog.buildStatusUntil(namespace, pass);
         defer status.deinit(self.alloc);
         var stats = RuntimeRunStats{};
-        if (!try self.enrichNamespaceWithStatus(namespace, policy, status, cancellation, &stats)) {
+        if (!try self.enrichNamespaceWithStatus(namespace, policy, status, cancellation, null, catalog, &stats)) {
             return error.MaterializationUnavailable;
         }
         try cancellation.check();
@@ -377,6 +416,8 @@ pub const ManagedRuntime = struct {
         policy: catalog_mod.NamespacePolicy,
         status: catalog_mod.BuildStatus,
         cancellation: CancellationToken,
+        execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution,
+        catalog: *catalog_mod.CatalogService,
         stats: *RuntimeRunStats,
     ) !bool {
         try cancellation.check();
@@ -390,16 +431,21 @@ pub const ManagedRuntime = struct {
         effective_policy.rerank_terms_enabled = status.rerank_terms_enabled;
         const stage = status.enrichment_active_stage orelse audit: {
             if (!effective_policy.chunk_embeddings_enabled) return true;
-            var table = (try self.catalog.getTableForNamespaceAlloc(self.alloc, namespace)) orelse return true;
+            var table = (try catalog.getTableForNamespaceAlloc(self.alloc, namespace)) orelse return true;
             defer table.deinit(self.alloc);
             if (!try @import("../build/document_facts_builder.zig").hasModelSources(self.alloc, table.indexes_json)) return true;
             break :audit catalog_mod.EnrichmentStage.chunk_embeddings;
         };
         const stage_spec = enrichment_mod.builtinPipelineForPolicy(effective_policy).stageSpec(stage) orelse return false;
 
+        var maintenance = self.cancellationToken();
+        maintenance.cooperative = cancellation;
+        maintenance.execution = execution orelse if (catalog.progress.context) |context| context.execution else null;
+        var lease_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = maintenance };
         var held_lease: ?build_mod.work_lease.HeldLease = null;
         if (self.work_lease_provider) |provider| {
-            held_lease = try build_mod.work_lease.acquireHeld(provider, self.io, namespace, self.work_lease_owner_id orelse return error.MissingLeaseOwner, self.work_lease_ttl_ns);
+            lease_bridge.maintenance = maintenance.withContext(provider.context);
+            held_lease = try build_mod.work_lease.acquireHeld(provider.withContext(lease_bridge.readContext()), self.io, namespace, self.work_lease_owner_id orelse return error.MissingLeaseOwner, self.work_lease_ttl_ns);
             if (held_lease == null) {
                 stats.enrichment_conflicts += 1;
                 stats.work_lease_conflicts += 1;
@@ -410,13 +456,17 @@ pub const ManagedRuntime = struct {
         defer if (held_lease) |*lease| {
             _ = lease.release() catch {};
         };
-        var maintenance = self.cancellationToken();
-        maintenance.cooperative = cancellation;
-        if (held_lease) |*lease| maintenance = lease.cancellation(maintenance);
+        if (held_lease) |*lease| maintenance = try lease.cancellation(maintenance);
         try self.chargeWork(.enrichment_round, 1);
         try maintenance.check();
+        var phase_control = maintenance;
+        // A foreground producer borrows its already funded team. Preserve it
+        // in provider calls while resizing only a background-owned execution.
+        phase_control.execution = execution;
+        var cpu_phase = try phase_control.beginCpuPhase(self.runnable_slots);
+        defer cpu_phase.deinit();
 
-        const maybe_table_record = self.catalog.getTableForNamespaceAlloc(self.alloc, namespace) catch |err| switch (err) {
+        const maybe_table_record = catalog.getTableForNamespaceAlloc(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
@@ -469,9 +519,13 @@ pub const ManagedRuntime = struct {
             enricher.clearModelChunker();
         }
 
+        // Construction may load/configure a provider; execution below admits
+        // each individual invocation and restores serial scanning/WAL work.
+        try cpu_phase.finish();
         try cancellation.check();
         const enrichment = enricher.runNamespaceWithConfigUntil(namespace, .{
             .batch_size = policy.enrichment_batch_size,
+            .model_cpu_slots = self.runnable_slots,
             .pipeline_version = stage_spec.pipeline_version,
             .stage = stage,
             .model_preference = stage_spec.model_preference,
@@ -556,10 +610,13 @@ pub const ManagedRuntime = struct {
         while (!self.stop_requested.load(.monotonic)) {
             _ = self.runOnce() catch |err| {
                 if (err == error.Canceled and self.stop_requested.load(.acquire)) return;
-                lockAtomic(&self.failure_mu);
-                if (self.run_failure == null) self.run_failure = err;
-                self.failure_mu.unlock();
-                return;
+                if (err != error.RunnableWaitTimeout and err != error.SchedulerFull) {
+                    lockAtomic(&self.failure_mu);
+                    if (self.run_failure == null) self.run_failure = err;
+                    self.failure_mu.unlock();
+                    return;
+                }
+                // Capacity pressure defers a tick; it never poisons the runtime.
             };
             self.stop_wake.waitTimeout(self.io, .{ .duration = .{
                 .raw = .fromMilliseconds(@intCast(self.publisher.nextWakeDelayMs(self.cfg.tick_interval_ms))),

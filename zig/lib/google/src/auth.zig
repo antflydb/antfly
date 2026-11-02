@@ -53,6 +53,7 @@ pub const TransportResponse = struct {
 /// One immutable budget for credential queueing, all exchanges, and the
 /// authenticated request. Never store borrowed cancellation in the cache.
 pub const RequestControl = struct {
+    execution_wait: ?httpx.socket.WriteControl = null,
     deadline_ns: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
 
@@ -63,9 +64,37 @@ pub const RequestControl = struct {
         };
     }
 
+    pub fn withExecutionWait(self: RequestControl, wait: ?httpx.socket.WriteControl) RequestControl {
+        var result = self;
+        result.execution_wait = wait;
+        return result;
+    }
+
     pub fn check(self: RequestControl) !void {
+        if (self.execution_wait) |wait| wait.check() catch |err| return switch (err) {
+            error.Canceled => error.Cancelled,
+            else => err,
+        };
         if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         if (self.deadline_ns) |deadline| if (platform.time.monotonicNs() >= deadline) return error.Timeout;
+    }
+
+    fn yieldOnce() !void {
+        platform.time.yieldNow();
+    }
+
+    fn waitForRefresh(self: RequestControl, io: ?std.Io) !void {
+        try self.check();
+        if (io) |executor| {
+            const duration = std.Io.Duration.fromMilliseconds(1);
+            if (self.execution_wait) |wait|
+                try wait.withWait(std.Io.sleep, .{ executor, duration, std.Io.Clock.awake })
+            else
+                try executor.sleep(duration, .awake);
+        } else if (self.execution_wait) |wait| {
+            try wait.withWait(yieldOnce, .{});
+        } else platform.time.yieldNow();
+        try self.check();
     }
 
     pub fn remainingTimeoutMs(self: RequestControl) !?u64 {
@@ -131,6 +160,7 @@ const HttpxTransport = struct {
             .body = body,
             .timeout_ms = try control.remainingTimeoutMs(),
             .cancellation = control.cancellation,
+            .socket_control = control.execution_wait,
         });
         defer response.deinit();
         try control.check();
@@ -298,6 +328,7 @@ pub const CachedTokenSource = struct {
     /// Filesystem authority for ADC and external-account subject-token files.
     filesystem_io: ?std.Io,
     mutex: std.atomic.Mutex = .unlocked,
+    refreshing: bool = false,
     cached_token: ?AccessToken = null,
 
     pub fn init(alloc: Allocator, cfg: Config) !CachedTokenSource {
@@ -381,46 +412,81 @@ pub const CachedTokenSource = struct {
         return self.accessTokenAllocWithControl(alloc, .{});
     }
 
-    pub fn accessTokenAllocWithControl(self: *CachedTokenSource, alloc: Allocator, control: RequestControl) ![]u8 {
-        try control.check();
-        while (!self.mutex.tryLock()) {
-            try control.check();
-            if (self.io) |io| {
-                try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
-            } else {
-                @import("antfly_platform").time.yieldNow();
-            }
-        }
-        defer self.mutex.unlock();
-        try control.check();
-        return self.accessTokenAllocLocked(alloc, control);
+    fn lockForRequest(self: *CachedTokenSource, control: RequestControl) !void {
+        while (!self.mutex.tryLock()) try control.waitForRefresh(self.io);
     }
 
-    fn accessTokenAllocLocked(self: *CachedTokenSource, alloc: Allocator, control: RequestControl) ![]u8 {
-        const now = nowSeconds();
-        if (self.cached_token) |token| {
-            if (token.expires_at_s > now + 30) return try alloc.dupe(u8, token.value);
-        }
+    fn lockForCleanup(self: *CachedTokenSource) void {
+        while (!self.mutex.tryLock()) platform.time.yieldNow();
+    }
 
-        var minted = self.mintTokenAlloc(self.alloc, now, control) catch |err| {
+    fn finishRefresh(self: *CachedTokenSource) void {
+        self.lockForCleanup();
+        self.refreshing = false;
+        self.mutex.unlock();
+    }
+
+    pub fn accessTokenAllocWithControl(self: *CachedTokenSource, alloc: Allocator, control: RequestControl) ![]u8 {
+        while (true) {
             try control.check();
-            if (err == error.Cancelled) return err;
-            // A proactive refresh failure must not turn a still-valid token
-            // into an outage. Once expired, fail closed and surface the auth
-            // provider error.
+            try self.lockForRequest(control);
+            const now = nowSeconds();
             if (self.cached_token) |token| {
-                if (token.expires_at_s > nowSeconds()) return try alloc.dupe(u8, token.value);
+                if (token.expires_at_s > now + 30 or (self.refreshing and token.expires_at_s > now)) {
+                    const result = alloc.dupe(u8, token.value) catch |err| {
+                        self.mutex.unlock();
+                        return err;
+                    };
+                    self.mutex.unlock();
+                    errdefer alloc.free(result);
+                    try control.check();
+                    return result;
+                }
+            }
+            if (self.refreshing) {
+                self.mutex.unlock();
+                try control.waitForRefresh(self.io);
+                continue;
+            }
+            self.refreshing = true;
+            self.mutex.unlock();
+            break;
+        }
+        // Refresh/signing/network work runs without the cache mutex. In
+        // particular, no CPU-return queue may retain that shared mutex.
+        defer self.finishRefresh();
+        var minted = self.mintTokenAlloc(self.alloc, nowSeconds(), control) catch |err| {
+            try control.check();
+            if (err == error.Cancelled or err == error.Canceled) return err;
+            self.lockForCleanup();
+            const fallback: ?[]u8 = if (self.cached_token) |token| blk: {
+                if (token.expires_at_s <= nowSeconds()) break :blk null;
+                break :blk alloc.dupe(u8, token.value) catch |allocation_error| {
+                    self.mutex.unlock();
+                    return allocation_error;
+                };
+            } else null;
+            self.mutex.unlock();
+            if (fallback) |result| {
+                errdefer alloc.free(result);
+                try control.check();
+                return result;
             }
             return err;
         };
-        errdefer minted.deinit(self.alloc);
+        var minted_owned = true;
+        errdefer if (minted_owned) minted.deinit(self.alloc);
         try control.check();
-
-        // Finish fallible caller allocation before transferring ownership to
-        // the cache; minted's errdefer must never free a published token.
+        // Allocate and validate the caller's copy before publishing the cache.
         const result = try alloc.dupe(u8, minted.value);
+        errdefer alloc.free(result);
+        try control.check();
+        self.lockForCleanup();
         if (self.cached_token) |*existing| existing.deinit(self.alloc);
         self.cached_token = minted;
+        minted_owned = false;
+        self.mutex.unlock();
+        try control.check();
         return result;
     }
 
@@ -575,7 +641,7 @@ pub const CachedTokenSource = struct {
         try control.check();
         const raw = if (account.subject_token_file) |path| blk: {
             const io = self.filesystem_io orelse return error.MissingIoRuntime;
-            break :blk try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1024 * 1024));
+            break :blk try credential_identity.controlled_file.readAlloc(alloc, io, path, 1024 * 1024, control.execution_wait);
         } else if (account.subject_token_url) |url| blk: {
             var response = try self.requestWithControl(
                 alloc,
@@ -640,40 +706,50 @@ pub const CredentialManager = struct {
         return self.tokenSourceWithControl(credentials_path, scope, .{});
     }
 
-    pub fn tokenSourceWithControl(
-        self: *CredentialManager,
-        credentials_path: ?[]const u8,
-        scope: []const u8,
-        control: RequestControl,
-    ) !*CachedTokenSource {
+    pub fn tokenSourceWithControl(self: *CredentialManager, credentials_path: ?[]const u8, scope: []const u8, control: RequestControl) !*CachedTokenSource {
         try control.check();
         const key = credentialSourceCacheKey(credentials_path, scope);
-
-        while (!self.mutex.tryLock()) {
+        while (!self.mutex.tryLock()) try control.waitForRefresh(self.io);
+        const existing = self.sources.get(key);
+        self.mutex.unlock(self.io);
+        if (existing) |source| {
             try control.check();
-            try self.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
-        }
-        defer self.mutex.unlock(self.io);
-        try control.check();
-        if (self.sources.get(key)) |source| {
             return source;
         }
 
-        const source = try self.alloc.create(CachedTokenSource);
-        errdefer self.alloc.destroy(source);
-        source.* = blk: {
-            var cfg = if (credentials_path) |path|
-                configFromFileAlloc(self.alloc, path, scope) catch return error.MissingGoogleCredentials
+        const candidate = try self.alloc.create(CachedTokenSource);
+        var candidate_owned = true;
+        defer if (candidate_owned) self.alloc.destroy(candidate);
+        candidate.* = blk: {
+            var cfg = (if (credentials_path) |path|
+                configFromFileAllocWithIoAndControl(self.alloc, path, scope, self.io, control)
             else
-                configFromEnvAlloc(self.alloc, scope) catch return error.MissingGoogleCredentials;
+                configFromEnvWithIoAndControlAlloc(self.alloc, scope, self.io, control)) catch |err| {
+                try control.check();
+                return if (err == error.OutOfMemory) err else error.MissingGoogleCredentials;
+            };
             errdefer cfg.deinit(self.alloc);
             try control.check();
             break :blk try CachedTokenSource.initWithIo(self.alloc, cfg, self.io);
         };
-        errdefer source.deinit();
+        defer if (candidate_owned) candidate.deinit();
         try control.check();
-        try self.sources.put(self.alloc, key, source);
-        return source;
+        while (!self.mutex.tryLock()) try control.waitForRefresh(self.io);
+        // Another caller may have installed the same source during I/O.
+        // Dispose the losing candidate only after releasing the mutex.
+        const winner = self.sources.get(key);
+        if (winner == null) self.sources.put(self.alloc, key, candidate) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.mutex.unlock(self.io);
+        if (winner) |source| {
+            try control.check();
+            return source;
+        }
+        candidate_owned = false;
+        try control.check();
+        return candidate;
     }
 };
 
@@ -944,12 +1020,20 @@ pub fn configFromFileAlloc(alloc: Allocator, path: []const u8, scope: []const u8
 }
 
 pub fn configFromFileAllocWithIo(alloc: Allocator, path: []const u8, scope: []const u8, shared_io: ?std.Io) !Config {
+    return configFromFileAllocWithIoAndControl(alloc, path, scope, shared_io, .{});
+}
+
+pub fn configFromFileAllocWithIoAndControl(alloc: Allocator, path: []const u8, scope: []const u8, shared_io: ?std.Io, control: RequestControl) !Config {
+    try control.check();
     var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const io = shared_io orelse io_impl.?.io();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(4 * 1024 * 1024));
+    const raw = try credential_identity.controlled_file.readAlloc(alloc, io, path, 4 * 1024 * 1024, control.execution_wait);
     defer alloc.free(raw);
-    return try configFromJsonAlloc(alloc, raw, scope);
+    var cfg = try configFromJsonAlloc(alloc, raw, scope);
+    errdefer cfg.deinit(alloc);
+    try control.check();
+    return cfg;
 }
 
 fn configFromJsonAlloc(alloc: Allocator, raw: []const u8, scope: []const u8) !Config {
@@ -1004,6 +1088,18 @@ pub fn configFromEnvAlloc(alloc: Allocator, scope: []const u8) !Config {
 }
 
 pub fn configFromEnvWithIoAlloc(alloc: Allocator, scope: []const u8, filesystem_io: ?std.Io) !Config {
+    return configFromEnvWithIoAndControlAlloc(alloc, scope, filesystem_io, .{});
+}
+
+pub fn configFromEnvWithIoAndControlAlloc(alloc: Allocator, scope: []const u8, filesystem_io: ?std.Io, control: RequestControl) !Config {
+    try control.check();
+    var cfg = try configFromEnvOnce(alloc, scope, filesystem_io, control);
+    errdefer cfg.deinit(alloc);
+    try control.check();
+    return cfg;
+}
+
+fn configFromEnvOnce(alloc: Allocator, scope: []const u8, filesystem_io: ?std.Io, control: RequestControl) !Config {
     if (try envOwned(alloc, "GOOGLE_SERVICE_ACCOUNT_JSON")) |json| {
         defer alloc.free(json);
         const account = try parseServiceAccountJsonAlloc(alloc, json);
@@ -1011,11 +1107,11 @@ pub fn configFromEnvWithIoAlloc(alloc: Allocator, scope: []const u8, filesystem_
     }
     if (try envOwned(alloc, "GOOGLE_APPLICATION_CREDENTIALS")) |path| {
         defer alloc.free(path);
-        return try configFromFileAllocWithIo(alloc, path, scope, filesystem_io);
+        return try configFromFileAllocWithIoAndControl(alloc, path, scope, filesystem_io, control);
     }
     if (try defaultAdcPathAlloc(alloc)) |path| {
         defer alloc.free(path);
-        if (configFromFileAllocWithIo(alloc, path, scope, filesystem_io)) |cfg| {
+        if (configFromFileAllocWithIoAndControl(alloc, path, scope, filesystem_io, control)) |cfg| {
             return cfg;
         } else |err| switch (err) {
             error.FileNotFound => {},
@@ -1031,15 +1127,26 @@ pub fn projectIdFromDefaultCredentialsAlloc(alloc: Allocator) !?[]u8 {
 }
 
 pub fn projectIdFromDefaultCredentialsAllocWithControl(alloc: Allocator, control: RequestControl) !?[]u8 {
+    return projectIdFromDefaultCredentialsAllocWithIoAndControl(alloc, null, control);
+}
+
+pub fn projectIdFromDefaultCredentialsAllocWithIoAndControl(alloc: Allocator, io: ?std.Io, control: RequestControl) !?[]u8 {
     try control.check();
-    if ((try envOwned(alloc, "GOOGLE_CLOUD_PROJECT")) orelse (try envOwned(alloc, "GCLOUD_PROJECT"))) |value| return value;
-    var cfg = configFromEnvAlloc(alloc, default_scope) catch return null;
+    if ((try envOwned(alloc, "GOOGLE_CLOUD_PROJECT")) orelse (try envOwned(alloc, "GCLOUD_PROJECT"))) |value| {
+        errdefer alloc.free(value);
+        try control.check();
+        return value;
+    }
+    var cfg = configFromEnvWithIoAndControlAlloc(alloc, default_scope, io, control) catch |err| {
+        try control.check();
+        return if (err == error.OutOfMemory) err else null;
+    };
     defer cfg.deinit(alloc);
-    return switch (cfg.credentials) {
+    const result: ?[]u8 = switch (cfg.credentials) {
         .service_account => if (cfg.projectId()) |value| try alloc.dupe(u8, value) else null,
         .authorized_user, .external_account => null,
         .metadata => |metadata| blk: {
-            var transport = HttpxTransport.init(alloc, null) catch break :blk null;
+            var transport = HttpxTransport.init(alloc, io) catch break :blk null;
             defer transport.deinit();
             var response = HttpxTransport.request(&transport, alloc, .GET, metadata.project_id_url, &.{.{ "Metadata-Flavor", "Google" }}, null, null, control) catch |err| {
                 try control.check();
@@ -1052,12 +1159,22 @@ pub fn projectIdFromDefaultCredentialsAllocWithControl(alloc: Allocator, control
             break :blk if (project.len > 0) try alloc.dupe(u8, project) else null;
         },
     };
+    errdefer if (result) |value| alloc.free(value);
+    try control.check();
+    return result;
 }
 
 pub fn projectIdFromFileAlloc(alloc: Allocator, path: []const u8) !?[]u8 {
-    var cfg = try configFromFileAlloc(alloc, path, default_scope);
+    return projectIdFromFileAllocWithIoAndControl(alloc, path, null, .{});
+}
+
+pub fn projectIdFromFileAllocWithIoAndControl(alloc: Allocator, path: []const u8, io: ?std.Io, control: RequestControl) !?[]u8 {
+    var cfg = try configFromFileAllocWithIoAndControl(alloc, path, default_scope, io, control);
     defer cfg.deinit(alloc);
-    return if (cfg.projectId()) |value| try alloc.dupe(u8, value) else null;
+    const result = if (cfg.projectId()) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (result) |value| alloc.free(value);
+    try control.check();
+    return result;
 }
 
 /// Compatibility alias. New code should use projectIdFromDefaultCredentialsAlloc.
@@ -1588,4 +1705,21 @@ test "google auth remaining budget includes previous exchanges" {
     const after = (try control.remainingTimeoutMs()).?;
     try std.testing.expect(after < before);
     try std.testing.expectError(error.Timeout, projectIdFromDefaultCredentialsAllocWithControl(std.testing.allocator, .{ .deadline_ns = 0 }));
+}
+
+test "google auth preserves valid proactive fallback after upstream timeout" {
+    const a = std.testing.allocator;
+    const cfg = try configFromJsonAlloc(a, "{\"type\":\"authorized_user\",\"client_id\":\"client\",\"client_secret\":\"secret\",\"refresh_token\":\"refresh\"}", default_scope);
+    const Timeout = struct {
+        fn request(_: ?*anyopaque, _: Allocator, _: HttpMethod, _: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: RequestControl) !TransportResponse {
+            return error.Timeout;
+        }
+    };
+    var source = CachedTokenSource.initWithRequestFn(a, cfg, null, Timeout.request);
+    defer source.deinit();
+    source.cached_token = .{ .value = try a.dupe(u8, "still-valid"), .expires_at_s = nowSeconds() + 10 };
+    const result = try source.accessTokenAllocWithControl(a, .{});
+    defer a.free(result);
+    try std.testing.expectEqualStrings("still-valid", result);
+    try std.testing.expect(!source.refreshing);
 }

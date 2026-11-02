@@ -1,0 +1,19 @@
+{
+  "state": "terminal",
+  "exit_code": 0,
+  "selected_tests": 43,
+  "passed": 33,
+  "skipped": 10,
+  "failed": 0,
+  "source_sha256": {
+    "zig/lib/httpx/src/net/socket.zig": "85519821fe9acf59f0395aae9247ebb2054d7b90d1e081f30620a7599c569199",
+    "zig/lib/httpx/src/util/common.zig": "5baac932275002d819ae55d201f0ec9dff1b28b7f684f6c7df0824dac059b76a",
+    "zig/lib/httpx/src/server/server.zig": "a7a97d72e84b275d45015e9bc52cbfcb74eaffad80d6031ea9cc90063ac360a0",
+    "zig/lib/httpx/src/protocol/h2_connection.zig": "940be3d5119429f782bb219391cd964e7561ed4cf54dad44d470b8895f909062",
+    "zig/build.zig": "23aec190effb2c1a352a2c0074ae8e64557ed6807702f5dc4112c30cc9400612",
+    "zig/lib/httpx/src/httpx.zig": "277ffdac9b9aaf0c5da757496dd5566ceae613e40b3ab57fd2a3ec43033d4600",
+    "zig/lib/json/src/mod.zig": "63867c1f746b5dbb6dcf0945bd938fd8f5d5b4a5548b578d31ad422b40ac20d3"
+  },
+  "hash_capture": "After completion; unchanged compiled-library source matches Linux launch manifest. Runtime bridge and standalone bodies excluded.",
+  "command": "zig test -OReleaseSafe -lc (same root, dependencies and filters as linux-result.json, native target)"
+}

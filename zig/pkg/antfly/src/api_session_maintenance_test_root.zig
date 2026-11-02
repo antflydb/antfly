@@ -19,6 +19,8 @@ const transactions = @import("api/transactions.zig");
 test {
     _ = http_server;
     _ = transactions;
+    _ = @import("api/sql_session.zig");
+    _ = @import("api/httpx_handler.zig");
 }
 
 /// Implementation source choices for this compilation root.

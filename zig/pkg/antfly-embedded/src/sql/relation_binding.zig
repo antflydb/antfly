@@ -1146,7 +1146,12 @@ const Builder = struct {
                 for (columns, arm.columns) |*column, other| {
                     if (self.shape_only) {
                         column.type = .string;
-                    } else if (column.type != other.type or column.element_type != other.element_type) return error.SqlTypeMismatch;
+                    } else {
+                        // Native declarations may omit the default numeric width.
+                        // Compare the same canonical identity as scalar binding.
+                        if (column.type != other.type or scalar.columnElementType(column.type, column.element_type) != scalar.columnElementType(other.type, other.element_type)) return error.SqlTypeMismatch;
+                        column.element_type = scalar.columnElementType(column.type, column.element_type);
+                    }
                     column.nullable = column.nullable or other.nullable;
                     column.untyped_null = column.untyped_null and other.untyped_null;
                 }
@@ -1188,7 +1193,8 @@ const Builder = struct {
                     column.numeric_modifier = common.numeric_modifier;
                     try self.constraints.append(self.alloc, .{ .expression = column.origin.? });
                 } else {
-                    if (column.type != other.type or column.element_type != other.element_type) return error.SqlTypeMismatch;
+                    if (column.type != other.type or scalar.columnElementType(column.type, column.element_type) != scalar.columnElementType(other.type, other.element_type)) return error.SqlTypeMismatch;
+                    column.element_type = scalar.columnElementType(column.type, column.element_type);
                     if (!scalar.NumericModifier.eql(column.numeric_modifier, other.numeric_modifier)) column.numeric_modifier = null;
                 }
                 column.internal = try self.internal();

@@ -88,6 +88,10 @@ pub fn isRowEvaluationError(err: anyerror) bool {
 
 pub fn describe(err: anyerror) Diagnostic {
     return switch (err) {
+        // A failed individual read admission does not prove that an entire
+        // statement, transaction or batch is safe to replay.
+        error.RemoteReadUnavailable => .{ .code = "53300", .message = "Remote read execution is temporarily unavailable.", .retryable = false },
+        error.UnsupportedRemoteAttemptProtocol => .{ .code = "0A000", .message = "The destination does not support the required remote read protocol.", .retryable = false },
         error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => .{ .code = "22023", .message = "The read requirements or write receipt do not match this table generation.", .retryable = false },
         error.UnsupportedReadVisibility => .{ .code = "0A000", .message = "This execution path does not support the requested read visibility.", .retryable = false },
         error.ReadRequirementNotReady => .{ .code = "53300", .message = "The requested write is not yet visible within the readiness budget.", .retryable = true },
@@ -232,8 +236,10 @@ pub fn describe(err: anyerror) Diagnostic {
         error.Canceled, error.Cancelled, error.QueryCanceled, error.DeadlineExceeded, error.Timeout => .{ .code = "57014", .message = "The SQL operation was canceled or its deadline expired.", .hint = "Reduce the operation's work or choose a suitable deadline." },
         error.CatalogGenerationChanged, error.PreparedGenerationChanged, error.GenerationRetired, error.IntegrityCatalogChanged => .{ .code = "40001", .message = "The table definition changed before the statement could complete.", .hint = "Prepare the statement again against the current schema.", .retryable = true },
         error.SqlWriteConflict, error.PreparedReadSetChanged, error.VersionConflict, error.IntentConflict => .{ .code = "40001", .message = "The mutation conflicted with a concurrent change and was not committed.", .hint = "Read the current rows before retrying the complete statement.", .retryable = true },
+        error.RunnableWaitTimeout => .{ .code = "57014", .message = "SQL runnable scheduling wait exceeded its bounded deadline.", .retryable = false },
+        error.SchedulerFull, error.SchedulerClosed => .{ .code = "53300", .message = "SQL runnable scheduling capacity is unavailable.", .retryable = true },
         error.FileBusy, error.WouldBlock => .{ .code = "55P03", .message = "The database resource is temporarily locked.", .hint = "Retry the complete statement after the competing operation finishes.", .retryable = true },
-        error.SqlWriteCapacityUnavailable, error.SqlPlanCacheBusy, error.Backpressured, error.DenseRepairBackpressure => .{ .code = "53300", .message = "SQL execution capacity is temporarily exhausted.", .hint = "Retry after a bounded delay; reduce concurrent requests.", .retryable = true },
+        error.ReadMemoryCapacityUnavailable, error.SqlWriteCapacityUnavailable, error.SqlPlanCacheBusy, error.Backpressured, error.DenseRepairBackpressure => .{ .code = "53300", .message = "SQL execution capacity is temporarily exhausted.", .hint = "Retry after a bounded delay; reduce concurrent requests.", .retryable = true },
         error.SqlStatementReadUnavailable => .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
         error.RestoreValidationPending => .{ .code = "53300", .message = "The source owner is not ready to admit a schema rewrite.", .hint = "No rewrite job was admitted; wait for the table owner to become ready before retrying the DDL.", .retryable = true },
         error.HAReadOnlyStandby, error.HAPromotedStandbyRequiresPrimaryOpen, error.HAFencedPrimary => .{ .code = "25006", .message = "This server is not accepting writes in its current standby or fencing state.", .hint = "Send the mutation to an active writable primary.", .retryable = false },
@@ -315,6 +321,28 @@ test "durable SQL destination credential rejection is forbidden, not internal" {
 test "SQL row evaluation classification preserves resource and control failures" {
     for ([_]anyerror{ error.SqlInvalidTextRepresentation, error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.SqlCardinalityViolation, error.SqlArraySubscriptError, error.SqlInvalidPowerArgument }) |err| try std.testing.expect(isRowEvaluationError(err));
     for ([_]anyerror{ error.OutOfMemory, error.QueryCanceled, error.DeadlineExceeded, error.SqlProgramLimitExceeded, error.ArtifactIntegrityMismatch, error.InvalidSqlBackendResponse }) |err| try std.testing.expect(!isRowEvaluationError(err));
+}
+
+test "remote read diagnostics distinguish missing proof and unsupported protocol without replay advice" {
+    const unavailable = describe(error.RemoteReadUnavailable);
+    try std.testing.expectEqualStrings("53300", unavailable.code);
+    try std.testing.expectEqual(@as(u16, 503), unavailable.httpStatus());
+    try std.testing.expectEqual(@as(?bool, false), unavailable.retryable);
+    const unsupported = describe(error.UnsupportedRemoteAttemptProtocol);
+    try std.testing.expectEqualStrings("0A000", unsupported.code);
+    try std.testing.expectEqual(@as(u16, 501), unsupported.httpStatus());
+    try std.testing.expectEqual(@as(?bool, false), unsupported.retryable);
+}
+
+test "SQL diagnostics distinguish read admission refusal from physical allocation failure" {
+    const capacity = describe(error.ReadMemoryCapacityUnavailable);
+    try std.testing.expectEqualStrings("53300", capacity.code);
+    try std.testing.expectEqual(@as(u16, 503), capacity.httpStatus());
+    try std.testing.expectEqual(@as(?bool, true), capacity.retryable);
+    const physical = describe(error.OutOfMemory);
+    try std.testing.expectEqualStrings("53200", physical.code);
+    try std.testing.expectEqual(@as(u16, 500), physical.httpStatus());
+    try std.testing.expect(physical.retryable != true);
 }
 
 test "SQL decision evidence failures are nonretryable client diagnostics" {

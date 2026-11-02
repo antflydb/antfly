@@ -1,0 +1,217 @@
+{
+  "automatic_defaults_qualified": false,
+  "architecture": "aarch64-linux-gnu",
+  "runtime_qualification_profiles": {
+    "small-idle": {
+      "candidate-fixed": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "candidate-failfast": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "origin-main": {
+        "passed": 0,
+        "total": 3,
+        "failures": [
+          {
+            "receipt": "linux-small-r01-origin-main.json",
+            "failures": [
+              "[Errno 104] Connection reset by peer",
+              "control_latency_seconds: None exceeds 2"
+            ]
+          },
+          {
+            "receipt": "linux-small-r02-origin-main.json",
+            "failures": [
+              "pgwire peer closed unexpectedly",
+              "control_latency_seconds: None exceeds 2"
+            ]
+          },
+          {
+            "receipt": "linux-small-r03-origin-main.json",
+            "failures": [
+              "[Errno 104] Connection reset by peer",
+              "control_latency_seconds: None exceeds 2"
+            ]
+          }
+        ]
+      }
+    },
+    "large-idle": {
+      "candidate-fixed": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "candidate-failfast": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "origin-main": {
+        "passed": 0,
+        "total": 3,
+        "failures": [
+          {
+            "receipt": "linux-large-r01-origin-main.json",
+            "failures": [
+              "pgwire peer closed unexpectedly",
+              "control_latency_seconds: None exceeds 2"
+            ]
+          },
+          {
+            "receipt": "linux-large-r02-origin-main.json",
+            "failures": [
+              "pgwire peer closed unexpectedly",
+              "control_latency_seconds: None exceeds 2"
+            ]
+          },
+          {
+            "receipt": "linux-large-r03-origin-main.json",
+            "failures": [
+              "[Errno 104] Connection reset by peer",
+              "control_latency_seconds: None exceeds 2"
+            ]
+          }
+        ]
+      }
+    },
+    "mixed": {
+      "candidate-fixed": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "candidate-failfast": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "origin-main": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      }
+    },
+    "waiting-pressure": {
+      "candidate-fixed": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "candidate-failfast": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "origin-main": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      }
+    },
+    "combined-one-slot": {
+      "candidate-fixed": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "candidate-failfast": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "origin-main": {
+        "passed": 0,
+        "total": 3,
+        "failures": [
+          {
+            "receipt": "linux-combined-pressure-r01-origin-main.json",
+            "failures": [
+              "qualification failed: ConnectionResetError"
+            ]
+          },
+          {
+            "receipt": "linux-combined-pressure-r02-origin-main.json",
+            "failures": [
+              "qualification failed: ConnectionResetError"
+            ]
+          },
+          {
+            "receipt": "linux-combined-pressure-r03-origin-main.json",
+            "failures": [
+              "qualification failed: ConnectionResetError"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "relative_comparisons": {
+    "mixed": {
+      "candidate-failfast": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "origin-main": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      }
+    },
+    "waiting-pressure": {
+      "candidate-failfast": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "origin-main": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      }
+    },
+    "combined-one-slot": {
+      "candidate-failfast": {
+        "passed": 3,
+        "total": 3,
+        "failures": []
+      },
+      "origin-main": {
+        "passed": 0,
+        "total": 3,
+        "failures": [
+          {
+            "receipt": "linux-combined-pressure-r01-compare-origin-main.json",
+            "failures": [
+              "baseline qualification failed",
+              "phase coverage does not match manifest"
+            ]
+          },
+          {
+            "receipt": "linux-combined-pressure-r02-compare-origin-main.json",
+            "failures": [
+              "baseline qualification failed",
+              "phase coverage does not match manifest"
+            ]
+          },
+          {
+            "receipt": "linux-combined-pressure-r03-compare-origin-main.json",
+            "failures": [
+              "baseline qualification failed",
+              "phase coverage does not match manifest"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "candidate_absolute_passed": 30,
+  "candidate_absolute_total": 30,
+  "limitation": "Main cannot retain the offered pgwire sessions in idle/combined setup; combined-versus-main timings are unavailable. Whole-process native/backend ownership and arbitrary physical completion are not established."
+}

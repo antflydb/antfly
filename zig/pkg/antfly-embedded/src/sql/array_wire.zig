@@ -50,6 +50,8 @@ pub const Inspection = struct {
 
 const View = struct {
     value: arrays.Value,
+    context: ?*@import("numeric_value.zig").Context = null,
+    failure: ?*?anyerror = null,
     pub fn jsonStringify(self: View, writer: anytype) !void {
         try writer.beginObject();
         try writer.objectField("dimensions");
@@ -63,7 +65,11 @@ const View = struct {
             if (element.sql_null) {
                 try writer.write(null);
             } else switch (self.value.element_type) {
-                .numeric => try writer.write(@import("scalar.zig").NumericJsonText{ .value = element.numeric.? }),
+                .numeric => try writer.write(@import("scalar.zig").NumericJsonText{ .value = element.numeric.?, .checkpoint = if (self.context != null) struct {
+                    fn poll(raw: ?*anyopaque) !void {
+                        try @as(*@import("numeric_value.zig").Context, @ptrCast(@alignCast(raw.?))).checkpointNow();
+                    }
+                }.poll else null, .ptr = self.context, .failure = self.failure }),
                 .int16, .int32, .int64 => {
                     var buffer: [20]u8 = undefined;
                     try writer.write(std.fmt.bufPrint(&buffer, "{d}", .{element.value.integer}) catch unreachable);
@@ -100,6 +106,27 @@ fn encodedSize(value: arrays.Value, options: Options) !usize {
 pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
     _ = try encodedSize(value, options);
     try std.json.Stringify.value(View{ .value = value }, .{}, writer);
+}
+
+/// A controlled compact encoder supplies countValue/write/original. Validation
+/// and exact byte/work admission complete before any destination bytes change.
+/// The encoder and optional numeric context borrow the same enclosing authority.
+pub fn encodeControlled(value: arrays.Value, encoder: anytype, options: Options) !void {
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
+    const canonical = try arrays.Value.initWithBudget(value.element_type, value.dimensions, value.elements, options.values, &work);
+    if (canonical.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
+    var numeric_failure: ?anyerror = null;
+    const view: View = .{ .value = value, .context = options.context, .failure = &numeric_failure };
+    const bytes = encoder.countValue(view) catch |err| {
+        if (numeric_failure) |cause| if (cause != error.WriteFailed) return cause;
+        return err;
+    };
+    if (bytes > options.wire_bytes or bytes > work.remaining / 2) return options.limit();
+    try work.consume(bytes * 2);
+    encoder.write(view) catch |err| {
+        if (numeric_failure) |cause| if (cause != error.WriteFailed) return cause;
+        return encoder.original(err);
+    };
 }
 
 /// Exact one-allocation output for owners which need retained bytes. Unlike a
@@ -156,7 +183,7 @@ fn arrayField(object: std.json.ObjectMap, name: []const u8) ![]const Json {
     return field.array.items;
 }
 
-fn readElement(kind: arrays.ElementType, raw: Json, sql_null: bool) !arrays.Element {
+fn readElement(kind: arrays.ElementType, raw: Json, sql_null: bool, context: ?*@import("numeric_value.zig").Context) !arrays.Element {
     if (sql_null) {
         if (raw != .null) return error.InvalidSqlArrayShape;
         return .{};
@@ -170,7 +197,10 @@ fn readElement(kind: arrays.ElementType, raw: Json, sql_null: bool) !arrays.Elem
             if (raw.string.len == 0) return error.SqlInvalidTextRepresentation;
             const digits = raw.string[@intFromBool(raw.string[0] == '-')..];
             if (digits.len == 0 or (digits.len > 1 and digits[0] == '0')) return error.SqlInvalidTextRepresentation;
-            for (digits) |digit| if (!std.ascii.isDigit(digit)) return error.SqlInvalidTextRepresentation;
+            for (digits, 0..) |digit, index| {
+                if (index % 1024 == 0) if (context) |owner| try owner.checkpointNow();
+                if (!std.ascii.isDigit(digit)) return error.SqlInvalidTextRepresentation;
+            }
             const parsed = std.fmt.parseInt(i64, raw.string, 10) catch |err| return switch (err) {
                 error.Overflow => error.SqlNumericOutOfRange,
                 else => error.SqlInvalidTextRepresentation,
@@ -183,7 +213,7 @@ fn readElement(kind: arrays.ElementType, raw: Json, sql_null: bool) !arrays.Elem
         .float32, .float64 => blk: {
             if (raw == .string and !std.mem.eql(u8, raw.string, "NaN") and !std.mem.eql(u8, raw.string, "Infinity") and !std.mem.eql(u8, raw.string, "-Infinity")) return error.SqlInvalidTextRepresentation;
             if (raw != .string and raw != .float and raw != .integer and raw != .number_string) return error.SqlTypeMismatch;
-            break :blk .{ .float = if (kind == .float32) try casts.floatValue(f32, raw) else try casts.floatValue(f64, raw) };
+            break :blk .{ .float = if (kind == .float32) try casts.floatValueControlled(f32, raw, context) else try casts.floatValueControlled(f64, raw, context) };
         },
         else => raw,
     });
@@ -275,15 +305,15 @@ pub fn normalize(kind: arrays.ElementType, input: *Json, preserve: bool, options
     if (!casts.floating(kind)) return inspected.admission;
     if (preserve and kind == .float32) for (inspected.values, inspected.nulls) |raw, flag| {
         if (flag.bool or raw == .string) continue;
-        const original = try casts.floatValue(f64, raw);
-        const canonical = (try readElement(kind, raw, false)).value.float;
+        const original = try casts.floatValueControlled(f64, raw, options.context);
+        const canonical = (try readElement(kind, raw, false, options.context)).value.float;
         if (original != canonical and !(std.math.isNan(original) and std.math.isNan(canonical))) return error.InvalidSqlArrayShape;
     };
     if (!preserve) {
         const values = input.object.getPtr("values").?.array.items;
         for (values, inspected.nulls) |*raw, flag| {
             if (flag.bool or raw.* == .string) continue;
-            raw.* = (try readElement(kind, raw.*, false)).value;
+            raw.* = (try readElement(kind, raw.*, false, options.context)).value;
         }
     }
     return inspected.admission;
@@ -333,7 +363,7 @@ fn inspect(kind: arrays.ElementType, input: Json, options: Options) !Inspection 
             .string, .number_string => |text| try work.consume(text.len),
             else => {},
         };
-        const cell = try readElement(kind, raw, flag.bool);
+        const cell = try readElement(kind, raw, flag.bool, options.context);
         // Reuse the complete typed-array domain validator (JSONB recursion,
         // UTF-8, widths, NULL ownership and finite float4 representation).
         _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{cell}, options.values, &work);
@@ -365,7 +395,7 @@ fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, inpu
             cell.* = if (flag.bool) .{} else try @import("scalar.zig").numericTextWithModifierLeaky(a, raw.string, modifier, &work);
             continue;
         }
-        const decoded = try readElement(kind, raw, flag.bool);
+        const decoded = try readElement(kind, raw, flag.bool, options.context);
         cell.* = if (own_payloads) try operators.cloneDatum(a, decoded) else decoded;
     }
     const owned_dimensions = try a.dupe(arrays.Dimension, inspected.dimensions[0..inspected.rank]);
@@ -511,7 +541,7 @@ fn decodeBytesImpl(a: A, kind: arrays.ElementType, input: []const u8, options: O
                     .string, .number_string => |text| try work.consume(text.len),
                     else => {},
                 };
-                const cell = try readElement(kind, value, flag);
+                const cell = try readElement(kind, value, flag, options.context);
                 if (fixed) try fixed_builder.appendChecked(cell, kind, options.values, &work) else _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{cell}, options.values, &work);
                 bytes = std.math.add(usize, bytes, try operators.datumBytes(cell)) catch return options.limit();
                 if (!flag and kind == .text) text_bytes += cell.value.string.len;
@@ -540,8 +570,8 @@ fn decodeBytesImpl(a: A, kind: arrays.ElementType, input: []const u8, options: O
         try work.consume(0);
         const flag = try nullFlag((try nulls.next()).?);
         const value = try elementJson(temporary.allocator(), kind, raw);
-        if (compact) try builder.append(try readElement(kind, value, flag)) else {
-            cells[index] = if (kind == .numeric and !flag) try @import("scalar.zig").numericTextLeaky(a, value.string, &work) else try operators.cloneDatum(a, try readElement(kind, value, flag));
+        if (compact) try builder.append(try readElement(kind, value, flag, options.context)) else {
+            cells[index] = if (kind == .numeric and !flag) try @import("scalar.zig").numericTextLeaky(a, value.string, &work) else try operators.cloneDatum(a, try readElement(kind, value, flag, options.context));
         }
     }
     var result = if (compact) try builder.finish(a, options.values) else arrays.Value{ .element_type = kind, .dimensions = try a.dupe(arrays.Dimension, dimensions[0..rank]), .elements = cells, .prepared_footprint = if (kind == .numeric) null else bytes };
@@ -987,6 +1017,44 @@ test "SQL array parsed admission benchmark retains no cell vectors at maximum ca
         for (0..4) |_| total_work += (try validate(.int64, input, options)).work;
         std.debug.print("SQL array parsed admission: cells={} passes=4 elapsed_ns={} work={} materialized_cells=0 allocations=0\n", .{ count, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start, total_work });
     }
+}
+
+test "SQL array integer wire validates long decimal input under original context before range diagnostics" {
+    const Context = @import("numeric_value.zig").Context;
+    const Probe = struct {
+        calls: usize = 0,
+        refuse: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == self.refuse) return error.QueryCanceled;
+        }
+    };
+    const a = std.testing.allocator;
+    const digits = try a.alloc(u8, 16384);
+    defer a.free(digits);
+    @memset(digits, '9');
+    const input = try std.mem.concat(a, u8, &.{ "{\"dimensions\":[{\"length\":1,\"lower_bound\":1}],\"values\":[\"", digits, "\"],\"sql_nulls\":[false]}" });
+    defer a.free(input);
+    const parsed = try std.json.parseFromSlice(Json, a, input, .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.SqlNumericOutOfRange, validate(.int64, parsed.value, .{}));
+    var probe: Probe = .{};
+    var baseline: Context = .{ .alloc = a, .checkpoint = Probe.check, .ptr = &probe };
+    try std.testing.expectError(error.SqlNumericOutOfRange, validate(.int64, parsed.value, .{ .context = &baseline }));
+    try std.testing.expect(probe.calls > 16);
+    for (1..probe.calls + 1) |failure| {
+        var interrupted: Probe = .{ .refuse = failure };
+        var context: Context = .{ .alloc = a, .checkpoint = Probe.check, .ptr = &interrupted };
+        try std.testing.expectError(error.QueryCanceled, validate(.int64, parsed.value, .{ .context = &context }));
+        try std.testing.expectError(error.QueryCanceled, context.charge(0));
+        try std.testing.expectEqual(failure, interrupted.calls);
+    }
+    // Validation still classifies a bad trailing digit before range overflow.
+    const value = parsed.value.object.get("values").?.array.items[0].string;
+    @constCast(value)[value.len - 1] = 'x';
+    var healthy: Context = .{ .alloc = a };
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, validate(.int64, parsed.value, .{ .context = &healthy }));
 }
 
 test "SQL streaming document arrays preserve legacy admission cells and failure cleanup" {

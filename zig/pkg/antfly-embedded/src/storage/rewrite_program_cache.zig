@@ -107,6 +107,14 @@ pub const Cache = struct {
         if (entry) |value| value.release();
     }
 
+    /// Exclusive close preflight after producers and foreground users drain.
+    /// Rejection retains the registration and its callback context for retry.
+    pub fn drainCallbacksWithAdmission(self: *Cache, io: std.Io, original: @import("../common/read_admission.zig").Port) !void {
+        if (self.manager) |manager| try manager.unregisterReclaimerWithAdmission(self.reclaimer, io, original);
+        self.reclaimer = 0;
+        self.manager = null;
+    }
+
     pub fn deinit(self: *Cache, io: std.Io) void {
         // The resident owner drains requests before close. Leases may outlive
         // eviction, but must not outlive the backing allocator/ResourceManager.

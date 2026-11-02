@@ -26,6 +26,7 @@ pub const background = @import("background.zig");
 pub const cache = @import("cache.zig");
 pub const wal = @import("wal.zig");
 pub const Options = impl.Options;
+pub const PinQuota = impl.PinQuota;
 pub const Backend = impl.Backend;
 pub const BackendHandle = impl.BackendHandle;
 pub const BackgroundExecutor = background.Executor;

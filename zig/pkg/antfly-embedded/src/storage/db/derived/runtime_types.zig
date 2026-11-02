@@ -36,6 +36,18 @@ pub const CatchUpFinishResult = struct {
 };
 pub const BeginCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!CatchUpSessionToken;
 pub const FinishCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, applied_sequence: u64, success: bool) anyerror!CatchUpFinishResult;
+/// Set immediately after the provider consumes its exact session. Rejections
+/// before consumption are retryable; failures afterward must not replay it.
+pub const FinishAttempt = struct {
+    consumed: bool = false,
+    /// Publish only after physical finish and durable publication succeed,
+    /// before any fallible caller reentry. No further fallible publication may follow
+    /// this receipt; mandatory retirement may still run. A later callback error cannot erase the completed result.
+    completed: ?CatchUpFinishResult = null,
+};
+/// A null original is reserved for an ordinary dispatch owning no foreground
+/// grant. It must use capture-funded execution and the same consumption receipt.
+pub const FinishWithAdmissionFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, applied_sequence: u64, success: bool, original: ?@import("../../../common/read_admission.zig").Port, attempt: *FinishAttempt) anyerror!CatchUpFinishResult;
 pub const CanAdvanceToTargetFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
 pub const AppliedSequenceAdvancedFn = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
 
@@ -49,15 +61,37 @@ pub const VisibilityWait = struct {
     cancellation: types.CancellationToken = .none,
     deadline_ns: ?u64 = null,
     clock: ?platform_clock.Clock = null,
+    /// Supplied only when the caller has no service holder forbidding lending.
+    execution_wait: ?@import("../../../common/execution_wait.zig").Boundary = null,
 
     pub fn check(self: @This()) !void {
-        if (self.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+        // A scoped fallible token is authoritative: retain its original
+        // lifetime cause instead of collapsing it to a transport cancel flag.
+        if (self.cancellation.check_fn != null) {
+            try self.cancellation.check();
+        } else if (self.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
         if (self.deadline_ns) |deadline_ns| {
             const now_ns = if (self.clock) |clock|
                 clock.nowRealtimeNs()
             else
                 platform_time.monotonicNs();
             if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
+        }
+    }
+
+    /// Only the physical polling sleep lends CPU. Reentry precedes consuming
+    /// its result, and neither operation ownership nor deadline is replaced.
+    pub fn waitForProgress(self: @This(), io: std.Io, duration: std.Io.Duration) !void {
+        if (self.execution_wait) |boundary| {
+            try self.check();
+            try boundary.beginWait();
+            const result = io.sleep(duration, .awake);
+            try boundary.endWait();
+            try self.check();
+            try result;
+        } else {
+            io.sleep(duration, .awake) catch {};
+            try self.check();
         }
     }
 };
@@ -77,4 +111,63 @@ test "derived visibility wait retains its deadline clock and cancellation" {
     try std.testing.expectError(error.EnrichmentWaitTimeout, wait.check());
     cancelled.store(true, .release);
     try std.testing.expectError(error.EnrichmentWaitCanceled, wait.check());
+}
+
+test "controlled derived visibility wait preserves authoritative one-shot lifetime rejection" {
+    const Scope = struct {
+        calls: usize = 0,
+        cause: anyerror,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 1) return self.cause;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged, error.DerivedTargetAdvanceStuck }) |cause| {
+        var scope: Scope = .{ .cause = cause };
+        const wait: VisibilityWait = .{ .cancellation = .{ .ptr = &scope, .check_fn = Scope.check } };
+        try std.testing.expectError(cause, wait.check());
+        try std.testing.expectEqual(@as(usize, 1), scope.calls);
+    }
+}
+
+test "controlled derived visibility retains CPU by default and skips polling after refused lending" {
+    const native = @import("../../../common/runnable_scheduler.zig");
+    const Probe = struct {
+        scheduler: *native.Scheduler,
+        checks: usize = 0,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), self.scheduler.stats().retained_bytes);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            return error.CatalogGenerationChanged;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+        }
+    };
+    var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+    defer scheduler.close();
+    var execution: native.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+    defer execution.finish();
+    var probe: Probe = .{ .scheduler = &scheduler };
+    var wait: VisibilityWait = .{ .cancellation = .{ .ptr = &probe, .check_fn = Probe.check } };
+    try wait.waitForProgress(std.testing.io, .zero);
+    try std.testing.expectEqual(@as(usize, 1), probe.checks);
+    wait.execution_wait = .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end };
+    try std.testing.expectError(error.CatalogGenerationChanged, wait.waitForProgress(std.testing.io, .zero));
+    try std.testing.expectEqual(@as(usize, 2), probe.checks);
+    try std.testing.expectEqual(@as(usize, 1), probe.begins);
+    try std.testing.expectEqual(@as(usize, 0), probe.ends);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
 }

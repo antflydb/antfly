@@ -30,13 +30,28 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
-    .{ .status = .read_transient_failure, .err = error.ReadTransientFailure },
-    .{ .status = .read_request_failed, .err = error.ReadRequestFailed },
-    .{ .status = .invalid_gcs_url, .err = error.InvalidGcsUrl },
-    .{ .status = .gcs_connection_not_found_or_out_of_scope, .err = error.GcsConnectionNotFoundOrOutOfScope },
     .{ .status = .ambiguous_gcs_connection, .err = error.AmbiguousGcsConnection },
-    .{ .status = .invalid_connection_credentials, .err = error.InvalidConnectionCredentials },
+    .{ .status = .backpressured, .err = error.Backpressured },
+    .{ .status = .commit_completion_pending, .err = error.CommitCompletionPending },
+    .{ .status = .corrupt_input, .err = error.CorruptInput },
+    .{ .status = .execution_wait_unsupported, .err = error.ExecutionWaitUnsupported },
+    .{ .status = .gcs_connection_not_found_or_out_of_scope, .err = error.GcsConnectionNotFoundOrOutOfScope },
     .{ .status = .hierarchy_cursor_stale, .err = error.HierarchyCursorStale },
+    .{ .status = .invalid_connection_credentials, .err = error.InvalidConnectionCredentials },
+    .{ .status = .invalid_gcs_url, .err = error.InvalidGcsUrl },
+    .{ .status = .invalid_runnable_demand, .err = error.InvalidRunnableDemand },
+    .{ .status = .invalid_runnable_policy, .err = error.InvalidRunnablePolicy },
+    .{ .status = .invalid_runnable_transition, .err = error.InvalidRunnableTransition },
+    .{ .status = .invalid_table_file, .err = error.InvalidTableFile },
+    .{ .status = .invalid_transaction_participant, .err = error.InvalidParticipant },
+    .{ .status = .manager_cleanup_capacity_unavailable, .err = error.ManagerCleanupCapacityUnavailable },
+    .{ .status = .read_request_failed, .err = error.ReadRequestFailed },
+    .{ .status = .read_transient_failure, .err = error.ReadTransientFailure },
+    .{ .status = .runnable_wait_timeout, .err = error.RunnableWaitTimeout },
+    .{ .status = .scheduler_closed, .err = error.SchedulerClosed },
+    .{ .status = .scheduler_full, .err = error.SchedulerFull },
+    .{ .status = .table_block_checksum_mismatch, .err = error.TableBlockChecksumMismatch },
+    .{ .status = .transaction_closed, .err = error.TransactionClosed },
     .{ .status = .invalid_document_checkpoint, .err = error.InvalidDocumentCheckpoint },
     .{ .status = .too_many_active_jobs, .err = error.TooManyActiveJobs },
     .{ .status = .grouped_source_owner_changed, .err = error.GroupedSourceOwnerChanged },
@@ -1107,12 +1122,40 @@ test "committed visibility outcomes survive the storage owner boundary" {
         error.EnrichmentWorkerFailed,
         error.CommitVisibilityNotSatisfied,
         error.CommitPropagationIncomplete,
+        error.CommitCompletionPending,
+        error.InvalidParticipant,
     }) |err| {
         const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
         try std.testing.expect(failure.status != .internal);
         try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
         try std.testing.expectError(err, statusToError(failure.status));
         try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+}
+
+test "runnable failures survive status-only storage and local query boundaries" {
+    // Maintenance uses status-only calls, while reads attach an envelope.
+    // Both must return the original admission cause to their owner.
+    const failures = [_]anyerror{
+        error.SchedulerClosed,
+        error.SchedulerFull,
+        error.RunnableWaitTimeout,
+        error.ExecutionWaitUnsupported,
+        error.InvalidRunnableDemand,
+        error.InvalidRunnablePolicy,
+        error.InvalidRunnableTransition,
+        error.ManagerCleanupCapacityUnavailable,
+    };
+    for (failures, 0..) |err, index| {
+        const status = statusFromError(err);
+        try std.testing.expectEqual(@as(u32, 0x10000) + @as(u32, @intCast(index)), @backingInt(status));
+        try std.testing.expectError(err, statusToError(status));
+        for ([_]abi.FailureBoundary{ .storage_owner, .local_query }) |boundary| {
+            const failure = failureFromError(err, boundary, abi.abi_version, 1);
+            try validateFailureEnvelope(status, &failure, abi.abi_version);
+            try std.testing.expectError(err, statusToError(failure.status));
+            try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+        }
     }
 }
 

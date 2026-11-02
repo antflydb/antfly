@@ -21,6 +21,7 @@ const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const internal_keys = @import("internal_keys.zig");
 const ordered = @import("mem_ordered.zig");
+const read_admission = @import("../common/read_admission.zig");
 
 const State = struct {
     tree: ordered.Tree = .empty,
@@ -95,6 +96,7 @@ fn releaseState(allocator: Allocator, rc: *RcState) void {
 
 pub const Backend = struct {
     serialized_write_mutex: std.atomic.Mutex = .unlocked,
+    publication_backlog_mutex: std.atomic.Mutex = .unlocked,
     allocator: Allocator,
     open_options: backend_types.OpenOptions,
     state: ?*RcState = null,
@@ -114,6 +116,11 @@ pub const Backend = struct {
         backend: *Backend,
         namespace: backend_types.Namespace,
 
+        pub fn publicationGate(self: *@This()) ?*std.atomic.Mutex {
+            if (@hasField(Backend, "publication_backlog_mutex")) return &self.backend.publication_backlog_mutex;
+            return null;
+        }
+
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{
                 .ordered_ranges = true,
@@ -128,6 +135,21 @@ pub const Backend = struct {
 
         pub fn beginRead(self: *@This()) !BoundTxn {
             return try BoundTxn.open(self.backend, self.namespace, true);
+        }
+
+        pub fn beginReadWithAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !BoundTxn {
+            _ = admission; // Persistent memory snapshots have no block cache.
+            return BoundTxn.openReadWithAdmission(self.backend, self.namespace, control);
+        }
+
+        pub fn beginProbeWithAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !BoundTxn {
+            // A memory probe borrows the current persistent snapshot just as
+            // the legacy erased probe does; no mutable memtable is cloned.
+            return self.beginReadWithAdmission(admission, control);
+        }
+
+        pub fn beginCurrentScanWithAdmission(self: *@This(), control: read_admission.Port) !BoundTxn {
+            return BoundTxn.openReadWithAdmission(self.backend, self.namespace, control);
         }
 
         pub fn beginWrite(self: *@This()) !BoundTxn {
@@ -228,6 +250,26 @@ pub const Backend = struct {
             return self.forward(try self.inner.next());
         }
 
+        pub fn seekAtOrAfterWithAdmission(self: *@This(), key: []const u8, control: read_admission.Port) !backend_adapter.Entry {
+            try control.checkpoint();
+            const entry = self.seekAtOrAfter(key) catch |err| {
+                try control.checkpoint();
+                return err;
+            };
+            try control.checkpoint();
+            return entry;
+        }
+
+        pub fn nextWithAdmission(self: *@This(), control: read_admission.Port) !backend_adapter.Entry {
+            try control.checkpoint();
+            const entry = self.next() catch |err| {
+                try control.checkpoint();
+                return err;
+            };
+            try control.checkpoint();
+            return entry;
+        }
+
         pub fn last(self: *@This()) !backend_adapter.Entry {
             var found = try self.inner.last(self.tree);
             while (found) |entry| {
@@ -270,6 +312,8 @@ pub const Backend = struct {
         }
 
         fn open(backend: *Backend, namespace: backend_types.Namespace, read_only: bool) !BoundTxn {
+            if (!read_only and !backend.serialized_write_mutex.tryLock()) return error.WriterLocked;
+            errdefer if (!read_only) backend.serialized_write_mutex.unlock();
             lockBackend(backend);
             defer backend.mutex.unlock();
             const current = try backend.ensureStateLocked();
@@ -292,12 +336,23 @@ pub const Backend = struct {
             };
         }
 
+        fn openReadWithAdmission(backend: *Backend, namespace: backend_types.Namespace, control: read_admission.Port) !BoundTxn {
+            try @import("../common/bounded_mutex.zig").lockAtomic(&backend.mutex, control);
+            defer backend.mutex.unlock();
+            const rc = try backend.ensureStateLocked();
+            retainState(rc);
+            errdefer releaseState(backend.allocator, rc);
+            try control.checkLifetime();
+            return .{ .allocator = backend.allocator, .backend = backend, .namespace = namespace, .read_only = true, .rc = rc };
+        }
+
         pub fn abort(self: *@This()) void {
             const rc = self.rc orelse return;
             lockBackend(self.backend);
             releaseState(self.allocator, rc);
             self.backend.mutex.unlock();
             self.rc = null;
+            if (!self.read_only) self.backend.serialized_write_mutex.unlock();
         }
 
         pub fn commit(self: *@This()) !void {
@@ -309,10 +364,23 @@ pub const Backend = struct {
             self.backend.state = rc;
             releaseState(self.allocator, old);
             self.rc = null;
+            if (!self.read_only) self.backend.serialized_write_mutex.unlock();
         }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             return try self.rc.?.state.get(self.namespace, key);
+        }
+
+        pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+            if (keys.len != values.len) return error.InvalidArgument;
+            @memset(values, null);
+            errdefer @memset(values, null);
+            try control.checkpoint();
+            for (keys, values) |key, *value| {
+                try control.checkpoint();
+                value.* = self.get(key) catch null;
+            }
+            try control.checkpoint();
         }
 
         pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
@@ -328,6 +396,14 @@ pub const Backend = struct {
         pub fn openCursor(self: *@This()) !BoundCursor {
             return BoundCursor.init(self.allocator, self.rc.?.state.tree, self.namespace);
         }
+
+        pub fn openCursorWithAdmission(self: *@This(), control: read_admission.Port) !BoundCursor {
+            try control.checkpoint();
+            var cursor = try self.openCursor();
+            errdefer cursor.close();
+            try control.checkpoint();
+            return cursor;
+        }
     };
 
     const NamespaceTxn = struct {
@@ -337,6 +413,8 @@ pub const Backend = struct {
         rc: ?*RcState,
 
         fn open(backend: *Backend, read_only: bool) !NamespaceTxn {
+            if (!read_only and !backend.serialized_write_mutex.tryLock()) return error.WriterLocked;
+            errdefer if (!read_only) backend.serialized_write_mutex.unlock();
             lockBackend(backend);
             defer backend.mutex.unlock();
             const current = try backend.ensureStateLocked();
@@ -364,6 +442,7 @@ pub const Backend = struct {
             releaseState(self.allocator, rc);
             self.backend.mutex.unlock();
             self.rc = null;
+            if (!self.read_only) self.backend.serialized_write_mutex.unlock();
         }
 
         pub fn commit(self: *@This()) !void {
@@ -375,6 +454,7 @@ pub const Backend = struct {
             self.backend.state = rc;
             releaseState(self.allocator, old);
             self.rc = null;
+            if (!self.read_only) self.backend.serialized_write_mutex.unlock();
         }
 
         pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
@@ -572,4 +652,60 @@ test "memory backend read transactions are snapshot isolated" {
         defer read_after.abort();
         try std.testing.expectEqualStrings("after", try read_after.get("doc:a"));
     }
+}
+
+test "memory backend enforces single snapshot writer across bound and namespace views" {
+    const a = std.testing.allocator;
+    var backend = Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    {
+        var writer = try backend.beginWrite();
+        defer writer.abort();
+        try std.testing.expectError(error.WriterLocked, backend.beginWrite());
+        try std.testing.expectError(error.WriterLocked, backend.beginBatch());
+        try std.testing.expectError(error.WriterLocked, runtime.beginWrite());
+        try std.testing.expectError(error.WriterLocked, runtime.beginBatch());
+        // A physical writer never excludes an immutable reader.
+        var reader = try runtime.beginRead();
+        reader.abort();
+    }
+    {
+        var writer = try runtime.beginWrite();
+        errdefer writer.abort();
+        try std.testing.expectError(error.WriterLocked, backend.beginWrite());
+        try writer.put("first", "value");
+        try writer.commit();
+    }
+    {
+        var writer = try backend.beginWrite();
+        errdefer writer.abort();
+        try writer.put(.{}, "second", "value");
+        try writer.commit();
+    }
+    var reader = try runtime.beginRead();
+    defer reader.abort();
+    try std.testing.expectEqualStrings("value", try reader.get("first"));
+    try std.testing.expectEqualStrings("value", try reader.get("second"));
+}
+
+test "memory backend failed snapshot writer creation releases its single writer claim" {
+    const Check = struct {
+        fn run(allocator: Allocator) !void {
+            var backend = Backend.init(allocator, .{});
+            defer backend.close();
+            var writer = backend.beginWrite() catch |cause| {
+                const available = backend.serialized_write_mutex.tryLock();
+                try std.testing.expect(available);
+                if (available) backend.serialized_write_mutex.unlock();
+                return cause;
+            };
+            writer.abort();
+            const available = backend.serialized_write_mutex.tryLock();
+            try std.testing.expect(available);
+            if (available) backend.serialized_write_mutex.unlock();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

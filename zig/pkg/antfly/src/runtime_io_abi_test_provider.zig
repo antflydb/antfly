@@ -174,3 +174,28 @@ export fn runtime_io_abi_test_threaded_destroy(runtime: *std.Io.Threaded, table:
     std.heap.page_allocator.destroy(table);
     std.heap.page_allocator.destroy(runtime);
 }
+
+export fn runtime_io_abi_test_durability_storage(contract: *const @import("antfly_runtime_abi").native_abi.TypeContract, output: *retained_io.Storage.Lease, context: *?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+    const abi = @import("antfly_runtime_abi");
+    context.* = null;
+    if (!contract.matches(abi.native_abi.TypeContract.of(retained_io.Storage.Lease))) return abi.error_abi.statusFromError(error.UnsupportedVersion);
+    const allocator = std.heap.c_allocator;
+    const native = allocator.create(retained_io.NativeStorage) catch return abi.error_abi.statusFromError(error.OutOfMemory);
+    native.* = retained_io.NativeStorage.init(allocator, .threaded) catch |cause| {
+        allocator.destroy(native);
+        return abi.error_abi.statusFromError(cause);
+    };
+    output.* = native.storage().acquireLease() catch |cause| {
+        native.deinit();
+        allocator.destroy(native);
+        return abi.error_abi.statusFromError(cause);
+    };
+    context.* = native;
+    return .ok;
+}
+
+export fn runtime_io_abi_test_durability_owner_close(raw: *anyopaque) callconv(.c) void {
+    const native: *retained_io.NativeStorage = @ptrCast(@alignCast(raw));
+    native.deinit();
+    std.heap.c_allocator.destroy(native);
+}

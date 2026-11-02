@@ -322,6 +322,7 @@ pub const Operations = struct {
             error.ReadIndexTimeout => error.ReadIndexTimeout,
             error.CatalogRoutingUnavailable,
             error.CatalogProjectionRefreshRequired,
+            error.OutOfMemory,
             => error.Unavailable,
             else => null,
         };
@@ -691,13 +692,10 @@ pub const Operations = struct {
         const writes = self.writes orelse return error.NotFound;
         const supports_pre_decision_context =
             writes.vtable.txn_begin_group_local_with_pre_decision_context != null;
-        _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, .{
-            .restore_staging_scope = input.restore_staging_scope,
-            .restore_staging_plan_id = input.restore_staging_plan_id,
-            .deadline_ns = request.deadline_ns,
-            .deadline_io = request.deadline_io,
-            .cancellation = request.cancellation,
-        }) catch |err| switch (err) {
+        var context = distributed_txn.PreDecisionContext.fromRequest(request);
+        context.restore_staging_scope = input.restore_staging_scope;
+        context.restore_staging_plan_id = input.restore_staging_plan_id;
+        _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, context) catch |err| switch (err) {
             error.RetainedEffectsFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
@@ -751,12 +749,9 @@ pub const Operations = struct {
             };
         }
         try ensurePreDecisionRequestActive(request);
-        _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, .{
-            .route_fence = input.route_fence,
-            .deadline_ns = request.deadline_ns,
-            .deadline_io = request.deadline_io,
-            .cancellation = request.cancellation,
-        }) catch |err| switch (err) {
+        var context = distributed_txn.PreDecisionContext.fromRequest(request);
+        context.route_fence = input.route_fence;
+        _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, context) catch |err| switch (err) {
             error.RetainedEffectsFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.TransactionTooLarge => return error.TransactionTooLarge,
@@ -832,6 +827,27 @@ pub const Operations = struct {
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
             else => return error.Internal,
         }) orelse error.NotFound;
+    }
+
+    /// Absence is a successful typed observation. No read failure, including
+    /// an original admission error named TxnNotFound, may become absence.
+    pub fn txnPreparationStatusWithRequest(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnStatusRequest) Error!distributed_txn.preparation_protocol.Observation {
+        try request.ensureActive();
+        if (request.deadline_ns == null) return error.InvalidArgument;
+        const writes = self.writes orelse return error.GroupLeaderUnavailable;
+        return (writes.txnPreparationStatusGroupLocal(alloc, group_id, table_name, input, request, null) catch |err| switch (err) {
+            error.InvalidTxnRequest, error.RestoreStagingScopeChanged => return error.InvalidArgument,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable,
+            error.DeadlineExceeded,
+            error.PreparedTransactionProtocolUnavailable,
+            error.UnknownGroup,
+            error.LeaderUnavailable,
+            error.NotLeader,
+            error.Timeout,
+            => return error.GroupLeaderUnavailable,
+            else => return error.Internal,
+        }) orelse error.GroupLeaderUnavailable;
     }
 
     pub fn txnAcknowledge(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnAcknowledgeRequest) Error!void {
@@ -1304,7 +1320,13 @@ pub const Operations = struct {
     pub fn textStats(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, body: []const u8) Error!query_api.QueryResponse {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.textStatsGroupLocal(alloc, group_id, table_name, body) catch |err| {
+        const native_request = request.platformDeadline() catch |err| return mapCommonReadError(err) orelse error.Internal;
+        const controls: db_mod.types.SearchRequest = .{
+            .execution_deadline_ns = native_request.deadline_ns,
+            .cancellation = if (std.meta.eql(request.cancellation, operation.CancellationToken.none)) null else request.cancellation,
+            .execution_runnable = if (request.execution_team) |team| team.borrow else null,
+        };
+        return (reads.textStatsGroupLocalWithControls(alloc, group_id, table_name, body, controls) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => error.InvalidArgument,
@@ -2399,4 +2421,31 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "distributed txn typed status operation never translates read rejection into absence" {
+    const Fixture = struct {
+        cause: ?anyerror = null,
+        calls: usize = 0,
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnexpectedMutation;
+        }
+        fn status(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: distributed_txn.TxnStatusRequest, _: operation.RequestContext, _: ?@import("antfly_runtime_abi").runnable_abi.Borrowed) !?distributed_txn.preparation_protocol.Observation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.cause) |cause| return cause;
+            return .missing;
+        }
+    };
+    var fixture: Fixture = .{};
+    const ops: Operations = .{ .reads = null, .shard_db_adapter = null, .writes = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .txn_preparation_status_group_local = Fixture.status } } };
+    const context: operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s };
+    const query: distributed_txn.TxnStatusRequest = .{ .txn_id = @splat(1) };
+    try std.testing.expect((try ops.txnPreparationStatusWithRequest(std.testing.allocator, context, 7, "docs", query)) == .missing);
+    fixture.cause = error.TxnNotFound;
+    try std.testing.expectError(error.Internal, ops.txnPreparationStatusWithRequest(std.testing.allocator, context, 7, "docs", query));
+    fixture.cause = error.NotLeader;
+    try std.testing.expectError(error.GroupLeaderUnavailable, ops.txnPreparationStatusWithRequest(std.testing.allocator, context, 7, "docs", query));
+    try std.testing.expectError(error.InvalidArgument, ops.txnPreparationStatusWithRequest(std.testing.allocator, .{}, 7, "docs", query));
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
 }

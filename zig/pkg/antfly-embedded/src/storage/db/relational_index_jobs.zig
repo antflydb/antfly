@@ -173,7 +173,7 @@ fn getOptional(txn: anytype, key: []const u8) !?[]const u8 {
     };
 }
 
-pub fn ownership(txn: *docstore.DocStore.Txn) !Digest {
+pub fn ownership(txn: anytype) !Digest {
     const range = (try getOptional(txn, range_state.range_key)) orelse &full_range;
     const identity = @import("doc_identity.zig");
     const namespace = (try identity.loadNamespaceTxn(txn)) orelse identity.default_namespace;
@@ -190,17 +190,17 @@ pub fn ownership(txn: *docstore.DocStore.Txn) !Digest {
     return result;
 }
 
-pub fn status(txn: *docstore.DocStore.Txn, index: plans.BoundIndex) !Progress {
+pub fn status(txn: anytype, index: plans.BoundIndex) !Progress {
     return statusWithOwnership(txn, index, try ownership(txn));
 }
 
-pub fn statusWithOwnership(txn: *docstore.DocStore.Txn, index: plans.BoundIndex, owner: Digest) !Progress {
+pub fn statusWithOwnership(txn: anytype, index: plans.BoundIndex, owner: Digest) !Progress {
     return (try statusProofWithOwnership(txn, index, owner)).progress;
 }
 
 pub const StatusProof = struct { progress: Progress, digest: Digest, maintenance_epoch: u64, last_maintenance_request: Digest };
 
-pub fn statusProofWithOwnership(txn: *docstore.DocStore.Txn, index: plans.BoundIndex, owner: Digest) !StatusProof {
+pub fn statusProofWithOwnership(txn: anytype, index: plans.BoundIndex, owner: Digest) !StatusProof {
     const raw = try getOptional(txn, &progressKey(index.id()));
     const control = try maintenance.readControl(txn, index.id());
     var current = Progress{ .id = index.id(), .owner = owner, .comparison = index.tuple.fingerprint };

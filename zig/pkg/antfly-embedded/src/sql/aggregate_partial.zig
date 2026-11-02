@@ -686,11 +686,15 @@ test "SQL NUMERIC aggregate extrema partials retain exact values and display sca
 /// Merge complete decoded states. DISTINCT uses membership, while ordinary
 /// numeric states merge without narrowing intermediate sums.
 pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
+    return mergeControlled(target, source, null);
+}
+pub fn mergeControlled(target: *operators.Aggregate, source: operators.Aggregate, control: ?@import("operator_work.zig").Control) !void {
+    try @import("operator_work.zig").poll(control);
     if (target.kind != source.kind or target.input_type != source.input_type or target.input_element != source.input_element or target.distinct != source.distinct) return error.InvalidSqlSpill;
     if (source.distinct) {
         if (source.patterns) |patterns| {
-            for (patterns.values.items) |value| try target.update(if (value == .null) Datum{} else Datum.json(value));
-        } else for (source.distinct_values.items) |entry| try target.update(entry.row.row.values[0]);
+            for (patterns.values.items) |value| try target.updateControlled(if (value == .null) Datum{} else Datum.json(value), control);
+        } else for (source.distinct_values.items) |entry| try target.updateControlled(entry.row.row.values[0], control);
         return;
     }
     const total = std.math.add(u64, target.count, source.count) catch return error.SqlNumericOutOfRange;
@@ -698,7 +702,7 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
     if (target.numeric) |reducer| {
         const incoming = source.numeric orelse return error.InvalidSqlSpill;
         if (reducer.state.count != target.count or incoming.state.count != source.count) return error.InvalidSqlSpill;
-        try reducer.merge(incoming.state);
+        try reducer.mergeControlled(incoming.state, control);
         target.count = total;
         return;
     }
@@ -736,7 +740,7 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
         },
         .bool_and => target.boolean = target.boolean and source.boolean,
         .bool_or => target.boolean = target.boolean or source.boolean,
-        .min, .max => try target.update(source.selected.?.row.values[0]),
+        .min, .max => try target.updateControlled(source.selected.?.row.values[0], control),
         .pattern_set => return error.InvalidSqlSpill,
     }
     target.count = total;

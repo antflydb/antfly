@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const Allocator = std.mem.Allocator;
 const catalog_types = @import("types.zig");
 const head_coordination = @import("../head_coordination.zig");
@@ -186,8 +187,19 @@ pub const ProgressStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context = null,
 
     pub const VTable = struct {
+        get_gc_watermark_for: ?*const fn (*anyopaque, []const u8, Context) anyerror!?u64 = null,
+        cas_gc_watermark_for: ?*const fn (*anyopaque, []const u8, ?u64, u64, Context) anyerror!bool = null,
+        cas_manifest_gc_floor_for: ?*const fn (*anyopaque, []const u8, ?u64, u64, Context) anyerror!bool = null,
+        prune_manifest_read_deadlines_for: ?*const fn (*anyopaque, []const u8, u64, u64, CancellationToken, Context) anyerror!void = null,
+
+        get_manifest_gc_floor_for: ?*const fn (*anyopaque, []const u8, Context) anyerror!?u64 = null,
+        get_manifest_read_deadline_for: ?*const fn (*anyopaque, []const u8, u64, Context) anyerror!?u64 = null,
+        cas_manifest_read_deadline_for: ?*const fn (*anyopaque, []const u8, u64, ?u64, u64, Context) anyerror!bool = null,
+        cas_head_for: ?*const fn (*anyopaque, []const u8, ?u64, u64, ?PublicationFence, Context) anyerror!bool = null,
+        get_head_for: ?*const fn (*anyopaque, []const u8, CancellationToken, Context) anyerror!u64 = null,
         work_lease_provider: ?*const fn (*anyopaque) work_lease.Provider = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         get_head: *const fn (*anyopaque, []const u8) anyerror!u64,
@@ -224,10 +236,16 @@ pub const ProgressStore = struct {
     }
 
     pub fn getHead(self: *ProgressStore, namespace: []const u8) !u64 {
+        if (self.context) |context| if (self.vtable.get_head_for != null) {
+            return self.vtable.get_head_for.?(self.ptr, namespace, .none, context);
+        };
         return try self.vtable.get_head(self.ptr, namespace);
     }
 
     pub fn getHeadWithCancellation(self: *ProgressStore, namespace: []const u8, cancellation: CancellationToken) !u64 {
+        if (self.context) |context| if (self.vtable.get_head_for != null) {
+            return self.vtable.get_head_for.?(self.ptr, namespace, cancellation, context);
+        };
         try cancellation.check();
         const result = (if (self.vtable.get_head_with_cancellation) |read| read(self.ptr, namespace, cancellation) else self.getHead(namespace)) catch |err| {
             try cancellation.check();
@@ -239,10 +257,14 @@ pub const ProgressStore = struct {
 
     /// The provider and HEAD CAS must share the same atomic coordination record.
     pub fn workLeaseProvider(self: *ProgressStore) !work_lease.Provider {
-        return (self.vtable.work_lease_provider orelse return error.WorkLeaseUnsupported)(self.ptr);
+        const provider = (self.vtable.work_lease_provider orelse return error.WorkLeaseUnsupported)(self.ptr);
+        return if (self.context) |context| provider.withContext(context) else provider;
     }
 
     pub fn compareAndSwapHead(self: *ProgressStore, namespace: []const u8, expected: ?u64, version: u64) !bool {
+        if (self.context) |context| if (self.vtable.cas_head_for != null) {
+            return self.vtable.cas_head_for.?(self.ptr, namespace, expected, version, null, context);
+        };
         return try self.vtable.compare_and_swap_head(self.ptr, namespace, expected, version);
     }
 
@@ -256,6 +278,7 @@ pub const ProgressStore = struct {
         version: u64,
         fence: PublicationFence,
     ) !bool {
+        if (self.context) |context| if (self.vtable.cas_head_for) |publish| return publish(self.ptr, namespace, expected, version, fence, context);
         return try self.vtable.compare_and_swap_head_fenced(
             self.ptr,
             namespace,
@@ -266,6 +289,7 @@ pub const ProgressStore = struct {
     }
 
     pub fn getGcWatermark(self: *ProgressStore, namespace: []const u8) !?u64 {
+        if (self.context) |context| if (self.vtable.get_gc_watermark_for) |call| return call(self.ptr, namespace, context);
         return try self.vtable.get_gc_watermark(self.ptr, namespace);
     }
 
@@ -273,10 +297,12 @@ pub const ProgressStore = struct {
     /// Record it before removing content so interrupted GC cannot resurrect
     /// partially deleted history when the retention policy increases.
     pub fn getManifestGcFloor(self: *ProgressStore, namespace: []const u8) !?u64 {
+        if (self.context) |context| if (self.vtable.get_manifest_gc_floor_for) |get| return get(self.ptr, namespace, context);
         return try self.vtable.get_manifest_gc_floor(self.ptr, namespace);
     }
 
     pub fn compareAndSwapManifestGcFloor(self: *ProgressStore, namespace: []const u8, expected: ?u64, floor: u64) !bool {
+        if (self.context) |context| if (self.vtable.cas_manifest_gc_floor_for) |call| return call(self.ptr, namespace, expected, floor, context);
         return try self.vtable.compare_and_swap_manifest_gc_floor(self.ptr, namespace, expected, floor);
     }
 
@@ -284,12 +310,14 @@ pub const ProgressStore = struct {
     /// version. Publish before checking MANIFEST_GC_FLOOR; collectors advance
     /// that floor before reading deadlines. An unsupported backend fails closed.
     pub fn getManifestReadDeadline(self: *ProgressStore, namespace: []const u8, version: u64) !?u64 {
+        if (self.context) |context| if (self.vtable.get_manifest_read_deadline_for) |get| return get(self.ptr, namespace, version, context);
         const get = self.vtable.get_manifest_read_deadline orelse return error.ManifestReadLeasesUnsupported;
         return get(self.ptr, namespace, version);
     }
 
     pub fn compareAndSwapManifestReadDeadline(self: *ProgressStore, namespace: []const u8, version: u64, expected: ?u64, deadline: u64) !bool {
         if (expected) |prior| if (deadline < prior) return false;
+        if (self.context) |context| if (self.vtable.cas_manifest_read_deadline_for) |cas| return cas(self.ptr, namespace, version, expected, deadline, context);
         const cas = self.vtable.compare_and_swap_manifest_read_deadline orelse return error.ManifestReadLeasesUnsupported;
         return cas(self.ptr, namespace, version, expected, deadline);
     }
@@ -299,10 +327,12 @@ pub const ProgressStore = struct {
     pub fn pruneManifestReadDeadlines(self: *ProgressStore, namespace: []const u8, floor: u64, expired_before: u64, cancellation: CancellationToken) !void {
         const prune = self.vtable.prune_manifest_read_deadlines orelse return;
         if (floor > (try self.getManifestGcFloor(namespace) orelse 0)) return error.ManifestGcFloorNotCommitted;
+        if (self.context) |context| if (self.vtable.prune_manifest_read_deadlines_for) |call| return call(self.ptr, namespace, floor, expired_before, cancellation, context);
         return prune(self.ptr, namespace, floor, expired_before, cancellation);
     }
 
     pub fn compareAndSwapGcWatermark(self: *ProgressStore, namespace: []const u8, expected: ?u64, watermark: u64) !bool {
+        if (self.context) |context| if (self.vtable.cas_gc_watermark_for) |call| return call(self.ptr, namespace, expected, watermark, context);
         return try self.vtable.compare_and_swap_gc_watermark(self.ptr, namespace, expected, watermark);
     }
 

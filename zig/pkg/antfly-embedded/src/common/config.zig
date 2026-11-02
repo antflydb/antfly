@@ -40,6 +40,14 @@ pub const default_health_port: u16 = 4200;
 pub const default_query_max_concurrent_requests: u32 = 32;
 pub const default_write_max_concurrent_requests: u32 = 16;
 pub const default_inference_max_concurrent_requests: u32 = 32;
+// Managed nodes reserve fixed sender/cleanup metadata before request publication.
+// The generic fixed scheduler keeps its smaller opt-in policy.
+pub const default_runnable_policy: @import("runnable_scheduler.zig").Config = .{ .capacity_mode = .automatic, .max_bytes = 16 << 20, .control_bytes = 8 << 20 };
+pub const default_query_waiting: @import("bounded_admission.zig").Waiting = .{
+    .max_queued_requests = 8,
+    .max_queued_bytes = 8 << 20,
+    .max_wait_ms = 250,
+};
 pub const default_mcp_max_tool_result_bytes: u32 = 96 * 1024;
 pub const minimum_mcp_max_tool_result_bytes: u32 = 512;
 pub const default_backup_operation_timeout_ms: u64 = 60 * 60 * 1_000;
@@ -77,6 +85,8 @@ pub const Config = struct {
     tls: ?TlsConfig = null,
     cors: ?CorsConfig = null,
     resources: platform.resource_policy.Resources = .{},
+    /// Derived internal admission view of canonical resources; never parsed as a root policy.
+    admission: AdmissionConfig = .{},
     mcp: McpConfig = .{},
     pgwire: ?PgwireConfig = null,
     backup: BackupConfig = .{},
@@ -119,6 +129,49 @@ pub const Config = struct {
         }
     };
 
+    pub const RequestAdmissionConfig = struct {
+        /// Zero disables this foreground admission class. Transport safeguards
+        /// and inference admission remain independent.
+        max_concurrent_requests: u32,
+    };
+
+    pub const QueryAdmissionConfig = struct {
+        max_concurrent_requests: u32,
+        waiting: @import("bounded_admission.zig").Waiting = default_query_waiting,
+    };
+
+    pub const AdmissionConfig = struct {
+        /// One HTTP request/stream ceiling from ingress through delivery.
+        /// Accepted durable work retains independent completion ownership.
+        max_request_duration_ms: u64 = 300_000,
+        runnable: ?@import("runnable_scheduler.zig").Config = default_runnable_policy,
+        max_request_memory_bytes: u64 = 256 << 20,
+        max_retained_memory_bytes: u64 = 256 << 20,
+        query: QueryAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
+        write: RequestAdmissionConfig = .{ .max_concurrent_requests = default_write_max_concurrent_requests },
+        inference: RequestAdmissionConfig = .{ .max_concurrent_requests = default_inference_max_concurrent_requests },
+
+        /// Resolve one node-wide startup envelope before reserving API/control
+        /// memory. Fixed policy remains authoritative; automatic values are
+        /// ceilings, and request/state pools each receive at most 1/8.
+        pub fn resolveForStartup(self: @This(), process_limit_bytes: u64) !@This() {
+            const requested = self.runnable orelse return self;
+            if (requested.capacity_mode == .fixed) return self;
+            const Runnable = @import("runnable_scheduler.zig").Config;
+            const envelope = Runnable.startupMemoryEnvelope(process_limit_bytes);
+            var effective = self;
+            effective.runnable = try requested.resolveCapacity(@import("antfly_platform").process_memory.cpuCapacity(), envelope);
+            if (envelope.limit_bytes != 0) {
+                const pool_limit = envelope.limit_bytes / 8;
+                effective.max_request_memory_bytes = @min(self.max_request_memory_bytes, pool_limit);
+                effective.max_retained_memory_bytes = @min(self.max_retained_memory_bytes, pool_limit);
+            }
+            if (effective.max_request_memory_bytes < 1 << 20 or effective.max_retained_memory_bytes < 1 << 20)
+                return error.InvalidConfig;
+            return effective;
+        }
+    };
+
     pub const McpConfig = struct {
         /// Zero disables the serialized MCP tool-result compatibility guard.
         max_tool_result_bytes: u32 = default_mcp_max_tool_result_bytes,
@@ -129,6 +182,10 @@ pub const Config = struct {
         bind_host: ?[]const u8 = null,
         bind_port: u16 = 5432,
         max_connections: u16 = 32,
+        max_session_bytes: u64 = 0,
+        max_retained_bytes: u64 = 0,
+        retained_bytes_per_connection: u32 = 8 << 20,
+        idle_transaction_timeout_ms: u32 = 30_000,
         externally_protected_transport: bool = false,
     };
 
@@ -912,7 +969,7 @@ pub const Config = struct {
         errdefer kernel_jit.deinit(alloc);
         var pgwire: ?PgwireConfig = null;
         if (root.get("pgwire")) |value| {
-            try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "externally_protected_transport" });
+            try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "max_session_bytes", "max_retained_bytes", "retained_bytes_per_connection", "idle_transaction_timeout_ms", "externally_protected_transport" });
             const object = switch (value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
@@ -925,10 +982,17 @@ pub const Config = struct {
                 else => return error.InvalidConfig,
             } else null;
             if (host) |name| if (name.len == 0 or name.len > 253) return error.InvalidConfig;
+            const retained_bytes = try optionalU32Field(object, "retained_bytes_per_connection") orelse (8 << 20);
+            const idle_transaction_timeout = try optionalU32Field(object, "idle_transaction_timeout_ms") orelse 30_000;
+            if (retained_bytes == 0 or retained_bytes > 16 << 20 or idle_transaction_timeout == 0) return error.InvalidConfig;
             pgwire = .{
                 .enabled = try optionalBoolField(object, "enabled") orelse false,
                 .bind_port = @intCast(port),
                 .max_connections = @intCast(connections_count),
+                .max_session_bytes = try optionalU64Field(object, "max_session_bytes") orelse 0,
+                .max_retained_bytes = try optionalU64Field(object, "max_retained_bytes") orelse 0,
+                .retained_bytes_per_connection = retained_bytes,
+                .idle_transaction_timeout_ms = idle_transaction_timeout,
                 .externally_protected_transport = try optionalBoolField(object, "externally_protected_transport") orelse false,
                 .bind_host = if (host) |name| try alloc.dupe(u8, name) else null,
             };
@@ -956,6 +1020,15 @@ pub const Config = struct {
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
             .resources = resources,
+            .admission = .{
+                .runnable = resources.execution.runnable,
+                .max_request_duration_ms = resources.execution.max_request_duration_ms,
+                .max_request_memory_bytes = resources.execution.max_request_memory_bytes,
+                .max_retained_memory_bytes = resources.execution.max_retained_memory_bytes,
+                .query = .{ .max_concurrent_requests = resources.query.admission.max_concurrent_requests, .waiting = if (resources.query.admission.waiting) |w| .{ .max_queued_requests = w.max_queued_requests, .max_queued_bytes = w.max_queued_bytes, .max_wait_ms = w.max_wait_ms } else if (resources.execution.runnable == null) .{} else default_query_waiting },
+                .write = .{ .max_concurrent_requests = resources.write.admission.max_concurrent_requests },
+                .inference = .{ .max_concurrent_requests = resources.inference.admission.max_concurrent_requests },
+            },
             .mcp = .{ .max_tool_result_bytes = mcp_max_tool_result_bytes },
             .backup = .{ .operation_timeout_ms = backup_operation_timeout_ms },
             .metadata = try parseMetadataConfig(
@@ -3941,6 +4014,73 @@ test "common config bootstraps named secret sources before resolving credentials
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"secrets\":{\"environment\":\"false\"}}"));
 }
 
+test "config query waiting validates complete bounds and automatic defaults" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"resources":{"query":{"admission":{"max_concurrent_requests":4,"waiting":{"max_queued_requests":8,"max_queued_bytes":1048576,"max_wait_ms":100}}}}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 4), cfg.admission.query.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 8), cfg.admission.query.waiting.max_queued_requests);
+    try std.testing.expectEqual(@as(u64, 1048576), cfg.admission.query.waiting.max_queued_bytes);
+    try std.testing.expectEqual(@as(u32, 100), cfg.admission.query.waiting.max_wait_ms);
+    var legacy = try Config.parseFromSlice(std.testing.allocator, "{}");
+    defer legacy.deinit();
+    try std.testing.expectEqualDeep(default_query_waiting, legacy.admission.query.waiting);
+    for ([_][]const u8{
+        \\{"resources":{"query":{"admission":{"waiting":{"max_wait_ms":1}}}}}
+        ,
+        \\{"resources":{"query":{"admission":{"waiting":{"max_queued_requests":1,"max_queued_bytes":1,"max_wait_ms":0}}}}}
+        ,
+        \\{"resources":{"query":{"admission":{"waiting":{"max_queued_requests":1,"max_queued_bytes":1,"max_wait_ms":60001}}}}}
+        ,
+        \\{"resources":{"query":{"admission":{"waiting":{"max_queue_requests":1}}}}}
+        ,
+        \\{"resources":{"write":{"admission":{"waiting":{"max_wait_ms":1}}}}}
+        ,
+    }) |body| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, body));
+}
+
+test "config query waiting pgwire aggregate memory round trips" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"pgwire":{"max_connections":64,"max_session_bytes":67108864}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u16, 64), cfg.pgwire.?.max_connections);
+    try std.testing.expectEqual(@as(u64, 67108864), cfg.pgwire.?.max_session_bytes);
+}
+
+test "config query waiting retained pgwire policy validates independent budgets" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"pgwire":{"max_session_bytes":67108864,"max_retained_bytes":16777216,"retained_bytes_per_connection":1048576,"idle_transaction_timeout_ms":5000}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u64, 16777216), cfg.pgwire.?.max_retained_bytes);
+    try std.testing.expectEqual(@as(u32, 1048576), cfg.pgwire.?.retained_bytes_per_connection);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.pgwire.?.idle_transaction_timeout_ms);
+    for ([_][]const u8{
+        \\{"pgwire":{"retained_bytes_per_connection":0}}
+        ,
+        \\{"pgwire":{"retained_bytes_per_connection":16777217}}
+        ,
+        \\{"pgwire":{"idle_transaction_timeout_ms":0}}
+        ,
+    }) |body| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, body));
+}
+
+test "config workload envelope validates finite allocation limits" {
+    var config = try Config.parseFromSlice(std.testing.allocator, "{\"resources\":{\"execution\":{\"max_request_memory_bytes\":1048576}}}");
+    defer config.deinit();
+    try std.testing.expectEqual(@as(u64, 1048576), config.admission.max_request_memory_bytes);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, "{\"resources\":{\"execution\":{\"max_request_memory_bytes\":0}}}"));
+}
+
+test "config workload envelope validates retained allocation limits" {
+    var config = try Config.parseFromSlice(std.testing.allocator, "{\"resources\":{\"execution\":{\"max_retained_memory_bytes\":1048576}}}");
+    defer config.deinit();
+    try std.testing.expectEqual(@as(u64, 1048576), config.admission.max_retained_memory_bytes);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, "{\"resources\":{\"execution\":{\"max_retained_memory_bytes\":0}}}"));
+}
+
 fn parseLakeCacheConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.LakeCacheConfig {
     var config: Config.LakeCacheConfig = .{};
     const input = value orelse return config;
@@ -4032,6 +4172,76 @@ test "common config parses ChatGPT connector policy and rejects misspellings" {
     }
 }
 
+test "config runnable scheduler validates canonical policy and explicit rollback" {
+    const alloc = std.testing.allocator;
+    var legacy = try Config.parseFromSlice(alloc, "{}");
+    defer legacy.deinit();
+    try std.testing.expectEqualDeep(default_runnable_policy, legacy.admission.runnable.?);
+    var disabled = try Config.parseFromSlice(alloc, "{\"resources\":{\"execution\":{\"runnable\":null}}}");
+    defer disabled.deinit();
+    try std.testing.expect(disabled.admission.runnable == null);
+    try std.testing.expectEqual(@as(u32, 0), disabled.admission.query.waiting.max_wait_ms);
+    var defaults = try Config.parseFromSlice(alloc,
+        \\{"resources":{"execution":{"runnable":{}}}}
+    );
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(usize, 8), defaults.admission.runnable.?.slots);
+    try std.testing.expectEqual(@as(usize, 0), defaults.admission.runnable.?.cleanup_slots);
+    var enabled = try Config.parseFromSlice(alloc,
+        \\{"resources":{"execution":{"runnable":{"slots":3,"control_slots":1,"cleanup_slots":1,"weights":[2,1,1,1],"max_operations":20,"max_bytes":65536,"control_bytes":8192,"max_wait_ms":500,"max_backfills":2,"quantum_ms":1,"checkpoint_budget":8}}}}
+    );
+    defer enabled.deinit();
+    const policy = enabled.admission.runnable.?;
+    try std.testing.expectEqual(@as(usize, 3), policy.slots);
+    try std.testing.expectEqual(@as(usize, 1), policy.cleanup_slots);
+    try std.testing.expectEqual(@as(u32, 8), policy.checkpoint_budget);
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .resources = .{ .execution = .{ .runnable = policy } } }, .{});
+    defer alloc.free(body);
+    var reopened = try Config.parseFromSlice(alloc, body);
+    defer reopened.deinit();
+    try std.testing.expectEqualDeep(policy, reopened.admission.runnable.?);
+    var elastic = try Config.parseFromSlice(alloc,
+        \\{"resources":{"execution":{"runnable":{"slots":5,"cleanup_slots":1,"read_isolation":true,"bounded_read_slots":2}}}}
+    );
+    defer elastic.deinit();
+    try std.testing.expectEqual(@as(usize, 2), elastic.admission.runnable.?.bounded_read_slots);
+    const elastic_body = try std.json.Stringify.valueAlloc(alloc, .{ .resources = .{ .execution = .{ .runnable = elastic.admission.runnable.? } } }, .{});
+    defer alloc.free(elastic_body);
+    var elastic_reopened = try Config.parseFromSlice(alloc, elastic_body);
+    defer elastic_reopened.deinit();
+    try std.testing.expectEqualDeep(elastic.admission.runnable.?, elastic_reopened.admission.runnable.?);
+    for ([_][]const u8{
+        \\{"resources":{"execution":{"runnable":{"slots":2}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"slots":3,"control_slots":2}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"cleanup_slots":2}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"cleanup_slots":-1}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"slots":3,"control_slots":2,"cleanup_slots":1}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"max_operations":2}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"max_operations":3}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"slots":1}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"control_slots":8}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"max_operations":1}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"max_bytes":65536,"control_bytes":65536}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"weights":[1,0,1,1]}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"quantum_ms":0}}}}
+        ,
+        \\{"resources":{"execution":{"runnable":{"unknown":1}}}}
+        ,
+    }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, invalid));
+}
+
 test "external lake cursor retention and capacity policy reject unbounded admission" {
     const a = std.testing.allocator;
     for ([_][]const u8{
@@ -4040,6 +4250,21 @@ test "external lake cursor retention and capacity policy reject unbounded admiss
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_cuts\":0}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_retained_bytes\":0}}}",
     }) |bytes| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, bytes));
+}
+
+test "common config HTTP lifetime has finite defaults and validates explicit duration" {
+    const a = std.testing.allocator;
+    var defaults = try Config.parseFromSlice(a, "{}");
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(u64, 300_000), defaults.admission.max_request_duration_ms);
+    var configured = try Config.parseFromSlice(a, "{\"resources\":{\"execution\":{\"max_request_duration_ms\":1234}}}");
+    defer configured.deinit();
+    try std.testing.expectEqual(@as(u64, 1234), configured.admission.max_request_duration_ms);
+    for ([_][]const u8{ "0", "-1", "86400001", "\"invalid\"" }) |value| {
+        const input = try std.fmt.allocPrint(a, "{{\"admission\":{{\"max_request_duration_ms\":{s}}}}}", .{value});
+        defer a.free(input);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, input));
+    }
 }
 
 test "provider registry gateway public inference policy defaults off and requires explicit opt-in" {

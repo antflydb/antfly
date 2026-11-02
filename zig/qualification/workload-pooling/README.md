@@ -1,0 +1,1979 @@
+# Native idle-client qualification
+
+The manifest fixes counts and acceptance thresholds before the candidate runs.
+Run against a built native binary:
+
+```sh
+python3 zig/qualification/workload-pooling/run_local.py \
+  --binary /path/to/antfly \
+  --manifest zig/qualification/workload-pooling/macos-small.json \
+  --output /tmp/pooling-idle-receipt.json
+```
+
+The launcher creates isolated temporary storage and a random authenticated admin,
+starts native HTTP and pgwire listeners, measures the process, closes all peers,
+and joins shutdown. Passwords are passed through child environments and omitted
+from the receipt. Data and server logs remain in the temporary directory printed
+in the receipt. It never connects to user deployment data.
+
+The probe records RSS, virtual address size, thread count, numeric file descriptor
+count, status latency, idle peaks, post-close recovery, binary SHA-256, configuration
+and exit status. It verifies that every offered pgwire startup socket remains open;
+connect success alone would conceal immediate listener shedding.
+
+This small profile covers 32 HTTP keep-alive sockets plus 32 pre-authentication
+pgwire startup sockets. The recovery allowance includes allocator/runtime caches;
+it requires FD recovery but does not require cached worker threads or RSS to drop
+immediately. It does not prove per-thread committed stack size, cursor snapshot
+cost, authenticated pooling behavior, throughput, Linux/container envelopes, or
+distributed recovery. Those need their own fixed manifests and receipts. Do not
+use this result to enable automatic sizing or query waiting by default.
+
+The original macOS receipts retain the failed 146 MiB idle-growth measurement.
+The shared signal-stack candidate passes the unchanged 128 MiB RSS growth and
+recovery limits; the manifest has not been relaxed. See the implementation ledger
+and the receipt's binary hash for the measured revision.
+
+Run the authenticated cursor profile with the isolated launcher:
+
+```sh
+python3 zig/qualification/workload-pooling/run_local.py \
+  --binary /path/to/antfly \
+  --manifest zig/qualification/workload-pooling/macos-authenticated-cursors.json \
+  --output /tmp/pooling-authenticated-receipt.json
+```
+
+This profile creates a relational fixture only in the launcher's isolated
+storage. It retains 32 authenticated pgwire sessions and 32 HTTP peers, with 16
+cursors held across COMMIT. It verifies exact integers above 2^53 and all remaining
+cursor rows, then closes cursors and sessions and measures resource recovery.
+Fixture failures produce a failed receipt. Credentials and raw pgwire error
+messages are excluded. It covers retained cursors; extended-protocol prepared
+portals and slow-consumer overload still require their own performance profiles.
+
+`linux-combined-pressure.json` retains 32 authenticated pgwire peers, eight
+cursors across COMMIT, 32 HTTP keep-alive peers and eight unfinished 4 MiB
+uploads throughout the open-loop phases. The mixed phases also include slow
+response readers and existing-row writes. The profile keeps the original
+latency, throughput, RSS, descriptor and recovery gates, requires measured
+waiting, and compares three rotated repetitions against main and fail-fast.
+Setup rejects cursor errors; verification rejects closed upload sockets,
+reconnected HTTP peers or missing cursor rows. All retained clients close before
+descriptor recovery is sampled. Declared upload bytes describe the offered
+pressure; they are not a claim about actual allocator capacity or total RSS.
+
+Linux default startup also initializes the optional local ChatGPT credential
+store. Zig's non-iterable Linux directory handles use `O_PATH`, which cannot be
+used with `fchmod`. The candidate opens an iterable handle before enforcing
+`0700`. When an older baseline needs the same fix, CI applies
+`baseline-linux-startup.patch` and retains the applied diff alongside its build
+artifacts. Such results compare against patched main; the patch does not change
+pooling policy or performance thresholds. Original startup failures are retained
+and cannot be interpreted as latency or throughput measurements.
+
+Older main also runs idle pgwire sessions on the shared outbound API executor.
+Those long-lived tasks exhaust its concurrency quota and close later accepted
+connections. The candidate uses a listener-owned executor bounded by the
+configured connection count. CI applies `baseline-pgwire-transport.patch` when
+needed and retains the applied diff; it changes only listener task ownership,
+leaving main's SQL admission and allocation policies intact. These are patched
+main comparisons. The saturation regression retains 32 sockets while an
+independent outbound executor is full, then verifies joined shutdown and port
+reuse. Historical failed setup receipts remain failed; fresh measurements are
+required to qualify the repaired baseline.
+
+## Resource ledger and operator controls
+
+[RESOURCE_OWNERSHIP.md](RESOURCE_OWNERSHIP.md) records nested versus independent
+owners, acquisition order and progress boundaries. Native data/standalone API
+allocations now charge the node memory manager used by managed storage/models;
+HTTP application output and pgwire heap charge the corresponding API envelopes.
+Raw transport buffers, native stacks/TLS and backend mappings still need separate
+qualification. A total-process RSS guarantee is not implied.
+
+Authenticated administrators can GET `/admin/v1/workload/query` for configured
+and effective query limits, policy version, queue timing, retiring waiter count,
+drain/suspension state and allocation envelope counters. PUT replaces a policy:
+
+```json
+{
+  "expected_version": 1,
+  "capacity": 2,
+  "waiting": {"max_queued_requests": 2, "max_queued_bytes": 1048576, "max_wait_ms": 100},
+  "suspended": false
+}
+```
+
+Limits may shrink and later return to startup reservations. A stale version
+returns 409; increasing finite capacity, queue size/bytes or wait ceiling beyond
+startup reservations returns 422. Explicit startup capacity zero remains
+unlimited; changing a finite startup capacity to zero is rejected. Queue shrinking
+retires newest excess waiters; existing grants survive. Suspension retires queued
+work and rejects fresh queries while transaction controls remain available.
+Existing waiters keep their original finite wait ceiling/deadline; a replacement
+wait ceiling applies to subsequent enqueue operations. PUT
+`{"expected_version":2,"action":"drain"}` permanently closes query admission.
+Quiescence requires active and queued counts and notified-but-unretired entries
+to reach zero; transport/background-owner joins are separate shutdown barriers.
+Policies are node-local and reset to configuration after restart.
+
+## Reproducible pressure comparison
+
+`run_matrix.py` runs origin/main (when supplied), candidate fail-fast, and candidate
+fixed waiting in independent temporary stores. Manifests with a runnable policy
+also compare candidate runnable scheduling directly against candidate fail-fast,
+candidate fixed waiting and origin/main. The same-binary comparisons validate
+both complete manifest policies before normalizing only the declared scheduler
+and waiting differences; memory and admission capacity remain equal. Candidate fail-fast uses the same
+startup heaps and configuration as fixed waiting, with only query waiting disabled. `load_clients.py` records every
+offered/submitted/completed/successful/failed/generator-dropped request, zero
+retries, successful and all-response p95/p99, resource peaks, control latency and
+recovery. Latency starts at the scheduled offer time, including client queueing.
+Mixed workloads validate exact query rows, issue writes, and delay reading large
+results. The generator has a finite task envelope; dropping offered work fails
+its manifest gate. Successful throughput excludes failures and includes drain
+elapsed time. A status code without valid rows is not a successful query.
+
+```sh
+python3 zig/qualification/workload-pooling/run_matrix.py \
+  --candidate /path/to/candidate/antfly --baseline /path/to/main/antfly \
+  --manifest zig/qualification/workload-pooling/macos-mixed-load.json \
+  --repetitions 3 \
+  --output-dir /tmp/fresh-pooling-comparison
+```
+
+The Linux profiles require exact enforced cgroup-v2 limits and fail on macOS or
+an unlimited Linux host. Build native GNU Linux binaries outside the measurement
+container, then run the small profiles with two CPUs, 2 GiB, 512 PIDs and 512 FDs;
+the large profile uses four CPUs, 4 GiB, 768 PIDs and 1024 FDs. The Dockerfile and
+manual `Zig Workload Pooling Qualification` workflow provide that environment,
+build the selected baseline with the same stripped ReleaseSafe optimization and pinned
+Nix glibc-linked Zig toolchain, verify compiler version and dynamic linkage, run
+the GNU signal-stack fixture, and retain all receipts. Small/large authenticated profiles
+also exercise extended-protocol prepared portal suspension/continuation.
+
+Repeated matrices rotate the variant order so each binary/policy occupies every
+position. Every repetition retains its own receipts and comparisons; one failed
+repetition fails the matrix. The manual workflow uses three repetitions with
+ReleaseSafe binaries. Per-phase receipts also separate cheap queries, expensive
+queries, writes and slow readers, record server CPU consumed and preserve
+before/after operator counters for candidate policies. Operator snapshots occur
+outside the timed phase. Per-kind comparison ratios are diagnostic; the original
+aggregate latency and successful-throughput gates remain unchanged. The fixed
+variant must also report SQL waiting as effective after executing each phase;
+startup configuration alone cannot qualify an unavailable worker pool. CI builds
+portable x86_64 GNU binaries on the existing heavy build runner, then measures
+them on a separate Ubuntu runner in the enforced small/large Docker envelopes.
+
+The separate `macos-waiting-pressure.json` and `linux-waiting-pressure.json`
+profiles use one execution slot and offer 750 requests/s during sustained load.
+They retain the mixed-load resource and performance gates and require at least
+one completed admission wait in that phase. The original 200 requests/s profile
+remains a separate measurement: on ReleaseSafe it can measure overhead without
+forcing requests to queue. A pressure receipt with no completed waits fails.
+
+The comparison requires identical manifest hashes, enforced limits, offered
+work and zero retries. It checks a 25% low-load/recovery p95 regression ceiling
+and 90% successful-throughput floor, in addition to each profile's absolute
+limits. These are proposed release gates fixed before measurement, not achieved
+performance claims. Passing one comparison never enables automatic defaults;
+Linux, whole-node ownership and distributed-progress gates remain explicit.
+Receipts cannot be overwritten accidentally. `test_harness.py` verifies the
+comparison and resource gates fail closed.
+
+The cold and warm macOS load profiles are separate measurements. The warm
+manifest explicitly records warm-up operations and uses cheap low-load/recovery
+queries; it is not a replacement for a failed cold profile. Historical development
+[receipts](receipts/2026-10-06/README.md) retain both outcomes and binary provenance.
+The API accounting port shares the actual storage owner in linked composition.
+Managed inference and public HTTP transport now share the node accounting owner.
+Unmanaged native and independently supplied service allocations retain their owners;
+see [the ownership ledger](RESOURCE_OWNERSHIP.md) before interpreting health
+counters as a whole-process cap.
+
+Same-binary comparisons reject configuration differences other than waiting and
+the ephemeral pgwire bind port. Each new receipt preserves a redacted server log
+beside its measurements. Missing idle control samples fail with `null`, never a
+passing zero. Final Linux comparisons currently fail sustained throughput; see
+[recorded outcomes](receipts/2026-10-06/README.md).
+
+
+## Runnable scheduler comparison
+
+`linux-runnable-pressure.json` adds an explicit fixed `runnable_policy` to the
+combined retention profile. `run_matrix.py` then also runs `candidate-runnable`,
+comparing it with `candidate-fixed` and main. The candidate pair shares the same
+query waiting, operation admission, memory ceilings, workload and retained peers;
+only runnable scheduling changes. Existing manifests keep their original variants.
+Use four rotated repetitions when including main, fixed, fail-fast and runnable:
+
+```sh
+python3 zig/qualification/workload-pooling/run_matrix.py \
+  --candidate /path/to/candidate/antfly --baseline /path/to/main/antfly \
+  --manifest zig/qualification/workload-pooling/linux-runnable-pressure.json \
+  --repetitions 4 --output-dir /tmp/fresh-runnable-comparison
+```
+
+Authenticated workload snapshots include `runnable` counters. Before and after
+each phase, the probe requires enabled scheduling, stable configured capacities,
+monotonic grant/yield counters and effective capacities matching the manifest.
+Successful query and write operations require corresponding grants during that
+phase. Sustained overload requires at least one cooperative yield. The existing
+request accounting, no-retry, latency, throughput, retained-peer and resource
+limits still apply. Same-binary comparisons reject any undeclared admission or
+memory change. The server build and compiler qualification stay outside the
+measurement container.
+
+Phase receipts also include `runnable_diagnostics.service`: versioned active
+execution-lease wall slot-time deltas for query general, write, inference,
+background, query bounded and query analytical. Estimates, observations,
+unobserved estimates, refunds, debt payments and clipped corrections are separate
+counter arrays; debt and rebate are end-of-phase gauges. The probe rejects
+counter resets, malformed classes, unsupported contracts, changing availability
+or quantum, and corrections outside the scheduler's 64-quantum bound. Older
+snapshots without service telemetry report `available: false`, without fabricated
+zero observations. A phase may declare `runnable_observed_slot_ns_min` before a
+run to require measured service; estimates and grants cannot satisfy that gate.
+`linux-runnable-pressure.json` now requires at least one observed slot-nanosecond
+in every runnable phase. The comparison also reconstructs service deltas from
+both workload snapshots and rejects missing, invalid or inconsistent diagnostics,
+even if the receipt's outer `passed` flag is true. This gate is declared before
+new measurements; historical receipts without observations cannot satisfy it.
+These observations do not establish thread CPU utilization, complete operator
+coverage, or fair service shares. Existing latency, throughput and resource
+thresholds remain unchanged.
+
+This profile has not yet passed a current-source runtime matrix. It does not
+complete the concurrency sweep, inference/background fairness, distributed
+progress, durability, or automatic sizing gates. Runtime receipts are required
+before drawing performance conclusions or enabling defaults.
+
+
+## Declared concurrency sweep
+
+`run_sweep.py` creates distinct hashed manifests for client worker ceilings
+1, 5, 10, 20, 30, 40, 60, 80 and the overload point 160, then runs all four
+variants at every point. Mixed burst/overload offer rates scale with worker count
+from the reference profile, keeping the offered rate per worker fixed. Cheap
+low-load/recovery rates, warmup, retained peers, server policy, the pending-client
+bound, resource limits and every existing acceptance threshold stay fixed.
+This is a client worker ceiling; phase receipts report the observed active-client
+peak and workers actually used rather than assuming every worker ran at once.
+Per-kind receipts reconcile offered, submitted, completed and dropped work.
+The runnable variant fails if any offered workload kind has no successful work.
+
+Prepare and inspect the complete declarations before measurement:
+
+```sh
+python3 zig/qualification/workload-pooling/run_sweep.py \
+  --manifest zig/qualification/workload-pooling/linux-runnable-pressure.json \
+  --prepare-only --output-dir /tmp/declared-runnable-sweep
+```
+
+Use a different fresh directory for measurement, supplying `--candidate` and
+`--baseline` instead of `--prepare-only`. Four repetitions rotate every variant
+through every position. Each point retains its own matrix and failures; an early
+failure does not skip later points. Preparation is explicitly unmeasured and
+cannot pass qualification. Missing or failed matrix receipts fail the sweep.
+A point with generator drops fails its existing envelope gate; receipts must be
+reviewed before changing any future workload declaration. No current-source
+sweep has passed, and automatic defaults remain unqualified.
+
+## Guarded native publication CPU return
+
+Automatic runnable policy reserves one publication-return CPU inside the node's
+slot ceiling, alongside independent health and cleanup CPUs. Its minimum is four
+logical slots, including one ordinary CPU. Fixed policies opt in with
+`publication_slots = 1`; a zero or busy reserve keeps the publisher's existing
+CPU and never waits to acquire the reserve under a DB fence.
+
+Top-level managed table batches can release ordinary CPU at an independently
+owned native WAL readiness wait and resume on publication CPU while retaining
+their apply, snapshot and policy fences. The original operation, class, memory,
+cancellation and deadline remain authoritative. The scope returns to ordinary
+CPU after its DB work and physical joins retire. Denied return after a successful
+primary commit reports `DurabilityOutcomeUnknown`; it does not fence an otherwise
+healthy backend or claim that the mutation was rejected before commit. Metrics
+expose the effective reserve as `antfly_runnable_publication_capacity_slots`.
+
+Nested capture/producer scopes, child executions, multi-CPU teams and providers
+without the owned native readiness contract retain their existing CPU policy.
+The `antfly-guarded-db-commit-test` gate exercises actual bound table callbacks,
+managed filesystem DBs, native WAL I/O and reopen recovery, with deterministic
+physical pause hooks. It includes an ordinary status request holding the sole
+ordinary CPU while waiting on the publisher's apply fence, independent health
+progress, cancellation/deadline joins and bounded ordinary-return refusal. This
+focused evidence does not qualify HTTP transport overload or every engine.
+
+## Native directory publication pressure
+
+`macos-guarded-publication-pressure.json` selects the standalone `local`
+directory engine and a four-slot automatic policy. It requires an observed
+publication reserve of one CPU, query/write progress, bounded waiting, status
+latency and resource recovery during mixed load. Eight HTTP peers, eight pgwire
+sessions, four held cursors and two unfinished uploads remain live through the
+phases. Changing, fixed-size payloads force updates instead of repeating the
+seeded postimage. Successful queries and writes must record grants in their
+respective runnable classes; unexpected server errors fail qualification.
+The native HTTP batch worker and its inline fallback retain a write capsule
+and the original request authority through physical completion. Historical
+profiles keep their original byte pattern and file-engine selection.
+
+```sh
+python3 zig/qualification/workload-pooling/run_local.py \
+  --binary zig/zig-out/bin/antfly \
+  --manifest zig/qualification/workload-pooling/macos-guarded-publication-pressure.json \
+  --policy runnable --output /tmp/guarded-publication-pressure.json
+```
+
+After load and client retirement, the launcher acknowledges one fresh primary
+write, verifies its exact large integer and payload over HTTP and pgwire, joins
+server shutdown, and reopens the same isolated store. Both protocols must return
+the same postimage after restart. The receipt retains both exit statuses,
+postimage hashes and harness hashes; missing restart evidence fails the run.
+This is joined-restart evidence. Crash/power-loss durability and comparisons
+across all engines require their own runs. This profile checks status progress;
+operator-policy drain testing remains in the existing dedicated profiles.
+
+Admission-aware backend batch reads, scoped reads and cursor opening use the
+owning runtime's checked dispatcher, matching ordinary backend reads. Raw Zig
+error identities cannot cross storage archives: contention previously surfaced
+as `InvalidSourceSnapshot` instead of backpressure. Synchronous admission relays
+preserve the caller's original rejection, discard partial values and retire a
+cursor returned after rejection. Focused dispatcher tests cover those paths;
+a native file-engine mixed-load run completed every phase without unexpected
+server errors and with query, write and slow-reader progress.
+
+Resident LSM inspection and both maintenance-step policies now carry the
+original lifetime restriction through the checked physical engine interface.
+The shared borrowed-I/O storage adapter supplies admission-aware range reads
+for owned recovery cursors, reuses its caller's executor, checks lifetime between
+64 KiB windows and closes the descriptor before CPU reentry. Its allocated-range
+wrapper also uses checked dispatch. This adds no host-path publication permission.
+
+Dedicated metrics-listener runs distinguish real background work from absence
+of warnings: both directory and file engines recorded flushes and completed
+compactions under mixed load, with zero maintenance worker failures. The original
+profiles then completed without maintenance or publication-recovery errors and
+verified exact HTTP/pgwire postimages through joined restart. The directory
+profile passed all gates; file descriptor recovery remains failed. These local
+runs do not qualify distributed or serverless deployment paths.
+
+The restart probe runs independently of load/resource acceptance when the
+server remains live. A failed load receipt stays failed even when exact HTTP
+and pgwire postimages survive joined shutdown and reopen; the receipt records
+the load exit code and both server exit codes separately. Native file-engine
+mixed load now has this exact-postimage restart evidence.
+
+File-engine qualification remains open because the unchanged cold-baseline
+descriptor-recovery gate still fails. A diagnostic ownership census matched all
+21 artifact-marker descriptors to their live registry sources: 16 idle-expirable
+cache sources and five explicit readers, with no callbacks in flight. The source
+cache and live full-text segments retain storage independently of connections;
+this census does not prove process-wide descriptor bounds or qualify the failed
+gate. The retained-cursor suite's two reproduced baseline failures are now
+resolved in their assertions: normalization OOM enumeration disables optional
+in-place allocator growth, and predecision accounting identifies live manager
+metadata before verifying its release at destruction. All 36 retained-admission
+tests pass without skips or leaks; the failing baseline receipts remain available.
+The resource, server-error and restart gates remain unchanged. A passing
+directory-engine receipt does not qualify the file engine.
+
+Directory overload/restart has a passing native receipt, but repeatability is
+still open: a repeat of the same binary and semantically identical harness
+observed warm-up capacity rejections and no successful slow-reader operation
+in the sustained-overload phase. Preserve these gates rather than treating the
+single passing run as stable qualification of the whole design.
+
+
+## Serverless WAL ingress demand
+
+The namespace and table `ingest-batch` routes reserve one runnable CPU for
+sequential encoding and WAL acceptance. Other write routes retain their
+configured build-team width. Original request cancellation, finite protected
+completion, WAL acknowledgement and response retirement remain in the existing
+owning execution path.
+
+The focused serverless gate covers both WAL handlers with only one general
+slot and a configured two-slot build demand, including original rejection
+identity and durable acknowledgement after foreground rejection. The managed
+native listener also exercises automatic defaults and a two-slot general pool
+with a cooperative competing CPU owner, real FsWal ingestion, background
+publication and exact published document reads. The competing owner checkpoints
+so the scheduler can honor age-protected wide maintenance work; permanently
+pinning a synthetic slot correctly caused bounded capacity rejections.
+
+The production server builds and the focused gate passes. These listener tests
+use local filesystem providers; they do not qualify cloud/distributed providers
+or all serverless maintenance waits.
+
+The H2 lifecycle probe now distinguishes peer-visible disconnect from local
+socket close. Diagnostics reproduced a closed client descriptor and a still
+established server socket despite correctly installed zero linger. An acknowledged
+PING boundary drains preceding control frames before the abort case; it neither
+grants response credit nor retires the stalled owner. The probe still requires
+zero scheduler operations, retained bytes, foreground/control allocations, active
+requests and physical connections within the original five-second limit, before
+server shutdown.
+
+The original unfenced abort also remains covered. That case and an additional
+fully silent peer use explicit 1.5-second request and 250-millisecond idle
+ceilings, proving bounded ownership when no immediate close notification reaches
+the server. These are local native-listener checks of the existing production
+request/idle policies; they do not promise five-second detection of an unseen
+abort under arbitrary policy or network conditions. Ten consecutive runs of
+the complete focused serverless binary pass all five lifecycle cases and the
+managed ingestion/publication checks. Published-read polling may observe
+retryable capacity responses before success within its existing retry bound.
+The failed baseline and native socket/stack diagnostics remain available.
+
+
+## Serverless maintenance execution phases
+
+Managed orchestration now starts with one background CPU. Waiting for the
+runtime or publisher mutex returns CPU on the same execution and executor;
+reentry precedes the next lock attempt, so queued CPU never retains that lock.
+Synchronous public-batch materialization borrows the request's existing producer
+capability for these waits and its bounded retry sleeps.
+
+The original maintenance authority survives namespace leases and graph-source
+protection. Owner-only publication checkpoints remain separate from parallel
+cancellation checks. Graph kernels grow the existing team before joined work
+and restore its previous width before encoding/publication, including compatible
+HITS pairs and rejected computation. Enrichment retains its configured stage
+width pending finer provider/model integration.
+
+Public batches reserve their bounded completion task and metadata before
+possible WAL acceptance. The task borrows the existing request executor and
+execution; the physical WAL reuses its activated completion. Optional sync waits
+retain the original narrower sync restriction and leave terminal-response time
+inside the finite completion. Foreground rejection and scheduler close after
+acceptance preserve the committed/pending response. This introduces no new
+per-request executor or independent scheduler root.
+
+The focused native gate exercises real HTTP ingestion and `full_index` batches,
+filesystem WAL/publication, and exact published postimages. A work-cost probe
+checks one-CPU orchestration with a configured two-CPU build width. The native
+page-graph builder verifies authority propagation through leases and publication;
+separate legacy-payload/kernel fixtures cover shared HITS work, serial restoration
+and healthy reuse after rejection. Background and request-borrowed mutex tests
+preserve original rejection while a competing request owns all general CPU.
+
+This is an integrated CPU-phase and synchronous-caller increment. Admission
+around physical provider I/O, finer joined-kernel participant scheduling, and
+model/provider waits remain required to complete the maintenance milestone.
+Local filesystem evidence does not qualify remote/cloud providers or all engines;
+the existing full-qualification waiver and failed file-engine resource gate remain.
+
+Maintenance artifact uploads also carry an operation-local provider context from
+the normal catalog and builder entrypoints. Shared object-store handles never
+receive that owner's execution pointer. Filesystem providers hash before lending
+CPU, join the prepared durable mutation and release its content locks before CPU
+return. S3 and GCS forward the same operation's wait control to their existing
+HTTP transport readiness and pool waits; cancellation monitors retain only the
+lifetime predicate.
+
+Page upload batches reserve bounded child metadata before publishing workers.
+The coordinator parks its complete existing team before child activation and
+reenters after every physical task joins and its child entry retires. Deferred
+reservation supports an existing foreground team as well as serial background
+orchestration. Original lifetime, clock, class and accepted-completion authority
+remain inherited; no child creates a fresh admission root or deadline.
+
+The provider integration remains part of the open maintenance milestone.
+WAL and catalog mutations, GC/enrichment progress and work-lease calls,
+retention/pruning mutations, direct filesystem artifact adapters, and model/kernel
+participant waits still need complete physical-boundary integration. Transport forwarding alone does not
+qualify remote providers. The existing file-engine resource-gate failure and
+full-qualification waiver are unchanged.
+
+
+### Maintenance metadata provider ownership
+
+Operation-local store views now carry the original execution through managed
+publication, status/planning, synchronous materialization, compaction, pruning
+and enrichment. The views share the original backend and retained lease-cache
+owners; neither mutable provider handles nor cache mutexes are copied. The
+new view packets are included in background admission and public-batch completion
+metadata before those operations can publish work or accept WAL.
+
+Manifest encoding and decoding, WAL decoding and catalog reconstruction retain
+CPU. Object-backed reads lend CPU at file open/stat/header/body reads, bounded
+filesystem iterator steps and existing S3/GCS transport waits. Opened descriptors
+remain owned through CPU return; denied return closes them through the provider's
+original executor. Provider bodies and decoded outputs remain operation-owned
+through the final lifetime check. Legacy adapters without contextual callbacks
+keep their existing CPU ownership.
+
+Catalog read sequences retain their existing mutex. Their physical waits use the
+scheduler's nonwaiting publication reserve; a disabled or busy reserve keeps CPU
+instead of queuing for ordinary CPU while holding that mutex. HEAD publication
+uses the same verified ETag and lease record in its conditional provider write;
+contextual publishers can finish without taking a legacy caller's local mutex.
+Original rejection after physical publication discards only the response and
+preserves the durable HEAD.
+
+Focused native evidence combines the actual listener's HTTP ingestion, public
+batch and published-query paths with filesystem-backed maintenance fixtures.
+The latter perform successive publications, compaction and lease-aware pruning,
+verify exact public postimages, exercise enabled/disabled catalog return capacity,
+and reject owned reads after CPU return. A separate physical HEAD-write fixture
+preserves durable publication after original-scope rejection. Enrichment checks
+retain the stable idempotent WAL identity over both memory and filesystem object
+providers, including an already funded two-CPU write owner. These fixture results
+do not qualify cloud transports or prove physical deletion while read leases
+still protect old versions.
+
+The full maintenance milestone remains open for remaining mutation/retention
+provider boundaries, immutable artifact reads and provider/model/kernel
+participation. Remote-provider behavior and the original cross-engine/resource
+gates also remain open; the full-qualification waiver still applies.
+
+### Maintenance kernel participant integration
+
+Graph materialization now admits each joined worker group at its actual width.
+Small kernels retain serial capacity even when the configured maximum is larger;
+iterative kernels restore their prior width before reductions, iteration
+checkpoints and encoding. The coordinator alone changes scheduler ownership.
+Workers retain lifetime cancellation, and error cleanup cancels and joins their
+group before restoring capacity. Both ordinary metric materialization and the
+shared paired-HITS publication path use these hooks. Serial vector construction
+uses cooperative owner checkpoints at its existing cancellation boundaries.
+
+Foreground maintenance borrows the ingress owner's funded width through the
+existing ABI/native adapter. It does not resize that owner or create another
+root. Requests exceeding the borrowed width fail before worker publication.
+Explicitly disabled scheduling retains its existing empty-capsule behavior.
+The native-only width callback does not change the public runnable ABI.
+
+Focused evidence lives in `serverless-kernel-participants-v5-debug.json` and its
+log under the cumulative integration receipts. Native scheduler fixtures cross
+both the 128-Ki-edge and 32-Ki-node thresholds for PageRank, eigenvector and both
+HITS outputs, compare encoded results byte-for-byte against serial execution,
+and exercise lease rejection, cleanup and an ingress-borrowed team. The existing
+paired-HITS fixture preserves its shared-work budget and durable artifact
+checks while correctly retaining one lane for its small graph. A vector fixture
+queues a real query behind the sole ordinary lane, proves it progresses at a
+construction checkpoint, checks protected control admission and verifies root
+retirement. These are production-code integration fixtures; the separate normal
+listener regression tests do not constitute a large-graph endpoint load test.
+
+The maintenance milestone remains open for invocation-scoped model execution,
+model construction/discovery/asset waits, serial graph preparation checkpoints,
+remaining provider mutation/retention boundaries and immutable artifact reads.
+Cross-engine resource gates, including
+the unresolved file-engine descriptor bound, remain open. Full GNU/full
+qualification remains waived; no cloud or all-engine qualification is claimed.
+
+### Maintenance model invocation integration
+
+Managed enrichment restores serial capacity after provider construction. Sparse
+and dense embedding calls, media generation probes and paged media execution
+now bind a synchronous invocation scope to the original maintenance execution.
+Each call admits its configured team and restores its previous width before
+fallback, document encoding or WAL publication. Foreground calls consume their
+existing funded team through the ABI/native adapter without creating a root or
+resizing the ingress owner. The adapter can now expose that borrowed team to the
+existing inference host's worker phase handoff.
+
+The invocation copies the configured provider descriptor and preserves its
+routing, transport, progress and narrower request lifetime. Cached embedder and
+chunk-provider handles never receive stack-scoped execution callbacks; durable
+chunk-provider construction rejects an invocation-bound grant. Lifetime
+polls serialize renewable source/maintenance authority; only the coordinator
+changes CPU ownership. Owned model output is discarded when original authority
+fails after provider return. Genuine provider failures retain the configured
+fallback policy; admission, cancellation, source-lease and narrower-scope
+failures propagate without publishing a derived WAL mutation. Legacy providers
+without contextual callbacks retain their synchronous compatibility behavior
+and do not gain physical-wait control from this integration.
+
+The invocation packet is included in `CatalogService.Scope.retained_bytes`,
+which funds both background roots and preaccepted foreground completion work.
+No request creates a separate executor or persists its grant in a model owner.
+
+Evidence: `serverless-model-invocations-v6-debug.json` and its log in the
+cumulative receipts. A filesystem-backed production enrichment fixture covers
+sparse, dense and media routes with owned and borrowed executions, including
+parked-capacity reuse by queries and protected control, model fallback, rejection
+after owned output allocation, narrower request authority and unchanged cached
+handles. It checks durable WAL advancement and complete root retirement. A separate
+queued-team fixture rejects narrower invocation authority while an unrelated
+owner continues holding the lane needed for admission. The
+existing enrichment, media scan and inference handoff tests provide regression
+coverage. These use deterministic model callbacks and real scheduler/provider
+plumbing; they do not qualify a downloaded model, cloud deployment or the
+installed CLI binary.
+
+The maintenance milestone remains open for physical waits in remote model
+transports, provider/model construction and discovery, asset loading, remaining
+provider mutation/retention and immutable artifact reads, and serial graph
+preparation checkpoints. The original cross-engine resource gates remain open,
+including the file-engine descriptor bound. Full GNU/full qualification remains
+waived.
+
+### Maintenance remote model HTTP waits
+
+Embedding dispatch now creates a request-local HTTP wait adapter and an owned
+credential-cache overlay. The adapter forwards the existing execution to
+outbound socket and pool waits without modifying persistent clients or cached
+model entries. Antfly JSON/numeric/framed requests, OpenAI-compatible and Cohere
+requests, and Gemini/Vertex and Bedrock model requests carry these controls.
+Remote media chunk requests use the same adapter. CPU returns to the actual
+saved class through checked reentry; response buffers remain transport-owned
+until that succeeds. Original fallible cancellation survives provider adapters
+and is rechecked before owned decoded output transfers to the caller.
+
+Capability discovery and model activation carry the operation's controls.
+Callers waiting on a shared discovery flight lend their own grants while
+retaining their own lifetime and flight reference. Retired-flight and query
+retry backoff also return CPU on the original executor. Discovery keeps its
+separate activation budget; only an explicit caller deadline narrows it, rather
+than starting the default inference timeout before a cold model is ready.
+
+Request overlays borrow shared cache synchronization and own their authorization
+cache allocations. Nested HTTP invocation packets are funded in the existing
+background/accepted-completion metadata reservation. Persistent models and
+clients retain no invocation control callbacks.
+
+Evidence is recorded in `serverless-model-http-v7-debug.json` and its log under
+the cumulative integration receipts. Real loopback HTTP fixtures exercise both
+OpenAI-compatible responses and cold Antfly discovery/model requests, including
+query/control progress during waits, retained metadata, and original authority
+rejection while response reentry waits behind another owner. A two-caller test
+proves shared discovery performs one catalog request while both callers return
+CPU, then completes both model invocations. Existing activation, caller-budget,
+framing, pinning, retry and model invocation tests provide regression coverage.
+Responses are deterministic fixtures; this does not qualify live cloud services,
+TLS across a deployment, downloaded models, or a rebuilt installed CLI.
+
+The maintenance milestone remains open for credential resolution/refresh and
+quota waits, provider/model construction and asset loading, lease renewal and
+remaining mutation/retention/immutable-artifact provider boundaries, and serial
+graph preparation checkpoints. Original cross-engine resource gates, including
+the file-engine descriptor bound, remain open. Full GNU/full qualification is
+still waived.
+
+### Maintenance credential refresh and quota waits
+
+HTTP attempt observers now receive the request's execution-wait control.
+Provider quota admission returns CPU during capacity, pacing and cooldown waits,
+after releasing the limiter mutex. Only successful admission owns a permit;
+cancellation during a wait never releases another caller's concurrency slot.
+The controls reach normal managed model requests through their existing shared
+clients, without storing invocation callbacks in the limiter registry.
+
+Google and AWS credential HTTP exchanges and refresh waiters carry the same
+caller control and deadline. Google token refresh now runs outside the token
+cache mutex, with one refresh owner and bounded polling by waiters. Fresh tokens
+and valid fallback snapshots retain their existing cache behavior; caller
+allocation and authority checks precede publication/transfer. Rejected return
+from a credential exchange cannot publish a replacement token or silently use a
+cached fallback. AWS snapshot/caller-copy cleanup also preserves ownership when
+refresh or shutdown rejects transfer. Managed Bedrock calls pass their existing
+executor explicitly for credential files rather than creating a request-local
+filesystem executor.
+
+Evidence: `serverless-credential-quota-v5-debug.json`, the prior fresh integration
+run `serverless-credential-quota-v3-debug.json`, and their logs in the cumulative
+receipts. The real model HTTP quota fixture proves query/control progress while
+admission waits and verifies that rejection neither sends a request nor releases
+an unowned permit. Real loopback OAuth and STS fixtures cover refresh owners,
+shared waiters, mutex availability during network waits, one exchange for two
+callers, rejected CPU return, unpublished rejected credentials and root retirement.
+Dedicated Google/AWS test targets run the libraries' actual allocation,
+cancellation, source-authority and shutdown regression tests; consumer filters
+alone did not discover those separate-module tests. Fixture tokens and responses
+are deterministic; live cloud identities and services are not qualified here.
+
+The maintenance milestone remains open for credential-file physical wait
+boundaries, provider/model construction and asset loading, lease renewal and
+remaining mutation/retention/immutable-artifact provider boundaries, and serial
+graph preparation checkpoints. The original cross-engine resource gates remain
+open, including the file-engine descriptor bound. Full GNU/full qualification
+remains waived; the installed CLI was not rebuilt for this increment.
+
+
+### Maintenance credential-file admission
+
+Normal AWS profile, web-identity and ECS authorization-token file reads, Google
+ADC/configuration and external-account subject-token reads, and Vertex project
+lookup now carry the invocation's execution-wait control. The bounded file
+adapter lends CPU only for physical open/read operations; buffer growth and
+credential parsing run after checked CPU return. A descriptor opened before a
+rejected return is closed with its original filesystem authority, and partially
+read buffers remain owned until success or cleanup. Existing credential-file
+size limits remain enforced, including files requiring several bounded reads.
+
+Google credential-source construction runs outside the manager mutex and uses
+the manager's supplied I/O runtime. Concurrent candidates resolve publication
+under the mutex, then dispose the losing candidate after unlocking. Invocation
+controls are never retained in cached sources. Configuration/project discovery
+also checks caller authority before transferring allocated results.
+
+Evidence: `serverless-credential-files-v3-debug.json` and its log in the cumulative
+receipts: 68 serverless integration tests, 31 local partition tests, 17 AWS and
+14 Google library tests pass; native-borrow, inference-owner and cleanup targets
+reuse unchanged successful results. The new production-loader fixture uses real
+temporary credential files with real scheduler admission. Its deterministic gate
+pauses CPU return after actual open/read completion; it does not simulate slow OS
+storage. It proves query/control progress, unlocked Google/AWS caches, one cached
+source for concurrent Google candidates, rejection before cache publication, and
+retirement of all execution roots/retained-byte charges. The bounded-reader test
+covers chunking, exact limits and overflow. No live cloud identity is involved.
+
+The broader maintenance milestone remains open for AWS vendor-process waits,
+provider/model construction and asset loading, lease renewal, remaining mutation/
+retention/immutable-artifact provider boundaries, and serial graph preparation.
+Cross-engine resource qualification, including the original file-engine descriptor
+gate, remains open. Full GNU/full qualification remains waived; the installed CLI
+was not rebuilt for this increment.
+
+
+### Independent CPU admission for native model loading
+
+Shared model and composite-asset loads now acquire one independent execution
+grant on their existing loader task. The grant borrows the flight's collective
+lifetime, remains owned through synchronous construction and final checks, and
+finishes before the task releases its flight ownership. Final-fence rejection
+retires an already published primary model or destroys an unpublished composite
+candidate. Callers park while awaiting independently admitted loads and resume
+before adopting handles; warm completed lookups avoid a new wait transition.
+Configured admission always requires a guaranteed concurrent loader, including
+callers without request controls; an exhausted async pool cannot execute it
+inline under the waiting caller's grant.
+
+In-process nodes install their existing execution-admission provider on the
+model manager. Supervised workers use private wire version 17 and carry loader
+CPU start, park, checkpoint, reentry, cancellation and finish over dedicated
+resource RPC. The parent records grants in a separate pinned ledger; scheduler
+waiting holds neither the shared resource mutex nor that ledger's registry
+mutex. Transport close cancels queued callbacks, and physical reap drops the
+generation's registry ownership while active callbacks retain their pins.
+
+Controlled resource RPC retains pending reply storage after cancellation,
+sends the owner an explicit cancellation, and joins the original reply before
+returning. A lost or uncertain mutation reply fences the child. CPU admission
+and the one-worker native CPU scope stay on the actual loader worker; no request
+callback or borrowed caller grant is retained by an asynchronous model load.
+Without a configured execution owner, existing offline/disabled paths retain
+their prior behavior rather than parking around an uncharged loader.
+
+Focused evidence is recorded in `serverless-model-load-waits-v5-debug.json`,
+`serverless-model-load-waits-v6-debug.json`, and
+`native-model-load-waits-v7-debug.json` in the cumulative integration directory. Real scheduler/pipe fixtures cover
+shared loader ownership, query/control progress, one departing caller, final
+cancellation during loading and queued CPU reentry, and pinned callback retirement.
+Constructor fixtures use a tiny local native model and local Whisper metadata;
+the constructor cases disable the async pool and cover controlled and legacy
+callers, admission denial before memory-domain creation, and final-fence rollback.
+These are deterministic native integration cases, not downloaded model or live
+cloud qualification. The production worker entry receives a separate semantic
+compile check. Full GNU/full qualification remains waived.
+
+This completes independent loader admission and shared-flight waiting within the
+maintenance milestone. Physical model-file/download waits inside construction,
+provider/model asset preparation, vendor-process credential waits, lease renewal,
+remaining mutation/retention/immutable-artifact boundaries, and serial graph
+preparation remain open. Cross-engine resource gates, including the original
+file-engine descriptor bound, remain open. The installed CLI is not rebuilt by
+these focused tests.
+
+
+### Physical native model-file waits
+
+The shared native `c_file` path now returns CPU around descriptor open, size/stat
+queries, bounded positional reads, and read-only mapping syscalls. Reads advance
+in at most 1 MiB chunks. Path/buffer allocation, size checks, hashing, parsing and
+mapped-data consumption retain the loader's CPU grant. Newly opened descriptors
+and mappings are disposed if checked CPU return rejects them; partially read
+buffers and existing descriptors retain their cleanup owners.
+
+Physical-return refusal remains sticky within the synchronous checkpoint scope,
+including nested scopes, so optional metadata fallback cannot turn a stopped
+loader into fresh work. Scope teardown restores the previous invocation state.
+Model/composite construction failure paths replay the owning control before
+publishing an error. Mapping stat failures preserve the original admission cause
+rather than collapsing it into `StatFailed`.
+
+Evidence: `native-model-file-waits-v5-debug.json` in the cumulative integration
+receipts. Six selected native tests include actual local model/composite
+construction with physical-wait callbacks, refusal before resident admission,
+descriptor recovery after open/stat/read refusal, exact chunked reads, limits,
+and nested refusal propagation. The separate real-owner fixture drives the
+production reader and mapper through actual scheduler capsules: queries and
+control work run at each loan boundary, original width and retained bytes return
+on success, and all roots retire after cancellation at open/stat/read-or-map
+return. Its gates are deterministic around real temporary-file operations; this
+is not a slow-disk latency or throughput measurement. The production worker
+entry also passes its semantic compile check.
+
+This closes the shared local file-syscall path within the maintenance milestone.
+Mapped page faults, parallel prefetch ownership and other backend-specific I/O
+remain outside this evidence. Downloads use a separate pull entry and still need
+admission plus physical network/disk wait integration. Credential subprocesses,
+lease renewal, other maintenance provider boundaries and graph preparation
+checkpoints remain open, along with the original cross-engine resource gates
+(including file-engine descriptor recovery). Full GNU/full qualification remains
+waived; the installed CLI is not rebuilt by these focused tests.
+
+
+### Query-template remote input waits
+
+Query-time embedding templates now enter an invocation-local execution scope
+before evaluating remoteText, remoteMedia and remotePDF. The normal distributed
+semantic-query planner already forwards its query runnable, I/O, deadline and
+cancellation into this managed entry. Rendering and subsequent provider dispatch
+retain that request's authority. Configured and invocation cancellation compose;
+request callbacks and mutable failure state are not cached in the shared entry.
+Only the owning worker performs park/reentry transitions. Transport monitors
+inspect lifetime without reading the owner's mutable failure state. A refused
+transition stops rendering instead of becoming an inline helper-error directive;
+the outer scope returns its exact original cause before provider dispatch.
+
+The scraping HTTP path forwards the existing objectstore cancellation token's
+execution-wait control on every redirect and pinned-range request. Response
+classification and result transfer check the original context. S3 already
+forwards this token to its HEAD/GET transport. Allowed local files now lend
+capacity around physical open, descriptor and allowlist canonicalization, and
+bounded positional/streaming reads. Owned-open refusal closes the descriptor.
+Controlled reads use at most 1 MiB per syscall, with scratch/result allocation
+and growth on CPU. Callers without execution transitions retain the original
+buffered reader. Path allowlists, symlink confinement, response limits, and the
+fail-closed policy for unsupported file deadlines remain in force.
+
+Evidence is in `template-download-waits-v4-debug.json` in the cumulative receipts
+directory. The integration fixture calls the production ManagedEmbedder template
+API and real renderer, uses a real scheduler with a two-slot background grant,
+and downloads through a real loopback HTTP listener before provider dispatch.
+It proves independent query/control progress while waiting, retained-byte
+ownership, restoration of the original width on success, exact source-revocation
+failure while queued for response reentry, no embedding dispatch after that
+failure, and complete root retirement. This is an integration fixture through
+production APIs, not an end-to-end serverless semantic-query endpoint test.
+The old entry-based test-only renderer bypass was removed after the fixture
+exposed it. Separate actual-file tests inject deterministic return refusal at
+every physical boundary, check exact bytes and overflow, and preserve path and
+deadline denials. Pinned-range listener tests also assert paired execution waits.
+Existing remote-content security and renderer regressions remain covered.
+These checks are not cloud/TLS or disk/network throughput qualification.
+
+Remaining in the broader remote-asset milestone: native inference media-download
+contexts still carry cancellation without execution-wait ownership; normal
+serverless semantic-query dispatch needs per-invocation runnable forwarding;
+remaining asset-producer provider and capability paths need controlled waits.
+Registry pulls are explicitly node-free CLI/SDK operations and must not be
+mistaken for a model loader owned by the node scheduler. The wider maintenance
+work and original cross-engine resource gates, including file-engine descriptor
+recovery, remain open. Full GNU/full qualification remains waived; the installed
+CLI is not rebuilt by these focused tests.
+
+
+### Serverless semantic-query context and native media waits
+
+Normal serverless ingress now creates a stack-stable read adapter on its existing
+execution for public table queries, table search, and namespace search. The
+trusted request context carries that team through public-query, joined-query and
+graph-search adapters into semantic query resolution. It also retains diagnostics,
+the original deadline and fallible cancellation. Expected lifetime rejection is
+checked before adapters translate or log generic query errors.
+
+ManagedEmbedder exposes synchronous context-bearing dense and template query
+entry points. Each applies the invocation context to a request overlay and
+combines configured and invocation cancellation. A cached query embedder retains
+its own cache/credential owners without retaining a request runnable, cancellation
+callback or transport-wait pointer. Per-table construction receives the same
+request scope, including discovery before query dispatch. The existing
+cancellation-only API remains available for callers without an I/O context.
+
+The native inference server now creates a local download-wait adapter for each
+synchronous media fetch and for the full lifetime of a pinned range pipeline.
+Physical transport waits use the current worker's ResourceWait/CheckpointScope;
+watchdogs only inspect request lifetime. The same control reaches HTTP, S3 and
+allowed local files through scraping. Parsing, allocation, result transfer and
+source-cache work remain runnable. Refused CPU return remains sticky in the
+native checkpoint scope, and final checks recover the original cause before
+optional per-item fallback or result transfer. Neither a request callback nor a
+borrowed grant is stored in an asynchronous loader or cached transport.
+
+Evidence: `semantic-invocation-waits-v3-debug.json` exercises the normal handler,
+actual filesystem-backed catalog/WAL/publication and vector query execution,
+and a real loopback model/template HTTP listener. Across all three semantic
+routes it checks dense and remote-template calls with successful query results,
+source cancellation while queued for reentry, and expiration of the original
+request deadline. Another query and the health control route progress while the
+model/template request is parked. Rejected template fetches never dispatch an
+embedding request; response retirement releases request admission, retained
+bytes and roots. Cached embedder request fields remain unchanged. The fixture
+uses direct handler ingress plus real provider transport, rather than an
+external client over a deployed serverless listener.
+
+`native-media-download-waits-v1-debug.json` records 47 filtered native tests,
+including actual multi-chunk file downloads through the native server helper,
+rejection at every physical return, exact original refusal after optional
+fallback checks, and existing independent-loader/model-file regressions. The
+production worker entry also passes its semantic compile check. Native media
+loan boundaries use deterministic callbacks around actual file I/O; this is not
+native live-network/cloud, TLS or latency/throughput qualification.
+
+Remaining in the remote-asset milestone: asset-producer provider/capability
+paths still need transport wait controls through their full invocation lifetime.
+The wider maintenance work (credential subprocesses, lease renewal, remaining
+mutation/retention/immutable-artifact boundaries and serial graph preparation)
+and original cross-engine gates remain open, including file-engine descriptor
+recovery. Full GNU/full qualification remains waived. These checks do not rebuild
+the installed CLI or establish completion of the full design.
+
+
+### Asset-provider transport waits and compatibility workers
+
+Asset-producer invocation boundaries now own their HTTP wait state through
+capability/memory discovery, scalar and reported batch execution, and raster
+availability checks. Direct Antfly requests and reader, transcription and
+extraction adapters forward invocation controls to transport waits. Google
+credential refresh and remote-audio downloads receive the same control; download
+controls remain present when no cancellation predicate was supplied. Cloudflare
+attempts also forward the control. Request overlays bind the synchronized
+capability-cache owner without copying its mutable mutex/cache state.
+
+Generation owns a separate synchronous wait scope around each actual backend
+call and Antfly text batch. Its OpenAI/Antfly, Vertex/Gemini, Bedrock and Anthropic
+transports use that scope; temporary transport pointers are cleared after every
+physical request joins. Constrained-generation discovery scopes its singleflight
+wait and HTTP control similarly. Parsing, formatting, allocation and result
+transfer keep CPU. Expected source/return refusal cannot become successful
+capability fallback. HttpWait publishes transition refusal through an atomic
+latch for transport monitors; mutable owner-only failure state remains private
+to the owner, and final readiness checks preserve the original error.
+
+Compatibility fanout reserves every owned child capsule before publishing a
+wave. Each physical worker activates its own child under the original source
+restriction, builds an invocation-local provider scope, and retires that child
+after its provider consumers return. The coordinator lends its grant until all
+workers physically join, then reacquires its original class and width before
+copying results. Failed publication cancels/joins published work before retiring
+unpublished reservations. A serial QueueFull retry uses the restored parent
+scope; no parallel worker borrows the parent's single-worker capability.
+Legacy unscheduled calls retain bounded compatibility width without acquiring
+fresh request authority.
+
+`asset-provider-waits-v9-focused.json` records a focused integration fixture
+through the production Producer APIs, real scheduler capsules and a concurrent
+loopback HTTP listener. Twelve success/revocation cases cover readers,
+transcription, generation, extraction, capability discovery, and two concurrent
+compatibility transcriptions. All lend capacity for unrelated query/control
+work; rejected reentry preserves the original source error and retires roots,
+children and retained bytes. The shared Runtime retains no invocation wait or
+runnable pointer. This is synchronous producer integration, not a deployed
+end-to-end table enrichment campaign or a live cloud/TLS qualification.
+
+`asset-provider-waits-v11-final.json` adds affected standalone library suites,
+serverless regression coverage and the production worker semantic compile
+check. The named `antfly-asset-provider-wait-test` target isolates the production
+fixture for efficient feedback; its equivalent case remains part of the
+serverless execution regression suite. Full GNU/full qualification remains
+waived and the installed CLI is not rebuilt by these targets.
+
+This integrates the audited remote HTTP provider/capability paths within the
+remote-asset milestone. Vendor-specific subprocess/native asset-preparation
+paths still require audit and integration; no subprocess/native-throughput claim
+follows from these HTTP fixtures. Credential subprocesses, lease renewal,
+remaining maintenance mutation/retention/immutable-artifact boundaries, serial
+graph preparation and original cross-engine gates remain open, including the
+file-engine descriptor recovery bound. The full design remains incomplete.
+
+
+### Credential vendor subprocess execution
+
+AWS configured-profile refresh now forwards the invocation execution wait to
+vendor-command resolution and credential export. PATH access, bounded pipe-read
+waits and process-exit waits lend the existing CPU grant. Spawn setup, output
+buffer growth, JSON parsing and credential publication remain runnable. Fixed
+pipe buffers allow stdout/stderr to drain concurrently without allocating while
+parked; each captured stream retains its existing 64 KiB bound. The process
+budget starts before environment/PATH setup and never renews after that setup.
+
+The process monitor publishes its terminal stop before canceling and joining the
+physical worker. Checked CPU return composes the operation ceiling with the
+original source authority, so both request expiry and a shorter process timeout
+remain Timeout through cancellation cleanup. Physical task cancellation used for
+teardown cannot replace that cause with Canceled. This required an existing
+worktree-local pinned-Zig overlay correction: a failed POSIX child wait retains
+its identifier and pipe ownership for the caller's deferred kill/reap. Successful
+waits still clean up normally; the installed toolchain remains unchanged.
+
+The focused production fixture calls the real AWS CredentialCache profile path,
+reads a real temporary profile file through the supplied Io authority, and
+launches a real local subprocess. Its authority substitutes a deterministic shell
+command for AWS; it does not execute a user's AWS CLI or authenticate to AWS.
+Success, source revocation during a wait, revocation during queued CPU return,
+request deadline and shorter process timeout each run with pipes open and with
+pipes closed before exit. Additional wait/queued-return cases make the authority
+report its source rejection only once, checking that the first cause stays
+published through cleanup. It checks unrelated query and protected-control
+progress, the refresh mutex remaining available, physical child retirement before
+return, publication only on success, and complete root/retained-byte retirement.
+A separate real-process capture check drains both pipes across multiple fixed
+buffers and verifies each output cap rejects independently.
+
+Evidence: `credential-process-waits-v8-focused.json` records the fourteen real
+scheduler/subprocess cases and credential regression suite.
+`credential-process-waits-v9-final.json` records the affected serverless, AWS,
+Google, HTTP, request-lifetime, runtime HTTP-control and worker semantic checks.
+The HTTP TLS fixture uses its existing `ANTFLY_TEST_TLS_PYTHON` override with
+`/opt/homebrew/bin/python3`; Apple's older Python lacks TLS 1.3 support.
+The worktree overlay's four Python preparation tests and Apache boundary check
+also pass. These checks do not rebuild the installed CLI.
+
+Credential vendor export is the production milestone covered here. Vendor-native
+model asset preparation, lease renewal, remaining mutation/retention/immutable-
+artifact boundaries, serial graph preparation, and original cross-engine gates
+remain open, including file-engine descriptor recovery. Full GNU/full
+qualification remains waived; this is not live AWS/cloud/TLS qualification.
+
+
+### Native model artifact identity and planning I/O
+
+Native model identity, managed receipt validation, tokenizer-planning digests,
+EmbeddingGemma metadata signatures and KV file identities now lend the existing
+synchronous execution grant during supplied-Io access, canonicalization, opens,
+stats, reads and legacy digest-memo writes. Allocation, JSON parsing, hashing,
+identity comparison and cache publication remain runnable. Receipt/path limits,
+contained-symlink checks, checksum verification and generation comparisons stay
+in force. Successful opens are owned until checked return; rejected return closes
+the descriptor before propagating the original source failure. Read buffers are
+fixed at 64 KiB during physical waits; dynamic buffer growth happens after return.
+
+Optional metadata and legacy memo fallbacks recheck the sticky original execution
+refusal before treating failed I/O as absent data. A failed memo write may remain
+an optional optimization failure, but rejected CPU return cannot publish the
+in-memory digest cache. KV identity now snapshots and publishes under its short
+cache mutex while hashing outside it. The existing cancellable execution lane
+coordinates cold validators; canceled validation releases the lane so another
+caller can retry. Cache/model mutexes in these audited identity paths are released
+before filesystem operations and checked CPU reentry.
+
+The real API-owner scheduler fixture loads a managed receipt and verifies its
+actual artifact checksum. It checks query/control progress at every loan, restores
+the original two-slot grant on success, and rejects every physical return in
+separate runs. Each run recovers the process descriptor count, retires retained
+bytes and releases its root. The fixture uses a real temporary artifact; it does
+not load a downloaded model or exercise cloud storage. Native ModelManager tests
+call the production model-identity, tokenizer-planning and KV identity paths over
+multi-buffer fixture files. Every physical return can be refused, with original
+error replay and no rejected identity cache publication. Loaded KV digest-cache
+cases also assert the cache mutex is available at every physical wait, release
+the validation lane on every refusal, retry successfully, and reuse the warm
+digest. No backend session is constructed by that cache fixture. These deterministic
+refusal tests supplement the real scheduler-owner integration.
+
+Evidence: `artifact-preparation-v4-final.json` records the focused native suite,
+actual API-owner file/receipt integration and production worker semantic check.
+All 33 selected native tests passed without skips; the build completed all 32
+steps. The Apache product boundary and staged license-header checks pass.
+`artifact-preparation-final.json` binds the tested input hashes to the committed
+source snapshots. The filters are compile-time filters, avoiding an unrelated
+full native/GNU qualification build.
+
+The milestone covers native artifact identity and planning I/O. It does not prove
+that mapped-page faults, vendor framework preparation, GPU construction or every
+model registry/download operation lend capacity. Those paths still require
+explicit audit and qualification. Lease renewal, remaining maintenance provider
+boundaries, serial graph preparation and original cross-engine gates (including
+file-engine descriptor recovery) remain open. Full GNU/full qualification remains
+waived, and the installed CLI is not rebuilt by the focused checks.
+
+
+### Joined held-work-lease renewal
+
+Ordinary and bootstrap held work leases now start one physically joined renewal
+worker before their builder/compactor/enricher proceeds. The worker is reserved
+under the original maintenance root, retains its original clock/cancellation
+borrow, releases CPU between attempts, and uses one control slot when renewal is
+due. A startup handoff prevents an activation race with the parent's CPU team.
+The parent regains its original class and width before production work resumes.
+Release stops and joins renewal before releasing the durable fencing token.
+Progress-store provider views carry their original request context into held
+leases. Convenience build calls therefore inherit the caller's execution, Io,
+deadline and authority even without an explicit maintenance-token argument.
+Existing explicit maintenance controls compose with that provider context.
+
+A held-lease maintenance checkpoint now reads published refusal and lease
+lifetime rather than performing provider I/O. Cached lease checks retain the
+acquisition's supplied wall clock plus a suspend-inclusive authority deadline;
+request clocks and deadlines are inherited without renewal. Model watchdogs and graph workers
+therefore do not renew work leases or borrow the invocation owner's CPU grant.
+Explicit publication renewal and periodic renewal serialize through the same
+lease-local lane. Contenders lend their own capacity while waiting; checks do
+not take that lane. A takeover, source cancellation or original deadline remains
+terminal and cannot authorize publication with a new lease or a renewed request
+budget.
+
+Object-backed renewal forwards the operation's execution context through the
+existing physical provider boundaries, including filesystem, S3 and GCS client
+adapters. Native filesystem renewal uses the supplied Io, the existing namespace
+file lock, the exact owner/token check, atomic HEAD replacement and directory
+sync. It lends physical file waits while JSON, allocation and fencing remain
+runnable. The namespace file lock serializes native renewal with legacy writers;
+no process-local metadata cache mutex is held across its I/O.
+
+This required an explicit protected-control child capability, rather than
+promoting ordinary children after publication. Runnable ABI 22 adds the checked
+control-child reservation flag; legacy prefixes and malformed flags fail before
+worker IO is borrowed. The original root remains alive through every child join.
+Control children and cleanup together cannot consume the last control registry
+slot or more than half of control retained-byte capacity. Both opaque owner and
+native-borrow forwarding preserve that reservation and its original lifetime.
+The SQL completion adapter also enforces its existing one-slot coordinator rule
+before reserving completion children; ordinary producer team reservations keep
+their existing path. Public publication routes report exhausted scheduler/control
+capacity as HTTP 503 with a one-second retry hint.
+
+The production fixture covers native and object-backed filesystem stores,
+ordinary/bootstrap leases, absolute/relative native roots, success, cancellation,
+original deadline and durable takeover. It executes real reads, conditional metadata updates, fsync and rename,
+with a deterministic barrier at a sync boundary to hold physical I/O. While that
+barrier is held, query and health work make progress and repeated lease checks
+perform no new provider I/O. Publication revalidates the exact token; every case
+joins renewal and retires its root/retained bytes. This is real local-provider
+integration with injected waiting, not cloud or slow-disk performance evidence.
+
+Evidence: `lease-renewal-v11-final.json` records affected serverless publication,
+scheduler cleanup, control-owner/borrow/ABI, SQL completion, real worker-pipe and
+worker semantic checks. `lease-renewal-v12-clock.json` adds the supplied-clock
+fixture, shifted one day behind the host clock, across all sixteen provider/
+lease/outcome combinations; all production source hashes match the broader run.
+The only subsequent Zig change is the clock fixture itself. Both runs pass with
+unchanged inputs. `lease-renewal-final.json` binds tested bytes to committed
+snapshots. Staged licensing and the Apache product boundary checks pass.
+
+Manifest read-pin renewal and external lake snapshot heartbeats remain separate
+open lease paths. Initial lease acquisition/release and remaining maintenance
+mutation/retention/immutable-artifact provider boundaries still need their full
+scheduling audit. Vendor framework/registry download preparation, serial graph
+preparation and original cross-engine recovery gates (including file-engine
+FD recovery) remain open. Full GNU/full qualification remains waived.
+
+
+### Maintenance manifest source pins (2026-10-29)
+
+Enrichment and graph publication now hold joined source-pin scopes. Their
+model/watchdog/parallel checks only inspect cached authority and sticky failures;
+they never renew a pin or mutate the owner's CPU grant. A work-lease renewal
+worker accepts bounded, intrusive source registrations, so nested graph scopes
+share its protected control child. A scope without a parent renewal worker owns
+one and propagates it to its children. Detachment removes a registration before
+joining its in-flight callback; the callback completes its event publication
+under the registry lock before the scope can retire.
+
+Renewal checks both existing Unix and suspend-inclusive source deadlines before
+and after provider I/O. The retirement floor still brackets durable monotonic pin
+publication. A retired version may use its existing rights, but cannot renew
+those rights; one source's refusal does not poison independent registered readers.
+Native filesystem pin reads/CAS use supplied Io, bounded numeric reads, namespace
+file locking, atomic replacement and file/directory sync. Object-backed pin
+reads/CAS use the existing physical provider adapters and conditional ETags.
+Formatting, allocation and parsing remain runnable. Ordinary native CAS callers
+reserve return CPU while retaining the namespace lock; renewal children use
+their already protected control return lane.
+
+The model-invocation integration exposed a scheduler dependency: protected
+control children must not prevent the parent's ordinary CPU team from resizing.
+Per-parent control-child accounting permits that resize while ordinary children
+still require a join. Original lifetime, byte ownership and parent retirement
+checks remain in force. Synchronous unadmitted callers whose Io cannot create
+concurrent tasks use a joined local timer executor; original source cancellation
+and physical provider Io remain authoritative. Admitted callers never take that
+fallback.
+
+Focused verification uses real native and object-backed filesystem providers
+with deterministic sync barriers. It covers passive checks, unrelated query and
+health progress, cancellation, expiry during I/O, physical callback detachment,
+eight nested source scopes, retirement and independent-reader failure isolation.
+Normal builder, compactor and enrichment callers are exercised separately,
+including native and opaque model teams and durable WAL checks. This is local
+provider integration, not live-cloud or slow-disk performance qualification.
+
+The broader read-protection milestone remains open: external lake snapshot
+heartbeats still need shared admitted renewal and joined cleanup. Query/catalog
+read-pin acquisition paths, initial work-lease acquisition/release, remaining
+maintenance provider boundaries and the previously documented cross-engine
+recovery gates still need their remaining audits. Full GNU/full qualification
+remains waived.
+
+Evidence: `read-pin-renewal-v7-final.json` records the six passing production,
+serverless execution, native/opaque owner, SQL team and cleanup targets, with
+unchanged source inputs. `read-pin-renewal-v9-unadmitted.json` separately verifies
+unadmitted callers through native and object-backed pin acquisition. All
+production source hashes match the broad run; only this regression case
+was added afterward. `read-pin-renewal-final.json` binds
+these source bytes to the committed snapshots. Licensing and Apache boundary
+checks pass. No full qualification or live-cloud claim is made.
+
+
+### Lake snapshot heartbeat authority and provider boundaries (2026-10-29, in progress)
+
+Snapshot-pin acquisition, renewal and retirement now use the existing physical
+provider adapters. Allocation, numeric parsing and CAS formatting stay outside
+physical object waits. The configured snapshot resolver forwards the original
+read context into artifact-store opening, so an expired or refused source fails
+before credential/provider initialization.
+
+Owner checks are passive: they inspect the original request/root lifetime,
+sticky provider refusal, and cached Unix/suspend-inclusive source deadlines.
+Background renewal does not invoke foreground checkpoint or wait hooks. Each
+provider attempt is bounded by the minimum of its ten-second ceiling and the
+original read deadline. Renewal checks old source rights through every physical
+wait and before publishing its new local bounds, so a delayed response cannot
+revive an expired reader. Precise cancellation, deadline and retirement errors
+survive the heartbeat instead of becoming a generic lease-expired flag. Other
+provider failures retain the existing unavailable-reader contract.
+
+This exposed an existing coupling in ServingSource.protectContext: snapshot
+protection replaced the caller's additional checkpoint. A separate passive
+read-lease hook now preserves both lease protection and the current owner's
+policy checkpoint across execution rebinding. Lifetime polling runs the lease
+hook; runnable owner checkpoints continue to validate policy.
+
+The real periodic worker is tested against a filesystem object provider with
+an injected uncancelable sync barrier. Coverage includes initial acquisition
+lending its original query CPU, passive checks during renewal, cancellation,
+original expiry, source-authority expiry, retirement and destruction physically
+joining the blocked callback. The configured S3 resolver's refusal tests stop
+before credential/provider opening; they do not claim a live S3 operation. SQL
+retained-cut, catalog/WAL/pin admission and maintenance source-pin tests exercise
+the normal surrounding callers.
+
+The lake heartbeat milestone is NOT complete. Periodic heartbeat tasks still
+need shared, admitted execution. The next production path is a bounded renewal
+service shared across snapshot readers, with per-reader original lifetime checks,
+physical callback detachment/join and server shutdown. Its operation/byte limits
+must preserve health progress; a control child per snapshot would exhaust the
+small protected reserve for ordinary multi-table reads. The current tests prove
+source correctness and initial-provider waiting, not admitted periodic CPU or
+live-cloud throughput. The remaining full-design and cross-engine recovery gates
+listed above remain open; full qualification remains waived.
+
+Evidence: lake-heartbeat-v7-final.json records the focused lake admission,
+maintenance source-pin renewal, provider-opening, real text-retirement, SQL scan
+startup and physical read-resource targets. lake-heartbeat-final.json binds their
+tested source hashes to the committed bytes.
+
+
+### Shared admitted lake snapshot heartbeats (2026-10-29)
+
+The snapshot-heartbeat admission path above is now integrated. Configured SQL,
+search, readiness, catalog/maintenance and native-index source opening share a
+lazy server-owned renewal service. The host lookup is deferred until a managed
+snapshot actually needs a pin. It does not allocate a worker for unrelated
+queries or for a source without managed snapshot protection.
+
+One control execution is reserved before task publication and remains parked
+between renewal sweeps and during physical provider waits. A fixed registry
+holds at most 64 borrowed source links; its worst-case link metadata is included
+in the service reservation. Every callback retains that reader's original root,
+request deadline, source refusal and cached Unix/suspend-inclusive lease bounds.
+The server's control execution supplies CPU, never fresh query/read authority.
+Admitted owners without a configured service fail explicitly; the existing
+unadmitted/disabled path remains explicit.
+
+Protected services, lease children and cleanup jointly leave the final control
+registry slot and at least half of control retained-byte capacity available.
+Services cannot reclassify into ordinary work. Scheduler metrics expose service
+count and retained bytes. New registration waits poll original authority while
+lending caller CPU; expiry can abandon an unregistered candidate. Reader
+retirement removes its link before joining the one in-flight callback, lends
+CPU during that join and stops/joins the worker when the registry becomes empty.
+Event completion is published under the registry mutex before a detached owner
+can be freed. Server shutdown closes admission before provider opening, joins
+the worker, then retires its executor before scheduler/Io teardown. Readiness and
+catalog routes now bind their original native/opaque execution for these waits.
+
+A service CPU denial fences its registered readers. A later registration can
+join the terminal worker and reserve a new execution, but the service epoch
+prevents old readers from reacquiring rights. A single reader's cancellation,
+expiry, transport failure or retirement remains local to that reader.
+
+Real local-provider fixtures cover 64 pins across eight retained query owners,
+quota overflow, one-reader refusal with another reader still renewing, service
+recovery without reviving old readers, initial pin acquisition and periodic
+provider I/O. Fourteen native/opaque periodic cases cover success, cancellation,
+original deadline, source expiry, transport failure, reader cleanup and server
+shutdown. An uncancelable sync barrier proves physical callback joins; a queued
+registration behind that join must expire at its original deadline. Unrelated
+query and health grants succeed while the retiring reader lends its CPU. The
+configured resolver rejects shutdown before artifact credentials/providers open.
+These are real filesystem-provider operations with injected waiting, not live
+cloud or disk-latency benchmark evidence.
+
+Evidence: `lake-service-v10-final.json` passes all ten affected targets: SQL lake
+admission, maintenance source-pin renewal, lake-store opening, text retirement,
+SQL scan startup, read resources, native/opaque owner ports, SQL write teams and
+cleanup budgets. It records 112/112 successful steps and 200/200 tests in that
+run, with unchanged source inputs. `lake-service-final.json` binds the tested
+source bytes to the committed snapshots. Licensing and Apache boundaries pass.
+
+The full design remains open. Native published-index reader-lease heartbeats
+(`lake_index_reader_lease.Pool`) still need admitted renewal; they are distinct
+from the external snapshot pins completed here. The previously recorded initial
+work-lease/provider boundaries, preparation and cross-engine recovery gates
+(including file-engine FD recovery) remain open. Full qualification is waived.
+
+### Shared admitted native published-index reader sessions (2026-10-29)
+
+Published-index reader sessions now use the server's bounded lake renewal
+service alongside external snapshot pins. SQL, text search, readiness,
+navigation warming, published navigation and maintenance obtain their pool
+through the configured server capability. Admitted readers cannot silently
+start an independent unadmitted heartbeat. Explicit unadmitted callers retain
+the compatibility path. Session reuse amortizes durable metadata admission;
+individual handles retain their original query execution, cancellation and
+deadline independently of the shared durable session.
+
+Renewal registers one callback per live native session, with the same combined
+64-link bound, protected control execution and health capacity accounting as
+snapshot renewal. The callback supplies its own control execution to metadata
+reads and mutations, with an attempt bounded by five seconds and the cached
+lease's remaining authority. Remote metadata reads, mutation leader discovery
+and mutation delivery forward that execution to physical HTTP waits; encoding,
+signing and response parsing retain CPU. Read retry pauses also lend CPU.
+Local metadata applied waits receive the original bounded request. Existing
+metadata critical sections retain their conservative execution policy.
+
+A delayed response cannot publish a new local deadline after the old rights
+expire. Ambiguous mutations terminate renewal without replay. One refused or
+expired reader does not stop the shared service or revive when another session
+registers. The last reader detaches and joins its callback while lending caller
+CPU, then stops the service if no other native or snapshot reader remains.
+Idle cached rights can be reused while valid. A retiring-owner counter prevents
+cache replacement from freeing an owner before its last physical close returns.
+
+Four loopback HTTP cases use the production metadata client and transport with
+a local lifecycle authority: session coalescing and reuse, per-handle deadline
+and cancellation isolation, delayed expiry with unrelated query and health
+progress, ambiguous outcome without replay, and last-close physical joining.
+The listener fixture applies lifecycle mutations but does not run Raft or
+validate internal authentication grants. A separate deterministic production
+callback check verifies execution propagation through RemoteMetadataSource's
+read, topology discovery and mutation delivery. These are distinct forms of
+evidence; neither claims live cloud qualification.
+
+The full design remains open. Initial work-lease acquisition/release,
+maintenance provider and metadata holder boundaries, remaining preparation
+paths and cross-engine recovery gates (including file-engine FD recovery)
+remain outstanding. Full qualification remains waived.
+
+Evidence: `index-reader-renewal-v11-final.json` records eight successful focused
+targets, 104/104 successful build steps and unchanged inputs. The executed
+production RPC artifact passes all four included tests; its named execution
+propagation probe is also recorded in `index-reader-renewal-rpc-direct.log`.
+The affected lake admission, source-pin renewal, opening, text retirement,
+SQL startup and metadata provider checks pass. `index-reader-renewal-final.json`
+binds every committed source file to the tested inputs and exact snapshots.
+License headers and the Apache product boundary pass.
+
+### Contextual work-lease acquisition and release (2026-10-29)
+
+Work-lease providers now carry execution and original lifetime authority through
+acquisition, validation and release, including bootstrap leases. Contextual
+attempts have a five-second ceiling clamped to the original deadline. An
+admitted provider lacking the required callback fails explicitly rather than
+running its legacy callback outside scheduling. Explicit unadmitted callers
+retain the legacy entry points; disabled scheduling explicitly carries no
+execution capability. Retired execution handles continue to fail closed.
+
+The background publisher, managed compaction/enrichment, catalog builds,
+builder/compactor entry points and retention barrier now bind the caller's
+maintenance token and any existing provider context before acquiring a lease.
+Their held lease retains that borrowed context through renewal shutdown and
+conditional release. Cancellation stops and joins renewal before attempting
+release; denied release does not create fresh authority or unadmitted work.
+Any retained durable lease remains bounded by its existing TTL and exact token.
+An uncertain acquisition likewise grants no usable publication capability.
+
+Native filesystem access shares one contextual lease transaction for acquire,
+validate, renew and release. Encoding/parsing retain CPU; physical operations
+use the existing protected publication-return guard while holding a namespace
+lock. Renewal children reuse their protected control return capacity. Kernel
+lock acquisition polls the actual lock with bounded, cancellation-aware CPU
+loans instead of entering an uninterruptible blocking flock. Conditional HEAD
+replacement preserves monotonically increasing tokens, file synchronization,
+atomic rename and directory synchronization. Object-backed progress and direct
+object lease stores forward the same context through the physical provider
+adapter without modifying shared client state.
+
+Real native and filesystem object-provider fixtures stall file synchronization
+for normal/bootstrap acquisition and release. They verify CPU loans, unrelated
+query/health progress, joining after cancellation, exact-token validation and
+replacement-owner protection. A contested native kernel lock proves completion
+before the external owner unlocks, for cancellation, original deadline and the
+default five-second attempt bound. The real catalog publication path checks
+acquisition/release CPU loans with protected return capacity; managed runtime,
+compaction, enrichment, retention resumption and public sync levels remain
+covered by the focused target. Memory-backed retention cancellation now follows
+an actual deletion rather than a checkpoint count. The manifest-pin fixture
+registers its near-expiry reader after setup with its provider barrier armed,
+and the model-quota fixture tests fair progress within its existing deadline
+instead of assuming a sampled free CPU stays reserved for its probe.
+
+The full design remains open. Remaining maintenance progress/listing/retention
+and immutable-artifact provider boundaries, metadata holder integration,
+preparation paths and cross-engine recovery gates (including the unresolved
+file-engine FD recovery gate) remain. Full qualification remains waived; local
+filesystem and deterministic fixture evidence does not qualify live cloud or
+installed native CLI behavior.
+
+A maintenance token's provided execution stays authoritative after retirement;
+a provider context cannot replace it with another live execution. The regression
+case distinguishes explicit disabled scheduling from a closed admitted owner,
+including context inheritance from a live provider.
+
+Evidence: `work-lease-admission-v11-final.json` records 70/70 successful steps,
+24/24 tests in the combined lifecycle artifact, successful background execution
+and SQL lake admission targets, and unchanged inputs. The combined target uses
+the exact concatenation of the existing lease and read-pin filter sets, retaining
+both earlier entry points while avoiding duplicate compilation and execution.
+`work-lease-admission-final.json` binds committed bytes to the tested sources.
+License headers, formatting and the Apache product boundary pass. The earlier
+cache-file failure and observed removal of the entire worktree cache are
+recorded in `work-lease-cache-removal.json`; the final run reuses the rebuilt
+worktree-local cache.
+
+### Contextual production retention (2026-10-29)
+
+The production pruner now carries its original execution, deadline and
+cancellation through artifact cleanup, manifest discovery/deletion, GC progress
+and read-pin pruning, graph/facts reads and WAL truncation. Its borrowed store
+views and bridges remain alive for the entire pass; shared backend caches and
+mutexes are never copied into those views. Explicit unadmitted cancellation
+also reaches the contextual callbacks.
+
+Native progress and manifest providers loan CPU around physical directory,
+file, synchronization and lock-readiness operations. Parsing, ordering,
+manifest decoding and GC traversal retain admitted CPU. Conditional native
+mutations preserve the existing namespace locks and protected return capacity;
+object mutations preserve conditional ETags, including expired-pin deletion.
+Artifact enumeration and payload deletion use the same context without
+modifying shared object clients. Rejected directory/file opens retire their
+owned handle before returning the original refusal.
+
+Native WAL truncation scans and copies through bounded buffers, loans CPU at
+physical reads/writes, preserves namespace serialization, and synchronizes the
+replacement log and next-LSN sidecar. Removing the entire log still persists
+its next LSN first. Object truncation retains CPU while decoding/encoding and
+passes the original context to conditional provider GET/PUT/DELETE. A canceled
+physical call is joined before the pruning owner returns.
+
+A production-pruner fixture runs against both native stores and a real local
+filesystem object client. It blocks actual WAL synchronization after manifest
+and artifact cleanup, verifies unrelated query and protected health progress,
+cancels without detaching physical I/O, then resumes pruning with a new admitted
+owner. It checks the retained manifest and readable artifacts, WAL retention,
+monotonic LSNs and complete scheduler ownership retirement. The existing managed
+publication/compaction/pruning path and retention concurrency/cancellation cases
+remain covered; native WAL reopen, allocation-refusal, malformed-input and
+cross-instance append tests cover the changed streaming helpers. The read-pin
+fixture's independent GC-floor update now uses its active publisher execution,
+rather than its parked reader parent.
+
+This completes the contextual retention provider milestone, not the full
+design. Retained-closure metadata journals and other metadata-holder critical
+sections still conservatively retain CPU and need their own integrated owner
+boundaries. Remaining immutable-artifact and preparation paths, serial graph
+checkpoints, vendor/framework preparation and the unresolved file-engine FD
+recovery gate remain open. These deterministic physical-provider fixtures do
+not qualify live cloud or an installed native CLI. Full qualification remains
+waived.
+
+Evidence: `retention-provider-v8-final.json` records the final lifecycle,
+background-execution and SQL-lake admission checks with unchanged native inputs.
+The combined run passes 70/70 build steps and 47/47 lifecycle tests; local
+dependency tests also pass. `retention-admission-final.json` binds the committed
+files to those tested inputs and retained source snapshots. Formatting, license
+headers and the Apache product boundary pass.
+
+### Artifact uploads and retained-closure holders (2026-10-29)
+
+Native artifact uploads now implement the contextual provider callback. Hashing
+and content verification keep admitted CPU, with checkpoints between bounded
+chunks; physical opens, reads, writes, synchronization and kernel-lock readiness
+use the original operation's receiver and lifetime. Existing content and journal
+serialization uses protected CPU return while holding its locks. Rejected
+creates close their file before reporting the original refusal. Journal record
+parsing and backfill enumeration run after CPU reentry. Object-backed local
+inventories use this same registration path instead of parking the compound
+journal operation. Explicit legacy wait-only adapters remain separate.
+
+The durable-directory proof cache now locks only around cache state. Cache
+misses prove ancestor durability outside the mutex, then publish their owned
+path under a short lock; duplicate proofs are harmless. Provider waits therefore
+cannot retain this shared mutex. Failed proofs never populate the cache.
+
+Native and remote retained-closure queues have short CPU-only critical sections.
+Inheritance loads and validates prior certificates before appending under the
+queue mutex; it rechecks same-attempt descendants and capacity after reentry.
+Sealing detaches a batch and owns its arenas through all provider I/O, including
+cancellation and physical retirement. Concurrent inheritance can proceed without
+waiting for a stalled sealing provider. Native epoch invalidation, certificate
+framing and hashing, witness validation and conditional remote publication keep
+their previous proof semantics. Remote queues now serialize their shared state
+as native queues already did.
+
+The artifact API forwards explicit metadata and verification context, including
+through the derived-artifact recovery decorator. Synchronous native text and
+ordered reuse audits bind their own operation context; asynchronous readers
+continue to own their independent execution. Object verification lends CPU
+inside physical provider calls rather than around provider parsing and hashing.
+Native verification pins an open file through hashing and identity checks.
+
+Physical filesystem fixtures cover upload, verification and sealing with native
+stores and a filesystem object client through the public artifact API and
+recovery decorator. They check available directory/closure mutexes, unrelated
+query and health progress, joined cancellation/deadline refusal, and retry with
+a fresh owner. A reopened ordered certificate must avoid payload reads rather
+than satisfy a particular checkpoint count.
+
+The full design remains open. Cloud-generation map holders and remaining
+immutable-artifact/read preparation boundaries still need their complete
+production audit, along with serial graph checkpoints, vendor/framework and
+registry preparation, mapped-page-fault scope, and the unresolved file-engine
+FD recovery gate. Live-cloud and installed-native behavior are not qualified by
+these deterministic local fixtures. Full qualification remains waived.
+
+Evidence: `artifact-holder-v5.json` records 80/80 successful steps, 52/52
+lifecycle tests, 69/69 artifact integrity/reuse tests, passing background and
+SQL-lake admission checks, and unchanged native inputs. The physical gate case
+covers 18 native/object operation and success/cancellation/deadline combinations.
+`artifact-holder-directory-direct.json` runs the directory-cache source as its
+actual test root and records 1/1 passing tests. The earlier top-level filtered
+object-store build selected zero tests and is excluded from verification
+evidence. The canceled retry fixture creates a fresh bridge as well as a fresh
+execution; it never clears refusal on the old owner's capability. Formatting,
+license headers and the Apache product boundary pass.
+
+`artifact-holder-admission-final.json` binds the committed files to both tested
+input manifests and retained source snapshots. The native upload/verification
+and retained-closure holder milestone is integrated; the remaining full-design
+work above is still open.
+
+### Generation-map ownership and qualified artifact reads (2026-10-29)
+
+Generation-map readers and writers now take an operation-local execution and
+lifetime context through lookup, capture, flush, finish, vacuum and provider
+proofs. Cold map-page GETs and readiness waits lend the caller's CPU; validation,
+hashing, decoding, partitioning and encoding execute after reentry. Shared
+navigation retains data and flight identities only. Coalesced waiters use their
+own admission and refusal, so a canceled leader cannot lend its authority to a
+waiter or poison the waiter's independent lifetime. Warm lookup still checks
+the supplied execution and rejects a retired owner.
+
+A writer serializes flush/vacuum with a logical ownership flag guarded by short
+mutex sections. Contenders release the mutex and CPU before waiting; provider
+calls and joins retain no shared mutex. This permits independently admitted
+branch children without crossing the scheduler's prohibition on children of a
+protected publication owner. At most eight child descriptors are considered;
+the existing retained-work envelope funds actual fanout. Unfunded branches run
+on the admitted parent after funded children drain. Each child owns execution
+and provider outputs through physical join before parent CPU reentry and root
+installation. Failure after detaching a batch disables completeness; no partial
+root or vacuum cursor escapes a refused operation.
+
+Artifact range and bounded reads have explicit contextual callbacks for native
+files and object providers. Generation lookup completes on admitted CPU before
+the payload provider runs. Native callbacks pin and close their file, bound
+allocation by the expected size, and lend CPU only at physical operations.
+Object callbacks preserve exact generation selectors and original refusal.
+Payload hashing remains on CPU. Opaque legacy callbacks retain native CPU;
+explicit legacy wait-only adapters keep their separate contract. The recovery
+decorator forwards these capabilities and preserves artifact failure provenance.
+Attaching a local execution supplies that owner's existing I/O receiver when
+none was explicit; it never creates a replacement admitted I/O owner.
+
+Normal publication, recent-vector maps, source selection, native runtime cache
+opening, navigation warming, lazy published readers, GC traversal and cloud
+certificate binding pass their own context. The map and navigation owners never
+store request execution capabilities. Caller and writer cancellation compose
+rather than replacing one another. The existing pinned-generation, immutable
+map, retention-certificate and vacuum formats remain unchanged.
+
+Gated version-provider fixtures exercise the public artifact-read/upload path,
+coalescing under independent lifetimes, original cancellation/deadline refusal,
+default-envelope child fanout, query and health progress, joined failure and
+preservation of the old map. These are deterministic readiness/provider
+fixtures, not live-cloud qualification. The wrapped real-Parquet publication,
+pinned-version restart, GC/vacuum and navigation-cache regressions remain part
+of focused verification. Full qualification remains waived.
+
+`cloud-generation-admission-v9.json` records 90/90 successful build steps and
+62/62 execution-lifecycle tests, together with 69/69 artifact-read tests and
+12/12 cloud integration cases. The background and SQL admission targets also
+pass. Formatting, license headers and the Apache product boundary pass.
+The coalescing fixture retains each execution through physical join while
+parking completed workers so they cannot pin a peer's CPU return.
+`cloud-generation-admission-final.json` binds the committed source snapshots
+to the successful run's input hashes. This production milestone is integrated.
+
+The full design remains open. Remaining native metadata/read preparation
+boundaries (including filesystem manifest publication and WAL reads), serial
+graph checkpoints, framework/vendor and registry preparation, mapped-page-fault
+scope and the unresolved file-engine FD recovery gate still require their
+complete production milestones and evidence. This milestone does not qualify
+installed-native or live-cloud operation.
+
+### Native immutable manifests and WAL acceptance/recovery (2026-10-29)
+
+The native manifest backend implements contextual immutable publication through
+`ManifestStore.put`. Encoding and immutable-byte comparison retain CPU; path
+proofs, file locking, writes, synchronization and rename use the original I/O
+receiver and execution. Publication retains the existing fencing-token temporary
+names, exclusive temporary creation and non-overwriting final rename. A matching
+retry synchronizes its publication directory; differing immutable bytes fail.
+Shared mutation ownership is released before ordinary CPU reentry.
+
+Native WAL append, idempotent and conditional append, replay and latest-LSN
+recovery now use operation-local contexts through the public `WalStore` facade.
+The execution-only append API attaches its existing local I/O receiver. Admitted
+operations never manufacture a replacement receiver; explicit legacy operations
+own one fallback receiver for the operation rather than reopening one per helper.
+The namespace lock and shared store mutex retain protected CPU return through
+mutation, and callers release those locks before normal checked reentry.
+
+Append writes and synchronizes the complete replacement log, renames it, and
+synchronizes the parent before installing a synchronized `NEXT_LSN` receipt.
+Idempotent recovery streams the existing operation identity and payload before
+returning its original LSN. Conditional misses preserve the original latest-LSN
+fence. Latest-LSN reads check the receipt against the log length and repair stale
+or absent receipts by streaming fixed headers. The namespace directory proof cache
+has 64 entries and retires with the store. Scanner and copy scratch remain fixed
+at 8 KiB and 32 KiB, independent of existing log size.
+
+Replay owns its file descriptor and pinned length through all reads, so a
+concurrent atomic replacement cannot change the replay cut. Allocations and
+record parsing run on CPU; positional reads lend CPU in bounded chunks. Rejected
+reads retire every partially built record. File descriptors close on all paths,
+and temporary cleanup blocks task cancellation while removing owned files.
+
+The normal builder's existing context reaches these backend callbacks. Prediction
+also binds its operation-local manifest, WAL and progress copies before metadata
+preparation, then carries source-pin authority through WAL replay and facts-page
+reads. Shared backend handles never retain the prediction caller's context.
+
+Focused evidence includes a normal native catalog build/status path under an
+admitted execution and real filesystem gates for manifest publication, ordinary,
+idempotent and conditional append, replay, latest-LSN reads and receipt recovery.
+The 32 gated operation/mode combinations exercise independent query/health
+progress, cooperative cancellation, actual task cancellation and deadlines,
+physical joining, temporary cleanup, old-file replay after replacement, immutable
+retry/conflict and conditional/idempotent WAL semantics. A gate after durable log
+replacement but before its receipt verifies that refused acknowledgement preserves
+the committed record and a fresh idempotent retry returns its original LSN. These
+are local filesystem integration checks, not power-loss or installed-CLI tests.
+
+`native-publication-recovery-v7.json` records 70/70 successful build steps and
+70/70 execution-lifecycle tests, including all 32 gated operation/mode
+combinations and the admitted native catalog's pending-tail prediction and
+incremental build. SQL admission and background targets pass. Formatting,
+license headers and the Apache product boundary pass.
+`native-publication-recovery-final.json` binds committed source snapshots to
+the successful run's exact input hashes. This native publication/recovery
+milestone is integrated.
+
+The full goal remains open. Serial graph checkpoint preparation, framework/vendor
+and registry preparation, mapped-page-fault scope, and the unresolved file-engine
+FD recovery gate still require completed production milestones. Full GNU
+qualification remains waived; installed-native and live-cloud qualification are
+not claimed here.
+
+### File-engine artifact descriptor recovery (2026-10-29)
+
+Native writable artifact sources now share physical data descriptors by Store
+generation and one locked marker inode per registry. Every logical source keeps
+its own header, checkpoint, cache, lease alias and original 32-hex marker name;
+marker names are hard links to the registry's locked inode. Existing and external
+orphan sweepers still cannot claim a live alias. Bounded marker sweeping also
+removes unlocked registry anchors after crashes. The .aflite wire format and
+logical source-cache admission/eviction policy are unchanged.
+
+Each NativeFile view retains a shared read-handle reference. Generation retirement
+or Store detach releases the registry's cached reference; active artifact views
+retain their old inode through their physical close. Store-owned I/O and resource
+accounting outlive the final view. Fenced external/read-only readers retain their
+independent lock semantics. Shared handles are accepted only by internal read-only
+views, with invalid opens refused before writer admission or allocation.
+
+`generation-handle-pool-v2-regressions.json` records 117/117 successful build steps,
+36/36 retained-cursor tests and 46/46 Lite artifact/reclamation/vacuum tests with
+no skips or leaks, including 64 simultaneous logical sources sharing two physical
+handles, live orphan-sweep protection, generation isolation and cold reads after
+owner shutdown. The updated CLI was built from the same tested native sources.
+The unchanged qualification harness passes 37 tests; its manifest equality proof
+is retained in `generation-handle-pool-harness.json`.
+
+The original macOS file-engine overload/restart manifest passes twice on that
+same CLI binary: `generation-handle-pool-native-file-v1.json` and `-v2.json` each
+complete 1,840 offered operations. Both recover from 23 baseline descriptors to
+23 after client retirement, against the unchanged allowance of eight and recovery
+interval of three seconds. Both server incarnations exit successfully and both
+HTTP and pgwire restore the same 4,096-byte postimage and exact integer
+9007199254740993 after joined shutdown/reopen. Historical failed receipts, which
+recovered from 25 to 63 descriptors, remain unchanged. The file-engine descriptor
+recovery gate is closed for this profile; this is not a wider performance or
+process-resource envelope claim.
+
+`generation-handle-pool-final.json` binds the committed source snapshots, focused
+build, CLI hash, unchanged manifest and both successful native receipts. The
+production descriptor-sharing milestone is integrated. The full goal remains
+open: serial graph checkpoint preparation, framework/vendor and registry
+preparation, mapped-page-fault scope and wider cross-engine/deployment evidence
+still require their complete production milestones. Full GNU qualification
+remains waived.
+
+
+### Graph and model directory preparation frontier
+
+Graph preparation is integrated in `2eed95bd00`: topology/CSR construction,
+projection, sorting and metric encoding checkpoint their existing owner. The
+focused graph root passes 80 serverless cases and 32 embedded cases, including
+a queued query progressing through a 32,768-node / 131,072-edge public build,
+serial-identical output and refused preparation cleanup.
+
+Model manifest GGUF directory discovery now lends the same worker's CPU grant
+through physical directory operations, while owning all opened directories
+through cancellation, refused reentry and allocation failure. The normal listing
+path preserves nested decoder/projector identity and retries successfully.
+Real API-owner integration checks query/control progress, retained-byte and team
+ownership, and descriptor recovery at every physical refusal. The focused native
+manifest suite selects and passes 11 cases with no skips; production worker
+semantic checks pass. See `model-discovery-final.json` and the resource ownership
+ledger for the exact deterministic integration scope.
+
+The file-engine descriptor recovery gate remains closed for its unchanged macOS
+profile. The full goal remains open for framework/vendor construction, registry
+pull/download admission and preparation, mapped-page-fault scope, and wider
+cross-engine/deployment evidence. Full GNU qualification remains waived.
+
+
+### Embedded model pull admission and physical waits
+
+Public embedded model pulls now share the runtime's native runnable owner with
+executor and cold-load work. Admission happens on the caller before helper
+creation, preserving the original deadline and cancellation. The helper and HTTP
+request tasks borrow that same root. Explicit socket, streamed-write and progress
+controls lend CPU during physical/caller waits and use checked reentry; synchronous
+hash verification and lock acquisition also lend the original CPU. The resource
+manager funds retained capsules, which keep the runtime alive until final finish.
+Existing hidden staging, verified retry state and publication/rollback are retained.
+
+From `zig/`, run `zig build antfly-inference-pull-test
+antfly-inference-file-owner-test antfly-inference-worker-provider-check -Dcuda=true
+-Doptimize=Debug -j1` using the supported platform toolchain and local listener
+access. `model-pull-v9.json` records 72/72 build steps with unchanged inputs: four
+public C API and four owner cases pass without skips or leaks. The local Hub
+fixture verifies exact installed bytes and receipt, original queued/network
+deadlines, caller-thread cancellation without publication, fresh-call retry, and
+query/control progress during Hub waits. The checked-refusal test keeps resources
+until finish and refuses to revive the failed root.
+
+Run the separate `inference-test-inference-unit` target with test-filter prefixes
+`downloadFile`, `Hub snapshot`, `managed model transaction`, `pinned bundle re-pull`,
+`existing final file`, `managed pull limits`, `ONNX dependencies`, `safetensors
+index`, and `pull progress reports`. `model-pull-registry-v1.json` records 31/31
+selected regressions without skips. Production registry/host inputs match the
+final build; subsequent fixture corrections are recorded separately. The final
+receipt binds source snapshots and the verification receipts.
+
+This completes embedded pull admission and these physical wait paths. It does not
+qualify deployed model execution or throughput. Framework/vendor construction,
+broader registry preparation, mapped-page faults and wider cross-engine/deployment
+evidence remain in the full goal. The full GNU qualification waiver remains in
+effect. The installed CLI has not been rebuilt for this milestone.
+
+### Interruptible registry decoding
+
+The normal Hub metadata, bundle, shard-index and receipt decoders now borrow the
+existing execution owner through the shared SQL/runtime JSON scanner. Scanner
+refills and owned copies check every 4 KiB, tokens every 64 iterations, and ONNX
+scans every 64 protobuf fields. Hub resolution parses its metadata once. Receipt
+fallback preserves the exact original execution refusal without a second poll.
+Existing artifact identities, selection, hidden staging and publication semantics
+remain covered by the normal registry regressions.
+
+From `zig/`, run `zig build antfly-inference-file-owner-test
+antfly-sql-input-owner-test antfly-inference-worker-provider-check -Dcuda=true
+-Doptimize=Debug -j1`, plus `inference-test-inference-unit` with the prefixes in
+`registry-preparation-v4.json`. The unchanged-input receipt records 36/36 steps,
+five real-owner cases, 15 SQL scanner/input cases (cached from the successful v2
+run), 33 selected registry/download/receipt cases and the production provider
+semantic check. Large inputs let an already queued query progress and retain
+the original team; compact inputs refuse every observed checkpoint under
+cancellation, deadline and a one-shot lease fence without leaking retained work.
+The existing SQL cases verify shared-scanner compatibility and allocation faults.
+
+The repaired standalone registry target is `inference-registry-test`; its runtime
+and document imports now include the production checkpoint dependency.
+`registry-preparation-standalone-v1.json` records 115/115 tests and 5/5 steps
+passing with unchanged inputs. Final source snapshots and verification references are recorded in
+`registry-preparation-final.json` in the cumulative integration receipts.
+
+This completes these decoder checkpoint paths. Broader registry selection and
+preparation, framework/vendor construction, mapped-page-fault scope and wider
+cross-engine/deployment evidence remain open. This is local deterministic
+integration; it adds no deployed inference or throughput claim. Full GNU
+qualification remains waived and the installed CLI is unchanged.
+
+### Manifest/configuration decoder and fallback integration
+
+Normal full-load, listing/candidate, capability and private-plan entry points now
+use admitted decoding. BERT/GPT, DeBERTa, ModernBERT, GLiNER and EmbeddingGemma
+config readers and tokenizer marker projection share the same bounded scanner.
+Raw embedder marker probes also checkpoint in 4 KiB chunks with marker/escape
+seam parity preserved. The first synchronous checkpoint refusal remains attached
+to its scope; optional metadata catches and public entry points inspect it
+without polling or treating it as absent/malformed metadata.
+
+From `zig/`, run `zig build antfly-inference-manifest-owner-test
+antfly-inference-file-owner-test antfly-inference-worker-provider-check -Dcuda=true
+-Doptimize=Debug -j1`. Run `inference-test-inference-unit` with the exact scoped
+prefixes in `manifest-preparation-v3.json`; avoid the broad `gliner boundary`
+selector, which includes unrelated device/socket qualification. The final run
+records 35/35 steps, two real-owner tests spanning all five entry points and the
+five cached file/registry ownership tests. Large inputs permit queued-query and
+control progress; compact inputs refuse every observed checkpoint while retaining
+the original root/team/bytes until finish. Private plans use actual transaction
+setup and hold the pull lock. Empty optional metadata cannot hide a retained
+refusal, and a retired scope permits a fresh call.
+
+The native selection passes 201 assertions with one unavailable optional sparse
+fixture skipped. It covers configuration compatibility, marker scan parity,
+bounded tokenizer projection, allocation failures and malformed-config fallback.
+`manifest-preparation-final.json` binds source snapshots, tested artifacts and
+verification. The broad first-run failure is preserved: an isolated direct-call
+cancellation-metrics assertion disagrees with the unchanged early precheck path.
+Its attribution is from source inspection, without a baseline rebuild; it remains
+open for the full design audit.
+
+The milestone covers these preparation paths, not deployed inference or throughput.
+Other materialization/preparation, framework/vendor construction, mapped-page
+faults and wider cross-engine/deployment evidence remain in the full goal. The
+full GNU qualification waiver is unchanged; the installed CLI was not rebuilt.
+
+### Direct extraction refusal accounting and current completion audit
+
+The previously isolated direct-cancellation metric failure is resolved by
+`design-audit-metrics-v1.json` in the cumulative integration receipts. Public
+controlled extraction counts an early refusal before JSON parsing or model
+lookup. V2 classification comes from the public entry point or typed version;
+rejected raw JSON is not parsed to recover a label. Cancellation and deadline
+outcomes retain the original error and control-check start time. Fixed scalar
+metrics require no request allocation or admission lease, and active gauges
+return to zero. Normal successful dispatch retains its existing accounting.
+
+The exact original direct-cancel/HTTP-capacity case, denied-allocation typed/raw
+entry points, metric rendering and extraction trace contracts all pass: seven
+selected, no skips, 27/27 build steps, unchanged inputs. The old failure and its
+source audit remain preserved as historical evidence. This closes that specific
+observability issue; it does not rebuild the installed CLI or qualify deployed
+models, all backends or throughput.
+
+The existing [full-goal completion checklist](../../WORKLOAD_POOLING_IMPLEMENTATION.md#completion-audit-against-the-full-delivery-goal)
+now distinguishes implemented scheduler/remote-ledger primitives from missing
+production integration and stale evidence. Normal SQL bounded-read eligibility
+and guarded DB mutation CPU-lending integration remain concrete unfinished
+capabilities. Full GNU qualification remains waived; the full goal stays open.
+
+### Prepared scalar SQL through shared bounded capacity
+
+`sql_read_lane.zig` now qualifies a source-free scalar program from compiler IR
+rather than a client hint. The proof bounds columns/parameters (16), visited
+expression nodes (128), depth (16) and primitive input/text footprints. It rejects
+providers, scans, functions, sets, aggregates, pattern/array payloads and expansive
+operations. Preparation and original authority checks remain ordinary. Unsupported
+host capabilities, explicit legacy admission and retained input too large for the
+bounded metadata partition keep the existing execution path.
+
+A qualified stage transfers the original parked root, preserving operation/input
+charges, clock and cancellation. Its 512 KiB private heap reserves a physical
+transition before publication, and its independent node worker executes the
+existing SQL runtime. The result heap retains no worker/request stack pointers.
+Original context and root lifetime checks apply inside the stage; provider and
+mutation callbacks fail closed. The worker physically joins before general
+transfer can wait. Result addresses/charges survive that transfer; output uses
+ordinary authority again. Stage-only cleanup authority and resource callbacks
+retire without changing a caller's preexisting cleanup reservation. A refused
+worker publication or query error fences foreground use while charges remain
+until the owning finish; no query is automatically replayed.
+
+Focused verification is complete for this first family. The v13 receipt records
+seven passing scalar cases, including refusal at all four observed private
+checkpoints for both cancellation and deadline, context-only cancellation while
+general capacity stays full, private-worker/control progress during transfer,
+legacy-host compatibility, maximum proof envelopes and normal HTTP/pgwire results.
+The overflow envelope preserves the same error as ordinary execution. The v12
+mixed-protocol regression passed both storage/control cases and all 180 array
+contracts; production definitions are unchanged by the later fixture repairs.
+The v16 compiled API suite passes all 13 cases through the opaque production
+bridge, including authenticated TCP calls with actual bounded grants, portals,
+queued cancellation at connection capacity, timeout and session reuse. These
+selected suites have no skips or leaks and unchanged inputs during their runs.
+
+The compiled fixtures now use the current connector, canonical scheduler byte
+budget and separate service/control worker accounting. Live-snapshot fixtures
+use real 256-row native pages and 1 KiB projected cells to reach the ordinary
+output boundary before EOF. Their finite request-memory budget is 64 MiB: the
+old 16 MiB setting left 1.75 MiB of general-read capacity and correctly refused
+the wider workload. The passing cases retain 3,607,930 and 3,625,954 read bytes
+within 7 MiB, with zero read-memory refusals, and preserve exactly two live
+captures through queued refusal. Snapshot, row-value and cleanup assertions
+remain intact. Earlier failed receipts remain failed evidence; v14 is a failed
+diagnostic compilation and v15 records the measured memory refusal.
+
+This qualifies one bounded operator family when its complete resource envelope
+is available. Ordinary backend scans, vendor work, sessions and other operators
+retain their existing paths and remain in the full-design inventory. It adds no
+all-engine throughput, deployed workload or installed CLI rebuild claim. Full
+GNU qualification remains waived and the full design remains open.
+
+### Prepared numeric column chunks
+
+Normal API coordinator scopes now offer a prepared numeric stage to the existing
+columnar evaluator. Qualification uses the bound primitive program: at most 64
+instructions and 64 copied rows, with at most 65 steps and 128 primitive cell
+visits per step. These are finite work bounds, not hardware preemption or a
+wall-clock latency guarantee. Providers, coercion and backend reads run outside
+the private worker.
+
+The same query root moves to the node's shared bounded worker for a fixed numeric
+clone. Its heap and transition reservation equal the clone's fixed size plus its
+allocation header. The original snapshot, page and encoded output retain their
+general owners. Worker join precedes checked restoration of the original general
+or analytical lane and read-policy validation. No backend or mutable program
+pointer is published to private arithmetic. Cancellation, deadline and resource
+refusal fence foreground use while original charges remain until owning finish.
+Row-evaluation errors instead restore ordinary authority for the existing pure
+page fallback, preserving valid rows and their terminal error without recapturing
+storage or replaying a query.
+
+Preparation uses the existing original-CPU scratch admission. Physical column
+selection and primitive coercion can allocate, so their temporary arena retires
+before each private publication, including decline/error paths. Current node
+accounting supplies the nonblocking reservation callback; older accounting
+prefixes deliberately retain ordinary evaluation. Columnar output stays encoded.
+Sessions, strings, exact NUMERIC, row-oriented digest reads and unsupported hosts
+keep their established paths.
+
+`antfly-sql-bounded-production-test` compiles scalar, numeric, normal HTTP and
+legacy-scratch ownership checks together using one API root. The separate
+compiled API suite checks actual TCP execution. `bounded-numeric-production-v6.json` records a successful unchanged-input run:
+13 normal API cases, one local companion, 13 compiled TCP cases and 125 numeric
+regressions, with all 100 build steps successful. The selected API suites report
+zero skips/leaks; the default numeric runner reports 125/125 tests passing.
+Cancellation and deadline are refused at all five observed numeric worker
+checkpoints. Normal HTTP checks exact wide-integer output, actual bounded grants
+and zero ordinary/read memory at teardown. TCP checks five chunks over 302 native
+rows, exact portal continuation and bounded arithmetic followed by the first
+valid row and SQLSTATE 22012 without another storage capture. Legacy accounting
+without nonblocking reservation retains ordinary evaluation; the current-node
+fixture now supplies that capability. Per-chunk preparation arenas fix the
+ordinary-memory leak exposed by enabling it. Earlier failed and diagnostic
+receipts remain failed evidence. Full GNU qualification remains waived;
+this work adds no installed CLI, deployed workload or all-engine throughput claim.

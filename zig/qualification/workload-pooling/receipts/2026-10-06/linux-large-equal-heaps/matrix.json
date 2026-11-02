@@ -1,0 +1,27 @@
+{
+  "passed": false,
+  "failures": [
+    "linux-large: origin-main"
+  ],
+  "profiles": [
+    {
+      "manifest": "zig/qualification/workload-pooling/linux-large.json",
+      "variant": "origin-main",
+      "receipt": "/receipts/linux-large-origin-main.json",
+      "exit_code": 1
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/linux-large.json",
+      "variant": "candidate-fixed",
+      "receipt": "/receipts/linux-large-candidate-fixed.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/linux-large.json",
+      "variant": "candidate-failfast",
+      "receipt": "/receipts/linux-large-candidate-failfast.json",
+      "exit_code": 0
+    }
+  ],
+  "automatic_defaults_qualified": false
+}

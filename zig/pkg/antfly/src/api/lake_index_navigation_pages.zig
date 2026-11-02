@@ -148,8 +148,17 @@ pub const Reader = struct {
         if (count != 0) {
             const reservation = @min(24 * 1024 * 1024, cold_bytes * 3 + count * 32 * 1024 + 256 * 1024);
             const scheduler = local.sql_parallel_scheduler.global();
-            if (scheduler.reservePull(0, reservation)) {
-                defer scheduler.releasePull(0, reservation);
+            var workspace_owner: ranges.Workspace = .{};
+            defer workspace_owner.deinit();
+            // Encoded output copies survive the inner range-worker joins. Their
+            // owner is separate from that loader's temporary physical buffers.
+            const scoped = self.cached.context.execution != null;
+            const admitted = if (scoped)
+                try workspace_owner.reserve(self.cached.context, cold_bytes + count * 32 * 1024 + 256 * 1024)
+            else
+                scheduler.reservePull(0, reservation);
+            if (admitted) {
+                defer if (!scoped) scheduler.releasePull(0, reservation);
                 var workspace: local.sql_memory_budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = reservation };
                 // Charge the wave once, including coalesced gaps. A declined
                 // optional copy must leave the required page path available.
@@ -250,4 +259,101 @@ test "external lake shared navigation leases reuse decoded pages and preserve au
     defer fallback.deinit(a);
     try std.testing.expect(fallback.lease == null);
     try std.testing.expectEqualStrings("one", fallback.entries[0].value);
+}
+
+test "external lake shared navigation scoped copies use node capacity and retire before output escapes" {
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const Execution = Runnable.Execution;
+    const Probe = struct {
+        store: stores.ArtifactStore,
+        owner: *Runnable.Scheduler,
+        parent: *Execution,
+        calls: std.atomic.Value(usize) = .init(0),
+        children: std.atomic.Value(usize) = .init(0),
+        fn before(self: *@This()) !void {
+            try std.testing.expect(self.owner.state(&self.parent.entry.?) != .running);
+            if (self.owner.stats().child_operations != 0) _ = self.children.fetchAdd(1, .monotonic);
+            var control: Execution = .{};
+            try control.start(self.owner, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            try control.checkpoint();
+            control.finish();
+            _ = self.calls.fetchAdd(1, .monotonic);
+        }
+        fn get(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Token) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.before();
+            return self.store.getRangeAllocWithCancellationUsingAllocator(alloc, id, offset, length, token);
+        }
+        fn bounded(raw: *anyopaque, alloc: A, id: []const u8, max: usize, token: Token) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.before();
+            const bytes = try self.store.getAllocWithCancellationUsingAllocator(alloc, id, token);
+            if (bytes.len > max) {
+                alloc.free(bytes);
+                return error.ArtifactTooLarge;
+            }
+            return bytes;
+        }
+    };
+    const Charge = struct {
+        fn charge(raw: *anyopaque, bytes: u64) !void {
+            try stores.chargeReadBudget(@ptrCast(@alignCast(raw)), bytes);
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("scoped-decoded-navigation");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var backend = fs.artifactStore();
+    const upload: stores.UploadScope = .{ .domain = @splat(19), .attempt = @splat(14) };
+    backend.upload_scope = upload;
+    var reads: u64 = 8 * 1024 * 1024;
+    var writes = reads;
+    var page_store: pages.PageStore = .{ .domain = upload.domain, .attempt = upload.attempt, .artifacts = &backend, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var roots: [2]tree.Ref = undefined;
+    for (&roots, [_][]const u8{ "first", "second" }) |*ref, text| {
+        var builder: tree.SortedBuilder = .{ .alloc = a, .store = page_store.store() };
+        defer builder.deinit();
+        try builder.add(text, text);
+        ref.* = (try builder.finish()).?;
+    }
+    // A scoped caller must not need the legacy process-global pull allowance.
+    const legacy = local.sql_parallel_scheduler.global();
+    const occupied = legacy.max_pull_bytes;
+    try std.testing.expect(legacy.reservePull(0, occupied));
+    defer legacy.releasePull(0, occupied);
+    for ([_]bool{ false, true }) |refused| {
+        var owner = try Runnable.Scheduler.init(.{ .slots = 2, .control_slots = 1, .max_operations = 16, .max_bytes = if (refused) 128 * 1024 else 4 * 1024 * 1024, .control_bytes = 64 * 1024 });
+        defer owner.close();
+        var execution: Execution = .{};
+        defer execution.finish();
+        try execution.start(&owner, .{ .io = std.testing.io, .retained_bytes = 17 }, .query);
+        var probe: Probe = .{ .store = backend, .owner = &owner, .parent = &execution };
+        var vtable = backend.vtable.*;
+        vtable.get_range_alloc_with_cancellation = Probe.get;
+        vtable.get_bounded_alloc_with_cancellation = Probe.bounded;
+        var observed = backend;
+        observed.ptr = &probe;
+        observed.vtable = &vtable;
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        var reader: Reader = .{ .store = observed, .domain = upload.domain, .token = .none, .cached = .{ .cache = &cache, .scope = @splat(22), .context = (local.serverless_query_lake_read_context.Context{ .io = std.testing.io }).withExecution(&execution) } };
+        const wanted = [_]tree.Ref{ roots[1], roots[0], roots[1] };
+        var output: [3]tree.Page = undefined;
+        const before = reads;
+        try reader.many(a, &wanted, &output, .{ .ptr = &reads, .charge = Charge.charge });
+        defer for (&output) |*owned| owned.deinit(a);
+        try std.testing.expectEqualSlices(u8, "second", output[0].entries[0].value);
+        try std.testing.expectEqualSlices(u8, "first", output[1].entries[0].value);
+        try std.testing.expect(output[0].entries.ptr == output[2].entries.ptr);
+        try std.testing.expectEqual(@as(usize, 2), probe.calls.load(.acquire));
+        try std.testing.expectEqual(!refused, probe.children.load(.acquire) != 0);
+        try std.testing.expectEqual(before - roots[0].bytes - 2 * roots[1].bytes, reads);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().child_operations);
+        try std.testing.expectEqual(@as(u64, 17), owner.stats().retained_bytes);
+        try std.testing.expectEqual(occupied, legacy.pull_bytes);
+        execution.finish();
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    }
 }

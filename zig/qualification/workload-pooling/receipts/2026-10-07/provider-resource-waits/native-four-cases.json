@@ -1,0 +1,7 @@
+{
+  "exit_code": 0,
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/functions/runtime.zig": "0c0feafe30b7bdc87f6a396d46782239614e094f48a977893934fe223c267f85",
+    "zig/pkg/antfly/src/api/sql_execution.zig": "9c5a8bce6bc00f8a82b70e4ba6a092d9972ca4012745f5055dc876c5c6043ea2"
+  }
+}

@@ -61,6 +61,9 @@ pub const Request = struct {
     /// Called before request bytes can reach the peer, never during setup.
     /// The callback must be nonblocking and must not reset earlier send proof.
     delivery_observer: ?DeliveryObserver = null,
+    /// Borrowed controls for HTTP/1 socket waits through synchronous client
+    /// execution. Never serialize these or attach them to an H2 reader.
+    socket_control: ?@import("../net/socket.zig").WriteControl = null,
 
     pub const DeliveryObserver = struct {
         context: *anyopaque,

@@ -1,0 +1,13 @@
+{
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "66fc7a13b355b3d518003f888f821685b87bda7476dbac91f0cc33b81b4001e8",
+    "zig/pkg/antfly/src/api/http_server.zig": "6714bfef5c6664fc325ab425a1d80b46e79879794266642456bf6d350b53c728",
+    "zig/pkg/antfly/src/api/httpx_handler.zig": "0bbb8034f8b00bd1f0795071e969cdf2c66df367de8f861d93b3a02078f2c19e",
+    "zig/pkg/antfly/src/api/sql_execution.zig": "159429282f3e114464e532fa01876930e8581ca4ed7f069cf2a2e3140da7e634",
+    "zig/pkg/antfly-embedded/src/functions/runtime.zig": "9da875b4e18fdb10521056a926aa56f439c4848bcbf1c69c5a50162df534cd00"
+  },
+  "exit_code": 1,
+  "embedded_tests_passed": 37,
+  "failure": "deferred borrower release reads poisoned self.runnable_owner after API self.* becomes undefined",
+  "full_gate_passed": false
+}

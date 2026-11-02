@@ -48,3 +48,32 @@ pub fn applyExecutionOptions(req: *types.SearchRequest, options: abi.LocalQueryE
         req.response_table_name = if (options.response_table_name.ptr != null) options.response_table_name.slice() else null;
     }
 }
+
+/// Apply trusted invocation controls without changing the parsed query. A
+/// serialized deadline may tighten the caller's deadline but never extend it.
+/// Authority and cancellation are accepted only from the synchronous caller.
+pub fn applyTrustedControls(req: *types.SearchRequest, controls: types.SearchRequest) void {
+    if (controls.execution_deadline_ns) |deadline| {
+        req.execution_deadline_ns = if (req.execution_deadline_ns) |parsed| @min(parsed, deadline) else deadline;
+    }
+    req.execution_runnable = controls.execution_runnable;
+    req.cancellation = controls.cancellation;
+}
+
+/// Native scoring holds index read locks. This borrowed callback must not
+/// suspend or acquire CPU, and retains the owner's original clock authority.
+pub fn nativeTextAuthority(req: *const types.SearchRequest) @import("../search/work_authority.zig").Authority {
+    return .{ .context = req, .check_fn = checkNativeTextLifetime };
+}
+
+fn checkNativeTextLifetime(raw: *const anyopaque) !void {
+    const req: *const types.SearchRequest = @ptrCast(@alignCast(raw));
+    if (req.execution_runnable) |grant| {
+        try grant.checkLifetime();
+    } else if (req.execution_deadline_ns) |deadline| {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+    }
+    if (req.cancellation) |cancellation| {
+        if (cancellation.isCancelled()) return error.Cancelled;
+    }
+}

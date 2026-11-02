@@ -96,6 +96,14 @@ pub fn encodeDocumentChildRangeOutboxRecordAlloc(
 }
 
 pub fn drain(alloc: Allocator, scanned: []const docstore_mod.OwnedKVPair, dispatcher: DocumentArtifactChildRangeDispatcher, limit: usize, ptr: *anyopaque, remove: *const fn (*anyopaque, []const u8) anyerror!void) !DocumentArtifactChildRangeOutboxDrainResult {
+    return drainWithRetirement(alloc, scanned, dispatcher, limit, ptr, remove, null);
+}
+
+/// Scanned records own their bytes and the local scan has physically finished.
+/// Retire local capture admission before decoding or invoking remote dispatch.
+/// The removal callback takes fresh local admission only after acknowledgement.
+pub fn drainWithRetirement(alloc: Allocator, scanned: []const docstore_mod.OwnedKVPair, dispatcher: DocumentArtifactChildRangeDispatcher, limit: usize, ptr: *anyopaque, remove: *const fn (*anyopaque, []const u8) anyerror!void, retirement: ?@import("mutation_admission.zig").MutationRetirement) !DocumentArtifactChildRangeOutboxDrainResult {
+    if (retirement) |local| local.retire();
     var result = DocumentArtifactChildRangeOutboxDrainResult{};
     const max_entries = if (limit == 0 or limit > scanned.len) scanned.len else limit;
     for (scanned[0..max_entries]) |entry| {

@@ -18,6 +18,7 @@
 //! Parsing this contract does not imply that a serving backend is qualified.
 
 const std = @import("std");
+const admitted_json = @import("../util/admitted_json.zig");
 const deberta = @import("deberta.zig");
 
 pub const Architecture = enum { unknown, span, boundary };
@@ -248,13 +249,21 @@ pub const Config = struct {
 
 /// Detect from executable architecture metadata, never from repository names.
 pub fn detectArchitecture(allocator: std.mem.Allocator, bytes: []const u8) !Architecture {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| {
+    const parsed = admitted_json.parse(std.json.Value, allocator, bytes, .{}) catch |err| {
+        try @import("../execution_control.zig").checkRetainedRefusal();
         if (err == error.OutOfMemory) return err;
         // Unrelated upstream metadata historically remains best-effort. A
         // malformed file carrying a boundary marker must still fail closed;
         // these strings only reject metadata and never select an architecture.
         for ([_][]const u8{ "\"boundary_head\"", "\"BoundaryExtractor\"", "\"boundary\"", "\"gliner2.5\"" }) |marker| {
-            if (std.mem.indexOf(u8, bytes, marker) != null) return error.InvalidGlinerBoundaryConfig;
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                try (@import("../execution_control.zig").InferenceExecutionControl{}).check();
+                const end = offset + @min(@as(usize, 4096), bytes.len - offset);
+                const extended = end + @min(marker.len - 1, bytes.len - end);
+                if (std.mem.indexOf(u8, bytes[offset..extended], marker) != null) return error.InvalidGlinerBoundaryConfig;
+                offset = end;
+            }
         }
         return .unknown;
     };
@@ -267,7 +276,8 @@ pub fn detectArchitecture(allocator: std.mem.Allocator, bytes: []const u8) !Arch
 /// contract implemented by the schema-v2 classifier route. Other span models
 /// can retain their legacy route without being guessed into this one.
 pub fn declaresSpanArchitecture(allocator: std.mem.Allocator, bytes: []const u8) !bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| {
+    const parsed = admitted_json.parse(std.json.Value, allocator, bytes, .{}) catch |err| {
+        try @import("../execution_control.zig").checkRetainedRefusal();
         if (err == error.OutOfMemory) return err;
         return false;
     };
@@ -369,7 +379,7 @@ fn sameJson(left: std.json.Value, right: std.json.Value, depth: usize) bool {
 }
 
 pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8, encoder_bytes: []const u8) !Config {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
+    const parsed = admitted_json.parse(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGlinerBoundaryConfig;
     const obj = parsed.value.object;
@@ -391,7 +401,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8, encoder_byte
     // this runtime does not consume. Object key order is immaterial.
     if (obj.get("encoder_config")) |inline_encoder| {
         if (inline_encoder != .object) return error.InvalidGlinerBoundaryConfig;
-        const sidecar = std.json.parseFromSlice(std.json.Value, allocator, encoder_bytes, .{}) catch |err| return configError(err);
+        const sidecar = admitted_json.parse(std.json.Value, allocator, encoder_bytes, .{}) catch |err| return configError(err);
         defer sidecar.deinit();
         if (!sameJson(inline_encoder, sidecar.value, 0)) return error.UnsupportedGlinerBoundaryEncoder;
     }
@@ -455,7 +465,7 @@ pub fn parseHeadConfig(obj: std.json.ObjectMap) !HeadConfig {
 }
 
 fn parseEncoderConfig(allocator: std.mem.Allocator, bytes: []const u8) !EncoderConfig {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
+    const parsed = admitted_json.parse(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGlinerBoundaryConfig;
     const obj = parsed.value.object;
@@ -511,7 +521,7 @@ fn releasedDebertaBackbone(encoder: EncoderConfig) !Backbone {
 }
 
 fn encoderIsModernBert(allocator: std.mem.Allocator, bytes: []const u8) !bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
+    const parsed = admitted_json.parse(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGlinerBoundaryConfig;
     const value = parsed.value.object.get("model_type") orelse return error.InvalidGlinerBoundaryConfig;
@@ -521,7 +531,7 @@ fn encoderIsModernBert(allocator: std.mem.Allocator, bytes: []const u8) !bool {
 /// Hugging Face ModernBERT (and mmBERT) encoder config. Only the bias-free,
 /// exact-GELU, dropout-free layout the training trunk implements is accepted.
 fn parseModernBertEncoderConfig(allocator: std.mem.Allocator, bytes: []const u8) !EncoderConfig {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
+    const parsed = admitted_json.parse(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGlinerBoundaryConfig;
     const obj = parsed.value.object;
@@ -591,7 +601,7 @@ fn requireBool(obj: std.json.ObjectMap, name: []const u8, expected: bool) !void 
 }
 
 fn configError(err: anyerror) anyerror {
-    return if (err == error.OutOfMemory) err else error.InvalidGlinerBoundaryConfig;
+    return admitted_json.preserveRefusal(if (err == error.OutOfMemory) err else error.InvalidGlinerBoundaryConfig);
 }
 
 fn loadFixture(allocator: std.mem.Allocator, backbone: Backbone, name: []const u8) ![]u8 {
@@ -714,7 +724,7 @@ test "gliner boundary encoder rejects negative overflowing and incompatible dime
 }
 
 test "gliner boundary retains precise consistency weight and rejects nonfinite doubles" {
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"consistency_loss_weight\":0.100000000123}", .{});
+    const parsed = try admitted_json.parse(std.json.Value, std.testing.allocator, "{\"consistency_loss_weight\":0.100000000123}", .{});
     defer parsed.deinit();
     var head = try parseHeadConfig(parsed.value.object);
     try std.testing.expectEqual(@as(f64, 0.100000000123), head.consistency_loss_weight);
@@ -810,7 +820,7 @@ test "gliner boundary Transformers wrapper preserves the pinned executable contr
     defer a.free(encoder);
     try std.testing.expectEqualDeep(try parseConfig(a, legacy, encoder), try parseConfig(a, wrapper, encoder));
     // Sidecar serialization and object insertion order do not change semantics.
-    var reordered = try std.json.parseFromSlice(std.json.Value, a, encoder, .{});
+    var reordered = try admitted_json.parse(std.json.Value, a, encoder, .{});
     defer reordered.deinit();
     const hidden_size = reordered.value.object.fetchSwapRemove("hidden_size").?;
     try reordered.value.object.put(reordered.arena.allocator(), "hidden_size", hidden_size.value);

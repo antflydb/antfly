@@ -82,11 +82,13 @@ class SourcePackageTests(unittest.TestCase):
             "zig/testdata/image/jpeg/upstream/fuzz.jpg",
             "zig/bench/bench.zig",
             "zig/tools/unneeded.py",
+            "zig/lib/httpx/src/response_test_root.zig",
             "zig/pkg/inference/testdata/model.bin",
         ):
             self.assertFalse(package.selected(path), path)
         for path in (
             "zig/pkg/antfly-embedded/src/root.zig",
+            "zig/tools/prepare_joinable_threaded.py",
             "zig/pkg/inference/src/root.zig",
             "zig/lib/raft/root.zig",
             "specs/openapi/query.yaml",

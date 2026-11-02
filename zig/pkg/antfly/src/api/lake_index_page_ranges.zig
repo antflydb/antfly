@@ -22,6 +22,9 @@ const stores = @import("../serverless/artifacts/store.zig");
 const artifacts = @import("lake_index_aggregate_artifact.zig");
 const ranges = @import("lake_artifact_ranges.zig");
 const A = std.mem.Allocator;
+const Context = local.serverless_query_lake_read_context.Context;
+const Execution = local.common_request_admission.runnable_scheduler.Execution;
+pub const Workspace = ranges.Workspace;
 const Token = @import("antfly_cancellation").CancellationToken;
 pub const Budget = ranges.Budget;
 pub const Batch = struct {
@@ -86,11 +89,18 @@ test "external lake metadata navigation range waves coalesce authenticate cache 
             if (self.corrupt and bytes.len > 128) bytes[128] ^= 1;
             return bytes;
         }
+        fn getFor(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Token, context: Context) ![]u8 {
+            return local.sql_execution_wait.runOwned(context.wait, get, .{ raw, alloc, id, offset, length, token }, discardRange, .{alloc});
+        }
+        fn discardRange(range_payload: []u8, alloc: A) void {
+            alloc.free(range_payload);
+        }
     };
     var probe: Probe = .{ .vtable = backend.vtable };
     Probe.active = &probe;
     var vtable = backend.vtable.*;
     vtable.get_range_alloc_with_cancellation = Probe.get;
+    vtable.get_range_alloc_for = Probe.getFor;
     backend.vtable = &vtable;
     var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer cache.deinit();
@@ -177,4 +187,189 @@ test "external lake metadata navigation range waves coalesce authenticate cache 
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Sweep.run, .{ backend, scope.domain, &shuffled });
+}
+
+test "external lake navigation scoped waves retain payload credit through joins and preserve original rejection" {
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const Case = enum { success, child_refused, wave_refused, bounded, wait_only, dispatch_refused, allocation_failure, budget_refused, canceled, deadline, revoked, io_failure, resume_denied };
+    const Clock = struct {
+        var value: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return value.load(.acquire);
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const Probe = struct {
+        base: stores.ArtifactStore,
+        parent: *Execution,
+        owner: *Runnable.Scheduler,
+        case: Case,
+        signal: std.atomic.Value(bool) = .init(false),
+        revoked: std.atomic.Value(bool) = .init(false),
+        reads: std.atomic.Value(usize) = .init(0),
+        controls: std.atomic.Value(usize) = .init(0),
+        children: std.atomic.Value(usize) = .init(0),
+        retained_joins: usize = 0,
+        fn authority(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.revoked.load(.acquire)) return error.FileNotFound;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.parent.checkpoint();
+            try self.parent.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Task.join has released its child metadata, but its returned bytes
+            // still belong to the wave until copying and physical retirement.
+            if (self.case == .wave_refused or self.case == .bounded or self.case == .wait_only)
+                try std.testing.expectEqual(@as(u64, 17), self.owner.stats().retained_bytes)
+            else
+                try std.testing.expect(self.owner.stats().retained_bytes > 17);
+            self.retained_joins += 1;
+            if (self.case == .resume_denied) return error.FileNotFound;
+            try self.parent.enter(.query);
+            try authority(raw);
+        }
+        fn get(raw: *anyopaque, a: A, id: []const u8, offset: u64, length: usize, token: Token) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.owner.state(&self.parent.entry.?) != .running);
+            if (self.owner.stats().child_operations >= 2) _ = self.children.fetchAdd(1, .monotonic);
+            var control: Execution = .{};
+            try control.start(self.owner, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            try control.checkpoint();
+            control.finish();
+            _ = self.controls.fetchAdd(1, .monotonic);
+            _ = self.reads.fetchAdd(1, .monotonic);
+            if (self.case == .io_failure) return error.FileNotFound;
+            const bytes = try self.base.getRangeAllocWithCancellationUsingAllocator(a, id, offset, length, token);
+            switch (self.case) {
+                .canceled => self.signal.store(true, .release),
+                .deadline => Clock.value.store(10, .release),
+                .revoked => self.revoked.store(true, .release),
+                else => {},
+            }
+            return bytes;
+        }
+        fn getFor(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Token, context: Context) ![]u8 {
+            return local.sql_execution_wait.runOwned(context.wait, get, .{ raw, alloc, id, offset, length, token }, discardRange, .{alloc});
+        }
+        fn discardRange(range_payload: []u8, alloc: A) void {
+            alloc.free(range_payload);
+        }
+    };
+    const Charge = struct {
+        fn charge(raw: *anyopaque, bytes: u64) !void {
+            try stores.chargeReadBudget(@ptrCast(@alignCast(raw)), bytes);
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("scoped-navigation-waves");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const domain: [32]u8 = @splat(81);
+    const upload: stores.UploadScope = .{ .domain = domain, .attempt = @splat(3) };
+    var references: [3]tree.Ref = undefined;
+    for (0..2) |pack| {
+        var payload: [512]u8 = @splat(@intCast(71 + pack));
+        var artifact = try store.putScoped(upload, &payload, .none);
+        defer artifact.deinit(a);
+        var pack_digest: [32]u8 = undefined;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&payload, &pack_digest, .{});
+        std.crypto.hash.sha2.Sha256.hash(payload[0..128], &digest, .{});
+        if (pack == 0) {
+            for (references[0..2], 0..) |*ref, i| ref.* = .{ .digest = digest, .attempt = upload.attempt, .bytes = 128, .height = 0, .records = 1, .pack = .{ .digest = pack_digest, .bytes = payload.len, .offset = @intCast(i * 144) } };
+        } else references[2] = .{ .digest = digest, .attempt = upload.attempt, .bytes = 128, .height = 0, .records = 1, .pack = .{ .digest = pack_digest, .bytes = payload.len, .offset = 0 } };
+    }
+    const refs = [_]tree.Ref{ references[0], references[1], references[2], references[0] };
+    for (std.enums.values(Case)) |case| {
+        errdefer std.debug.print("navigation original-scope case={s}\n", .{@tagName(case)});
+        var owner = try Runnable.Scheduler.init(.{ .slots = 2, .control_slots = 1, .max_operations = if (case == .wave_refused) 2 else if (case == .child_refused) 3 else 16, .max_bytes = 4 * 1024 * 1024, .control_bytes = 64 * 1024 });
+        defer owner.close();
+        var threads = std.Io.Threaded.init(a, .{ .concurrent_limit = .limited(0) });
+        defer threads.deinit();
+        var parent: Execution = .{};
+        defer parent.finish();
+        var probe: Probe = .{ .base = store, .owner = &owner, .parent = &parent, .case = case };
+        Clock.value.store(0, .release);
+        try parent.startRead(&owner, .{ .io = std.testing.io, .retained_bytes = 17, .deadline_ns = 10, .native_now_ns = Clock.now, .cancellation = .{ .ptr = &probe.signal, .requested = Clock.requested } }, if (case == .bounded) .bounded else .general);
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        var vtable = store.vtable.*;
+        vtable.get_range_alloc_with_cancellation = Probe.get;
+        vtable.get_range_alloc_for = Probe.getFor;
+        var observed = store;
+        observed.ptr = &probe;
+        observed.vtable = &vtable;
+        var context = (Context{ .io = if (case == .dispatch_refused) threads.io() else std.testing.io, .authority = .{ .ptr = &probe, .check = Probe.authority } }).withExecution(&parent);
+        if (case == .wait_only) context.execution = null;
+        context.wait = .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end };
+        const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(38), .context = context };
+        var remaining: u64 = if (case == .budget_refused) 1 else 4096;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const result = load(if (case == .allocation_failure) failing.allocator() else a, observed, domain, &refs, .none, cached, .{ .ptr = &remaining, .charge = Charge.charge });
+        switch (case) {
+            .success, .child_refused, .wave_refused, .bounded, .wait_only, .dispatch_refused => {
+                var batch = try result;
+                defer batch.deinit();
+                for (batch.values[0..4], [_]u8{ 71, 71, 72, 71 }) |bytes, value| for (bytes.?) |byte| try std.testing.expectEqual(value, byte);
+                // Main's authenticated coalescing also applies to serial,
+                // caller-funded fallback. It dispatches no child and charges
+                // the same actual gap bytes as the parallel path.
+                try std.testing.expectEqual(@as(usize, 2), probe.reads.load(.acquire));
+                try std.testing.expectEqual(@as(u64, 4096 - 512 - 16), remaining);
+                if (case == .success) {
+                    try std.testing.expect(probe.children.load(.acquire) > 0);
+                    try std.testing.expect(probe.retained_joins > 0);
+                } else try std.testing.expectEqual(@as(usize, 0), probe.children.load(.acquire));
+                const before = probe.reads.load(.acquire);
+                var warm = try load(a, observed, domain, &refs, .none, cached, .{ .ptr = &remaining, .charge = Charge.charge });
+                defer warm.deinit();
+                try std.testing.expectEqual(before, probe.reads.load(.acquire));
+            },
+            .allocation_failure => {
+                try std.testing.expectError(error.OutOfMemory, result);
+                try std.testing.expectEqual(@as(usize, 0), probe.reads.load(.acquire));
+            },
+            .budget_refused => {
+                try std.testing.expectError(error.ArtifactReadBudgetExceeded, result);
+                try std.testing.expectEqual(@as(usize, 0), probe.reads.load(.acquire));
+            },
+            .canceled => try std.testing.expectError(error.Canceled, result),
+            .deadline => try std.testing.expectError(error.DeadlineExceeded, result),
+            .revoked, .io_failure, .resume_denied => try std.testing.expectError(error.FileNotFound, result),
+        }
+        try std.testing.expectEqual(probe.reads.load(.acquire), probe.controls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().child_operations);
+        try std.testing.expectEqual(@as(u64, 17), owner.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), cache.physical.flights.count());
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+        if (case == .canceled or case == .deadline or case == .revoked or case == .resume_denied) {
+            // A different connection may reuse immutable physical bytes, never
+            // the failed leader's source authority or execution capsule.
+            var healthy: Execution = .{};
+            defer healthy.finish();
+            var next: Probe = .{ .base = store, .owner = &owner, .parent = &healthy, .case = .success };
+            Clock.value.store(0, .release);
+            try healthy.start(&owner, .{ .io = std.testing.io, .retained_bytes = 17, .native_now_ns = Clock.now }, .query);
+            var backend = observed;
+            backend.ptr = &next;
+            const original = (Context{ .io = std.testing.io, .authority = .{ .ptr = &next, .check = Probe.authority } }).withExecution(&healthy);
+            remaining = 4096;
+            var again = try load(a, backend, domain, &refs, .none, .{ .cache = &cache, .scope = cached.scope, .context = original }, .{ .ptr = &remaining, .charge = Charge.charge });
+            defer again.deinit();
+            for (again.values[0..4], [_]u8{ 71, 71, 72, 71 }) |bytes, value| for (bytes.?) |byte| try std.testing.expectEqual(value, byte);
+            try std.testing.expectEqual(@as(usize, 0), owner.stats().child_operations);
+            healthy.finish();
+            try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+        }
+    }
 }

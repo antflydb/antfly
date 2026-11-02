@@ -1,0 +1,47 @@
+{
+  "base_commit": "72796babc4",
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/functions/runtime.zig": "f8f806c2d0f8f561096aa4093b66fc31221fa822d03fcaa230127b75ed170799",
+    "zig/pkg/antfly/src/api/sql_execution.zig": "9c5a8bce6bc00f8a82b70e4ba6a092d9972ca4012745f5055dc876c5c6043ea2",
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "f1dc5d220a393912334cdb170d40d6a71aae7c3a50845d8a895e6d6991afca34"
+  },
+  "native_command": "ZIG_GLOBAL_CACHE_DIR=/private/tmp/antfly-default-pooling-global /Users/ajroetker/bin/zig-0.17.0/zig build functions-test -Doptimize=ReleaseSafe -j1 --maxrss 4294967296 --cache-dir /private/tmp/antfly-provider-parent-cache --summary all",
+  "native_exit_code": 0,
+  "native_build_steps": 47,
+  "native_embedded_tests": 18,
+  "native_coordinator_tests": 7,
+  "compile_scheduling_budget_bytes": 4294967296,
+  "pending": [
+    "Embedded inference parent grant transfer and independent child admission",
+    "Broader background scheduling, completion stalls and default sizing/overload qualification"
+  ],
+  "linux": {
+    "exit_code": 0,
+    "build_steps": 44,
+    "embedded_tests": 18,
+    "coordinator_tests": 7,
+    "target": "aarch64-linux-gnu",
+    "image": "sha256:fb3236b6cc7411028d62f76eb418110a6c34e246b9437a9d093d58a53a3e2954",
+    "cpus": 2,
+    "memory_bytes": 4294967296,
+    "memory_and_swap_bytes": 4294967296,
+    "reported_test_compile_peak": "3G",
+    "command": "zig build functions-test -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-gnu -j1 --maxrss 4294967296 --cache-dir /cache --summary all"
+  },
+  "native_api": {
+    "snapshot_base": "94aef4b165",
+    "build_steps": 50,
+    "embedded_tests": 39,
+    "coordinator_tests": 46,
+    "skips": 0,
+    "leaks": 0,
+    "completed_build_summary": "50/50 steps succeeded",
+    "process_observation": "Original session unavailable; verified maker PID 7624 live, then absent after complete success summary",
+    "source_sha256": {
+      "zig/pkg/antfly-embedded/src/functions/runtime.zig": "f8f806c2d0f8f561096aa4093b66fc31221fa822d03fcaa230127b75ed170799",
+      "zig/pkg/antfly/src/api/sql_execution.zig": "9c5a8bce6bc00f8a82b70e4ba6a092d9972ca4012745f5055dc876c5c6043ea2",
+      "zig/pkg/antfly/build/api_tests.zig": "8cc6272cfde8443e0dc63d28a8fb92dcc3b0e0b80569c2f8b9ecbec5ab5cea63"
+    },
+    "command": "ZIG_GLOBAL_CACHE_DIR=/private/tmp/antfly-default-pooling-global /Users/ajroetker/bin/zig-0.17.0/zig build antfly-workload-pooling-test -Doptimize=ReleaseSafe -j1 --cache-dir /private/tmp/antfly-default-pooling-cache --summary all"
+  }
+}

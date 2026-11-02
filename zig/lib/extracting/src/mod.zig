@@ -360,6 +360,7 @@ pub const RemoteOptions = struct {
     source_table: []const u8 = "",
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
+    socket_control: ?httpx.socket.WriteControl = null,
 };
 
 fn validateSchemaVersion(version: u32) !u32 {
@@ -372,6 +373,7 @@ const ExtractionControl = struct {
     io: std.Io,
     deadline_ns: ?i96,
     cancellation: ?httpx.CancellationToken,
+    socket_control: ?httpx.socket.WriteControl = null,
 
     fn init(client: *httpx.Client, options: RemoteOptions) ExtractionControl {
         const timeout = options.timeout_ms orelse client.config.timeouts.request_ms;
@@ -379,6 +381,7 @@ const ExtractionControl = struct {
             .io = client.io,
             .deadline_ns = if (timeout == 0) null else std.Io.Clock.awake.now(client.io).nanoseconds +| @as(i96, timeout) * std.time.ns_per_ms,
             .cancellation = options.cancellation orelse client.config.request_cancellation,
+            .socket_control = options.socket_control,
         };
     }
     fn remainingAt(self: ExtractionControl, now_ns: i96) !?u64 {
@@ -569,6 +572,7 @@ const CloudflareExtractor = struct {
             }, try cloudflare.evidenceRequest(a, cfg.model, state, plan.fields), .{
                 .timeout_ms = try control.remaining(),
                 .cancellation = control.cancellation,
+                .socket_control = control.socket_control,
                 .max_response_bytes = req.max_response_bytes orelse 16 * 1024 * 1024,
             });
             _ = try control.remaining();
@@ -690,6 +694,7 @@ const HttpExtractorState = struct {
     source_table: ?[]u8 = null,
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
+    socket_control: ?httpx.socket.WriteControl = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Extractor {
         const state = try alloc.create(HttpExtractorState);
@@ -708,6 +713,7 @@ const HttpExtractorState = struct {
             .source_table = source_table,
             .timeout_ms = options.timeout_ms,
             .cancellation = options.cancellation,
+            .socket_control = options.socket_control,
         };
         return .{ .ptr = state, .vtable = &.{ .extract = extract, .deinit = deinit } };
     }
@@ -787,6 +793,7 @@ const HttpExtractorState = struct {
             .timeout_ms = self.timeout_ms,
             .max_response_size = req.max_response_bytes,
             .cancellation = self.cancellation,
+            .socket_control = self.socket_control,
         });
         defer resp.deinit();
         if (!resp.ok()) {

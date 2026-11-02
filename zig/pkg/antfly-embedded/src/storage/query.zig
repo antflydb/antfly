@@ -229,6 +229,7 @@ pub fn executeStorageKernelGraphEdges(
     const control_req = db_mod.types.SearchRequest{
         .identity_read_generation = req.identity_read_generation,
         .execution_deadline_ns = req.execution_deadline_ns orelse local_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .execution_runnable = req.execution_runnable,
         .cancellation = req.cancellation,
     };
     try checkQueryDeadline(control_req);
@@ -299,8 +300,26 @@ pub fn collectTextStatsFromDbForRequest(
     request: ParsedTextStatsRequest,
 ) ![]const distributed_stats_mod.TextFieldStats {
     if (comptime storage_engine.enabled) return storage_engine.call("queryCollectTextStatsFromDbForRequest", .{ alloc, db, request });
+    const controls: db_mod.types.SearchRequest = switch (request) {
+        .query_request => |owned| owned.req,
+        else => .{},
+    };
+    return collectTextStatsFromDbForRequestWithControls(alloc, db, request, controls);
+}
+
+pub fn collectTextStatsFromDbForRequestWithControls(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    request: ParsedTextStatsRequest,
+    controls: db_mod.types.SearchRequest,
+) ![]const distributed_stats_mod.TextFieldStats {
+    try checkQueryDeadline(controls);
     return switch (request) {
-        .query_request => |owned_query| try db.collectSearchRequestTextStats(alloc, owned_query.req),
+        .query_request => |owned_query| blk: {
+            var req = owned_query.req;
+            @import("query_controls.zig").applyTrustedControls(&req, controls);
+            break :blk try db.collectSearchRequestTextStats(alloc, req);
+        },
         .explicit_fields => |parsed| blk: {
             const generation = try db.currentIdentityReadGenerationForRequest(parsed.identity_read_generation);
             if (parsed.resolved_doc_filter) |filter| {
@@ -317,7 +336,7 @@ pub fn collectTextStatsFromDbForRequest(
                     .resolved_doc_filter = if (parsed.resolved_doc_filter) |filter| filter.resolved_doc_filter else null,
                 };
             }
-            break :blk try db.collectExplicitTextStats(alloc, explicit);
+            break :blk try db.collectExplicitTextStatsWithControls(alloc, explicit, controls);
         },
         .background_fields => return error.InvalidQueryRequest,
     };
@@ -329,6 +348,16 @@ pub fn collectBackgroundTextStatsFromDbForRequest(
     request: ParsedTextStatsRequest,
 ) ![]const db_mod.aggregations.DistributedBackgroundTextStats {
     if (comptime storage_engine.enabled) return storage_engine.call("queryCollectBackgroundTextStatsFromDbForRequest", .{ alloc, db, request });
+    return collectBackgroundTextStatsFromDbForRequestWithControls(alloc, db, request, .{});
+}
+
+pub fn collectBackgroundTextStatsFromDbForRequestWithControls(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    request: ParsedTextStatsRequest,
+    controls: db_mod.types.SearchRequest,
+) ![]const db_mod.aggregations.DistributedBackgroundTextStats {
+    try checkQueryDeadline(controls);
     return switch (request) {
         .background_fields => |parsed| blk: {
             const generation = try db.currentIdentityReadGenerationForRequest(parsed.identity_read_generation);
@@ -348,7 +377,7 @@ pub fn collectBackgroundTextStatsFromDbForRequest(
                     .resolved_doc_filter = if (parsed.resolved_doc_filter) |filter| filter.resolved_doc_filter else null,
                 };
             }
-            break :blk try db.collectExplicitBackgroundTextStats(alloc, explicit);
+            break :blk try db.collectExplicitBackgroundTextStatsWithControls(alloc, explicit, controls);
         },
         else => return error.InvalidQueryRequest,
     };
@@ -458,17 +487,30 @@ pub fn executeStorageKernelTextStats(
     body: []const u8,
 ) ![]u8 {
     if (comptime storage_engine.enabled) return storage_engine.call("queryExecuteStorageKernelTextStats", .{ alloc, db, table_name, body });
+    return executeStorageKernelTextStatsWithControls(alloc, db, table_name, body, .{});
+}
+
+pub fn executeStorageKernelTextStatsWithControls(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    body: []const u8,
+    controls: db_mod.types.SearchRequest,
+) ![]u8 {
+    try checkQueryDeadline(controls);
     var parsed = try parseTextStatsRequest(alloc, table_name, body);
     defer parsed.deinit(alloc);
     return switch (parsed) {
         .background_fields => blk: {
-            const stats = try collectBackgroundTextStatsFromDbForRequest(alloc, db, parsed);
+            const stats = try collectBackgroundTextStatsFromDbForRequestWithControls(alloc, db, parsed, controls);
             defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, stats);
+            try checkQueryDeadline(controls);
             break :blk try encodeBackgroundTextStatsResponse(alloc, stats);
         },
         else => blk: {
-            const stats = try collectTextStatsFromDbForRequest(alloc, db, parsed);
+            const stats = try collectTextStatsFromDbForRequestWithControls(alloc, db, parsed, controls);
             defer distributed_stats_mod.deinitTextFieldStats(alloc, stats);
+            try checkQueryDeadline(controls);
             break :blk try encodeTextStatsResponse(alloc, stats);
         },
     };

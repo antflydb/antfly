@@ -27,9 +27,11 @@ const graph = @import("query/graph_exec.zig");
 const document = @import("../../sql/document_row.zig");
 const catalog = @import("../../sql/catalog.zig");
 const scalar = @import("../../sql/scalar.zig");
+const admission = @import("../../common/read_admission.zig");
 const View = @import("../relational_read_view.zig").View;
 
 pub const Session = struct {
+    page_admission: admission.Scope = .{},
     row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
     range_proofs: ?[]const @import("../range_protection.zig").Proof = null,
     alloc: std.mem.Allocator,
@@ -62,8 +64,14 @@ pub const Session = struct {
 
     /// Takes ownership of txn on every outcome; clones the borrowed epoch.
     pub fn openSnapshot(alloc: std.mem.Allocator, store: *store_mod.DocStore, txn: store_mod.DocStore.Txn, schema: ?registry.SchemaView, range: types.ByteRange, from: []const u8, to: []const u8, opts: types.ScanOptions, now_ns: u64) !*Session {
+        return openSnapshotWithAdmission(alloc, store, txn, schema, range, from, to, opts, now_ns, null);
+    }
+
+    /// Creation context is borrowed only until the session is published.
+    pub fn openSnapshotWithAdmission(alloc: std.mem.Allocator, store: *store_mod.DocStore, txn: store_mod.DocStore.Txn, schema: ?registry.SchemaView, range: types.ByteRange, from: []const u8, to: []const u8, opts: types.ScanOptions, now_ns: u64, control: ?admission.Port) !*Session {
         var read = txn;
         errdefer read.abort();
+        if (control) |port| try port.checkpoint();
         if (schema) |view| if (view.storageMode() != .document) return error.UnsupportedSqlExecution;
         if (opts.include_range_proofs) if (schema) |view| if (view.tableSchema().ttl_duration_ns != 0) return error.UnsupportedSqlExecution;
         if (opts.relational_query_json.len > 1024 * 1024 or opts.limit > 4096) return error.InvalidRelationalRowsRequest;
@@ -80,6 +88,7 @@ pub const Session = struct {
         const projection = try document.Projection.init(owned, table, input.fields);
         const condition_fields = try owned.alloc([]const u8, input.conditions.len);
         for (input.conditions, condition_fields) |condition, *field| {
+            if (control) |port| try port.checkpoint();
             _ = try table.column(condition.column);
             field.* = condition.column;
             if (condition.collation) |collation| if (!std.mem.eql(u8, collation, "binary")) return error.UnsupportedSqlExecution;
@@ -91,6 +100,7 @@ pub const Session = struct {
         const condition_projection = try document.Projection.init(owned, table, condition_fields);
         const conditions = try owned.alloc(types.RelationalRowQuery.Condition, input.conditions.len);
         for (input.conditions, conditions) |condition, *copy| {
+            if (control) |port| try port.checkpoint();
             copy.* = condition;
             copy.column = try owned.dupe(u8, condition.column);
             copy.collation = if (condition.collation) |text| try owned.dupe(u8, text) else null;
@@ -98,12 +108,14 @@ pub const Session = struct {
         }
         var filter = if (opts.filter_query_json.len != 0) try graph.PreparedPatternFilter.init(alloc, opts.filter_query_json) else null;
         errdefer if (filter) |*compiled| compiled.deinit();
+        var metadata = admission.MetadataRead(*store_mod.DocStore.Txn).init(alloc, &read, control);
+        defer metadata.deinit();
         const lower_raw = if (from.len == 0 or std.mem.order(u8, from, range.start) == .lt) range.start else from;
         const upper_raw = if (to.len == 0 or (range.end.len != 0 and std.mem.order(u8, range.end, to) == .lt)) range.end else to;
         const session = try alloc.create(Session);
         errdefer alloc.destroy(session);
         session.* = .{
-            .range_proofs = if (opts.include_range_proofs) try @import("../range_protection.zig").capture(owned, &read, lower_raw, upper_raw) else null,
+            .range_proofs = if (opts.include_range_proofs) try @import("../range_protection.zig").capture(owned, &metadata, lower_raw, upper_raw) else null,
             .alloc = alloc,
             .arena = undefined,
             .store = store,
@@ -128,6 +140,7 @@ pub const Session = struct {
             .cancellation = opts.cancellation,
             .deadline_ns = opts.execution_deadline_ns,
         };
+        if (control) |port| try port.checkpoint();
         // Epoch retain is the last fallible initialization boundary.
         session.schema = if (schema) |view| view.clone() else null;
         // Move arena state only after all initializer allocations. Copying it
@@ -147,6 +160,21 @@ pub const Session = struct {
         self.alloc.destroy(self);
     }
 
+    pub fn rangeProofsWithAdmission(self: *Session, alloc: std.mem.Allocator, control: admission.Port) ![]@import("../range_protection.zig").Proof {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionRangeProofsWithAdmission", .{ self, alloc, control });
+        const guard = try self.page_admission.enter(control);
+        defer guard.deinit();
+        const result = try self.rangeProofs(alloc);
+        errdefer alloc.free(result);
+        try control.checkpoint();
+        return result;
+    }
+    pub fn normalizeRowsWithAdmission(self: *Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite, control: admission.Port) ![]types.BatchWrite {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionNormalizeRowsWithAdmission", .{ self, alloc, writes, control });
+        const guard = try self.page_admission.enter(control);
+        defer guard.deinit();
+        return self.normalizeRows(alloc, writes);
+    }
     pub fn rangeProofs(self: *Session, alloc: std.mem.Allocator) ![]@import("../range_protection.zig").Proof {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionRangeProofs", .{ self, alloc });
         try self.checkpoint();
@@ -154,6 +182,7 @@ pub const Session = struct {
     }
 
     fn checkpoint(self: *const Session) !void {
+        try self.page_admission.checkpoint();
         if (self.failed) return error.InvalidSqlBackendResponse;
         if (self.cancellation) |token| try token.check();
         if (self.deadline_ns) |deadline| if (time.monotonicNs() >= deadline) return error.DeadlineExceeded;
@@ -166,7 +195,13 @@ pub const Session = struct {
     pub fn normalizeRows(self: *Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionNormalizeRows", .{ self, alloc, writes });
         if (writes.len > 4096) return error.InvalidArgument;
+        try self.checkpoint();
         const result = try alloc.alloc(types.BatchWrite, writes.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |write| types.freeNormalizedWrite(alloc, write);
+            alloc.free(result);
+        }
         // Parse/validator scratch is row-local, not retained for the batch.
         // Only canonical bytes and null provenance cross the commit boundary.
         var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -190,16 +225,40 @@ pub const Session = struct {
             };
             if (self.schema) |view| if (view.validator()) |validator| try validator.prepareValue(temporary, temporary, &value);
             var json_nulls: std.ArrayList([]const u8) = .empty;
+            defer json_nulls.deinit(alloc);
             for (self.table.columns) |column| if (column.type == .json) {
-                if (value.object.get(column.path)) |cell| if (cell == .null) try json_nulls.append(alloc, try alloc.dupe(u8, column.path));
+                if (value.object.get(column.path)) |cell| if (cell == .null) try json_nulls.append(alloc, column.path);
             };
             const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            errdefer alloc.free(bytes);
             total = std.math.add(usize, total, bytes.len +| write.key.len) catch return error.RelationalRowResultTooLarge;
             if (total > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
-            out.* = .{ .key = try alloc.dupe(u8, write.key), .value = bytes, .json_null_fields = try json_nulls.toOwnedSlice(alloc) };
+            const key = try alloc.dupe(u8, write.key);
+            errdefer alloc.free(key);
+            const nulls = try types.cloneJsonNullFields(alloc, json_nulls.items);
+            out.* = .{ .key = key, .value = bytes, .json_null_fields = nulls };
+            initialized += 1;
         }
         try self.checkpoint();
         return result;
+    }
+
+    fn get(self: *Session, key: []const u8) ![]const u8 {
+        const control = self.page_admission.control orelse return self.txn.get(key);
+        var values: [1]?[]const u8 = .{null};
+        try self.txn.getManySortedWithAdmission(&.{key}, &values, control);
+        return values[0] orelse error.NotFound;
+    }
+
+    pub fn nextWithAdmission(self: *Session, alloc: std.mem.Allocator, limit: u32, control: admission.Port) !View.Page {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionNextWithAdmission", .{ self, alloc, limit, control });
+        const guard = try self.page_admission.enter(control);
+        defer guard.deinit();
+        errdefer self.failed = true;
+        var page = try self.next(alloc, limit);
+        errdefer page.deinit();
+        try control.checkpoint();
+        return page;
     }
 
     pub fn next(self: *Session, alloc: std.mem.Allocator, limit: u32) !View.Page {
@@ -262,7 +321,7 @@ pub const Session = struct {
                 const duration = if (session.schema) |schema| schema.visibilityTtlDurationNs() else 0;
                 const version: u64 = version: {
                     const ttl_key = try internal.ttlKeyAlloc(temporary, key);
-                    const timestamp = session.txn.get(ttl_key) catch |err| switch (err) {
+                    const timestamp = session.get(ttl_key) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,
                     };
@@ -279,6 +338,7 @@ pub const Session = struct {
                 if (session.conditions.len != 0) {
                     const condition_row = try session.condition_projection.projectValue(temporary, key, 0, root);
                     for (session.conditions) |condition| {
+                        try session.checkpoint();
                         const cell = try condition_row.cell(condition.column);
                         const rhs = condition.value orelse .null;
                         const matched = switch (condition.op) {
@@ -321,7 +381,10 @@ pub const Session = struct {
             }
         };
         var context = Context{ .session = self, .owned = owned, .scratch = &scratch, .limit = limit, .begin = time.monotonicNs() };
-        try self.store.scanDocumentRowsReadTxnWithContext(&self.txn, lower, self.upper, &context, Context.admit, Context.visit);
+        if (self.page_admission.control) |control|
+            try self.store.scanDocumentRowsReadTxnWithAdmission(&self.txn, lower, self.upper, &context, Context.admit, Context.visit, control)
+        else
+            try self.store.scanDocumentRowsReadTxnWithContext(&self.txn, lower, self.upper, &context, Context.admit, Context.visit);
         try self.checkpoint();
         self.done = !context.more;
         const owned_result_rows = try context.rows.toOwnedSlice(owned);

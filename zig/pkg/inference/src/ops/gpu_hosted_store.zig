@@ -233,6 +233,9 @@ pub const WeightStore = struct {
     access_epoch: u64 = 1,
     packed_expert_views: std.StringHashMapUnmanaged(PackedExpertViewEntry) = .empty,
     packed_expert_view_bytes: usize = 0,
+    /// Session-owned capability, independent of a particular native provider.
+    /// Persists across provider recreation and is released after store metadata.
+    device_memory_budget: ?runtime.kv.device_memory.Budget = null,
     shared_metal_native_provider: if (supports_native_metal_provider) ?*metal_native_provider_mod.MetalNativeProvider else void =
         if (supports_native_metal_provider) null else {},
     shared_metal_native_provider_lock: if (supports_native_metal_provider) std.Io.Mutex else void =
@@ -293,6 +296,7 @@ pub fn startPrefetchWorker(data: *WeightStore) !void {
 }
 
 pub fn stopPrefetchWorker(data: *WeightStore) void {
+    if (!data.prefetch_initialized) return;
     data.prefetch.stop();
 }
 

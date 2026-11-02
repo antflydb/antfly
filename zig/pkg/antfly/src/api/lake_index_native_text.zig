@@ -1093,12 +1093,13 @@ pub const CachedSegments = struct {
             store: stores.ArtifactStore,
             ref: artifacts.ChunkRef,
             cancellation: Cancellation,
+            context: local.serverless_query_lake_read_context.Context,
             fn load(ptr: *anyopaque, alloc: A) ![]u8 {
                 const provider: *@This() = @ptrCast(@alignCast(ptr));
-                return provider.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, provider.ref.artifact_id, provider.ref.byte_len, provider.ref.checksum, provider.cancellation);
+                return provider.store.getVerifiedAllocFor(alloc, provider.ref.artifact_id, provider.ref.byte_len, provider.ref.checksum, provider.cancellation, provider.context);
             }
         };
-        var provider: Provider = .{ .store = self.store, .ref = ref, .cancellation = cancellation };
+        var provider: Provider = .{ .store = self.store, .ref = ref, .cancellation = cancellation, .context = self.cache.context };
         const owner = try a.create(OwnedLease);
         errdefer a.destroy(owner);
         owner.* = .{ .a = a, .lease = try self.cache.cache.readImmutableLease(a, self.cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.InvalidNativeLakeTextCorpus, try stores.sha256DigestFromChecksum(ref.checksum), self.cache.context, .{ .ptr = &provider, .load = Provider.load }) };
@@ -1773,6 +1774,7 @@ fn validateBuildReuse(a: A, store: stores.ArtifactStore, root: Root, ref: local.
 }
 fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_id: []const u8, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) anyerror!void {
     var retained_backend = backend;
+    retained_backend.write_context = context;
     const certified = retained_backend.retainedClosure(root_id, cancellation) catch false;
     try context.ensureActive();
     try cancellation.check();
@@ -1944,6 +1946,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
         }
     };
     var validator: Validator = .{ .a = a, .store = backend, .context = context, .cancellation = cancellation, .domain = root.domain, .maintenance_only = root.serving != null };
+    validator.store.write_context = context;
     defer validator.drain(true);
     defer validator.witnesses.deinit(a);
     try validator.retainArtifact(root_id);

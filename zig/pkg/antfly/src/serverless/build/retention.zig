@@ -88,11 +88,27 @@ pub const Pruner = struct {
         if (self.limits.max_working_set_bytes == 0) return error.InvalidGarbageCollectionLimits;
         var working_set = try WorkingSetAllocator.init(self.alloc, .{ .max_working_set_bytes = self.limits.max_working_set_bytes });
         const operation_alloc = working_set.allocator();
+        var artifacts = self.artifacts.*;
         var manifests = self.manifests.*;
         manifests.allocator = operation_alloc;
+        var progress = self.progress.*;
+        var wal = self.wal.*;
+        var artifact_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = if (cancellation) |token| token.withContext(self.artifacts.write_context) else null };
+        var manifest_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = if (cancellation) |token| token.withContext(self.manifests.context) else null };
+        var progress_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = if (cancellation) |token| token.withContext(self.progress.context) else null };
+        var wal_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = if (cancellation) |token| token.withContext(self.wal.context) else null };
+        if (cancellation != null) {
+            artifacts.write_context = artifact_bridge.readContext();
+            manifests.context = manifest_bridge.readContext();
+            progress.context = progress_bridge.readContext();
+            wal.context = wal_bridge.readContext();
+        }
         var operation_pruner = self.*;
         operation_pruner.alloc = operation_alloc;
+        operation_pruner.artifacts = &artifacts;
         operation_pruner.manifests = &manifests;
+        operation_pruner.progress = &progress;
+        operation_pruner.wal = &wal;
         var result = operation_pruner.pruneNamespaceAdmitted(namespace, keep_latest_versions, cancellation) catch |err| {
             if (err == error.OutOfMemory and working_set.limitExceeded()) return error.GarbageCollectionBudgetExceeded;
             return err;
@@ -115,14 +131,15 @@ pub const Pruner = struct {
         // This short, durable ownership barrier makes every older publisher
         // incapable of committing HEAD. Do not hold it across graph traversal:
         // newer publishers use higher tokens and pin their source manifests.
-        var fallback_io = std.Io.Threaded.init(self.alloc, .{});
-        defer fallback_io.deinit();
-        const io = if (cancellation) |token| token.io else fallback_io.io();
+        var fallback_io: ?std.Io.Threaded = if (cancellation == null) std.Io.Threaded.init(self.alloc, .{}) else null;
+        defer if (fallback_io) |*value| value.deinit();
+        const io = if (cancellation) |token| token.io else fallback_io.?.io();
         const provider = try self.progress.workLeaseProvider();
         var nonce: [16]u8 = undefined;
         io.random(&nonce);
         const owner = std.fmt.bytesToHex(&nonce, .lower);
-        var barrier = (try work_lease.acquireHeld(provider, io, namespace, &owner, 30 * std.time.ns_per_s)) orelse {
+        var lease_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = (cancellation orelse maintenance_cancellation.Token{ .io = io }).withContext(provider.context) };
+        var barrier = (try work_lease.acquireHeld(provider.withContext(lease_bridge.readContext()), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse {
             var result = try self.noopResult(namespace, 0, false);
             result.work_lease_conflict = true;
             return result;
@@ -237,6 +254,7 @@ pub const Pruner = struct {
         var graph_write_bytes: u64 = 0;
         var graph_pages: graph_page_store.PageStore = .{
             .artifacts = self.artifacts,
+            .read_context = self.artifacts.write_context orelse .{},
             .cancellation = graph_bridge.token(),
             .remaining_read_bytes = &graph_read_bytes,
             .remaining_write_bytes = &graph_write_bytes,
@@ -1189,15 +1207,26 @@ test "serverless retention resumes artifact cleanup after cancellation" {
     var requested = std.atomic.Value(bool).init(false);
     const CancelAfterFirstDelete = struct {
         requested: *std.atomic.Value(bool),
-        checkpoints: usize = 0,
+        artifacts: *artifacts_mod.ArtifactStore,
+        ids: [2][]const u8,
 
         fn checkpoint(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.checkpoints += 1;
-            if (self.checkpoints == 6) self.requested.store(true, .release);
+            // Cancellation follows an observable durable deletion rather
+            // than the number of preflight/provider lifetime checkpoints.
+            for (self.ids) |id| {
+                const bytes = self.artifacts.getAlloc(id) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        self.requested.store(true, .release);
+                        return error.Canceled;
+                    },
+                    else => return err,
+                };
+                self.artifacts.allocator.free(bytes);
+            }
         }
     };
-    var cancel_state = CancelAfterFirstDelete{ .requested = &requested };
+    var cancel_state = CancelAfterFirstDelete{ .requested = &requested, .artifacts = &artifacts, .ids = .{ first_artifact.artifact_id, second_artifact.artifact_id } };
     const token = (maintenance_cancellation.Token{
         .io = std.testing.io,
         .requested = &requested,

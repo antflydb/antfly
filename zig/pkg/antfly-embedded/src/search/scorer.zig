@@ -23,6 +23,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const inverted = @import("../section/inverted.zig");
+pub const WorkAuthority = @import("work_authority.zig").Authority;
 
 /// Compact logical order supplied by an immutable native source span map.
 /// The callback is pure and borrowed until every scoring task has joined.
@@ -385,6 +386,8 @@ pub const WANDScorer = struct {
     global_avg_dl: f32,
     bm25_config: inverted.BM25Config,
     bound_table: ?*const inverted.BM25BoundTable = null,
+    authority: ?WorkAuthority = null,
+    authority_steps: u8 = 0,
     /// Diagnostics — populated during `execute*`. Useful for benchmarking
     /// where the WAND inner loop spends time. `next_in_score` is the count
     /// of `iter.next()` calls made when fully scoring a pivot doc;
@@ -411,6 +414,13 @@ pub const WANDScorer = struct {
     pub fn deinit(self: *WANDScorer) void {
         for (self.terms.items) |*t| t.iter.deinit();
         self.terms.deinit(self.alloc);
+    }
+
+    fn checkWork(self: *WANDScorer) !void {
+        if (self.authority) |authority| {
+            if (self.authority_steps == 0) try authority.check();
+            self.authority_steps = (self.authority_steps + 1) % 64;
+        }
     }
 
     pub fn setBoundTable(self: *WANDScorer, table: *const inverted.BM25BoundTable) void {
@@ -477,6 +487,7 @@ pub const WANDScorer = struct {
     pub fn executeInto(self: *WANDScorer, collector: anytype) !void {
         // Advance all iterators to their first hit, applying doc offset
         for (self.terms.items) |*t| {
+            try self.checkWork();
             t.current = try t.iter.nextScoring();
             if (t.current) |*hit| {
                 hit.doc_id += t.doc_offset;
@@ -488,6 +499,7 @@ pub const WANDScorer = struct {
         // Check if any term has block-max info
         var has_block_max = false;
         for (self.terms.items) |t| {
+            try self.checkWork();
             if (t.block_max != null and !t.exhausted) {
                 has_block_max = true;
                 break;
@@ -512,6 +524,7 @@ pub const WANDScorer = struct {
             const target = collector.nextCandidate(doc);
             if (target > std.math.maxInt(u32)) {
                 for (self.terms.items) |*term| {
+                    try self.checkWork();
                     term.current = null;
                     term.exhausted = true;
                 }
@@ -519,6 +532,7 @@ pub const WANDScorer = struct {
             }
             if (target > doc) {
                 for (self.terms.items) |*term| if (!term.exhausted and term.current.?.doc_id < target) {
+                    try self.checkWork();
                     try self.advancePast(term, @intCast(target));
                 };
                 return true;
@@ -538,6 +552,7 @@ pub const WANDScorer = struct {
         const block_max = term.block_max.?;
 
         while (!term.exhausted) {
+            try self.checkWork();
             const hit = term.current orelse break;
             if (try self.seekCandidate(collector, hit.doc_id)) continue;
             self.pivots_scored += 1;
@@ -564,13 +579,14 @@ pub const WANDScorer = struct {
             const ordered_tie_is_worse = current_bound == threshold and
                 worst_doc_id != null and hit.doc_id >= worst_doc_id.?;
             if (current_bound < threshold or ordered_tie_is_worse) {
-                const advanced = try term.iter.advanceToCompetitiveBlockWithScorer(
+                const advanced = try term.iter.advanceToCompetitiveBlockWithAuthority(
                     block_max,
                     threshold,
                     term.bm25_scorer,
                     term.idf,
                     self.bound_table,
                     true,
+                    self.authority,
                 );
                 self.next_in_advance += 1;
                 self.chunks_skipped +|= advanced.chunks_skipped;
@@ -592,9 +608,11 @@ pub const WANDScorer = struct {
     /// Brute-force: score every document that appears in any term's postings.
     fn executeBruteForce(self: *WANDScorer, collector: anytype) !void {
         while (true) {
+            try self.checkWork();
             // Find the minimum doc_id across all active terms
             var min_doc: ?u32 = null;
             for (self.terms.items) |t| {
+                try self.checkWork();
                 if (t.exhausted) continue;
                 const doc_id = t.current.?.doc_id;
                 if (min_doc == null or doc_id < min_doc.?) {
@@ -607,6 +625,7 @@ pub const WANDScorer = struct {
             // Score this document across all terms that contain it
             var score: f32 = 0;
             for (self.terms.items) |*t| {
+                try self.checkWork();
                 if (t.exhausted) continue;
                 if (t.current.?.doc_id == min_doc.?) {
                     const hit = t.current.?;
@@ -639,9 +658,11 @@ pub const WANDScorer = struct {
         for (sorted, 0..) |*s, i| s.* = i;
 
         while (true) {
+            try self.checkWork();
             // Count active terms and sort indices by current doc_id
             var active: usize = 0;
             for (sorted) |idx| {
+                try self.checkWork();
                 if (!self.terms.items[idx].exhausted) active += 1;
             }
             if (active == 0) break;
@@ -652,9 +673,11 @@ pub const WANDScorer = struct {
             const terms = self.terms.items;
             var sort_pos: usize = 1;
             while (sort_pos < sorted.len) : (sort_pos += 1) {
+                try self.checkWork();
                 const moving = sorted[sort_pos];
                 var insert_pos = sort_pos;
                 while (insert_pos > 0 and termIndexBefore(terms, moving, sorted[insert_pos - 1])) : (insert_pos -= 1) {
+                    try self.checkWork();
                     sorted[insert_pos] = sorted[insert_pos - 1];
                 }
                 sorted[insert_pos] = moving;
@@ -672,6 +695,7 @@ pub const WANDScorer = struct {
             var cumulative: f32 = 0;
             var pivot_pos: ?usize = null;
             for (sorted, 0..) |idx, pos| {
+                try self.checkWork();
                 const t = &self.terms.items[idx];
                 if (t.exhausted) break;
                 cumulative += self.termMaxImpact(t);
@@ -691,6 +715,7 @@ pub const WANDScorer = struct {
             // Check if all terms up to pivot are at pivot_doc
             var all_at_pivot = true;
             for (sorted[0 .. pivot_pos.? + 1]) |idx| {
+                try self.checkWork();
                 const t = &self.terms.items[idx];
                 if (t.exhausted or t.current.?.doc_id != pivot_doc) {
                     all_at_pivot = false;
@@ -703,6 +728,7 @@ pub const WANDScorer = struct {
                 self.pivots_scored += 1;
                 var score: f32 = 0;
                 for (self.terms.items) |*t| {
+                    try self.checkWork();
                     if (t.exhausted) continue;
                     if (t.current.?.doc_id == pivot_doc) {
                         const hit = t.current.?;
@@ -717,6 +743,7 @@ pub const WANDScorer = struct {
                 // measurable overhead to balanced disjunctions where the
                 // combined global bound prevents chunk pruning.
                 for (self.terms.items) |*t| {
+                    try self.checkWork();
                     if (t.exhausted or t.current.?.doc_id != pivot_doc) continue;
                     t.current = try t.iter.nextScoring();
                     if (t.current) |*hit| {
@@ -735,6 +762,7 @@ pub const WANDScorer = struct {
                 self.pivots_advanced += 1;
                 collector.markLowerBound();
                 for (sorted[0 .. pivot_pos.? + 1]) |idx| {
+                    try self.checkWork();
                     const t = &self.terms.items[idx];
                     if (!t.exhausted and t.current.?.doc_id < pivot_doc) {
                         try self.advancePastWithChunkSkip(t, pivot_doc, threshold, false);
@@ -758,6 +786,7 @@ pub const WANDScorer = struct {
         if (front.exhausted or front.current == null or front.chunk_size == 0) return false;
         if (!front.iter.doc_range_aligned) return self.skipNonCompetitivePostingBlockInterval(collector);
         for (self.terms.items) |*term| {
+            try self.checkWork();
             if (term.exhausted or term.current == null) continue;
             if (term.block_max == null) return false;
             if (!term.iter.doc_range_aligned) return false;
@@ -767,12 +796,15 @@ pub const WANDScorer = struct {
 
         var skipped_blocks: u64 = 0;
         while (true) {
+            try self.checkWork();
             var candidate_chunk: ?u32 = null;
             for (self.terms.items) |*term| {
+                try self.checkWork();
                 if (term.block_cursor) |cursor| candidate_chunk = if (candidate_chunk) |current| @min(current, cursor.chunk_id) else cursor.chunk_id;
             }
             const chunk_id = candidate_chunk orelse {
                 for (self.terms.items) |*term| {
+                    try self.checkWork();
                     term.current = null;
                     term.exhausted = true;
                 }
@@ -782,6 +814,7 @@ pub const WANDScorer = struct {
 
             var bound: f32 = 0;
             for (self.terms.items) |*term| {
+                try self.checkWork();
                 const cursor = term.block_cursor orelse continue;
                 if (cursor.chunk_id != chunk_id) continue;
                 bound += term.iter.blockCursorImpactWithScorer(
@@ -797,6 +830,7 @@ pub const WANDScorer = struct {
             if (bound > threshold or (bound == threshold and tie_can_beat)) {
                 if (skipped_blocks == 0) return false;
                 for (self.terms.items) |*term| {
+                    try self.checkWork();
                     const cursor = term.block_cursor orelse {
                         term.current = null;
                         term.exhausted = true;
@@ -816,6 +850,7 @@ pub const WANDScorer = struct {
 
             skipped_blocks +|= 1;
             for (self.terms.items) |*term| {
+                try self.checkWork();
                 if (term.block_cursor) |*cursor| {
                     if (cursor.chunk_id == chunk_id and !try term.iter.advanceBlockCursor(cursor)) term.block_cursor = null;
                 }
@@ -837,6 +872,7 @@ pub const WANDScorer = struct {
         var doc_offset: ?u32 = null;
         var scan_floor: u32 = std.math.maxInt(u32);
         for (self.terms.items) |*term| {
+            try self.checkWork();
             if (term.exhausted or term.current == null) {
                 term.block_cursor = null;
                 continue;
@@ -858,13 +894,16 @@ pub const WANDScorer = struct {
         var skipped_intervals: u64 = 0;
         var skipped_blocks: u64 = 0;
         while (true) {
+            try self.checkWork();
             var interval_end: ?u32 = null;
             for (self.terms.items) |term| {
+                try self.checkWork();
                 const cursor = term.block_cursor orelse continue;
                 interval_end = if (interval_end) |end| @min(end, cursor.max_doc) else cursor.max_doc;
             }
             const end = interval_end orelse {
                 for (self.terms.items) |*term| {
+                    try self.checkWork();
                     term.current = null;
                     term.exhausted = true;
                 }
@@ -874,6 +913,7 @@ pub const WANDScorer = struct {
 
             var bound: f32 = 0;
             for (self.terms.items) |*term| {
+                try self.checkWork();
                 const cursor = term.block_cursor orelse continue;
                 if (cursor.min_doc > end) continue;
                 bound += term.iter.blockCursorImpactWithScorer(
@@ -890,6 +930,7 @@ pub const WANDScorer = struct {
             if (competitive) {
                 if (skipped_intervals == 0) return false;
                 for (self.terms.items) |*term| {
+                    try self.checkWork();
                     const cursor = term.block_cursor orelse {
                         term.current = null;
                         term.exhausted = true;
@@ -913,6 +954,7 @@ pub const WANDScorer = struct {
             skipped_intervals +|= 1;
             if (end == std.math.maxInt(u32)) {
                 for (self.terms.items) |*term| {
+                    try self.checkWork();
                     term.current = null;
                     term.exhausted = true;
                 }
@@ -921,6 +963,7 @@ pub const WANDScorer = struct {
             }
             scan_floor = end + 1;
             for (self.terms.items) |*term| {
+                try self.checkWork();
                 if (term.block_cursor) |*cursor| {
                     if (cursor.max_doc == end) {
                         skipped_blocks +|= 1;
@@ -948,6 +991,7 @@ pub const WANDScorer = struct {
     /// `next_in_advance` continues to count one tick per advance call so the
     /// `wand-skip-bench` ratios stay comparable across implementations.
     fn advancePast(self: *WANDScorer, t: *TermState, target: u32) !void {
+        try self.checkWork();
         if (t.exhausted or t.current == null) {
             t.exhausted = true;
             return;
@@ -987,6 +1031,7 @@ pub const WANDScorer = struct {
         var others_max: ?f32 = null;
 
         while (!t.exhausted) {
+            try self.checkWork();
             const current_cursor = t.iter.currentBlockCursor() orelse return;
             const chunk_idx: u32 = @intCast(current_cursor.ordinal);
 
@@ -1015,6 +1060,7 @@ pub const WANDScorer = struct {
             if (others_max == null) {
                 var sum: f32 = 0;
                 for (self.terms.items) |*other| {
+                    try self.checkWork();
                     if (other == t) continue;
                     if (other.exhausted) continue;
                     // Other iterators can move into later chunks while this
@@ -1481,6 +1527,94 @@ test "WAND failed term admission releases owned metadata" {
     const iterator: inverted.PostingsIterator = .{ .alloc = std.testing.allocator, .is_one_hit = true, .metadata_owner = .{ .ptr = &owner, .retain = Owner.retain, .release = Owner.release } };
     try std.testing.expectError(error.OutOfMemory, wand.addTerm(iterator, 1, null, 1024, 0));
     try std.testing.expectEqual(@as(usize, 0), owner.refs);
+}
+
+test "controlled WAND scoring stops original lifetime failures and retires partial results" {
+    const a = std.testing.allocator;
+    var builder = inverted.InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    for (0..512) |doc| try builder.addDocument(@intCast(doc), &.{
+        .{ .term = "first", .freq = 1, .norm = 2 },
+        .{ .term = "second", .freq = 2, .norm = 2 },
+    });
+    const section = try builder.build();
+    defer a.free(section);
+    var reader = try inverted.InvertedIndexReader.init(a, section);
+    const State = struct {
+        checks: usize = 0,
+        failure: anyerror,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.checks == 3) return self.failure;
+        }
+    };
+    // Real postings exercise the brute-force, single-term and multi-term WAND
+    // paths. A failure after scoring starts must propagate, free collector
+    // output, and leave iterator ownership with the scorer until deinit.
+    for ([_]anyerror{ error.Cancelled, error.Timeout, error.SchedulerClosed }) |failure| {
+        for ([_]usize{ 1, 2 }) |count| {
+            for ([_]bool{ false, true }) |bounded| {
+                var state = State{ .failure = failure };
+                var scorer = WANDScorer.init(a, 512, reader.doc_count, reader.avgDocLen(), .{});
+                defer scorer.deinit();
+                scorer.authority = .{ .context = &state, .check_fn = State.check };
+                for (([_][]const u8{ "first", "second" })[0..count]) |term| {
+                    const lookup = reader.lookup(term) orelse return error.TestExpectedEqual;
+                    try scorer.addTerm(try lookup.iterator(a), lookup.docFreq(), switch (lookup) {
+                        .postings => |postings| if (bounded) postings.block_max else null,
+                        .one_hit => null,
+                    }, switch (lookup) {
+                        .postings => |postings| postings.scoringChunkSize(),
+                        .one_hit => 1024,
+                    }, 0);
+                }
+                try std.testing.expectError(failure, scorer.execute());
+                try std.testing.expectEqual(@as(usize, 3), state.checks);
+                try std.testing.expect(scorer.terms.items[0].current.?.doc_id > 0);
+                try std.testing.expect(scorer.terms.items[0].current.?.doc_id < 512);
+            }
+        }
+    }
+}
+
+test "controlled WAND block pruning checks lifetime while skipping unscored chunks" {
+    const a = std.testing.allocator;
+    var builder = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 2 });
+    defer builder.deinit();
+    for (0..512) |doc| try builder.addDocument(@intCast(doc * 1024), &.{
+        .{ .term = "skip", .freq = 1, .norm = 1 },
+    });
+    const section = try builder.build();
+    defer a.free(section);
+    var reader = try inverted.InvertedIndexReader.init(a, section);
+    const lookup = reader.lookup("skip") orelse return error.TestExpectedEqual;
+    const blocks = switch (lookup) {
+        .postings => |postings| postings.block_max orelse return error.TestExpectedEqual,
+        .one_hit => return error.TestExpectedEqual,
+    };
+    var iter = try lookup.iterator(a);
+    defer iter.deinit();
+    _ = try iter.nextScoring();
+    const State = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 2) return error.Timeout;
+        }
+    };
+    var state: State = .{};
+    try std.testing.expectError(error.Timeout, iter.advanceToCompetitiveBlockWithAuthority(
+        blocks,
+        std.math.floatMax(f32),
+        inverted.BM25TermScorer.init(reader.avgDocLen(), 1, .{}),
+        1,
+        null,
+        true,
+        .{ .context = &state, .check_fn = State.check },
+    ));
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
 }
 
 test "shared heap top k matches full ordering across windows and arrivals" {

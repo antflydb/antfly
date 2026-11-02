@@ -528,7 +528,7 @@ pub fn configureKubernetesCA(
     executor: *std_http_executor.StdHttpExecutor,
     ca_path: []const u8,
 ) !void {
-    const io = executor.io_impl.io();
+    const io = executor.networkIo();
     const now = std.Io.Clock.real.now(io);
     executor.client.ca_bundle.deinit(executor.alloc);
     executor.client.ca_bundle = .empty;

@@ -21,7 +21,28 @@ const threaded_connect_io = @import("antfly_local_sources").common_threaded_conn
 
 const cancellation_poll_interval_ms: i64 = 25;
 
+/// Admission precedes every task or byte of one complete HTTP attempt. The
+/// permit is synchronous and remains owned until nested cancellation has joined.
+pub const TaskAdmission = struct {
+    pub const Permit = struct {
+        context: ?*anyopaque = null,
+        // Move-only, fixed stack storage avoids an extra fallible allocation
+        // after protected capacity has been granted. Providers check their
+        // concrete value's size/alignment and never retain a pointer to this.
+        storage: [512]u8 align(16) = undefined,
+        release_fn: ?*const fn (*Permit) void = null,
+        pub fn release(self: *Permit) void {
+            const finish = self.release_fn orelse return;
+            self.release_fn = null;
+            finish(self);
+        }
+    };
+    context: *anyopaque,
+    acquire: *const fn (*anyopaque) anyerror!Permit,
+};
+
 pub const StdHttpExecutorConfig = struct {
+    task_admission: ?TaskAdmission = null,
     read_buffer_size: usize = 8 * 1024,
     write_buffer_size: usize = 1024,
     max_response_bytes: usize = 4 << 20,
@@ -31,12 +52,18 @@ pub const StdHttpExecutorConfig = struct {
     /// query admission; the finite limit prevents an abnormal fan-out from
     /// permanently growing the owned Threaded executor without bound.
     io_concurrent_limit: u32 = std_http_listener.default_process_io_concurrent_limit,
-    keep_alive: bool = false,
+    keep_alive: bool = true,
+    pool_max_connections: u32 = 20,
+    pool_max_per_host: u32 = 5,
+    pool_max_waiters: u16 = 20,
+    pool_max_wait_bytes: usize = 64 << 20,
+    pool_max_wait_ms: u32 = 5000,
+    outbound_admission: ?*httpx.OutboundAdmission = null,
     /// Resolve host names before opening a concrete IP socket. Zig 0.16's
     /// `HostName.connect` can corrupt its nested lookup future when a winning
     /// connection cancels the remaining attempts. This transport avoids that
     /// cancellation path and is required for long-lived HA replication loops.
-    resolve_before_connect: bool = false,
+    resolve_before_connect: bool = true,
     /// Retain a successfully connected DNS result across requests. Keep this
     /// disabled for Kubernetes headless Services: an old Pod can remain
     /// connectable after the Service authority has moved to a new endpoint.
@@ -66,16 +93,17 @@ pub const StdHttpExecutor = struct {
     const IoOwner = enum {
         owned,
         shared,
+        borrowed,
     };
 
     alloc: std.mem.Allocator,
     cfg: StdHttpExecutorConfig,
-    io_impl: *std.Io.Threaded,
-    io_vtable: *std.Io.VTable,
+    io_impl: ?*std.Io.Threaded,
+    io_vtable: ?*std.Io.VTable,
+    borrowed_io: ?std.Io = null,
     io_owner: IoOwner,
     client: std.http.Client,
     resolved_client: httpx.Client,
-    resolved_client_mutex: std.Io.Mutex,
     lifecycle_mutex: std.Io.Mutex,
     idle_cond: std.Io.Condition,
     closing: bool,
@@ -85,12 +113,18 @@ pub const StdHttpExecutor = struct {
     requests_on_current_connection: u32,
 
     pub fn initInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig) void {
-        const io_impl = alloc.create(std.Io.Threaded) catch @panic("OOM");
+        self.initInPlaceFallible(alloc, cfg) catch @panic("OOM");
+    }
+
+    pub fn initInPlaceFallible(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig) !void {
+        const io_impl = try alloc.create(std.Io.Threaded);
+        errdefer alloc.destroy(io_impl);
         io_impl.* = std.Io.Threaded.init(alloc, .{
             .stack_size = cfg.thread_stack_size,
             .concurrent_limit = .limited(cfg.io_concurrent_limit),
         });
-        const io_vtable = threaded_connect_io.createVTable(alloc, io_impl) catch @panic("OOM");
+        errdefer io_impl.deinit();
+        const io_vtable = try threaded_connect_io.createVTable(alloc, io_impl);
         self.* = .{
             .alloc = alloc,
             .cfg = cfg,
@@ -99,7 +133,6 @@ pub const StdHttpExecutor = struct {
             .io_owner = .owned,
             .client = undefined,
             .resolved_client = undefined,
-            .resolved_client_mutex = .init,
             .lifecycle_mutex = .init,
             .idle_cond = .init,
             .closing = false,
@@ -128,7 +161,6 @@ pub const StdHttpExecutor = struct {
             .io_owner = .shared,
             .client = undefined,
             .resolved_client = undefined,
-            .resolved_client_mutex = .init,
             .lifecycle_mutex = .init,
             .idle_cond = .init,
             .closing = false,
@@ -147,6 +179,34 @@ pub const StdHttpExecutor = struct {
         self.resolved_client = httpx.Client.initWithConfig(alloc, safe_io, resolvedClientConfig(cfg));
     }
 
+    /// The enclosing owner supplies a stable, cancellation-safe network view.
+    /// A client owns its connections and joins requests, never the shared Io.
+    pub fn initBorrowedInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig, io: std.Io) void {
+        self.* = .{
+            .alloc = alloc,
+            .cfg = cfg,
+            .io_impl = null,
+            .io_vtable = null,
+            .borrowed_io = io,
+            .io_owner = .borrowed,
+            .client = .{ .allocator = alloc, .io = io, .read_buffer_size = cfg.read_buffer_size, .write_buffer_size = cfg.write_buffer_size },
+            .resolved_client = httpx.Client.initWithConfig(alloc, io, resolvedClientConfig(cfg)),
+            .lifecycle_mutex = .init,
+            .idle_cond = .init,
+            .closing = false,
+            .in_flight = 0,
+            .client_mutex = .init,
+            .reuse_mutex = .init,
+            .requests_on_current_connection = 0,
+        };
+    }
+    fn taskIo(self: *StdHttpExecutor) std.Io {
+        return self.borrowed_io orelse self.io_impl.?.io();
+    }
+    pub fn networkIo(self: *StdHttpExecutor) std.Io {
+        return self.borrowed_io orelse threaded_connect_io.ioWithOwnedVTable(self.io_impl.?, self.io_vtable.?);
+    }
+
     pub fn init(alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig) StdHttpExecutor {
         var self: StdHttpExecutor = undefined;
         self.initInPlace(alloc, cfg);
@@ -154,9 +214,10 @@ pub const StdHttpExecutor = struct {
     }
 
     pub fn deinit(self: *StdHttpExecutor) void {
-        const io = self.io_impl.io();
+        const io = self.taskIo();
         self.lifecycle_mutex.lockUncancelable(io);
         self.closing = true;
+        self.resolved_client.beginShutdown();
         while (self.in_flight != 0) {
             self.idle_cond.waitUncancelable(io, &self.lifecycle_mutex);
         }
@@ -164,10 +225,10 @@ pub const StdHttpExecutor = struct {
 
         self.client.deinit();
         self.resolved_client.deinit();
-        self.alloc.destroy(self.io_vtable);
+        if (self.io_vtable) |vtable| self.alloc.destroy(vtable);
         if (self.io_owner == .owned) {
-            self.io_impl.deinit();
-            self.alloc.destroy(self.io_impl);
+            self.io_impl.?.deinit();
+            self.alloc.destroy(self.io_impl.?);
         }
         self.* = undefined;
     }
@@ -175,6 +236,7 @@ pub const StdHttpExecutor = struct {
     pub fn executor(self: *StdHttpExecutor) common.RequestExecutor {
         return .{
             .ptr = self,
+            .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&self.client.io),
             .vtable = &.{
                 .execute = execute,
                 .execute_stream = executeStream,
@@ -204,6 +266,9 @@ pub const StdHttpExecutor = struct {
         if (effective_req.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
         }
+        if (effective_req.timeout_ms != null and effective_req.timeout_ms.? == 0) return error.Timeout;
+        var permit: ?TaskAdmission.Permit = if (self.cfg.task_admission) |admission| try admission.acquire(admission.context) else null;
+        defer if (permit) |*held| held.release();
         if (effective_req.timeout_ms != null or effective_req.cancellation != null)
             return try self.executeWithControl(alloc, effective_req);
         return try self.executeTransport(alloc, effective_req);
@@ -225,6 +290,9 @@ pub const StdHttpExecutor = struct {
             effective_req.timeout_ms = self.cfg.request_timeout_ms;
         if (effective_req.cancellation) |cancellation| if (cancellation.isCancelled())
             return error.Cancelled;
+        if (effective_req.timeout_ms != null and effective_req.timeout_ms.? == 0) return error.Timeout;
+        var permit: ?TaskAdmission.Permit = if (self.cfg.task_admission) |admission| try admission.acquire(admission.context) else null;
+        defer if (permit) |*held| held.release();
         if (self.cfg.resolve_before_connect or
             effective_req.timeout_ms != null or effective_req.cancellation != null)
         {
@@ -244,13 +312,7 @@ pub const StdHttpExecutor = struct {
         req: common.HttpRequest,
         downstream: common.StreamWriter,
     ) !void {
-        const io = self.io_impl.io();
-        var config = resolvedClientConfig(self.cfg);
-        // Response bytes are handed directly to downstream backpressure; the
-        // buffered-response ceiling is neither useful nor correct here.
-        config.max_response_size = std.math.maxInt(usize);
-        var client = httpx.Client.initWithConfig(std.heap.page_allocator, io, config);
-        defer client.deinit();
+        const client = &self.resolved_client;
 
         const extra_count = @as(usize, @intFromBool(req.content_type != null)) +
             @as(usize, @intFromBool(req.authorization != null));
@@ -302,8 +364,8 @@ pub const StdHttpExecutor = struct {
             .PUT => .PUT,
             .DELETE => .DELETE,
         };
-        if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         var response = try client.requestToWriter(method, req.uri, .{
+            .delivery_observer = if (req.delivery_tracker) |tracker| .{ .context = tracker, .before_send = observeDelivery } else null,
             .headers = header_pairs,
             .max_response_size = if (req.max_response_bytes != null) req.responseLimit(self.cfg.max_response_bytes) else null,
             .body = if (req.body.len == 0) null else req.body,
@@ -324,7 +386,7 @@ pub const StdHttpExecutor = struct {
         req: common.HttpRequest,
         downstream: common.StreamWriter,
     ) !void {
-        const io = threaded_connect_io.ioWithOwnedVTable(self.io_impl, self.io_vtable);
+        const io = self.networkIo();
         if (self.cfg.keep_alive) try self.client_mutex.lock(io);
         defer if (self.cfg.keep_alive) self.client_mutex.unlock(io);
 
@@ -417,17 +479,19 @@ pub const StdHttpExecutor = struct {
     }
 
     fn executeResolved(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
-        const io = self.io_impl.io();
-        // Controlled callers rely on interruptible queueing before the opaque
-        // resolved exchange. Uncontrolled non-persistent transfers use
-        // request-local clients and may overlap safely.
-        const serialize = self.cfg.keep_alive or req.timeout_ms != null or req.cancellation != null;
-        if (serialize) try self.resolved_client_mutex.lock(io);
-        defer if (serialize) self.resolved_client_mutex.unlock(io);
-
-        var local_client = httpx.Client.initWithConfig(std.heap.page_allocator, io, resolvedClientConfig(self.cfg));
-        defer if (!self.cfg.keep_alive) local_client.deinit();
-        const client = if (self.cfg.keep_alive) &self.resolved_client else &local_client;
+        const client = &self.resolved_client;
+        const RequestWait = struct {
+            boundary: @import("antfly_local_sources").common_execution_wait.Boundary,
+            fn begin(raw: ?*anyopaque) !void {
+                const self_wait: *@This() = @ptrCast(@alignCast(raw.?));
+                try self_wait.boundary.beginWait();
+            }
+            fn end(raw: ?*anyopaque) !void {
+                const self_wait: *@This() = @ptrCast(@alignCast(raw.?));
+                try self_wait.boundary.endWait();
+            }
+        };
+        var request_wait: RequestWait = .{ .boundary = req.execution_wait orelse undefined };
 
         const extra_count = @as(usize, @intFromBool(req.content_type != null)) +
             @as(usize, @intFromBool(req.authorization != null));
@@ -457,8 +521,9 @@ pub const StdHttpExecutor = struct {
         // transmission, and response receipt behind one opaque call. Local
         // header construction above can still prove `not_sent`; once this
         // boundary is crossed, any error must conservatively assume delivery.
-        if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         var response = try client.request(method, req.uri, .{
+            .socket_control = if (req.execution_wait != null) .{ .ptr = &request_wait, .wait_begin_fn = RequestWait.begin, .wait_end_fn = RequestWait.end } else null,
+            .delivery_observer = if (req.delivery_tracker) |tracker| .{ .context = tracker, .before_send = observeDelivery } else null,
             .headers = header_pairs,
             .max_response_size = req.responseLimit(self.cfg.max_response_bytes),
             .body = if (req.body.len == 0) null else req.body,
@@ -514,6 +579,11 @@ pub const StdHttpExecutor = struct {
         };
     }
 
+    fn observeDelivery(raw: *anyopaque) void {
+        const tracker: *common.RequestDeliveryTracker = @ptrCast(@alignCast(raw));
+        tracker.markMayHaveBeenSent();
+    }
+
     fn resolvedClientConfig(cfg: StdHttpExecutorConfig) httpx.ClientConfig {
         return .{
             .timeouts = .{
@@ -524,8 +594,21 @@ pub const StdHttpExecutor = struct {
             },
             .retry_policy = .{ .max_retries = 0 },
             .redirect_policy = .{ .follow_redirects = false },
-            .max_response_size = cfg.max_response_bytes,
-            .keep_alive = false,
+            // Streaming output is sink-budgeted; buffered calls lower this per request.
+            .max_response_size = std.math.maxInt(usize),
+            .cookies_enabled = false,
+            .keep_alive = cfg.keep_alive,
+            .pool_max_connections = cfg.pool_max_connections,
+            .pool_max_per_host = cfg.pool_max_per_host,
+            .pool_max_requests_per_connection = cfg.max_requests_per_connection,
+            .outbound_admission = cfg.outbound_admission,
+            .outbound = .{
+                .max_active = cfg.pool_max_connections,
+                .max_per_endpoint = cfg.pool_max_per_host,
+                .max_waiters = cfg.pool_max_waiters,
+                .max_wait_bytes = cfg.pool_max_wait_bytes,
+                .max_wait_ms = cfg.pool_max_wait_ms,
+            },
             .cache_resolved_addresses = cfg.cache_resolved_addresses,
         };
     }
@@ -560,7 +643,7 @@ pub const StdHttpExecutor = struct {
             }
         };
 
-        const io = self.io_impl.io();
+        const io = self.taskIo();
         const deadline = if (req.timeout_ms) |value|
             std.Io.Clock.Timestamp.fromNow(io, .{
                 .raw = std.Io.Duration.fromMilliseconds(@intCast(value)),
@@ -688,7 +771,7 @@ pub const StdHttpExecutor = struct {
     }
 
     fn executeDirect(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
-        const io = threaded_connect_io.ioWithOwnedVTable(self.io_impl, self.io_vtable);
+        const io = self.networkIo();
         // A controlled request queued behind the serialized keep-alive client
         // must remain interruptible before it acquires a socket of its own.
         if (self.cfg.keep_alive) try self.client_mutex.lock(io);
@@ -835,7 +918,7 @@ pub const StdHttpExecutor = struct {
     }
 
     fn beginRequest(self: *StdHttpExecutor) !void {
-        const io = self.io_impl.io();
+        const io = self.taskIo();
         self.lifecycle_mutex.lockUncancelable(io);
         defer self.lifecycle_mutex.unlock(io);
 
@@ -844,7 +927,7 @@ pub const StdHttpExecutor = struct {
     }
 
     fn endRequest(self: *StdHttpExecutor) void {
-        const io = self.io_impl.io();
+        const io = self.taskIo();
         self.lifecycle_mutex.lockUncancelable(io);
         defer self.lifecycle_mutex.unlock(io);
 
@@ -853,7 +936,7 @@ pub const StdHttpExecutor = struct {
     }
 
     fn reserveRequestKeepAlive(self: *StdHttpExecutor) bool {
-        const io = self.io_impl.io();
+        const io = self.taskIo();
         self.reuse_mutex.lockUncancelable(io);
         defer self.reuse_mutex.unlock(io);
 
@@ -869,7 +952,7 @@ pub const StdHttpExecutor = struct {
     }
 
     fn recordCompletedRequest(self: *StdHttpExecutor, request_keep_alive: bool, connection_closing: bool) void {
-        const io = self.io_impl.io();
+        const io = self.taskIo();
         self.reuse_mutex.lockUncancelable(io);
         defer self.reuse_mutex.unlock(io);
 
@@ -972,10 +1055,10 @@ test "std http executor retains socket write failures and uncertain delivery" {
     const uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(uri);
     for ([_]common.Method{ .GET, .POST }) |method| {
-        var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
+        var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true, .resolve_before_connect = false });
         defer executor.deinit();
-        Inject.upstream = executor.io_vtable.operate;
-        executor.io_vtable.operate = Inject.operate;
+        Inject.upstream = executor.io_vtable.?.operate;
+        executor.io_vtable.?.operate = Inject.operate;
         Inject.writes.store(0, .monotonic);
         var delivery: common.RequestDeliveryTracker = .{};
         try std.testing.expectError(error.ConnectionResetByPeer, executor.executor().execute(std.testing.allocator, .{
@@ -1029,10 +1112,10 @@ test "std http executor rejects truncated response without replaying a delivered
         "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nnull",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nnull",
     }) |response| for ([_]common.Method{ .GET, .POST }) |method| for ([_]bool{ false, true }) |streaming| {
-        var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
+        var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true, .resolve_before_connect = false });
         defer executor.deinit();
-        Inject.upstream = executor.io_vtable.operate;
-        executor.io_vtable.operate = Inject.operate;
+        Inject.upstream = executor.io_vtable.?.operate;
+        executor.io_vtable.?.operate = Inject.operate;
         Inject.response = response;
         Inject.reads.store(0, .monotonic);
         Inject.writes.store(0, .monotonic);
@@ -1100,7 +1183,7 @@ test "std http executor owns a finite controlled request worker budget" {
     });
     defer executor.deinit();
 
-    try std.testing.expectEqual(std.Io.Limit.limited(7), executor.io_impl.concurrent_limit);
+    try std.testing.expectEqual(std.Io.Limit.limited(7), executor.io_impl.?.concurrent_limit);
 }
 
 test "std http executor applies the safe connector to both transports" {
@@ -1109,7 +1192,7 @@ test "std http executor applies the safe connector to both transports" {
 
     try std.testing.expect(executor.client.io.vtable == executor.io_vtable);
     try std.testing.expect(executor.resolved_client.io.vtable == executor.io_vtable);
-    try std.testing.expect(executor.io_impl.io().vtable.netConnectIp != executor.io_vtable.netConnectIp);
+    try std.testing.expect(executor.io_impl.?.io().vtable.netConnectIp != executor.io_vtable.?.netConnectIp);
 }
 
 test "controlled HTTP completion time arbitrates the absolute deadline" {
@@ -1191,7 +1274,7 @@ test "controlled HTTP completion time arbitrates the absolute deadline" {
     // survive cancellation and retain its ownership exactly once.
     var executor = StdHttpExecutor.init(std.testing.allocator, .{});
     defer executor.deinit();
-    const task_io = executor.io_impl.io();
+    const task_io = executor.io_impl.?.io();
     var raced = StdHttpExecutor.ControlledRequestState{};
     raced.result = common.HttpResponse{
         .status = 200,
@@ -1461,13 +1544,13 @@ test "resolved std http executor bounds queued requests before delivery" {
 
     var executor = StdHttpExecutor.init(std.testing.allocator, .{
         .resolve_before_connect = true,
+        .pool_max_connections = 1,
+        .pool_max_per_host = 1,
     });
     defer executor.deinit();
 
-    const io = executor.io_impl.io();
-    executor.resolved_client_mutex.lockUncancelable(io);
-    var client_locked = true;
-    defer if (client_locked) executor.resolved_client_mutex.unlock(io);
+    var held = try executor.resolved_client.outbound.acquire("held", 1, .{});
+    defer held.release();
 
     var timeout_delivery: common.RequestDeliveryTracker = .{};
     try std.testing.expectError(error.Timeout, executor.executor().execute(std.testing.allocator, .{
@@ -1499,8 +1582,7 @@ test "resolved std http executor bounds queued requests before delivery" {
     try std.testing.expectEqual(common.RequestDeliveryTracker.State.not_sent, cancelled_delivery.load());
     try std.testing.expectEqual(@as(usize, 0), app.calls.load(.acquire));
 
-    executor.resolved_client_mutex.unlock(io);
-    client_locked = false;
+    try std.testing.expectEqual(@as(usize, 0), executor.resolved_client.outbound.snapshot().waiting);
 }
 
 test "std http executor retires pooled connection before configured cap" {
@@ -1562,12 +1644,11 @@ test "std http executor cancellation interrupts a request queued for the pooled 
         }
     };
 
-    var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
+    var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true, .pool_max_connections = 1 });
     defer executor.deinit();
-    const io = threaded_connect_io.ioWithOwnedVTable(executor.io_impl, executor.io_vtable);
-    executor.client_mutex.lockUncancelable(io);
-    var client_locked = true;
-    defer if (client_locked) executor.client_mutex.unlock(io);
+    const io = threaded_connect_io.ioWithOwnedVTable(executor.io_impl.?, executor.io_vtable.?);
+    var held = try executor.resolved_client.outbound.acquire("held", 1, .{});
+    defer held.release();
 
     var cancellation: common.RequestCancellation = .{};
     var request_state = RequestThread{
@@ -1577,10 +1658,7 @@ test "std http executor cancellation interrupts a request queued for the pooled 
     var request_thread = try std.testing.io.concurrent(RequestThread.run, .{&request_state});
     var request_joined = false;
     defer if (!request_joined) {
-        if (client_locked) {
-            executor.client_mutex.unlock(io);
-            client_locked = false;
-        }
+        held.release();
         request_thread.await(std.testing.io);
     };
 
@@ -1603,8 +1681,7 @@ test "std http executor cancellation interrupts a request queued for the pooled 
     }
     const cancelled_while_queued = request_state.outcome.load(.acquire) == 1;
 
-    executor.client_mutex.unlock(io);
-    client_locked = false;
+    held.release();
     request_thread.await(std.testing.io);
     request_joined = true;
     try std.testing.expect(cancelled_while_queued);
@@ -1696,4 +1773,209 @@ test "std http executor cancellation interrupts an active response wait" {
     try std.testing.expect(app.exited.load(.acquire));
     try group.await(task_io.io());
     group_active = false;
+}
+
+test "std http executor and I/O owner reuse one connection across buffered and streamed requests" {
+    const Fixture = struct {
+        io: std.Io,
+        listener: *std.Io.net.Server,
+        requests: std.atomic.Value(usize) = .init(0),
+        fn serve(self: *@This()) !void {
+            const peer = try self.listener.accept(self.io);
+            defer peer.close(self.io);
+            var read_buffer: [4096]u8 = undefined;
+            var reader = peer.reader(self.io, &read_buffer);
+            var writer = peer.writer(self.io, &.{});
+            for (0..3) |i| {
+                var matched: usize = 0;
+                while (matched < 4) {
+                    const byte = try reader.interface.takeByte();
+                    matched = if (byte == "\r\n\r\n"[matched]) matched + 1 else if (byte == '\r') 1 else 0;
+                }
+                _ = self.requests.fetchAdd(1, .acq_rel);
+                try writer.interface.writeAll(if (i == 2)
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                else
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok");
+                try writer.interface.flush();
+            }
+        }
+    };
+    const Sink = struct {
+        bytes: usize = 0,
+        fn start(_: *anyopaque, _: std.mem.Allocator, response: common.StreamingResponse) !void {
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+        }
+        fn write(raw: *anyopaque, bytes: []const u8) !void {
+            @as(*@This(), @ptrCast(@alignCast(raw))).bytes += bytes.len;
+        }
+        fn flush(_: *anyopaque) !void {}
+        fn writer(self: *@This()) common.StreamWriter {
+            return .{ .ptr = self, .vtable = &.{ .start = start, .write_all = write, .flush = flush } };
+        }
+    };
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |borrowed_io| {
+        var listener = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(io, .{ .reuse_address = true });
+        defer listener.deinit(io);
+        var fixture: Fixture = .{ .io = io, .listener = &listener };
+        var serving = try io.concurrent(Fixture.serve, .{&fixture});
+        defer serving.cancel(io) catch {};
+        const uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+        defer std.testing.allocator.free(uri);
+        var owned: StdHttpExecutor = undefined;
+        var borrowed: @import("io_http_executor.zig").IoHttpExecutor = undefined;
+        if (borrowed_io) borrowed = @import("io_http_executor.zig").IoHttpExecutor.init(std.testing.allocator, io, .{ .pool_max_connections = 1 }) else owned.initInPlace(std.testing.allocator, .{ .pool_max_connections = 1 });
+        defer if (borrowed_io) borrowed.deinit() else owned.deinit();
+        const executor = if (borrowed_io) borrowed.executor() else owned.executor();
+        const client = if (borrowed_io) &borrowed.client else &owned.resolved_client;
+        const req: common.HttpRequest = .{ .method = .GET, .uri = uri, .timeout_ms = 1000 };
+        var first = try executor.execute(std.testing.allocator, req);
+        defer first.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("ok", first.body);
+        try std.testing.expectEqual(@as(usize, 1), client.pool.stats().idle);
+        var sink: Sink = .{};
+        try std.testing.expect((try executor.executeStream(std.testing.allocator, req, sink.writer())).?);
+        try std.testing.expectEqual(@as(usize, 2), sink.bytes);
+        try std.testing.expectEqual(@as(usize, 1), client.pool.stats().idle);
+        var third = try executor.execute(std.testing.allocator, req);
+        defer third.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("ok", third.body);
+        try serving.await(io);
+        try std.testing.expectEqual(@as(usize, 3), fixture.requests.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), client.pool.stats().total);
+        try std.testing.expectEqual(@as(usize, 0), client.outbound.snapshot().active);
+        try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
+    }
+}
+
+test "remote attempt owner transport construction unwinds allocation failures" {
+    const Fixture = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var executor_: StdHttpExecutor = undefined;
+            try executor_.initInPlaceFallible(allocator, .{ .io_concurrent_limit = 2 });
+            defer executor_.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "std http executor borrowed owner admits before tasks and retires permits before client retirement" {
+    const Admission = struct {
+        executor: *StdHttpExecutor,
+        allowed: bool = false,
+        calls: usize = 0,
+        acquired: usize = 0,
+        released: usize = 0,
+        release_before_end: bool = false,
+        fn acquire(raw: *anyopaque) !TaskAdmission.Permit {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), self.executor.in_flight);
+            if (!self.allowed) return error.RaftOutboundCapacityUnavailable;
+            self.acquired += 1;
+            return .{ .context = self, .release_fn = release };
+        }
+        fn release(permit: *TaskAdmission.Permit) void {
+            const self: *@This() = @ptrCast(@alignCast(permit.context.?));
+            self.released += 1;
+            self.release_before_end = self.executor.in_flight == 1;
+        }
+    };
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(6) });
+    defer io_impl.deinit();
+    var executor: StdHttpExecutor = undefined;
+    var admission: Admission = .{ .executor = &executor };
+    executor.initBorrowedInPlace(std.testing.allocator, .{ .request_timeout_ms = 0, .resolve_before_connect = false, .task_admission = .{ .context = &admission, .acquire = Admission.acquire } }, io_impl.io());
+    defer executor.deinit();
+    try std.testing.expect(executor.io_impl == null and executor.io_vtable == null);
+    try std.testing.expectError(error.RaftOutboundCapacityUnavailable, executor.executor().execute(std.testing.allocator, .{ .method = .GET, .uri = "" }));
+    try std.testing.expectEqual(@as(usize, 0), executor.in_flight);
+    try std.testing.expectEqual(@as(usize, 0), admission.released);
+    var cancellation: common.RequestCancellation = .{};
+    cancellation.cancel();
+    try std.testing.expectError(error.Cancelled, executor.executor().execute(std.testing.allocator, .{ .method = .GET, .uri = "", .cancellation = &cancellation }));
+    try std.testing.expectError(error.Timeout, executor.executor().execute(std.testing.allocator, .{ .method = .GET, .uri = "", .timeout_ms = 0 }));
+    try std.testing.expectEqual(@as(usize, 1), admission.calls);
+    admission.allowed = true;
+    if (executor.executor().execute(std.testing.allocator, .{ .method = .GET, .uri = "" })) |unexpected| {
+        var response = unexpected;
+        response.deinit(std.testing.allocator);
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expect(err != error.RaftOutboundCapacityUnavailable);
+    try std.testing.expectEqual(@as(usize, 1), admission.acquired);
+    try std.testing.expectEqual(@as(usize, 1), admission.released);
+    try std.testing.expect(admission.release_before_end);
+    try std.testing.expectEqual(@as(usize, 0), io_impl.busy_count);
+}
+
+test "std http executor borrowed clients isolate cancellation on one shared network owner" {
+    const App = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        fn execute(raw: *anyopaque, a: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.endsWith(u8, req.uri, "/slow")) {
+                self.entered.store(true, .release);
+                const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
+                while (!cancellation.isCancelled()) sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 1);
+            }
+            return .{ .status = 200, .body = try a.dupe(u8, "ok") };
+        }
+    };
+    const Slow = struct {
+        executor: common.RequestExecutor,
+        uri: []const u8,
+        cancellation: *common.RequestCancellation,
+        outcome: std.atomic.Value(u8) = .init(0),
+        fn run(self: *@This()) void {
+            var response = self.executor.execute(std.testing.allocator, .{ .method = .GET, .uri = self.uri, .cancellation = self.cancellation, .timeout_ms = 5000 }) catch |err| {
+                self.outcome.store(if (err == error.Cancelled) 1 else 2, .release);
+                return;
+            };
+            response.deinit(std.testing.allocator);
+            self.outcome.store(3, .release);
+        }
+    };
+    var app: App = .{};
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{ .serve_in_connection_threads = true }, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const base = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    const slow_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/slow", .{base});
+    defer std.testing.allocator.free(slow_uri);
+    var network = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(24) });
+    defer network.deinit();
+    const vtable = try threaded_connect_io.createVTable(std.testing.allocator, &network);
+    defer std.testing.allocator.destroy(vtable);
+    const network_io = threaded_connect_io.ioWithOwnedVTable(&network, vtable);
+    var slow_client: StdHttpExecutor = undefined;
+    slow_client.initBorrowedInPlace(std.testing.allocator, .{}, network_io);
+    defer slow_client.deinit();
+    var sibling: StdHttpExecutor = undefined;
+    sibling.initBorrowedInPlace(std.testing.allocator, .{ .keep_alive = false }, network_io);
+    defer sibling.deinit();
+    try std.testing.expect(slow_client.io_impl == null and sibling.io_impl == null);
+    var cancellation: common.RequestCancellation = .{};
+    defer cancellation.cancel();
+    var slow: Slow = .{ .executor = slow_client.executor(), .uri = slow_uri, .cancellation = &cancellation };
+    var caller = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer caller.deinit();
+    var group: std.Io.Group = .init;
+    defer group.cancel(caller.io());
+    try group.concurrent(caller.io(), Slow.run, .{&slow});
+    for (0..2000) |_| {
+        if (app.entered.load(.acquire)) break;
+        sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 1);
+    }
+    try std.testing.expect(app.entered.load(.acquire));
+    for (0..20) |index| {
+        if (index == 1) cancellation.cancel();
+        var response = try sibling.executor().execute(std.testing.allocator, .{ .method = .GET, .uri = base, .timeout_ms = 2000 });
+        defer response.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("ok", response.body);
+    }
+    try group.await(caller.io());
+    try std.testing.expectEqual(@as(u8, 1), slow.outcome.load(.acquire));
+    try std.testing.expectEqual(std.Io.Limit.limited(24), network.concurrent_limit);
 }

@@ -38,6 +38,10 @@ pub const SourceArtifact = struct {
         std.crypto.hash.Blake3.hash(encoded, &result, .{});
         return result;
     }
+
+    pub fn digestWithAdmission(self: SourceArtifact, alloc: std.mem.Allocator, control: @import("antfly_local_sources").common_read_admission.Port) ![32]u8 {
+        return @import("../storage/restore_plan_codec.zig").digestValue(self, alloc, control, std.math.maxInt(usize));
+    }
 };
 
 pub const ProvisioningProjection = struct {

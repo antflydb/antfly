@@ -29,10 +29,15 @@ pub const BatchAppendResult = native.BatchAppendResult;
 pub const CommitBackend = if (storage_source_options.control_only) client.CommitBackend else native.CommitBackend;
 pub const StorageBackend = if (storage_source_options.control_only) client.StorageBackend else native.StorageBackend;
 
+pub const RecoveryPosition = if (storage_source_options.control_only) client.RecoveryPosition else native.RecoveryPosition;
+pub const RecoveryAppendResult = if (storage_source_options.control_only) client.RecoveryAppendResult else native.RecoveryAppendResult;
+
 pub fn appendAt(wal: *WAL, expected_lsn: u64, data: []const u8) !u64 {
-    if (storage_source_options.control_only) return wal.appendAt(expected_lsn, data);
-    const original_next_lsn = wal.next_lsn;
-    wal.next_lsn = expected_lsn;
-    errdefer wal.next_lsn = original_next_lsn;
-    return wal.append(data);
+    return wal.appendAt(expected_lsn, data);
+}
+
+/// Native and compiled-owner snapshots borrow the same original authority.
+pub fn lastLsnWithAdmission(wal: *WAL, control: @import("antfly_local_sources").common_read_admission.Port) !u64 {
+    if (storage_source_options.control_only) return wal.lastLsnWithAdmission(control);
+    return wal.lastLsnSnapshotWithAdmission(control);
 }

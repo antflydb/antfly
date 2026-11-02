@@ -30,7 +30,21 @@ pub const CreateContext = struct {
 pub const OwnedRuntime = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    callback_dispatch: @import("../named_callback.zig").Dispatch = Boundary.local_dispatch,
+    const admission = @import("../../common/read_admission.zig");
+    const Stop = *const fn (*anyopaque, admission.Port) anyerror!void;
+    const Boundary = @import("../named_callback.zig").Boundary(struct { stop_with_admission: Stop });
+
+    pub fn stopWithAdmission(self: OwnedRuntime, original: admission.Port) !void {
+        const callback = self.vtable.stop_with_admission orelse return error.ExecutionWaitUnsupported;
+        var relay: admission.ExecutionErrorRelay = .{};
+        const borrowed = try relay.bind(original);
+        Boundary.call("stop_with_admission", self.callback_dispatch, callback, .{ self.ptr, borrowed }) catch |cause| return relay.errors.rejection orelse cause;
+        if (relay.errors.rejection) |cause| return cause;
+    }
+
     pub const VTable = struct {
+        stop_with_admission: ?Stop = null,
         deinit: *const fn (*anyopaque) void,
         start: *const fn (*anyopaque) anyerror!void,
         stop: *const fn (*anyopaque) bool,

@@ -145,6 +145,16 @@ pub const BackgroundPublisher = struct {
         return self.runOnceWithToken(.{ .io = self.io, .requested = &self.stop_requested, .cooperative = cancellation });
     }
 
+    pub fn runOnceWithMaintenance(self: *BackgroundPublisher, parent: maintenance_cancellation.Token) !PublishRunStats {
+        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = parent };
+        return self.runOnceWithToken(.{
+            .io = self.io,
+            .requested = &self.stop_requested,
+            .cooperative = bridge.token(),
+            .execution = parent.execution,
+        });
+    }
+
     /// Both the standalone publisher and managed runtime honor pending-tail
     /// deadlines even when their normal maintenance poll is much longer.
     pub fn nextWakeDelayMs(self: *BackgroundPublisher, poll_ms: u64) u64 {
@@ -154,16 +164,19 @@ pub const BackgroundPublisher = struct {
     }
 
     fn runOnceWithToken(self: *BackgroundPublisher, cancellation: maintenance_cancellation.Token) !PublishRunStats {
-        try self.run_mutex.lock(self.io);
+        try cancellation.lock(&self.run_mutex);
         defer self.run_mutex.unlock(self.io);
-        const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
-        defer self.catalog.freeNamespaces(self.alloc, namespaces);
+        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
+        var scope: catalog_service.CatalogService.Scope = .{};
+        const catalog = if (cancellation.execution != null) scope.bind(self.catalog, bridge.readContext()) else self.catalog;
+        const namespaces = try catalog.listNamespacesAlloc(self.alloc);
+        defer catalog.freeNamespaces(self.alloc, namespaces);
 
         var stats = PublishRunStats{};
         self.budget_backoff.beginPass();
         self.coalescing.beginPass();
         for (namespaces) |namespace| {
-            try cancellation.check();
+            try cancellation.ownerCheckpoint();
             self.coalescing.touch(namespace.name);
             const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
             // Eligibility precedes all document loading and impact prediction.
@@ -172,7 +185,7 @@ pub const BackgroundPublisher = struct {
                 stats.budget_rejected_namespaces += 1;
                 continue;
             }
-            var status = self.catalog.buildStatusUntil(namespace.name, cancellation) catch |err| switch (err) {
+            var status = catalog.buildStatusUntil(namespace.name, cancellation) catch |err| switch (err) {
                 error.LakeSidecarBuildBudgetExceeded => {
                     self.coalescing.suppressWake(namespace.name);
                     try self.budget_backoff.reject(self.alloc, namespace.name, std.Io.Timestamp.now(self.io, .awake).toNanoseconds());
@@ -201,14 +214,17 @@ pub const BackgroundPublisher = struct {
                 continue;
             }
 
+            var lease_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
             var held_lease: ?work_lease.HeldLease = null;
             var held_bootstrap_lease: ?work_lease.HeldBootstrapLease = null;
             // Bootstrap and established publications use the same durable
             // HEAD coordination record and monotonically increasing fence.
             if (self.lease_provider) |provider| {
+                lease_bridge.maintenance = cancellation.withContext(provider.context);
+                const scoped_provider = provider.withContext(lease_bridge.readContext());
                 if (status.head_version == 0) {
                     held_bootstrap_lease = try work_lease.acquireBootstrapHeld(
-                        provider,
+                        scoped_provider,
                         self.io,
                         namespace.name,
                         self.lease_owner_id orelse return error.MissingLeaseOwner,
@@ -221,7 +237,7 @@ pub const BackgroundPublisher = struct {
                     if (held_bootstrap_lease.?.acquisition.took_over) stats.lease_takeovers += 1;
                 } else {
                     held_lease = try work_lease.acquireHeld(
-                        provider,
+                        scoped_provider,
                         self.io,
                         namespace.name,
                         self.lease_owner_id orelse return error.MissingLeaseOwner,
@@ -248,12 +264,12 @@ pub const BackgroundPublisher = struct {
             else
                 null;
             const build_cancellation = if (held_lease) |*lease|
-                lease.cancellation(cancellation)
+                try lease.cancellation(cancellation)
             else if (held_bootstrap_lease) |*lease|
-                lease.cancellation(cancellation)
+                try lease.cancellation(cancellation)
             else
                 cancellation;
-            var result = self.catalog.buildNamespaceGuardedUntil(
+            var result = catalog.buildNamespaceGuardedUntil(
                 namespace.name,
                 publication_guard,
                 build_cancellation,

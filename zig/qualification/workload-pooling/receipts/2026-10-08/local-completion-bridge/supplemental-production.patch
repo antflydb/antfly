@@ -1,0 +1,3304 @@
+diff --git a/zig/lib/runtime/src/runtime_http_abi.zig b/zig/lib/runtime/src/runtime_http_abi.zig
+index 277f294f89..6fe6f0a540 100644
+--- a/zig/lib/runtime/src/runtime_http_abi.zig
++++ b/zig/lib/runtime/src/runtime_http_abi.zig
+@@ -131,11 +131,21 @@ pub const CancellationView = extern struct {
+ /// Transport-owned response sink used by independently generated handlers.
+ /// `start` publishes streaming response headers, `write` transfers one body chunk,
+ /// and `close` commits the terminating frame. Callbacks are request-scoped.
++pub const ExecutionWait = extern struct {
++    context: ?*anyopaque = null,
++    begin: ?*const fn (?*anyopaque) callconv(.c) CallbackStatus = null,
++    end: ?*const fn (?*anyopaque) callconv(.c) CallbackStatus = null,
++};
++
+ pub const StreamSink = extern struct {
+     context: ?*anyopaque = null,
+     start: ?*const fn (?*anyopaque, u16, Bytes, HeaderList) callconv(.c) CallbackStatus = null,
+     write: ?*const fn (?*anyopaque, Bytes) callconv(.c) CallbackStatus = null,
+     close: ?*const fn (?*anyopaque) callconv(.c) CallbackStatus = null,
++    /// Synchronously installs borrowed caller-task ownership callbacks. The
++    /// caller clears them after its acknowledged worker call joins or fences.
++    /// Transport monitors must never invoke these execution transitions.
++    set_execution_wait: ?*const fn (?*anyopaque, ?*const ExecutionWait) callconv(.c) CallbackStatus = null,
+ };
+ 
+ pub const HttpResponseView = extern struct {
+diff --git a/zig/lib/runtime/src/runtime_http_bridge.zig b/zig/lib/runtime/src/runtime_http_bridge.zig
+index f6c2e0cd7f..c52b3b4ce6 100644
+--- a/zig/lib/runtime/src/runtime_http_bridge.zig
++++ b/zig/lib/runtime/src/runtime_http_bridge.zig
+@@ -44,6 +44,7 @@ pub const Outbound = struct {
+     writer: ?httpx.Context.StreamWriter = null,
+     started: bool = false,
+     write_control: httpx.socket.WriteControl = .{},
++    execution_wait: abi.ExecutionWait = .{},
+ 
+     pub fn cancellation(self: *Outbound) abi.CancellationView {
+         return .{
+@@ -66,9 +67,45 @@ pub const Outbound = struct {
+             .start = start,
+             .write = write,
+             .close = close,
++            .set_execution_wait = setExecutionWait,
+         };
+     }
+ 
++    fn setExecutionWait(raw: ?*anyopaque, view: ?*const abi.ExecutionWait) callconv(.c) abi.CallbackStatus {
++        const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
++        if (view) |value| {
++            if (value.begin == null or value.end == null) return .failed;
++            self.execution_wait = value.*;
++        } else self.execution_wait = .{};
++        if (self.writer) |*writer| {
++            writer.control = self.outputControl();
++            if (writer.h2_writer) |*h2_writer| h2_writer.control = writer.control;
++        }
++        return .ok;
++    }
++
++    fn checkOutput(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
++        const self: *Outbound = @ptrCast(@alignCast(raw.?));
++        try self.write_control.check();
++    }
++    fn remainingOutput(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
++        const self: *Outbound = @ptrCast(@alignCast(raw.?));
++        if (self.write_control.remaining_ms_fn) |remaining| return remaining(self.write_control.ptr);
++        return null;
++    }
++    fn beginOutputWait(raw: ?*anyopaque) !void {
++        const self: *Outbound = @ptrCast(@alignCast(raw.?));
++        try callbackResult(self.execution_wait.begin.?(self.execution_wait.context));
++    }
++    fn endOutputWait(raw: ?*anyopaque) !void {
++        const self: *Outbound = @ptrCast(@alignCast(raw.?));
++        try callbackResult(self.execution_wait.end.?(self.execution_wait.context));
++    }
++    fn outputControl(self: *Outbound) httpx.socket.WriteControl {
++        if (self.execution_wait.begin == null) return self.write_control;
++        return .{ .ptr = self, .check_fn = checkOutput, .remaining_ms_fn = remainingOutput, .wait_begin_fn = beginOutputWait, .wait_end_fn = endOutputWait };
++    }
++
+     fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
+         const context: *const httpx.Context = @ptrCast(@alignCast(raw orelse return 0));
+         return @intFromBool(context.isCancellationRequested());
+@@ -94,7 +131,7 @@ pub const Outbound = struct {
+         for (headers.slice()) |header| {
+             self.context.response.headers.append(header.name.slice(), header.value.slice()) catch |err| return callbackStatusAfterIo(self.context, err);
+         }
+-        self.writer = self.context.streamResponseWithContentTypeControlled(status, content_type.slice(), self.write_control) catch |err| return callbackStatusAfterIo(self.context, err);
++        self.writer = self.context.streamResponseWithContentTypeControlled(status, content_type.slice(), self.outputControl()) catch |err| return callbackStatusAfterIo(self.context, err);
+         self.started = true;
+         return .ok;
+     }
+@@ -562,3 +599,55 @@ test "outbound callbacks prefer cancellation that arrives during transport IO" {
+     cancellation.store(false, .release);
+     try std.testing.expectEqual(.canceled, stream_sink.close.?(stream_sink.context));
+ }
++
++test "outbound checked execution wait installation preserves fences and clears borrowed hooks" {
++    const std = @import("std");
++    const State = struct {
++        parked: bool = false,
++        canceled: bool = false,
++        begins: usize = 0,
++        ends: usize = 0,
++        fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            if (self.canceled) return error.Canceled;
++        }
++        fn begin(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            if (self.parked) return .failed;
++            self.parked = true;
++            self.begins += 1;
++            return .ok;
++        }
++        fn end(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            if (!self.parked) return .failed;
++            self.parked = false;
++            self.ends += 1;
++            return .ok;
++        }
++        fn operation(self: *@This()) !void {
++            try std.testing.expect(self.parked);
++        }
++    };
++    var request = try httpx.Request.init(std.testing.allocator, .POST, "/stream");
++    defer request.deinit();
++    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
++    defer context.deinit();
++    var state = State{};
++    var outbound = Outbound{ .context = &context, .write_control = .{ .ptr = &state, .check_fn = State.check } };
++    const sink = outbound.stream();
++    try std.testing.expectEqual(.failed, sink.set_execution_wait.?(sink.context, &.{ .context = &state, .begin = State.begin }));
++    try std.testing.expect(outbound.execution_wait.begin == null);
++    try std.testing.expectEqual(.ok, sink.set_execution_wait.?(sink.context, &.{ .context = &state, .begin = State.begin, .end = State.end }));
++    try outbound.outputControl().withWait(State.operation, .{&state});
++    try std.testing.expect(!state.parked);
++    try std.testing.expectEqual(@as(usize, 1), state.begins);
++    try std.testing.expectEqual(@as(usize, 1), state.ends);
++    state.canceled = true;
++    try std.testing.expectError(error.Canceled, outbound.outputControl().withWait(State.operation, .{&state}));
++    try std.testing.expectEqual(@as(usize, 1), state.begins);
++    // Retirement must clear borrowed stack pointers despite cancellation.
++    try std.testing.expectEqual(.ok, sink.set_execution_wait.?(sink.context, null));
++    try std.testing.expect(outbound.outputControl().wait_begin_fn == null);
++    try std.testing.expectError(error.Canceled, outbound.outputControl().check());
++}
+diff --git a/zig/pkg/antfly-embedded/src/api/operation.zig b/zig/pkg/antfly-embedded/src/api/operation.zig
+index 479dde4535..25e853ee34 100644
+--- a/zig/pkg/antfly-embedded/src/api/operation.zig
++++ b/zig/pkg/antfly-embedded/src/api/operation.zig
+@@ -138,6 +138,9 @@ pub const RequestContext = struct {
+     /// Execution capability for bounded request fanout. Independent of the
+     /// deadline clock: native-monotonic HTTP budgets can still schedule Io.
+     fanout_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
++    /// Trusted request-lifetime execution team. Local callbacks may borrow it
++    /// only until their children join. Never reconstruct this from wire data.
++    execution_team: ?*@import("antfly_runtime_abi").runnable_abi.Team = null,
+     /// Borrowed request identity used for correlation. An empty value means
+     /// the caller did not supply one; adapters may generate one in middleware.
+     request_id: []const u8 = "",
+diff --git a/zig/pkg/antfly-embedded/src/api/table_writes.zig b/zig/pkg/antfly-embedded/src/api/table_writes.zig
+index c6123a3356..f476f3eaed 100644
+--- a/zig/pkg/antfly-embedded/src/api/table_writes.zig
++++ b/zig/pkg/antfly-embedded/src/api/table_writes.zig
+@@ -27,6 +27,7 @@ pub const backend_types = @import("../storage/backend_types.zig");
+ pub const portable_backup = @import("../storage/portable_backup.zig");
+ pub const table_catalog = @import("routing_budget.zig");
+ pub const table_write_source = @import("table_write_source.zig");
++const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
+ pub const table_index_config = @import("table_index_config.zig");
+ pub const tables_api = @import("tables.zig");
+ pub const runtime_status = @import("runtime_status.zig");
+@@ -117,8 +118,10 @@ pub const BoundTableWriteSource = struct {
+                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
+                 .commit_batch = commitBatch,
+                 .commit_batch_with_cancellation = commitBatchWithCancellation,
++                .commit_batch_with_execution = commitBatchWithExecution,
+                 .commit_transaction_with_id = commitTransactionWithId,
+                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
++                .commit_transaction_with_id_with_execution = commitTransactionWithIdAndExecution,
+                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
+                 .batch = batch,
+                 .begin_bulk_ingest = beginBulkIngest,
+@@ -770,6 +773,36 @@ pub const BoundTableWriteSource = struct {
+         return try commitBoundTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
+     }
+ 
++    fn commitBatchWithExecution(
++        ptr: *anyopaque,
++        alloc: std.mem.Allocator,
++        tables: []const distributed_txn.TableCommitRequest,
++        sync_level: db_mod.types.SyncLevel,
++        cancellation: db_mod.types.CancellationToken,
++        team: *runnable_abi.Team,
++    ) !?distributed_txn.CommitOutcome {
++        // Bound storage has one coordinator participant and no child fanout.
++        // Validate the original execution fences before contacting storage.
++        try team.reserve(0);
++        defer team.finish();
++        return commitBatchWithCancellation(ptr, alloc, tables, sync_level, cancellation);
++    }
++
++    fn commitTransactionWithIdAndExecution(
++        ptr: *anyopaque,
++        alloc: std.mem.Allocator,
++        txn_id: db_mod.types.TxnId,
++        begin_timestamp: u64,
++        tables: []const distributed_txn.TableCommitRequest,
++        sync_level: db_mod.types.SyncLevel,
++        cancellation: db_mod.types.CancellationToken,
++        team: *runnable_abi.Team,
++    ) !?distributed_txn.CommitOutcome {
++        try team.reserve(0);
++        defer team.finish();
++        return commitTransactionWithIdAndCancellation(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation);
++    }
++
+     pub fn acknowledgeTransactionCommit(
+         ptr: *anyopaque,
+         alloc: std.mem.Allocator,
+diff --git a/zig/pkg/antfly-embedded/src/storage/inference_provider.zig b/zig/pkg/antfly-embedded/src/storage/inference_provider.zig
+index 3704a3e7be..3068102181 100644
+--- a/zig/pkg/antfly-embedded/src/storage/inference_provider.zig
++++ b/zig/pkg/antfly-embedded/src/storage/inference_provider.zig
+@@ -1250,40 +1250,20 @@ pub fn inferenceProviderGenerateMessages(
+     }, null);
+ }
+ 
++const JsonRouteResponse = struct { status: u16, body: []u8 };
++
+ pub fn inferenceProviderGenerateJson(
+     ptr: *anyopaque,
+     alloc: std.mem.Allocator,
+     body: []const u8,
+     request: ?inference.RequestContext,
+ ) ![]u8 {
+-    if (request) |context| try context.check();
+-    const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(ptr));
+-    var guard = try lifetime.acquire();
+-    defer guard.deinit();
+-    var target = LocalInferenceConnectionContext{ .handle = lifetime.handle };
+-    var abi_alloc = inference_connection_abi.Allocator.fromStd(&alloc);
+-    var response: inference_connection_abi.InvokeResponse = .{};
+-    defer response.deinit(&abi_alloc);
+-    try invokeLocalInferenceConnectionFallible(&.{
+-        .abi_version = inference_connection_abi.abi_version,
+-        .target_context = &target,
+-        .allocator = &abi_alloc,
+-        .operation = .init("generate"),
+-        .body = .init(body),
+-        .deadline_ns = if (request) |context| context.deadline_ns orelse 0 else platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
+-        .cancellation = .{ .context = &request, .is_cancelled = struct {
+-            pub fn cancelled(raw: ?*const anyopaque) callconv(.c) u8 {
+-                const source: *const ?inference.RequestContext = @ptrCast(@alignCast(raw orelse return 1));
+-                const active = source.* orelse return 0;
+-                return @intFromBool(if (active.cancellation) |token| token.isCancelled() else false);
+-            }
+-        }.cancelled },
+-        .out_response = &response,
+-    });
+-    if (request) |context| try context.check();
+-    if (!response.valid()) return error.RuntimeBoundaryFailure;
+-    if (response.status >= 300) return inference.types.localGenerationStatusError(alloc, response.status, response.body.slice());
+-    return alloc.dupe(u8, response.body.slice());
++    _ = enrichment_types.interactive_generate_inflight.fetchAdd(1, .monotonic);
++    defer _ = enrichment_types.interactive_generate_inflight.fetchSub(1, .monotonic);
++    const response = try invokeInferenceProvider(JsonRouteResponse, alloc, ptr, .generate_json, .{ .body = body }, request);
++    errdefer alloc.free(response.body);
++    if (response.status >= 300) return inference.types.localGenerationStatusError(alloc, response.status, response.body);
++    return response.body;
+ }
+ 
+ pub fn inferenceProviderDecideJson(
+@@ -1292,38 +1272,14 @@ pub fn inferenceProviderDecideJson(
+     body: []const u8,
+     request: ?inference.RequestContext,
+ ) ![]u8 {
+-    if (request) |context| try context.check();
+-    const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(ptr));
+-    var guard = try lifetime.acquire();
+-    defer guard.deinit();
+-    var target = LocalInferenceConnectionContext{ .handle = lifetime.handle };
+-    var abi_alloc = inference_connection_abi.Allocator.fromStd(&alloc);
+-    var response: inference_connection_abi.InvokeResponse = .{};
+-    defer response.deinit(&abi_alloc);
+-    try invokeLocalInferenceConnectionFallible(&.{
+-        .abi_version = inference_connection_abi.abi_version,
+-        .target_context = &target,
+-        .allocator = &abi_alloc,
+-        .operation = .init("decide"),
+-        .body = .init(body),
+-        .deadline_ns = if (request) |context| context.deadline_ns orelse 0 else platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
+-        .cancellation = .{ .context = &request, .is_cancelled = struct {
+-            pub fn cancelled(raw: ?*const anyopaque) callconv(.c) u8 {
+-                const source: *const ?inference.RequestContext = @ptrCast(@alignCast(raw orelse return 1));
+-                const active = source.* orelse return 0;
+-                return @intFromBool(if (active.cancellation) |token| token.isCancelled() else false);
+-            }
+-        }.cancelled },
+-        .out_response = &response,
+-    });
+-    if (request) |context| try context.check();
+-    if (!response.valid()) return error.RuntimeBoundaryFailure;
++    const response = try invokeInferenceProvider(JsonRouteResponse, alloc, ptr, .decide_json, .{ .body = body }, request);
++    errdefer alloc.free(response.body);
+     if (response.status >= 300) return switch (response.status) {
+         401, 403 => error.DecisionUnauthorized,
+         429, 529 => error.DecisionRateLimited,
+         else => error.DecisionUpstreamFailure,
+     };
+-    return alloc.dupe(u8, response.body.slice());
++    return response.body;
+ }
+ 
+ pub fn inferenceProviderGenerateMessagesWithContext(
+diff --git a/zig/pkg/antfly/build/api_tests.zig b/zig/pkg/antfly/build/api_tests.zig
+index a5a10bc531..d355d195d0 100644
+--- a/zig/pkg/antfly/build/api_tests.zig
++++ b/zig/pkg/antfly/build/api_tests.zig
+@@ -201,6 +201,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
+         .link_libc = true,
+     });
+     worker_owner_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
++    worker_owner_root.addImport("httpx", antfly_imports.httpx);
+     worker_owner_root.addImport("antfly_local_sources", inference_owner_sources);
+     worker_owner_root.addImport("inference_execution_control", inference_owner_control);
+     worker_owner_root.addImport("inference_worker_rpc", worker_owner_rpc);
+@@ -213,6 +214,35 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
+     });
+     b.step("antfly-inference-worker-owner-handoff-test", "Run real owner capsules through the worker pipe phase transport")
+         .dependOn(&b.addRunArtifact(worker_owner_tests).step);
++    const worker_process_fixture_root = b.createModule(.{
++        .root_source_file = b.path("pkg/antfly/src/api/runnable_worker_process_fixture.zig"),
++        .target = target,
++        .optimize = optimize,
++        .link_libc = true,
++    });
++    worker_process_fixture_root.addImport("inference_worker_rpc", worker_owner_rpc);
++    const worker_process_fixture = b.addExecutable(.{ .name = "inference-worker-output-fixture", .root_module = worker_process_fixture_root });
++    const worker_process_root = b.createModule(.{
++        .root_source_file = b.path("pkg/antfly/src/api/runnable_worker_process_test_root.zig"),
++        .target = target,
++        .optimize = optimize,
++        .link_libc = true,
++    });
++    worker_process_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
++    worker_process_root.addImport("httpx", antfly_imports.httpx);
++    worker_process_root.addImport("antfly_local_sources", inference_owner_sources);
++    worker_process_root.addImport("inference_worker_rpc", worker_owner_rpc);
++    const worker_process_tests = b.addTest(.{
++        .name = "inference-worker-process-output-tests",
++        .root_module = worker_process_root,
++        .filters = &.{"inference worker subprocess output"},
++        .max_rss = 2 * 1024 * 1024 * 1024,
++    });
++    const run_worker_process_tests = b.addRunArtifact(worker_process_tests);
++    run_worker_process_tests.setCwd(worker_process_fixture.getEmittedBin().dirname());
++    run_worker_process_tests.setEnvironmentVariable("ANTFLY_TEST_WORKER_OUTPUT_FIXTURE", b.fmt("./{s}", .{worker_process_fixture.out_filename}));
++    b.step("antfly-inference-worker-process-output-test", "Run actual worker subprocess output through API ownership, TCP waits and reaping")
++        .dependOn(&run_worker_process_tests.step);
+     const worker_output_error_root = b.createModule(.{
+         .root_source_file = b.path("pkg/inference/src/host/worker_output_error.zig"),
+         .target = target,
+diff --git a/zig/pkg/antfly/src/api/distributed_txn.zig b/zig/pkg/antfly/src/api/distributed_txn.zig
+index 711952f642..cfeef87b13 100644
+--- a/zig/pkg/antfly/src/api/distributed_txn.zig
++++ b/zig/pkg/antfly/src/api/distributed_txn.zig
+@@ -1190,9 +1190,16 @@ pub const ExecuteOptions = struct {
+     /// prepare, and phase-two delivery use bounded concurrent windows.
+     fanout_io: ?std.Io = null,
+     max_parallel_participants: usize = 8,
++    /// Borrowed invocation-owned CPU team and bounded child allocator. Reserve
++    /// before any participant contact; retain through commit/abort and joins.
++    team: ?*@import("antfly_runtime_abi").runnable_abi.Team = null,
+     /// Consulted only by participant implementations after a committed
+     /// transaction mutation is durable, never during begin or prepare.
+     post_commit_cancellation: db_mod.types.CancellationToken = .none,
++
++    fn participantAllocator(self: ExecuteOptions) std.mem.Allocator {
++        return if (self.team) |team| team.allocator else std.heap.page_allocator;
++    }
+ };
+ 
+ const ParticipantFanoutSlot = struct {
+@@ -1230,9 +1237,18 @@ fn isTerminalVisibilityRepair(err: anyerror) bool {
+     return err == error.EnrichmentWorkerFailed;
+ }
+ 
++fn reserveParticipantTeam(options: *ExecuteOptions, participants: usize) !void {
++    if (options.team) |team| {
++        const children = if (options.fanout_io != null) @min(@max(options.max_parallel_participants, 1), participants) else 0;
++        try team.reserve(children);
++        if (team.childCapacity() == 0) options.fanout_io = null;
++    }
++}
++
+ fn fanoutWidth(options: ExecuteOptions, participant_count: usize) usize {
+     if (options.fanout_io == null or participant_count <= 1) return 1;
+-    return @min(@max(options.max_parallel_participants, 1), participant_count);
++    const requested = @min(@max(options.max_parallel_participants, 1), participant_count);
++    return if (options.team) |team| @min(requested, @max(team.childCapacity(), 1)) else requested;
+ }
+ 
+ fn awaitFanout(group: *std.Io.Group, io: std.Io) void {
+@@ -1342,8 +1358,9 @@ fn executeMultiTableCommitOnce(
+     tables: []const TableCommitRequest,
+     sync_level: db_mod.types.SyncLevel,
+     trace_writer: ?tracing.AntflyTraceWriter,
+-    options: ExecuteOptions,
++    requested_options: ExecuteOptions,
+ ) !CommitOutcome {
++    var options = requested_options;
+     var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
+     defer {
+         for (participants.items) |*participant| participant.deinit(alloc);
+@@ -1480,6 +1497,11 @@ fn executeMultiTableCommitOnce(
+     defer alloc.free(fanout_slots);
+     for (fanout_slots) |*slot| slot.reset();
+ 
++    // This is before the first participant RPC and before registering abort
++    // obligations. A denied team never falls back to unscheduled child work.
++    try reserveParticipantTeam(&options, participants.items.len);
++    defer if (options.team) |team| team.finish();
++
+     var begun_count: usize = 0;
+     var abort_on_error = true;
+     var resume_committed = false;
+@@ -2024,6 +2046,7 @@ const ParticipantTxn = struct {
+ 
+ const BeginFanoutTask = struct {
+     fn run(
++        allocator: std.mem.Allocator,
+         worker: ParticipantWorker,
+         participant: *const ParticipantTxn,
+         participant_ids: []const []const u8,
+@@ -2032,7 +2055,7 @@ const BeginFanoutTask = struct {
+         retain_terminal: bool,
+         slot: *ParticipantFanoutSlot,
+     ) void {
+-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
++        var arena = std.heap.ArenaAllocator.init(allocator);
+         defer arena.deinit();
+         worker.beginGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+             .txn_id = txn_id,
+@@ -2071,6 +2094,7 @@ fn runBeginFanout(
+             var group: std.Io.Group = .init;
+             for (start..end) |i| {
+                 group.concurrent(io, BeginFanoutTask.run, .{
++                    options.participantAllocator(),
+                     worker,
+                     &participants[i],
+                     participant_ids,
+@@ -2079,6 +2103,7 @@ fn runBeginFanout(
+                     options.retain_terminal,
+                     &slots[i],
+                 }) catch BeginFanoutTask.run(
++                    options.participantAllocator(),
+                     worker,
+                     &participants[i],
+                     participant_ids,
+@@ -2091,6 +2116,7 @@ fn runBeginFanout(
+             awaitFanout(&group, io);
+         } else {
+             for (start..end) |i| BeginFanoutTask.run(
++                options.participantAllocator(),
+                 worker,
+                 &participants[i],
+                 participant_ids,
+@@ -2106,12 +2132,13 @@ fn runBeginFanout(
+ 
+ const PrepareFanoutTask = struct {
+     fn run(
++        allocator: std.mem.Allocator,
+         worker: ParticipantWorker,
+         participant: *const ParticipantTxn,
+         txn_id: db_mod.types.TxnId,
+         slot: *ParticipantFanoutSlot,
+     ) void {
+-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
++        var arena = std.heap.ArenaAllocator.init(allocator);
+         defer arena.deinit();
+         worker.prepareGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+             .route_fence = participant.route_fence,
+@@ -2160,12 +2187,12 @@ fn runPrepareFanout(
+         if (options.fanout_io) |io| {
+             var group: std.Io.Group = .init;
+             for (start..end) |i| {
+-                group.concurrent(io, PrepareFanoutTask.run, .{ worker, &participants[i], txn_id, &slots[i] }) catch
+-                    PrepareFanoutTask.run(worker, &participants[i], txn_id, &slots[i]);
++                group.concurrent(io, PrepareFanoutTask.run, .{ options.participantAllocator(), worker, &participants[i], txn_id, &slots[i] }) catch
++                    PrepareFanoutTask.run(options.participantAllocator(), worker, &participants[i], txn_id, &slots[i]);
+             }
+             awaitFanout(&group, io);
+         } else {
+-            for (start..end) |i| PrepareFanoutTask.run(worker, &participants[i], txn_id, &slots[i]);
++            for (start..end) |i| PrepareFanoutTask.run(options.participantAllocator(), worker, &participants[i], txn_id, &slots[i]);
+         }
+         if (firstFanoutError(slots[start..end]) != null) break;
+     }
+@@ -2173,6 +2200,7 @@ fn runPrepareFanout(
+ 
+ const ResolveFollowerFanoutTask = struct {
+     fn run(
++        allocator: std.mem.Allocator,
+         worker: ParticipantWorker,
+         coordinator: *const ParticipantTxn,
+         participant: *const ParticipantTxn,
+@@ -2184,7 +2212,7 @@ const ResolveFollowerFanoutTask = struct {
+         cancellation: db_mod.types.CancellationToken,
+         slot: *ParticipantFanoutSlot,
+     ) void {
+-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
++        var arena = std.heap.ArenaAllocator.init(allocator);
+         defer arena.deinit();
+         worker.resolveGroupWithCancellation(arena.allocator(), participant.group_id, participant.table_name, .{
+             .restore_staging_scope = participant.restore_staging_scope,
+@@ -2242,6 +2270,7 @@ fn runResolveFollowerFanout(
+             var group: std.Io.Group = .init;
+             for (start..end) |i| {
+                 group.concurrent(io, ResolveFollowerFanoutTask.run, .{
++                    options.participantAllocator(),
+                     worker,
+                     &participants[0],
+                     &participants[i],
+@@ -2253,6 +2282,7 @@ fn runResolveFollowerFanout(
+                     options.post_commit_cancellation,
+                     &slots[i],
+                 }) catch ResolveFollowerFanoutTask.run(
++                    options.participantAllocator(),
+                     worker,
+                     &participants[0],
+                     &participants[i],
+@@ -2268,6 +2298,7 @@ fn runResolveFollowerFanout(
+             awaitFanout(&group, io);
+         } else {
+             for (start..end) |i| ResolveFollowerFanoutTask.run(
++                options.participantAllocator(),
+                 worker,
+                 &participants[0],
+                 &participants[i],
+@@ -2280,7 +2311,7 @@ fn runResolveFollowerFanout(
+                 &slots[i],
+             );
+         }
+-        acknowledgeFollowerWindow(worker, txn_id, participants, participant_ids, slots, start, end, true);
++        acknowledgeFollowerWindow(options.participantAllocator(), worker, txn_id, participants, participant_ids, slots, start, end, true);
+     }
+ }
+ 
+@@ -3504,6 +3535,7 @@ fn abortParticipantsWithContactMask(
+ 
+ const AbortFollowerFanoutTask = struct {
+     fn run(
++        allocator: std.mem.Allocator,
+         worker: ParticipantWorker,
+         coordinator: *const ParticipantTxn,
+         participant: *const ParticipantTxn,
+@@ -3514,7 +3546,7 @@ const AbortFollowerFanoutTask = struct {
+         allow_missing_state: bool,
+         slot: *ParticipantFanoutSlot,
+     ) void {
+-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
++        var arena = std.heap.ArenaAllocator.init(allocator);
+         defer arena.deinit();
+         slot.reset();
+         if (resolve) worker.resolveGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+@@ -3538,8 +3570,8 @@ const AbortFollowerFanoutTask = struct {
+     }
+ };
+ 
+-fn acknowledgeFollowerWindow(worker: ParticipantWorker, txn_id: db_mod.types.TxnId, participants: []const ParticipantTxn, participant_ids: []const []const u8, slots: []ParticipantFanoutSlot, start: usize, end: usize, committed: bool) void {
+-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
++fn acknowledgeFollowerWindow(allocator: std.mem.Allocator, worker: ParticipantWorker, txn_id: db_mod.types.TxnId, participants: []const ParticipantTxn, participant_ids: []const []const u8, slots: []ParticipantFanoutSlot, start: usize, end: usize, committed: bool) void {
++    var arena = std.heap.ArenaAllocator.init(allocator);
+     defer arena.deinit();
+     var ids: [64][]const u8 = undefined;
+     var indexes: [64]usize = undefined;
+@@ -3589,14 +3621,14 @@ fn runAbortFollowerFanout(
+             // Copy contact evidence before the worker resets its result slot.
+             const resolve = if (attempted_count) |count| i < count else slots[i].may_have_transaction_state;
+             if (options.fanout_io) |io| {
+-                group.concurrent(io, AbortFollowerFanoutTask.run, .{ worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i] }) catch
+-                    AbortFollowerFanoutTask.run(worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i]);
++                group.concurrent(io, AbortFollowerFanoutTask.run, .{ options.participantAllocator(), worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i] }) catch
++                    AbortFollowerFanoutTask.run(options.participantAllocator(), worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i]);
+             } else {
+-                AbortFollowerFanoutTask.run(worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i]);
++                AbortFollowerFanoutTask.run(options.participantAllocator(), worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i]);
+             }
+         }
+         if (options.fanout_io) |io| awaitFanout(&group, io);
+-        acknowledgeFollowerWindow(worker, txn_id, participants, participant_ids, slots, start, end, false);
++        acknowledgeFollowerWindow(options.participantAllocator(), worker, txn_id, participants, participant_ids, slots, start, end, false);
+     }
+     for (slots[1..], 1..) |slot, i| {
+         if (slot.err) |err| std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{ participants[i].table_name, participants[i].group_id, @errorName(err) });
+@@ -3741,12 +3773,12 @@ fn implementationTests() type {
+             var slots: [132]ParticipantFanoutSlot = @splat(.{ .acknowledgement_ready = true });
+             slots[2] = .{ .err = error.GroupLeaderUnavailable };
+             const txn: db_mod.types.TxnId = @splat(1);
+-            acknowledgeFollowerWindow(recorder.worker(), txn, &participants, &ids, &slots, 1, slots.len, true);
++            acknowledgeFollowerWindow(std.testing.allocator, recorder.worker(), txn, &participants, &ids, &slots, 1, slots.len, true);
+             try std.testing.expectEqual(@as(usize, 3), recorder.batches);
+             try std.testing.expectEqual(@as(usize, 130), recorder.members);
+             try std.testing.expectEqual(@as(usize, 0), recorder.singles);
+             recorder.failure = error.ConnectionRefused;
+-            acknowledgeFollowerWindow(recorder.worker(), txn, &participants, &ids, &slots, 1, 4, true);
++            acknowledgeFollowerWindow(std.testing.allocator, recorder.worker(), txn, &participants, &ids, &slots, 1, 4, true);
+             try std.testing.expectEqual(@as(?anyerror, error.ConnectionRefused), slots[1].acknowledgement_err);
+             try std.testing.expect(slots[1].propagation_pending and slots[3].propagation_pending);
+             try std.testing.expect(slots[2].acknowledgement_err == null);
+@@ -5217,6 +5249,85 @@ fn consumerTests() type {
+             }
+         }
+ 
++        test "distributed txn participant team bounds CPU and child allocations" {
++            const runtime = @import("antfly_runtime_abi");
++            const execution = @import("runnable_owner_execution.zig");
++            const Recorder = struct {
++                owner: *execution.State,
++                minimum_slots: usize,
++                active: std.atomic.Value(usize) = .init(0),
++                peak: std.atomic.Value(usize) = .init(0),
++                calls: std.atomic.Value(usize) = .init(0),
++                fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
++                fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
++                fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
++                    return .pending;
++                }
++                fn prepare(raw: *anyopaque, allocator: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
++                    const self: *@This() = @ptrCast(@alignCast(raw));
++                    try std.testing.expectEqual(self.minimum_slots, self.owner.owner.scheduler.stats().runnable_slots);
++                    _ = self.calls.fetchAdd(1, .monotonic);
++                    const current = self.active.fetchAdd(1, .acq_rel) + 1;
++                    defer _ = self.active.fetchSub(1, .acq_rel);
++                    var peak = self.peak.load(.monotonic);
++                    while (current > peak) peak = self.peak.cmpxchgWeak(peak, current, .monotonic, .monotonic) orelse break;
++                    const allocation = try allocator.alloc(u8, 32);
++                    defer allocator.free(allocation);
++                    sleepNs(10 * std.time.ns_per_ms);
++                }
++                fn worker(self: *@This()) ParticipantWorker {
++                    return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status } };
++                }
++                fn now() u64 {
++                    return 0;
++                }
++            };
++            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
++            defer io_impl.deinit();
++            const io = io_impl.io();
++            var owner: execution.State = .{ .owner_alloc = std.testing.allocator, .owner = try @import("antfly_local_sources").common_request_admission.runnable_scheduler.NodeOwner.init(.{ .slots = 4, .max_operations = 8 }), .native_now_ns = Recorder.now };
++            defer owner.owner.tryDeinit() catch @panic("owner leaked");
++            const port = owner.port();
++            const borrow = runtime.native_abi.IoBorrow.init(&io);
++            var handle: ?*anyopaque = null;
++            try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.write), .retained_bytes = 71, .out_handle = &handle }).isOk());
++            defer port.finish(handle.?);
++            const retained = owner.owner.scheduler.stats().retained_bytes;
++            const participants = [_]ParticipantTxn{
++                .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 1 },
++                .{ .table_name = "docs", .group_id = 7002, .topology_epoch = 1 },
++                .{ .table_name = "docs", .group_id = 7003, .topology_epoch = 1 },
++                .{ .table_name = "docs", .group_id = 7004, .topology_epoch = 1 },
++            };
++            var slots: [participants.len]ParticipantFanoutSlot = undefined;
++            var team: runtime.runnable_abi.Team = .{ .borrow = try runtime.runnable_abi.Borrowed.fromOwner(port, handle.?, 1, .write), .maximum_slots = 3, .allocator = std.testing.allocator };
++            var options: ExecuteOptions = .{ .fanout_io = io, .max_parallel_participants = 8, .team = &team };
++            try reserveParticipantTeam(&options, participants.len);
++            var recorder: Recorder = .{ .owner = &owner, .minimum_slots = 3 };
++            runPrepareFanout(recorder.worker(), @splat(1), &participants, &slots, options);
++            try std.testing.expectEqual(@as(usize, 4), recorder.calls.load(.monotonic));
++            try std.testing.expectEqual(@as(usize, 2), recorder.peak.load(.monotonic));
++            for (slots) |slot| try std.testing.expectEqual(@as(?anyerror, null), slot.err);
++            try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
++            try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
++            team.finish();
++            try port.resizeTeam(handle.?, 1);
++            // A zero-capacity owned child allocator must fail rather than use
++            // the previous page-allocator fallback. Single-slot teams execute
++            // serially on the parent, with no unscheduled task submission.
++            var storage: [0]u8 = .{};
++            var fixed = std.heap.FixedBufferAllocator.init(&storage);
++            var serial: runtime.runnable_abi.Team = .{ .borrow = try runtime.runnable_abi.Borrowed.fromOwner(port, handle.?, 1, .write), .maximum_slots = 1, .allocator = fixed.allocator() };
++            options = .{ .fanout_io = io, .max_parallel_participants = 8, .team = &serial };
++            try reserveParticipantTeam(&options, participants.len);
++            try std.testing.expect(options.fanout_io == null);
++            recorder.minimum_slots = 1;
++            runPrepareFanout(recorder.worker(), @splat(2), &participants, &slots, options);
++            try std.testing.expectEqual(@as(?anyerror, error.OutOfMemory), slots[0].err);
++            try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
++            serial.finish();
++        }
++
+         test "distributed txn participant fanout is bounded and concurrent" {
+             const Recorder = struct {
+                 active: std.atomic.Value(usize) = .init(0),
+diff --git a/zig/pkg/antfly/src/api/http_server.zig b/zig/pkg/antfly/src/api/http_server.zig
+index 823d188f5a..7aeb877bc9 100644
+--- a/zig/pkg/antfly/src/api/http_server.zig
++++ b/zig/pkg/antfly/src/api/http_server.zig
+@@ -4027,6 +4027,10 @@ pub const ApiHttpServer = struct {
+         table_read_source: ?table_reads.TableReadSource,
+         table_write_source: ?table_writes.TableWriteSource,
+     ) ApiHttpServer {
++        if (cfg.runnable_policy != null or cfg.runnable_owner_handle != null) {
++            return initWithConfig(alloc, cfg, source, table_read_source, table_write_source) catch
++                @panic("API bounded runnable initialization failed");
++        }
+         const request_alloc = if (builtin.is_test)
+             alloc
+         else
+@@ -4049,6 +4053,10 @@ pub const ApiHttpServer = struct {
+         table_read_source: ?table_reads.TableReadSource,
+         table_write_source: ?table_writes.TableWriteSource,
+     ) ApiHttpServer {
++        if (cfg.runnable_policy != null or cfg.runnable_owner_handle != null) {
++            return initWithConfig(owner_alloc, cfg, source, table_read_source, table_write_source) catch
++                @panic("API bounded runnable initialization failed");
++        }
+         return ApiHttpServer.initWithRequestAllocator(
+             owner_alloc,
+             platform.allocator.processAllocator(std.heap.smp_allocator),
+@@ -13685,7 +13693,7 @@ pub const ApiHttpServer = struct {
+         var arena_state = std.heap.ArenaAllocator.init(alloc);
+         defer arena_state.deinit();
+         const signed = try self.signRowPolicyMutationParticipants(arena_state.allocator(), tables, catalog_tables, request);
+-        return source.commitBatchWithCancellation(alloc, signed, sync_level, request.cancellation);
++        return source.commitBatchWithExecution(alloc, signed, sync_level, request.cancellation, request.execution_team);
+     }
+ 
+     fn commitPublicTableBatchWithIntegrity(
+@@ -13700,7 +13708,7 @@ pub const ApiHttpServer = struct {
+         std.debug.assert(retained_preparation.* == null);
+         const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
+         const selected = (try self.selectIntegritySnapshot(alloc, tables, request)) orelse {
+-            return source.commitBatchWithCancellation(alloc, tables, sync_level, request.cancellation);
++            return source.commitBatchWithExecution(alloc, tables, sync_level, request.cancellation, request.execution_team);
+         };
+         var snapshot = selected.snapshot;
+         defer self.source.freeAdminSnapshot(&snapshot);
+@@ -57198,3 +57206,32 @@ test "workload deadline bounds internal planning retrieval and administrative wa
+     try std.testing.expectError(error.DeadlineExceeded, server.waitForProjectedTableCreateReadinessWithContext("docs", expired));
+     try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+ }
++
++test "runnable execution legacy API constructors retain bounded request owners" {
++    inline for (.{ ApiHttpServer.init, ApiHttpServer.initWithProcessRequestAllocator }) |initialize| {
++        var server = initialize(std.testing.allocator, .{
++            .request_memory_bytes = 1 << 20,
++            .retained_memory_bytes = 1 << 20,
++            .runnable_policy = .{ .slots = 4, .control_slots = 1 },
++        }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
++        defer server.deinit();
++        const memory = server.request_memory orelse return error.TestUnexpectedResult;
++        try std.testing.expectError(error.OutOfMemory, server.alloc.alloc(u8, memory.foreground.stats().limit_bytes + 1));
++        var execution: RunnableScheduler.Execution = .{};
++        defer execution.finish();
++        try server.startSqlRunnable(&execution, .{ .io = std.testing.io, .retained_bytes = 128 }, .write);
++        var team = try @import("runnable_write_team.zig").init(&execution, memory.allocator(false));
++        try team.reserve(2);
++        try std.testing.expectEqual(@as(usize, 2), team.childCapacity());
++        const before = memory.foreground.stats().used_bytes;
++        const child = try team.allocator.alloc(u8, 64);
++        try std.testing.expectEqual(before + 64 + ApiHttpServer.RequestMemory.overhead(.of(u8)), memory.foreground.stats().used_bytes);
++        team.allocator.free(child);
++        team.finish();
++        try std.testing.expectEqual(before, memory.foreground.stats().used_bytes);
++        try std.testing.expectEqual(@as(usize, 1), server.runnableSchedulingStats().operations);
++        try std.testing.expectEqual(@as(usize, 3), server.runnableSchedulingStats().runnable_slots);
++        execution.finish();
++        try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().operations);
++    }
++}
+diff --git a/zig/pkg/antfly/src/api/httpx_handler.zig b/zig/pkg/antfly/src/api/httpx_handler.zig
+index d4347cf17a..df5ceaea0b 100644
+--- a/zig/pkg/antfly/src/api/httpx_handler.zig
++++ b/zig/pkg/antfly/src/api/httpx_handler.zig
+@@ -5904,6 +5904,18 @@ pub const AntflyApiHandler = struct {
+             // may suspend via the adapter until write completion can detach.
+             try self.adapter.server.startSqlRunnable(&runnable, try self.admissionOptions(), if (self.protected_control) .control else if (self.is_write) .write else .query);
+             if ((!self.is_write or self.protected_control) and runnable.entry != null) self.adapter.runnable = &runnable;
++            var write_completion: ?@import("runnable_write_team.zig").Completion = null;
++            if (self.is_write) {
++                if (runnable.entry) |entry| {
++                    const memory = self.adapter.server.request_memory orelse return error.ExecutionWaitUnsupported;
++                    write_completion = try @import("runnable_write_team.zig").Completion.init(&runnable, memory.allocator(entry.class == .control));
++                    self.adapter.write_execution = &runnable;
++                    self.adapter.write_completion = &write_completion.?;
++                }
++            }
++            // Receivers stay in this scope through runnable.finish's defer.
++            defer self.adapter.write_completion = null;
++            defer self.adapter.write_execution = null;
+             self.adapter.serial_execution = runnable.entry != null;
+             defer self.adapter.serial_execution = false;
+             defer self.adapter.runnable = null;
+diff --git a/zig/pkg/antfly/src/api/runnable_worker_test_root.zig b/zig/pkg/antfly/src/api/runnable_worker_test_root.zig
+index b9fe5d0dcc..63962d42b1 100644
+--- a/zig/pkg/antfly/src/api/runnable_worker_test_root.zig
++++ b/zig/pkg/antfly/src/api/runnable_worker_test_root.zig
+@@ -11,7 +11,7 @@ const rpc = @import("inference_worker_rpc");
+ const phases = @import("inference_worker_phases").For(controls, rpc);
+ 
+ test "inference worker physical handoff releases weighted real capacity and fences rejected resumes" {
+-    const Mode = enum { success, canceled, deadline, quantum };
++    const Mode = enum { success, canceled, deadline, quantum, output, output_canceled, output_deadline, output_lost_ack };
+     const Clock = struct {
+         var current: std.atomic.Value(u64) = .init(0);
+         fn now() u64 {
+@@ -32,6 +32,7 @@ test "inference worker physical handoff releases weighted real capacity and fenc
+         parent_phase: phases.Parent = .{},
+         retained_bytes: u64 = 0,
+         handler_started: std.atomic.Value(bool) = .init(false),
++        writes: usize = 0,
+         parks: usize = 0,
+         reentries: usize = 0,
+         fn checked(status: runtime.error_abi.Status) !void {
+@@ -78,7 +79,49 @@ test "inference worker physical handoff releases weighted real capacity and fenc
+         }
+         fn rpcCheck(raw: ?*anyopaque) !void {
+             const self: *@This() = @ptrCast(@alignCast(raw.?));
+-            try self.parent_phase.poll(runtime.http_abi.CancellationView{ .context = self, .is_cancelled = requested }, null, Clock.now());
++            try self.parent_phase.poll(runtime.http_abi.CancellationView{ .context = self, .is_cancelled = requested }, if (self.mode == .quantum) 10 * std.time.ns_per_ms else 5, Clock.now());
++        }
++        fn event(raw: ?*anyopaque, payload: rpc.Payload) !void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            // Formatter CPU starts charged. Only the sink's physical wait
++            // releases the real API capsule while child output is acknowledged.
++            const running = self.state.owner.scheduler.stats();
++            try std.testing.expectEqual(@as(usize, 2), running.runnable_slots);
++            try std.testing.expectEqual(@as(usize, 0), running.resource_blocked);
++            try self.parent_phase.transition(.resource_wait);
++            try outputWait(raw, payload);
++            try self.parent_phase.transition(.runnable);
++            try std.testing.expectEqual(@as(usize, 2), self.state.owner.scheduler.stats().runnable_slots);
++        }
++        fn outputWait(raw: ?*anyopaque, payload: rpc.Payload) !void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            try std.testing.expectEqualStrings("chunk", payload.body);
++            try std.testing.expect(!self.computed.load(.acquire));
++            const parked = self.state.owner.scheduler.stats();
++            try std.testing.expectEqual(@as(usize, 0), parked.runnable_slots);
++            try std.testing.expectEqual(@as(usize, 1), parked.resource_blocked);
++            try std.testing.expectEqual(self.retained_bytes, parked.retained_bytes);
++            // Execute both peer classes while the real output callback is
++            // stalled. The child's acknowledged call cannot resume yet.
++            var query: ?*anyopaque = null;
++            try checked(self.port.start(self.port.context, &.{ .io = self.io, .class = @backingInt(runtime.runnable_abi.Class.query), .out_handle = &query }));
++            defer self.port.finish(query.?);
++            var control: ?*anyopaque = null;
++            try checked(self.port.start(self.port.context, &.{ .io = self.io, .class = @backingInt(runtime.runnable_abi.Class.control), .out_handle = &control }));
++            defer self.port.finish(control.?);
++            for (0..15) |_| {
++                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
++                try std.testing.expect(!self.computed.load(.acquire));
++                try std.testing.expectEqual(@as(usize, 2), self.state.owner.scheduler.stats().runnable_slots);
++            }
++            self.writes += 1;
++            switch (self.mode) {
++                .output_canceled => self.canceled.store(true, .release),
++                .output_deadline => Clock.current.store(6, .release),
++                .output_lost_ack => self.pair.parent.fail(),
++                .output => {},
++                else => return error.InvalidTestMode,
++            }
+         }
+         fn closed(raw: *anyopaque) void {
+             const self: *@This() = @ptrCast(@alignCast(raw));
+@@ -94,6 +137,11 @@ test "inference worker physical handoff releases weighted real capacity and fenc
+             var child_phase = phases.Child{ .request = request };
+             var scope = controls.CheckpointScope.init(.{ .context = &child_phase, .check_fn = phases.Child.check, .wait_begin_fn = phases.Child.park, .wait_end_fn = phases.Child.reenter });
+             defer scope.deinit();
++            if (self.mode == .output or self.mode == .output_canceled or self.mode == .output_deadline or self.mode == .output_lost_ack) {
++                try request.eventAcknowledged(.{ .body = "chunk" });
++                self.computed.store(true, .release);
++                return request.endpoint.copyPayload(.{ .body = "computed" });
++            }
+             try (controls.InferenceExecutionControl{}).lock(&self.gate);
+             defer self.gate.unlock();
+             if (self.mode == .quantum) {
+@@ -114,7 +162,7 @@ test "inference worker physical handoff releases weighted real capacity and fenc
+             return request.endpoint.copyPayload(.{ .body = "computed" });
+         }
+         fn call(self: *@This()) !rpc.OwnedPayload {
+-            const result = self.pair.parent.call(.{ .body = "work" }, .{ .ptr = self, .check = rpcCheck, .phase = phase, .fence_on_error = true }) catch |err| {
++            const result = self.pair.parent.call(.{ .body = "work" }, .{ .ptr = self, .check = rpcCheck, .event = event, .phase = phase, .fence_on_error = true, .event_owns_waits = true }) catch |err| {
+                 try self.parent_phase.finish();
+                 return err;
+             };
+@@ -126,7 +174,7 @@ test "inference worker physical handoff releases weighted real capacity and fenc
+             return result;
+         }
+     };
+-    for ([_]Mode{ .success, .canceled, .deadline, .quantum }) |mode| {
++    for (std.enums.values(Mode)) |mode| {
+         Clock.current.store(0, .release);
+         var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = Clock.now };
+         defer state.owner.tryDeinit() catch @panic("owner leaked");
+@@ -157,16 +205,21 @@ test "inference worker physical handoff releases weighted real capacity and fenc
+         var scope = controls.CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.park, .wait_end_fn = Probe.reenter });
+         defer if (scope.active) scope.deinit();
+         try std.testing.expect(probe.gate.tryLock());
+-        if (mode == .success or mode == .quantum) {
++        if (mode == .success or mode == .quantum or mode == .output) {
+             const response = try probe.call();
+             defer response.deinit();
+             try std.testing.expectEqualStrings("computed", response.view().body);
+             try std.testing.expect(probe.computed.load(.acquire));
+         } else {
+-            try std.testing.expectError(if (mode == .canceled) error.Canceled else error.DeadlineExceeded, probe.call());
++            try std.testing.expectError(switch (mode) {
++                .canceled, .output_canceled => error.Canceled,
++                .output_lost_ack => error.InferenceWorkerUnavailable,
++                else => error.DeadlineExceeded,
++            }, probe.call());
+             try std.testing.expect(!probe.computed.load(.acquire));
+             try std.testing.expect(pair.parent.closed_fence.isSet());
+         }
++        try std.testing.expectEqual(@as(usize, if (mode == .output or mode == .output_canceled or mode == .output_deadline or mode == .output_lost_ack) 1 else 0), probe.writes);
+         try std.testing.expectEqual(@as(usize, 1), probe.parks);
+         try std.testing.expectEqual(@as(usize, 1), probe.reentries);
+         try std.testing.expect(probe.parent_phase.wait == null);
+@@ -179,3 +232,215 @@ test "inference worker physical handoff releases weighted real capacity and fenc
+         try std.testing.expectEqual(@as(u64, 0), drained.retained_bytes);
+     }
+ }
++
++test "inference worker physical handoff carries API ownership through checked streaming callbacks to a stalled TCP peer" {
++    const httpx = @import("httpx");
++    const io = std.testing.io;
++    const Fixture = struct {
++        state: *owner_module.State,
++        port: runtime.runnable_abi.Owner,
++        capsule: *anyopaque,
++        transport: *runtime.http_bridge.Outbound,
++        payload: []const u8,
++        io: std.Io,
++        deadline_ns: u64,
++        h2: ?*httpx.H2Connection = null,
++        canceled: std.atomic.Value(bool) = .init(false),
++        done: std.atomic.Value(bool) = .init(false),
++        waiting: std.Io.Event = .unset,
++        body_started: bool = false,
++        write_epoch: std.atomic.Value(usize) = .init(0),
++        in_write: std.atomic.Value(bool) = .init(false),
++        begins: usize = 0,
++        ends: usize = 0,
++        fn now(io_value: std.Io) u64 {
++            return @intCast(@max(0, std.Io.Clock.now(.awake, io_value).nanoseconds));
++        }
++        fn unusedNativeNow() u64 {
++            @panic("original IO clock must own this deadline");
++        }
++        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
++            const self: *const @This() = @ptrCast(@alignCast(raw.?));
++            return @intFromBool(self.canceled.load(.acquire));
++        }
++        fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            if (self.canceled.load(.acquire)) return error.Canceled;
++            if (now(self.io) >= self.deadline_ns) return error.Timeout;
++        }
++        fn remaining(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            try check(raw);
++            const ns = self.deadline_ns -| now(self.io);
++            return @divTrunc(ns, std.time.ns_per_ms) + @intFromBool(ns % std.time.ns_per_ms != 0);
++        }
++        fn status(value: runtime.error_abi.Status) runtime.http_abi.CallbackStatus {
++            if (value.isOk()) return .ok;
++            return switch (runtime.error_abi.errorFromStatus(value)) {
++                error.Canceled, error.Cancelled => .canceled,
++                error.Timeout, error.DeadlineExceeded => .timeout,
++                else => .failed,
++            };
++        }
++        fn begin(raw: ?*anyopaque) callconv(.c) runtime.http_abi.CallbackStatus {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            const result = status(self.port.park(self.capsule, @backingInt(runtime.runnable_abi.Wait.resource)));
++            if (result != .ok) return result;
++            self.begins += 1;
++            self.write_epoch.store(self.begins, .release);
++            self.in_write.store(true, .release);
++            // Header and chunk-prefix writes complete first. Signal while a
++            // large body is being sent to a peer which never reads it.
++            if (self.body_started and self.begins >= 4) self.waiting.set(self.io);
++            return .ok;
++        }
++        fn end(raw: ?*anyopaque) callconv(.c) runtime.http_abi.CallbackStatus {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            self.ends += 1;
++            self.in_write.store(false, .release);
++            if (self.h2) |connection| {
++                // Weighted reentry can queue. It must not retain the frame
++                // mutex and obstruct connection control/state progress.
++                if (!connection.write_mutex.tryLock()) return .failed;
++                connection.write_mutex.unlock(self.io);
++            }
++            return status(self.port.enter(self.capsule, @backingInt(runtime.runnable_abi.Class.inference)));
++        }
++        fn run(self: *@This()) !runtime.http_abi.CallbackStatus {
++            defer self.done.store(true, .release);
++            const sink = self.transport.stream();
++            const installed = sink.set_execution_wait.?(sink.context, &.{ .context = self, .begin = begin, .end = end });
++            if (installed != .ok) return installed;
++            defer _ = sink.set_execution_wait.?(sink.context, null);
++            const started = sink.start.?(sink.context, 200, .init("application/x-ndjson"), .{});
++            if (started != .ok) return started;
++            try std.testing.expectEqual(@as(usize, 2), self.state.owner.scheduler.stats().runnable_slots);
++            self.body_started = true;
++            for (0..64) |_| {
++                const result = sink.write.?(sink.context, .init(self.payload));
++                if (result != .ok) return result;
++            }
++            return error.FixtureBufferDidNotFill;
++        }
++    };
++    const payload = try std.testing.allocator.alloc(u8, 4 * 1024 * 1024);
++    defer std.testing.allocator.free(payload);
++    @memset(payload, 'x');
++    for ([_]bool{ false, true }) |use_h2| {
++        for ([_]bool{ false, true }) |cancel| {
++            std.debug.print("REAL_SINK transport={s} cancel={} start\n", .{ if (use_h2) "h2" else "h1", cancel });
++            var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = Fixture.unusedNativeNow };
++            defer state.owner.tryDeinit() catch @panic("socket owner leaked");
++            const port = state.port();
++            var lease = try runtime.runnable_abi.Lease.init(port);
++            defer lease.deinit();
++            const borrow = runtime.native_abi.IoBorrow.init(&io);
++            var listener = try httpx.socket.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
++            defer listener.deinit();
++            var sender = try httpx.socket.Socket.connect(listener.getLocalAddress(), io);
++            defer sender.close();
++            sender.enableNativeTimeouts();
++            var peer = try listener.accept();
++            defer peer.socket.close();
++            peer.socket.enableNativeTimeouts();
++            var request = try httpx.Request.init(std.testing.allocator, .POST, "/stream");
++            defer request.deinit();
++            var context = httpx.Context.init(std.testing.allocator, io, &request);
++            defer context.deinit();
++            context.h1_sock = &sender;
++            var h2 = httpx.H2Connection.initServer(std.testing.allocator, io);
++            defer h2.deinit();
++            if (use_h2) {
++                const stream = try h2.stream_manager.getOrCreateStream(1);
++                stream.state = .open;
++                // Give DATA enough peer-advertised credit to reach actual TCP
++                // backpressure rather than the independent flow-credit fixture.
++                stream.send_window = std.math.maxInt(i32);
++                h2.stream_manager.connection_send_window = std.math.maxInt(i32);
++                context.h2 = &h2;
++                context.h2_sock = &sender;
++                context.h2_stream_id = 1;
++            }
++            var outbound = runtime.http_bridge.Outbound{ .context = &context };
++            var fixture = Fixture{ .state = &state, .port = port, .capsule = undefined, .transport = &outbound, .payload = payload, .io = io, .deadline_ns = Fixture.now(io) + 750 * std.time.ns_per_ms, .h2 = if (use_h2) &h2 else null };
++            outbound.write_control = .{ .ptr = &fixture, .check_fn = Fixture.check, .remaining_ms_fn = Fixture.remaining };
++            var capsule: ?*anyopaque = null;
++            const start = port.start(port.context, &.{ .io = &borrow, .clock_io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.inference), .slots = 2, .retained_bytes = payload.len, .deadline_ns = fixture.deadline_ns, .has_deadline = 1, .cancellation = .{ .context = &fixture, .is_cancelled = Fixture.requested }, .out_handle = &capsule });
++            if (!start.isOk()) return runtime.error_abi.errorFromStatus(start);
++            fixture.capsule = capsule.?;
++            var finished = false;
++            defer if (!finished) port.finish(capsule.?);
++            const retained = state.owner.scheduler.stats().retained_bytes;
++            var task = try io.concurrent(Fixture.run, .{&fixture});
++            defer _ = task.cancel(io) catch .failed;
++            std.debug.print("REAL_SINK await backpressure\n", .{});
++            try fixture.waiting.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
++            var query: ?*anyopaque = null;
++            const query_start = port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.query), .out_handle = &query });
++            if (!query_start.isOk()) return runtime.error_abi.errorFromStatus(query_start);
++            var query_finished = false;
++            defer if (!query_finished) port.finish(query.?);
++            var control: ?*anyopaque = null;
++            const control_start = port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.control), .out_handle = &control });
++            if (!control_start.isOk()) return runtime.error_abi.errorFromStatus(control_start);
++            var control_finished = false;
++            defer if (!control_finished) port.finish(control.?);
++            try std.testing.expect(!fixture.done.load(.acquire));
++            const waiting = state.owner.scheduler.stats();
++            try std.testing.expectEqual(@as(usize, 1), waiting.resource_blocked + waiting.queued);
++            try io.sleep(.fromMilliseconds(15), .awake);
++            port.finish(control.?);
++            control_finished = true;
++            port.finish(query.?);
++            query_finished = true;
++            try std.testing.expectEqual(retained, state.owner.scheduler.stats().retained_bytes);
++            if (cancel) {
++                // Cancellation between complete H2 frames preserves the
++                // connection. Require a stable in-progress kernel write,
++                // after releasing peer grants, to exercise uncertain output.
++                var epoch: usize = 0;
++                var stable_since = Fixture.now(io);
++                while (true) {
++                    const current = fixture.write_epoch.load(.acquire);
++                    const now = Fixture.now(io);
++                    if (!fixture.in_write.load(.acquire) or current != epoch) {
++                        epoch = current;
++                        stable_since = now;
++                    } else if (now - stable_since >= 40 * std.time.ns_per_ms) break;
++                    if (fixture.done.load(.acquire) or now >= fixture.deadline_ns) return error.FixtureDidNotStall;
++                    try io.sleep(.fromMilliseconds(1), .awake);
++                }
++                fixture.canceled.store(true, .release);
++            }
++            const output_status = try task.await(io);
++            std.debug.print("REAL_SINK output status={s} begins={d} ends={d}\n", .{ @tagName(output_status), fixture.begins, fixture.ends });
++            try std.testing.expectEqual(if (cancel) runtime.http_abi.CallbackStatus.canceled else .timeout, output_status);
++            try std.testing.expect(fixture.begins >= 4);
++            try std.testing.expectEqual(fixture.begins, fixture.ends);
++            try std.testing.expect(outbound.execution_wait.begin == null);
++            // A partly delivered chunk cannot be reused as another response. The
++            // controlled writer retires uncertainty; drain queued TCP bytes and
++            // require EOF rather than a live, idle connection after the failure.
++            try peer.socket.setRecvTimeout(1000);
++            var bytes: [64 * 1024]u8 = undefined;
++            var drained_bytes: usize = 0;
++            std.debug.print("REAL_SINK await peer EOF\n", .{});
++            while (true) {
++                const count = peer.socket.recv(&bytes) catch |err| {
++                    std.debug.print("REAL_SINK peer err={} drained={d}\n", .{ err, drained_bytes });
++                    return err;
++                };
++                if (count == 0) break;
++                drained_bytes += count;
++                if (drained_bytes > 64 * 1024 * 1024) return error.FixtureDrainExceeded;
++            }
++            try std.testing.expect(drained_bytes > 0);
++            port.finish(capsule.?);
++            finished = true;
++            const drained = state.owner.scheduler.stats();
++            try std.testing.expectEqual(@as(usize, 0), drained.operations);
++            try std.testing.expectEqual(@as(usize, 0), drained.runnable_slots);
++            try std.testing.expectEqual(@as(u64, 0), drained.retained_bytes);
++        }
++    }
++}
+diff --git a/zig/pkg/antfly/src/api/sql_execution.zig b/zig/pkg/antfly/src/api/sql_execution.zig
+index d1afaeba81..5619c51362 100644
+--- a/zig/pkg/antfly/src/api/sql_execution.zig
++++ b/zig/pkg/antfly/src/api/sql_execution.zig
+@@ -114,8 +114,13 @@ pub const Adapter = struct {
+     identity: *?http_server.AuthenticatedIdentity,
+     context: operation.RequestContext,
+     runnable: ?*http_server.RunnableScheduler.Execution = null,
+-    /// A scheduled ordinary write owns one worker through durable completion.
+-    /// It must not fan out CPU children or borrow read-only suspension hooks.
++    /// Write teams retain their grant through accepted durable completion;
++    /// they do not borrow read-only suspension hooks.
++    write_execution: ?*http_server.RunnableScheduler.Execution = null,
++    /// Ingress-owned stable receivers survive through the root owning finish.
++    write_completion: ?*@import("runnable_write_team.zig").Completion = null,
++    /// SQL preparation remains serial. Participant fanout separately reserves
++    /// its bounded team on the same retained execution.
+     serial_execution: bool = false,
+     read_guard: ?read_fence.Guard = null,
+     database: []const u8 = "default",
+@@ -180,6 +185,19 @@ pub const Adapter = struct {
+     }
+ 
+     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
++        var write_team: ?@import("antfly_runtime_abi").runnable_abi.Team = null;
++        const previous_team = self.context.execution_team;
++        defer self.context.execution_team = previous_team;
++        const participates_in_commit = switch (compiled.statement) {
++            .insert, .update, .delete, .merge, .commit => true,
++            else => false,
++        };
++        if (previous_team == null and participates_in_commit) {
++            if (self.write_execution) |execution| {
++                write_team = try self.writeTeam(execution);
++                self.context.execution_team = &write_team.?;
++            }
++        }
+         if (self.runnable != null and (compiled.statement == .select or compiled.statement == .explain)) try self.beginReadFence();
+         defer self.endReadFence();
+         const state_alloc = if (@import("sql_control.zig").isControl(compiled.statement)) self.server.controlAllocator() else self.server.alloc;
+@@ -731,6 +749,18 @@ pub const Adapter = struct {
+         try execution.park(.resource_blocked);
+     }
+ 
++    fn writeTeam(self: *Adapter, execution: *http_server.RunnableScheduler.Execution) !@import("antfly_runtime_abi").runnable_abi.Team {
++        if (self.write_completion) |completion| {
++            if (completion.execution != execution) return error.InvalidRunnableTransition;
++            return completion.team();
++        }
++        const entry = execution.entry orelse return error.InvalidRunnableTransition;
++        // Concurrent children cannot borrow a request arena. This stable
++        // process-owned partition enforces the API request byte limit.
++        const memory = self.server.request_memory orelse return error.ExecutionWaitUnsupported;
++        return @import("runnable_write_team.zig").init(execution, memory.allocator(entry.class == .control));
++    }
++
+     fn providerRunnable(self: *Adapter) ?@import("antfly_runtime_abi").runnable_abi.Borrowed {
+         const execution = self.runnable orelse return null;
+         const entry = execution.entry orelse return null;
+diff --git a/zig/pkg/antfly/src/api/sql_pgwire.zig b/zig/pkg/antfly/src/api/sql_pgwire.zig
+index f819c7f391..439cff078c 100644
+--- a/zig/pkg/antfly/src/api/sql_pgwire.zig
++++ b/zig/pkg/antfly/src/api/sql_pgwire.zig
+@@ -829,8 +829,18 @@ const Job = struct {
+         defer identity.?.deinit(identity_alloc);
+         var authority = Authority{ .credential = self.credential, .identity = &identity, .request = self.request };
+         const context = try authority.context();
++        // Stable local completion receivers outlive the root's deferred finish.
++        var write_completion: ?@import("runnable_write_team.zig").Completion = null;
++        if (write) {
++            if (runnable.entry) |entry| {
++                const memory = server.request_memory orelse return error.ExecutionWaitUnsupported;
++                write_completion = try @import("runnable_write_team.zig").Completion.init(&runnable, memory.allocator(entry.class == .control));
++            }
++        }
+         var native_adapter = execution.Adapter{
+             .runnable = if ((!write or protected) and runnable.entry != null) &runnable else null,
++            .write_execution = if (write and runnable.entry != null) &runnable else null,
++            .write_completion = if (write_completion) |*bridge| bridge else null,
+             .serial_execution = runnable.entry != null,
+             .server = server,
+             .identity = &identity,
+diff --git a/zig/pkg/antfly/src/api/sql_session.zig b/zig/pkg/antfly/src/api/sql_session.zig
+index 9bd4a270da..eaee7ba773 100644
+--- a/zig/pkg/antfly/src/api/sql_session.zig
++++ b/zig/pkg/antfly/src/api/sql_session.zig
+@@ -59,11 +59,14 @@ pub const Coordinator = struct {
+         var proof_arena = std.heap.ArenaAllocator.init(alloc);
+         defer proof_arena.deinit();
+         const signed = try server.signCurrentRowPolicyMutationParticipants(proof_arena.allocator(), prepared.tables, self.context);
++        // Refuse an unsupported execution capability before sealing durable
++        // recovery debt; never silently switch to unaccounted fanout.
++        if (self.context.execution_team != null and !source.supportsTransactionExecution()) return error.ExecutionWaitUnsupported;
+         var plan = (try server.txn_sessions.sealExecutionPlan(alloc, id, signed)) orelse return error.SqlTransactionNotActive;
+         defer plan.deinit();
+         // Once the durable plan is sealed, no error is safe to turn into a
+         // replay invitation. Maintenance owns completion under this same id.
+-        const outcome = (source.commitTransactionWithIdAndCancellation(alloc, id, info.begin_timestamp, plan.value, info.sync_level, self.context.cancellation) catch |err| {
++        const outcome = (source.commitTransactionWithIdAndExecution(alloc, id, info.begin_timestamp, plan.value, info.sync_level, self.context.cancellation, self.context.execution_team) catch |err| {
+             if (err == error.EnrichmentWorkerFailed) {
+                 // Persist terminal repair debt before exposing it. The legacy
+                 // error lacks coordinator metadata; maintenance retains the
+diff --git a/zig/pkg/antfly/src/api/table_writes.zig b/zig/pkg/antfly/src/api/table_writes.zig
+index c1d9f953d9..729acdb771 100644
+--- a/zig/pkg/antfly/src/api/table_writes.zig
++++ b/zig/pkg/antfly/src/api/table_writes.zig
+@@ -104,6 +104,7 @@ const indexes_api = @import("indexes.zig");
+ const coverage_policy_mod = @import("antfly_local_sources").api_coverage_policy;
+ const query_api = @import("antfly_local_sources").api_query;
+ const public_table_http = @import("public_table_http.zig");
++const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
+ const runtime_status = @import("antfly_local_sources").api_runtime_status;
+ const stored_destination_authorization = @import("antfly_local_sources").api_stored_destination_authorization;
+ 
+@@ -20088,8 +20089,10 @@ pub const ProvisionedTableWriteSource = struct {
+                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
+                 .commit_batch = commitBatch,
+                 .commit_batch_with_cancellation = commitBatchWithCancellation,
++                .commit_batch_with_execution = commitBatchWithExecution,
+                 .commit_transaction_with_id = commitTransactionWithId,
+                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
++                .commit_transaction_with_id_with_execution = commitTransactionWithIdAndExecution,
+                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
+                 .backup_table = backupTable,
+                 .backup_pin_control = backupPinControl,
+@@ -22106,7 +22109,7 @@ pub const ProvisionedTableWriteSource = struct {
+         const txn_source: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+         const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
+         const txn_id = nextTxnId(txn_io);
+-        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
++        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, null);
+     }
+ 
+     fn commitTransactionWithId(
+@@ -22129,7 +22132,33 @@ pub const ProvisionedTableWriteSource = struct {
+         sync_level: db_mod.types.SyncLevel,
+         cancellation: db_mod.types.CancellationToken,
+     ) !?distributed_txn.CommitOutcome {
+-        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
++        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, null);
++    }
++
++    fn commitTransactionWithIdAndExecution(
++        ptr: *anyopaque,
++        alloc: std.mem.Allocator,
++        txn_id: db_mod.types.TxnId,
++        begin_timestamp: u64,
++        tables: []const distributed_txn.TableCommitRequest,
++        sync_level: db_mod.types.SyncLevel,
++        cancellation: db_mod.types.CancellationToken,
++        team: *runnable_abi.Team,
++    ) !?distributed_txn.CommitOutcome {
++        return commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, team);
++    }
++
++    fn commitBatchWithExecution(
++        ptr: *anyopaque,
++        alloc: std.mem.Allocator,
++        tables: []const distributed_txn.TableCommitRequest,
++        sync_level: db_mod.types.SyncLevel,
++        cancellation: db_mod.types.CancellationToken,
++        team: *runnable_abi.Team,
++    ) !?distributed_txn.CommitOutcome {
++        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
++        try enforceReplicationWriteGateOptional(self.replication_write_gate);
++        return commitStatelessBatchWithExecution(self, commitProvisionedBatchOnceWithExecution, alloc, tables, sync_level, cancellation, team);
+     }
+ 
+     fn acknowledgeTransactionCommit(
+@@ -22160,6 +22189,7 @@ pub const ProvisionedTableWriteSource = struct {
+         sync_level: db_mod.types.SyncLevel,
+         retain_terminal: bool,
+         cancellation: db_mod.types.CancellationToken,
++        team: ?*runnable_abi.Team,
+     ) !?distributed_txn.CommitOutcome {
+         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+         try enforceReplicationWriteGateOptional(self.replication_write_gate);
+@@ -22180,6 +22210,7 @@ pub const ProvisionedTableWriteSource = struct {
+                 .report_post_commit_failure = false,
+                 .fanout_io = self.tableActivityIo(),
+                 .post_commit_cancellation = cancellation,
++                .team = team,
+             },
+         );
+     }
+@@ -22212,10 +22243,26 @@ pub const ProvisionedTableWriteSource = struct {
+         sync_level: db_mod.types.SyncLevel,
+         cancellation: db_mod.types.CancellationToken,
+     ) !?distributed_txn.CommitOutcome {
+-        if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
++        return commitProvisionedBatchOnceWithExecution(self, alloc, tables, sync_level, cancellation, null);
++    }
++
++    fn commitProvisionedBatchOnceWithExecution(
++        self: *ProvisionedTableWriteSource,
++        alloc: std.mem.Allocator,
++        tables: []const distributed_txn.TableCommitRequest,
++        sync_level: db_mod.types.SyncLevel,
++        cancellation: db_mod.types.CancellationToken,
++        team: ?*runnable_abi.Team,
++    ) !?distributed_txn.CommitOutcome {
++        const single = if (team) |execution| single: {
++            try execution.reserve(0);
++            defer execution.finish();
++            break :single try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation);
++        } else try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation);
++        if (single) |outcome| return outcome;
+         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
+         const txn_id = nextTxnId(txn_io);
+-        return commitProvisionedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation) catch |err| {
++        return commitProvisionedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, team) catch |err| {
+             if (err == error.CommitDecisionUnknown)
+                 public_table_http.setLastAmbiguousBatchTxnId(distributed_txn.encodeTxnIdHex(txn_id));
+             return err;
+@@ -25520,8 +25567,10 @@ pub const HostedProvisionedTableWriteSource = struct {
+                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
+                 .commit_batch = commitBatch,
+                 .commit_batch_with_cancellation = commitBatchWithCancellation,
++                .commit_batch_with_execution = commitBatchWithExecution,
+                 .commit_transaction_with_id = commitTransactionWithId,
+                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
++                .commit_transaction_with_id_with_execution = commitTransactionWithIdAndExecution,
+                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
+                 .backup_table = backupTable,
+                 .backup_pin_control = backupPinControl,
+@@ -26095,7 +26144,7 @@ pub const HostedProvisionedTableWriteSource = struct {
+         const txn_source: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+         const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
+         const txn_id = nextTxnId(txn_io);
+-        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
++        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, null);
+     }
+ 
+     fn commitBatch(
+@@ -26124,10 +26173,21 @@ pub const HostedProvisionedTableWriteSource = struct {
+         tables: []const distributed_txn.TableCommitRequest,
+         sync_level: db_mod.types.SyncLevel,
+         cancellation: db_mod.types.CancellationToken,
++    ) !?distributed_txn.CommitOutcome {
++        return commitHostedBatchOnceWithExecution(self, alloc, tables, sync_level, cancellation, null);
++    }
++
++    fn commitHostedBatchOnceWithExecution(
++        self: *HostedProvisionedTableWriteSource,
++        alloc: std.mem.Allocator,
++        tables: []const distributed_txn.TableCommitRequest,
++        sync_level: db_mod.types.SyncLevel,
++        cancellation: db_mod.types.CancellationToken,
++        team: ?*runnable_abi.Team,
+     ) !?distributed_txn.CommitOutcome {
+         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
+         const txn_id = nextTxnId(txn_io);
+-        return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
++        return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, team);
+     }
+ 
+     fn commitTransactionWithId(
+@@ -26150,7 +26210,32 @@ pub const HostedProvisionedTableWriteSource = struct {
+         sync_level: db_mod.types.SyncLevel,
+         cancellation: db_mod.types.CancellationToken,
+     ) !?distributed_txn.CommitOutcome {
+-        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
++        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, null);
++    }
++
++    fn commitTransactionWithIdAndExecution(
++        ptr: *anyopaque,
++        alloc: std.mem.Allocator,
++        txn_id: db_mod.types.TxnId,
++        begin_timestamp: u64,
++        tables: []const distributed_txn.TableCommitRequest,
++        sync_level: db_mod.types.SyncLevel,
++        cancellation: db_mod.types.CancellationToken,
++        team: *runnable_abi.Team,
++    ) !?distributed_txn.CommitOutcome {
++        return commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, team);
++    }
++
++    fn commitBatchWithExecution(
++        ptr: *anyopaque,
++        alloc: std.mem.Allocator,
++        tables: []const distributed_txn.TableCommitRequest,
++        sync_level: db_mod.types.SyncLevel,
++        cancellation: db_mod.types.CancellationToken,
++        team: *runnable_abi.Team,
++    ) !?distributed_txn.CommitOutcome {
++        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
++        return commitStatelessBatchWithExecution(self, commitHostedBatchOnceWithExecution, alloc, tables, sync_level, cancellation, team);
+     }
+ 
+     fn acknowledgeTransactionCommit(
+@@ -26181,6 +26266,7 @@ pub const HostedProvisionedTableWriteSource = struct {
+         sync_level: db_mod.types.SyncLevel,
+         retain_terminal: bool,
+         cancellation: db_mod.types.CancellationToken,
++        team: ?*runnable_abi.Team,
+     ) !?distributed_txn.CommitOutcome {
+         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+@@ -26201,6 +26287,7 @@ pub const HostedProvisionedTableWriteSource = struct {
+                 .report_post_commit_failure = false,
+                 .fanout_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null,
+                 .post_commit_cancellation = cancellation,
++                .team = team,
+             },
+         );
+     }
+@@ -27709,10 +27796,29 @@ fn commitStatelessBatchWithRetries(
+     sync_level: db_mod.types.SyncLevel,
+     cancellation: db_mod.types.CancellationToken,
+ ) !?distributed_txn.CommitOutcome {
++    return commitStatelessBatchWithExecution(source, commit_once, alloc, tables, sync_level, cancellation, null);
++}
++
++fn commitStatelessBatchWithExecution(
++    source: anytype,
++    comptime commit_once: anytype,
++    alloc: std.mem.Allocator,
++    tables: []const distributed_txn.TableCommitRequest,
++    sync_level: db_mod.types.SyncLevel,
++    cancellation: db_mod.types.CancellationToken,
++    team: ?*runnable_abi.Team,
++) !?distributed_txn.CommitOutcome {
++    if (comptime @typeInfo(@TypeOf(commit_once)).@"fn".params.len != 6) {
++        if (team != null) return error.UnsupportedOperation;
++    }
+     const retry_conflicts = statelessBatchMayRetry(tables);
+     var attempt: u8 = 0;
+     while (true) : (attempt += 1) {
+-        const outcome = commit_once(source, alloc, tables, sync_level, cancellation) catch |err| {
++        const attempt_result = if (comptime @typeInfo(@TypeOf(commit_once)).@"fn".params.len == 6)
++            commit_once(source, alloc, tables, sync_level, cancellation, team)
++        else
++            commit_once(source, alloc, tables, sync_level, cancellation);
++        const outcome = attempt_result catch |err| {
+             if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts and err == error.TopologyChanged) {
+                 try sleepStatelessBatchRetry(source, attempt);
+                 continue;
+diff --git a/zig/pkg/antfly/src/standalone/runtime.zig b/zig/pkg/antfly/src/standalone/runtime.zig
+index 40230e3ddb..c96cc4b53c 100644
+--- a/zig/pkg/antfly/src/standalone/runtime.zig
++++ b/zig/pkg/antfly/src/standalone/runtime.zig
+@@ -5508,6 +5508,7 @@ pub fn runFromIterator(
+             &unified_api_ready,
+             &unified_lifecycle,
+             &http_runtime,
++            inference_runnable_port,
+         })
+     else
+         control_io.concurrent(serveUnifiedWithLinkedInference, .{
+@@ -5523,6 +5524,7 @@ pub fn runFromIterator(
+             &unified_api_ready,
+             &unified_lifecycle,
+             &http_runtime,
++            inference_runnable_port,
+         })) catch |err| {
+         std.log.err("standalone startup failed step=schedule_unified_http err={}", .{err});
+         return err;
+@@ -5668,8 +5670,9 @@ fn serveUnifiedWithInference(
+     unified_api_ready: *std.atomic.Value(bool),
+     lifecycle: *UnifiedServerLifecycle,
+     http_runtime: *httpx.HttpRuntime,
++    runnable_owner: ?inference_bridge.runnable_abi.Owner,
+ ) void {
+-    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
++    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime, runnable_owner) catch |err| {
+         unified_api_ready.store(false, .release);
+         lifecycle.publishFailure(err);
+         std.debug.print("unified server error: {}\n", .{err});
+@@ -5692,8 +5695,9 @@ fn serveUnifiedWithLinkedInference(
+     unified_api_ready: *std.atomic.Value(bool),
+     lifecycle: *UnifiedServerLifecycle,
+     http_runtime: *httpx.HttpRuntime,
++    runnable_owner: ?inference_bridge.runnable_abi.Owner,
+ ) void {
+-    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
++    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime, runnable_owner) catch |err| {
+         unified_api_ready.store(false, .release);
+         lifecycle.publishFailure(err);
+         std.debug.print("unified server error: {}\n", .{err});
+@@ -5717,9 +5721,13 @@ fn serveUnifiedInner(
+     unified_api_ready: *std.atomic.Value(bool),
+     lifecycle: *UnifiedServerLifecycle,
+     http_runtime: *httpx.HttpRuntime,
++    runnable_owner: ?inference_bridge.runnable_abi.Owner,
+ ) !void {
++    var cleanup_owner = if (runnable_owner) |port| try @import("antfly_runtime_abi").http_cleanup.Owner.init(port) else null;
++    defer if (cleanup_owner) |*owner| owner.deinit();
+     var server_config = public_http_config;
+     server_config.http_runtime = http_runtime;
++    if (cleanup_owner) |*owner| server_config.cleanup_execution = owner.view();
+     var server = httpx.Server.initWithConfig(alloc, io, server_config);
+     defer server.deinit();
+     var route_context = StandaloneHttpContext{
+@@ -5750,6 +5758,7 @@ fn serveUnifiedInner(
+                 antfly_node,
+                 functions,
+                 &linked_inference_routes,
++                runnable_owner,
+             );
+         }
+     }
+@@ -5819,6 +5828,7 @@ const LinkedInferenceRoute = struct {
+     kernel_route_handle: *anyopaque,
+     request_body: runtime_http_abi.RequestBodyMode,
+     streaming_response: bool,
++    runnable_owner: ?inference_bridge.runnable_abi.Owner = null,
+ };
+ 
+ fn registerLinkedInferenceManifest(
+@@ -5827,6 +5837,7 @@ fn registerLinkedInferenceManifest(
+     inference_handle: *anyopaque,
+     functions: *const inference_bridge.FunctionTable,
+     owned_routes: *std.ArrayListUnmanaged(*LinkedInferenceRoute),
++    runnable_owner: ?inference_bridge.runnable_abi.Owner,
+ ) !void {
+     var entries_ptr: ?[*]const inference_bridge.RouteManifestEntry = null;
+     var entries_len: usize = 0;
+@@ -5846,6 +5857,7 @@ fn registerLinkedInferenceManifest(
+             .kernel_route_handle = entry.route_handle,
+             .request_body = entry.request_body,
+             .streaming_response = entry.streaming_response != 0,
++            .runnable_owner = runnable_owner,
+         };
+         try owned_routes.append(alloc, route);
+         errdefer _ = owned_routes.pop();
+@@ -5859,9 +5871,91 @@ fn registerLinkedInferenceManifest(
+     }
+ }
+ 
++const LinkedInferenceHttpOutputControl = struct {
++    fn now(context: *const httpx.Context) u64 {
++        if (context.application_deadline_io) |clock_io| return @intCast(@max(0, std.Io.Clock.now(.awake, clock_io).nanoseconds));
++        return platform_time.monotonicNs();
++    }
++    fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
++        const context: *const httpx.Context = @ptrCast(@alignCast(raw.?));
++        if (context.isCancellationRequested()) return error.Canceled;
++        if (context.application_deadline_ns) |deadline| if (now(context) >= deadline) return error.Timeout;
++    }
++    fn remaining(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
++        const context: *const httpx.Context = @ptrCast(@alignCast(raw.?));
++        try check(raw);
++        const deadline = context.application_deadline_ns orelse return null;
++        const ns = deadline -| now(context);
++        return @divTrunc(ns, std.time.ns_per_ms) + @intFromBool(ns % std.time.ns_per_ms != 0);
++    }
++    fn view(context: *httpx.Context) httpx.socket.WriteControl {
++        return .{ .ptr = context, .check_fn = check, .remaining_ms_fn = remaining };
++    }
++};
++
++fn linkedInferenceHttpNativeDeadline(context: *const httpx.Context) ?u64 {
++    const deadline = context.application_deadline_ns orelse return null;
++    const clock_io = context.application_deadline_io orelse return deadline;
++    const now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, clock_io).nanoseconds));
++    // Convert the remaining original budget once at the native ABI boundary.
++    // Keep the original clock on the owner; never refresh its absolute fence.
++    return platform_time.monotonicNs() +| (deadline -| now);
++}
++
+ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
+     const route: *const LinkedInferenceRoute = @ptrCast(@alignCast(context.route_data orelse return error.InferenceRuntimeUnavailable));
+     const source_headers = context.request.headers.iterator();
++    var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = context, .write_control = LinkedInferenceHttpOutputControl.view(context) };
++    const native_deadline_ns = linkedInferenceHttpNativeDeadline(context);
++    var execution_handle: ?*anyopaque = null;
++    const io_borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&context.io);
++    const clock_borrow = if (context.application_deadline_io) |clock_io| @import("antfly_runtime_abi").native_abi.IoBorrow.init(&clock_io) else null;
++    if (route.runnable_owner) |owner| {
++        var retained_bytes: u64 = @sizeOf(LinkedInferenceRoute);
++        retained_bytes +|= context.request.uri.path.len;
++        if (context.request.uri.query) |query| retained_bytes +|= query.len;
++        if (context.request.body) |body| retained_bytes +|= body.len;
++        for (source_headers) |header| {
++            retained_bytes +|= header.name.len;
++            retained_bytes +|= header.value.len;
++            retained_bytes +|= @sizeOf(runtime_http_abi.HeaderView);
++        }
++        for (context.params) |param| {
++            retained_bytes +|= param.name.len;
++            retained_bytes +|= param.value.len;
++            retained_bytes +|= @sizeOf(runtime_http_abi.RouteParamView);
++        }
++        const status = owner.start(owner.context, &.{
++            .io = &io_borrow,
++            .clock_io = if (clock_borrow) |*clock| clock else null,
++            .class = @backingInt(inference_bridge.runnable_abi.Class.inference),
++            .slots = 1,
++            .deadline_ns = context.application_deadline_ns orelse 0,
++            .has_deadline = @intFromBool(context.application_deadline_ns != null),
++            .native_deadline = @intFromBool(context.application_deadline_io == null),
++            .cancellation = transport.cancellation(),
++            .retained_bytes = retained_bytes,
++            .out_handle = &execution_handle,
++        });
++        if (!status.isOk()) {
++            const err = inference_bridge.errorFromStatus(status);
++            if (err == error.QueueFull or err == error.ResourceTemporarilyUnavailable) {
++                var overloaded = httpx.Response.init(context.allocator, 503);
++                errdefer overloaded.deinit();
++                try overloaded.headers.append("Content-Type", "application/json");
++                try overloaded.headers.append("Retry-After", "1");
++                overloaded.body = "{\"error\":\"inference execution capacity exceeded\"}";
++                return overloaded;
++            }
++            return err;
++        }
++        if (execution_handle == null) return error.RuntimeBoundaryFailure;
++    }
++    defer if (execution_handle) |handle| route.runnable_owner.?.finish(handle);
++    var runnable = if (execution_handle) |handle|
++        try inference_bridge.runnable_abi.Borrowed.fromOwner(route.runnable_owner.?, handle, 1, .inference)
++    else
++        null;
+     const headers = try context.allocator.alloc(runtime_http_abi.HeaderView, source_headers.len);
+     defer context.allocator.free(headers);
+     for (source_headers, 0..) |header, i| {
+@@ -5898,7 +5992,6 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
+         .authorization = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Authorization")),
+         .content_type = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
+     };
+-    var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = context };
+     const body_source = if (route.request_body == .buffered) transport.bodySource() else runtime_http_abi.RequestBodySource{};
+     var response_handle: ?*anyopaque = null;
+     var response_view: runtime_http_abi.HttpResponseView = undefined;
+@@ -5911,6 +6004,9 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
+         .stream = if (route.streaming_response) transport.stream() else .{},
+         .out_response_handle = &response_handle,
+         .out_response = &response_view,
++        .deadline_ns = native_deadline_ns orelse 0,
++        .has_deadline = @intFromBool(native_deadline_ns != null),
++        .runnable = if (runnable) |*borrow| borrow else null,
+     });
+     if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+     const owned_response_handle = response_handle orelse return error.RuntimeBoundaryFailure;
+@@ -5928,6 +6024,10 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
+     }
+     response.body = try context.allocator.dupe(u8, response_view.body.slice());
+     response.body_owned = true;
++    if (execution_handle) |handle| {
++        const completion = route.runnable_owner.?.checkpoint(handle);
++        if (!completion.isOk()) return inference_bridge.errorFromStatus(completion);
++    }
+     return response;
+ }
+ 
+@@ -14690,6 +14790,288 @@ test "runnable execution context adapters preserve parent authority" {
+     try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderChunkInputWithContext(&lifetime, alloc, "unused", .{ .binary = .{ .mime_type = "audio/wav", .data = &.{1} } }, config, context));
+     const rasters = [_]antfly.readers.RasterImage{.{ .bytes = &.{ 0, 0, 0, 255 }, .width = 1, .height = 1, .stride_bytes = 4 }};
+     try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderEmbedDenseRasters(&lifetime, alloc, "unused", &rasters, embedding));
+-    try std.testing.expectEqual(@as(usize, 7), parent.checks);
++    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderGenerateJson(&lifetime, alloc, "{}", context));
++    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderDecideJson(&lifetime, alloc, "{}", context));
++    try std.testing.expectEqual(@as(usize, 9), parent.checks);
++    const AllowedParent = struct {
++        class: c_int = @backingInt(inference_bridge.runnable_abi.Class.query),
++        parked: bool = false,
++        checks: usize = 0,
++        parks: usize = 0,
++        enters: usize = 0,
++        reject_return: bool = false,
++        fn check(raw: *anyopaque) callconv(.c) inference_bridge.Status {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            std.debug.assert(!self.parked);
++            self.checks += 1;
++            return .{};
++        }
++        fn park(raw: *anyopaque, wait: c_int) callconv(.c) inference_bridge.Status {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            std.debug.assert(!self.parked and wait == @backingInt(inference_bridge.runnable_abi.Wait.resource));
++            self.parked = true;
++            self.parks += 1;
++            return .{};
++        }
++        fn enter(raw: *anyopaque, class: c_int) callconv(.c) inference_bridge.Status {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            std.debug.assert(self.parked);
++            self.enters += 1;
++            if (class == @backingInt(inference_bridge.runnable_abi.Class.query) and self.reject_return)
++                return @import("antfly_runtime_abi").error_abi.statusFromError(error.Forbidden);
++            self.parked = false;
++            self.class = class;
++            return .{};
++        }
++    };
++    for ([_]bool{ false, true }) |reject_return| {
++        for ([_]bool{ false, true }) |decide| {
++            var allowed = AllowedParent{ .reject_return = reject_return };
++            const granted = antfly.inference.RequestContext{
++                .io = io,
++                .deadline_ns = null,
++                .runnable = .{ .context = &allowed, .cpu_slots = 1, .parent_class = @backingInt(inference_bridge.runnable_abi.Class.query), .checkpoint = AllowedParent.check, .park = AllowedParent.park, .enter = AllowedParent.enter },
++            };
++            // Malformed requests reach the real HTTP handler through the new
++            // provider operation. Preserve its status mapping, then require
++            // parent authority before publishing even this error response.
++            if (decide) {
++                try std.testing.expectError(if (reject_return) error.Forbidden else error.DecisionUpstreamFailure, inference_provider.inferenceProviderDecideJson(&lifetime, alloc, "{", granted));
++            } else {
++                try std.testing.expectError(if (reject_return) error.Forbidden else error.GenerateRequestFailed, inference_provider.inferenceProviderGenerateJson(&lifetime, alloc, "{", granted));
++            }
++            try std.testing.expectEqual(@as(usize, 2), allowed.parks);
++            try std.testing.expectEqual(@as(usize, 2), allowed.enters);
++            try std.testing.expectEqual(reject_return, allowed.parked);
++            try std.testing.expect(allowed.checks >= 2);
++            try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());
++        }
++    }
+     try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());
+ }
++
++test "runnable execution context adapters install immutable production broker admission" {
++    const Ports = struct {
++        refs: usize = 0,
++        starts: usize = 0,
++        finishes: usize = 0,
++        active: bool = false,
++        parked: bool = false,
++        reject_start: bool = false,
++        reject_return: bool = false,
++        parks: usize = 0,
++        enters: usize = 0,
++        deadline_ns: ?u64 = null,
++        native_deadline: bool = false,
++        has_clock_io: bool = false,
++        fn retain(raw: *anyopaque) callconv(.c) inference_bridge.Status {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.refs += 1;
++            return .ok;
++        }
++        fn release(raw: *anyopaque) callconv(.c) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.refs -= 1;
++        }
++        fn budgetRetain(raw: *anyopaque) callconv(.c) u8 {
++            _ = retain(raw);
++            return 1;
++        }
++        fn start(raw: *anyopaque, options: *const inference_bridge.runnable_abi.Start) callconv(.c) inference_bridge.Status {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            options.validate() catch |err| return inference_bridge.statusFromError(err);
++            std.debug.assert(!self.active and options.slots == 1 and options.class == @backingInt(inference_bridge.runnable_abi.Class.inference));
++            self.deadline_ns = if (options.has_deadline != 0) options.deadline_ns else null;
++            self.native_deadline = options.native_deadline != 0;
++            self.has_clock_io = options.clock_io != null;
++            if (options.clock_io) |clock| _ = clock.receive() catch |err| return inference_bridge.statusFromError(err);
++            if (self.reject_start) return inference_bridge.statusFromError(error.QueueFull);
++            self.active = true;
++            self.starts += 1;
++            options.out_handle.* = self;
++            return .ok;
++        }
++        fn check(raw: *anyopaque) callconv(.c) inference_bridge.Status {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            std.debug.assert(self.active);
++            return .ok;
++        }
++        fn park(raw: *anyopaque, kind: c_int) callconv(.c) inference_bridge.Status {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            std.debug.assert(self.active and !self.parked and kind == @backingInt(inference_bridge.runnable_abi.Wait.resource));
++            self.parked = true;
++            self.parks += 1;
++            return .ok;
++        }
++        fn enter(raw: *anyopaque, class: c_int) callconv(.c) inference_bridge.Status {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            std.debug.assert(self.active and self.parked and class == @backingInt(inference_bridge.runnable_abi.Class.inference));
++            self.enters += 1;
++            if (self.reject_return and self.enters == 2)
++                return inference_bridge.statusFromError(error.Forbidden);
++            self.parked = false;
++            return .ok;
++        }
++        fn finish(raw: *anyopaque) callconv(.c) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            std.debug.assert(self.active);
++            self.active = false;
++            self.parked = false;
++            self.finishes += 1;
++        }
++        fn reserve(_: *anyopaque, _: *const inference_bridge.AdmissionAmounts, out: *usize) callconv(.c) inference_bridge.Status {
++            out.* = 1;
++            return .ok;
++        }
++        fn retainAdmission(_: *anyopaque, _: usize, _: *const inference_bridge.AdmissionAmounts) callconv(.c) inference_bridge.Status {
++            return .ok;
++        }
++        fn releaseAdmission(_: *anyopaque, _: usize) callconv(.c) void {}
++        fn observe(_: *anyopaque, _: usize, _: u64, _: u64) callconv(.c) u8 {
++            return 1;
++        }
++    };
++    var ports = Ports{};
++    const alloc = std.testing.allocator;
++    const io = std.testing.io;
++    var handle: ?*anyopaque = null;
++    const create = inference_bridge.CreateContext{
++        .abi_version = inference_bridge.abi_version,
++        .data_dir_ptr = ".".ptr,
++        .data_dir_len = 1,
++        .models_dir = .init("."),
++        .ml_dir = .init("."),
++        .host_limit_bytes = 0,
++        .backend_limit_bytes = 0,
++        .combined_limit_bytes = 0,
++        .kv_limit_bytes = 0,
++        .scratch_limit_bytes = 0,
++        .process_memory_limit_bytes = std.math.maxInt(usize),
++        .preload_ptr = null,
++        .preload_len = 0,
++        .keep_alive = .{},
++        .max_loaded_models = 0,
++        .has_max_loaded_models = 0,
++        .content_security_json = .{},
++        .s3_credentials_json = .{},
++        .runtime_config_json = .init("{\"embedded_enabled\":false}"),
++        .executor = .init(&io),
++        .out_handle = &handle,
++    };
++    handle = try inference_host.linkedInferenceCreate(&create);
++    var destroyed = false;
++    defer if (!destroyed) inference_host.linkedInferenceDestroy(handle.?);
++    var budget = inference_bridge.ResourceBudget{ .abi_version = inference_bridge.abi_version, .context = &ports, .retain_context = Ports.budgetRetain, .release_context = Ports.release, .reserve_admission = Ports.reserve, .retain_admission = Ports.retainAdmission, .release_admission = Ports.releaseAdmission, .observe_prompt_cache = Ports.observe, .observe_tokenizer_cache = Ports.observe };
++    var owner = inference_bridge.runnable_abi.Owner{ .context = &ports, .retain = Ports.retain, .release = Ports.release, .start = Ports.start, .checkpoint = Ports.check, .park = Ports.park, .enter = Ports.enter, .finish = Ports.finish };
++    const context = inference_bridge.ConfigureContext{ .abi_version = inference_bridge.abi_version, .handle = handle.?, .resource_budget = &budget, .runnable_owner = &owner };
++    try inference_host.linkedInferenceConfigure(&context);
++    const state: *inference_host.LinkedInferenceState = @ptrCast(@alignCast(handle.?));
++    try std.testing.expect(state.executor_admission_provider != null and state.runnable_owner != null);
++    try state.node.testExecutorAdmission();
++    try std.testing.expectEqual(@as(usize, 2), ports.starts);
++    try std.testing.expectEqual(@as(usize, 2), ports.finishes);
++    try std.testing.expect(!ports.active);
++    try std.testing.expectError(error.InvalidRunnableTransition, state.node.configureExecutorAdmission(state.executor_admission_provider.?.admission()));
++    try std.testing.expectError(error.ExternalResourceBudgetsAlreadyConfigured, inference_host.linkedInferenceConfigure(&context));
++    // Exercise the actual public frontend and linked archive handler, including
++    // root admission before marshalling and authority before response copying.
++    const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
++    // Opaque handles belong to the module which created them. The inline
++    // broker fixture above has a different concrete Node layout from the
++    // production archive, so create the frontend handle through that archive.
++    var frontend_handle: ?*anyopaque = null;
++    var frontend_create = create;
++    frontend_create.out_handle = &frontend_handle;
++    const frontend_create_status = functions.create(&frontend_create);
++    if (!frontend_create_status.isOk()) return inference_bridge.errorFromStatus(frontend_create_status);
++    var frontend_destroyed = false;
++    defer if (!frontend_destroyed) functions.destroy(frontend_handle.?);
++    var frontend_configure = context;
++    frontend_configure.handle = frontend_handle.?;
++    const frontend_configure_status = functions.configure(&frontend_configure);
++    if (!frontend_configure_status.isOk()) return inference_bridge.errorFromStatus(frontend_configure_status);
++    var entries: ?[*]const inference_bridge.RouteManifestEntry = null;
++    var entries_len: usize = 0;
++    const manifest_status = functions.route_manifest(&.{ .abi_version = inference_bridge.abi_version, .handle = frontend_handle.?, .out_entries = &entries, .out_len = &entries_len });
++    if (!manifest_status.isOk()) return inference_bridge.errorFromStatus(manifest_status);
++    const generate = found: {
++        for (entries.?[0..entries_len]) |entry| {
++            if (entry.method == .post and std.mem.eql(u8, entry.path.slice(), "/ai/v1/generate")) break :found entry;
++        }
++        return error.MissingGenerateRoute;
++    };
++    var route = LinkedInferenceRoute{ .functions = functions, .kernel_route_handle = generate.route_handle, .request_body = generate.request_body, .streaming_response = generate.streaming_response != 0, .runnable_owner = owner };
++    var request = try httpx.Request.init(alloc, .POST, "/ai/v1/generate");
++    defer request.deinit();
++    try request.headers.append("Content-Type", "application/json");
++    request.body = "{";
++    var http_context = httpx.Context.init(alloc, io, &request);
++    defer http_context.deinit();
++    http_context.route_data = &route;
++    http_context.application_deadline_ns = platform_time.monotonicNs() +| 60 * std.time.ns_per_s;
++    ports.reject_start = true;
++    var overloaded = try linkedInferenceHttpHandler(&http_context);
++    defer overloaded.deinit();
++    try std.testing.expectEqual(@as(u16, 503), overloaded.status.code);
++    try std.testing.expectEqualStrings("1", overloaded.headers.get("Retry-After").?);
++    try std.testing.expectEqual(@as(usize, 2), ports.starts);
++    try std.testing.expect(!ports.active);
++    ports.reject_start = false;
++    for ([_]bool{ false, true }) |reject_return| {
++        ports.reject_return = reject_return;
++        ports.parks = 0;
++        ports.enters = 0;
++        if (reject_return) {
++            try std.testing.expectError(error.Forbidden, linkedInferenceHttpHandler(&http_context));
++        } else {
++            var response = try linkedInferenceHttpHandler(&http_context);
++            defer response.deinit();
++            try std.testing.expect(response.status.code >= 400);
++            try std.testing.expect(response.body != null and response.body.?.len > 0);
++        }
++        try std.testing.expectEqual(http_context.application_deadline_ns, ports.deadline_ns);
++        try std.testing.expect(ports.native_deadline and !ports.has_clock_io);
++        try std.testing.expectEqual(@as(usize, 2), ports.parks);
++        try std.testing.expectEqual(@as(usize, 2), ports.enters);
++        try std.testing.expectEqual(ports.starts, ports.finishes);
++        try std.testing.expect(!ports.active);
++    }
++    ports.reject_return = false;
++    ports.parks = 0;
++    ports.enters = 0;
++    http_context.application_deadline_ns = 1;
++    try std.testing.expectError(error.Timeout, linkedInferenceHttpHandler(&http_context));
++    try std.testing.expectEqual(ports.starts, ports.finishes);
++    try std.testing.expect(!ports.active);
++    // An executor-clock deadline has its original authority on the owner,
++    // while the native provider ABI receives only the remaining budget.
++    http_context.application_deadline_io = io;
++    http_context.application_deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds))) +| 60 * std.time.ns_per_s;
++    ports.parks = 0;
++    ports.enters = 0;
++    const before_native = platform_time.monotonicNs();
++    const converted = linkedInferenceHttpNativeDeadline(&http_context).?;
++    try std.testing.expect(converted > before_native);
++    try std.testing.expect(converted <= platform_time.monotonicNs() +| 60 * std.time.ns_per_s);
++    var clock_response = try linkedInferenceHttpHandler(&http_context);
++    defer clock_response.deinit();
++    try std.testing.expect(clock_response.status.code >= 400);
++    try std.testing.expectEqual(http_context.application_deadline_ns, ports.deadline_ns);
++    try std.testing.expect(!ports.native_deadline and ports.has_clock_io);
++    try std.testing.expectEqual(@as(usize, 2), ports.parks);
++    try std.testing.expectEqual(@as(usize, 2), ports.enters);
++    try std.testing.expectEqual(ports.starts, ports.finishes);
++    http_context.application_deadline_ns = 1;
++    ports.parks = 0;
++    ports.enters = 0;
++    try std.testing.expect(linkedInferenceHttpNativeDeadline(&http_context).? <= platform_time.monotonicNs());
++    try std.testing.expectError(error.Timeout, linkedInferenceHttpHandler(&http_context));
++    try std.testing.expect(!ports.native_deadline and ports.has_clock_io);
++    try std.testing.expectEqual(ports.starts, ports.finishes);
++    try std.testing.expect(!ports.active);
++    functions.destroy(frontend_handle.?);
++    frontend_destroyed = true;
++    inference_host.linkedInferenceDestroy(handle.?);
++    destroyed = true;
++    try std.testing.expectEqual(@as(usize, 0), ports.refs);
++}
+diff --git a/zig/pkg/inference/src/host/bridge.zig b/zig/pkg/inference/src/host/bridge.zig
+index d2c688790c..dc5224473e 100644
+--- a/zig/pkg/inference/src/host/bridge.zig
++++ b/zig/pkg/inference/src/host/bridge.zig
+@@ -24,7 +24,7 @@ const native_abi = @import("antfly_runtime_abi").native_abi;
+ pub const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
+ const antfly_image = @import("antfly_image");
+ 
+-pub const abi_version: u32 = 30;
++pub const abi_version: u32 = 33;
+ pub const ai_api_prefix = "/ai/v1";
+ pub const public_api_prefix = "/ml/v1";
+ pub const Status = error_abi.Status;
+@@ -177,6 +177,10 @@ pub const ProviderOperation = enum(c_int) {
+     /// Documents as ordered content parts; binary parts travel as payloads
+     /// whose refs index the parts flattened in document order.
+     rerank_documents = 22,
++    /// Raw JSON routes preserve the HTTP status and body contract while using
++    /// the provider request context and private-worker CPU grant transport.
++    generate_json = 23,
++    decide_json = 24,
+ };
+ 
+ pub const ProviderBinaryPayload = extern struct {
+@@ -326,6 +330,12 @@ pub const HttpHandleContext = extern struct {
+     stream: http_abi.StreamSink = .{},
+     out_response_handle: *?*anyopaque,
+     out_response: *http_abi.HttpResponseView,
++    deadline_ns: u64 = 0,
++    has_deadline: u8 = 0,
++    /// Synchronous HTTP dispatch borrows its caller's execution capsule.
++    runnable: ?*const runnable_abi.Borrowed = null,
++    /// A worker receives only scalar CPU demand, never parent callbacks.
++    admitted_cpu_slots: u32 = 0,
+ };
+ 
+ pub const Capability = struct {
+diff --git a/zig/pkg/inference/src/host/host.zig b/zig/pkg/inference/src/host/host.zig
+index e4f42bf3e3..00d7edb57e 100644
+--- a/zig/pkg/inference/src/host/host.zig
++++ b/zig/pkg/inference/src/host/host.zig
+@@ -41,6 +41,8 @@ const chunking_types = @import("antfly_chunking");
+ pub const worker_module = @import("worker.zig");
+ const worker_runtime = worker_module;
+ 
++const ExecutorAdmissionProvider = inference.server.ExecutorAdmissionProvider(@import("antfly_runtime_abi"));
++
+ pub const LinkedInferenceState = struct {
+     alloc: std.mem.Allocator,
+     executor: @import("antfly_runtime_abi").io_abi.Receiver,
+@@ -56,6 +58,7 @@ pub const LinkedInferenceState = struct {
+     owned_ml_dir: ?[]u8,
+     resource_budget_context: ?*LinkedResourceBudgetContext = null,
+     runnable_owner: ?inference_bridge.runnable_abi.Lease = null,
++    executor_admission_provider: ?ExecutorAdmissionProvider = null,
+     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
+     route_manifest: std.ArrayListUnmanaged(inference_bridge.RouteManifestEntry) = .empty,
+     route_validator: httpx.Router,
+@@ -925,8 +928,10 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
+         return error.UnsupportedVersion;
+     if (state.resource_budget_context != null)
+         return error.ExternalResourceBudgetsAlreadyConfigured;
++    if (context.runnable_owner != null and state.node.request_surfaces_published)
++        return error.InvalidRunnableTransition;
+     var runnable_lease = if (context.runnable_owner) |owner|
+-        try inference_bridge.runnable_abi.Lease.init(owner.*)
++        try inference_bridge.runnable_abi.Lease.initFrom(owner)
+     else
+         null;
+     errdefer if (runnable_lease) |*lease| lease.deinit();
+@@ -954,6 +959,11 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
+         std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
+         return err;
+     };
++    if (runnable_lease) |lease| {
++        state.executor_admission_provider = try ExecutorAdmissionProvider.init(state.alloc, lease.owner);
++        errdefer state.executor_admission_provider = null;
++        try state.node.configureExecutorAdmission(state.executor_admission_provider.?.admission());
++    }
+     state.runnable_owner = runnable_lease;
+ }
+ 
+@@ -1026,8 +1036,12 @@ test "runnable execution worker budget scopes execution and discards failed outp
+ }
+ 
+ fn invokeBorrowedProvider(context: *const inference_bridge.ProviderInvokeContext, callback: *const fn (*const inference_bridge.ProviderInvokeContext) anyerror!void) !void {
++    return invokeBorrowedExecution(context, discardProviderResponse, callback);
++}
++
++fn invokeBorrowedExecution(context: anytype, comptime discard: anytype, callback: anytype) !void {
+     const borrow = context.runnable orelse return error.InvalidRunnableTransition;
+-    var transfer = try inference_bridge.runnable_abi.Transfer.init(borrow.*, .inference);
++    var transfer = try inference_bridge.runnable_abi.Transfer.initFrom(borrow, .inference);
+     var scope = @import("inference_linalg").pool.WorkerScope.init(borrow.cpu_slots) catch |err| {
+         try transfer.returnToParent();
+         return err;
+@@ -1065,7 +1079,7 @@ fn invokeBorrowedProvider(context: *const inference_bridge.ProviderInvokeContext
+     const result = callback(context);
+     checkpoint_scope.deinit();
+     scope.deinit();
+-    errdefer discardProviderResponse(context);
++    errdefer discard(context);
+     // Authority and original-deadline failures take precedence over a newly
+     // acquired provider response; owning cleanup cannot require another grant.
+     if (phase.resume_error) |err| return err;
+@@ -1241,6 +1255,27 @@ fn invokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void
+     try execution_control.check();
+ 
+     const response_json = switch (operation) {
++        .generate_json, .decide_json => blk: {
++            var parsed = try std.json.parseFromSlice(struct { body: []const u8 }, alloc, request_json, .{});
++            defer parsed.deinit();
++            var http_request = try httpx.Request.init(alloc, .POST, if (operation == .generate_json) "/ai/v1/generate" else "/ai/v1/decide");
++            defer http_request.deinit();
++            try http_request.headers.append("Content-Type", "application/json");
++            http_request.body = parsed.value.body;
++            var http_context = httpx.Context.init(alloc, call_io, &http_request);
++            defer http_context.deinit();
++            try inference.server.installHttpExecutionControl(&http_context, &execution_control);
++            var response = if (operation == .generate_json)
++                try state.node.generateContent(&http_context)
++            else
++                try state.node.decide(&http_context);
++            defer response.deinit();
++            try execution_control.check();
++            break :blk try std.json.Stringify.valueAlloc(alloc, .{
++                .status = response.status.code,
++                .body = response.body orelse "",
++            }, .{});
++        },
+         .embed_dense_texts, .embed_dense_texts_with_context => blk: {
+             var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+             defer parsed.deinit();
+@@ -2245,6 +2280,37 @@ fn localInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
+ }
+ 
+ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleContext) !void {
++    const slots = try worker_runtime.wire.admittedCpuSlots(context);
++    if (context.has_deadline > 1) return error.InvalidArgument;
++    if (context.runnable != null)
++        return invokeBorrowedExecution(context, discardHttpResponse, handleHttp);
++    if (slots != 0) {
++        const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
++        if (route.owner.worker != null) return error.InvalidRunnableTransition;
++        var scope = try @import("inference_linalg").pool.WorkerScope.init(slots);
++        defer scope.deinit();
++        errdefer discardHttpResponse(context);
++        return handleHttp(context);
++    }
++    return handleHttp(context);
++}
++
++fn discardHttpResponse(context: *const inference_bridge.HttpHandleContext) void {
++    if (context.out_response_handle.*) |response| {
++        linkedInferenceDestroyHttpResponse(response);
++        context.out_response_handle.* = null;
++        context.out_response.* = std.mem.zeroes(@import("antfly_runtime_abi").http_abi.HttpResponseView);
++    }
++}
++
++fn checkHttpControls(context: *const inference_bridge.HttpHandleContext) !void {
++    if (context.cancellation.requested()) return error.Canceled;
++    if (context.has_deadline != 0 and platform_time.monotonicNs() >= context.deadline_ns)
++        return error.Timeout;
++}
++
++fn handleHttp(context: *const inference_bridge.HttpHandleContext) !void {
++    try checkHttpControls(context);
+     const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
+     const state = route.owner;
+     const alloc = state.alloc;
+@@ -2275,10 +2341,17 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
+         params[i] = .{ .name = param.name.slice(), .value = param.value.slice() };
+     }
+ 
+-    var http_context = httpx.Context.init(alloc, state.io, &http_request);
++    var serial_executor = borrowedProviderExecutor(alloc);
++    defer serial_executor.deinit();
++    const call_io = if (context.runnable != null or context.admitted_cpu_slots != 0)
++        serial_executor.io()
++    else
++        state.io;
++    var http_context = httpx.Context.init(alloc, call_io, &http_request);
+     defer http_context.deinit();
+     http_context.params = params;
+     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
++    http_context.application_deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null;
+     var response = if (state.worker) |worker| remote: {
+         // Preserve admission-before-upload, including lazy streaming bodies.
+         const admitted = request.method != .get;
+@@ -2294,6 +2367,7 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
+         break :remote try worker_runtime.invokeHttp(worker, route.path, context);
+     } else try route.handler.invoke(&http_context);
+     errdefer response.deinit();
++    try checkHttpControls(context);
+ 
+     const response_state = try alloc.create(HttpResponseState);
+     errdefer alloc.destroy(response_state);
+@@ -2364,6 +2438,7 @@ pub fn linkedInferenceDestroy(handle: *anyopaque) void {
+     state.runtime_config.deinit();
+     if (state.owned_models_dir) |path| alloc.free(path);
+     if (state.owned_ml_dir) |path| alloc.free(path);
++    state.executor_admission_provider = null;
+     if (state.runnable_owner) |*lease| lease.deinit();
+     alloc.destroy(state);
+ }
+diff --git a/zig/pkg/inference/src/host/provider_failure.zig b/zig/pkg/inference/src/host/provider_failure.zig
+index f668f4ef82..403e7060f9 100644
+--- a/zig/pkg/inference/src/host/provider_failure.zig
++++ b/zig/pkg/inference/src/host/provider_failure.zig
+@@ -19,7 +19,7 @@ const std = @import("std");
+ const bridge = @import("antfly_inference_bridge");
+ const diagnostics = @import("antfly_private_error_diagnostics");
+ 
+-const operation_slots = @backingInt(bridge.ProviderOperation.classify_texts) + 1;
++const operation_slots = @backingInt(bridge.ProviderOperation.decide_json) + 1;
+ var overflow_counts = @as([operation_slots]@import("antfly_platform").atomic.Value(u64), @splat(.init(0)));
+ var failures = @as([diagnostics.slots_count]diagnostics.Diagnostic, @splat(.{}));
+ 
+diff --git a/zig/pkg/inference/src/host/worker.zig b/zig/pkg/inference/src/host/worker.zig
+index f9bf5abcb3..f97a499736 100644
+--- a/zig/pkg/inference/src/host/worker.zig
++++ b/zig/pkg/inference/src/host/worker.zig
+@@ -24,6 +24,7 @@ const host = @import("host.zig");
+ const platform = @import("antfly_platform");
+ const httpx = @import("httpx");
+ const execution_control = @import("inference_server").execution_control;
++const Output = @import("worker_output_error.zig").Output;
+ const ExecutionPhases = @import("worker_execution_phase.zig").For(execution_control, rpc);
+ pub const EnvironmentEntry = struct { name: []const u8, value: []const u8 };
+ 
+@@ -33,8 +34,9 @@ const ForwardControl = struct {
+     deadline_ns: ?u64 = null,
+     progress: bridge.ProgressView = .{},
+     stream: http.StreamSink = .{},
+-    stream_started: bool = false,
++    output: Output = .{},
+     phase_handoff: bool = false,
++    output_waits_owned: bool = false,
+     execution_phase: ExecutionPhases.Parent = .{},
+ 
+     fn phase(raw: ?*anyopaque, value: rpc.Phase) !void {
+@@ -49,6 +51,17 @@ const ForwardControl = struct {
+         try self.execution_phase.finish();
+     }
+ 
++    fn beginOutputWait(raw: ?*anyopaque) callconv(.c) http.CallbackStatus {
++        const self: *@This() = @ptrCast(@alignCast(raw.?));
++        phase(raw, .resource_wait) catch |err| return self.output.record(err);
++        return .ok;
++    }
++    fn endOutputWait(raw: ?*anyopaque) callconv(.c) http.CallbackStatus {
++        const self: *@This() = @ptrCast(@alignCast(raw.?));
++        phase(raw, .runnable) catch |err| return self.output.record(err);
++        return .ok;
++    }
++
+     fn check(raw: ?*anyopaque) !void {
+         const self: *@This() = @ptrCast(@alignCast(raw.?));
+         // Poll original cancellation/deadline only. A scheduler checkpoint can
+@@ -68,31 +81,23 @@ const ForwardControl = struct {
+                 const headers = try self.alloc.alloc(http.HeaderView, value.headers.len);
+                 defer self.alloc.free(headers);
+                 for (value.headers, headers) |header, *header_view| header_view.* = .{ .name = .init(header.name), .value = .init(header.value) };
+-                try callbackResult((self.stream.start orelse return error.StreamingUnavailable)(self.stream.context, value.status, .init(payload.body), .{ .ptr = headers.ptr, .len = headers.len }));
+-                self.stream_started = true;
++                try self.output.start(self.stream, value.status, .init(payload.body), .{ .ptr = headers.ptr, .len = headers.len });
+             },
+             .stream_write => {
+-                try callbackResult((self.stream.write orelse return error.StreamingUnavailable)(self.stream.context, .init(payload.body)));
++                try self.output.write(self.stream, .init(payload.body));
+             },
+-            .stream_close => try callbackResult((self.stream.close orelse return error.StreamingUnavailable)(self.stream.context)),
++            .stream_close => try self.output.close(self.stream),
+         }
+     }
+ 
+     fn view(self: *@This()) rpc.Control {
+-        return .{ .ptr = self, .check = check, .event = event, .phase = if (self.phase_handoff) phase else null, .fence_on_error = self.phase_handoff };
++        return .{ .ptr = self, .check = check, .event = event, .phase = if (self.phase_handoff) phase else null, .fence_on_error = self.phase_handoff, .event_owns_waits = self.output_waits_owned };
+     }
+ };
+ 
+ fn callbackResult(status: http.CallbackStatus) !void {
+-    return switch (status) {
+-        .ok => {},
+-        .canceled => error.Cancelled,
+-        .timeout => error.Timeout,
+-        .body_too_large => error.BodyTooLarge,
+-        .body_capacity_exceeded => error.BodyCapacityExceeded,
+-        .end_of_stream => error.EndOfStream,
+-        .failed => error.InferenceTransportFailed,
+-    };
++    const output: Output = .{};
++    try output.result(status);
+ }
+ 
+ pub const ProviderResult = union(enum) {
+@@ -142,7 +147,15 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
+     const alloc = arena.allocator();
+     // Events can be numerous on a long stream: use a freeing allocator rather
+     // than retaining every decoded frame in the request arena.
+-    var control = ForwardControl{ .alloc = client.alloc, .cancellation = context.cancellation, .stream = context.stream };
++    const cpu_slots = try wire.admittedCpuSlots(context);
++    var control = ForwardControl{
++        .alloc = client.alloc,
++        .cancellation = context.cancellation,
++        .stream = context.stream,
++        .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null,
++        .phase_handoff = context.runnable != null,
++    };
++    defer control.finishResourceWait() catch {};
+     try ForwardControl.check(&control);
+     var body = context.request.body;
+     if (body.slice() == null) if (context.body_source.read_all) |read| {
+@@ -162,9 +175,24 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
+         .headers = headers,
+         .params = params,
+         .has_body = body.slice() != null,
++        .deadline_ns = control.deadline_ns,
++        .admitted_cpu_slots = cpu_slots,
++        .phase_handoff = control.phase_handoff,
+     }, .{});
++    if (control.phase_handoff) if (control.stream.set_execution_wait) |install| {
++        callbackResult(install(control.stream.context, &.{ .context = &control, .begin = ForwardControl.beginOutputWait, .end = ForwardControl.endOutputWait })) catch |err| {
++            // A rejecting sink may have copied part of the borrowed view.
++            // Clear it before this stack-owned parent control retires.
++            _ = install(control.stream.context, null);
++            return err;
++        };
++        control.output_waits_owned = true;
++    };
++    defer if (control.output_waits_owned) {
++        _ = control.stream.set_execution_wait.?(control.stream.context, null);
++    };
+     const result = client.invoke(.http, data, body.slice() orelse "", control.view()) catch |err| {
+-        if (control.stream_started) return err;
++        if (control.output.started) return err;
+         if (err == error.BodyTooLarge) {
+             var response = httpx.Response.init(client.alloc, 413);
+             errdefer response.deinit();
+@@ -712,6 +740,7 @@ const Child = struct {
+             },
+             .http => {
+                 const incoming = try std.json.parseFromSliceLeaky(wire.Http, arena, envelope.options, .{});
++                try incoming.validate();
+                 // Route identity, not an ordinal: replacing the executable
+                 // must never redirect a request to a different handler.
+                 const route_handle = found: {
+@@ -739,6 +768,12 @@ const Child = struct {
+                 var response_handle: ?*anyopaque = null;
+                 var response: http.HttpResponseView = undefined;
+                 defer if (response_handle) |handle| host.linkedInferenceDestroyHttpResponse(handle);
++                var child_phase = ChildPhase{ .request = request };
++                var phase_scope: ?execution_control.CheckpointScope = if (incoming.phase_handoff)
++                    execution_control.CheckpointScope.init(.{ .context = &child_phase, .check_fn = ChildPhase.check, .wait_begin_fn = ChildPhase.park, .wait_end_fn = ChildPhase.reenter })
++                else
++                    null;
++                defer if (phase_scope) |*scope| scope.deinit();
+                 try host.linkedInferenceHandleHttp(&.{
+                     .abi_version = bridge.abi_version,
+                     .route_handle = route_handle,
+@@ -747,7 +782,11 @@ const Child = struct {
+                     .stream = .{ .context = request, .start = streamStart, .write = streamWrite, .close = streamClose },
+                     .out_response_handle = &response_handle,
+                     .out_response = &response,
++                    .deadline_ns = incoming.deadline_ns orelse 0,
++                    .has_deadline = @intFromBool(incoming.deadline_ns != null),
++                    .admitted_cpu_slots = incoming.admitted_cpu_slots,
+                 });
++                if (child_phase.failure) |err| return err;
+                 const output_headers = try arena.alloc(wire.Header, response.headers_len);
+                 const source_headers = if (response.headers_ptr) |ptr| ptr[0..response.headers_len] else &.{};
+                 for (source_headers, output_headers) |header, *out| out.* = .{ .name = header.name.slice(), .value = header.value.slice() };
+@@ -779,6 +818,13 @@ const Child = struct {
+         try request.event(.{ .metadata = data, .body = body });
+     }
+ 
++    fn emitAcknowledged(request: *rpc.Request, event: wire.Event, body: []const u8) !void {
++        const alloc = request.endpoint.alloc;
++        const data = try std.json.Stringify.valueAlloc(alloc, event, .{});
++        defer alloc.free(data);
++        try request.eventAcknowledged(.{ .metadata = data, .body = body });
++    }
++
+     fn progress(raw: ?*anyopaque, phase: u8, completed: u64, total: u64, model: bridge.String, backend: bridge.String) callconv(.c) void {
+         const request: *rpc.Request = @ptrCast(@alignCast(raw.?));
+         emit(request, .{ .kind = .progress, .phase = phase, .completed = completed, .total = total, .model = model.slice(), .backend = backend.slice() }) catch
+@@ -792,17 +838,17 @@ const Child = struct {
+         for (headers.slice(), values) |header, *value| value.* = .{ .name = header.name.slice(), .value = header.value.slice() };
+         // The start event's body carries the content type; subsequent chunks
+         // keep their existing envelope without an extra JSON field per event.
+-        emitBody(request, .{ .kind = .stream_start, .status = status, .headers = values }, content_type.slice()) catch return .canceled;
++        emitAcknowledged(request, .{ .kind = .stream_start, .status = status, .headers = values }, content_type.slice()) catch return .canceled;
+         return .ok;
+     }
+     fn streamWrite(raw: ?*anyopaque, bytes: http.Bytes) callconv(.c) http.CallbackStatus {
+         const request: *rpc.Request = @ptrCast(@alignCast(raw.?));
+-        emitBody(request, .{ .kind = .stream_write }, bytes.slice()) catch return .canceled;
++        emitAcknowledged(request, .{ .kind = .stream_write }, bytes.slice()) catch return .canceled;
+         return .ok;
+     }
+     fn streamClose(raw: ?*anyopaque) callconv(.c) http.CallbackStatus {
+         const request: *rpc.Request = @ptrCast(@alignCast(raw.?));
+-        emit(request, .{ .kind = .stream_close }) catch return .canceled;
++        emitAcknowledged(request, .{ .kind = .stream_close }, "") catch return .canceled;
+         return .ok;
+     }
+ 
+@@ -940,7 +986,7 @@ test "inference worker streaming events preserve content type and callback ABI"
+         const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, wire.Event{ .kind = .stream_start, .status = 202, .headers = &.{.{ .name = "X-Test-Policy", .value = "preserved" }} }, .{});
+         defer std.testing.allocator.free(encoded);
+         try ForwardControl.event(&control, .{ .metadata = encoded, .body = content_type });
+-        try std.testing.expect(control.stream_started);
++        try std.testing.expect(control.output.started);
+         try std.testing.expect(capture.saw_headers);
+         try std.testing.expectEqual(@as(u16, 202), capture.status);
+         try std.testing.expectEqualStrings(content_type, capture.bytes[0..capture.len]);
+diff --git a/zig/pkg/inference/src/host/worker_rpc.zig b/zig/pkg/inference/src/host/worker_rpc.zig
+index d976e192b4..51f3325054 100644
+--- a/zig/pkg/inference/src/host/worker_rpc.zig
++++ b/zig/pkg/inference/src/host/worker_rpc.zig
+@@ -26,8 +26,8 @@ const max_retained_bytes = 256 * 1024 * 1024;
+ const control_budget_bytes = 4 * 1024 * 1024;
+ const max_requests = 128;
+ const header_len = 17;
+-const Kind = enum(u8) { offer = 1, accept, reject, chunk, finish, abort, cancel, failure, capacity, resource_request, resource_reply, phase_request, phase_reply };
+-const MessageKind = enum(u8) { request = 1, response, event };
++const Kind = enum(u8) { offer = 1, accept, reject, chunk, finish, abort, cancel, failure, capacity, resource_request, resource_reply, phase_request, phase_reply, event_reply };
++const MessageKind = enum(u8) { request = 1, response, event, acknowledged_event };
+ const Failure = enum { failure, capacity };
+ 
+ // Resource mutations use dedicated frames and slots, never payload offers.
+@@ -106,6 +106,9 @@ pub const Control = struct {
+     check: ?*const fn (?*anyopaque) anyerror!void = null,
+     event: ?*const fn (?*anyopaque, Payload) anyerror!void = null,
+     phase: ?*const fn (?*anyopaque, Phase) anyerror!void = null,
++    /// The acknowledged event's sink releases execution only at physical IO
++    /// waits. Its parsing and formatting must retain the current grant.
++    event_owns_waits: bool = false,
+     /// A caller lending physical capacity cannot retire it until an uncertain
+     /// child has been reaped by the endpoint's lifetime owner.
+     fence_on_error: bool = false,
+@@ -120,6 +123,10 @@ pub const Request = struct {
+     phase_waiting: bool = false,
+     phase_reply: ?PhaseStatus = null,
+     phase_ready: std.Io.Event = .unset,
++    event_sequence: u64 = 0,
++    event_waiting: bool = false,
++    event_reply: ?PhaseStatus = null,
++    event_ready: std.Io.Event = .unset,
+ 
+     fn check(raw: ?*anyopaque) !void {
+         const self: *Request = @ptrCast(@alignCast(raw.?));
+@@ -168,16 +175,61 @@ pub const Request = struct {
+         }
+     }
+ 
++    /// Use only at a synchronous boundary where this request's physical
++    /// computation is stopped. The recipient may park borrowed CPU while its
++    /// sink runs; this call cannot return successfully before reacquisition.
++    pub fn eventAcknowledged(self: *Request, payload: Payload) !void {
++        try check(self);
++        const endpoint = self.endpoint;
++        endpoint.mutex.lockUncancelable(endpoint.io);
++        if (self.event_waiting) {
++            endpoint.mutex.unlock(endpoint.io);
++            return error.InvalidWorkerEvent;
++        }
++        const sequence = std.math.add(u64, self.event_sequence, 1) catch {
++            endpoint.mutex.unlock(endpoint.io);
++            return error.InvalidWorkerEvent;
++        };
++        self.event_sequence = sequence;
++        self.event_waiting = true;
++        self.event_reply = null;
++        self.event_ready.reset();
++        endpoint.mutex.unlock(endpoint.io);
++        defer {
++            endpoint.mutex.lockUncancelable(endpoint.io);
++            self.event_waiting = false;
++            endpoint.mutex.unlock(endpoint.io);
++        }
++        errdefer self.cancelled.store(true, .release);
++        try endpoint.sendMessage(.acknowledged_event, self.id, payload, .{ .ptr = self, .check = check }, null, sequence);
++        while (true) {
++            try check(self);
++            endpoint.mutex.lockUncancelable(endpoint.io);
++            const status = self.event_reply;
++            const closed = endpoint.closed.load(.acquire);
++            endpoint.mutex.unlock(endpoint.io);
++            if (status) |value| return switch (value) {
++                .accepted => {},
++                .canceled => error.Cancelled,
++                .timeout => error.Timeout,
++                .denied => error.InferenceExecutionHandoffFailed,
++            };
++            if (closed) return error.InferenceWorkerUnavailable;
++            try endpoint.waitTick(&self.event_ready);
++        }
++    }
++
+     pub fn event(self: *Request, payload: Payload) !void {
+-        try self.endpoint.sendMessage(.event, self.id, payload, .{ .ptr = self, .check = check }, null);
++        try self.endpoint.sendMessage(.event, self.id, payload, .{ .ptr = self, .check = check }, null, 0);
+     }
+ };
+ 
+-const Message = struct { kind: MessageKind, payload: OwnedPayload };
++const Message = struct { kind: MessageKind, payload: OwnedPayload, event_sequence: u64 = 0 };
+ const Pending = struct {
+     ready: std.Io.Event = .unset,
+     terminal: ?Failure = null,
+     next_phase_sequence: u64 = 1,
++    next_event_sequence: u64 = 1,
+     phase: ?PhaseRequest = null,
+     phase_inflight: bool = false,
+     messages: std.ArrayListUnmanaged(Message) = .empty,
+@@ -186,7 +238,7 @@ const Offer = struct {
+     ready: std.Io.Event = .unset,
+     accepted: bool = false,
+ };
+-const Assembly = struct { kind: MessageKind, request_id: u64, payload: OwnedPayload, received: usize = 0 };
++const Assembly = struct { kind: MessageKind, request_id: u64, payload: OwnedPayload, received: usize = 0, event_sequence: u64 = 0 };
+ 
+ pub const Endpoint = struct {
+     alloc: std.mem.Allocator,
+@@ -322,7 +374,7 @@ pub const Endpoint = struct {
+         var dispatch_possible = false;
+         errdefer if (control.fence_on_error and dispatch_possible) self.fence();
+         errdefer self.sendFrame(.cancel, id, "") catch {};
+-        try self.sendMessage(.request, id, payload, control, &dispatch_possible);
++        try self.sendMessage(.request, id, payload, control, &dispatch_possible, 0);
+         while (true) {
+             if (control.check) |check| try check(control.ptr);
+             self.mutex.lockUncancelable(self.io);
+@@ -370,6 +422,25 @@ pub const Endpoint = struct {
+                         defer item.payload.deinit();
+                         if (control.event) |event| try event(control.ptr, item.payload.view());
+                     },
++                    .acknowledged_event => {
++                        defer item.payload.deinit();
++                        const result = deliverAcknowledgedEvent(control, item.payload.view());
++                        const status: PhaseStatus = if (result) |_| .accepted else |err| switch (err) {
++                            error.Cancelled, error.Canceled => .canceled,
++                            error.Timeout, error.DeadlineExceeded => .timeout,
++                            else => .denied,
++                        };
++                        var bytes: [9]u8 = undefined;
++                        std.mem.writeInt(u64, bytes[0..8], item.event_sequence, .little);
++                        bytes[8] = @backingInt(status);
++                        self.sendFrame(.event_reply, id, &bytes) catch |err| {
++                            // The sink and reacquisition may have completed.
++                            // Fence uncertain delivery before retiring capacity.
++                            self.fence();
++                            return err;
++                        };
++                        try result;
++                    },
+                     .request => unreachable,
+                 }
+             } else {
+@@ -380,6 +451,27 @@ pub const Endpoint = struct {
+         }
+     }
+ 
++    fn deliverAcknowledgedEvent(control: Control, payload: Payload) !void {
++        if (control.check) |check| try check(control.ptr);
++        if (control.event_owns_waits) {
++            // The child cannot compute until this event is acknowledged, so
++            // cooperative checkpoints are safe at these formatter boundaries.
++            if (control.phase) |phase| try phase(control.ptr, .checkpoint);
++            if (control.event) |event| try event(control.ptr, payload);
++            if (control.check) |check| try check(control.ptr);
++            if (control.phase) |phase| try phase(control.ptr, .checkpoint);
++            return;
++        }
++        if (control.phase) |phase| try phase(control.ptr, .resource_wait);
++        if (control.check) |check| try check(control.ptr);
++        // On error the lending caller fences the child, then its existing
++        // invocation cleanup finishes this outstanding resource wait.
++        if (control.event) |event| try event(control.ptr, payload);
++        if (control.check) |check| try check(control.ptr);
++        if (control.phase) |phase| try phase(control.ptr, .runnable);
++        if (control.check) |check| try check(control.ptr);
++    }
++
+     pub fn callResource(self: *Endpoint, payload: []const u8) !ResourceReply {
+         // Every failure here is a transport failure, not a budget denial.
+         errdefer self.fail();
+@@ -437,7 +529,7 @@ pub const Endpoint = struct {
+         };
+     }
+ 
+-    fn sendMessage(self: *Endpoint, kind: MessageKind, request_id: u64, payload: Payload, control: Control, dispatch_possible: ?*bool) !void {
++    fn sendMessage(self: *Endpoint, kind: MessageKind, request_id: u64, payload: Payload, control: Control, dispatch_possible: ?*bool, event_sequence: u64) !void {
+         _ = try payload.size();
+         var offer = Offer{};
+         self.mutex.lockUncancelable(self.io);
+@@ -464,13 +556,14 @@ pub const Endpoint = struct {
+             _ = self.offers.remove(transfer);
+             self.mutex.unlock(self.io);
+         }
+-        var description: [21]u8 = undefined;
++        var description: [29]u8 = undefined;
+         description[0] = @backingInt(kind);
+         std.mem.writeInt(u64, description[1..9], request_id, .little);
+         std.mem.writeInt(u32, description[9..13], @intCast(payload.metadata.len), .little);
+         std.mem.writeInt(u64, description[13..21], try payload.bodySize(), .little);
+         errdefer self.sendFrame(.abort, transfer, "") catch {};
+-        try self.sendFrame(.offer, transfer, &description);
++        if (kind == .acknowledged_event) std.mem.writeInt(u64, description[21..29], event_sequence, .little);
++        try self.sendFrame(.offer, transfer, description[0..if (kind == .acknowledged_event) @as(usize, 29) else 21]);
+         while (!offer.ready.isSet()) {
+             if (control.check) |check| try check(control.ptr);
+             if (self.closed.load(.acquire)) return error.InferenceWorkerUnavailable;
+@@ -596,6 +689,17 @@ pub const Endpoint = struct {
+                         request.phase_ready.set(self.io);
+                     }
+                 },
++                .event_reply => {
++                    if (length != 9) return error.InvalidWorkerEvent;
++                    const sequence = std.mem.readInt(u64, bytes[0..8], .little);
++                    const status = std.enums.fromInt(PhaseStatus, bytes[8]) orelse return error.InvalidWorkerEvent;
++                    if (self.active.get(id)) |request| {
++                        if (!request.event_waiting or request.event_reply != null or sequence != request.event_sequence)
++                            return error.InvalidWorkerEvent;
++                        request.event_reply = status;
++                        request.event_ready.set(self.io);
++                    }
++                },
+                 .resource_request => {
+                     if (self.resource_handler == null or length == 0 or length > max_resource_bytes)
+                         return error.InvalidResourceFrame;
+@@ -625,8 +729,11 @@ pub const Endpoint = struct {
+                     pending.ready.set(self.io);
+                 },
+                 .offer => {
+-                    if (length != 21 or self.incoming.contains(id)) return error.InvalidWorkerFrame;
++                    if ((length != 21 and length != 29) or self.incoming.contains(id)) return error.InvalidWorkerFrame;
+                     const message_kind = std.enums.fromInt(MessageKind, bytes[0]) orelse return error.InvalidWorkerFrame;
++                    if (length != (if (message_kind == .acknowledged_event) @as(u32, 29) else 21)) return error.InvalidWorkerFrame;
++                    const event_sequence = if (message_kind == .acknowledged_event) std.mem.readInt(u64, bytes[21..29], .little) else 0;
++                    if (message_kind == .acknowledged_event and event_sequence == 0) return error.InvalidWorkerEvent;
+                     const request_id = std.mem.readInt(u64, bytes[1..9], .little);
+                     const metadata_len = std.mem.readInt(u32, bytes[9..13], .little);
+                     const body_len = std.mem.readInt(u64, bytes[13..21], .little);
+@@ -646,7 +753,7 @@ pub const Endpoint = struct {
+                         try self.replyOffer(.reject, id);
+                         continue;
+                     };
+-                    self.incoming.put(self.alloc, id, .{ .kind = message_kind, .request_id = request_id, .payload = payload }) catch |err| {
++                    self.incoming.put(self.alloc, id, .{ .kind = message_kind, .request_id = request_id, .payload = payload, .event_sequence = event_sequence }) catch |err| {
+                         payload.deinitLocked();
+                         return err;
+                     };
+@@ -684,7 +791,11 @@ pub const Endpoint = struct {
+                     } else if (self.pending.get(assembly.request_id)) |pending| {
+                         // Bound empty-event floods as well as payload bytes.
+                         std.debug.assert(pending.messages.items.len < 1024);
+-                        try pending.messages.append(self.alloc, .{ .kind = assembly.kind, .payload = assembly.payload });
++                        if (assembly.kind == .acknowledged_event) {
++                            if (assembly.event_sequence != pending.next_event_sequence) return error.InvalidWorkerEvent;
++                            pending.next_event_sequence = try std.math.add(u64, assembly.event_sequence, 1);
++                        }
++                        try pending.messages.append(self.alloc, .{ .kind = assembly.kind, .payload = assembly.payload, .event_sequence = assembly.event_sequence });
+                         pending.ready.set(self.io);
+                         owned = false;
+                     }
+@@ -722,7 +833,7 @@ pub const Endpoint = struct {
+             return;
+         };
+         defer response.deinit();
+-        self.sendMessage(.response, request.id, response.view(), .{ .ptr = request, .check = Request.check }, null) catch |err| {
++        self.sendMessage(.response, request.id, response.view(), .{ .ptr = request, .check = Request.check }, null, 0) catch |err| {
+             // Terminal failure never needs message credit or an offer slot.
+             // Even a completely full recipient can finish this one request.
+             self.sendFrame(if (err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) .capacity else .failure, request.id, "") catch {};
+@@ -792,6 +903,13 @@ pub const TestPair = struct {
+             };
+             self.phase_resumed.store(true, .release);
+         }
++        if (std.mem.eql(u8, request.payload.view().body, "output")) {
++            request.eventAcknowledged(.{ .body = "chunk" }) catch |err| {
++                self.phase_denied.set(std.testing.io);
++                return err;
++            };
++            self.phase_resumed.store(true, .release);
++        }
+         if (std.mem.eql(u8, request.payload.view().body, "nested"))
+             return request.endpoint.call(.{ .body = "echo" }, .{});
+         if (std.mem.eql(u8, request.payload.view().body, "cancel")) {
+@@ -1407,3 +1525,147 @@ test "inference worker concurrent resource callbacks route replies by ID" {
+     try first.await(std.testing.io);
+     try second.await(std.testing.io);
+ }
++
++test "inference worker output acknowledgment blocks child compute through sink delivery and reacquisition" {
++    const Sink = struct {
++        pair: *TestPair,
++        thread: std.Thread.Id,
++        parked: bool = false,
++        writes: usize = 0,
++        transitions: usize = 0,
++        fn phase(raw: ?*anyopaque, value: Phase) !void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
++            try std.testing.expect(!self.pair.phase_resumed.load(.acquire));
++            try std.testing.expectEqual(if (self.parked) Phase.runnable else Phase.resource_wait, value);
++            self.parked = !self.parked;
++            self.transitions += 1;
++        }
++        fn event(raw: ?*anyopaque, payload: Payload) !void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            try std.testing.expect(self.parked);
++            try std.testing.expectEqualStrings("chunk", payload.body);
++            // A second request can traverse the actual same pipes while the
++            // first child is held at its output boundary.
++            const peer = try self.pair.parent.call(.{ .body = "echo" }, .{});
++            defer peer.deinit();
++            try std.testing.expectEqualStrings("echo", peer.view().body);
++            for (0..15) |_| {
++                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
++                try std.testing.expect(!self.pair.phase_resumed.load(.acquire));
++            }
++            self.writes += 1;
++        }
++    };
++    var pair: TestPair = undefined;
++    try pair.init();
++    defer pair.deinit();
++    var sink = Sink{ .pair = &pair, .thread = std.Thread.getCurrentId() };
++    const result = try pair.parent.call(.{ .body = "output" }, .{ .ptr = &sink, .event = Sink.event, .phase = Sink.phase, .fence_on_error = true });
++    defer result.deinit();
++    try std.testing.expectEqualStrings("output", result.view().body);
++    try std.testing.expectEqual(@as(usize, 1), sink.writes);
++    try std.testing.expectEqual(@as(usize, 2), sink.transitions);
++    try std.testing.expect(!sink.parked);
++    try std.testing.expect(pair.phase_resumed.load(.acquire));
++}
++
++test "inference worker output failures preserve parent cause and fence child before capacity retirement" {
++    const Mode = enum { sink_failure, canceled, timeout, reacquire_failure, lost_ack };
++    const Sink = struct {
++        pair: *TestPair,
++        mode: Mode,
++        parked: bool = false,
++        writes: usize = 0,
++        reaped: bool = false,
++        fn phase(raw: ?*anyopaque, value: Phase) !void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            if (value == .resource_wait) {
++                self.parked = true;
++            } else if (value == .runnable) {
++                if (self.mode == .reacquire_failure) return error.Forbidden;
++                self.parked = false;
++            } else return error.InvalidWorkerPhase;
++        }
++        fn event(raw: ?*anyopaque, _: Payload) !void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            try std.testing.expect(self.parked);
++            try std.testing.expect(!self.pair.phase_resumed.load(.acquire));
++            self.writes += 1;
++            switch (self.mode) {
++                .sink_failure => return error.InferenceTransportFailed,
++                .canceled => return error.Canceled,
++                .timeout => return error.DeadlineExceeded,
++                .reacquire_failure => {},
++                .lost_ack => self.pair.parent.fail(),
++            }
++        }
++        fn closed(raw: *anyopaque) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.pair.child.fail();
++            // This fixture joins the actual handler at the mock process-reap
++            // boundary. It does not claim to test an OS child process.
++            self.pair.phase_denied.waitUncancelable(std.testing.io);
++            self.reaped = true;
++        }
++    };
++    for (std.enums.values(Mode)) |mode| {
++        var pair: TestPair = undefined;
++        try pair.init();
++        defer pair.deinit();
++        var sink = Sink{ .pair = &pair, .mode = mode };
++        pair.parent.context = &sink;
++        pair.parent.on_closed = Sink.closed;
++        const expected: anyerror = switch (mode) {
++            .sink_failure => error.InferenceTransportFailed,
++            .canceled => error.Canceled,
++            .timeout => error.DeadlineExceeded,
++            .reacquire_failure => error.Forbidden,
++            .lost_ack => error.InferenceWorkerUnavailable,
++        };
++        try std.testing.expectError(expected, pair.parent.call(.{ .body = "output" }, .{ .ptr = &sink, .event = Sink.event, .phase = Sink.phase, .fence_on_error = true }));
++        try std.testing.expect(sink.reaped);
++        try std.testing.expectEqual(@as(usize, 1), sink.writes);
++        try std.testing.expect(!pair.phase_resumed.load(.acquire));
++        // A failed sink/reentry leaves the loan parked until the caller's
++        // existing cleanup, after the fence, retires or resumes it.
++        try std.testing.expectEqual(mode != .lost_ack, sink.parked);
++    }
++}
++
++test "inference worker acknowledged output formatting retains execution while its sink owns physical waits" {
++    const State = struct {
++        parked: bool = false,
++        checkpoints: usize = 0,
++        fn phase(raw: ?*anyopaque, value: Phase) !void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            switch (value) {
++                .checkpoint => {
++                    try std.testing.expect(!self.parked);
++                    self.checkpoints += 1;
++                },
++                .resource_wait => {
++                    try std.testing.expect(!self.parked);
++                    self.parked = true;
++                },
++                .runnable => {
++                    try std.testing.expect(self.parked);
++                    self.parked = false;
++                },
++            }
++        }
++        fn event(raw: ?*anyopaque, _: Payload) !void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            // JSON/header formatting is CPU work and cannot begin parked.
++            try std.testing.expect(!self.parked);
++            try phase(raw, .resource_wait);
++            try std.testing.expect(self.parked);
++            try phase(raw, .runnable);
++            try std.testing.expect(!self.parked);
++        }
++    };
++    var state = State{};
++    try Endpoint.deliverAcknowledgedEvent(.{ .ptr = &state, .event = State.event, .phase = State.phase, .event_owns_waits = true }, .{ .metadata = "{}", .body = "payload" });
++    try std.testing.expect(!state.parked);
++    try std.testing.expectEqual(@as(usize, 2), state.checkpoints);
++}
+diff --git a/zig/pkg/inference/src/host/worker_wire.zig b/zig/pkg/inference/src/host/worker_wire.zig
+index 69898d5018..98462955e4 100644
+--- a/zig/pkg/inference/src/host/worker_wire.zig
++++ b/zig/pkg/inference/src/host/worker_wire.zig
+@@ -17,7 +17,7 @@ const std = @import("std");
+ const bridge = @import("antfly_inference_bridge");
+ const http = @import("antfly_runtime_abi").http_abi;
+ 
+-pub const version: u32 = 8;
++pub const version: u32 = 10;
+ // Only options are JSON metadata. The application payload is carried raw.
+ pub const Request = struct { operation: Operation, options: []const u8 = "" };
+ pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
+@@ -184,7 +184,7 @@ pub const Provider = struct {
+     }
+ };
+ 
+-pub fn admittedCpuSlots(context: *const bridge.ProviderInvokeContext) !u32 {
++pub fn admittedCpuSlots(context: anytype) !u32 {
+     if (context.runnable) |borrow| {
+         try borrow.validate();
+         if (context.admitted_cpu_slots != 0) return error.InvalidArgument;
+@@ -335,6 +335,15 @@ pub const Http = struct {
+     headers: []const Header,
+     params: []const Header,
+     has_body: bool,
++    deadline_ns: ?u64 = null,
++    admitted_cpu_slots: u32 = 0,
++    phase_handoff: bool = false,
++
++    pub fn validate(self: Http) !void {
++        if (self.admitted_cpu_slots > 65535 or
++            (self.phase_handoff and self.admitted_cpu_slots == 0))
++            return error.InvalidRunnableDemand;
++    }
+ };
+ pub const HttpResponse = struct { status: u16, headers: []const Header };
+ pub const Reservation = struct { lease: usize = 0, amounts: bridge.AdmissionAmounts };
+@@ -455,3 +464,32 @@ fn checkNumericRoundTrip(alloc: std.mem.Allocator) !void {
+ test "inference worker typed numeric responses preserve ownership under allocation failure" {
+     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkNumericRoundTrip, .{});
+ }
++
++test "inference worker HTTP requires valid scalar demand for acknowledged phases" {
++    var input = Http{
++        .route = "/ai/v1/generate",
++        .method = .post,
++        .path = "/ai/v1/generate",
++        .query = null,
++        .headers = &.{},
++        .params = &.{},
++        .has_body = false,
++        .deadline_ns = 1234,
++        .phase_handoff = true,
++    };
++    try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
++    input.admitted_cpu_slots = 2;
++    try input.validate();
++    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, input, .{});
++    defer std.testing.allocator.free(encoded);
++    const decoded = try std.json.parseFromSlice(Http, std.testing.allocator, encoded, .{});
++    defer decoded.deinit();
++    try decoded.value.validate();
++    try std.testing.expectEqual(@as(?u64, 1234), decoded.value.deadline_ns);
++    try std.testing.expectEqual(@as(u32, 2), decoded.value.admitted_cpu_slots);
++    try std.testing.expect(decoded.value.phase_handoff);
++    input.admitted_cpu_slots = 65536;
++    try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
++    input.phase_handoff = false;
++    try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
++}
+diff --git a/zig/pkg/inference/src/server/server.zig b/zig/pkg/inference/src/server/server.zig
+index 8a673449d1..fd76971ff1 100644
+--- a/zig/pkg/inference/src/server/server.zig
++++ b/zig/pkg/inference/src/server/server.zig
+@@ -115,7 +115,23 @@ const InferenceExecutionControl = execution_control_mod.InferenceExecutionContro
+ const cancellable_rerank_batch_size: usize = 8;
+ const native_call_cancellation_grace_ns: u64 = 5 * std.time.ns_per_s;
+ 
++const borrowed_http_control_key = "antfly.inference.borrowed_execution_control";
++
++/// The caller owns this control until the synchronous handler has joined. It
++/// carries progress and the serial executor without adding a second HTTP ABI.
++pub fn installHttpExecutionControl(ctx: *httpx.Context, control: *const InferenceExecutionControl) !void {
++    try ctx.setData(borrowed_http_control_key, @constCast(control), null);
++}
++
+ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
++    if (ctx.getData(borrowed_http_control_key)) |raw| {
++        const borrowed: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
++        var control = borrowed.*;
++        if (control.hard_cancellation == null) {
++            if (node.hard_cancellation_watchdog) |watchdog| control.hard_cancellation = watchdog.boundary();
++        }
++        return control;
++    }
+     const Check = struct {
+         fn check(raw: ?*anyopaque) !void {
+             const request: *const httpx.Context = @ptrCast(@alignCast(raw.?));
+@@ -3644,6 +3660,10 @@ test "direct generation rejects non-generator manifests before execution" {
+     );
+ }
+ 
++pub fn ExecutorAdmissionProvider(comptime RuntimeAbi: type) type {
++    return @import("runnable_execution.zig").ProviderFor(@import("../execution_control.zig"), RuntimeAbi);
++}
++
+ pub const Node = struct {
+     config: NodeConfig,
+     allocator: std.mem.Allocator,
+@@ -3669,6 +3689,7 @@ pub const Node = struct {
+     /// Ownership is here, rather than the storage BackendRuntime, because Node
+     /// owns resolved model generations and concrete fused executor callbacks.
+     executor_microbatch_broker: ?executor_microbatch.Broker = null,
++    executor_admission: ?executor_microbatch.ExecutionAdmission = null,
+     executor_microbatch_init_mutex: std.atomic.Mutex = .unlocked,
+     admission_metrics_mutex: std.atomic.Mutex = .unlocked,
+     compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
+@@ -3944,11 +3965,44 @@ pub const Node = struct {
+         self.compatibility_cache.deinit(self.allocator);
+     }
+ 
++    /// Startup-only installation. The host retains the provider/owner until
++    /// all requests join and Node teardown disposes the broker.
++    pub fn configureExecutorAdmission(self: *Node, admission: executor_microbatch.ExecutionAdmission) !void {
++        if (self.request_surfaces_published or self.executor_admission != null)
++            return error.InvalidRunnableTransition;
++        // Preload calls may have created an unscheduled broker. Warmup has
++        // joined before installation; replace it before request publication.
++        if (self.executor_microbatch_broker) |*broker| broker.deinit();
++        self.executor_microbatch_broker = null;
++        self.executor_admission = admission;
++    }
++
++    pub fn testExecutorAdmission(self: *Node) !void {
++        if (!builtin.is_test) @compileError("test-only executor admission fixture");
++        const Executor = struct {
++            fn run(_: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
++                std.debug.assert(@import("inference_linalg").pool.scopedWorkerLimit() == 1);
++                for (items) |item| item.slot.setValue(usize, item.payloadAs(usize).*, .serial);
++            }
++        };
++        const payload: usize = 42;
++        const broker = self.executorMicrobatchBroker();
++        const result = try broker.submit(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "fixture", .task = .embed, .resource_class = .cpu }, .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1 }, .{}, .{}, null, null, &payload, self, Executor.run);
++        try std.testing.expectEqual(payload, result.result.value);
++        const values = [_]usize{ 1, 2 };
++        const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "fixture", .task = .embed, .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, &.{ .{}, .{} }, &.{ .{}, .{} }, null, .{}, &values, self, Executor.run);
++        defer std.testing.allocator.free(results);
++        for (results, values) |value, expected| try std.testing.expectEqual(expected, value.result.value);
++    }
++
+     fn executorMicrobatchBroker(self: *Node) *executor_microbatch.Broker {
+         spinLock(&self.executor_microbatch_init_mutex);
+         defer self.executor_microbatch_init_mutex.unlock();
+         if (self.executor_microbatch_broker == null)
+-            self.executor_microbatch_broker = executor_microbatch.Broker.init(self.allocator);
++            self.executor_microbatch_broker = if (self.executor_admission) |admission|
++                executor_microbatch.Broker.initWithAdmission(self.allocator, admission)
++            else
++                executor_microbatch.Broker.init(self.allocator);
+         return &self.executor_microbatch_broker.?;
+     }
+ 
+@@ -19188,7 +19242,7 @@ pub const Node = struct {
+         const request = try decide_mod.parse(a, request_json);
+         var owned_io: ?std.Io.Threaded = null;
+         defer if (owned_io) |*io_impl| io_impl.deinit();
+-        const io = self.inferenceIo(a, null, &owned_io);
++        const io = (if (control) |active| active.io else null) orelse self.inferenceIo(a, null, &owned_io);
+         const path = try self.resolveRequestModelPath(a, io, request.model, "extractors");
+         var manifest = try manifest_mod.loadListingFromDir(a, path);
+         defer manifest.deinit();
+diff --git a/zig/pkg/antfly/src/api/runnable_worker_process_fixture.zig b/zig/pkg/antfly/src/api/runnable_worker_process_fixture.zig
+new file mode 100644
+index 0000000000..8a8b279b97
+--- /dev/null
++++ b/zig/pkg/antfly/src/api/runnable_worker_process_fixture.zig
+@@ -0,0 +1,25 @@
++// Copyright 2026 Antfly, Inc.
++// SPDX-License-Identifier: Elastic-2.0
++
++//! Constrained subprocess fixture: actual production RPC, deterministic output.
++const std = @import("std");
++const rpc = @import("inference_worker_rpc");
++fn handle(_: *anyopaque, request: *rpc.Request) !rpc.OwnedPayload {
++    const payload = try request.endpoint.alloc.alloc(u8, 1024 * 1024);
++    defer request.endpoint.alloc.free(payload);
++    @memset(payload, 'x');
++    for (0..64) |_| try request.eventAcknowledged(.{ .metadata = "chunk", .body = payload });
++    // This branch must never execute after a denied output acknowledgment.
++    return request.endpoint.copyPayload(.{ .body = "computed" });
++}
++fn closed(_: *anyopaque) void {
++    std.process.exit(0);
++}
++pub fn main(init: std.process.Init) !void {
++    var context: u8 = 0;
++    var endpoint = rpc.Endpoint{ .alloc = init.gpa, .io = init.io, .input = .stdin(), .output = .stdout(), .context = &context, .handler = handle, .on_closed = closed, .next_id = 2 };
++    try endpoint.start();
++    defer endpoint.deinit();
++    var lifetime: std.Io.Event = .unset;
++    try lifetime.wait(init.io);
++}
+diff --git a/zig/pkg/antfly/src/api/runnable_worker_process_test_root.zig b/zig/pkg/antfly/src/api/runnable_worker_process_test_root.zig
+new file mode 100644
+index 0000000000..73daa5eb7a
+--- /dev/null
++++ b/zig/pkg/antfly/src/api/runnable_worker_process_test_root.zig
+@@ -0,0 +1,275 @@
++// Copyright 2026 Antfly, Inc.
++// SPDX-License-Identifier: Elastic-2.0
++
++//! Actual child process, acknowledged RPC output, API owner and physical TCP waits.
++const std = @import("std");
++const runtime = @import("antfly_runtime_abi");
++const owner_module = @import("runnable_owner_execution.zig");
++const runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
++const rpc = @import("inference_worker_rpc");
++const chunk_size = 1024 * 1024;
++
++test "inference worker subprocess output retains borrowed capacity through physical waits and actual reap" {
++    const httpx = @import("httpx");
++    const io = std.testing.io;
++    const executable = std.testing.environ.getPosix("ANTFLY_TEST_WORKER_OUTPUT_FIXTURE") orelse return error.WorkerFixturePathMissing;
++    const Fixture = struct {
++        state: *owner_module.State,
++        port: runtime.runnable_abi.Owner,
++        capsule: *anyopaque,
++        transport: *runtime.http_bridge.Outbound,
++        endpoint: *rpc.Endpoint = undefined,
++        child: *std.process.Child = undefined,
++        reaped: std.atomic.Value(bool) = .init(false),
++        held_through_reap: std.atomic.Value(bool) = .init(false),
++        retained_bytes: u64 = 0,
++        io: std.Io,
++        deadline_ns: u64,
++        h2: ?*httpx.H2Connection = null,
++        canceled: std.atomic.Value(bool) = .init(false),
++        done: std.atomic.Value(bool) = .init(false),
++        waiting: std.Io.Event = .unset,
++        body_started: bool = false,
++        write_epoch: std.atomic.Value(usize) = .init(0),
++        in_write: std.atomic.Value(bool) = .init(false),
++        begins: usize = 0,
++        ends: usize = 0,
++        fn now(io_value: std.Io) u64 {
++            return @intCast(@max(0, std.Io.Clock.now(.awake, io_value).nanoseconds));
++        }
++        fn unusedNativeNow() u64 {
++            @panic("original IO clock must own this deadline");
++        }
++        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
++            const self: *const @This() = @ptrCast(@alignCast(raw.?));
++            return @intFromBool(self.canceled.load(.acquire));
++        }
++        fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            if (self.canceled.load(.acquire)) return error.Canceled;
++            if (now(self.io) >= self.deadline_ns) return error.Timeout;
++        }
++        fn remaining(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            try check(raw);
++            const ns = self.deadline_ns -| now(self.io);
++            return @divTrunc(ns, std.time.ns_per_ms) + @intFromBool(ns % std.time.ns_per_ms != 0);
++        }
++        fn status(value: runtime.error_abi.Status) runtime.http_abi.CallbackStatus {
++            if (value.isOk()) return .ok;
++            return switch (runtime.error_abi.errorFromStatus(value)) {
++                error.Canceled, error.Cancelled => .canceled,
++                error.Timeout, error.DeadlineExceeded => .timeout,
++                else => .failed,
++            };
++        }
++        fn begin(raw: ?*anyopaque) callconv(.c) runtime.http_abi.CallbackStatus {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            const result = status(self.port.park(self.capsule, @backingInt(runtime.runnable_abi.Wait.resource)));
++            if (result != .ok) return result;
++            self.begins += 1;
++            self.write_epoch.store(self.begins, .release);
++            self.in_write.store(true, .release);
++            // Header and chunk-prefix writes complete first. Signal while a
++            // large body is being sent to a peer which never reads it.
++            if (self.body_started and self.begins >= 4) self.waiting.set(self.io);
++            return .ok;
++        }
++        fn end(raw: ?*anyopaque) callconv(.c) runtime.http_abi.CallbackStatus {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            self.ends += 1;
++            self.in_write.store(false, .release);
++            if (self.h2) |connection| {
++                // Weighted reentry can queue. It must not retain the frame
++                // mutex and obstruct connection control/state progress.
++                if (!connection.write_mutex.tryLock()) return .failed;
++                connection.write_mutex.unlock(self.io);
++            }
++            return status(self.port.enter(self.capsule, @backingInt(runtime.runnable_abi.Class.inference)));
++        }
++        fn closed(raw: *anyopaque) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            const before = self.state.owner.scheduler.stats();
++            self.child.kill(self.io);
++            const after = self.state.owner.scheduler.stats();
++            self.held_through_reap.store(before.operations == 1 and after.operations == 1 and before.retained_bytes == self.retained_bytes and after.retained_bytes == self.retained_bytes, .release);
++            self.reaped.store(self.child.id == null, .release);
++        }
++        fn reject(_: *anyopaque, _: *rpc.Request) !rpc.OwnedPayload {
++            return error.UnsupportedOperation;
++        }
++        fn rpcCheck(raw: ?*anyopaque) !void {
++            try check(raw);
++        }
++        fn phase(raw: ?*anyopaque, value: rpc.Phase) !void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            if (value != .checkpoint) return error.InvalidWorkerPhase;
++            const result = self.port.checkpoint(self.capsule);
++            if (!result.isOk()) return runtime.error_abi.errorFromStatus(result);
++        }
++        fn event(raw: ?*anyopaque, payload: rpc.Payload) !void {
++            const self: *@This() = @ptrCast(@alignCast(raw.?));
++            try std.testing.expectEqualStrings("chunk", payload.metadata);
++            try std.testing.expectEqual(chunk_size, payload.body.len);
++            const active = self.state.owner.scheduler.stats();
++            if (active.runnable_slots - active.control_slots != 2) return error.FormatterHasNoOrdinaryGrant;
++            const sink = self.transport.stream();
++            const result = sink.write.?(sink.context, .init(payload.body));
++            if (result != .ok) return switch (result) {
++                .canceled => error.Canceled,
++                .timeout => error.Timeout,
++                else => error.OutputFailed,
++            };
++        }
++        fn run(self: *@This()) !runtime.http_abi.CallbackStatus {
++            defer self.done.store(true, .release);
++            const sink = self.transport.stream();
++            const installed = sink.set_execution_wait.?(sink.context, &.{ .context = self, .begin = begin, .end = end });
++            if (installed != .ok) return installed;
++            defer _ = sink.set_execution_wait.?(sink.context, null);
++            const started = sink.start.?(sink.context, 200, .init("application/x-ndjson"), .{});
++            if (started != .ok) return started;
++            const active = self.state.owner.scheduler.stats();
++            if (active.runnable_slots - active.control_slots != 2) return error.FormatterHasNoOrdinaryGrant;
++            self.body_started = true;
++            const response = self.endpoint.call(.{ .body = "stream" }, .{ .ptr = self, .check = rpcCheck, .event = event, .phase = phase, .fence_on_error = true, .event_owns_waits = true }) catch |err| {
++                std.debug.print("PROCESS_RPC cause={} fenced={} reaped={} held={}\n", .{ err, self.endpoint.closed_fence.isSet(), self.reaped.load(.acquire), self.held_through_reap.load(.acquire) });
++                if (!self.endpoint.closed_fence.isSet()) return error.BorrowedPeerNotFenced;
++                if (!self.reaped.load(.acquire)) return error.BorrowedPeerNotReaped;
++                if (!self.held_through_reap.load(.acquire)) return error.BorrowedOwnerRetiredEarly;
++                return switch (err) {
++                    error.Canceled, error.Cancelled => .canceled,
++                    error.Timeout, error.DeadlineExceeded => .timeout,
++                    else => return err,
++                };
++            };
++            defer response.deinit();
++            return error.FixtureBufferDidNotFill;
++        }
++    };
++    for ([_]bool{ false, true }) |use_h2| {
++        for ([_]bool{ false, true }) |cancel| {
++            std.debug.print("PROCESS_SINK transport={s} cancel={} start\n", .{ if (use_h2) "h2" else "h1", cancel });
++            var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = Fixture.unusedNativeNow };
++            defer state.owner.tryDeinit() catch @panic("socket owner leaked");
++            const port = state.port();
++            var lease = try runtime.runnable_abi.Lease.init(port);
++            defer lease.deinit();
++            const borrow = runtime.native_abi.IoBorrow.init(&io);
++            var listener = try httpx.socket.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
++            defer listener.deinit();
++            var sender = try httpx.socket.Socket.connect(listener.getLocalAddress(), io);
++            defer sender.close();
++            sender.enableNativeTimeouts();
++            var peer = try listener.accept();
++            defer peer.socket.close();
++            peer.socket.enableNativeTimeouts();
++            var request = try httpx.Request.init(std.testing.allocator, .POST, "/stream");
++            defer request.deinit();
++            var context = httpx.Context.init(std.testing.allocator, io, &request);
++            defer context.deinit();
++            context.h1_sock = &sender;
++            var h2 = httpx.H2Connection.initServer(std.testing.allocator, io);
++            defer h2.deinit();
++            if (use_h2) {
++                const stream = try h2.stream_manager.getOrCreateStream(1);
++                stream.state = .open;
++                // Give DATA enough peer-advertised credit to reach actual TCP
++                // backpressure rather than the independent flow-credit fixture.
++                stream.send_window = std.math.maxInt(i32);
++                h2.stream_manager.connection_send_window = std.math.maxInt(i32);
++                context.h2 = &h2;
++                context.h2_sock = &sender;
++                context.h2_stream_id = 1;
++            }
++            var outbound = runtime.http_bridge.Outbound{ .context = &context };
++            var fixture = Fixture{ .state = &state, .port = port, .capsule = undefined, .transport = &outbound, .io = io, .deadline_ns = Fixture.now(io) + 750 * std.time.ns_per_ms, .h2 = if (use_h2) &h2 else null };
++            outbound.write_control = .{ .ptr = &fixture, .check_fn = Fixture.check, .remaining_ms_fn = Fixture.remaining };
++            var capsule: ?*anyopaque = null;
++            const start = port.start(port.context, &.{ .io = &borrow, .clock_io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.inference), .slots = 2, .retained_bytes = 2 * chunk_size, .deadline_ns = fixture.deadline_ns, .has_deadline = 1, .cancellation = .{ .context = &fixture, .is_cancelled = Fixture.requested }, .out_handle = &capsule });
++            if (!start.isOk()) return runtime.error_abi.errorFromStatus(start);
++            fixture.capsule = capsule.?;
++            var finished = false;
++            defer if (!finished) port.finish(capsule.?);
++            const retained = state.owner.scheduler.stats().retained_bytes;
++            fixture.retained_bytes = retained;
++            var child = try std.process.spawn(io, .{ .argv = &.{executable}, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit });
++            errdefer child.kill(io);
++            fixture.child = &child;
++            var endpoint = rpc.Endpoint{ .alloc = std.testing.allocator, .io = io, .input = child.stdout.?, .output = child.stdin.?, .context = &fixture, .handler = Fixture.reject, .on_closed = Fixture.closed, .next_id = 1 };
++            fixture.endpoint = &endpoint;
++            try endpoint.start();
++            defer endpoint.deinit();
++            var task = try io.concurrent(Fixture.run, .{&fixture});
++            defer _ = task.cancel(io) catch .failed;
++            std.debug.print("PROCESS_SINK await backpressure\n", .{});
++            try fixture.waiting.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
++            var query: ?*anyopaque = null;
++            const query_start = port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.query), .out_handle = &query });
++            if (!query_start.isOk()) return runtime.error_abi.errorFromStatus(query_start);
++            var query_finished = false;
++            defer if (!query_finished) port.finish(query.?);
++            var control: ?*anyopaque = null;
++            const control_start = port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.control), .out_handle = &control });
++            if (!control_start.isOk()) return runtime.error_abi.errorFromStatus(control_start);
++            var control_finished = false;
++            defer if (!control_finished) port.finish(control.?);
++            try std.testing.expect(!fixture.done.load(.acquire));
++            const waiting = state.owner.scheduler.stats();
++            try std.testing.expectEqual(@as(usize, 1), waiting.resource_blocked + waiting.queued);
++            try io.sleep(.fromMilliseconds(15), .awake);
++            port.finish(control.?);
++            control_finished = true;
++            port.finish(query.?);
++            query_finished = true;
++            try std.testing.expectEqual(retained, state.owner.scheduler.stats().retained_bytes);
++            if (cancel) {
++                // Cancellation between complete H2 frames preserves the
++                // connection. Require a stable in-progress kernel write,
++                // after releasing peer grants, to exercise uncertain output.
++                var epoch: usize = 0;
++                var stable_since = Fixture.now(io);
++                while (true) {
++                    const current = fixture.write_epoch.load(.acquire);
++                    const now = Fixture.now(io);
++                    if (!fixture.in_write.load(.acquire) or current != epoch) {
++                        epoch = current;
++                        stable_since = now;
++                    } else if (now - stable_since >= 40 * std.time.ns_per_ms) break;
++                    if (fixture.done.load(.acquire) or now >= fixture.deadline_ns) return error.FixtureDidNotStall;
++                    try io.sleep(.fromMilliseconds(1), .awake);
++                }
++                fixture.canceled.store(true, .release);
++            }
++            const output_status = try task.await(io);
++            std.debug.print("PROCESS_SINK output status={s} begins={d} ends={d}\n", .{ @tagName(output_status), fixture.begins, fixture.ends });
++            try std.testing.expectEqual(if (cancel) runtime.http_abi.CallbackStatus.canceled else .timeout, output_status);
++            try std.testing.expect(fixture.begins >= 4);
++            try std.testing.expectEqual(fixture.begins, fixture.ends);
++            try std.testing.expect(outbound.execution_wait.begin == null);
++            // A partly delivered chunk cannot be reused as another response. The
++            // controlled writer retires uncertainty; drain queued TCP bytes and
++            // require EOF rather than a live, idle connection after the failure.
++            try peer.socket.setRecvTimeout(1000);
++            var bytes: [64 * 1024]u8 = undefined;
++            var drained_bytes: usize = 0;
++            std.debug.print("PROCESS_SINK await peer EOF\n", .{});
++            while (true) {
++                const count = peer.socket.recv(&bytes) catch |err| {
++                    std.debug.print("PROCESS_SINK peer err={} drained={d}\n", .{ err, drained_bytes });
++                    return err;
++                };
++                if (count == 0) break;
++                drained_bytes += count;
++                if (drained_bytes > 64 * 1024 * 1024) return error.FixtureDrainExceeded;
++            }
++            try std.testing.expect(drained_bytes > 0);
++            port.finish(capsule.?);
++            finished = true;
++            const drained = state.owner.scheduler.stats();
++            try std.testing.expectEqual(@as(usize, 0), drained.operations);
++            try std.testing.expectEqual(@as(usize, 0), drained.runnable_slots);
++            try std.testing.expectEqual(@as(u64, 0), drained.retained_bytes);
++        }
++    }
++}

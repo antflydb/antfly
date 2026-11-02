@@ -452,6 +452,104 @@ pub fn encodeJournalFrameAlloc(allocator: std.mem.Allocator, sequence: u64, chec
     return try out.toOwnedSlice(allocator);
 }
 
+/// Exact current-format size. Scalar descriptors are bounded; every row and
+/// variable byte range is checked under the caller's execution authority.
+pub fn journalFrameLenWithAdmission(checkpoint: bool, removed_runs: []const u64, removed_paths: []const []const u8, value: Manifest, original: @import("../../common/read_admission.zig").Port) !usize {
+    try original.checkpoint();
+    if (checkpoint and (removed_runs.len != 0 or removed_paths.len != 0)) return error.InvalidManifest;
+    for ([_]usize{ removed_runs.len, removed_paths.len, value.runs.len, value.obsolete_paths.len }) |count| if (count > std.math.maxInt(u32)) return error.FileTooBig;
+    var len: usize = if (checkpoint) 76 else 68;
+    len = try std.math.add(usize, len, try std.math.mul(usize, removed_runs.len, 8));
+    for (removed_paths) |path| {
+        try original.checkpoint();
+        if (path.len > std.math.maxInt(u32)) return error.FileTooBig;
+        len = try std.math.add(usize, len, try std.math.add(usize, 4, path.len));
+    }
+    for (value.runs) |run| {
+        try original.checkpoint();
+        len = try std.math.add(usize, len, 112);
+        for ([_][]const u8{ run.path, run.smallest_namespace_name orelse &.{}, run.smallest_key, run.largest_namespace_name orelse &.{}, run.largest_key }) |bytes| {
+            if (bytes.len > std.math.maxInt(u32)) return error.FileTooBig;
+            len = try std.math.add(usize, len, bytes.len);
+        }
+    }
+    for (value.obsolete_paths) |path| {
+        try original.checkpoint();
+        if (path.path.len > std.math.maxInt(u32)) return error.FileTooBig;
+        len = try std.math.add(usize, len, try std.math.add(usize, 12, path.path.len));
+    }
+    return len;
+}
+
+/// Caller owns/prepays the exact buffer through completion or independent
+/// retirement. No geometric growth, intermediate frame or scope is retained.
+pub fn encodeJournalFrameIntoWithAdmission(out: []u8, sequence: u64, checkpoint: bool, removed_runs: []const u64, removed_paths: []const []const u8, value: Manifest, original: @import("../../common/read_admission.zig").Port) !void {
+    if (out.len != try journalFrameLenWithAdmission(checkpoint, removed_runs, removed_paths, value, original)) return error.InvalidArgument;
+    const Writer = struct {
+        bytes: []u8,
+        used: usize = 0,
+        fn put(self: *@This(), bytes: []const u8, port: @import("../../common/read_admission.zig").Port) !void {
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                try port.checkpoint();
+                const n = @min(16 * 1024, bytes.len - offset);
+                @memcpy(self.bytes[self.used..][0..n], bytes[offset..][0..n]);
+                offset += n;
+                self.used += n;
+            }
+        }
+        fn integer(self: *@This(), comptime T: type, value_: T, port: @import("../../common/read_admission.zig").Port) !void {
+            var bytes: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &bytes, value_, .little);
+            try self.put(&bytes, port);
+        }
+        fn checksum(self: *@This(), start: usize, port: @import("../../common/read_admission.zig").Port) !u32 {
+            var crc: Crc32 = .init();
+            var offset = start;
+            while (offset < self.used) {
+                try port.checkpoint();
+                const end = @min(self.used, offset + 16 * 1024);
+                crc.update(self.bytes[offset..end]);
+                offset = end;
+            }
+            return crc.final();
+        }
+    };
+    var writer: Writer = .{ .bytes = out };
+    if (checkpoint) try writer.put(journal_magic, original);
+    const header = writer.used;
+    try writer.integer(u64, @intCast(out.len - writer.used - journal_header_len - checksum_len), original);
+    try writer.integer(u64, sequence, original);
+    try writer.integer(u32, @intFromBool(checkpoint), original);
+    try writer.integer(u32, try writer.checksum(header, original), original);
+    const body = writer.used;
+    try writer.integer(u32, @intCast(removed_runs.len), original);
+    for (removed_runs) |id| try writer.integer(u64, id, original);
+    try writer.integer(u32, @intCast(removed_paths.len), original);
+    for (removed_paths) |path| {
+        try writer.integer(u32, @intCast(path.len), original);
+        try writer.put(path, original);
+    }
+    const inner = writer.used;
+    try writer.put(magic, original);
+    try writer.integer(u32, version, original);
+    try writer.integer(u64, value.next_run_id, original);
+    try writer.integer(u32, @intCast(value.runs.len), original);
+    try writer.integer(u32, @intCast(value.obsolete_paths.len), original);
+    for (value.runs) |run| {
+        try writer.put(&runHeader(run), original);
+        for ([_][]const u8{ run.path, run.smallest_namespace_name orelse &.{}, run.smallest_key, run.largest_namespace_name orelse &.{}, run.largest_key }) |bytes| try writer.put(bytes, original);
+    }
+    for (value.obsolete_paths) |path| {
+        try writer.integer(u64, path.delete_after_ns, original);
+        try writer.integer(u32, @intCast(path.path.len), original);
+        try writer.put(path.path, original);
+    }
+    try writer.integer(u32, try writer.checksum(inner, original), original);
+    try writer.integer(u32, try writer.checksum(body, original), original);
+    std.debug.assert(writer.used == out.len);
+}
+
 fn decodeJournalBorrowed(allocator: std.mem.Allocator, raw: []u8) !BorrowedManifest {
     var runs: std.AutoHashMapUnmanaged(u64, BorrowedRunMeta) = .empty;
     defer runs.deinit(allocator);

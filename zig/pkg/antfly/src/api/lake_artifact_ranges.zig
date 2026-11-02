@@ -21,9 +21,52 @@ const stores = @import("../serverless/artifacts/store.zig");
 const artifacts = @import("lake_index_aggregate_artifact.zig");
 const A = std.mem.Allocator;
 const Token = @import("antfly_cancellation").CancellationToken;
+const Context = local.serverless_query_lake_read_context.Context;
+const Execution = local.common_request_admission.runnable_scheduler.Execution;
+const scheduling = local.sql_parallel_scheduler;
+
+/// Temporary wave payloads outlive task joins, so their reservation is separate
+/// from worker metadata. A reserved child consumes no CPU and retires only after
+/// its buffers and physical-cache leases are gone.
+pub const Workspace = struct {
+    execution: Execution = .{},
+    pub fn reserve(self: *Workspace, context: Context, bytes: usize) !bool {
+        const parent = context.execution orelse return false;
+        const io = context.io orelse return false;
+        try context.ensureActive();
+        // Verified bounded reads promise no fan-out, even on configurations
+        // where the bounded lane shares ordinary CPU capacity.
+        if (parent.entry) |entry| if (entry.read_lane == .bounded) return false;
+        const retained = std.math.add(u64, bytes, @sizeOf(Workspace)) catch return error.InvalidRunnableDemand;
+        self.execution.reserveChild(parent, io, retained) catch |err| {
+            if (err == error.SchedulerFull or err == error.ExecutionWaitUnsupported) return false;
+            return err;
+        };
+        return true;
+    }
+    pub fn deinit(self: *Workspace) void {
+        self.execution.finish();
+    }
+};
+
+fn copy(a: A, bytes: []const u8, context: Context) ![]u8 {
+    try context.ensureActive();
+    const output = try a.alloc(u8, bytes.len);
+    errdefer a.free(output);
+    var offset: usize = 0;
+    while (offset != bytes.len) {
+        const end = offset + @min(16 * 1024, bytes.len - offset);
+        @memcpy(output[offset..end], bytes[offset..end]);
+        offset = end;
+        try context.ensureActive();
+    }
+    return output;
+}
+fn discardVoid(_: A, _: void) void {}
+
 pub const max_batch = 16;
 pub const Unit = struct { object: artifacts.ChunkRef, offset: u64, bytes: usize, digest: [32]u8 };
-pub const Options = struct { max_range: usize, max_gap: usize = 0 };
+pub const Options = struct { max_range: usize, max_gap: usize = 0, context: ?Context = null };
 pub const Budget = struct { ptr: *anyopaque, charge: *const fn (*anyopaque, u64) anyerror!void };
 pub const Batch = struct {
     a: A,
@@ -48,6 +91,10 @@ const Job = struct {
     length: usize,
     token: Token,
     cached: ?artifacts.CachedRead,
+    context: Context = .{},
+    ready: ?*std.Io.Event = null,
+    notification_io: ?std.Io = null,
+    completed: std.atomic.Value(bool) = .init(false),
     lease: ?Decoded.Lease = null,
     result: ?[]const u8 = null,
     owned: ?*SharedBytes = null,
@@ -97,18 +144,18 @@ const Job = struct {
         const self: *const Job = @ptrCast(@alignCast(raw));
         // Context is authoritative even when a transport-only adapter flattened
         // the same deadline to Canceled.
-        if (self.cached) |cache| try cache.context.ensureActive();
+        try self.context.checkLifetime();
         try self.token.check();
     }
     fn canceled(raw: *const anyopaque) bool {
-        const self: *const Job = @ptrCast(@alignCast(raw));
-        self.token.check() catch return true;
-        if (self.cached) |cache| cache.context.ensureActive() catch return true;
+        // Physical-provider polling can run with the original parent parked.
+        // Check authority/lifetime without checkpointing that parent's CPU.
+        check(raw) catch return true;
         return false;
     }
     fn read(self: *Job, alloc: A) ![]u8 {
         const token: Token = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = check };
-        const bytes = self.store.getRangeAllocWithCancellationUsingAllocator(alloc, self.id, self.begin, self.length, token) catch |err| {
+        const bytes = self.store.getRangeAllocFor(alloc, self.id, self.begin, self.length, token, self.context) catch |err| {
             try check(self);
             return err;
         };
@@ -120,7 +167,7 @@ const Job = struct {
         for (self.units) |ref| {
             if (!std.mem.eql(u8, self.id, ref.object.artifact_id) or ref.offset < self.begin or ref.offset + ref.bytes > self.begin + self.length) continue;
             const offset: usize = @intCast(ref.offset - self.begin);
-            try stores.validatePayloadSha256WithCancellation(bytes[offset..][0..ref.bytes], &std.fmt.bytesToHex(&ref.digest, .lower), token);
+            try stores.validatePayloadSha256For(bytes[offset..][0..ref.bytes], &std.fmt.bytesToHex(&ref.digest, .lower), token, self.context);
         }
         return bytes;
     }
@@ -138,7 +185,18 @@ const Job = struct {
         value.* = .{ .start = self.begin, .bytes = bytes };
         item.payload = .{ .extension = value };
     }
+    fn retired(arguments: anytype, _: ?anyerror) void {
+        const job: *Job = arguments[0];
+        // Publish before signaling: activation can fail without entering run.
+        job.completed.store(true, .release);
+        if (job.ready) |ready| ready.set(job.notification_io.?);
+    }
+    fn runChild(self: *Job, execution: *Execution) anyerror!void {
+        self.context = self.context.withExecution(execution);
+        return self.run();
+    }
     fn run(self: *Job) anyerror!void {
+        try self.context.ensureActive();
         if (self.cached) |cache| {
             var hash = std.crypto.hash.sha2.Sha256.init(.{});
             hash.update("native-lake-authenticated-range-wave-v1");
@@ -149,8 +207,8 @@ const Job = struct {
             std.mem.writeInt(u64, interval[0..8], self.begin, .big);
             std.mem.writeInt(u64, interval[8..16], self.begin + self.length, .big);
             hash.update(&interval);
-            var context = cache.context;
-            context.checkpoint = null;
+            var context = self.context;
+            if (context.execution == null and context.wait == null) context.checkpoint = null;
             context.cancellation = .fromCallback(self, canceled);
             const lease = cache.cache.physical.acquireCovered(hash.finalResult(), self.length * 2 + 64 * 1024, context, .{ .ptr = self, .load = fill }, .{ .domain = domain, .start = self.begin, .end = self.begin + self.length }) catch |err| fallback: {
                 try check(self);
@@ -169,6 +227,42 @@ const Job = struct {
         self.result = try self.read(self.a);
     }
 };
+
+/// Completion-order retirement is required even when the first submitted
+/// provider is parked. Scoped workers retain the original CPU wait boundary;
+/// any refusal unwinds through the caller's mandatory cancellation/joins.
+fn joinJobs(context: Context, io: std.Io, ready: *std.Io.Event, tasks: []?scheduling.Task(anyerror!void), jobs: []Job) !void {
+    while (true) {
+        ready.reset();
+        var pending = false;
+        for (tasks, 0..) |*task, i| if (task.*) |*held| {
+            if (!jobs[i].completed.load(.acquire) and !held.isComplete()) {
+                pending = true;
+                continue;
+            }
+            const result = held.await(io);
+            task.* = null;
+            try result;
+        };
+        if (!pending) return;
+        var wait = context.wait;
+        if (wait == null) if (context.execution) |execution| {
+            wait = local.sql_spill.childWait(execution);
+        };
+        if (wait) |boundary| {
+            try boundary.begin(boundary.ptr);
+            const result = ready.wait(io);
+            const restored = boundary.end(boundary.ptr);
+            if (result) |_| {
+                try restored;
+            } else |cause| {
+                restored catch {};
+                return cause;
+            }
+        } else try ready.wait(io);
+        try context.ensureActive();
+    }
+}
 
 /// Logical units and physical jobs have independent bounds. Wide covering
 /// packs may contain 1025 stripes, while at most 16 bounded reads run together.
@@ -239,7 +333,8 @@ pub fn load(a: A, store: stores.ArtifactStore, refs: []const Unit, token: Token,
 fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: Output, token: Token, cached: ?artifacts.CachedRead, budget: Budget, options: Options) !void {
     if (refs.len != values.len() or options.max_range == 0) return error.InvalidGraphPage;
     try token.check();
-    if (cached) |cache| try cache.context.ensureActive();
+    const context: Context = options.context orelse if (cached) |cache| cache.context else .{};
+    try context.ensureActive();
     if (refs.len == 0) return;
     var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
     defer scratch.deinit();
@@ -294,16 +389,30 @@ fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: Outpu
     // Charge every logical byte and physical gap before provider work starts.
     // Decode batch boundaries never split an otherwise admissible range.
     try budget.charge(budget.ptr, std.math.add(u64, logical, gaps) catch return error.InvalidGraphPage);
-    const io = if (cached) |cache| cache.context.io else null;
+    const io = context.io;
     var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = a };
     var first: usize = 0;
     while (first < run_count) {
-        const end = @min(first + max_batch, run_count);
-        const wave = runs[first..end];
-        var jobs: [max_batch]Job = undefined;
-        for (wave, jobs[0..wave.len]) |run, *job| job.* = .{ .store = store, .a = allocations.allocator(), .id = ordered[run.first].object.artifact_id, .units = ordered[run.first..run.end], .begin = run.offset, .length = run.length, .token = token, .cached = cached };
-        defer for (jobs[0..wave.len]) |*job| job.deinit();
+        var end = @min(first + max_batch, run_count);
+        var wave = runs[first..end];
+        var workspace: Workspace = .{};
+        defer workspace.deinit();
+        var parallel = true;
+        if (context.execution != null) {
+            var bytes: usize = 0;
+            for (wave) |run| bytes = std.math.add(usize, bytes, run.length * 2 + 64 * 1024) catch return error.InvalidRunnableDemand;
+            parallel = try workspace.reserve(context, bytes);
+            if (!parallel) {
+                // Required reads retain their caller's finite heap/CPU policy.
+                // No uncharged worker or multi-response wave is dispatched.
+                end = first + 1;
+                wave = runs[first..end];
+            }
+        }
         var ready: std.Io.Event = .unset;
+        var jobs: [max_batch]Job = undefined;
+        for (wave, jobs[0..wave.len]) |run, *job| job.* = .{ .store = store, .a = allocations.allocator(), .id = ordered[run.first].object.artifact_id, .units = ordered[run.first..run.end], .begin = run.offset, .length = run.length, .token = token, .cached = cached, .context = context, .ready = &ready, .notification_io = io };
+        defer for (jobs[0..wave.len]) |*job| job.deinit();
         var tasks: [max_batch]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
         defer if (io) |active| for (&tasks) |*task| if (task.*) |*held| {
             held.cancel(active) catch {};
@@ -311,19 +420,42 @@ fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: Outpu
         var failure: ?anyerror = null;
         for (jobs[0..wave.len], 0..) |*job, i| {
             if (failure != null) break;
-            if (io) |active| if (wave.len > 1) {
-                tasks[i] = local.sql_parallel_scheduler.global().submitIoNotified(active, job.length * 2 + 64 * 1024, &ready, Job.run, .{job});
+            try context.ensureActive();
+            if (io) |active| if (parallel and wave.len > 1) {
+                if (context.execution) |execution| {
+                    const scope: scheduling.ExecutionScope = .{ .execution = execution, .allocator = allocations.allocator(), .io = active, .wait = context.wait orelse local.sql_spill.childWait(execution) };
+                    tasks[i] = scope.submitNotified(0, allocations.allocator(), Job.runChild, .{job}, discardVoid, Job.retired) catch |err| fallback: {
+                        if (err != error.ConcurrencyUnavailable) return err;
+                        break :fallback null;
+                    };
+                } else if (context.wait == null) {
+                    job.context.checkpoint = null;
+                    tasks[i] = scheduling.global().submitIoNotified(active, job.length * 2 + 64 * 1024, &ready, Job.run, .{job});
+                }
             };
             if (tasks[i] == null) job.run() catch |err| {
                 failure = err;
             };
         }
-        if (failure) |err| return err;
-        if (io) |active| local.sql_parallel_scheduler.joinNotified(active, &ready, &tasks) catch |err| {
-            if (cached) |cache| try cache.context.ensureActive();
+        if (failure == null) if (io) |active| {
+            joinJobs(context, active, &ready, &tasks, jobs[0..wave.len]) catch |err| {
+                failure = err;
+            };
+        };
+        if (failure) |err| {
+            // A failed sibling must retire parked providers before any caller
+            // continuation or authority check can leave this wave's owners.
+            if (io) |active| for (&tasks) |*task| if (task.*) |*held| {
+                _ = held.cancel(active) catch {};
+                task.* = null;
+            };
+            // Reentry may itself have been denied. Lifetime checks remain
+            // valid while parked and must not replace that first refusal.
+            try context.checkLifetime();
             try token.check();
             return err;
-        };
+        }
+        try context.ensureActive();
         const Loader = struct {
             data: []const u8,
             fn read(raw: *anyopaque, alloc: A) ![]u8 {
@@ -338,7 +470,7 @@ fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: Outpu
             const ref = refs[index];
             const offset: usize = @intCast(ref.offset - job.begin);
             const bytes = job.result.?[offset..][0..ref.bytes];
-            try stores.validatePayloadSha256WithCancellation(bytes, &std.fmt.bytesToHex(&ref.digest, .lower), token);
+            try stores.validatePayloadSha256For(bytes, &std.fmt.bytesToHex(&ref.digest, .lower), token, context);
             var loader: Loader = .{ .data = bytes };
             if (values == .leased) {
                 const held = try job.rangeLease(a, offset, ref.bytes);
@@ -383,11 +515,18 @@ test "external lake metadata navigation wide range plans bound physical jobs cha
             if (self.fail_offset == offset) return error.InjectedRangeFailure;
             return if (self.original.get_range_alloc_with_cancellation) |read| read(raw, alloc, id, offset, length, token) else self.original.get_range_alloc(raw, alloc, id, offset, length);
         }
+        fn getFor(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Token, context: Context) ![]u8 {
+            return local.sql_execution_wait.runOwned(context.wait, get, .{ raw, alloc, id, offset, length, token }, discardRange, .{alloc});
+        }
+        fn discardRange(range_payload: []u8, alloc: A) void {
+            alloc.free(range_payload);
+        }
     };
     var probe: Probe = .{ .original = store.vtable };
     Probe.active = &probe;
     var traced = store.vtable.*;
     traced.get_range_alloc_with_cancellation = Probe.get;
+    traced.get_range_alloc_for = Probe.getFor;
     store.vtable = &traced;
     const Charge = struct {
         fn charge(raw: *anyopaque, bytes: u64) !void {
@@ -458,11 +597,18 @@ test "external lake metadata navigation range failures cancel parked siblings be
             try self.entered.wait(std.testing.io);
             return error.InjectedRangeFailure;
         }
+        fn getFor(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Token, context: Context) ![]u8 {
+            return local.sql_execution_wait.runOwned(context.wait, get, .{ raw, alloc, id, offset, length, token }, discardRange, .{alloc});
+        }
+        fn discardRange(range_payload: []u8, alloc: A) void {
+            alloc.free(range_payload);
+        }
     };
     var probe: Probe = .{};
     Probe.active = &probe;
     var traced = store.vtable.*;
     traced.get_range_alloc_with_cancellation = Probe.get;
+    traced.get_range_alloc_for = Probe.getFor;
     store.vtable = &traced;
     var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer cache.deinit();
@@ -507,11 +653,18 @@ test "external lake metadata navigation leased range units retain owners and red
             self.bytes += len;
             return if (self.original.get_range_alloc_with_cancellation) |get| get(raw, alloc, id, offset, len, token) else self.original.get_range_alloc(raw, alloc, id, offset, len);
         }
+        fn readFor(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Token, context: Context) ![]u8 {
+            return local.sql_execution_wait.runOwned(context.wait, read, .{ raw, alloc, id, offset, length, token }, discardRange, .{alloc});
+        }
+        fn discardRange(range_payload: []u8, alloc: A) void {
+            alloc.free(range_payload);
+        }
     };
     var provider: Provider = .{ .original = store.vtable };
     Provider.active = &provider;
     var traced = store.vtable.*;
     traced.get_range_alloc_with_cancellation = Provider.read;
+    traced.get_range_alloc_for = Provider.readFor;
     store.vtable = &traced;
     const Charge = struct {
         fn charge(raw: *anyopaque, bytes: u64) !void {

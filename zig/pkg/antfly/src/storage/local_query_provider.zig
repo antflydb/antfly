@@ -38,6 +38,12 @@ pub fn execute(
     out_failure.* = .{};
     if (request.version != abi.abi_version)
         return fail(error.InvalidAbiVersion, .validate_request, out_failure);
+    if (request.execution_runnable) |raw| {
+        const grant = @import("antfly_runtime_abi").runnable_abi.Borrowed.read(@ptrCast(@alignCast(raw))) catch |err|
+            return fail(err, .validate_request, out_failure);
+        const status = grant.checkpoint(grant.context);
+        if (!status.isOk()) return fail(@import("antfly_runtime_abi").error_abi.errorFromStatus(status), .validate_request, out_failure);
+    }
     const live_db: *db_mod.DB = @ptrCast(@alignCast(request.db orelse
         return fail(error.InvalidArgument, .validate_request, out_failure)));
     const table_name = request.table_name.slice();
@@ -85,9 +91,8 @@ pub fn execute(
             defer alloc.free(query_json);
             var owned = query_api.parseQueryRequest(alloc, null, table_name, query_json) catch |err| return fail(err, .validate_request, out_failure);
             defer owned.deinit(alloc);
-            @import("antfly_local_sources").storage_local_query_controls.applyExecutionOptions(&owned.req, request.execution_options);
-            owned.req.cancellation = requestCancellationToken(request);
-            if (request.has_execution_deadline != 0) owned.req.execution_deadline_ns = request.execution_deadline_ns;
+            applySearchControls(request, &owned.req) catch |err|
+                return fail(err, .validate_request, out_failure);
             if (request.kind == .preflight) {
                 const max_work: u32 = if (parsed.value.object.get("max_work")) |value| if (value == .integer) std.math.cast(u32, value.integer) orelse return fail(error.InvalidQueryRequest, .preflight, out_failure) else return fail(error.InvalidQueryRequest, .preflight, out_failure) else 0;
                 var summary = cover.preflight(alloc, owned.req, max_work) catch |err| return fail(err, .preflight, out_failure);
@@ -151,14 +156,8 @@ fn executeSearch(
     // namespace when canonicalizing explicit self-table start identities.
     if (request.dialect == .public) owned.req.graph_owning_table = table_name;
 
-    @import("antfly_local_sources").storage_local_query_controls.applyExecutionOptions(&owned.req, request.execution_options);
-    if (request.has_execution_deadline != 0) {
-        owned.req.execution_deadline_ns = if (owned.req.execution_deadline_ns) |parsed_deadline|
-            @min(parsed_deadline, request.execution_deadline_ns)
-        else
-            request.execution_deadline_ns;
-    }
-    owned.req.cancellation = requestCancellationToken(request);
+    applySearchControls(request, &owned.req) catch |err|
+        return fail(err, .validate_request, out_failure);
     @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(owned.req) catch |err|
         return fail(err, executeOperation(request.dialect), out_failure);
 
@@ -291,7 +290,7 @@ fn executeGraphExpand(
     var parsed = distributed_graph.parseGraphExpandRequest(alloc, request.request_json.slice()) catch |err|
         return fail(err, .parse_graph_expand, out_failure);
     defer parsed.deinit(alloc);
-    applyControls(request, &parsed);
+    applyControls(request, &parsed) catch |err| return fail(err, .validate_request, out_failure);
     var result = local_query.executeStorageKernelGraphExpand(alloc, db, table_name, parsed) catch |err|
         return fail(err, .execute_graph_expand, out_failure);
     defer result.deinit(alloc);
@@ -311,7 +310,7 @@ fn executeGraphHydrate(
     var parsed = distributed_graph.parseGraphHydrateRequest(alloc, request.request_json.slice()) catch |err|
         return fail(err, .parse_graph_hydrate, out_failure);
     defer parsed.deinit(alloc);
-    applyControls(request, &parsed);
+    applyControls(request, &parsed) catch |err| return fail(err, .validate_request, out_failure);
     var result = local_query.executeStorageKernelGraphHydrate(alloc, db, parsed) catch |err|
         return fail(err, .execute_graph_hydrate, out_failure);
     defer result.deinit(alloc);
@@ -331,7 +330,7 @@ fn executeGraphEdges(
     var parsed = distributed_graph.parseGraphEdgesRequest(alloc, request.request_json.slice()) catch |err|
         return fail(err, .parse_graph_edges, out_failure);
     defer parsed.deinit(alloc);
-    applyControls(request, &parsed);
+    applyControls(request, &parsed) catch |err| return fail(err, .validate_request, out_failure);
     var result = local_query.executeStorageKernelGraphEdges(alloc, db, parsed) catch |err|
         return fail(err, .execute_graph_edges, out_failure);
     defer result.deinit(alloc);
@@ -348,11 +347,14 @@ fn executeTextStats(
     out_response: *abi.OwnedBytes,
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
-    const response = local_query.executeStorageKernelTextStats(
+    var controls: db_mod.types.SearchRequest = .{};
+    applySearchControls(request, &controls) catch |err| return fail(err, .text_stats, out_failure);
+    const response = local_query.executeStorageKernelTextStatsWithControls(
         std.heap.c_allocator,
         db,
         table_name,
         request.request_json.slice(),
+        controls,
     ) catch |err| return fail(err, .text_stats, out_failure);
     out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
     return .ok;
@@ -390,13 +392,31 @@ fn executePreflight(
     return .ok;
 }
 
-fn applyControls(request: *const abi.LocalQueryRequest, graph_request: anytype) void {
+fn applySearchControls(request: *const abi.LocalQueryRequest, search_request: *db_mod.types.SearchRequest) !void {
+    @import("antfly_local_sources").storage_local_query_controls.applyExecutionOptions(search_request, request.execution_options);
+    if (request.has_execution_deadline != 0) {
+        search_request.execution_deadline_ns = if (search_request.execution_deadline_ns) |parsed_deadline|
+            @min(parsed_deadline, request.execution_deadline_ns)
+        else
+            request.execution_deadline_ns;
+    }
+    search_request.cancellation = requestCancellationToken(request);
+    search_request.execution_runnable = try requestRunnable(request);
+}
+
+fn applyControls(request: *const abi.LocalQueryRequest, graph_request: anytype) !void {
+    graph_request.execution_runnable = try requestRunnable(request);
     graph_request.execution_deadline_ns = if (request.has_execution_deadline != 0)
         request.execution_deadline_ns
     else
         null;
     graph_request.timeout_ms = null;
     graph_request.cancellation = requestCancellationToken(request);
+}
+
+fn requestRunnable(request: *const abi.LocalQueryRequest) !?@import("antfly_runtime_abi").runnable_abi.Borrowed {
+    const raw = request.execution_runnable orelse return null;
+    return try @import("antfly_runtime_abi").runnable_abi.Borrowed.read(@ptrCast(@alignCast(raw)));
 }
 
 fn requestCancellationToken(request: *const abi.LocalQueryRequest) db_mod.types.CancellationToken {
@@ -428,6 +448,20 @@ fn fail(
     return out_failure.status;
 }
 
+// Parse errors precede kind-specific dispatch, so retain the same operation
+// identity that the selected provider would report for malformed input.
+fn requestParseOperation(request: *const abi.LocalQueryRequest) abi.LocalQueryOperation {
+    return switch (request.kind) {
+        .search => parseOperation(request.dialect),
+        .graph_expand => .parse_graph_expand,
+        .graph_hydrate => .parse_graph_hydrate,
+        .graph_edges => .parse_graph_edges,
+        .text_stats => .text_stats,
+        .algebraic_partials => .algebraic_partials,
+        .preflight => .preflight,
+    };
+}
+
 fn parseOperation(dialect: abi.LocalQueryDialect) abi.LocalQueryOperation {
     return switch (dialect) {
         .internal => .parse_internal_request,
@@ -452,4 +486,75 @@ fn encodeOperation(dialect: abi.LocalQueryDialect) abi.LocalQueryOperation {
 pub fn bufferDestroy(buffer: *abi.OwnedBytes) callconv(.c) void {
     if (buffer.ptr) |ptr| std.heap.c_allocator.free(ptr[0..@intCast(buffer.len)]);
     buffer.* = .{};
+}
+
+test "storage local graph controls preserve borrowed authority and reject malformed grants" {
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const runnable = @import("antfly_runtime_abi").runnable_abi;
+    const clock = @import("antfly_platform").time;
+    var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var canceled: std.atomic.Value(bool) = .init(false);
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    var parent: native.Execution = .{};
+    defer parent.finish();
+    try parent.start(&scheduler, .{
+        .io = std.testing.io,
+        .native_now_ns = clock.monotonicNs,
+        .deadline_ns = deadline,
+        .retained_bytes = 23,
+        .cancellation = .{ .ptr = &canceled, .requested = struct {
+            fn requested(raw: *const anyopaque) bool {
+                return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+            }
+        }.requested },
+    }, .query);
+    var read: @import("../api/runnable_local_read.zig").Read = .{ .execution = &parent, .allocator = std.testing.allocator };
+    const team = try read.team();
+    var request = abi.LocalQueryRequest{
+        .execution_runnable = &team.borrow,
+        .execution_deadline_ns = deadline,
+        .has_execution_deadline = 1,
+    };
+    var parsed: distributed_graph.GraphHydrateRequest = .{ .keys = &.{} };
+    try applyControls(&request, &parsed);
+    try std.testing.expect(parsed.execution_runnable.?.context == team.borrow.context);
+    try std.testing.expectEqual(@as(?u64, deadline), parsed.execution_deadline_ns);
+    const search = local_query_contract.graphHydrateSearchRequest(parsed);
+    try local_query_contract.checkQueryDeadline(search);
+    try std.testing.expectEqual(runnable.Class.query, try search.execution_runnable.?.currentClass());
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+
+    // A local grant survives the ABI control path, never the JSON payload.
+    const encoded = try distributed_graph.encodeGraphHydrateRequest(std.testing.allocator, parsed);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "execution_runnable") == null);
+    var reparsed = try distributed_graph.parseGraphHydrateRequest(std.testing.allocator, encoded);
+    defer reparsed.deinit(std.testing.allocator);
+    try std.testing.expect(reparsed.execution_runnable == null);
+
+    var search_request: db_mod.types.SearchRequest = .{ .execution_deadline_ns = deadline - std.time.ns_per_s };
+    try applySearchControls(&request, &search_request);
+    try std.testing.expect(search_request.execution_runnable.?.context == team.borrow.context);
+    try std.testing.expectEqual(@as(?u64, deadline - std.time.ns_per_s), search_request.execution_deadline_ns);
+    try local_query_contract.checkQueryDeadline(search_request);
+
+    var malformed = team.borrow;
+    malformed.version -= 1;
+    request.execution_runnable = &malformed;
+    try std.testing.expectError(error.UnsupportedVersion, applyControls(&request, &parsed));
+    try std.testing.expectError(error.UnsupportedVersion, applySearchControls(&request, &search_request));
+    request.execution_runnable = &team.borrow;
+    try applyControls(&request, &parsed);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, local_query_contract.checkQueryDeadline(local_query_contract.graphHydrateSearchRequest(parsed)));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectError(error.Canceled, local_query_contract.checkQueryDeadline(search_request));
+    request.execution_runnable = null;
+    try applyControls(&request, &parsed);
+    try std.testing.expect(parsed.execution_runnable == null);
+    parent.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }

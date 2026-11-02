@@ -24,6 +24,9 @@ pub const QueryResponse = struct {
     pub const identity_read_generation_header = "X-Antfly-Identity-Read-Generation";
 
     json: []u8,
+    /// Move-only physical buffer owner. Release after JSON, including when its
+    /// allocator is borrowed across the table-runtime callback boundary.
+    retirement: ?struct { ptr: *anyopaque, release: *const fn (*anyopaque) void } = null,
     /// Present only after synchronous delivery to a caller-owned sink. JSON is
     /// empty in that case; internal/group callers continue receiving owned JSON.
     delivered_bytes: ?usize = null,
@@ -34,6 +37,7 @@ pub const QueryResponse = struct {
 
     pub fn deinit(self: *QueryResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.json);
+        if (self.retirement) |retained| retained.release(retained.ptr);
         self.* = undefined;
     }
 };

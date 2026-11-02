@@ -30,6 +30,9 @@ pub const Connection = struct {
 
     pub const Options = struct {
         fsync: bool = true,
+        resource_manager: ?*@import("../resource_manager.zig").ResourceManager = null,
+        /// Borrowed native-file authority; must outlive the connection.
+        io: ?std.Io = null,
         writer_lock_marker: []const u8 = "",
         reclamation: backend.ReclamationOptions = .{},
     };
@@ -40,6 +43,8 @@ pub const Connection = struct {
 
     pub fn openWithOptions(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode, opts: Options) !Connection {
         var lite_backend = try backend.Handle.open(allocator, path, .{
+            .resource_manager = opts.resource_manager,
+            .io = opts.io,
             .reclamation = opts.reclamation,
             .read_only = openModeRequiresReadOnlyBackends(open_mode),
             .no_sync = !opts.fsync,
@@ -69,6 +74,8 @@ pub const Connection = struct {
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, exclusive: bool, opts: Options) !Connection {
         var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{
+            .resource_manager = opts.resource_manager,
+            .io = opts.io,
             .reclamation = opts.reclamation,
             .exclusive = exclusive,
             .no_sync = !opts.fsync,

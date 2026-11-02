@@ -59,6 +59,7 @@ pub const BuildOptions = struct {
     provenance: Provenance = .{},
     io: ?std.Io = null,
     max_parallelism: usize = 1,
+    execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution = null,
     topology_requirements: ?metrics.TopologyRequirements = null,
     topology_checksum: [32]u8 = @splat(0),
     /// Optional current-ordinal vectors recovered from the last compatible
@@ -69,9 +70,21 @@ pub const BuildOptions = struct {
     initial_hubs: ?[]const f64 = null,
 };
 
+const preparation = @import("antfly_local_sources").graph_preparation;
+fn preparationControl(options: BuildOptions) preparation.Control {
+    return preparationFor(options.cancellation, options.execution);
+}
+fn preparationFor(cancellation: CancellationToken, execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) preparation.Control {
+    return .{ .cancellation = cancellation, .checkpoint = if (execution) |owner| .{ .ptr = owner, .check = preparationCheckpoint } else null };
+}
+fn preparationCheckpoint(raw: *anyopaque) !void {
+    try @as(*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution, @ptrCast(@alignCast(raw))).checkpoint();
+}
+
 pub const ComputeRuntime = struct {
     io: ?std.Io = null,
     max_parallelism: usize = 1,
+    execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution = null,
 
     pub fn validate(self: ComputeRuntime) !void {
         if (self.max_parallelism == 0 or self.max_parallelism > max_compute_parallelism) return error.InvalidGraphMetricBuildOptions;
@@ -244,7 +257,8 @@ fn discardInboundEdges(alloc: Allocator, graph: *graph_segment.Segment) !usize {
 
 pub fn buildFromGraphPayloadAlloc(alloc: Allocator, graph_payload: []const u8, options: BuildOptions) !BuildResult {
     try validateOptions(graph_payload, options);
-    var topology = try prepareTopologyFromPackedAlloc(alloc, graph_payload, options.cancellation, options.limits);
+    var control = preparationControl(options);
+    var topology = try prepareTopologyFromPackedAlloc(alloc, graph_payload, control.token(), options.limits);
     defer topology.deinit(alloc);
     // This entry point borrows the payload throughout kernel execution.
     topology.retained_bytes = try std.math.add(usize, topology.retained_bytes, graph_payload.len);
@@ -311,7 +325,7 @@ pub fn publishFromGraphArtifactOracleAlloc(
         var local_budget = graph_metric_policy.Budget{ .limits = options.limits };
         const budget = options.batch_budget orelse &local_budget;
         try validatePublicationOptions(options.graph_index_name, options.source_graph, &.{options.config}, options.cancellation, options.limits, budget);
-        var prepared = (try prepareSelectedGraphArtifactOracleAlloc(alloc, artifacts, options.source_graph, &.{options.config}, options.cancellation, options.limits, budget)) orelse return error.InvalidGraphRoot;
+        var prepared = (try prepareSelectedGraphArtifactControlledAlloc(alloc, artifacts, options.source_graph, &.{options.config}, preparationControl(options), options.limits, budget)) orelse return error.InvalidGraphRoot;
         defer prepared.deinit(alloc);
         var admitted = options;
         admitted.batch_budget = budget;
@@ -448,14 +462,25 @@ fn prepareSelectedGraphArtifactAlloc(alloc: Allocator, artifacts: *artifact_stor
 
 /// Explicit packed-format reference path for codec tests and benchmarks.
 fn prepareSelectedGraphArtifactOracleAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, source: artifact_ref.ArtifactRef, configs: []const graph_mod.GraphMetricConfig, cancellation: CancellationToken, limits: Limits, budget: *graph_metric_policy.Budget) !?PreparedGraphArtifact {
+    return prepareSelectedGraphArtifactControlledAlloc(alloc, artifacts, source, configs, .{ .cancellation = cancellation }, limits, budget);
+}
+
+fn prepareSelectedGraphArtifactControlledAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, source: artifact_ref.ArtifactRef, configs: []const graph_mod.GraphMetricConfig, control: preparation.Control, limits: Limits, budget: *graph_metric_policy.Budget) !?PreparedGraphArtifact {
     var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_peak_memory_bytes);
     var remaining: u64 = limits.max_total_graph_payload_bytes -| budget.graph_payload_bytes;
     const before = remaining;
     defer budget.graph_payload_bytes += @intCast(before - remaining);
-    var topology = (indexed_topology.readOracleAlloc(limiter.allocator(), artifacts, source, configs, limits, cancellation, &remaining) catch |err| {
-        if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
-        return err;
-    }) orelse return null;
+    var topology = prepared: {
+        var context = indexed_topology.Context.initOracle(limiter.allocator(), artifacts, source, control.cancellation, &remaining) catch |err| {
+            if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
+            return err;
+        };
+        defer context.deinit();
+        break :prepared (indexed_topology.readPreparedControlledAlloc(limiter.allocator(), &context, configs, limits, control) catch |err| {
+            if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
+            return err;
+        }) orelse return null;
+    };
     errdefer topology.deinit(alloc);
     const id = limiter.allocator().dupe(u8, source.artifact_id) catch |err| {
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
@@ -472,10 +497,10 @@ fn prepareSelectedGraphArtifactOracleAlloc(alloc: Allocator, artifacts: *artifac
     return .{ .source_artifact_id = id, .source_checksum = checksum, .source_byte_len = source.byte_len, .topology = topology };
 }
 
-fn prepareContextGraphAlloc(alloc: Allocator, context: *indexed_topology.Context, source: artifact_ref.ArtifactRef, configs: []const graph_mod.GraphMetricConfig, cancellation: CancellationToken, limits: Limits) !?PreparedGraphArtifact {
+fn prepareContextGraphAlloc(alloc: Allocator, context: *indexed_topology.Context, source: artifact_ref.ArtifactRef, configs: []const graph_mod.GraphMetricConfig, control: preparation.Control, limits: Limits) !?PreparedGraphArtifact {
     if (context.retainedBytes() >= limits.max_peak_memory_bytes) return error.GraphMetricBuildBudgetExceeded;
     var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_peak_memory_bytes - context.retainedBytes());
-    var topology = (indexed_topology.readPreparedAlloc(limiter.allocator(), context, configs, limits, cancellation) catch |err| {
+    var topology = (indexed_topology.readPreparedControlledAlloc(limiter.allocator(), context, configs, limits, control) catch |err| {
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
         return err;
     }) orelse return null;
@@ -663,6 +688,9 @@ fn publishPreparedComputationsAlloc(
     provenance: Provenance,
     runtime: ComputeRuntime,
 ) ![]artifact_ref.ArtifactRef {
+    var serial = preparationFor(cancellation, runtime.execution);
+    const cpu_cancellation = serial.token();
+    try serial.check();
     if (configs.len == 0) return try alloc.alloc(artifact_ref.ArtifactRef, 0);
     if (prior_artifacts.len != 0 and prior_artifacts.len != configs.len) return error.InvalidGraphMetricBuildOptions;
     try provenance.validate();
@@ -694,7 +722,7 @@ fn publishPreparedComputationsAlloc(
             // when it would crowd out already retained work.
             var hashing_topology = prepared.topology;
             if (prepared.cached_projection) |projection| hashing_topology.retained_bytes = try projectionResidentMemoryBytes(projection);
-            const type_checksums = typeChecksumsAlloc(alloc, hashing_topology, limits, cancellation) catch |err| switch (err) {
+            const type_checksums = typeChecksumsAlloc(alloc, hashing_topology, limits, cpu_cancellation) catch |err| switch (err) {
                 error.GraphMetricBuildBudgetExceeded => null,
                 else => return err,
             };
@@ -730,14 +758,14 @@ fn publishPreparedComputationsAlloc(
         const first = for (processed, 0..) |done, i| {
             if (!done) break i;
         } else break;
-        try cancellation.check();
+        try serial.check();
         var config = configs[first];
         const share = projectionGroupFits(prepared.topology, configs, processed, config.edge_filter, limits, batch_budget.*);
         if (!share) {
             var cheapest: u64 = std.math.maxInt(u64);
             for (configs, processed) |candidate, done| {
                 if (done or !candidate.edge_filter.equivalent(config.edge_filter)) continue;
-                const selected_edges = try selectedEdgeCount(prepared.topology, candidate.edge_filter, cancellation);
+                const selected_edges = try selectedEdgeCount(prepared.topology, candidate.edge_filter, cpu_cancellation);
                 const selected_nodes = @min(prepared.topology.source_node_count, selected_edges * 2);
                 const cost = graph_metric_policy.metricWorkItems(candidate.kind, selected_nodes, selected_edges, candidate.max_iterations) catch std.math.maxInt(u64);
                 if (cost < cheapest) {
@@ -761,6 +789,7 @@ fn publishPreparedComputationsAlloc(
             .provenance = provenance,
             .io = runtime.io,
             .max_parallelism = runtime.max_parallelism,
+            .execution = runtime.execution,
             .topology_requirements = group_requirements,
             .topology_checksum = topology_checksums[first],
         };
@@ -780,7 +809,7 @@ fn publishPreparedComputationsAlloc(
 
         for (configs, 0..) |candidate, candidate_index| {
             if (processed[candidate_index] or !inProjectionGroup(candidate, config, share)) continue;
-            try cancellation.check();
+            try serial.check();
             const reused = for (configs, initialized, 0..) |prior, ready, prior_index| {
                 if (ready and sameComputation(prior, candidate)) break prior_index;
             } else null;
@@ -1251,7 +1280,7 @@ pub fn publishRequestsWithPriorOracleAlloc(
                 source_remaining = limits.max_total_graph_payload_bytes -| budget.graph_payload_bytes;
                 const before = source_remaining;
                 defer budget.graph_payload_bytes += @intCast(before - source_remaining);
-                if (prepareContextGraphAlloc(alloc, context, first.source_graph, configs.items, cancellation, limits) catch |err| switch (err) {
+                if (prepareContextGraphAlloc(alloc, context, first.source_graph, configs.items, preparationFor(cancellation, runtime.execution), limits) catch |err| switch (err) {
                     error.GraphMetricBuildBudgetExceeded => break :prepare null,
                     else => return err,
                 }) |selected| break :prepare selected;
@@ -1908,7 +1937,10 @@ fn buildAdmittedProjectionFromTopologyAlloc(
 }
 
 fn buildProjectionWithEdgeCopyAlloc(alloc: Allocator, topology: CompiledTopology, decoded_retained_bytes: usize, options: BuildOptions, comptime copy_edges: bool) !Projection {
-    try options.cancellation.check();
+    var control = preparationControl(options);
+    const cancellation = control.token();
+    try control.check();
+    try cancellation.check();
     if (topology.edge_type_offsets.len != topology.edge_types.len + 1 or
         @as(usize, topology.edge_type_offsets[topology.edge_types.len]) != topology.edges.len)
     {
@@ -1955,7 +1987,7 @@ fn buildProjectionWithEdgeCopyAlloc(alloc: Allocator, topology: CompiledTopology
         if (projected_edge_count > options.limits.max_edges) return error.GraphMetricBuildBudgetExceeded;
         for (topology.edges[range_start..range_end]) |edge| {
             inspected_edges += 1;
-            if (inspected_edges % 4096 == 0) try options.cancellation.check();
+            if (inspected_edges % 4096 == 0) try cancellation.check();
             active_nodes.set(edge.source);
             active_nodes.set(edge.target);
         }
@@ -2013,14 +2045,14 @@ fn buildProjectionWithEdgeCopyAlloc(alloc: Allocator, topology: CompiledTopology
         defer alloc.free(copied);
         var iterator = source;
         for (copied) |*edge| edge.* = iterator.next() orelse return error.InvalidGraphMetricBuildOptions;
-        break :blk try metrics.Topology.initAllocFor(alloc, projected_node_count, copied, requirements, options.cancellation);
-    } else try metrics.Topology.initFromSourceAlloc(
+        break :blk try metrics.Topology.initAllocControlled(alloc, projected_node_count, copied, requirements, control);
+    } else try metrics.Topology.initFromSourceControlled(
         alloc,
         projection.node_ids.items.len,
         projected_edge_count,
         source,
         requirements,
-        options.cancellation,
+        control,
     );
     return projection;
 }
@@ -2084,7 +2116,9 @@ fn useSparseProjection(nodes: usize, edges: usize) bool {
 }
 
 fn compiledProjectionCensusWork(topology: CompiledTopology, options: BuildOptions) !u64 {
-    const edges = try selectedEdgeCount(topology, options.config.edge_filter, options.cancellation);
+    var control = preparationControl(options);
+    const cancellation = control.token();
+    const edges = try selectedEdgeCount(topology, options.config.edge_filter, cancellation);
     return projectionCensusWork(topology, options.config.edge_filter, edges);
 }
 
@@ -2100,6 +2134,9 @@ fn projectionCensusWork(topology: CompiledTopology, filter: graph_mod.GraphMetri
 }
 
 fn buildSparseProjectionAlloc(alloc: Allocator, topology: CompiledTopology, options: BuildOptions, edge_count: usize, requirements: metrics.TopologyRequirements) !Projection {
+    var control = preparationControl(options);
+    const cancellation = control.token();
+    try control.check();
     var projection = Projection{
         .source_node_count = topology.source_node_count,
         .source_edge_count = topology.source_edge_count,
@@ -2117,34 +2154,36 @@ fn buildSparseProjectionAlloc(alloc: Allocator, topology: CompiledTopology, opti
         allowed[i] = filter.allows(edge_type);
         if (!allowed[i]) continue;
         for (topology.edges[topology.edge_type_offsets[i]..topology.edge_type_offsets[i + 1]]) |edge| {
-            if (count % 4096 == 0) try options.cancellation.check();
+            if (count % 4096 == 0) try cancellation.check();
             if (edge.source >= topology.node_ids.len or edge.target >= topology.node_ids.len) return error.InvalidGraphMetricBuildOptions;
             endpoints[count] = edge.source;
             endpoints[count + 1] = edge.target;
             count += 2;
         }
     }
-    std.mem.sort(u32, endpoints, {}, std.sort.asc(u32));
-    try options.cancellation.check();
+    try preparation.sort(u32, endpoints, {}, std.sort.asc(u32), cancellation);
+    try cancellation.check();
     var active_count: usize = 0;
-    for (endpoints) |ordinal| {
+    for (endpoints, 0..) |ordinal, i| {
+        if (i % 4096 == 0) try cancellation.check();
         if (active_count != 0 and endpoints[active_count - 1] == ordinal) continue;
         endpoints[active_count] = ordinal;
         active_count += 1;
     }
     try chargeProjectionConstruction(options, topology, active_count, edge_count);
     try projection.node_ids.ensureTotalCapacityPrecise(alloc, active_count);
-    for (endpoints[0..active_count]) |ordinal| {
+    for (endpoints[0..active_count], 0..) |ordinal, i| {
+        if (i % 4096 == 0) try cancellation.check();
         const id = topology.node_ids[ordinal];
         projection.node_ids.appendAssumeCapacity(id);
         projection.node_id_bytes += id.len;
     }
-    projection.topology = try metrics.Topology.initFromSourceAlloc(alloc, active_count, edge_count, ProjectedEdges{
+    projection.topology = try metrics.Topology.initFromSourceControlled(alloc, active_count, edge_count, ProjectedEdges{
         .topology = topology,
         .allowed = allowed,
         .ordinals = endpoints[0..active_count],
         .sparse = true,
-    }, requirements, options.cancellation);
+    }, requirements, control);
     return projection;
 }
 
@@ -2268,6 +2307,9 @@ fn buildDegreeProjectionFromTopologyAlloc(
     decoded_retained_bytes: usize,
     options: BuildOptions,
 ) !Projection {
+    var control = preparationControl(options);
+    const cancellation = control.token();
+    try control.check();
     var projection = Projection{
         .source_node_count = topology.source_node_count,
         .source_edge_count = topology.source_edge_count,
@@ -2300,7 +2342,7 @@ fn buildDegreeProjectionFromTopologyAlloc(
             projected_edge_count = std.math.add(usize, projected_edge_count, 1) catch
                 return error.GraphMetricBuildBudgetExceeded;
             if (projected_edge_count > options.limits.max_edges) return error.GraphMetricBuildBudgetExceeded;
-            if (projected_edge_count % 4096 == 0) try options.cancellation.check();
+            if (projected_edge_count % 4096 == 0) try cancellation.check();
             incoming_counts[edge.target] = std.math.add(u32, incoming_counts[edge.target], 1) catch
                 return error.GraphMetricBuildBudgetExceeded;
             outgoing_counts[edge.source] = std.math.add(u32, outgoing_counts[edge.source], 1) catch
@@ -2396,7 +2438,10 @@ fn preparedProjectionAlloc(
 }
 
 fn buildProjectionAlloc(alloc: Allocator, graph: graph_segment.Segment, options: BuildOptions) !Projection {
-    try options.cancellation.check();
+    var control = preparationControl(options);
+    const cancellation = control.token();
+    try control.check();
+    try cancellation.check();
     const requirements = options.topology_requirements orelse topologyRequirementsForKind(options.config.kind);
     if (!requirements.satisfies(topologyRequirementsForKind(options.config.kind)))
         return error.InvalidGraphMetricBuildOptions;
@@ -2410,12 +2455,12 @@ fn buildProjectionAlloc(alloc: Allocator, graph: graph_segment.Segment, options:
     defer projected_edges.deinit(alloc);
 
     for (graph.adjacencies, 0..) |adjacency, adjacency_index| {
-        if (adjacency_index % 256 == 0) try options.cancellation.check();
+        if (adjacency_index % 256 == 0) try cancellation.check();
         for (adjacency.out_edges) |edge| {
             projection.source_edge_count = std.math.add(usize, projection.source_edge_count, 1) catch
                 return error.GraphMetricBuildBudgetExceeded;
             if (projection.source_edge_count > options.limits.max_edges) return error.GraphMetricBuildBudgetExceeded;
-            if (projection.source_edge_count % 4096 == 0) try options.cancellation.check();
+            if (projection.source_edge_count % 4096 == 0) try cancellation.check();
             if (edge.neighbor_table_id != null) continue;
             if (!filter.allows(edge.edge_type)) continue;
             const source = try getOrPutNode(alloc, &projection.ordinals, &projection.node_ids, adjacency.node_id, options.limits.max_nodes);
@@ -2429,12 +2474,12 @@ fn buildProjectionAlloc(alloc: Allocator, graph: graph_segment.Segment, options:
         projection.node_id_bytes = std.math.add(usize, projection.node_id_bytes, node_id.len) catch
             return error.GraphMetricBuildBudgetExceeded;
     }
-    projection.topology = try metrics.Topology.initAllocFor(
+    projection.topology = try metrics.Topology.initAllocControlled(
         alloc,
         projection.node_ids.items.len,
         projected_edges.items,
         requirements,
-        options.cancellation,
+        control,
     );
     return projection;
 }
@@ -2598,9 +2643,56 @@ fn buildFromProjectionAlloc(alloc: Allocator, projection: Projection, options: B
     return buildAdmittedProjectionAlloc(alloc, projection, options);
 }
 
+const KernelExecution = struct {
+    const Token = @import("../maintenance_cancellation.zig").Token;
+    options: BuildOptions,
+    phase: ?Token.CpuPhase = null,
+
+    fn control(self: *KernelExecution) ?metrics.ParticipantControl {
+        if (self.options.execution == null) return null;
+        return .{ .ptr = self, .begin = begin, .end = end, .abandon = abandon, .checkpoint = checkpoint };
+    }
+
+    fn token(self: *KernelExecution) !Token {
+        return .{
+            .io = self.options.io orelse return error.MissingBackendRuntimeIo,
+            .cooperative = self.options.cancellation,
+            .execution = self.options.execution,
+        };
+    }
+
+    fn begin(raw: *anyopaque, width: usize) !void {
+        const self: *KernelExecution = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.phase == null);
+        self.phase = try (try self.token()).beginCpuPhase(width);
+    }
+
+    fn end(raw: *anyopaque) !void {
+        const self: *KernelExecution = @ptrCast(@alignCast(raw));
+        if (self.phase) |*phase| try phase.finish();
+        self.phase = null;
+    }
+
+    fn abandon(raw: *anyopaque) void {
+        const self: *KernelExecution = @ptrCast(@alignCast(raw));
+        if (self.phase) |*phase| phase.deinit();
+        self.phase = null;
+    }
+
+    fn checkpoint(raw: *anyopaque) !void {
+        const self: *KernelExecution = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.phase == null);
+        try (try self.token()).ownerCheckpoint();
+    }
+};
+
 fn buildAdmittedProjectionAlloc(alloc: Allocator, projection: Projection, options: BuildOptions) !BuildResult {
-    const kernel_options = kernelOptions(options);
+    var execution: KernelExecution = .{ .options = options };
+    defer KernelExecution.abandon(&execution);
+    var kernel_options = kernelOptions(options);
+    kernel_options.participants = execution.control();
     const topology = projection.topology orelse return error.InvalidGraphMetricBuildOptions;
+    if (options.execution != null) try KernelExecution.checkpoint(&execution);
     var result = switch (options.config.kind) {
         .degree => try metrics.degreeTopologyAlloc(alloc, topology, kernel_options),
         .pagerank => try metrics.pageRankTopologyAlloc(alloc, topology, kernel_options),
@@ -2614,6 +2706,7 @@ fn buildAdmittedProjectionAlloc(alloc: Allocator, projection: Projection, option
         },
     };
     defer result.deinit(alloc);
+    if (options.execution != null) try KernelExecution.checkpoint(&execution);
     return try encodeMetricResultAlloc(alloc, projection.node_ids.items, options, result);
 }
 
@@ -2622,10 +2715,13 @@ fn buildFromTopologyAlloc(
     topology: CompiledTopology,
     options: BuildOptions,
 ) !BuildResult {
+    var control = preparationControl(options);
+    const cancellation = control.token();
+    try control.check();
     var identified = options;
     if (topology.type_checksums.len == topology.edge_types.len) {
         identified.topology_checksum = selectedTopologyChecksum(topology, topology.type_checksums, options.config.edge_filter);
-    } else if (typeChecksumsAlloc(alloc, topology, options.limits, options.cancellation)) |checksums| {
+    } else if (typeChecksumsAlloc(alloc, topology, options.limits, cancellation)) |checksums| {
         defer alloc.free(checksums);
         identified.topology_checksum = selectedTopologyChecksum(topology, checksums, options.config.edge_filter);
     } else |err| if (err != error.GraphMetricBuildBudgetExceeded) return err;
@@ -2652,8 +2748,14 @@ fn publishHitsPairFromProjectionAlloc(
     try chargeKernelWork(first_options, projection);
 
     const topology = projection.topology orelse return error.InvalidGraphMetricBuildOptions;
-    var pair = try metrics.hitsTopologyAlloc(alloc, topology, kernelOptions(first_options));
+    var execution: KernelExecution = .{ .options = first_options };
+    defer KernelExecution.abandon(&execution);
+    var kernel_options = kernelOptions(first_options);
+    kernel_options.participants = execution.control();
+    if (first_options.execution != null) try KernelExecution.checkpoint(&execution);
+    var pair = try metrics.hitsTopologyAlloc(alloc, topology, kernel_options);
     defer pair.deinit(alloc);
+    if (first_options.execution != null) try KernelExecution.checkpoint(&execution);
     const first_scores = if (first_options.config.kind == .hits_authority) pair.authorities else pair.hubs;
     const second_scores = if (second_config.kind == .hits_authority) pair.authorities else pair.hubs;
     const first_result = metrics.Result{ .scores = first_scores, .iterations_completed = pair.iterations_completed, .converged = pair.converged, .delta = pair.delta };
@@ -2701,26 +2803,32 @@ fn encodeMetricResultAlloc(
 }
 
 fn prepareMetricOutputPlan(alloc: Allocator, node_ids: []const []const u8, options: BuildOptions, result: metrics.Result) !metric_segment.codec.EncodingPlan {
-    const scores = try makeScoresAlloc(alloc, node_ids, result.scores, options.cancellation);
+    var control = preparationControl(options);
+    const cancellation = control.token();
+    try control.check();
+    const scores = try makeScoresAlloc(alloc, node_ids, result.scores, cancellation);
     var owned = true;
     errdefer if (owned) alloc.free(scores);
     var segment = try makeMetricSegmentAlloc(alloc, options, result, scores);
     owned = false;
     defer segment.deinit(alloc);
-    const plan = try metric_segment.codec.prepareEncoding(segment, options.cancellation);
+    const plan = try metric_segment.codec.prepareEncoding(segment, cancellation);
     if (plan.size > options.limits.max_metric_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
     return plan;
 }
 
 fn encodeMetricResultWithPlanAlloc(alloc: Allocator, node_ids: []const []const u8, options: BuildOptions, result: metrics.Result, prepared: ?*const metric_segment.codec.EncodingPlan, reserved: bool) !BuildResult {
-    const scores = try makeScoresAlloc(alloc, node_ids, result.scores, options.cancellation);
+    var control = preparationControl(options);
+    const cancellation = control.token();
+    try control.check();
+    const scores = try makeScoresAlloc(alloc, node_ids, result.scores, cancellation);
     var scores_owned = true;
     defer if (scores_owned) alloc.free(scores);
 
     var segment = try makeMetricSegmentAlloc(alloc, options, result, scores);
     scores_owned = false;
     defer segment.deinit(alloc);
-    const local_plan = if (prepared == null) try metric_segment.codec.prepareEncoding(segment, options.cancellation) else undefined;
+    const local_plan = if (prepared == null) try metric_segment.codec.prepareEncoding(segment, cancellation) else undefined;
     const plan = prepared orelse &local_plan;
     if (plan.size > options.limits.max_metric_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
     if (!reserved) if (options.batch_budget) |budget| try budget.chargePayload(plan.size);
@@ -2730,7 +2838,7 @@ fn encodeMetricResultWithPlanAlloc(alloc: Allocator, node_ids: []const []const u
     const payload = metric_segment.codec.encodePreparedAlloc(
         alloc,
         segment,
-        options.cancellation,
+        cancellation,
         plan,
         options.limits.max_metric_payload_bytes,
     ) catch |err| switch (err) {
@@ -3012,8 +3120,12 @@ fn makeScoresAlloc(alloc: Allocator, node_ids: []const []const u8, values: []con
     // the compiled projection preserves that order. Keep the fallback for the
     // legacy direct-projection test seam, but avoid an O(V log V) sort in the
     // production path.
-    if (!std.sort.isSorted(metric_segment.Score, scores, {}, lessScore)) {
-        std.mem.sort(metric_segment.Score, scores, {}, lessScore);
+    const sorted = for (scores, 0..) |score, i| {
+        if (i % 4096 == 0) try cancellation.check();
+        if (i != 0 and lessScore({}, score, scores[i - 1])) break false;
+    } else true;
+    if (!sorted) {
+        try preparation.sort(metric_segment.Score, scores, {}, lessScore, cancellation);
     }
     try cancellation.check();
     return scores;
@@ -4050,7 +4162,27 @@ test "serverless lake graph metrics share one bounded HITS execution for a compa
     };
     // 604 HITS kernel work items plus sixteen projection/filter work items.
     const limits = Limits{ .max_work_items = 620, .max_total_work_items = 620 };
-    const published = try publishManyFromGraphArtifactOracleAlloc(alloc, &artifacts, "graph", source, &configs, .none, limits, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Probe = struct {
+        scheduler: *Runnable.Scheduler,
+        saw_team: std.atomic.Value(bool) = .init(false),
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.scheduler.stats().runnable_slots == 2) self.saw_team.store(true, .release);
+        }
+    };
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .cleanup_slots = 1 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .background);
+    var probe: Probe = .{ .scheduler = &scheduler };
+    var requests: [2]PublicationRequest = undefined;
+    for (&requests, configs) |*request, config| request.* = .{ .graph_index_name = "graph", .source_graph = source, .config = config, .provenance = .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 } };
+    var budget: graph_metric_policy.Budget = .{ .limits = limits };
+    const published = try publishRequestsOracleAlloc(alloc, &artifacts, &requests, .{ .ptr = &probe, .check_fn = Probe.check }, limits, &budget, .{ .io = std.testing.io, .max_parallelism = 2, .execution = &execution });
+    try std.testing.expect(!probe.saw_team.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
         alloc.free(published);
@@ -4484,4 +4616,253 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "serverless execution graph kernels own their team and restore serial encoding on success and rejection" {
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Probe = struct {
+        scheduler: *Runnable.Scheduler,
+        reject_parallel: bool,
+        saw_team: std.atomic.Value(bool) = .init(false),
+        saw_serial_after: std.atomic.Value(bool) = .init(false),
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.scheduler.stats().runnable_slots == 2) {
+                self.saw_team.store(true, .release);
+                if (self.reject_parallel) return error.WorkLeaseLost;
+            } else if (self.saw_team.load(.acquire)) self.saw_serial_after.store(true, .release);
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var graph: graph_segment.Builder = .{ .alloc = alloc };
+    defer graph.deinit();
+    try graph.addEdge("a", "b", "cites", 1, null);
+    const payload = try graph.encodeAlloc(1 << 20, .none);
+    defer alloc.free(payload);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const checksum = std.fmt.bytesToHex(digest, .lower);
+    const id = try std.fmt.allocPrint(alloc, "{s}{s}", .{ artifact_store.sha256_artifact_id_prefix, checksum });
+    defer alloc.free(id);
+    const source: artifact_ref.ArtifactRef = .{ .kind = .graph_segment, .name = "graph", .artifact_id = id, .checksum = &checksum, .byte_len = payload.len };
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .cleanup_slots = 1 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = io }, .background);
+    // The ordinary payload entrypoint must leave a tiny graph serial even
+    // when the runtime allows two participants.
+    var serial_probe: Probe = .{ .scheduler = &scheduler, .reject_parallel = true };
+    var serial = try buildFromGraphPayloadAlloc(alloc, payload, .{
+        .graph_index_name = "graph",
+        .config = .{ .name = "pagerank" },
+        .source_graph = source,
+        .io = io,
+        .max_parallelism = 2,
+        .execution = &execution,
+        .cancellation = .{ .ptr = &serial_probe, .check_fn = Probe.check },
+    });
+    serial.deinit(alloc);
+    try std.testing.expect(!serial_probe.saw_team.load(.acquire));
+
+    // A high-degree projection crosses the real edge fanout threshold. Use
+    // the normal admitted-projection/encoding path without constructing a
+    // separate string for every repeated edge in the fixture.
+    const edges = try alloc.alloc(metrics.Edge, 128 * 1024);
+    defer alloc.free(edges);
+    const node_count = 32 * 1024;
+    for (edges, 0..) |*edge, i| edge.* = if (i < edges.len / 2)
+        .{ .source = 0, .target = 1 }
+    else
+        .{ .source = @intCast(i % node_count), .target = @intCast((i + 1) % node_count) };
+    const names = try alloc.alloc(u8, node_count * 8);
+    defer alloc.free(names);
+    var projection: Projection = .{ .source_node_count = node_count, .source_edge_count = edges.len };
+    defer projection.deinit(alloc);
+    try projection.node_ids.appendSlice(alloc, &.{ "a", "b" });
+    for (2..node_count) |i| {
+        const name = try std.fmt.bufPrint(names[i * 8 ..][0..8], "n{x}", .{i});
+        try projection.node_ids.append(alloc, name);
+        projection.node_id_bytes += name.len;
+    }
+    projection.topology = try metrics.Topology.initAlloc(alloc, node_count, edges, .none);
+    // Cross both vector and edge thresholds for every iterative kernel,
+    // exercising every participant group with the real native scheduler.
+    for ([_]@FieldType(graph_mod.GraphMetricConfig, "kind"){ .pagerank, .eigenvector, .hits_authority, .hits_hub }) |kind| {
+        for ([_]bool{ false, true, false }) |reject| {
+            var probe: Probe = .{ .scheduler = &scheduler, .reject_parallel = reject };
+            const options: BuildOptions = .{
+                .graph_index_name = "graph",
+                .config = .{ .name = "metric", .kind = kind, .max_iterations = 2 },
+                .source_graph = source,
+                .io = io,
+                .max_parallelism = 2,
+                .execution = &execution,
+                .cancellation = .{ .ptr = &probe, .check_fn = Probe.check },
+            };
+            if (reject) {
+                try std.testing.expectError(error.WorkLeaseLost, buildFromProjectionAlloc(alloc, projection, options));
+            } else {
+                var built = try buildFromProjectionAlloc(alloc, projection, options);
+                defer built.deinit(alloc);
+                var decoded = try metric_segment.decodeAlloc(alloc, built.payload);
+                defer decoded.deinit(alloc);
+                if (kind == .pagerank) try std.testing.expect(decoded.score("b").? > decoded.score("a").?);
+                var serial_options = options;
+                serial_options.execution = null;
+                serial_options.max_parallelism = 1;
+                serial_options.cancellation = .none;
+                var expected = try buildFromProjectionAlloc(alloc, projection, serial_options);
+                defer expected.deinit(alloc);
+                try std.testing.expectEqualSlices(u8, expected.payload, built.payload);
+                try std.testing.expect(probe.saw_serial_after.load(.acquire));
+            }
+            try std.testing.expect(probe.saw_team.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        }
+    }
+    // Preserve the explicitly disabled scheduler configuration, including
+    // parallel work on an empty execution capsule.
+    var disabled: Runnable.Execution = .{};
+    var unadmitted = try buildFromProjectionAlloc(alloc, projection, .{
+        .graph_index_name = "graph",
+        .config = .{ .name = "pagerank", .max_iterations = 2 },
+        .source_graph = source,
+        .io = io,
+        .max_parallelism = 2,
+        .execution = &disabled,
+    });
+    unadmitted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+
+    // Exercise the production ingress ABI -> native adapter as well. The
+    // maintenance borrower consumes the existing two-lane team and cannot
+    // resize it or create a second root.
+    try execution.resizeTeam(2);
+    var read: @import("../../api/runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = alloc };
+    const team = try read.team();
+    var bridge = try @import("../../api/runnable_native_borrow.zig").Bridge.init(&team.borrow, alloc);
+    var borrowed: Runnable.Execution = .{};
+    try bridge.bind(&borrowed);
+    defer borrowed.finish();
+    const maintenance = @import("../maintenance_cancellation.zig").Token{ .io = io, .execution = &borrowed };
+    try std.testing.expectError(error.InvalidRunnableDemand, maintenance.beginCpuPhase(0));
+    try std.testing.expectError(error.InvalidRunnableDemand, maintenance.beginCpuPhase(3));
+    var borrowed_result = try buildFromProjectionAlloc(alloc, projection, .{
+        .graph_index_name = "graph",
+        .config = .{ .name = "pagerank", .max_iterations = 2 },
+        .source_graph = source,
+        .io = io,
+        .max_parallelism = 2,
+        .execution = &borrowed,
+    });
+    borrowed_result.deinit(alloc);
+    borrowed.finish();
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try execution.resizeTeam(1);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "serverless execution graph preparation yields to queued query and preserves results on reuse" {
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Query = struct {
+        scheduler: *Runnable.Scheduler,
+        ready: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            while (!self.ready.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch return;
+            var query: Runnable.Execution = .{};
+            defer query.finish();
+            query.start(self.scheduler, .{ .io = std.testing.io }, .query) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    const Probe = struct {
+        query: *Query,
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls != 8) return;
+            self.query.ready.store(true, .release);
+            const until = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(2));
+            while (self.query.scheduler.stats().queued == 0) {
+                if (self.query.done.load(.acquire)) return error.QueryDidNotQueue;
+                if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= until.nanoseconds) return error.QueryDidNotQueue;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    const alloc = std.testing.allocator;
+    const node_count = 32768;
+    const edges = try alloc.alloc(CompiledEdge, node_count * 4);
+    defer alloc.free(edges);
+    for (edges, 0..) |*edge, i| edge.* = .{ .source = @intCast(i % node_count), .target = @intCast((i + 1) % node_count) };
+    const names = try alloc.alloc([8]u8, node_count);
+    defer alloc.free(names);
+    const ids = try alloc.alloc([]const u8, node_count);
+    defer alloc.free(ids);
+    for (ids, 0..) |*id, i| id.* = try std.fmt.bufPrint(&names[i], "n{x:0>7}", .{i});
+    const topology: CompiledTopology = .{ .node_ids = ids, .edge_types = &.{"link"}, .string_bytes = &.{}, .edge_type_offsets = &.{ 0, @intCast(edges.len) }, .edges = edges, .source_node_count = node_count, .source_edge_count = edges.len, .retained_bytes = 0 };
+    // Exercise the public payload build, including decoding, projection,
+    // kernels and encoding, using the same connection-owned execution.
+    var graph: graph_segment.Builder = .{ .alloc = alloc };
+    defer graph.deinit();
+    for (edges) |edge| try graph.addEdge(ids[edge.source], ids[edge.target], "link", 1, null);
+    const payload = try graph.encodeAlloc(64 * 1024 * 1024, .none);
+    defer alloc.free(payload);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const checksum = std.fmt.bytesToHex(digest, .lower);
+    const artifact_id = try std.fmt.allocPrint(alloc, "sha256:{s}", .{checksum});
+    defer alloc.free(artifact_id);
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1, .max_wait_ms = 5000 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .background);
+    var query: Query = .{ .scheduler = &scheduler };
+    var future = try std.testing.io.concurrent(Query.run, .{&query});
+    defer future.cancel(std.testing.io);
+    var probe: Probe = .{ .query = &query };
+    var options: BuildOptions = .{ .graph_index_name = "graph", .config = .{ .name = "degree", .kind = .degree }, .source_graph = .{ .kind = .graph_segment, .artifact_id = artifact_id, .checksum = &checksum, .byte_len = payload.len }, .io = std.testing.io, .execution = &execution, .cancellation = .{ .ptr = &probe, .check_fn = Probe.check } };
+    var built = try buildFromGraphPayloadAlloc(alloc, payload, options);
+    defer built.deinit(alloc);
+    future.await(std.testing.io);
+    if (query.failure) |err| return err;
+    try std.testing.expect(query.done.load(.acquire));
+    try std.testing.expect(probe.calls > 8);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    const Refusal = struct {
+        calls: usize = 0,
+        failure: anyerror,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls >= 16) return self.failure;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.WorkLeaseLost }) |failure| {
+        var refusal: Refusal = .{ .failure = failure };
+        options.cancellation = .{ .ptr = &refusal, .check_fn = Refusal.check };
+        try std.testing.expectError(failure, buildFromTopologyAlloc(alloc, topology, options));
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    }
+    options.execution = null;
+    options.cancellation = .none;
+    var expected = try buildFromGraphPayloadAlloc(alloc, payload, options);
+    defer expected.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, expected.payload, built.payload);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
 }

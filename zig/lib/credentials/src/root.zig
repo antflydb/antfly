@@ -148,3 +148,6 @@ test "credential source identities preserve type locator and presence boundaries
 pub const aws = if (@import("builtin").os.tag == .freestanding) struct {} else @import("aws.zig");
 
 pub const cloud = @import("cloud.zig");
+
+/// Invocation-local filesystem execution control; never retained in credentials.
+pub const controlled_file = @import("controlled_file.zig");

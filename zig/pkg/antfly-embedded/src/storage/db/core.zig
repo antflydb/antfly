@@ -245,6 +245,14 @@ pub const PrimaryStoreOwner = union(enum) {
         };
     }
 
+    pub fn lsmMaintenanceScoreWithLifetime(self: *const PrimaryStoreOwner, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !u64 {
+        if (lifetime) |original| try original.checkpoint();
+        return switch (self.*) {
+            .none, .mem => 0,
+            .lsm => |owner| try owner.handle.backend.maintenanceScoreWithLifetime(lifetime),
+        };
+    }
+
     pub fn lsmMaintenanceScore(self: *const PrimaryStoreOwner) u64 {
         return switch (self.*) {
             .none, .mem => 0,
@@ -316,9 +324,14 @@ pub const PrimaryStoreOwner = union(enum) {
     }
 
     pub fn runLsmMaintenanceStep(self: *PrimaryStoreOwner) !bool {
+        return self.runLsmMaintenanceStepWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepWithLifetime(self: *PrimaryStoreOwner, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         return switch (self.*) {
             .none, .mem => false,
-            .lsm => |owner| try owner.handle.backend.runMaintenanceStep(),
+            .lsm => |owner| try owner.handle.backend.runMaintenanceStepWithLifetime(lifetime),
         };
     }
 
@@ -330,9 +343,14 @@ pub const PrimaryStoreOwner = union(enum) {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *PrimaryStoreOwner) !bool {
+        return self.runLsmMaintenanceStepBestEffortWithLifetime(null);
+    }
+
+    pub fn runLsmMaintenanceStepBestEffortWithLifetime(self: *PrimaryStoreOwner, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        if (lifetime) |original| try original.checkpoint();
         return switch (self.*) {
             .none, .mem => false,
-            .lsm => |owner| try owner.handle.backend.runMaintenanceStepBestEffort(),
+            .lsm => |owner| try owner.handle.backend.runMaintenanceStepBestEffortWithLifetime(lifetime),
         };
     }
 };
@@ -744,6 +762,10 @@ pub const DBCore = struct {
 
     pub fn reserveDerivedAppendSequence(self: *DBCore) u64 {
         return self.store.reserveNextReplaySequence(1);
+    }
+
+    pub fn claimDerivedAppendSequence(self: *DBCore, expected: u64) !void {
+        try self.store.claimReplaySequence(expected);
     }
 
     pub fn replaySource(self: *DBCore) replay_source_mod.Source {
@@ -2235,7 +2257,11 @@ pub const DBCore = struct {
         );
     }
 
-    pub fn beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+    pub fn beginTransactionWithParticipantsCreatedAtRoleAndRetention(self: *DBCore, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool) !transactions_mod.TxnId {
+        return self.beginTransactionWithParticipantsCreatedAtRoleAndRetentionWithAdmission(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, null);
+    }
+
+    pub fn beginTransactionWithParticipantsCreatedAtRoleAndRetentionWithAdmission(
         self: *DBCore,
         txn_id: transactions_mod.TxnId,
         timestamp_ns: u64,
@@ -2243,17 +2269,35 @@ pub const DBCore = struct {
         participants: []const []const u8,
         coordinator: bool,
         retain_terminal: bool,
+        control: ?@import("../../common/read_admission.zig").Port,
     ) !transactions_mod.TxnId {
+        if (control) |owner| try owner.checkpoint();
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionWithAdmission(
             txn_id,
             timestamp_ns,
             created_at_ns,
             participants,
             coordinator,
             retain_terminal,
+            control,
         );
+        return txn_id;
+    }
+
+    /// The serving/replicated BEGIN adapter must hold the same apply fence as
+    /// ordinary transaction creation. extra_batch carries its ordered receipt.
+    pub fn beginTransactionRequiringPreparedEffects(self: *DBCore, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: @import("prepared_transaction_effects.zig").Requirement, extra_batch: transactions_mod.MutationExtraBatch, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.TxnId {
+        return self.beginTransactionRequiringPreparedEffectsWithBinding(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, requirement, null, extra_batch, control);
+    }
+
+    pub fn beginTransactionRequiringPreparedEffectsWithBinding(self: *DBCore, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: @import("prepared_transaction_effects.zig").Requirement, binding: ?@import("prepared_transaction_effects.zig").Binding, extra_batch: transactions_mod.MutationExtraBatch, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.TxnId {
+        if (control) |owner| try owner.checkpoint();
+        try self.requirePreparedTransactionProtocol(control);
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.initTransactionRequiringPreparedEffectsWithBinding(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, requirement, binding, extra_batch, control);
         return txn_id;
     }
 
@@ -2297,6 +2341,18 @@ pub const DBCore = struct {
         predicates: []const transactions_mod.VersionPredicate,
         extra_batch: transactions_mod.MutationExtraBatch,
     ) !void {
+        return self.writeIntentsExtraBatchWithAdmission(txn_id, intents, predicates, extra_batch, null);
+    }
+
+    pub fn writeIntentsExtraBatchWithAdmission(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+        predicates: []const transactions_mod.VersionPredicate,
+        extra_batch: transactions_mod.MutationExtraBatch,
+        control: ?@import("../../common/read_admission.zig").Port,
+    ) !void {
+        if (control) |owner| try owner.checkpoint();
         var manager = try transactions_mod.TxnManager.init(extra_batch.preparation_allocator orelse self.alloc, self.store);
         defer manager.deinit();
         var bound = extra_batch;
@@ -2304,7 +2360,7 @@ pub const DBCore = struct {
             bound.max_intent_admission_bytes = self.table_catalog.transaction_admission_bytes;
         if (bound.schema_binding == null)
             bound.schema_binding = .{ .version = if (self.schema) |schema| schema.version else null };
-        try manager.writeIntentsExtraBatch(txn_id, intents, predicates, bound);
+        try manager.writeIntentsExtraBatchWithAdmission(txn_id, intents, predicates, bound, control);
     }
 
     pub fn checkVersionPredicates(
@@ -2352,10 +2408,193 @@ pub const DBCore = struct {
         return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
     }
 
+    /// Read durable eligibility under the caller's apply fence. Never infer
+    /// activation from native ABI compatibility or an accepted frame alone.
+    pub fn requirePreparedTransactionProtocol(self: *DBCore, original: ?@import("../../common/read_admission.zig").Port) !void {
+        const catalog = @import("catalog/resolver_catalog.zig");
+        var trace: transactions_mod.MutationAdmissionTrace = .{};
+        const control = trace.bind(original);
+        var read = if (control) |owner| try self.store.beginReadTxnWithAdmission(.retain, owner) else try self.store.beginReadTxn();
+        defer read.abort();
+        const Floors = struct {
+            txn: *docstore_mod.DocStore.Txn,
+            pub fn get(self_: *@This(), key: []const u8) ![]const u8 {
+                const raw = try self_.txn.get(key);
+                // Writer-owned decimal u32 sidecars need at most ten bytes.
+                // Reject oversized metadata before parseInt can scan padding.
+                if (raw.len > 10) return error.InvalidPreparedTransactionProtocol;
+                return raw;
+            }
+        };
+        var floors: Floors = .{ .txn = &read };
+        const minimum = catalog.readMinimumReaderVersion(&floors, catalog.supported_reader_version) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| return cause;
+        if (minimum < catalog.prepared_transaction_reader_version) return error.PreparedTransactionProtocolDisabled;
+        const baseline = catalog.readAuthoritativeReaderVersion(&floors, catalog.supported_reader_version) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| return cause;
+        if (baseline < catalog.prepared_transaction_reader_version) return error.InvalidPreparedTransactionProtocol;
+        // The catalog was fully validated on load or at durable publication.
+        // Its DocStore witness changes on every catalog commit attempt, so a
+        // raw or ambiguous mutation fails closed without fetching/parsing an
+        // unbounded resolver document on the required-BEGIN path.
+        if (!self.index_manager.hasPreparedCatalogAttestation(self.store)) return error.InvalidPreparedTransactionProtocol;
+        if (control) |owner| try owner.checkpoint();
+        if (trace.failure) |cause| return cause;
+    }
+
+    /// Caller holds apply ownership. Bind accepted output to the exact durable
+    /// catalog bytes and physical table/shard/range identity, across restart.
+    /// This validates a current catalog; durable generation retention remains
+    /// the prepare protocol's responsibility.
+    pub fn preparedEffectsCatalogDigest(self: *DBCore, original: ?@import("../../common/read_admission.zig").Port) ![32]u8 {
+        var trace: transactions_mod.MutationAdmissionTrace = .{};
+        const control = trace.bind(original);
+        var read = if (control) |owner| try self.store.beginReadTxnWithAdmission(.retain, owner) else try self.store.beginReadTxn();
+        defer read.abort();
+        const result = @import("prepared_transaction_effects.zig").catalogDigest(&read, self.identity_namespace, self.byteRange(), control) catch |cause| return trace.failure orelse cause;
+        if (trace.failure) |cause| return cause;
+        return result;
+    }
+
+    /// Capture the exact producer inputs and their durable catalog/physical
+    /// identity under the caller's apply fence. Keep the catalog generation and
+    /// route leases alive while producing; the seal rechecks the current digest.
+    /// This owner is not a funded prepare vote or a validated replay request.
+    pub fn capturePreparedTransactionInputs(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId, mode: @import("prepared_transaction_effects.zig").Mode, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.PreparedIntentSnapshot {
+        try self.requirePreparedTransactionProtocol(control);
+        const catalog = try self.preparedEffectsCatalogDigest(control);
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return manager.capturePreparedIntents(alloc, txn_id, catalog, mode, control);
+    }
+
+    /// Caller holds apply ownership and retained non-yielding controls. The
+    /// frame becomes the durable catalog lease in the same publication batch.
+    pub fn sealPreparedTransactionEffects(self: *DBCore, txn_id: transactions_mod.TxnId, frame: []const u8, mode: @import("prepared_transaction_effects.zig").Mode, control: ?@import("../../common/read_admission.zig").Port) !void {
+        const catalog = try self.preparedEffectsCatalogDigest(control);
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.sealPreparedEffects(txn_id, frame, catalog, mode, control);
+    }
+
+    /// Caller holds apply ownership and retained controls. Observation validation
+    /// is optimistic until semantic writer exclusion is installed; this API is
+    /// intentionally separate from the normal PREPARE/vote drivers.
+    pub fn sealPreparedTransactionEffectsWithReadObservations(self: *DBCore, txn_id: transactions_mod.TxnId, frame: []const u8, mode: @import("prepared_transaction_effects.zig").Mode, binding: @import("prepared_transaction_effects.zig").Binding, observations: *const @import("prepared_read_set.zig").Owned, replay_request: ?@import("derived/derived_types.zig").DerivedBatch, control: ?@import("../../common/read_admission.zig").Port) !void {
+        try self.requirePreparedTransactionProtocol(control);
+        const catalog = try self.preparedEffectsCatalogDigest(control);
+        try observations.validate(self.store, control);
+        const inspection = try @import("prepared_transaction_effects.zig").inspect(frame, control);
+        var namespace: [24]u8 = undefined;
+        @import("doc_identity.zig").encodeNamespace(&namespace, self.identity_namespace);
+        const raw = try @import("prepared_read_set.zig").Durable.encode(self.alloc, observations, .{ .contract = inspection.contract, .participant = binding, .namespace = namespace, .frame_digest = inspection.fingerprint }, control);
+        defer self.alloc.free(raw);
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.sealPreparedEffectsWithReadObservations(txn_id, frame, catalog, mode, binding, .{ .namespace = namespace, .frame = raw, .replay_request = replay_request }, .{}, control);
+    }
+
+    pub const PreparedReadFootprint = struct {
+        namespace: [24]u8,
+        receipt: @import("prepared_transaction_effects.zig").BoundReceipt,
+        predicates: @import("prepared_read_set.zig").Footprint,
+        pub fn deinit(self: *@This()) void {
+            self.predicates.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// Caller retains apply/catalog/route ownership and revalidates this receipt
+    /// at any later admission. This returns owned predicates, not a lease or vote.
+    /// Raw stopping rows can overlap control metadata; classify/refine those
+    /// dependencies before granting exclusion so mandatory progress can drain.
+    pub fn compilePreparedReadFootprint(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId, binding: @import("prepared_transaction_effects.zig").Binding, original: ?@import("../../common/read_admission.zig").Port) !PreparedReadFootprint {
+        var trace: transactions_mod.MutationAdmissionTrace = .{};
+        return self.compilePreparedReadFootprintInner(alloc, txn_id, binding, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+
+    fn compilePreparedReadFootprintInner(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId, binding: @import("prepared_transaction_effects.zig").Binding, control: ?@import("../../common/read_admission.zig").Port) !PreparedReadFootprint {
+        try self.requirePreparedTransactionProtocol(control);
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        var namespace: [24]u8 = undefined;
+        @import("doc_identity.zig").encodeNamespace(&namespace, self.identity_namespace);
+        const receipt = try manager.getBoundPreparedSealReceipt(txn_id, binding, control);
+        var observed = (try manager.loadPreparedReadObservations(alloc, txn_id, namespace, binding, control)) orelse return error.PreparedEffectsRequired;
+        defer observed.deinit();
+        return .{ .namespace = namespace, .receipt = receipt, .predicates = try @import("prepared_read_set.zig").Footprint.compile(alloc, &observed, self.store, control) };
+    }
+
+    /// Caller retains apply/catalog/route ownership. Acquire the physical gate
+    /// before accepting read assumptions; publish predicates in the same batch.
+    /// Requires persisted namespace identity and permanent reader-16 eligibility.
+    pub fn registerPreparedReadGuards(self: *DBCore, txn_id: transactions_mod.TxnId, binding: @import("prepared_transaction_effects.zig").Binding, original: ?@import("../../common/read_admission.zig").Port) !void {
+        var trace: transactions_mod.MutationAdmissionTrace = .{};
+        self.registerPreparedReadGuardsInner(txn_id, binding, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+    fn registerPreparedReadGuardsInner(self: *DBCore, txn_id: transactions_mod.TxnId, binding: @import("prepared_transaction_effects.zig").Binding, control: ?@import("../../common/read_admission.zig").Port) !void {
+        var batch = try self.store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.setReadGuardScope(.{ .txn_id = txn_id, .phase = .admission });
+        try batch.prepareReadGuardRegistration(control);
+        try @import("../prepared_read_guards.zig").requireFloors(batch.asTxn());
+        const effects = @import("prepared_transaction_effects.zig");
+        const frame = try batch.asTxn().get(&transactions_mod.makePreparedEffectsKey(txn_id));
+        const inspection = try effects.inspect(frame, control);
+        try transactions_mod.validatePreparedReadGuardInputs(self.alloc, self.store, inspection.contract, control);
+        var compiled = try self.compilePreparedReadFootprint(self.alloc, txn_id, binding, control);
+        defer compiled.deinit();
+        const catalog = try self.preparedEffectsCatalogDigest(control);
+        if (!std.meta.eql(catalog, compiled.receipt.catalog_digest)) return error.PreparedGenerationChanged;
+        const raw = try batch.asTxn().get(&transactions_mod.makePreparedReadObservationsKey(txn_id));
+        const hash = try @import("../prepared_read_guards.zig").observationsDigest(raw, control);
+        const record: @import("../prepared_read_guards.zig").Record = .{ .namespace = compiled.namespace, .receipt = compiled.receipt, .observations_digest = hash, .predicates = compiled.predicates };
+        try batch.installPreparedReadGuards(&record, control);
+        if (control) |port| try port.checkpoint();
+        try batch.commit();
+    }
+
+    pub fn resolveTransactionIntentsWithAcceptedEffects(self: *DBCore, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, extra_batch: transactions_mod.ResolutionExtraBatch, accepted: ?*const transactions_mod.PreparedEffects, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.ResolutionOutcome {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        if (accepted) |plan| {
+            if (status != .committed) return error.PreparedEffectsMismatch;
+            var trace: transactions_mod.MutationAdmissionTrace = .{};
+            const original = trace.bind(control);
+            const catalog = self.preparedEffectsCatalogDigest(original) catch |err| return trace.failure orelse err;
+            if (trace.failure) |cause| return cause;
+            if (!std.mem.eql(u8, &plan.decoded.plan.contract.catalog_digest, &catalog)) return error.PreparedGenerationChanged;
+            var budget: ?resource_manager_mod.BudgetedAllocator = if (self.index_manager.resource_manager) |resources|
+                resource_manager_mod.BudgetedAllocator.init(resources, .relational_preparation_working_set, self.alloc, 1)
+            else
+                null;
+            defer if (budget) |*owner| {
+                std.debug.assert(owner.live_bytes == 0);
+                owner.deinit();
+            };
+            if (budget) |*owner| manager.alloc = owner.allocator();
+            defer manager.alloc = self.alloc;
+            const outcome = manager.resolvePreparedIntents(txn_id, commit_version, plan, extra_batch, original) catch |err| {
+                if (trace.failure) |cause| return cause;
+                if (err == error.OutOfMemory) if (budget) |*owner| if (owner.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+            if (trace.failure) |cause| return cause;
+            return outcome;
+        }
+        return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
+    }
+
     pub fn collectTransactionIntentBatch(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) !transactions_mod.IntentBatch {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         return try manager.collectIntentBatch(alloc, txn_id);
+    }
+
+    pub fn collectTransactionIntentBatchWithAdmission(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.IntentBatch {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return manager.collectIntentBatchWithAdmission(alloc, txn_id, control);
     }
 
     pub fn transactionHasIntents(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
@@ -3066,7 +3305,11 @@ pub fn openCoreResourcesFromPrimaryStore(
     const store = try alloc.create(docstore_mod.DocStore);
     store.* = opened_primary.store;
     owned_store = store;
-    if (!read_only) try @import("../artifact_footprint.zig").initializeEmpty(store);
+    try @import("../prepared_read_guards.zig").validateOpen(alloc, store);
+    if (!read_only) {
+        try @import("../artifact_footprint.zig").initializeEmpty(store);
+        try @import("../artifact_replay_inventory.zig").initialize(store);
+    }
 
     const change_journal = try alloc.create(change_journal_mod.Journal);
     owned_change_journal = change_journal;
@@ -3256,7 +3499,7 @@ pub fn clearAllKeysFromStore(alloc: Allocator, store: *docstore_mod.DocStore) !v
     var deletes = std.ArrayListUnmanaged([]const u8).empty;
     defer deletes.deinit(alloc);
     for (keys) |item| {
-        if (@import("../artifact_footprint.zig").isKey(item.key)) continue;
+        if (@import("../artifact_footprint.zig").isKey(item.key) or std.mem.eql(u8, item.key, @import("../artifact_replay_inventory.zig").marker_key)) continue;
         try deletes.append(alloc, item.key);
     }
     try store.putBatch(&.{}, deletes.items);
@@ -3302,7 +3545,7 @@ pub fn importStoreSnapshotWithIo(
         defer alloc.free(writes);
         var count: usize = 0;
         for (decoded.entries[offset..end]) |entry| {
-            if (@import("../artifact_footprint.zig").isKey(entry.key)) continue;
+            if (@import("../artifact_footprint.zig").isKey(entry.key) or @import("../artifact_replay_inventory.zig").isMetadataKey(entry.key)) continue;
             writes[count] = .{
                 .key = entry.key,
                 .value = entry.value,
@@ -3579,7 +3822,7 @@ fn importStreamingStoreSnapshot(
         errdefer if (key_owned) alloc.free(key);
         if (try file.readPositionalAll(io, key, offset) != key.len) return error.InvalidTableFile;
         offset += key_len_u64;
-        if (@import("../artifact_footprint.zig").isKey(key)) {
+        if (@import("../artifact_footprint.zig").isKey(key) or @import("../artifact_replay_inventory.zig").isMetadataKey(key)) {
             // Never import source-local certification/cursors into a different
             // physical store. Actual imported family mutations update ours.
             alloc.free(key);

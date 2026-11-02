@@ -1469,12 +1469,75 @@ pub const Host = struct {
     }
 };
 
+// Every HTTP client in one host borrows this admission source. A runtime-backed
+// host delegates to its common origin; the explicit standalone fallback shares
+// one finite native executor and reserves the same complete task graph.
+const HttpOutboundAdmission = struct {
+    const Runtime = backend_runtime_mod.BackendRuntime;
+    const Executor = @import("../common/http/std_http_executor.zig");
+    const Limits = @import("antfly_runtime_fs").threaded_io_limits;
+    alloc: std.mem.Allocator,
+    runtime: ?*Runtime,
+    retention: ?Runtime.ExecutionServicesRetention = null,
+    native: ?*std.Io.Threaded = null,
+    active: std.atomic.Value(usize) = .init(0),
+    fn releaseRuntime(permit: *Executor.TaskAdmission.Permit) void {
+        const lease: *Runtime.RaftOutboundLaneLease = @ptrCast(@alignCast(&permit.storage));
+        lease.release();
+    }
+    fn acquire(raw: *anyopaque) !Executor.TaskAdmission.Permit {
+        const self: *HttpOutboundAdmission = @ptrCast(@alignCast(raw));
+        if (self.runtime) |runtime| {
+            comptime {
+                if (@sizeOf(Runtime.RaftOutboundLaneLease) > 512 or @alignOf(Runtime.RaftOutboundLaneLease) > 16)
+                    @compileError("Raft attempt permit exceeds inline admission storage");
+            }
+            var permit: Executor.TaskAdmission.Permit = .{ .release_fn = releaseRuntime };
+            const lease: *Runtime.RaftOutboundLaneLease = @ptrCast(@alignCast(&permit.storage));
+            lease.* = try runtime.acquireRaftOutboundLane();
+            return permit;
+        }
+        const impl = self.native.?;
+        const graph = Limits.raft_outbound_workers_per_request;
+        const ceiling = @backingInt(impl.concurrent_limit);
+        const capacity = ceiling / graph;
+        var active = self.active.load(.acquire);
+        while (true) {
+            if (active >= capacity) return error.RaftOutboundCapacityUnavailable;
+            if (self.active.cmpxchgWeak(active, active + 1, .acq_rel, .acquire)) |actual| active = actual else break;
+        }
+        errdefer _ = self.active.fetchSub(1, .acq_rel);
+        const sync_io = std.Io.Threaded.global_single_threaded.io();
+        impl.mutex.lockUncancelable(sync_io);
+        const remaining = ceiling -| impl.busy_count;
+        const reserved = self.active.load(.acquire) * graph;
+        impl.mutex.unlock(sync_io);
+        if (reserved > remaining) return error.RaftOutboundCapacityUnavailable;
+        return .{ .context = self, .release_fn = releaseNative };
+    }
+    fn releaseNative(permit: *Executor.TaskAdmission.Permit) void {
+        const self: *HttpOutboundAdmission = @ptrCast(@alignCast(permit.context.?));
+        std.debug.assert(self.active.fetchSub(1, .acq_rel) > 0);
+    }
+    fn destroy(self: *HttpOutboundAdmission) void {
+        std.debug.assert(self.active.load(.acquire) == 0);
+        const alloc = self.alloc;
+        var retention = self.retention;
+        alloc.destroy(self);
+        if (retention) |*guard| guard.release();
+    }
+    fn capability(self: *HttpOutboundAdmission) Executor.TaskAdmission {
+        return .{ .context = self, .acquire = acquire };
+    }
+};
+
 pub const HttpHost = struct {
     worker_leases: [5]?backend_runtime_mod.BackendRuntime.WorkerLease = @splat(null),
     alloc: std.mem.Allocator,
     cfg: HttpHostConfig,
     deps: HttpHostDeps,
     executor: ?*transport.StdHttpExecutor,
+    outbound_admission: ?*HttpOutboundAdmission = null,
     request_executor: transport.RequestExecutor,
     transport_stack: *transport.HttpTransportStack,
     owned_snapshot_resolver: ?*PeerSnapshotTargetResolver,
@@ -1491,18 +1554,25 @@ pub const HttpHost = struct {
         };
         var listener_config = cfg.listener;
 
+        var outbound_admission: ?*HttpOutboundAdmission = null;
+        errdefer if (outbound_admission) |admission| admission.destroy();
         var executor: ?*transport.StdHttpExecutor = null;
         const request_executor = if (deps.request_executor) |override| override else blk: {
             const owned = try alloc.create(transport.StdHttpExecutor);
             errdefer alloc.destroy(owned);
+            const admission = try alloc.create(HttpOutboundAdmission);
+            admission.* = .{ .alloc = alloc, .runtime = deps.backend_runtime };
+            outbound_admission = admission;
+            if (deps.backend_runtime) |runtime| admission.retention = try runtime.retainExecutionServices();
+            var executor_config = cfg.executor;
+            executor_config.task_admission = admission.capability();
             if (deps.backend_runtime) |backend_runtime| {
-                if (backend_runtime.raftOutboundIoImpl()) |io_impl| {
-                    owned.initSharedInPlace(alloc, cfg.executor, io_impl);
-                } else {
-                    owned.initInPlace(alloc, cfg.executor);
-                }
+                const network_io = backend_runtime.raftOutboundIo() orelse return error.BackendRuntimeUnavailable;
+                owned.initBorrowedInPlace(alloc, executor_config, network_io);
             } else {
-                owned.initInPlace(alloc, cfg.executor);
+                executor_config.io_concurrent_limit = @min(executor_config.io_concurrent_limit, HttpOutboundAdmission.Limits.backend_runtime_raft_outbound);
+                try owned.initInPlaceFallible(alloc, executor_config);
+                admission.native = owned.io_impl.?;
             }
             errdefer owned.deinit();
             executor = owned;
@@ -1529,7 +1599,12 @@ pub const HttpHost = struct {
             resolver.resolver()
         else
             null;
-        const transport_io = if (deps.backend_runtime) |runtime| runtime.raftOutboundIo() else null;
+        const transport_io = if (deps.backend_runtime) |runtime| blk: {
+            const io = runtime.raftOutboundIo();
+            if (io == null and !runtime.usesBorrowedIo() and runtime.backend != .manual)
+                return error.BackendRuntimeUnavailable;
+            break :blk io;
+        } else null;
         var transport_config = cfg.transport;
         if (deps.backend_runtime) |runtime| {
             if (transport_config.driver.async_send_worker_count > 0) {
@@ -1571,11 +1646,11 @@ pub const HttpHost = struct {
         );
         if (transport_config.snapshot.chunk_size < snapshot_transfer.min_chunk_bytes)
             return error.InvalidSnapshotTransferLimits;
-        // The std Threaded timeout path uses process signals for cancellation.
-        // Keep each asynchronous peer lane on an independent I/O pool so one
-        // canceled request cannot interrupt another lane's connect syscall.
+        // Keep connection/cache ownership per sender while the cancellation-safe
+        // connector and all nested tasks use the common bounded network owner.
         transport_config.driver.isolated_worker_executors = executor != null;
-        transport_config.driver.isolated_worker_executor_config = cfg.executor;
+        transport_config.driver.isolated_worker_network_io = if (executor) |owned| owned.networkIo() else null;
+        transport_config.driver.isolated_worker_executor_config = if (executor) |owned| owned.cfg else cfg.executor;
         transport_stack.* = try transport.HttpTransportStack.init(
             alloc,
             transport_config,
@@ -1635,8 +1710,10 @@ pub const HttpHost = struct {
             owned.* = if (deps.backend_runtime) |backend_runtime|
                 if (backend_runtime.raftInboundIoImpl()) |io_impl|
                     transport.StdHttpListener.initShared(alloc, listener_config, server.executor(), io_impl)
-                else
+                else if (backend_runtime.usesBorrowedIo() or backend_runtime.backend == .manual)
                     transport.StdHttpListener.init(alloc, listener_config, server.executor())
+                else
+                    return error.BackendRuntimeUnavailable
             else
                 transport.StdHttpListener.init(alloc, listener_config, server.executor());
             break :blk owned;
@@ -1647,6 +1724,7 @@ pub const HttpHost = struct {
             .cfg = cfg,
             .deps = deps,
             .executor = executor,
+            .outbound_admission = outbound_admission,
             .request_executor = request_executor,
             .worker_leases = worker_leases,
             .transport_stack = transport_stack,
@@ -1679,6 +1757,7 @@ pub const HttpHost = struct {
             executor.deinit();
             self.alloc.destroy(executor);
         }
+        if (self.outbound_admission) |admission| admission.destroy();
         for (&self.worker_leases) |*slot| {
             if (slot.*) |*lease| lease.release();
         }
@@ -3252,4 +3331,74 @@ test "http host reserves service workers through its runtime and rolls back over
     host.deinit();
     live = false;
     try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+}
+
+test "http host refuses native Raft lane failure without an independent executor fallback" {
+    const resources = @import("antfly_local_sources").storage_resource_manager;
+    const Stub = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: transport.HttpRequest) !transport.HttpResponse {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var token: u8 = 0;
+    const override: transport.RequestExecutor = .{ .ptr = &token, .vtable = &.{ .execute = Stub.execute } };
+    inline for (.{ .inbound, .outbound }) |direction| {
+        for ([_]bool{ false, true }) |custom_executor| {
+            var root = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1536 << 20 } });
+            defer root.deinit(std.testing.allocator);
+            var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{ .memory_parent = root.memoryParentPort() });
+            defer runtime.deinit();
+            const allocator = runtime.ptr().runtime_memory.?.raftAllocator(direction);
+            const occupied = try allocator.alloc(u8, 1 << 20);
+            defer allocator.free(occupied);
+            try std.testing.expectError(error.BackendRuntimeUnavailable, HttpHost.init(std.testing.allocator, .{
+                .host = .{ .local_node_id = 1 },
+                .transport = .{ .driver = .{ .async_send_worker_count = 0 }, .snapshot = .{ .root_dir = "/tmp", .async_send_worker_count = 1 } },
+            }, .{ .backend_runtime = runtime.ptr(), .request_executor = if (custom_executor) override else null }));
+            try std.testing.expect(runtime.ptr().runtime_memory.?.raftStats(direction).heap.rejected > 0);
+            try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+            try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().worker_active_leases);
+        }
+    }
+}
+
+test "http host shares Raft network owner and whole graph admission across sender clients" {
+    const Unused = struct {
+        fn put(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            return error.UnexpectedSnapshot;
+        }
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedSnapshot;
+        }
+    };
+    const a = std.testing.allocator;
+    var origin = try backend_runtime_mod.BackendRuntimeHandle.init(a, .{ .lane_limits = .{ .raft_outbound = 12 } });
+    defer origin.deinit();
+    const offer = @import("antfly_local_sources").storage_execution_services.Offer.init(origin.ptr());
+    var proxy = try backend_runtime_mod.BackendRuntimeHandle.init(a, .{ .execution_services = &offer });
+    defer proxy.deinit();
+    var unused: u8 = 0;
+    var host_ = try HttpHost.init(a, .{ .host = .{ .local_node_id = 1 }, .transport = .{ .driver = .{ .async_send_worker_count = 2 }, .snapshot = .{ .root_dir = "/tmp", .async_send_worker_count = 1 } } }, .{ .backend_runtime = proxy.ptr(), .listener_disabled = true, .snapshot_store = .{ .ptr = &unused, .vtable = &.{ .put_snapshot = Unused.put, .get_snapshot = Unused.get } } });
+    defer host_.deinit();
+    const executor = host_.executor.?;
+    try std.testing.expect(executor.io_impl == null);
+    try std.testing.expect(proxy.ptr().raft_outbound_io_impl.load(.acquire) == null);
+    try std.testing.expect(origin.ptr().raft_outbound_io_impl.load(.acquire) != null);
+    for (host_.transport_stack.driver.isolated_executors) |*sender| {
+        try std.testing.expect(sender.io_impl == null);
+        try std.testing.expectEqual(executor.networkIo().userdata, sender.networkIo().userdata);
+        try std.testing.expectEqual(executor.cfg.task_admission.?.context, sender.cfg.task_admission.?.context);
+    }
+    // Attempt permits are inline: foreground header allocation cannot become
+    // a new failure dependency after the protected runtime grant succeeds.
+    const metadata_allocator = host_.outbound_admission.?.alloc;
+    var denied = std.heap.FixedBufferAllocator.init(&.{});
+    host_.outbound_admission.?.alloc = denied.allocator();
+    defer host_.outbound_admission.?.alloc = metadata_allocator;
+    var first = try host_.outbound_admission.?.capability().acquire(host_.outbound_admission.?);
+    defer first.release();
+    var second = try host_.outbound_admission.?.capability().acquire(host_.outbound_admission.?);
+    defer second.release();
+    try std.testing.expectError(error.RaftOutboundCapacityUnavailable, host_.outbound_admission.?.capability().acquire(host_.outbound_admission.?));
+    try std.testing.expectEqual(@as(usize, 2), origin.ptr().laneStats().raft_outbound_active_leases);
 }

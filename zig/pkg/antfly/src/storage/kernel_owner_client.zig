@@ -36,6 +36,12 @@ pub const singleNamespaceStore = system_store_client.singleNamespaceStore;
 pub const Context = struct {
     handle: ?*anyopaque = null,
 
+    pub fn memoryParent(self: *const Context) !abi.MemoryParent {
+        var result: abi.MemoryParent = undefined;
+        if (!abi.antfly_storage_context_memory_parent(self.handle, &result)) return error.StorageContextUnavailable;
+        return result;
+    }
+
     pub fn reclaimBackupPinJson(self: *Context, request: abi.BackupPinReclaimRequest) !Response {
         try self.ensure();
         var response: Response = .{};
@@ -54,6 +60,13 @@ pub const Context = struct {
         self.handle = handle orelse return error.StorageKernelFailure;
     }
 
+    /// The node runtime outlives this context and every attached owner.
+    pub fn ensureWithBackendRuntime(self: *Context, runtime: *@import("antfly_local_sources").storage_background_runtime.BackendRuntime, options: @import("kernel_runtime_services.zig").RuntimeRequest.Options) !void {
+        if (self.handle != null) return;
+        var request = try @import("kernel_runtime_services.zig").RuntimeRequest.init(runtime, options);
+        try self.ensureWithRuntime(request.request());
+    }
+
     pub fn ensureWithRuntime(self: *Context, request: @import("kernel_runtime_services.zig").Request) !void {
         if (self.handle != null) return;
         var handle: ?*anyopaque = null;
@@ -61,10 +74,14 @@ pub const Context = struct {
         self.handle = handle orelse return error.StorageKernelFailure;
     }
 
-    pub fn deinit(self: *Context) void {
-        const status = abi.antfly_storage_context_destroy(self.handle);
-        std.debug.assert(status == .ok);
+    /// Joined destruction. A busy physical owner keeps its exact handle for
+    /// retry; an idle owner performs the existing executor/cache joins.
+    pub fn tryDeinit(self: *Context) !void {
+        try statusToError(abi.antfly_storage_context_destroy(self.handle));
         self.* = .{};
+    }
+    pub fn deinit(self: *Context) void {
+        self.tryDeinit() catch @panic("storage context still retained");
     }
 
     pub fn attachInferenceProvider(self: *Context, inference_handle: *anyopaque) !void {
@@ -115,6 +132,14 @@ pub const Context = struct {
             self.handle,
             .fromSlice(security_json),
         ));
+    }
+
+    pub fn reserveExternal(self: *Context, bytes: usize) bool {
+        return abi.antfly_storage_context_reserve_external(self.handle, bytes);
+    }
+
+    pub fn releaseExternal(self: *Context, bytes: usize) void {
+        abi.antfly_storage_context_release_external(self.handle, bytes);
     }
 
     pub fn metrics(self: *Context) !abi.ContextMetricsResult {
@@ -362,6 +387,10 @@ pub const Owner = struct {
         return result;
     }
 
+    pub fn drainClose(self: *Owner, request: abi.CloseDrainRequest) !void {
+        try statusToError(abi.antfly_storage_owner_drain_close(self.handle, &request));
+    }
+
     pub fn deinit(self: *Owner) void {
         abi.antfly_storage_owner_close(self.handle);
         self.* = undefined;
@@ -503,21 +532,73 @@ pub const Owner = struct {
         committed_effects_fn: ?abi.CommittedBatchEffectsFn,
         response: *Response,
     ) abi.Status {
+        return self.batchJsonWithCallbacksAndAdmissionStatus(table_name, request_json, dispatch_ctx, dispatch_fn, committed_effects_ctx, committed_effects_fn, null, response);
+    }
+
+    pub fn batchJsonWithCallbacksAndAdmissionStatus(self: *Owner, table_name: []const u8, request_json: []const u8, dispatch_ctx: ?*anyopaque, dispatch_fn: ?abi.DocumentChildRangeDispatchFn, committed_effects_ctx: ?*anyopaque, committed_effects_fn: ?abi.CommittedBatchEffectsFn, admission: ?*const @import("antfly_local_sources").common_read_admission.Port, response: *Response) abi.Status {
+        return self.batchJsonWithCallbacksAndAdmissionContextStatus(table_name, request_json, dispatch_ctx, dispatch_fn, committed_effects_ctx, committed_effects_fn, admission, response);
+    }
+
+    pub fn batchJsonWithCallbacksAndAdmissionContextStatus(self: *Owner, table_name: []const u8, request_json: []const u8, dispatch_ctx: ?*anyopaque, dispatch_fn: ?abi.DocumentChildRangeDispatchFn, committed_effects_ctx: ?*anyopaque, committed_effects_fn: ?abi.CommittedBatchEffectsFn, admission: ?*const anyopaque, response: *Response) abi.Status {
         response.* = .{};
         if ((dispatch_ctx == null) != (dispatch_fn == null)) return .invalid_argument;
         if ((committed_effects_ctx == null) != (committed_effects_fn == null)) return .invalid_argument;
-        return abi.antfly_storage_owner_batch_json(
-            self.handle,
-            &.{
-                .table_name = .fromSlice(table_name),
-                .request_json = .fromSlice(request_json),
-                .document_child_range_dispatch_ctx = dispatch_ctx,
-                .document_child_range_dispatch_fn = dispatch_fn,
-                .committed_batch_effects_ctx = committed_effects_ctx,
-                .committed_batch_effects_fn = committed_effects_fn,
-            },
-            &response.buffer,
-        );
+        const request: abi.BatchJsonOperationRequest = .{
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+            .document_child_range_dispatch_ctx = dispatch_ctx,
+            .document_child_range_dispatch_fn = dispatch_fn,
+            .committed_batch_effects_ctx = committed_effects_ctx,
+            .committed_batch_effects_fn = committed_effects_fn,
+        };
+        if (admission) |port| return abi.antfly_storage_owner_batch_json_with_admission(self.handle, &request, port, &response.buffer);
+        return abi.antfly_storage_owner_batch_json(self.handle, &request, &response.buffer);
+    }
+
+    pub fn transactionBeginWithAdmission(self: *Owner, _: std.mem.Allocator, table: []const u8, txn_id: [16]u8, timestamp: u64, created_at: u64, participants: []const []const u8, retain_terminal: bool, scope: ?[32]u8, plan: ?[16]u8, port: *const @import("antfly_local_sources").common_read_admission.Port) !void {
+        try port.checkpoint();
+        if ((scope == null) != (plan == null)) return error.RestoreStagingScopeChanged;
+        const arrays = @import("antfly_local_sources").api_transaction_begin_admission;
+        const participant_payload: arrays.Payload = .{ .participants = participants };
+        const participant_port = arrays.Port.init(&participant_payload);
+        var trace: @import("antfly_local_sources").common_read_admission.RejectionTrace = .{};
+        const original = trace.bind(port.*).?;
+        const status = abi.antfly_storage_owner_transaction_begin_with_admission(self.handle, &.{ .table_name = .fromSlice(table), .txn_id = .{ .bytes = txn_id }, .begin_timestamp = timestamp, .created_at_ns = created_at, .participants = &participant_port, .participants_len = participants.len, .retain_terminal = @intFromBool(retain_terminal), .has_scope = @intFromBool(scope != null), .scope = scope orelse @splat(0), .plan_id = plan orelse @splat(0), .port = &original });
+        if (trace.failure) |cause| return cause;
+        try statusToError(status);
+    }
+
+    pub fn transactionPrepareWithAdmission(self: *Owner, table: []const u8, txn_id: [16]u8, intents: @import("antfly_local_sources").storage_db_types.TransactionIntentRequest, port: *const @import("antfly_local_sources").common_read_admission.Port) !void {
+        try port.checkpoint();
+        const requests = @import("antfly_local_sources").api_transaction_prepare_admission;
+        const payload: requests.Payload = .{ .request = intents };
+        const borrowed = requests.Port.init(&payload);
+        var trace: @import("antfly_local_sources").common_read_admission.RejectionTrace = .{};
+        const original = trace.bind(port.*).?;
+        const status = abi.antfly_storage_owner_transaction_prepare_with_admission(self.handle, &.{ .table_name = .fromSlice(table), .txn_id = .{ .bytes = txn_id }, .intents = &borrowed, .port = &original });
+        if (trace.failure) |cause| return cause;
+        try statusToError(status);
+    }
+
+    pub fn transactionAcknowledgeWithAdmission(self: *Owner, table: []const u8, txn_id: [16]u8, participants: []const []const u8, port: *const @import("antfly_local_sources").common_read_admission.Port) !void {
+        try port.checkpoint();
+        const arrays = @import("antfly_local_sources").api_transaction_begin_admission;
+        const payload: arrays.Payload = .{ .participants = participants };
+        const borrowed = arrays.Port.init(&payload);
+        var trace: @import("antfly_local_sources").common_read_admission.RejectionTrace = .{};
+        const original = trace.bind(port.*).?;
+        const status = abi.antfly_storage_owner_transaction_acknowledge_with_admission(self.handle, &.{ .table_name = .fromSlice(table), .txn_id = .{ .bytes = txn_id }, .participants = &borrowed, .port = &original });
+        if (trace.failure) |cause| return cause;
+        try statusToError(status);
+    }
+
+    pub fn transactionResolveWithAdmission(self: *Owner, table: []const u8, txn_id: [16]u8, status: abi.TxnStatus, commit_version: u64, sync_level: abi.SyncLevel, port: *const @import("antfly_local_sources").common_read_admission.Port) !void {
+        try port.checkpoint();
+        var trace: @import("antfly_local_sources").common_read_admission.RejectionTrace = .{};
+        const original = trace.bind(port.*).?;
+        const result = abi.antfly_storage_owner_transaction_resolve_with_admission(self.handle, &.{ .table_name = .fromSlice(table), .txn_id = .{ .bytes = txn_id }, .status = @backingInt(status), .commit_version = commit_version, .sync_level = @backingInt(sync_level), .port = &original });
+        if (trace.failure) |cause| return cause;
+        try statusToError(result);
     }
 
     pub fn replicatedBatchJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
@@ -592,6 +673,20 @@ pub const Owner = struct {
         ));
         if (result.version != abi.abi_version) return error.InvalidAbi;
         return result.status;
+    }
+
+    pub fn transactionPreparationStatus(self: *Owner, table_name: []const u8, txn_id: [16]u8, port: *const @import("antfly_local_sources").common_read_admission.Port) !abi.TransactionPreparationStatusResult {
+        try port.validate();
+        // The status-only C ABI cannot enumerate arbitrary original controls.
+        // Retain rejection at the caller edge before translating owner status.
+        var trace: @import("antfly_local_sources").common_read_admission.RejectionTrace = .{};
+        const original = trace.bind(port.*).?;
+        var result: abi.TransactionPreparationStatusResult = .{};
+        const status = abi.antfly_storage_owner_transaction_preparation_status(self.handle, &.{ .table_name = .fromSlice(table_name), .txn_id = .{ .bytes = txn_id }, .port = &original }, &result);
+        if (trace.failure) |cause| return cause;
+        try statusToError(status);
+        if (std.enums.fromInt(abi.TxnStatus, @backingInt(result.status)) == null or result.version != abi.abi_version or result.present > 1 or result.has_binding > 1 or !std.mem.allEqual(u8, &result._reserved, 0)) return error.InvalidAbi;
+        return result;
     }
 
     pub fn waitForSync(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel) !void {
@@ -698,6 +793,7 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64 = null,
         cancellation_ctx: ?*anyopaque = null,
         cancellation_fn: ?abi.CancellationCheckFn = null,
+        execution_runnable: ?*const anyopaque = null,
         execution: abi.LocalQueryExecutionOptions = .{},
     };
 
@@ -708,10 +804,12 @@ pub const Owner = struct {
     pub fn queryJsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !QueryResponse {
         var response: QueryResponse = .{};
         var failure: abi.FailureIdentity = .{};
+        var control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn);
+        control.execution_runnable = options.execution_runnable;
         const status = abi.antfly_storage_owner_query_json(
             self.handle,
             &.{
-                .control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+                .control = control,
                 .execution_options = options.execution,
             },
             &response.response,
@@ -870,6 +968,16 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn textStatsJsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        var failure: abi.FailureIdentity = .{};
+        var request = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn);
+        request.execution_runnable = options.execution_runnable;
+        const status = abi.antfly_storage_owner_text_stats_controlled_json(self.handle, &request, &response.buffer, &failure);
+        try acceptStorageOwnerFailure(status, failure, "storage-owner controlled text stats");
+        return response;
+    }
+
     pub fn algebraicPartialsJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
@@ -893,10 +1001,12 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64,
         cancellation_ctx: ?*anyopaque,
         cancellation_fn: ?abi.CancellationCheckFn,
+        execution_runnable: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        var request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        request.execution_runnable = execution_runnable;
         const status = abi.antfly_storage_owner_graph_expand_json(
             self.handle,
             &request,
@@ -914,10 +1024,12 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64,
         cancellation_ctx: ?*anyopaque,
         cancellation_fn: ?abi.CancellationCheckFn,
+        execution_runnable: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        var request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        request.execution_runnable = execution_runnable;
         const status = abi.antfly_storage_owner_graph_hydrate_json(
             self.handle,
             &request,
@@ -935,10 +1047,12 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64,
         cancellation_ctx: ?*anyopaque,
         cancellation_fn: ?abi.CancellationCheckFn,
+        execution_runnable: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        var request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        request.execution_runnable = execution_runnable;
         const status = abi.antfly_storage_owner_graph_edges_json(
             self.handle,
             &request,
@@ -1074,16 +1188,28 @@ pub const Owner = struct {
         table_name: []const u8,
         action: abi.MaintenanceAction,
     ) !abi.MaintenanceResult {
+        return self.maintenanceWithLifetime(table_name, action, null);
+    }
+
+    pub fn maintenanceWithLifetime(
+        self: *Owner,
+        table_name: []const u8,
+        action: abi.MaintenanceAction,
+        lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !abi.MaintenanceResult {
+        if (lifetime) |original| try original.checkpoint();
         var result: abi.MaintenanceResult = .{};
         try statusToError(abi.antfly_storage_owner_maintenance(
             self.handle,
             &.{
                 .action = @backingInt(action),
                 .table_name = .fromSlice(table_name),
+                .lifetime_check = lifetime,
             },
             &result,
         ));
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        if (lifetime) |original| try original.checkpoint();
         return result;
     }
 
@@ -1103,6 +1229,15 @@ pub const Owner = struct {
         table_name: []const u8,
         deadline_ns: u64,
     ) !void {
+        return self.prepareHotStandbySeedSnapshotWithLifetime(table_name, deadline_ns, null);
+    }
+    pub fn prepareHotStandbySeedSnapshotWithLifetime(
+        self: *Owner,
+        table_name: []const u8,
+        deadline_ns: u64,
+        lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !void {
+        if (lifetime) |original| try original.checkpoint();
         var result: abi.MaintenanceResult = .{};
         try statusToError(abi.antfly_storage_owner_maintenance(
             self.handle,
@@ -1110,10 +1245,12 @@ pub const Owner = struct {
                 .action = @backingInt(abi.MaintenanceAction.prepare_ha_seed_snapshot),
                 .table_name = .fromSlice(table_name),
                 .deadline_ns = deadline_ns,
+                .lifetime_check = lifetime,
             },
             &result,
         ));
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        if (lifetime) |original| try original.checkpoint();
     }
 };
 

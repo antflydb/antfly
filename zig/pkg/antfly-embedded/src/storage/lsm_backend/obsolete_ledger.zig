@@ -18,13 +18,14 @@
 const std = @import("std");
 const Account = @import("memory_account.zig").Account;
 const Path = @import("repository.zig").ObsoletePath;
-const Payload = struct {
+pub const Payload = struct {
     refs: std.atomic.Value(usize) = .init(1),
     path: []u8,
-    account: *Account,
+    account: ?*Account = null,
+    registered: ?*@import("../resource_manager.zig").PayloadRetirement = null,
 };
 
-const Entry = struct {
+pub const Entry = struct {
     path: []const u8,
     deadline: u64 = 0,
     payload: ?*Payload = null,
@@ -39,14 +40,59 @@ const Entry = struct {
     }
     pub fn deinit(self: Entry, allocator: std.mem.Allocator) void {
         const payload = self.payload orelse return;
-        if (payload.refs.fetchSub(1, .acq_rel) != 1) return;
+        const previous = payload.refs.fetchSub(1, .acq_rel);
+        if (payload.registered != null) {
+            std.debug.assert(previous > 1); // Registered final anchor owns destruction.
+            return;
+        }
+        if (previous != 1) return;
         // Payload slots and adopted strings were charged separately; each
         // charge owns an accounting reference, including a zero-length path.
-        payload.account.discharge(payload.path.len);
-        payload.account.discharge(@sizeOf(Payload));
+        payload.account.?.discharge(payload.path.len);
+        payload.account.?.discharge(@sizeOf(Payload));
         allocator.free(payload.path);
         allocator.destroy(payload);
     }
+    /// The tree transfers its final entry reference into this prepaid cursor.
+    /// A large path cannot turn one node credit into an unbounded destructor.
+    pub const Retirement = struct {
+        payload: ?*Payload = null,
+        offset: usize = 0,
+        pub fn init(entry: Entry) @This() {
+            const payload = entry.payload orelse return .{};
+            const previous = payload.refs.fetchSub(1, .acq_rel);
+            if (payload.registered != null) {
+                std.debug.assert(previous > 1);
+                return .{};
+            }
+            return if (previous == 1) .{ .payload = payload } else .{};
+        }
+        pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+            if (self.payload == null) return true;
+            while (credits.* != 0) {
+                if (self.stepWithAdmission(allocator, credits, null) catch unreachable) return true;
+            }
+            return false;
+        }
+        pub fn stepWithAdmission(self: *@This(), allocator: std.mem.Allocator, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !bool {
+            const payload = self.payload orelse return true;
+            if (credits.* == 0) return false;
+            if (original) |port| try port.checkpoint();
+            credits.* -= 1;
+            const end = @min(payload.path.len, self.offset + 16 * 1024);
+            @memset(payload.path[self.offset..end], undefined);
+            self.offset = end;
+            if (end != payload.path.len) return false;
+            const account = payload.account.?;
+            const bytes = payload.path.len;
+            allocator.rawFree(payload.path, .of(u8), @returnAddress());
+            allocator.destroy(payload);
+            account.discharge(bytes);
+            account.discharge(@sizeOf(Payload));
+            self.payload = null;
+            return true;
+        }
+    };
     pub fn retainedBytes(_: Entry) usize {
         return 0;
     }
@@ -63,10 +109,11 @@ fn compare(a: Entry, b: Entry) std.math.Order {
 }
 
 pub const Ledger = struct {
-    const Tree = @import("ordered_index.zig").Index(Entry, compare);
+    pub const Tree = @import("ordered_index.zig").Index(Entry, compare);
     tree: Tree = .{},
     spare: std.ArrayListUnmanaged(*Payload) = .empty,
     allocator: ?std.mem.Allocator = null,
+    registered_owner: ?*@import("../resource_manager.zig").PayloadRetirement = null,
 
     pub const empty: Ledger = .{};
     pub fn count(self: *const Ledger) usize {
@@ -76,7 +123,7 @@ pub const Ledger = struct {
         return if (self.tree.root) |root| root.summary.wire_bytes else 0;
     }
     pub fn fork(self: *const Ledger) Ledger {
-        return .{ .tree = self.tree.fork(), .allocator = self.allocator };
+        return .{ .tree = self.tree.fork(), .allocator = self.allocator, .registered_owner = self.registered_owner };
     }
     /// Consumes a detached ledger. Shared subtrees and spare payloads are
     /// reclaimed with explicit credits, including cancellation/OOM cleanup.
@@ -84,20 +131,35 @@ pub const Ledger = struct {
         tree: Tree.Reclaimer,
         spare: std.ArrayListUnmanaged(*Payload),
         account: ?*Account,
+        spare_offset: usize = 0,
         pub fn init(ledger: Ledger) Reclaimer {
             return .{ .tree = .init(ledger.tree), .spare = ledger.spare, .account = ledger.tree.account };
         }
         pub fn step(self: *Reclaimer, allocator: std.mem.Allocator, credits: *usize) bool {
+            return self.stepWithAdmission(allocator, credits, null) catch unreachable;
+        }
+        pub fn stepWithAdmission(self: *Reclaimer, allocator: std.mem.Allocator, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !bool {
+            if (original) |port| try port.checkpoint();
             while (credits.* != 0) {
+                if (original) |port| try port.checkpoint();
                 const payload = self.spare.pop() orelse break;
                 credits.* -= 1;
                 self.account.?.discharge(@sizeOf(Payload));
                 allocator.destroy(payload);
             }
             if (self.spare.items.len != 0) return false;
-            self.spare.deinit(allocator);
+            const vector = std.mem.sliceAsBytes(self.spare.allocatedSlice());
+            while (self.spare_offset < vector.len) {
+                if (credits.* == 0) return false;
+                if (original) |port| try port.checkpoint();
+                credits.* -= 1;
+                const end = @min(vector.len, self.spare_offset + 16 * 1024);
+                @memset(vector[self.spare_offset..end], undefined);
+                self.spare_offset = end;
+            }
+            if (vector.len != 0) allocator.rawFree(vector, .of(*Payload), @returnAddress());
             self.spare = .empty;
-            return self.tree.step(allocator, credits);
+            return self.tree.stepWithAdmission(allocator, credits, original);
         }
     };
 
@@ -109,6 +171,9 @@ pub const Ledger = struct {
         stack: [2 * @bitSizeOf(usize)]*Tree.Node = undefined,
         len: usize = 0,
         phase: enum { removed, added, done } = .removed,
+        pending: ?*Tree.Node = null,
+        searching: ?*Tree.Node = null,
+        comparison: ?@import("run_comparison.zig").Cursor = null,
         pub fn init(previous: *const Ledger, current: *const Ledger) ChangeCursor {
             var out = ChangeCursor{ .previous = previous.tree.root, .current = current.tree.root };
             out.push(previous.tree.root);
@@ -124,24 +189,44 @@ pub const Ledger = struct {
             return self.phase == .done;
         }
         pub fn next(self: *ChangeCursor, credits: *usize) ?Change {
-            while (credits.* != 0 and !self.done()) {
-                if (self.len == 0) {
+            return self.nextWithAdmission(credits, null) catch unreachable;
+        }
+        pub fn nextWithAdmission(self: *ChangeCursor, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !?Change {
+            while ((credits.* != 0 or self.pending != null) and !self.done()) {
+                if (original) |port| try port.checkpoint();
+                if (self.pending == null and self.len == 0) {
                     if (self.phase == .removed) {
                         self.phase = .added;
                         self.push(self.current);
                     } else self.phase = .done;
                     continue;
                 }
-                credits.* -= 1;
-                self.len -= 1;
-                const node = self.stack[self.len];
-                const matched = Tree.find(if (self.phase == .removed) self.current else self.previous, node.entry);
+                if (self.pending == null) {
+                    credits.* -= 1;
+                    self.len -= 1;
+                    self.pending = self.stack[self.len];
+                    self.searching = if (self.phase == .removed) self.current else self.previous;
+                }
+                while (self.searching) |probe| {
+                    if (self.comparison == null) self.comparison = @import("run_comparison.zig").Cursor.bound(null, self.pending.?.entry.path, null, probe.entry.path);
+                    const order = try self.comparison.?.resumeWithAdmission(original);
+                    self.comparison = null;
+                    switch (order) {
+                        .lt => self.searching = probe.left,
+                        .gt => self.searching = probe.right,
+                        .eq => break,
+                    }
+                }
+                const node = self.pending.?;
+                const matched = self.searching;
+                self.pending = null;
+                self.searching = null;
                 if (matched == node) continue;
                 self.push(node.right);
                 self.push(node.left);
                 if (self.phase == .removed) {
                     if (matched == null) return .{ .kind = .remove, .path = node.entry.value() };
-                } else if (matched == null or !Entry.eql(matched.?.entry, node.entry)) return .{ .kind = .put, .path = node.entry.value() };
+                } else if (matched == null or matched.?.entry.deadline != node.entry.deadline) return .{ .kind = .put, .path = node.entry.value() };
             }
             return null;
         }
@@ -156,10 +241,12 @@ pub const Ledger = struct {
         self.* = .{};
     }
     pub fn memoryBytes(self: *const Ledger, pass: u64) u64 {
+        if (self.tree.account) |account| if (account.independently_funded) return 0;
         return self.spare.capacity * @sizeOf(*Payload) + self.tree.spare.capacity * @sizeOf(*Tree.Node) +
             (if (self.tree.account) |account| account.chargeOnce(pass) else 0);
     }
     pub fn ensureUnusedCapacity(self: *Ledger, allocator: std.mem.Allocator, edits: usize) !void {
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
         self.allocator = allocator;
         try self.tree.prepareEdits(allocator, edits);
         try self.spare.ensureTotalCapacity(allocator, edits);
@@ -169,8 +256,26 @@ pub const Ledger = struct {
             self.spare.appendAssumeCapacity(payload);
         }
     }
+    /// One edit only. Partial preparation belongs to this ledger on every
+    /// refusal; its construction credit must remain held until reclamation.
+    pub fn prepareWithAdmission(self: *Ledger, allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
+        self.allocator = allocator;
+        try self.tree.prepareWithAdmission(allocator, original);
+        try original.checkpoint();
+        try self.spare.ensureTotalCapacity(allocator, 1);
+        if (self.spare.items.len == 0) {
+            try original.checkpoint();
+            const payload = try allocator.create(Payload);
+            self.tree.account.?.charge(@sizeOf(Payload));
+            self.spare.appendAssumeCapacity(payload);
+        }
+    }
+    pub fn spareBytes(self: *const Ledger) u64 {
+        return (self.spare.capacity + self.tree.spare.capacity) * @sizeOf(*anyopaque);
+    }
     pub fn prepareMemoryBound(self: *const Ledger, edits: usize) !u64 {
-        return std.math.add(u64, try self.tree.prepareMemoryBound(edits), try std.math.mul(u64, edits, @sizeOf(Payload) + 2 * @sizeOf(*Payload)));
+        return std.math.add(u64, try self.tree.prepareMemoryBound(edits), try std.math.add(u64, try std.math.mul(u64, edits, @sizeOf(Payload)), try std.math.mul(u64, if (edits == 0) 0 else std.ArrayListUnmanaged(*Payload).growCapacity(edits), 2 * @sizeOf(*Payload))));
     }
     /// Takes ownership of path; reserves all fallible work before publication.
     pub fn append(self: *Ledger, allocator: std.mem.Allocator, path: Path) !void {
@@ -180,9 +285,10 @@ pub const Ledger = struct {
         self.appendAssumeCapacity(path);
     }
     pub fn appendAssumeCapacity(self: *Ledger, path: Path) void {
+        std.debug.assert(self.registered_owner == null);
         const payload = self.spare.pop().?;
         payload.* = .{ .path = path.path, .account = self.tree.account.? };
-        payload.account.charge(path.path.len);
+        payload.account.?.charge(path.path.len);
         const entry = Entry{ .path = path.path, .deadline = path.delete_after_ns, .payload = payload };
         defer entry.deinit(self.allocator.?);
         self.tree.putPrepared(self.allocator.?, entry);
@@ -197,12 +303,14 @@ pub const Ledger = struct {
         return self.tree.root.?.at(rank).value();
     }
     pub fn setDeadlinePrepared(self: *Ledger, path: []const u8, deadline: u64) void {
+        std.debug.assert(self.registered_owner == null);
         var entry = (Tree.find(self.tree.root, .{ .path = path }) orelse unreachable).entry.retainShared();
         defer entry.deinit(self.allocator.?);
         entry.deadline = deadline;
         self.tree.putPrepared(self.allocator.?, entry);
     }
     pub fn removePrepared(self: *Ledger, path: []const u8) void {
+        std.debug.assert(self.registered_owner == null);
         self.tree.removePrepared(self.allocator.?, .{ .path = path });
     }
     pub const Cursor = struct {

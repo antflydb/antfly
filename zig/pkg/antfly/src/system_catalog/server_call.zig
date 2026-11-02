@@ -89,6 +89,7 @@ pub const Call = union(enum) {
     fk_initial_parent_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
     /// Internal, read-only discovery. A ticket is not authority to unlink.
     fk_initial_retirement_page: @import("../metadata/fk_initial_retirement_wire.zig").PageRequest,
+    remote_attempt_initialization: @import("../metadata/remote_attempt_initialization.zig").Request,
     store_root_enroll: @import("../metadata/store_root_enrollment.zig").Request,
     /// Exact, linearizable read used to resolve an ambiguous enrollment response.
     store_root_enrollment_status: @import("../metadata/store_root_enrollment.zig").Identity,
@@ -151,6 +152,7 @@ pub const Call = union(enum) {
 
     pub fn isMutation(self: @This()) bool {
         return self == .mutate or self == .fk_initial_retirement_ack or
+            (self == .remote_attempt_initialization and self.remote_attempt_initialization.action != .status) or
             (self != .store_root_enrollment_status and self.requiresAdministrativeGrant());
     }
 };

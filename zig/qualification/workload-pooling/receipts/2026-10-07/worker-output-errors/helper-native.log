@@ -1,0 +1,6 @@
+Build Summary: 4/4 steps succeeded; 3/3 tests passed
+antfly-inference-worker-output-error-test success
++- run test inference-worker-output-error-tests 3 pass (3 total) 111ms MaxRSS:2M
+   +- compile test inference-worker-output-error-tests safe native success 7s MaxRSS:381M
+      +- WriteFile macos-sdk-libc.txt cached
+

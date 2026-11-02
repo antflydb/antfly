@@ -145,7 +145,7 @@ fn validateFiles(entries: []const FileArtifact) !void {
     }
 }
 fn fileStat(dir: std.Io.Dir, io: std.Io, entry: FileArtifact) !?std.Io.File.Stat {
-    const stat = dir.statFile(io, entry.path, .{}) catch |err| {
+    const stat = @import("../../execution_control.zig").physicalWait(std.Io.Dir.statFile, .{ dir, io, entry.path, std.Io.Dir.StatFileOptions{} }) catch |err| {
         if (entry.optional and err == error.FileNotFound) return null;
         return err;
     };
@@ -184,23 +184,25 @@ pub fn hashFiles(dir: std.Io.Dir, io: std.Io, entries: []const FileArtifact, exp
         bytes(&aggregate, entry.role);
         if (try fileStat(dir, io, entry)) |before| {
             aggregate.update(&.{1});
-            var file = try dir.openFile(io, entry.path, .{});
+            const Discard = struct {
+                fn close(file: std.Io.File, args: anytype) void {
+                    file.close(args[1]);
+                }
+            };
+            var file = try @import("../../execution_control.zig").ownedPhysicalWait(std.Io.Dir.openFile, .{ dir, io, entry.path, std.Io.Dir.OpenFileOptions{} }, Discard.close);
             defer file.close(io);
-            if (!statEqual(before, try file.stat(io))) return error.ModelArtifactsChanging;
+            if (!statEqual(before, try @import("../../execution_control.zig").physicalWait(std.Io.File.stat, .{ file, io }))) return error.ModelArtifactsChanging;
             var hash = Hash.init(.{});
             var size: u64 = 0;
             while (true) {
                 try control.check();
-                const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
-                    error.EndOfStream => 0,
-                    else => return err,
-                };
+                const count = try @import("../../util/admitted_file.zig").read(file, io, &buffer);
                 if (count == 0) break;
                 size = try std.math.add(u64, size, count);
                 if (size > before.size or size > entry.max_bytes) return error.ModelArtifactsChanging;
                 hash.update(buffer[0..count]);
             }
-            if (size != before.size or !statEqual(before, try file.stat(io))) return error.ModelArtifactsChanging;
+            if (size != before.size or !statEqual(before, try @import("../../execution_control.zig").physicalWait(std.Io.File.stat, .{ file, io }))) return error.ModelArtifactsChanging;
             try valueHash(&aggregate, size);
             aggregate.update(&hash.finalResult());
         } else aggregate.update(&.{0});

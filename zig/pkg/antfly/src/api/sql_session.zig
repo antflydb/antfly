@@ -15,6 +15,7 @@
 
 //! Shared SQL protocol/HTTP control adapter. All state belongs to the durable
 //! transaction registry; commit is the native coordinator, never HTTP replay.
+const distributed_txn = @import("distributed_txn.zig");
 const std = @import("std");
 const sql = @import("antfly_local_sources").sql_session;
 const transactions = @import("transactions.zig");
@@ -31,7 +32,7 @@ pub const Coordinator = struct {
     pub fn commit(ptr: *anyopaque, _: sql.Scope, id: sql.Id) !sql.CommitResult {
         const self: *Coordinator = @ptrCast(@alignCast(ptr));
         const server = self.server;
-        const alloc = server.alloc;
+        const alloc = server.controlAllocator();
         try self.context.ensureActive();
         const lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
         defer lease.release();
@@ -66,11 +67,88 @@ pub const Coordinator = struct {
         var proof_arena = std.heap.ArenaAllocator.init(alloc);
         defer proof_arena.deinit();
         const signed = try server.signCurrentRowPolicyMutationParticipants(proof_arena.allocator(), prepared.tables, self.context);
-        var plan = (try server.txn_sessions.sealExecutionPlan(alloc, id, signed)) orelse return error.SqlTransactionNotActive;
+        // Refuse an unsupported execution capability before sealing durable
+        // recovery debt; never silently switch to unaccounted fanout.
+        var commit_control = distributed_txn.CommitControl.fromRequest(self.context);
+        commit_control.participant_plan_store = server.txn_sessions.participantPlanStore();
+        if (!source.supportsTransactionControl(commit_control)) return error.ExecutionWaitUnsupported;
+        return self.completePrepared(id, info.begin_timestamp, info.sync_level, signed);
+    }
+
+    fn completePrepared(self: *Coordinator, id: sql.Id, begin_timestamp: u64, sync_level: @import("antfly_local_sources").storage_db_types.SyncLevel, signed: []const distributed_txn.TableCommitRequest) !sql.CommitResult {
+        const server = self.server;
+        if (self.context.execution_team) |team| {
+            // This handoff moves one admitted CPU owner to a joined task; it
+            // cannot race children that still borrow that owner's execution.
+            if (team.state == .active) return error.InvalidRunnableTransition;
+            const backend = server.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
+            const io = backend.io() orelse return error.SqlWriteCapacityUnavailable;
+            const runtime = @import("antfly_runtime_abi");
+            const borrowed_io = runtime.native_abi.IoBorrow.init(&io);
+            var completion = PreparedCompletion{
+                .coordinator = self,
+                .id = id,
+                .begin_timestamp = begin_timestamp,
+                .sync_level = sync_level,
+                .tables = signed,
+            };
+            // Allocate the task and reserve its finite completion fence before
+            // publishing durable recovery debt. Both task admission and fence
+            // admission fail with its gate closed, without sealing a plan.
+            var task = try @import("runnable_completion_task.zig").Task.reserve(
+                team.allocator,
+                io,
+                team.borrow,
+                &.{
+                    .io = &borrowed_io,
+                    .deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds))) +| 30 * std.time.ns_per_s,
+                },
+                &completion,
+                PreparedCompletion.run,
+            );
+            defer task.deinit();
+            try self.context.ensureActive();
+            // The request, signed tables, registry lease, bounded allocator,
+            // ingress bridge and execution stay alive through this join.
+            try task.runAndJoin();
+            return completion.result orelse error.InvalidRunnableTransition;
+        }
+        return self.commitPrepared(id, begin_timestamp, sync_level, signed);
+    }
+
+    const PreparedCompletion = struct {
+        coordinator: *Coordinator,
+        id: sql.Id,
+        begin_timestamp: u64,
+        sync_level: @import("antfly_local_sources").storage_db_types.SyncLevel,
+        tables: []const distributed_txn.TableCommitRequest,
+        result: ?sql.CommitResult = null,
+
+        fn run(raw: *anyopaque, _: @import("antfly_runtime_abi").runnable_abi.Borrowed, _: std.Io) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.result = try self.coordinator.commitPrepared(self.id, self.begin_timestamp, self.sync_level, self.tables);
+        }
+    };
+
+    fn commitPrepared(self: *Coordinator, id: sql.Id, begin_timestamp: u64, sync_level: @import("antfly_local_sources").storage_db_types.SyncLevel, signed: []const distributed_txn.TableCommitRequest) !sql.CommitResult {
+        const server = self.server;
+        const alloc = server.controlAllocator();
+        const source = server.table_writes orelse return error.UnsupportedSqlExecution;
+        // Completion activation does not replace the original proposal fence.
+        // Recheck it in the child before sealing, and pass it unchanged to the
+        // participant coordinator even after independent completion activates.
+        try self.context.ensureActive();
+        var commit_control = distributed_txn.CommitControl.fromRequest(self.context);
+        commit_control.participant_plan_store = server.txn_sessions.participantPlanStore();
+        var plan = (server.txn_sessions.sealExecutionPlan(alloc, id, signed) catch
+            // Persistence may have succeeded before a later publication error.
+            // Preserve this ID for authoritative reconciliation on every such
+            // outcome instead of inviting replay with a fresh transaction.
+            return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return error.SqlTransactionNotActive;
         defer plan.deinit();
         // Once the durable plan is sealed, no error is safe to turn into a
         // replay invitation. Maintenance owns completion under this same id.
-        const outcome = (source.commitTransactionWithIdAndCancellation(alloc, id, info.begin_timestamp, plan.value, info.sync_level, self.context.cancellation) catch |err| {
+        const outcome = (source.commitTransactionWithIdAndControl(alloc, id, begin_timestamp, plan.value, sync_level, self.context.cancellation, commit_control) catch |err| {
             if (err == error.EnrichmentWorkerFailed) {
                 // Persist terminal repair debt before exposing it. The legacy
                 // error lacks coordinator metadata; maintenance retains the
@@ -276,4 +354,139 @@ test "SQL native session owns durable savepoint and failure state" {
     try std.testing.expectError(error.SqlTransactionNotActive, other.attach(session.transaction_id.?));
     _ = try session.execute(.rollback);
     try std.testing.expectEqual(sql.Status.idle, try session.status());
+}
+
+test "SQL prepared completion reserves before sealing and preserves original proposal fences" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const types = @import("antfly_local_sources").storage_db_types;
+    const background = @import("antfly_local_sources").storage_background_runtime;
+    const scheduler = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const runtime = @import("antfly_runtime_abi");
+    const Fake = struct {
+        expected: distributed_txn.CommitControl = .{},
+        id: sql.Id = undefined,
+        registry: *transactions.SessionRegistry = undefined,
+        scheduler: *scheduler.Scheduler = undefined,
+        signal: *std.atomic.Value(bool),
+        cancel_after_acceptance: bool,
+        expire_after_acceptance: bool,
+        calls: usize = 0,
+        var completion_now: std.atomic.Value(u64) = .init(0);
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = completion_now.load(.acquire) };
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: types.BatchRequest) !?void {
+            return error.UnexpectedBatch;
+        }
+        fn commit(raw: *anyopaque, alloc: std.mem.Allocator, id: types.TxnId, _: u64, tables: []const distributed_txn.TableCommitRequest, _: types.SyncLevel, _: types.CancellationToken, control: distributed_txn.CommitControl) !?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var expected = self.expected;
+            expected.participant_plan_store = self.registry.participantPlanStore();
+            try std.testing.expectEqualDeep(expected, control);
+            try std.testing.expectEqualDeep(self.id, id);
+            try std.testing.expectEqualStrings("docs", tables[0].table_name);
+            var plan = (try self.registry.getExecutionPlan(alloc, id)) orelse return error.ExpectedSealedPlan;
+            defer plan.deinit();
+            try std.testing.expectEqualStrings("docs", plan.value[0].table_name);
+            const borrow = control.team.?.borrow;
+            const checked = borrow.checkpoint(borrow.context);
+            if (!checked.isOk()) return runtime.error_abi.errorFromStatus(checked);
+            self.calls += 1;
+            if (self.expire_after_acceptance) {
+                completion_now.store(31 * std.time.ns_per_s, .release);
+                const expired = borrow.checkpoint(borrow.context);
+                if (!expired.isOk()) return runtime.error_abi.errorFromStatus(expired);
+                return error.ExpectedCompletionExpiry;
+            }
+            if (self.cancel_after_acceptance) {
+                self.signal.store(true, .release);
+                const parked = borrow.park(borrow.context, @backingInt(runtime.runnable_abi.Wait.resource));
+                if (!parked.isOk()) return runtime.error_abi.errorFromStatus(parked);
+                try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+                var health: scheduler.Execution = .{};
+                try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                health.finish();
+                self.scheduler.close();
+                const resumed = borrow.enter(borrow.context, @backingInt(runtime.runnable_abi.Class.write));
+                if (!resumed.isOk()) return runtime.error_abi.errorFromStatus(resumed);
+                const completed = borrow.checkpoint(borrow.context);
+                if (!completed.isOk()) return runtime.error_abi.errorFromStatus(completed);
+            }
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    };
+    for (0..7) |scenario| {
+        const alloc = std.testing.allocator;
+        var threaded = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(if (scenario == 5) 0 else 2) });
+        defer threaded.deinit();
+        Fake.completion_now.store(0, .release);
+        var io_vtable = threaded.io().vtable.*;
+        io_vtable.now = Fake.now;
+        const io: std.Io = .{ .userdata = threaded.io().userdata, .vtable = &io_vtable };
+        var backend = try background.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = io } });
+        defer backend.deinit();
+        var memory_backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
+        defer memory_backend.close();
+        var store = try memory_backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" });
+        defer store.deinit();
+        var durable = transactions.DurableSessionStore.initRuntime(alloc, &store);
+        var signal = std.atomic.Value(bool).init(false);
+        var fake = Fake{ .signal = &signal, .cancel_after_acceptance = scenario == 2, .expire_after_acceptance = scenario == 6 };
+        var server = http.ApiHttpServer.init(alloc, .{ .backend_runtime = &backend, .session_store = &durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status } }, null, .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .commit_transaction_with_id_with_control = Fake.commit } });
+        defer server.deinit();
+        const info = try server.txn_sessions.begin(alloc, .{ .sync_level = .write }, 9);
+        var request = try transactions.parseCommitRequest(alloc,
+            \\{"read_set":[],"tables":{"docs":{"inserts":{"a":{"id":1}}}}}
+        );
+        defer request.deinit(alloc);
+        var staged = (try server.txn_sessions.cloneCommitRequest(alloc, info.txn_id, &request)).?;
+        defer staged.deinit(alloc);
+        const lease = server.txn_sessions.tryAcquireCommitExecution(info.txn_id) orelse return error.ExpectedCommitLease;
+        defer lease.release();
+        var scheduling = try scheduler.Scheduler.init(.{ .slots = 3 });
+        var execution: scheduler.Execution = .{};
+        defer execution.finish();
+        const original_deadline = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+        try execution.start(&scheduling, .{ .io = std.testing.io, .deadline_ns = original_deadline, .native_now_ns = platform_time.monotonicNs, .cancellation = .{ .ptr = &signal, .requested = Fake.canceled } }, .write);
+        var memory: @import("../common/allocation_budget.zig").Shared = .{ .child = alloc, .limit = if (scenario == 0) 0 else 16384 };
+        var bridge = try @import("runnable_write_team.zig").Completion.init(&execution, memory.allocator());
+        var team = try bridge.team();
+        var identity: ?http.AuthenticatedIdentity = null;
+        var coordinator = Coordinator{ .server = &server, .identity = &identity, .context = .{ .execution_team = &team, .deadline_ns = original_deadline, .cancellation = .fromAtomic(&signal) } };
+        fake.expected = distributed_txn.CommitControl.fromRequest(coordinator.context);
+        fake.id = info.txn_id;
+        fake.registry = &server.txn_sessions;
+        fake.scheduler = &scheduling;
+        durable.fail_writes_for_test = scenario == 3;
+        if (scenario == 4) signal.store(true, .release);
+        const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} }};
+        const result = coordinator.completePrepared(info.txn_id, info.begin_timestamp, info.sync_level, &tables);
+        if (scenario == 0) {
+            try std.testing.expectError(error.OutOfMemory, result);
+        } else if (scenario == 4) {
+            try std.testing.expectError(error.Canceled, result);
+        } else if (scenario == 5) {
+            try std.testing.expectError(error.ConcurrencyUnavailable, result);
+        } else {
+            const terminal = try result;
+            try std.testing.expectEqual(if (scenario == 3 or scenario == 6) sql.CommitOutcome.unknown else sql.CommitOutcome.committed, terminal.outcome);
+            try std.testing.expectEqualDeep(info.txn_id, terminal.reconciliation_id);
+        }
+        durable.fail_writes_for_test = false;
+        try std.testing.expectEqual(@as(usize, if (scenario == 1 or scenario == 2 or scenario == 6) 1 else 0), fake.calls);
+        if (fake.calls == 0) try std.testing.expect((try server.txn_sessions.getExecutionPlan(alloc, info.txn_id)) == null);
+        if (scenario == 6) {
+            var retained = (try server.txn_sessions.getExecutionPlan(alloc, info.txn_id)) orelse return error.ExpectedRecoveryPlan;
+            defer retained.deinit();
+            try std.testing.expectEqualStrings("docs", retained.value[0].table_name);
+        }
+        try std.testing.expectEqual(@as(usize, 0), memory.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
+    }
 }

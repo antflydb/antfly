@@ -1,0 +1,5 @@
+Build Summary: 3/3 steps succeeded; 4/4 tests passed
+antfly-sql-write-team-test success
++- run test sql-write-team-tests 4 pass (4 total) 3ms MaxRSS:31M
+   +- compile test sql-write-team-tests safe aarch64-linux-gnu success 10s MaxRSS:850M
+

@@ -1408,86 +1408,109 @@ test "storage.hot_standby synchronous waits pipeline later commits by lsn" {
 
 test "storage.hot_standby durable outbox recovery does not duplicate an appended batch" {
     const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |via_batch_startup| {
+        var db_path_tmp = try TestDirectory.init("db");
+        defer db_path_tmp.cleanup();
+        const db_path = db_path_tmp.path().ptr;
+        defer cleanupTempDir(db_path);
+        var replication_log_path_tmp = try TestDirectory.init("db");
+        defer replication_log_path_tmp.cleanup();
+        const replication_log_path = replication_log_path_tmp.path().ptr;
+        defer cleanupTempDir(replication_log_path);
+        var replication_slots_path_tmp = try TestDirectory.init("db");
+        defer replication_slots_path_tmp.cleanup();
+        const replication_slots_path = replication_slots_path_tmp.path().ptr;
+        defer cleanupTempDir(replication_slots_path);
 
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var replication_log_path_tmp = try TestDirectory.init("db");
-    defer replication_log_path_tmp.cleanup();
-    const replication_log_path = replication_log_path_tmp.path().ptr;
-    defer cleanupTempDir(replication_log_path);
-    var replication_slots_path_tmp = try TestDirectory.init("db");
-    defer replication_slots_path_tmp.cleanup();
-    const replication_slots_path = replication_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(replication_slots_path);
+        var primary = try hot_standby_primary_mod.Primary.open(alloc, replication_log_path, replication_slots_path, .{
+            .cluster_id = 256,
+            .shard_id = 4,
+            .table_id = 10,
+            .timeline_id = 1,
+            .epoch = 1,
+        }, .{});
+        defer primary.close();
+        try primary.createSlot("standby-a", 0);
 
-    var primary = try hot_standby_primary_mod.Primary.open(alloc, replication_log_path, replication_slots_path, .{
-        .cluster_id = 256,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
+        var mutation_barrier: MutationBarrier = .{};
+        const SyncWait = struct {
+            barrier: *MutationBarrier,
+            captured: bool = false,
+            calls: usize = 0,
 
-    const SyncWait = struct {
-        calls: usize = 0,
+            fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, _: hot_standby_primary_mod.SyncPolicy) !void {
+                const primary_arg: *hot_standby_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                self.captured = false;
+                const worker = try std.Thread.spawn(.{}, capture, .{self});
+                worker.join();
+                try std.testing.expect(self.captured);
+                self.calls += 1;
+                try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
+            }
+            fn capture(self: *@This()) void {
+                if (self.barrier.tryAcquireExclusive()) |lease| {
+                    var owned = lease;
+                    owned.release();
+                    self.captured = true;
+                }
+            }
+        };
+        var wait_state = SyncWait{ .barrier = &mutation_barrier };
+        var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+        const standby_names = [_][]const u8{"standby-a"};
+        var db = try DB.open(alloc, std.mem.span(db_path), .{
+            .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
+            .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
+                .last_lsn = &last_lsn,
+                .mutation_barrier = &mutation_barrier,
+                .sync_policy = .{
+                    .mode = .remote_write,
+                    .standby_names = &standby_names,
+                    .failure_policy = .block,
+                },
+                .sync_wait_ctx = &wait_state,
+                .sync_wait_fn = SyncWait.wait,
+            }),
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        });
+        defer db.close();
 
-        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, _: hot_standby_primary_mod.SyncPolicy) !void {
-            const primary_arg: *hot_standby_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
-        }
-    };
-    var wait_state = SyncWait{};
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
-            .last_lsn = &last_lsn,
-            .sync_policy = .{
-                .mode = .remote_write,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = SyncWait.wait,
-        }),
-        .start_index_workers = false,
-    });
-    defer db.close();
+        const request = types.BatchRequest{
+            .writes = &.{.{ .key = "doc:recovered", .value = "{\"title\":\"recovered\"}" }},
+            .sync_level = .write,
+        };
+        const payload = try replication_effects_mod.encodeBatchMutationRequestAlloc(alloc, request);
+        defer alloc.free(payload);
+        const from_lsn = primary.nextLsn();
+        const outbox = try encodeDurableReplicationOutboxAlloc(alloc, from_lsn, payload);
+        defer alloc.free(outbox);
+        try db.core.store.putBatch(&.{.{ .key = replication_batch_outbox_key, .value = outbox }}, &.{});
+        // Direct fixture insertion bypasses the normal writer publication fence.
+        db.local_execution.durable_replication_outbox_maybe.store(true, .release);
 
-    const request = types.BatchRequest{
-        .writes = &.{.{ .key = "doc:recovered", .value = "{\"title\":\"recovered\"}" }},
-        .sync_level = .write,
-    };
-    const payload = try replication_effects_mod.encodeBatchMutationRequestAlloc(alloc, request);
-    defer alloc.free(payload);
-    const from_lsn = primary.nextLsn();
-    const outbox = try encodeDurableReplicationOutboxAlloc(alloc, from_lsn, payload);
-    defer alloc.free(outbox);
-    try db.core.store.putBatch(&.{.{ .key = replication_batch_outbox_key, .value = outbox }}, &.{});
-    // Direct fixture insertion bypasses the normal writer publication fence.
-    db.local_execution.durable_replication_outbox_maybe.store(true, .release);
+        // Model a crash after the HA append succeeds but before the local outbox
+        // delete commits. Recovery must acknowledge this exact record, not append
+        // the non-idempotent request a second time.
+        const appended_lsn = try @import("effects.zig").appendEncodedBatchMutationRequest(&primary, payload, .{
+            .shard_id = 4,
+            .table_id = 10,
+        });
+        try std.testing.expectEqual(@as(u64, 1), appended_lsn);
+        if (via_batch_startup) {
+            db.local_execution.durable_replication_startup_barrier_pending.store(true, .release);
+            db.async_context.primary_replication_append_pending.store(true, .release);
+            try db.batch(.{ .writes = &.{.{ .key = "doc:next", .value = "{}" }}, .sync_level = .write });
+        } else try engine.test_support.flushDurableReplicationOutboxes(&db);
 
-    // Model a crash after the HA append succeeds but before the local outbox
-    // delete commits. Recovery must acknowledge this exact record, not append
-    // the non-idempotent request a second time.
-    const appended_lsn = try @import("effects.zig").appendEncodedBatchMutationRequest(&primary, payload, .{
-        .shard_id = 4,
-        .table_id = 10,
-    });
-    try std.testing.expectEqual(@as(u64, 1), appended_lsn);
-    try engine.test_support.flushDurableReplicationOutboxes(&db);
-
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), wait_state.calls);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, replication_batch_outbox_key));
+        const expected_lsn: u64 = if (via_batch_startup) 2 else 1;
+        try std.testing.expectEqual(expected_lsn, primary.lastLsn());
+        try std.testing.expectEqual(expected_lsn, last_lsn.load(.acquire));
+        try std.testing.expectEqual(@as(usize, @intCast(expected_lsn)), wait_state.calls);
+        try std.testing.expectEqual(@as(usize, 0), mutation_barrier.reader_count);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, replication_batch_outbox_key));
+    }
 }
 
 test "storage.hot_standby db session sync wait satisfies remote apply through standby DB apply" {
@@ -2094,7 +2117,7 @@ test "storage.hot_standby pending acknowledgement preserves batch and replay tai
     try std.testing.expectEqualStrings("{\"title\":\"pending-tail\"}", local.json);
 }
 
-test "db transaction HA retry drains durable mirror outbox" {
+test "storage.hot_standby transaction HA retry drains durable mirror outbox without blocking capture" {
     const alloc = std.testing.allocator;
     var db_path_tmp = try TestDirectory.init("db");
     defer db_path_tmp.cleanup();
@@ -2118,20 +2141,28 @@ test "db transaction HA retry drains durable mirror outbox" {
     }, .{});
     defer primary.close();
     try primary.createSlot("standby-a", 0);
+    var mutation_barrier: MutationBarrier = .{};
     const AckOnRetry = struct {
+        barrier: *MutationBarrier,
         calls: usize = 0,
         fn wait(ctx: *anyopaque, active_primary_ctx: *anyopaque, target_lsn: u64, _: hot_standby_primary_mod.SyncPolicy) !void {
             const active_primary: *hot_standby_primary_mod.Primary = @ptrCast(@alignCast(active_primary_ctx));
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            // Exercise the real DB resolver on both initial commit and the
+            // no-intents retry after an uncertain remote reply.
+            var capture = self.barrier.tryAcquireExclusive() orelse
+                return error.TransactionResolutionBlockedCapture;
+            capture.release();
             self.calls += 1;
             if (self.calls == 1) return error.InjectedMirrorWaitFailure;
             try active_primary.standbyStatusUpdate("standby-a", 1, target_lsn, target_lsn);
         }
     };
-    var ack = AckOnRetry{};
+    var ack = AckOnRetry{ .barrier = &mutation_barrier };
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
+            .mutation_barrier = &mutation_barrier,
             .sync_policy = .{
                 .mode = .remote_write,
                 .standby_names = &standby_names,
@@ -2152,6 +2183,9 @@ test "db transaction HA retry drains durable mirror outbox" {
     try std.testing.expectError(error.InjectedMirrorWaitFailure, db.commitTransaction(txn_id, 20_001));
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    var pending = try db.core.loadTransactionReplicationOutbox(alloc, txn_id);
+    defer pending.deinit(alloc);
+    try std.testing.expect(pending.batch_payload != null);
 
     const configured_mirror = db.local_execution.replication_async_batch_mirror;
     db.local_execution.replication_async_batch_mirror = null;
@@ -2163,6 +2197,10 @@ test "db transaction HA retry drains durable mirror outbox" {
     try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
     try db.commitTransaction(txn_id, 20_001);
     try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    try std.testing.expectEqual(@as(usize, 2), ack.calls);
+    var remaining = try db.core.loadTransactionReplicationOutbox(alloc, txn_id);
+    defer remaining.deinit(alloc);
+    try std.testing.expect(remaining.batch_payload == null and remaining.replay_payload == null);
 }
 
 test "storage.hot_standby db primary progress sync wait survives primary restart before ack" {
@@ -2652,6 +2690,49 @@ test "storage.hot_standby row policy metadata publication replays with its exact
             .range_end = range.end,
         }).digest(),
     };
+    // Native frame funding must fail before closing the runtime policy gate
+    // or persisting the preparing marker for this committed owner command.
+    var empty: [0]u8 = .{};
+    var deny = std.heap.FixedBufferAllocator.init(&empty);
+    primary.alloc = deny.allocator();
+    defer primary.alloc = alloc;
+    try std.testing.expectError(error.OutOfMemory, owner.applyReplicatedRowPolicyPublication(bundle, request, .{ .term = 3, .index = 11 }));
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.disabled, owner.local_execution.row_policy_gate.currentPhase());
+    try std.testing.expectError(error.NotFound, owner.core.store.get(alloc, row_policy_bundle_mod.pending_key));
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    primary.alloc = alloc;
+    // A configured asynchronous publisher can fail after local policy commit.
+    // Its durable intent must survive until an actual append succeeds.
+    const AppendFailure = struct {
+        fn prepare(mirror: ReplicationAsyncEffectMirror, _: durable_outbox.Kind, _: []const u8, _: DocIdentityNamespace, _: ?@import("antfly_local_sources").common_read_admission.Port) !@import("antfly_local_sources").storage_db_replication_contract.PreparedPublication {
+            return .{ .ptr = mirror.publisher.ptr, .vtable = &.{ .publish = publish, .deinit = deinit } };
+        }
+        fn publish(_: *anyopaque) !u64 {
+            return error.OutOfMemory;
+        }
+        fn deinit(_: *anyopaque) void {}
+        // This injected provider is a different vtable identity; native
+        // telemetry callbacks deliberately reject foreign bindings.
+        fn noteFailure(_: ReplicationAsyncEffectMirror) void {}
+    };
+    const native_mirror = owner.local_execution.replication_async_metadata_mirror.?;
+    var failing_vtable = native_mirror.publisher.vtable.*;
+    failing_vtable.prepare = AppendFailure.prepare;
+    failing_vtable.note_failure = AppendFailure.noteFailure;
+    var failing_mirror = native_mirror;
+    failing_mirror.publisher.vtable = &failing_vtable;
+    owner.local_execution.replication_async_metadata_mirror = failing_mirror;
+    try std.testing.expectError(error.DurabilityOutcomeUnknown, owner.applyReplicatedRowPolicyPublication(bundle, request, .{ .term = 3, .index = 11 }));
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, owner.local_execution.row_policy_gate.currentPhase());
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    {
+        var pending = try @import("antfly_local_sources").storage_db_durable_outbox_store.readPending(alloc, owner.core.store);
+        defer pending.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), pending.entries.len);
+        try std.testing.expectEqual(durable_outbox.Kind.row_policy, try durable_outbox.durableReplicationOutboxKindFromKey(pending.entries[0].key));
+    }
+    owner.local_execution.replication_async_metadata_mirror = native_mirror;
+    try engine.test_support.flushDurableReplicationOutboxes(&owner);
     try std.testing.expect((try owner.applyReplicatedRowPolicyPublication(bundle, request, .{ .term = 3, .index = 11 })) == null);
     try std.testing.expectEqual(@as(u64, 3), primary.lastLsn());
     var policy_entry = (try primary.log.entryAt(alloc, 3)) orelse return error.TestExpectedEqual;
@@ -2704,6 +2785,39 @@ test "storage.hot_standby row policy metadata publication replays with its exact
     try engine.test_support.ensureDurableReplicationStartupBarrier(&reopened);
     try std.testing.expectEqual(@as(u64, 4), primary.lastLsn());
     try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, outbox_key));
+
+    // Staging a successor while the old policy serves also consumes its
+    // transaction before HA publication. Failure must retain that candidate
+    // and its outbox without aborting the already committed transaction.
+    var successor = serving.value;
+    successor.phase = .pending_install;
+    successor.policy_generation = 2;
+    successor.catalog_epoch = 3;
+    const successor_bundle = try std.json.Stringify.valueAlloc(alloc, successor, .{});
+    defer alloc.free(successor_bundle);
+    request.expected_phase = .pending_install;
+    request.expected_generation = 2;
+    request.expected_catalog_epoch = 3;
+    const reopened_native_mirror = reopened.local_execution.replication_async_metadata_mirror.?;
+    reopened.local_execution.replication_async_metadata_mirror = failing_mirror;
+    try std.testing.expectError(error.DurabilityOutcomeUnknown, reopened.applyReplicatedRowPolicyPublication(successor_bundle, request, .{ .term = 3, .index = 13 }));
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, reopened.local_execution.row_policy_gate.currentPhase());
+    try std.testing.expectEqual(@as(u64, 1), reopened.core.table_catalog.row_policy_generation);
+    try std.testing.expectEqual(@as(u64, 4), primary.lastLsn());
+    {
+        var pending = try @import("antfly_local_sources").storage_db_durable_outbox_store.readPending(alloc, reopened.core.store);
+        defer pending.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), pending.entries.len);
+        try std.testing.expectEqual(durable_outbox.Kind.row_policy, try durable_outbox.durableReplicationOutboxKindFromKey(pending.entries[0].key));
+    }
+    const candidate = try reopened.core.store.get(alloc, row_policy_bundle_mod.candidate_key);
+    defer alloc.free(candidate);
+    try std.testing.expectEqualSlices(u8, successor_bundle, candidate);
+    reopened.local_execution.replication_async_metadata_mirror = reopened_native_mirror;
+    try engine.test_support.flushDurableReplicationOutboxes(&reopened);
+    try std.testing.expectEqual(@as(u64, 5), primary.lastLsn());
+    try std.testing.expect((try reopened.applyReplicatedRowPolicyPublication(successor_bundle, request, .{ .term = 3, .index = 13 })) != null);
+    try std.testing.expectEqual(@as(u64, 5), primary.lastLsn());
 }
 
 test "storage.hot_standby db applies batch mutation records through replication session callback" {
@@ -3121,6 +3235,15 @@ test "db graph ttl HA carries primary effects and duplicate receipt across reope
     var clock = platform_clock.ManualClock{};
     clock.setRealtimeNs(candidate.deadline_ns + 1);
     var ttl = TtlCleanupContext{ .batch = engine.test_support.batchContext(&primary), .grace_period_ns = 0, .clock = clock.clock() };
+    var empty: [0]u8 = .{};
+    var deny = std.heap.FixedBufferAllocator.init(&empty);
+    const before_preparation = stream.lastLsn();
+    stream.alloc = deny.allocator();
+    defer stream.alloc = alloc;
+    try std.testing.expectError(error.OutOfMemory, expireGraphTtlCandidateContext(&ttl, candidate));
+    stream.alloc = alloc;
+    try GraphPrimaryPublicationTest.expectCount(&primary, 1);
+    try std.testing.expectEqual(before_preparation, stream.lastLsn());
     wait.fail = true;
     try std.testing.expectError(error.InjectedTtlHAWait, expireGraphTtlCandidateContext(&ttl, candidate));
     const pending = try primary.core.store.scanPrefix(alloc, replication_outbox_v2_prefix);
@@ -3642,4 +3765,7 @@ test "db graph ttl HA retirement preserves different replay progress" {
             try std.testing.expectEqual(@as(usize, 1), renewed.len);
         }
     }
+}
+test {
+    _ = @import("ttl_cleanup_retirement_test.zig");
 }

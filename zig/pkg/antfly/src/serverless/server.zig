@@ -33,9 +33,11 @@ pub const ListenerConfig = struct {
     bind_port: u16 = 0,
     max_request_bytes: usize = 16 * 1024 * 1024,
     max_connections: u32 = 64,
+    /// Idle connections do not expand the bounded application handler lane.
+    max_request_tasks: u32 = 64,
 };
 
-fn listenerHttpxConfig(cfg: ListenerConfig, http_runtime: ?*httpx.HttpRuntime) httpx.ServerConfig {
+pub fn listenerHttpxConfig(cfg: ListenerConfig, http_runtime: ?*httpx.HttpRuntime) httpx.ServerConfig {
     return (httpx.ServerConfig{
         .host = cfg.bind_host,
         .port = cfg.bind_port,
@@ -45,8 +47,39 @@ fn listenerHttpxConfig(cfg: ListenerConfig, http_runtime: ?*httpx.HttpRuntime) h
         // for one maximum-size request to complete without preallocating it.
         .request_body_buffer_budget_bytes = cfg.max_request_bytes *| 2,
         .max_connections = cfg.max_connections,
+        .max_request_tasks = cfg.max_request_tasks,
+        .protected_request_tasks = 4,
+        .is_protected_request = protectedListenerRequest,
         .http_runtime = http_runtime,
     }).normalized();
+}
+
+/// Budget both encoded/decoded input and transport application allocations.
+/// Normalize only after clamping the single-body limit, so normalization cannot
+/// silently expand an aggregate body quota beyond the startup envelope.
+pub fn listenerHttpxConfigWithMemory(cfg: ListenerConfig, bootstrap: runtime_mod.BootstrapConfig, http_runtime: ?*httpx.HttpRuntime) httpx.ServerConfig {
+    const requested_limit: usize = @intCast(bootstrap.max_request_memory_bytes);
+    const control_bytes = @min(4 << 20, requested_limit / 8);
+    const read_reserved = if (bootstrap.runnable_policy) |policy| if (policy.readIsolation()) @import("../common/read_memory.zig").startupReservedBytes(requested_limit - control_bytes) else 0 else 0;
+    const limit = requested_limit - read_reserved;
+    var bounded = cfg;
+    bounded.max_request_bytes = @min(cfg.max_request_bytes, limit / 2);
+    if (bootstrap.runnable_policy) |policy| {
+        const metadata = @import("api/http_handler.zig").HttpHandler.requestRetainedBytes() + @import("api/service.zig").Service.completionRetainedBytes();
+        const input_limit = policy.generalMetadataBytes() -| metadata;
+        bounded.max_request_bytes = @min(bounded.max_request_bytes, std.math.cast(usize, input_limit) orelse std.math.maxInt(usize));
+    }
+    var result = listenerHttpxConfig(bounded, http_runtime);
+    result.request_body_buffer_budget_bytes = @min(result.request_body_buffer_budget_bytes, limit);
+    result.application_memory_budget_bytes = @min(result.application_memory_budget_bytes, limit);
+    result.protected_application_memory_bytes = @min(result.protected_application_memory_bytes, result.application_memory_budget_bytes / 8);
+    return result.normalized();
+}
+
+fn protectedListenerRequest(method: httpx.Method, path: []const u8) bool {
+    // These routes read only fixed runtime state. Diagnostics, catalog/status,
+    // publication and client-supplied priority labels remain ordinary work.
+    return method == .GET and (std.mem.eql(u8, path, "/healthz") or std.mem.eql(u8, path, "/readyz"));
 }
 
 pub const ServerlessServer = struct {
@@ -58,19 +91,22 @@ pub const ServerlessServer = struct {
     listener_task: ?httpx.ListenerTask = null,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, cfg: ServerlessServerConfig) !ServerlessServer {
+        const effective_bootstrap = try @import("runtime/bootstrap.zig").resolveStartupConfig(cfg.bootstrap);
         const stack = try alloc.create(runtime_mod.OwnedStack);
         errdefer alloc.destroy(stack);
-        try stack.init(alloc, cfg.bootstrap, io);
+        try stack.init(alloc, effective_bootstrap, io);
         errdefer stack.deinit();
 
         const http_server = try alloc.create(serverless_http_server.ServerlessHttpServer);
         errdefer alloc.destroy(http_server);
-        http_server.* = serverless_http_server.ServerlessHttpServer.init(alloc, cfg.http, &stack.handler);
+        var http_config = cfg.http;
+        http_config.control_allocator = stack.request_memory.allocator(true);
+        http_server.* = serverless_http_server.ServerlessHttpServer.init(stack.request_memory.allocator(false), http_config, &stack.handler);
 
         const http_runtime = try alloc.create(httpx.HttpRuntime);
         errdefer alloc.destroy(http_runtime);
         const public_server_config: ?httpx.ServerConfig = if (cfg.listener) |listener_cfg|
-            listenerHttpxConfig(listener_cfg, null)
+            listenerHttpxConfigWithMemory(listener_cfg, effective_bootstrap, null)
         else
             null;
         http_runtime.* = httpx.HttpRuntime.init(alloc, .{
@@ -90,6 +126,8 @@ pub const ServerlessServer = struct {
             const listener = try alloc.create(httpx.Server);
             var listener_config = resolved_config;
             listener_config.http_runtime = http_runtime;
+            listener_config.application_allocator = stack.request_memory.allocator(false);
+            listener_config.protected_application_allocator = stack.request_memory.allocator(true);
             listener.* = httpx.Server.initWithConfig(alloc, io, listener_config);
             listener.global(httpx.Handler.bind(http_server, serverless_http_server.ServerlessHttpServer.handleHttpx));
             owned_listener = listener;
@@ -188,11 +226,24 @@ test "serverless server module compiles" {
 
     const normalized = listenerHttpxConfig(.{ .max_connections = 0 }, null);
     try std.testing.expectEqual(@as(u32, 1000), normalized.max_connections);
-    try std.testing.expectEqual(normalized.max_connections, normalized.max_request_tasks);
+    try std.testing.expectEqual(@as(u32, 64), normalized.max_request_tasks);
+    try std.testing.expectEqual(@as(u32, 4), normalized.protected_request_tasks);
+    try std.testing.expect(normalized.is_protected_request.?(.GET, "/healthz"));
+    try std.testing.expect(normalized.is_protected_request.?(.GET, "/readyz"));
+    try std.testing.expect(!normalized.is_protected_request.?(.POST, "/healthz"));
+    try std.testing.expect(!normalized.is_protected_request.?(.GET, "/status"));
+    const tiny = listenerHttpxConfig(.{ .max_connections = 1, .max_request_tasks = 1 }, null);
+    try std.testing.expectEqual(@as(u32, 0), tiny.protected_request_tasks);
+    try std.testing.expectEqual(@as(u32, 1), tiny.max_request_tasks);
     try std.testing.expectEqual(normalized.max_body_size * 2, normalized.request_body_buffer_budget_bytes);
 }
 
 test "serverless server starts managed runtime and serves listener requests" {
+    try managedListenerFixture(false);
+    try managedListenerFixture(true);
+}
+
+fn managedListenerFixture(contended: bool) !void {
     const alloc = std.testing.allocator;
     const serverless_http_client = @import("../serverless_http_client.zig");
     const api_mod = @import("api/mod.zig");
@@ -224,20 +275,92 @@ test "serverless server starts managed runtime and serves listener requests" {
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
+    var cfg: runtime_mod.BootstrapConfig = .{
+        .artifacts_uri = artifacts_uri,
+        .manifests_uri = manifests_uri,
+        .wal_uri = wal_uri,
+        .progress_uri = progress_uri,
+        .catalog_uri = catalog_uri,
+        .query_cache_dir = null,
+        .tick_interval_ms = 1,
+        .role = .combined,
+        .process_memory_limit_bytes = 64 << 20,
+    };
+    if (contended) {
+        cfg.runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .max_bytes = 2 << 20 };
+        cfg.graph_metric_max_parallelism = 2;
+        cfg.max_request_memory_bytes = 8 << 20;
+        cfg.max_retained_memory_bytes = 8 << 20;
+    }
     var server = try ServerlessServer.init(alloc, std.testing.io, .{
-        .bootstrap = .{
-            .artifacts_uri = artifacts_uri,
-            .manifests_uri = manifests_uri,
-            .wal_uri = wal_uri,
-            .progress_uri = progress_uri,
-            .catalog_uri = catalog_uri,
-            .query_cache_dir = null,
-            .tick_interval_ms = 1,
-            .role = .combined,
-        },
+        .bootstrap = cfg,
         .listener = .{},
     });
     defer server.deinit();
+    const scheduler = &server.stack.runnable_scheduler.?;
+    const PhaseProbe = struct {
+        scheduler: *@import("antfly_local_sources").common_request_admission.runnable_scheduler.Scheduler,
+        observed: std.atomic.Value(bool) = .init(false),
+        fn charge(raw: *anyopaque, _: runtime_mod.manager.RuntimeWorkKind, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            while (!self.scheduler.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.scheduler.mutex.unlock();
+            var entry = self.scheduler.entries;
+            while (entry) |owner| : (entry = owner.all_next) {
+                if (owner.class == .background and owner.state == .running) {
+                    try std.testing.expectEqual(@as(usize, 1), owner.slots);
+                    self.observed.store(true, .release);
+                    return;
+                }
+            }
+            return error.MaintenanceOwnerMissing;
+        }
+    };
+    var phase_probe: PhaseProbe = .{ .scheduler = scheduler };
+    if (contended) server.stack.runtime.setWorkCostPort(.{ .ptr = &phase_probe, .charge_fn = PhaseProbe.charge });
+
+    try std.testing.expectEqual(@as(@TypeOf(scheduler.config.capacity_mode), .fixed), scheduler.config.capacity_mode);
+    try std.testing.expect(scheduler.config.max_bytes <= 2 << 20);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.config.cleanup_slots);
+    const transport = server.owned_listener.?.config;
+    try std.testing.expect(transport.request_body_buffer_budget_bytes <= 8 << 20);
+    try std.testing.expect(transport.application_memory_budget_bytes <= 8 << 20);
+    try std.testing.expect(transport.max_body_size * 2 <= transport.request_body_buffer_budget_bytes);
+    try std.testing.expect(transport.protected_application_memory_bytes > 0);
+    try std.testing.expect(server.stack.handler.runnable_scheduler.? == scheduler);
+    try std.testing.expect(server.stack.runtime.runnable_scheduler.? == scheduler);
+    try std.testing.expectEqualDeep(@import("antfly_local_sources").common_config.default_query_waiting, server.stack.handler.query_admission.stats().waiting);
+    const memory = &server.stack.request_memory;
+    const read_reserved = if (server.stack.read_memory) |*pool| blk: {
+        try std.testing.expect(server.stack.handler.read_memory_pool.? == pool);
+        break :blk pool.pinned;
+    } else blk: {
+        try std.testing.expect(!scheduler.config.readIsolation());
+        try std.testing.expect(server.stack.handler.read_memory_pool == null);
+        break :blk @as(usize, 0);
+    };
+    try std.testing.expect(memory.foreground.limit + memory.control.limit + read_reserved <= 8 << 20);
+    try std.testing.expect(transport.application_memory_budget_bytes <= memory.foreground.limit + memory.control.limit);
+    try std.testing.expect(memory.retained.?.limit <= 8 << 20);
+    const pressure = memory.foreground.limit - memory.foreground.stats().used_bytes;
+    try std.testing.expect(memory.foreground.reserve(pressure));
+    var pressure_held = true;
+    defer if (pressure_held) memory.foreground.release(pressure);
+    if (server.stack.read_memory) |*pool| {
+        var read = try @import("../api/runnable_read_resources.zig").Owner.init(pool, 64 << 10);
+        defer read.deinit();
+        try read.start(scheduler, .{ .io = std.testing.io, .retained_bytes = 1024 }, .{ .max_retained_bytes = 1024, .max_wait_ms = 100, .estimated_work_ns = std.time.ns_per_ms }, .{ .io = std.testing.io }, std.time.ns_per_s);
+        const bytes = try read.allocator().dupe(u8, "managed read under ordinary pressure");
+        defer read.allocator().free(bytes);
+        try read.execution.demoteRead(.general);
+        try std.testing.expectEqualStrings("managed read under ordinary pressure", bytes);
+    }
+    var health = try server.owned_http_server.handle(.{ .method = .GET, .uri = "/healthz" });
+    try std.testing.expectEqual(@as(u16, 200), health.status);
+    health.deinit(server.owned_http_server.alloc);
+    try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+    memory.foreground.release(pressure);
+    pressure_held = false;
     try server.start();
     defer server.stop();
 
@@ -246,12 +369,56 @@ test "serverless server starts managed runtime and serves listener requests" {
 
     var client_exec = raft_transport.StdHttpExecutor.init(alloc, .{});
     defer client_exec.deinit();
-    var client = serverless_http_client.ServerlessHttpClient.init(alloc, client_exec.executor());
+    const Observed = struct {
+        inner: raft_transport.RequestExecutor,
+        fn execute(raw: *anyopaque, allocator: std.mem.Allocator, req: raft_transport.HttpRequest) !raft_transport.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const response = try self.inner.execute(allocator, req);
+            if (response.status >= 400) std.debug.print("managed listener {s}: HTTP {d}: {s}\n", .{ req.uri, response.status, response.body });
+            return response;
+        }
+    };
+    var observed: Observed = .{ .inner = client_exec.executor() };
+    var client = serverless_http_client.ServerlessHttpClient.init(alloc, .{ .ptr = &observed, .vtable = &.{ .execute = Observed.execute } });
     const tables = client.tables();
 
     var ensure = try tables.ensure(base_uri, "docs", 100);
     defer ensure.deinit(alloc);
     try std.testing.expect(ensure.created);
+
+    // Leave one general slot available: ingestion must progress while a
+    // separate request holds the other slot required by graph build teams.
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Competing = struct {
+        execution: *Runnable.Execution,
+        stop: std.atomic.Value(bool) = .init(false),
+        work: std.atomic.Value(usize) = .init(0),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                // A real CPU owner must checkpoint: permanently pinning one
+                // slot would starve the queued two-slot maintenance team and
+                // correctly activate the scheduler's backfill-age protection.
+                for (0..256) |_| std.atomic.spinLoopHint();
+                self.execution.checkpoint() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                _ = self.work.fetchAdd(1, .release);
+            }
+        }
+    };
+    var competing: Runnable.Execution = .{};
+    defer competing.finish();
+    var cpu: Competing = .{ .execution = &competing };
+    var cpu_future: ?std.Io.Future(void) = null;
+    defer if (cpu_future) |*future| future.cancel(std.testing.io);
+    if (contended) {
+        try std.testing.expectEqual(@as(usize, 2), server.stack.handler.write_runnable_slots);
+        try std.testing.expectEqual(@as(usize, 2), scheduler.config.generalSlots());
+        try competing.start(scheduler, .{ .io = std.testing.io }, .query);
+        cpu_future = try std.testing.io.concurrent(Competing.run, .{&cpu});
+    }
 
     const mutations = [_]api_mod.TableIngestMutation{
         try api_mod.TableIngestMutation.initUpsert("doc-a", "{\"body\":\"alpha\"}"),
@@ -264,15 +431,43 @@ test "serverless server starts managed runtime and serves listener requests" {
     defer ingest.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), ingest.start_lsn);
 
+    // The native listener and FsWal acknowledge while another CPU owner and
+    // the configured two-slot maintenance team share this same scheduler.
+    if (cpu_future) |*future| {
+        cpu.stop.store(true, .release);
+        future.await(std.testing.io);
+        cpu_future = null;
+        if (cpu.failure) |err| return err;
+        try std.testing.expect(cpu.work.load(.acquire) > 0);
+    }
+    competing.finish();
     try waitForPublishedTable(tables, base_uri, "docs", 1, publish_wait_attempts);
 
     var query = try tables.queryPublished(base_uri, "docs");
     defer query.deinit();
     try std.testing.expectEqual(@as(u64, 1), query.value.version);
     try std.testing.expectEqualStrings("docs", query.value.table_name);
+    if (contended) try std.testing.expect(phase_probe.observed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), query.value.documents.len);
     try std.testing.expectEqualStrings("doc-a", query.value.documents[0].doc_id);
     try std.testing.expectEqualStrings("{\"body\":\"alpha\"}", query.value.documents[0].body);
+
+    const batch_uri = try std.fmt.allocPrint(alloc, "{s}/tables/docs/batch", .{base_uri});
+    defer alloc.free(batch_uri);
+    var batch = try client_exec.executor().execute(alloc, .{
+        .method = .POST,
+        .uri = batch_uri,
+        .content_type = "application/json",
+        .body = "{\"inserts\":{\"doc-b\":{\"body\":\"beta\"}},\"sync_level\":\"full_index\"}",
+    });
+    defer batch.deinit(alloc);
+    if (batch.status != 201) std.debug.print("native public batch HTTP {d}: {s}\n", .{ batch.status, batch.body });
+    try std.testing.expectEqual(@as(u16, 201), batch.status);
+    var updated = try tables.queryPublished(base_uri, "docs");
+    defer updated.deinit();
+    try std.testing.expectEqual(@as(usize, 2), updated.value.documents.len);
+    try std.testing.expectEqualStrings("doc-b", updated.value.documents[1].doc_id);
+    try std.testing.expectEqualStrings("{\"body\":\"beta\"}", updated.value.documents[1].body);
 }
 
 test "serverless server query-only role rejects maintenance routes but serves reads" {

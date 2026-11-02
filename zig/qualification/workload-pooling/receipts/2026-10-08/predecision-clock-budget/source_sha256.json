@@ -1,0 +1,6 @@
+{
+  "zig/pkg/antfly-embedded/src/api/distributed_txn_contract.zig": "574b798b6bd3aefaaa3e00e1ebd79258bbe707e24b56a2cb7c9ff3ea5c5e9bd7",
+  "zig/pkg/antfly-embedded/src/api/table_write_source.zig": "3d9bc2f934a68b12fc49110df95ddaee35119116957895be14ef1de6cef20228",
+  "zig/pkg/antfly-embedded/src/api/routing_budget.zig": "6e479ea6e1cab77eac5c390b21975b10ce1d017aadf4b7a3af2a0607f5f08a8c",
+  "zig/pkg/antfly-embedded/src/table_write_execution_test_root.zig": "0eb3517db2803b87358b065c73200302b3d861ea8d0ebdf78fd12327c037fe1d"
+}

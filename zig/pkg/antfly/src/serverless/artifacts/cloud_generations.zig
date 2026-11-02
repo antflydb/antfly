@@ -22,6 +22,8 @@ const api = @import("store.zig");
 const local = @import("antfly_local_sources");
 const Token = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
+const Context = api.ReadContext;
+const ProviderOps = @import("../provider_operation.zig");
 pub const Ref = local.serverless_manifest_artifact_ref.ProviderGenerationRef;
 pub const max_page_bytes = 1024 * 1024;
 const leaf_records = 128;
@@ -293,6 +295,13 @@ pub const Reader = struct {
         }
     }
     pub fn read(self: *Reader, a: A, ref: Ref, depth: u8, token: Token) !Node {
+        return self.readFor(a, ref, depth, token, .{});
+    }
+    pub fn readFor(self: *Reader, a: A, ref: Ref, depth: u8, token: Token, context: Context) !Node {
+        var receiver = context;
+        if (receiver.io == null and receiver.execution == null) receiver.io = self.io;
+        const op: ProviderOps.Operation = .{ .context = receiver, .cancellation = token };
+        try op.ready();
         try ref.validate();
         try token.check();
         if (ref.byte_len > max_page_bytes) return error.InvalidCloudGenerationMap;
@@ -308,8 +317,7 @@ pub const Reader = struct {
             self.navigation().mu.unlock();
         };
         while (true) {
-            try token.check();
-            lock(&self.navigation().mu);
+            try op.lockAtomic(&self.navigation().mu);
             var locked = true;
             defer if (locked) self.navigation().mu.unlock();
             self.navigation().clock +|= 1;
@@ -322,7 +330,7 @@ pub const Reader = struct {
                     return cloneNode(a, cached.node);
                 }
             };
-            if (self.io) |io| {
+            if (op.context.io != null) {
                 var available: ?usize = null;
                 var waiting = false;
                 for (self.navigation().flights, 0..) |active, index| {
@@ -334,7 +342,7 @@ pub const Reader = struct {
                     _ = self.navigation().coalesced_waits.fetchAdd(1, .monotonic);
                     self.navigation().mu.unlock();
                     locked = false;
-                    try io.sleep(.fromMilliseconds(1), .awake);
+                    try op.sleep(1);
                     continue;
                 }
                 if (available) |index| {
@@ -349,20 +357,21 @@ pub const Reader = struct {
         defer a.free(path);
         var client = self.client;
         client.allocator = a;
-        var result = client.getObject(self.bucket, path, .{ .version_id = ref.generation, .skip_metadata_probe = true, .max_response_bytes = @intCast(ref.byte_len), .cancellation = remote(token) }) catch |err| switch (err) {
+        var result = op.get(&client, self.bucket, path, .{ .version_id = ref.generation, .skip_metadata_probe = true, .max_response_bytes = @intCast(ref.byte_len), .cancellation = op.token() }) catch |err| switch (err) {
             error.FileNotFound, error.NotFound => return error.CloudGenerationMapUnavailable,
             else => return err,
         };
         defer result.deinit(a);
         if (result.body.len != ref.byte_len) return error.ArtifactIntegrityMismatch;
-        try api.validatePayloadSha256WithCancellation(result.body, ref.checksum, token);
+        try api.validatePayloadSha256WithCancellation(result.body, ref.checksum, op.cancellationToken());
+        try op.ready();
         const node = try std.json.parseFromSliceLeaky(Node, a, result.body, .{ .allocate = .alloc_always });
         try node.validate(depth);
         try self.validateDomain(node, ref);
         if (result.body.len > self.cacheLimit()) return node;
         // Distinct cold leaves can use the shared I/O scheduler concurrently.
         // Cache bookkeeping stays serialized; no network request holds its lock.
-        lock(&self.navigation().mu);
+        try op.lockAtomic(&self.navigation().mu);
         defer self.navigation().mu.unlock();
         self.navigation().clock +|= 1;
         for (self.navigation().cache) |entry| if (entry) |cached| {
@@ -439,8 +448,8 @@ pub const Reader = struct {
         for (node.children) |child| if (child.slot == slot(digest, depth)) return .{ .next = try cloneRef(std.heap.page_allocator, child.ref) };
         return .{ .found = null };
     }
-    fn cachedStep(self: *Reader, a: A, ref: Ref, id: []const u8, digest: [32]u8, depth: u8) !?Step {
-        lock(&self.navigation().mu);
+    fn cachedStep(self: *Reader, a: A, ref: Ref, id: []const u8, digest: [32]u8, depth: u8, op: *const ProviderOps.Operation) !?Step {
+        try op.lockAtomic(&self.navigation().mu);
         defer self.navigation().mu.unlock();
         self.navigation().clock +|= 1;
         for (&self.navigation().cache) |*entry| if (entry.*) |*value| {
@@ -453,11 +462,26 @@ pub const Reader = struct {
         return null;
     }
     pub fn lookup(self: *Reader, a: A, id: []const u8, token: Token) !?Record {
-        return self.lookupAt(a, id, self.root, token);
+        return self.lookupFor(a, id, token, .{});
+    }
+    pub fn lookupFor(self: *Reader, a: A, id: []const u8, token: Token, context: Context) !?Record {
+        const op: ProviderOps.Operation = .{ .context = context, .cancellation = token };
+        try op.ready();
+        var result = try self.lookupAtFor(a, id, self.root, token, context);
+        errdefer if (result) |*record| record.deinit(a);
+        try op.ready();
+        return result;
     }
     fn lookupAt(self: *Reader, a: A, id: []const u8, root: ?Ref, token: Token) anyerror!?Record {
+        return self.lookupAtFor(a, id, root, token, .{});
+    }
+    fn lookupAtFor(self: *Reader, a: A, id: []const u8, root: ?Ref, token: Token, context: Context) anyerror!?Record {
+        var receiver = context;
+        if (receiver.io == null and receiver.execution == null) receiver.io = self.io;
+        const op: ProviderOps.Operation = .{ .context = receiver, .cancellation = token };
+        try op.ready();
         _ = try api.sha256ChecksumFromArtifactId(id);
-        for (self.alternatives) |reader| if (try reader.lookup(a, id, token)) |record| return record;
+        for (self.alternatives) |reader| if (try reader.lookupFor(a, id, token, op.context)) |record| return record;
         var ref = root orelse return null;
         const digest = hash(id);
         var memory: local.sql_memory_budget = .{ .backing = self.cache_allocator, .limit = 8 * 1024 * 1024 };
@@ -467,9 +491,9 @@ pub const Reader = struct {
         defer if (owned_ref) |value| freeRef(std.heap.page_allocator, value);
         var depth: u8 = 0;
         while (true) : (depth += 1) {
-            try token.check();
-            const step = (try self.cachedStep(a, ref, id, digest, depth)) orelse cold: {
-                const node = try self.read(arena.allocator(), ref, depth, token);
+            try op.ready();
+            const step = (try self.cachedStep(a, ref, id, digest, depth, &op)) orelse cold: {
+                const node = try self.readFor(arena.allocator(), ref, depth, token, op.context);
                 break :cold try select(node, a, id, digest, depth);
             };
             const retained = switch (step) {
@@ -488,15 +512,21 @@ pub const Reader = struct {
     /// Map pages are reachability roots themselves; records describe versions
     /// but do not retain orphan payloads merely because they share a map page.
     pub fn walk(self: *Reader, a: A, visitor: anytype, token: Token) !void {
-        if (self.root) |root| try self.walkNode(a, root, 0, visitor, token);
+        return self.walkFor(a, visitor, token, .{});
     }
-    fn walkNode(self: *Reader, a: A, ref: Ref, depth: u8, visitor: anytype, token: Token) anyerror!void {
+    pub fn walkFor(self: *Reader, a: A, visitor: anytype, token: Token, context: Context) !void {
+        const op: ProviderOps.Operation = .{ .context = context, .cancellation = token };
+        try op.ready();
+        if (self.root) |root| try self.walkNode(a, root, 0, visitor, token, context);
+        try op.ready();
+    }
+    fn walkNode(self: *Reader, a: A, ref: Ref, depth: u8, visitor: anytype, token: Token, context: Context) anyerror!void {
         try visitor.page(ref);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        const node = try self.read(arena.allocator(), ref, depth, token);
+        const node = try self.readFor(arena.allocator(), ref, depth, token, context);
         for (node.records) |record| try visitor.record(record);
-        for (node.children) |child| try self.walkNode(a, child.ref, depth + 1, visitor, token);
+        for (node.children) |child| try self.walkNode(a, child.ref, depth + 1, visitor, token, context);
     }
 };
 pub const VacuumCut = struct {
@@ -525,9 +555,29 @@ pub const Writer = struct {
     pending: std.ArrayList(Record) = .empty,
     mu: std.atomic.Mutex = .unlocked,
     io: ?std.Io = null,
-    flush_mu: std.Io.Mutex = .init,
+    flushing: bool = false,
     active: std.atomic.Value(u32) = .init(0),
     vacuum_progress: local.metadata_lake_index_catalog.CloudVacuumProgress = .{},
+    const Authority = struct {
+        writer: *Writer,
+        incoming: Token,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            try self.incoming.check();
+            try self.writer.cancellation.check();
+        }
+        fn token(self: *const @This()) Token {
+            return .{ .ptr = self, .check_fn = check };
+        }
+    };
+    fn operation(self: *Writer, token: Token, context: Context) !ProviderOps.Operation {
+        var receiver = context;
+        if (receiver.io == null) {
+            if (receiver.execution != null) return error.BackendRuntimeIoUnavailable;
+            receiver.io = try self.operationIo();
+        }
+        return .{ .context = receiver, .cancellation = token };
+    }
     fn operationIo(self: *Writer) !std.Io {
         return self.io orelse (if (@import("builtin").is_test) std.testing.io else return error.UnsupportedOperation);
     }
@@ -537,30 +587,45 @@ pub const Writer = struct {
         return if (self.reader.root) |root| try cloneRef(std.heap.page_allocator, root) else null;
     }
     pub fn deinit(self: *Writer) void {
+        std.debug.assert(self.active.load(.acquire) == 0 and !self.flushing);
         self.reader.deinit();
         for (self.pending.items) |*record| record.deinit(self.a);
         self.pending.deinit(self.a);
         if (self.reader.root) |root| freeRef(self.a, root);
     }
     pub fn lookup(self: *Writer, a: A, id: []const u8, token: Token) !?Record {
+        return self.lookupFor(a, id, token, .{});
+    }
+    pub fn lookupFor(self: *Writer, a: A, id: []const u8, incoming: Token, context: Context) !?Record {
+        const authority: Authority = .{ .writer = self, .incoming = incoming };
+        const token = authority.token();
+        const op = try self.operation(token, context);
+        try op.ready();
         const root: ?Ref = held: {
-            lock(&self.mu);
+            try op.lockAtomic(&self.mu);
             defer self.mu.unlock();
             for (self.pending.items) |record| if (std.mem.eql(u8, record.id, id)) return try record.clone(a);
             break :held if (self.reader.root) |ref| try cloneRef(std.heap.page_allocator, ref) else null;
         };
         defer if (root) |ref| freeRef(std.heap.page_allocator, ref);
-        return self.reader.lookupAt(a, id, root, token);
+        var result = try self.reader.lookupAtFor(a, id, root, token, op.context);
+        errdefer if (result) |*record| record.deinit(a);
+        try op.ready();
+        return result;
     }
     pub fn capture(self: *Writer, id: []const u8, bytes: u64, generation: ?[]const u8, incoming: Token) !void {
+        return self.captureFor(id, bytes, generation, incoming, .{});
+    }
+    pub fn captureFor(self: *Writer, id: []const u8, bytes: u64, generation: ?[]const u8, incoming: Token, context: Context) !void {
         _ = self.active.fetchAdd(1, .acq_rel);
         defer _ = self.active.fetchSub(1, .acq_rel);
-        try incoming.check();
-        const token = if (incoming.ptr != null) incoming else self.cancellation;
-        try token.check();
+        const authority: Authority = .{ .writer = self, .incoming = incoming };
+        const token = authority.token();
+        const op = try self.operation(token, context);
+        try op.ready();
         const version = generation orelse "";
         {
-            lock(&self.mu);
+            try op.lockAtomic(&self.mu);
             defer self.mu.unlock();
             if (self.disabled) return;
             if (version.len == 0 or std.mem.eql(u8, version, "null")) {
@@ -581,7 +646,7 @@ pub const Writer = struct {
         // publication of an immutable root require the short bookkeeping lock.
         const root = try self.rootSnapshot();
         defer if (root) |ref| freeRef(std.heap.page_allocator, ref);
-        if (try self.reader.lookupAt(std.heap.page_allocator, id, root, token)) |previous| {
+        if (try self.reader.lookupAtFor(std.heap.page_allocator, id, root, token, op.context)) |previous| {
             var prior = previous;
             defer prior.deinit(std.heap.page_allocator);
             if (prior.bytes != bytes) return error.ArtifactIntegrityMismatch;
@@ -590,17 +655,22 @@ pub const Writer = struct {
         if (self.qualified_retention) {
             const path = try key(std.heap.page_allocator, self.reader.prefix, id);
             defer std.heap.page_allocator.free(path);
-            if (try self.reader.client.versionRetention(self.reader.bucket, path, version, remote(token))) |proof| record.retention_until_ms = proof.until_ms;
+            const proof = self.reader.client.versionRetention(self.reader.bucket, path, version, op.token()) catch |err| {
+                try op.check();
+                return err;
+            };
+            try op.ready();
+            if (proof) |value| record.retention_until_ms = value.until_ms;
         }
         const should_flush = appended: while (true) {
-            lock(&self.mu);
+            try op.lockAtomic(&self.mu);
             if (self.disabled) {
                 self.mu.unlock();
                 return;
             }
             if (self.pending.items.len >= leaf_records * 2) {
                 self.mu.unlock();
-                try self.flush(token);
+                try self.flushFor(token, op.context);
                 continue;
             }
             defer self.mu.unlock();
@@ -617,7 +687,7 @@ pub const Writer = struct {
             };
             break :appended self.pending.items.len >= leaf_records;
         };
-        if (should_flush) try self.flush(token);
+        if (should_flush) try self.flushFor(token, op.context);
     }
     pub fn rebase(self: *Writer) void {
         lock(&self.mu);
@@ -630,28 +700,54 @@ pub const Writer = struct {
         self.complete = true;
     }
     pub fn finish(self: *Writer, token: Token) !?Ref {
-        try token.check();
-        const io = try self.operationIo();
-        // Callers stop submitting uploads before this publication barrier.
-        while (self.active.load(.acquire) != 0) {
-            try token.check();
-            try io.sleep(.fromMilliseconds(1), .awake);
+        return self.finishFor(token, .{});
+    }
+    pub fn finishFor(self: *Writer, incoming: Token, context: Context) !?Ref {
+        const authority: Authority = .{ .writer = self, .incoming = incoming };
+        const token = authority.token();
+        const op = try self.operation(token, context);
+        try op.ready();
+        while (self.active.load(.acquire) != 0) try op.sleep(1);
+        try self.flushFor(token, op.context);
+        try op.lockAtomic(&self.mu);
+        const result = if (self.reader.root) |root| cloneRef(self.a, root) catch |err| {
+            self.mu.unlock();
+            return err;
+        } else null;
+        self.mu.unlock();
+        errdefer if (result) |root| freeRef(self.a, root);
+        try op.ready();
+        return result;
+    }
+    fn acquireFlush(self: *Writer, op: *const ProviderOps.Operation) !void {
+        while (true) {
+            try op.lockAtomic(&self.mu);
+            if (!self.flushing) {
+                self.flushing = true;
+                self.mu.unlock();
+                return;
+            }
+            self.mu.unlock();
+            try op.sleep(1);
         }
-        try self.flush(token);
+    }
+    fn releaseFlush(self: *Writer) void {
         lock(&self.mu);
-        defer self.mu.unlock();
-        return if (self.reader.root) |root| try cloneRef(self.a, root) else null;
+        self.flushing = false;
+        self.mu.unlock();
     }
     fn flush(self: *Writer, token: Token) !void {
-        const io = try self.operationIo();
-        // Waiting flushers suspend; network I/O never holds the spinlock.
-        try self.flush_mu.lock(io);
-        defer self.flush_mu.unlock(io);
+        return self.flushFor(token, .{});
+    }
+    fn flushFor(self: *Writer, token: Token, context: Context) !void {
+        const op = try self.operation(token, context);
+        try self.acquireFlush(&op);
+        defer self.releaseFlush();
         var batch: std.ArrayList(Record) = .empty;
         const root: ?Ref = detached: {
-            lock(&self.mu);
+            try op.lockAtomic(&self.mu);
             defer self.mu.unlock();
-            if (self.disabled or self.pending.items.len == 0) return;
+            if (self.disabled or self.pending.items.len == 0) break :detached null;
             batch = self.pending;
             self.pending = .empty;
             break :detached self.reader.root;
@@ -660,32 +756,52 @@ pub const Writer = struct {
             for (batch.items) |*record| record.deinit(self.a);
             batch.deinit(self.a);
         }
-        const next = self.update(root, batch.items, 0, token) catch |err| {
+        if (batch.items.len == 0) {
+            try op.ready();
+            return;
+        }
+        errdefer {
             lock(&self.mu);
-            defer self.mu.unlock();
             self.complete = false;
-            self.disabled = true; // failed journals can never claim completeness
+            self.disabled = true;
+            self.mu.unlock();
+        }
+        const next = self.updateFor(root, batch.items, 0, token, op.context) catch |err| {
+            lock(&self.mu);
+            self.complete = false;
+            self.disabled = true;
+            self.mu.unlock();
             if (err == error.ProviderGenerationUnavailable) return;
             return err;
         };
-        lock(&self.mu);
-        defer self.mu.unlock();
+        var installed = false;
+        errdefer if (!installed) freeRef(self.a, next);
+        try op.lockAtomic(&self.mu);
         if (self.reader.root) |old| freeRef(self.a, old);
         self.reader.root = next;
+        installed = true;
+        self.mu.unlock();
+        try op.ready();
     }
     pub fn vacuum(self: *Writer, store: *api.ArtifactStore, cut: VacuumCut, progress: local.metadata_lake_index_catalog.CloudVacuumProgress, token: Token) !local.metadata_lake_index_catalog.CloudVacuumProgress {
+        return self.vacuumFor(store, cut, progress, token, .{});
+    }
+    pub fn vacuumFor(self: *Writer, store: *api.ArtifactStore, cut: VacuumCut, progress: local.metadata_lake_index_catalog.CloudVacuumProgress, incoming: Token, context: Context) !local.metadata_lake_index_catalog.CloudVacuumProgress {
+        const authority: Authority = .{ .writer = self, .incoming = incoming };
+        const token = authority.token();
+        const op = try self.operation(token, context);
+        try self.acquireFlush(&op);
+        defer self.releaseFlush();
         try token.check();
         try cut.validate();
         if (!std.mem.eql(u8, &cut.domain, &self.scope.domain)) return error.InvalidCloudGenerationMap;
-        const io = try self.operationIo();
-        try self.flush_mu.lock(io);
-        defer self.flush_mu.unlock(io);
         const proof = try cut.fingerprint(self.a);
         const same_proof = progress.cutoff == cut.cutoff and progress.proof != null and std.mem.eql(u8, &progress.proof.?, &proof);
         const root = self.reader.root orelse return .{ .cutoff = cut.cutoff, .proof = proof, .done = true };
         if (same_proof and progress.done) return progress;
         const State = struct {
             writer: *Writer,
+            context: Context,
             cut: VacuumCut,
             after: ?[32]u8,
             last: ?[32]u8,
@@ -708,7 +824,7 @@ pub const Writer = struct {
                 var arena = std.heap.ArenaAllocator.init(v.writer.a);
                 defer arena.deinit();
                 const a = arena.allocator();
-                const node = try v.writer.reader.read(a, ref, depth, v.token);
+                const node = try v.writer.reader.readFor(a, ref, depth, v.token, v.context);
                 if (node.leaf) {
                     v.leaves -= 1;
                     var kept: std.ArrayList(Record) = .empty;
@@ -726,7 +842,7 @@ pub const Writer = struct {
                     }
                     if (kept.items.len == node.records.len) return try cloneRef(v.writer.a, ref);
                     if (kept.items.len == 0) return null;
-                    return try v.writer.publish(.{ .depth = depth, .leaf = true, .records = kept.items }, v.token);
+                    return try v.writer.publishFor(.{ .depth = depth, .leaf = true, .records = kept.items }, v.token, v.context);
                 }
                 var children: std.ArrayList(Child) = .empty;
                 defer for (children.items) |child| freeRef(v.writer.a, child.ref);
@@ -744,29 +860,38 @@ pub const Writer = struct {
                 }
                 if (!changed) return try cloneRef(v.writer.a, ref);
                 if (children.items.len == 0) return null;
-                return try v.writer.publish(.{ .depth = depth, .leaf = false, .children = children.items }, v.token);
+                return try v.writer.publishFor(.{ .depth = depth, .leaf = false, .children = children.items }, v.token, v.context);
             }
         };
         var reads: u64 = 16 * 1024 * 1024;
         var writes: u64 = 0;
-        var pages: @import("../graph_segment/page_store.zig").PageStore = .{ .domain = cut.domain, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        var pages: @import("../graph_segment/page_store.zig").PageStore = .{ .domain = cut.domain, .artifacts = store, .read_context = op.context, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
         var cache: @import("../graph_segment/page_tree.zig").Cache = .{ .alloc = self.a, .underlying = pages.store() };
         defer cache.deinit();
         // Cursors prove work only under the complete GC evidence. A new
         // mark root can retire records without changing the generation cutoff.
         // Legacy cursors have no proof and restart safely.
         const after = if (same_proof and !progress.done) progress.after else null;
-        var state: State = .{ .writer = self, .cut = cut, .after = after, .last = after, .token = token, .marks = cache.store() };
+        var state: State = .{ .writer = self, .context = op.context, .cut = cut, .after = after, .last = after, .token = token, .marks = cache.store() };
         const next = try state.prune(root, 0, @splat(0));
         // A failed pass leaves the old root and cursor intact. Readers retain
         // their own immutable map roots; only this new publication is vacuumed.
-        lock(&self.mu);
-        defer self.mu.unlock();
+        var installed = false;
+        errdefer if (!installed) if (next) |ref| freeRef(self.a, ref);
+        try op.lockAtomic(&self.mu);
         freeRef(self.a, self.reader.root.?);
         self.reader.root = next;
+        installed = true;
+        self.mu.unlock();
+        try op.ready();
         return .{ .cutoff = cut.cutoff, .proof = proof, .after = state.last, .done = state.done };
     }
     fn update(self: *Writer, old: ?Ref, changes: []const Record, depth: u8, token: Token) anyerror!Ref {
+        return self.updateFor(old, changes, depth, token, .{});
+    }
+    fn updateFor(self: *Writer, old: ?Ref, changes: []const Record, depth: u8, token: Token, context: Context) anyerror!Ref {
+        const op = try self.operation(token, context);
+        try op.ready();
         try token.check();
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -775,7 +900,7 @@ pub const Writer = struct {
         lock(&self.reader.navigation().mu);
         self.reader.remaining_bytes = std.math.maxInt(u64);
         self.reader.navigation().mu.unlock();
-        const node: Node = if (old) |ref| try self.reader.read(a, ref, depth, token) else .{ .depth = depth, .leaf = true };
+        const node: Node = if (old) |ref| try self.reader.readFor(a, ref, depth, token, op.context) else .{ .depth = depth, .leaf = true };
         if (node.leaf) {
             var entries: std.StringHashMapUnmanaged(Record) = .empty;
             for (node.records) |record| try entries.put(a, record.id, record);
@@ -791,13 +916,128 @@ pub const Writer = struct {
                     return std.mem.order(u8, l.id, r.id) == .lt;
                 }
             }.less);
-            if (records.len <= leaf_records) return self.publish(.{ .depth = depth, .leaf = true, .records = records }, token);
+            if (records.len <= leaf_records) return self.publishFor(.{ .depth = depth, .leaf = true, .records = records }, token, op.context);
             if (depth == 64) return error.InvalidCloudGenerationMap;
-            return self.branch(&.{}, records, depth, token);
+            return self.branchFor(&.{}, records, depth, token, op.context);
         }
-        return self.branch(node.children, changes, depth, token);
+        return self.branchFor(node.children, changes, depth, token, op.context);
     }
-    fn branch(self: *Writer, previous: []const Child, changes: []const Record, depth: u8, token: Token) !Ref {
+    fn branchFor(self: *Writer, previous: []const Child, changes: []const Record, depth: u8, token: Token, context: Context) !Ref {
+        if (context.execution == null) return self.branchLegacy(previous, changes, depth, token);
+        const Runnable = local.common_request_admission.runnable_scheduler;
+        const op = try self.operation(token, context);
+        try op.ready();
+        const io = try op.receiver();
+        const parent = context.execution.?;
+        const class = try parent.retainedClass();
+        const Work = struct {
+            writer: *Writer,
+            prior: ?Ref,
+            records: []const Record,
+            depth: u8,
+            token: Token,
+            context: Context,
+            execution: Runnable.Execution = .{},
+            output: ?Ref = null,
+            failure: ?anyerror = null,
+            fn run(job: *@This()) void {
+                job.execution.activateChild() catch |err| {
+                    job.failure = err;
+                    return;
+                };
+                defer job.execution.park(.resource_blocked) catch {};
+                const child_context = job.context.withExecution(&job.execution);
+                job.output = job.writer.updateFor(job.prior, job.records, job.depth, job.token, child_context) catch |err| {
+                    job.failure = err;
+                    return;
+                };
+            }
+        };
+        var counts: [16]usize = @splat(0);
+        for (changes) |record| counts[slot(hash(record.id), depth)] += 1;
+        var offsets: [16]usize = undefined;
+        var total: usize = 0;
+        for (counts, 0..) |length, index| {
+            offsets[index] = total;
+            total += length;
+        }
+        const partitioned = try self.a.alloc(Record, changes.len);
+        defer self.a.free(partitioned);
+        var positions = offsets;
+        for (changes) |record| {
+            const index = slot(hash(record.id), depth);
+            partitioned[positions[index]] = record;
+            positions[index] += 1;
+        }
+        var work: [8]Work = undefined;
+        var reserved: usize = 0;
+        defer for (work[0..reserved]) |*job| {
+            job.execution.finish();
+            if (job.output) |ref| freeRef(self.a, ref);
+        };
+        var indexes: [16]?usize = @splat(null);
+        var owned: [16]?Ref = @splat(null);
+        defer for (owned) |value| if (value) |ref| freeRef(self.a, ref);
+        for (counts, 0..) |length, index| {
+            if (length == 0) continue;
+            const prior = for (previous) |child| {
+                if (child.slot == index) break child.ref;
+            } else null;
+            const records = partitioned[offsets[index]..][0..length];
+            if (depth == 0 and reserved < work.len) {
+                work[reserved] = .{ .writer = self, .prior = prior, .records = records, .depth = depth + 1, .token = token, .context = context };
+                work[reserved].execution.reserveChild(parent, io, @sizeOf(Work) + 2 * max_page_bytes) catch |err| switch (err) {
+                    error.SchedulerFull, error.ResourceTemporarilyUnavailable => {
+                        work[reserved].execution.finish();
+                        continue;
+                    },
+                    else => return err,
+                };
+                indexes[index] = reserved;
+                reserved += 1;
+            }
+        }
+        if (reserved != 0) {
+            // The flush owner holds only a logical claim. Every contender
+            // releases CPU before polling it, and children never need it.
+            try parent.park(.resource_blocked);
+            var group: std.Io.Group = .init;
+            for (work[0..reserved]) |*job| group.async(io, Work.run, .{job});
+            const joined = group.await(io);
+            if (joined) |_| {} else |_| group.cancel(io);
+            for (work[0..reserved]) |*job| job.execution.finish();
+            parent.enter(class) catch |err| {
+                try op.check();
+                return err;
+            };
+            try op.ready();
+            try joined;
+            for (work[0..reserved]) |job| if (job.failure) |err| return err;
+        }
+        // The process envelope funds the available fanout. Run unfunded
+        // branches on the original admitted caller after its children drain,
+        // so reserved children never wait behind inline provider I/O.
+        for (counts, 0..) |length, index| {
+            if (length == 0 or indexes[index] != null) continue;
+            const prior = for (previous) |child| {
+                if (child.slot == index) break child.ref;
+            } else null;
+            owned[index] = try self.updateFor(prior, partitioned[offsets[index]..][0..length], depth + 1, token, context);
+        }
+        try op.ready();
+        var children: [16]Child = undefined;
+        var count: usize = 0;
+        for (0..16) |index| {
+            const prior = for (previous) |child| {
+                if (child.slot == index) break child.ref;
+            } else null;
+            const ref = if (indexes[index]) |i| work[i].output.? else owned[index] orelse prior orelse continue;
+            children[count] = .{ .slot = @intCast(index), .ref = ref };
+            count += 1;
+        }
+        return self.publishFor(.{ .depth = depth, .leaf = false, .children = children[0..count] }, token, context);
+    }
+    fn branchLegacy(self: *Writer, previous: []const Child, changes: []const Record, depth: u8, token: Token) !Ref {
         const scheduler = local.sql_parallel_scheduler;
         const Worker = struct {
             fn run(writer: *Writer, prior: ?Ref, selected: []const Record, level: u8, cancellation: Token) anyerror!Ref {
@@ -868,6 +1108,11 @@ pub const Writer = struct {
         return self.publish(.{ .depth = depth, .leaf = false, .children = children[0..count] }, token);
     }
     fn publish(self: *Writer, node: Node, token: Token) !Ref {
+        return self.publishFor(node, token, .{});
+    }
+    fn publishFor(self: *Writer, node: Node, token: Token, context: Context) !Ref {
+        const op = try self.operation(token, context);
+        try op.ready();
         try node.validate(node.depth);
         const bytes = try std.json.Stringify.valueAlloc(self.a, node, .{});
         defer self.a.free(bytes);
@@ -880,9 +1125,9 @@ pub const Writer = struct {
         defer self.a.free(path);
         var client = self.reader.client;
         client.allocator = self.a;
-        var result = client.putObject(self.reader.bucket, path, bytes, .{ .if_none_match = true, .cancellation = remote(token) }) catch |err| switch (err) {
+        var result = op.put(&client, self.reader.bucket, path, bytes, .{ .if_none_match = true, .cancellation = op.token() }) catch |err| switch (err) {
             error.PreconditionFailed => existing: {
-                var object = try client.getObject(self.reader.bucket, path, .{ .max_response_bytes = bytes.len, .cancellation = remote(token) });
+                var object = try op.get(&client, self.reader.bucket, path, .{ .max_response_bytes = bytes.len, .cancellation = op.token() });
                 defer object.deinit(self.a);
                 if (!std.mem.eql(u8, object.body, bytes)) return error.ArtifactIntegrityMismatch;
                 break :existing objectstore.PutResult{ .version_id = if (object.metadata.version_id) |value| try self.a.dupe(u8, value) else null };
@@ -895,7 +1140,11 @@ pub const Writer = struct {
         var until: u64 = std.math.maxInt(u64);
         for (node.records) |record| until = @min(until, record.retention_until_ms);
         for (node.children) |child| until = @min(until, child.ref.retention_until_ms);
-        const proof = if (self.qualified_retention) try client.versionRetention(self.reader.bucket, path, generation, remote(token)) else null;
+        const proof = if (self.qualified_retention) client.versionRetention(self.reader.bucket, path, generation, op.token()) catch |err| {
+            try op.check();
+            return err;
+        } else null;
+        try op.ready();
         until = @min(until, if (proof) |value| value.until_ms else 0);
         return cloneRef(self.a, .{ .artifact_id = &id, .checksum = &checksum, .byte_len = bytes.len, .generation = generation, .retention_until_ms = until });
     }
@@ -1424,4 +1673,325 @@ test "external lake metadata navigation pool reclaims idle scopes before owner a
     try std.testing.expectEqual(@as(usize, 2), next.refs.load(.acquire));
     next.release();
     (try pool.acquire(@splat(3))).release();
+}
+
+test "serverless execution generation reads coalesce without borrowing another caller's lifetime" {
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const maintenance = @import("../maintenance_cancellation.zig");
+    const Object = @import("object_store.zig").ObjectStore;
+    const Mode = enum { success, canceled, deadline };
+    const Gate = struct {
+        io: std.Io,
+        arrived: std.atomic.Value(usize) = .init(0),
+        release: std.Io.Event = .unset,
+        fn get(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.arrived.fetchAdd(1, .acq_rel) == 0) self.release.waitUncancelable(self.io);
+        }
+    };
+    const Job = struct {
+        store: *api.ArtifactStore,
+        artifact: api.ArtifactMetadata,
+        context: Context,
+        output: ?[]u8 = null,
+        failure: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            // The completed worker retains its execution and result through
+            // physical join, but cannot pin CPU while its peer returns.
+            defer if (self.context.execution) |execution| execution.park(.resource_blocked) catch {};
+            self.output = self.store.getVerifiedAllocFor(std.testing.allocator, self.artifact.artifact_id, self.artifact.byte_len, self.artifact.checksum, .none, self.context) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for (std.enums.values(Mode)) |mode| {
+        var provider = @import("cloud_generations_test_provider.zig").Provider.init(a);
+        defer provider.deinit();
+        var client = provider.client();
+        try client.makeBucket("bucket");
+        const scope = try api.UploadScope.forPublication(@splat(1), 1, io);
+        var writer: Writer = .{ .a = a, .io = io, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .scope = scope, .complete = true };
+        defer writer.deinit();
+        var object = try Object.initWithClientOptions(a, client, "bucket", "native", .{});
+        defer object.deinit();
+        object.cloud_writer = &writer;
+        var artifacts = object.artifactStore();
+        artifacts.upload_scope = scope;
+        var artifact = try artifacts.put("published immutable payload");
+        defer artifact.deinit(a);
+        object.cloud_writer = null;
+        const root = (try writer.finish(.none)).?;
+        defer freeRef(a, root);
+        var pool: NavigationPool = .{};
+        defer pool.deinit();
+        var one: Reader = .{ .io = io, .client = client, .bucket = "bucket", .prefix = "native", .root = root, .complete = true, .shared = try pool.acquire(@splat(5)) };
+        defer one.deinit();
+        var two: Reader = .{ .io = io, .client = client, .bucket = "bucket", .prefix = "native", .root = root, .complete = true, .shared = try pool.acquire(@splat(5)) };
+        defer two.deinit();
+        var other = try Object.initWithClientOptions(a, client, "bucket", "native", .{ .read_only = true });
+        defer other.deinit();
+        object.cloud_reader = &one;
+        other.cloud_reader = &two;
+        var first_store = object.artifactStore();
+        var second_store = other.artifactStore();
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .publication_slots = 1, .read_isolation = false, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var leader: Runnable.Execution = .{};
+        defer leader.finish();
+        try leader.start(&scheduler, .{ .io = io }, .query);
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var bridge: maintenance.GraphBridge = .{ .maintenance = .{ .io = io, .execution = &leader, .requested = &canceled, .deadline_ns = if (mode == .deadline) @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s else null } };
+        var gate: Gate = .{ .io = io };
+        provider.get_hook = .{ .ptr = &gate, .call = Gate.get };
+        defer provider.get_hook = null;
+        var first: Job = .{ .store = &first_store, .artifact = artifact, .context = bridge.readContext() };
+        defer if (first.output) |bytes| a.free(bytes);
+        var first_task = try io.concurrent(Job.run, .{&first});
+        defer {
+            gate.release.set(io);
+            first_task.cancel(io);
+        }
+        const until = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (gate.arrived.load(.acquire) == 0) {
+            if (first.done.load(.acquire)) return first.failure orelse error.GenerationProviderWasNotEntered;
+            if (@import("antfly_platform").time.monotonicNs() >= until) return error.GenerationProviderWasNotEntered;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        var waiter: Runnable.Execution = .{};
+        defer waiter.finish();
+        try waiter.start(&scheduler, .{ .io = io, .deadline_ns = until }, .query);
+        var second: Job = .{ .store = &second_store, .artifact = artifact, .context = (Context{ .io = io }).withExecution(&waiter) };
+        defer if (second.output) |bytes| a.free(bytes);
+        var second_task = try io.concurrent(Job.run, .{&second});
+        defer {
+            gate.release.set(io);
+            second_task.cancel(io);
+        }
+        while (one.navigation().coalesced_waits.load(.acquire) == 0) {
+            if (second.done.load(.acquire)) return second.failure orelse error.GenerationReadDidNotCoalesce;
+            if (@import("antfly_platform").time.monotonicNs() >= until) return error.GenerationReadDidNotCoalesce;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 1), gate.arrived.load(.acquire));
+        var unrelated: Runnable.Execution = .{};
+        defer unrelated.finish();
+        try unrelated.start(&scheduler, .{ .io = io, .deadline_ns = until }, .query);
+        unrelated.finish();
+        var health: Runnable.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        if (mode == .canceled) canceled.store(true, .release);
+        if (mode == .deadline) while (@import("antfly_platform").time.monotonicNs() < bridge.maintenance.?.deadline_ns.?) try io.sleep(.fromMilliseconds(1), .awake);
+        if (mode != .success) {
+            try io.sleep(.fromMilliseconds(3), .awake);
+            try std.testing.expect(!first.done.load(.acquire));
+        }
+        gate.release.set(io);
+        first_task.await(io);
+        second_task.await(io);
+        if (mode == .success) {
+            if (first.failure) |err| return err;
+        } else try std.testing.expectEqual(if (mode == .canceled) error.Canceled else error.DeadlineExceeded, first.failure.?);
+        if (second.failure) |err| {
+            std.debug.print("generation waiter mode={s} failed={s}\n", .{ @tagName(mode), @errorName(err) });
+            return err;
+        }
+        try std.testing.expectEqualStrings("published immutable payload", second.output.?);
+        leader.finish();
+        try std.testing.expectError(error.InvalidRunnableTransition, one.lookupFor(a, artifact.artifact_id, .none, (Context{ .io = io }).withExecution(&leader)));
+        waiter.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "serverless execution generation flush owns bounded children and preserves the old map on refusal" {
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const maintenance = @import("../maintenance_cancellation.zig");
+    const Object = @import("object_store.zig").ObjectStore;
+    const Mode = enum { success, canceled, deadline, provider_failed };
+    const Gate = struct {
+        io: std.Io,
+        fail: bool,
+        arrived: std.atomic.Value(usize) = .init(0),
+        active: std.atomic.Value(usize) = .init(0),
+        release: std.Io.Event = .unset,
+        fn put(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.active.fetchAdd(1, .acq_rel);
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            _ = self.arrived.fetchAdd(1, .acq_rel);
+            self.release.waitUncancelable(self.io);
+            if (self.fail) return error.TestWriteFailed;
+        }
+        fn selected(scope: api.UploadScope, bytes: []const u8) !bool {
+            const digest = std.fmt.bytesToHex(hash(bytes), .lower);
+            const id = try scope.artifactId(&digest);
+            return slot(hash(&id), 0) < 8;
+        }
+    };
+    const Job = struct {
+        store: *api.ArtifactStore,
+        body: []const u8,
+        output: ?api.ArtifactMetadata = null,
+        failure: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.output = self.store.put(self.body) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for (std.enums.values(Mode)) |mode| {
+        var provider = @import("cloud_generations_test_provider.zig").Provider.init(a);
+        defer provider.deinit();
+        var client = provider.client();
+        try client.makeBucket("bucket");
+        const scope = try api.UploadScope.forPublication(@splat(1), 1, io);
+        var memory: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = a };
+        var writer: Writer = .{ .a = memory.allocator(), .io = io, .reader = .{ .io = io, .client = client, .bucket = "bucket", .prefix = "native" }, .scope = scope, .complete = true };
+        defer writer.deinit();
+        var object = try Object.initWithClientOptions(a, client, "bucket", "native", .{});
+        defer object.deinit();
+        object.cloud_writer = &writer;
+        var store = object.artifactStore();
+        store.upload_scope = scope;
+        var base_buffer: [64]u8 = undefined;
+        var base_number: usize = 0;
+        const base_body = while (true) : (base_number += 1) {
+            const body = try std.fmt.bufPrint(&base_buffer, "base payload {d}", .{base_number});
+            if (try Gate.selected(scope, body)) break body;
+        };
+        var base = try store.put(base_body);
+        defer base.deinit(a);
+        const original = (try writer.finish(.none)).?;
+        defer freeRef(writer.a, original);
+        var index: usize = 0;
+        while (writer.pending.items.len < 127) : (index += 1) {
+            var bytes: [64]u8 = undefined;
+            const text = try std.fmt.bufPrint(&bytes, "prepared generation {d}", .{index});
+            if (!try Gate.selected(scope, text)) continue;
+            const id = try scope.artifactId(&std.fmt.bytesToHex(hash(text), .lower));
+            const owned = try writer.a.dupe(u8, &id);
+            errdefer writer.a.free(owned);
+            const version = try writer.a.dupe(u8, "prepared");
+            errdefer writer.a.free(version);
+            try writer.pending.append(writer.a, .{ .id = owned, .bytes = 8, .generation = version });
+        }
+        var next_buffer: [64]u8 = undefined;
+        var next_number: usize = 0;
+        const next_body = while (true) : (next_number += 1) {
+            const body = try std.fmt.bufPrint(&next_buffer, "next immutable payload {d}", .{next_number});
+            if (try Gate.selected(scope, body)) break body;
+        };
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .publication_slots = 1, .read_isolation = false, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = io }, .background);
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var bridge: maintenance.GraphBridge = .{ .maintenance = .{ .io = io, .execution = &execution, .requested = &canceled, .deadline_ns = if (mode == .deadline) @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s else null } };
+        store.write_context = bridge.readContext();
+        var gate: Gate = .{ .io = io, .fail = mode == .provider_failed };
+        provider.map_put_hook = .{ .ptr = &gate, .call = Gate.put };
+        defer provider.map_put_hook = null;
+        var job: Job = .{ .store = &store, .body = next_body };
+        defer if (job.output) |*output| output.deinit(a);
+        var task = try io.concurrent(Job.run, .{&job});
+        defer {
+            gate.release.set(io);
+            task.cancel(io);
+        }
+        const until = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (gate.arrived.load(.acquire) < 2) {
+            if (job.done.load(.acquire)) return job.failure orelse error.GenerationBranchesDidNotOverlap;
+            if (@import("antfly_platform").time.monotonicNs() >= until) {
+                std.debug.print("generation branch mode={s} arrivals={d} active={d} operations={d}\n", .{ @tagName(mode), gate.arrived.load(.acquire), gate.active.load(.acquire), scheduler.stats().operations });
+                return error.GenerationBranchesDidNotOverlap;
+            }
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(scheduler.stats().operations > 2);
+        try std.testing.expect(scheduler.stats().retained_bytes <= scheduler.config.max_bytes);
+        try std.testing.expect(writer.mu.tryLock());
+        writer.mu.unlock();
+        try std.testing.expectEqualStrings(original.generation, writer.reader.root.?.generation);
+        var query: Runnable.Execution = .{};
+        defer query.finish();
+        try query.start(&scheduler, .{ .io = io, .deadline_ns = until }, .query);
+        query.finish();
+        var health: Runnable.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        if (mode == .canceled) canceled.store(true, .release);
+        if (mode == .deadline) while (@import("antfly_platform").time.monotonicNs() < bridge.maintenance.?.deadline_ns.?) try io.sleep(.fromMilliseconds(1), .awake);
+        if (mode == .canceled or mode == .deadline) {
+            try io.sleep(.fromMilliseconds(3), .awake);
+            try std.testing.expect(!job.done.load(.acquire));
+        }
+        gate.release.set(io);
+        task.await(io);
+        try std.testing.expectEqual(@as(usize, 0), gate.active.load(.acquire));
+        if (mode == .success) {
+            if (job.failure) |err| return err;
+            const updated = (try writer.finishFor(.none, bridge.readContext())).?;
+            defer freeRef(writer.a, updated);
+            var reader: Reader = .{ .io = io, .client = client, .bucket = "bucket", .prefix = "native", .root = updated, .complete = true };
+            defer reader.deinit();
+            var found = (try reader.lookupFor(a, job.output.?.artifact_id, .none, bridge.readContext())).?;
+            defer found.deinit(a);
+            try std.testing.expectEqual(job.output.?.byte_len, found.bytes);
+        } else {
+            try std.testing.expectEqual(if (mode == .canceled) error.Canceled else if (mode == .deadline) error.DeadlineExceeded else error.TestWriteFailed, job.failure.?);
+            try std.testing.expect(!writer.complete and writer.disabled);
+            try std.testing.expectEqualStrings(original.generation, writer.reader.root.?.generation);
+        }
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "serverless execution generation opaque artifact callbacks retain admitted CPU" {
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const Backend = struct {
+        execution: *Runnable.Execution,
+        fn read(raw: *anyopaque, a: A, _: []const u8, offset: u64, length: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(Runnable.State.running, self.execution.entry.?.state);
+            return a.dupe(u8, "opaque payload"[@intCast(offset)..][0..length]);
+        }
+        fn bounded(raw: *anyopaque, a: A, id: []const u8, length: usize, token: Token) ![]u8 {
+            try token.check();
+            return read(raw, a, id, 0, length);
+        }
+    };
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .read_isolation = false });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .query);
+    var backend: Backend = .{ .execution = &execution };
+    const vtable: api.ArtifactStore.VTable = .{ .deinit = undefined, .put = undefined, .get_alloc = undefined, .get_range_alloc = Backend.read, .stat = undefined, .delete = undefined, .get_bounded_alloc_with_cancellation = Backend.bounded };
+    var store: api.ArtifactStore = .{ .allocator = std.testing.allocator, .ptr = &backend, .vtable = &vtable };
+    const checksum = std.fmt.bytesToHex(hash("opaque payload"), .lower);
+    const id = "sha256:" ++ checksum;
+    const context = (Context{ .io = std.testing.io }).withExecution(&execution);
+    const bytes = try store.getVerifiedAllocFor(std.testing.allocator, id, "opaque payload".len, &checksum, .none, context);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("opaque payload", bytes);
+    const prefix = try store.getRangeAllocFor(std.testing.allocator, id, 0, 3, .none, context);
+    defer std.testing.allocator.free(prefix);
+    try std.testing.expectEqualStrings("opa", prefix);
 }

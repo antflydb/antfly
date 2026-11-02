@@ -90,20 +90,35 @@ pub const Compactor = struct {
             var owner_bytes: [16]u8 = undefined;
             io.random(&owner_bytes);
             const owner = std.fmt.bytesToHex(&owner_bytes, .lower);
-            var held = (try work_lease.acquireHeld(try self.progress.workLeaseProvider(), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse
+            const provider = try self.progress.workLeaseProvider();
+            var lease_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = (cancellation orelse maintenance_cancellation.Token{ .io = io }).withContext(provider.context) };
+            var held = (try work_lease.acquireHeld(provider.withContext(lease_bridge.readContext()), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse
                 return error.WorkLeaseLost;
             defer _ = held.release() catch false;
-            return self.compactHeadGuardedUntil(namespace, held.guard(), held.cancellation(cancellation orelse .{ .io = io }));
+            return self.compactHeadGuardedUntil(namespace, held.guard(), try held.cancellation(cancellation orelse .{ .io = io }));
         }
         var protection = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
+        defer protection.deinit();
         var scoped_artifacts = self.artifacts.*;
         scoped_artifacts.upload_scope = .{
             .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain(namespace),
             .attempt = try builder_mod.graphPublicationAttempt(publication_guard, namespace, io),
         };
+        const protected = try protection.token(io);
+        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = protected };
+        var manifests = self.manifests.*;
+        var progress = self.progress.*;
+        if (protected.execution != null) {
+            const context = bridge.readContext();
+            scoped_artifacts.write_context = context;
+            manifests.context = context;
+            progress.context = context;
+        }
         var compactor = self.*;
         compactor.artifacts = &scoped_artifacts;
-        return compactor.compactHeadPinnedUntil(namespace, publication_guard, protection.token(io)) catch |err| return builder_mod.graphPublicationError(err, false);
+        compactor.manifests = &manifests;
+        compactor.progress = &progress;
+        return compactor.compactHeadPinnedUntil(namespace, publication_guard, protected) catch |err| return builder_mod.graphPublicationError(err, false);
     }
 
     fn compactHeadPinnedUntil(

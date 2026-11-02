@@ -1,0 +1,197 @@
+{
+  "manifest": {
+    "version": 1,
+    "name": "linux-container-authenticated-small",
+    "http_connections": 32,
+    "pgwire_connections": 32,
+    "samples": 5,
+    "sample_interval_seconds": 0.2,
+    "recovery_seconds": 3,
+    "thresholds": {
+      "idle_rss_growth_bytes": 134217728,
+      "idle_thread_growth": 160,
+      "idle_fd_growth": 80,
+      "control_latency_seconds": 2,
+      "recovery_fd_growth": 8,
+      "recovery_rss_growth_bytes": 134217728
+    },
+    "pgwire_mode": "authenticated",
+    "held_cursors": 16,
+    "fixture_rows": 9,
+    "process_limits": {
+      "cpu_count": 2,
+      "max_fds": 512
+    },
+    "container_limits": {
+      "cpu_count": 2,
+      "memory_bytes": 2147483648,
+      "pids": 512
+    },
+    "configuration": {
+      "pgwire": {
+        "max_connections": 32
+      },
+      "admission": {
+        "query": {
+          "max_concurrent_requests": 4
+        },
+        "write": {
+          "max_concurrent_requests": 2
+        }
+      }
+    },
+    "candidate_configuration": {
+      "admission": {
+        "max_request_memory_bytes": 67108864,
+        "max_retained_memory_bytes": 67108864,
+        "query": {
+          "max_concurrent_requests": 4,
+          "waiting": {
+            "max_queued_requests": 4,
+            "max_queued_bytes": 1048576,
+            "max_wait_ms": 250
+          }
+        }
+      }
+    },
+    "extended_portals": 2
+  },
+  "platform": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.39",
+  "pid": 81,
+  "baseline": {
+    "rss_bytes": 183422976,
+    "virtual_bytes": 1101724057600,
+    "threads": 22,
+    "fds": 17
+  },
+  "retained_pgwire_clients": 32,
+  "retained_http_clients": 32,
+  "idle_samples": [
+    {
+      "rss_bytes": 232837120,
+      "virtual_bytes": 1107180912640,
+      "threads": 87,
+      "fds": 87
+    },
+    {
+      "rss_bytes": 233426944,
+      "virtual_bytes": 1107264864256,
+      "threads": 88,
+      "fds": 87
+    },
+    {
+      "rss_bytes": 233426944,
+      "virtual_bytes": 1107264864256,
+      "threads": 88,
+      "fds": 87
+    },
+    {
+      "rss_bytes": 233426944,
+      "virtual_bytes": 1107264864256,
+      "threads": 88,
+      "fds": 87
+    },
+    {
+      "rss_bytes": 233426944,
+      "virtual_bytes": 1107264864256,
+      "threads": 88,
+      "fds": 87
+    }
+  ],
+  "control_latencies_seconds": [
+    0.20928441699999922,
+    0.21199333299999878,
+    0.21325729200000154,
+    0.21079312500000214,
+    0.20892291700000243
+  ],
+  "verified_extended_portals": 2,
+  "verified_held_cursors": 16,
+  "verified_authenticated_sessions": 32,
+  "memory_map_summary": "01000000-fffff891f000 ---p 00000000 00:00 0                              [rollup]\nRss:              230392 kB\nPss:              229399 kB\nPss_Dirty:         92816 kB\nPss_Anon:          92816 kB\nPss_File:         136583 kB\nPss_Shmem:             0 kB\nShared_Clean:       1328 kB\nShared_Dirty:          0 kB\nPrivate_Clean:    136248 kB\nPrivate_Dirty:     92816 kB\nReferenced:       230392 kB\nAnonymous:         92816 kB\nKSM:                   0 kB\nLazyFree:              0 kB\nAnonHugePages:     10240 kB\nShmemPmdMapped:        0 kB\nFilePmdMapped:         0 kB\nShared_Hugetlb:        0 kB\nPrivate_Hugetlb:       0 kB\nSwap:                  0 kB\nSwapPss:               0 kB\nLocked:                0 kB\n",
+  "recovery": {
+    "rss_bytes": 236761088,
+    "virtual_bytes": 1107264864256,
+    "threads": 88,
+    "fds": 17
+  },
+  "idle_peak": {
+    "rss_bytes": 233426944,
+    "virtual_bytes": 1107264864256,
+    "threads": 88,
+    "fds": 87
+  },
+  "checks": {
+    "idle_rss_growth_bytes": 50003968,
+    "idle_thread_growth": 66,
+    "idle_fd_growth": 70,
+    "control_latency_seconds": 0.21325729200000154,
+    "recovery_fd_growth": 0,
+    "recovery_rss_growth_bytes": 53338112
+  },
+  "failures": [],
+  "passed": true,
+  "policy": "fixed",
+  "process_limits": {
+    "cpu_count": 2,
+    "max_fds": 512
+  },
+  "enforced_limits": {
+    "platform": "Linux",
+    "nofile_soft": 512,
+    "affinity_cpu_count": 14,
+    "memory_bytes": 2147483648,
+    "pids": 512,
+    "cpu_count": 2.0
+  },
+  "manifest_sha256": "7fe062994df10f78a40e83ea97e009a2bb49035070ba7114be03024a2bf5cacd",
+  "binary_sha256": "bdb00ea2cdfa785f6db662b50792e16bee279a562cdd98a4250f1ab1643ab894",
+  "configuration": {
+    "pgwire": {
+      "max_connections": 32,
+      "enabled": true,
+      "bind_port": 60269
+    },
+    "admission": {
+      "query": {
+        "max_concurrent_requests": 4,
+        "waiting": {
+          "max_queued_requests": 4,
+          "max_queued_bytes": 1048576,
+          "max_wait_ms": 250
+        }
+      },
+      "write": {
+        "max_concurrent_requests": 2
+      },
+      "max_request_memory_bytes": 67108864,
+      "max_retained_memory_bytes": 67108864
+    }
+  },
+  "server_exit_code": 0,
+  "server_log": "/receipts/linux-small-candidate-fixed.server.log",
+  "command": [
+    "/candidate/antfly",
+    "standalone",
+    "--config",
+    "/tmp/antfly-pooling-qualification-h63o2u7s/config.json",
+    "--auth",
+    "true",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "59371",
+    "--health",
+    "false",
+    "--data-dir",
+    "/tmp/antfly-pooling-qualification-h63o2u7s/data",
+    "--models-dir",
+    "/tmp/antfly-pooling-qualification-h63o2u7s/models",
+    "--ml-dir",
+    "/tmp/antfly-pooling-qualification-h63o2u7s/ml",
+    "--storage-engine",
+    "lite",
+    "--storage-path",
+    "/tmp/antfly-pooling-qualification-h63o2u7s/data.aflite"
+  ]
+}

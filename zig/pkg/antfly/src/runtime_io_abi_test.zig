@@ -236,6 +236,72 @@ test "executor archive boundary composes inference checkpoints in both error dom
     }
 }
 
+test "executor archive boundary requests cancellation without joining retained callback" {
+    var borrow: bridge.Borrow = undefined;
+    runtime_io_abi_test_borrow(&borrow);
+    defer runtime_io_abi_test_destroy(&borrow);
+    var receiver = try borrow.receive();
+    const io = receiver.io();
+    const F = struct {
+        io: std.Io,
+        checkpoint_only: bool,
+        enter: std.atomic.Value(bool) = .init(false),
+        canceled: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fn run(self: *@This()) std.Io.Cancelable!void {
+            if (self.checkpoint_only) while (!self.enter.load(.acquire)) std.atomic.spinLoopHint();
+            const operation = if (self.checkpoint_only) self.io.checkCancel() else self.io.sleep(.fromSeconds(3600), .awake);
+            operation catch |cause| {
+                self.canceled.set(self.io);
+                self.release.waitUncancelable(self.io);
+                return cause;
+            };
+        }
+    };
+    // Request immediately after submission to exercise the queued/start race,
+    // then retain the callback after cancellation to prove request != join.
+    for ([_]bool{ true, false }) |checkpoint_only| for (0..64) |_| {
+        var f: F = .{ .io = io, .checkpoint_only = checkpoint_only };
+        var future = try io.concurrent(F.run, .{&f});
+        defer {
+            f.enter.store(true, .release);
+            f.release.set(io);
+            _ = future.cancel(io) catch {};
+        }
+        try std.testing.expect(future.requestCancel(io));
+        f.enter.store(true, .release);
+        if (checkpoint_only) {
+            // One request must survive the queued/start race. Pure CPU before
+            // this checkpoint avoids the separate syscall-entry signal race.
+            try f.canceled.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        } else {
+            // A signal can arrive just before a blocking syscall starts.
+            // Poll exactly as production readiness does, with one fixed budget;
+            // request support is not an acknowledgement of syscall interruption.
+            const until = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (!f.canceled.isSet()) {
+                if (@import("antfly_platform").time.monotonicNs() >= until) return error.Timeout;
+                try std.testing.expect(future.requestCancel(io));
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+        try std.testing.expect(future.any_future != null);
+        try std.testing.expect(future.requestCancel(io));
+        f.release.set(io);
+        try std.testing.expectError(error.Canceled, future.await(io));
+        try std.testing.expect(future.requestCancel(io));
+    };
+    // A cancellation for a completed registration must not poison the next
+    // task running on the same physical executor.
+    const Healthy = struct {
+        fn run(lane: std.Io) !void {
+            try lane.sleep(.fromMilliseconds(1), .awake);
+        }
+    };
+    var healthy = try io.concurrent(Healthy.run, .{io});
+    try healthy.await(io);
+}
+
 const RemoteConfig = @import("antfly_scraping").RemoteContentConfig;
 extern fn runtime_io_abi_test_remote_snapshot(output: *RemoteConfig.RemoteContentRuntime, failure: u8) callconv(.c) void;
 test "executor archive boundary remote snapshot failures retain stable identities" {
@@ -281,4 +347,325 @@ test "executor archive boundary outbound view uses the calling archive error dom
     var hosts = [_][]u8{@constCast("127.0.0.1")};
     const security: scraping.ContentSecurityConfig = .{ .block_private_ips = false, .allowed_hosts = &hosts, .max_download_size_bytes = 1024 };
     try std.testing.expectError(error.ConnectionRefused, scraping.downloadContentOutcomeAllocWithHeadersAndContext(std.testing.allocator, .{ .io = io, .timeout_ms = 1000 }, url, &security, null, null));
+}
+
+extern fn runtime_io_abi_test_durability_storage(*const @import("antfly_runtime_abi").native_abi.TypeContract, *retained_io.Storage.Lease, *?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status;
+extern fn runtime_io_abi_test_durability_owner_close(*anyopaque) callconv(.c) void;
+
+test "executor archive boundary durability grant retains physical authority and original errors" {
+    const os = @import("builtin").os.tag;
+    if (os == .windows or os == .wasi or os == .freestanding) return error.SkipZigTest;
+    const abi = @import("antfly_runtime_abi");
+    const admission = @import("antfly_local_sources").common_read_admission;
+    const Control = struct {
+        rejected: bool = false,
+        deadline_ns: u64,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.rejected) return error.SessionLeaseLost;
+        }
+        fn deadline(raw: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.deadline_ns;
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    var lease: retained_io.Storage.Lease = undefined;
+    var owner: ?*anyopaque = null;
+    defer if (owner) |context| runtime_io_abi_test_durability_owner_close(context);
+    const contract = abi.native_abi.TypeContract.of(retained_io.Storage.Lease);
+    var older = contract;
+    older.version -= 1;
+    const refused = runtime_io_abi_test_durability_storage(&older, &lease, &owner);
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.error_abi.errorFromStatus(refused));
+    try std.testing.expect(owner == null);
+    const status = runtime_io_abi_test_durability_storage(&contract, &lease, &owner);
+    if (!status.isOk()) return abi.error_abi.errorFromStatus(status);
+    var leased = true;
+    defer if (leased) lease.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/CURRENT", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const missing = try std.fmt.allocPrint(std.testing.allocator, "{s}.missing", .{path});
+    defer std.testing.allocator.free(missing);
+    try lease.view.writeFileAbsolute(path, "archive-control");
+    var control: Control = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s };
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    var grant = (try lease.view.tryPrepareDurabilityWithAdmission(original)) orelse return error.TestUnexpectedResult;
+    defer grant.deinit();
+    var read = try grant.beginControlRead(path, 36, original);
+    var read_live = true;
+    defer if (read_live) read.deinit();
+    control.rejected = true;
+    try std.testing.expectError(error.SessionLeaseLost, read.waitWithAdmission(original));
+    // The producer's original owner and storage lease may both close while a
+    // rejected consumer still owns a phase and its reusable completion grant.
+    runtime_io_abi_test_durability_owner_close(owner.?);
+    owner = null;
+    lease.deinit();
+    leased = false;
+    control.rejected = false;
+    const result = try read.waitWithAdmission(original);
+    try std.testing.expectEqual(@as(u64, 15), result.file_size);
+    try std.testing.expectEqualStrings("archive-control", result.bytes);
+    try std.testing.expectError(error.ResourceBudgetExceeded, grant.beginSyncContents(path, original));
+    read.deinit();
+    read_live = false;
+    var sync = try grant.beginSyncContents(path, original);
+    try sync.waitWithAdmission(original);
+    sync.deinit();
+    var absent = try grant.beginSyncContents(missing, original);
+    try std.testing.expectError(error.FileNotFound, absent.waitWithAdmission(original));
+    try std.testing.expectError(error.FileNotFound, absent.waitWithAdmission(original));
+    absent.deinit();
+    var parent = try grant.beginSyncParent(path, original);
+    try parent.waitWithAdmission(original);
+    parent.deinit();
+    control.rejected = true;
+    try std.testing.expectError(error.SessionLeaseLost, grant.beginControlRead(path, 36, original));
+    control.rejected = false;
+    var healthy = try grant.beginControlRead(path, 36, original);
+    defer healthy.deinit();
+    try std.testing.expectEqualStrings("archive-control", (try healthy.waitWithAdmission(original)).bytes);
+}
+
+test "executor archive boundary WAL sync distinguishes original missing-file rejection from absent CURRENT" {
+    const os = @import("builtin").os.tag;
+    if (os == .windows or os == .wasi or os == .freestanding) return error.SkipZigTest;
+    const abi = @import("antfly_runtime_abi");
+    const local = @import("antfly_local_sources");
+    const admission = local.common_read_admission;
+    const wal = local.storage_lsm_backend_wal;
+    const Publication = struct {
+        held: *bool,
+        releases: *usize,
+        pub fn release(self: *@This()) void {
+            self.held.* = false;
+            self.releases.* += 1;
+        }
+    };
+    const Shim = struct {
+        var upstream: @FieldType(retained_io.ControlFileReadOperation, "boundary_dispatch") = undefined;
+        var inside: bool = false;
+        var calls: usize = 0;
+        fn dispatch(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            calls += 1;
+            inside = true;
+            defer inside = false;
+            return upstream(contract, callback, args, output);
+        }
+    };
+    const Control = struct {
+        rejected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Reject inside the independently compiled read implementation,
+            // after the coordinator has entered its physical-wait boundary.
+            if (self.rejected and Shim.inside) return error.FileNotFound;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var lease: retained_io.Storage.Lease = undefined;
+    var owner: ?*anyopaque = null;
+    defer if (owner) |context| runtime_io_abi_test_durability_owner_close(context);
+    const contract = abi.native_abi.TypeContract.of(retained_io.Storage.Lease);
+    const status = runtime_io_abi_test_durability_storage(&contract, &lease, &owner);
+    if (!status.isOk()) return abi.error_abi.errorFromStatus(status);
+    var leased = true;
+    defer if (leased) lease.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    var state: local.storage_lsm_backend_state.State = .{};
+    defer state.deinit(a);
+    try state.upsert(a, .{ .name = "docs" }, "doc", "state", false);
+    _ = try wal.appendState(lease.view, a, root, &state, false);
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    var held = true;
+    var releases: usize = 0;
+    var operation = try wal.CurrentStateSync(Publication).prepare(root);
+    var resources = (try lease.view.tryPrepareDurabilityWithAdmission(original)) orelse return error.TestUnexpectedResult;
+    operation.start(resources, .{ .held = &held, .releases = &releases }, original) catch |cause| {
+        resources.deinit();
+        return cause;
+    };
+    defer operation.deinit();
+    Shim.upstream = operation.pending.read.boundary_dispatch;
+    Shim.calls = 0;
+    operation.pending.read.boundary_dispatch = Shim.dispatch;
+    control.rejected = true;
+    try std.testing.expectError(error.FileNotFound, operation.waitWithAdmission(original));
+    try std.testing.expect(held and operation.stage == .current);
+    try std.testing.expectEqual(@as(usize, 0), releases);
+    try std.testing.expectEqual(@as(usize, 1), Shim.calls);
+    runtime_io_abi_test_durability_owner_close(owner.?);
+    owner = null;
+    lease.deinit();
+    leased = false;
+    control.rejected = false;
+    const result = try operation.waitWithAdmission(original);
+    try std.testing.expectEqual(@as(u64, 1), result.segment_syncs);
+    try std.testing.expectEqual(@as(u64, 1), result.index_syncs);
+    try std.testing.expect(!held);
+    try std.testing.expectEqual(@as(usize, 1), releases);
+    _ = try operation.waitWithAdmission(original);
+    try std.testing.expectEqual(@as(usize, 2), Shim.calls);
+}
+
+test "executor archive boundary prepared append owns bytes after producer and input retirement" {
+    const os = @import("builtin").os.tag;
+    if (os == .windows or os == .wasi or os == .freestanding) return error.SkipZigTest;
+    const abi = @import("antfly_runtime_abi");
+    const admission = @import("antfly_local_sources").common_read_admission;
+    const Control = struct {
+        rejected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.rejected) return error.SessionLeaseLost;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var lease: retained_io.Storage.Lease = undefined;
+    var owner: ?*anyopaque = null;
+    defer if (owner) |context| runtime_io_abi_test_durability_owner_close(context);
+    const contract = abi.native_abi.TypeContract.of(retained_io.Storage.Lease);
+    const status = runtime_io_abi_test_durability_storage(&contract, &lease, &owner);
+    if (!status.isOk()) return abi.error_abi.errorFromStatus(status);
+    var leased = true;
+    defer if (leased) lease.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/append", .{tmp.sub_path});
+    defer a.free(path);
+    try lease.view.writeFileAbsolute(path, "prefix:");
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    const input = try a.dupe(u8, "owned-record");
+    var input_live = true;
+    defer if (input_live) a.free(input);
+    var grant = (try lease.view.tryPrepareAppendWithAdmission(input, original)) orelse return error.TestUnexpectedResult;
+    defer grant.deinit();
+    @memset(input, 'x');
+    a.free(input);
+    input_live = false;
+    var write = try grant.beginPreparedAppend(path, false, original);
+    var write_live = true;
+    defer if (write_live) write.deinit();
+    control.rejected = true;
+    try std.testing.expectError(error.SessionLeaseLost, write.waitWithAdmission(original));
+    runtime_io_abi_test_durability_owner_close(owner.?);
+    owner = null;
+    lease.deinit();
+    leased = false;
+    control.rejected = false;
+    try write.waitWithAdmission(original);
+    try write.waitWithAdmission(original);
+    write.deinit();
+    write_live = false;
+    var sync = try grant.beginSyncContents(path, original);
+    try sync.waitWithAdmission(original);
+    sync.deinit();
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(100));
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("prefix:owned-record", actual);
+}
+
+test "executor archive boundary WAL append bootstraps metadata and retains publication through rejected adoption" {
+    const os = @import("builtin").os.tag;
+    if (os == .windows or os == .wasi or os == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const abi = @import("antfly_runtime_abi");
+    const sources = @import("antfly_local_sources");
+    const wal = sources.storage_lsm_backend_wal;
+    const admission = sources.common_read_admission;
+    const Control = struct {
+        reject: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.SessionLeaseLost;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    const Publication = struct {
+        held: *bool,
+        published: *usize,
+        recover: *bool,
+        pub fn publish(self: *@This(), _: wal.AppendResult) void {
+            self.published.* += 1;
+        }
+        pub fn requireRecovery(self: *@This()) void {
+            self.recover.* = true;
+        }
+        pub fn release(self: *@This()) void {
+            self.held.* = false;
+        }
+    };
+    var lease: retained_io.Storage.Lease = undefined;
+    var owner: ?*anyopaque = null;
+    defer if (owner) |context| runtime_io_abi_test_durability_owner_close(context);
+    const contract = abi.native_abi.TypeContract.of(retained_io.Storage.Lease);
+    const status = runtime_io_abi_test_durability_storage(&contract, &lease, &owner);
+    if (!status.isOk()) return abi.error_abi.errorFromStatus(status);
+    var leased = true;
+    defer if (leased) lease.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    var state: sources.storage_lsm_backend_state.State = .{};
+    defer state.deinit(a);
+    try state.upsert(a, .{ .name = "docs" }, "final", "status", false);
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    const record = try wal.prepareStateRecordWithAdmission(a, &state, original);
+    defer a.free(record);
+    var held = true;
+    var published: usize = 0;
+    var recover = false;
+    var operation = try wal.CurrentStateAppend(Publication).prepare(root, record.len, .{});
+    var resources = (try lease.view.tryPrepareAppendWithAdmission(record, original)).?;
+    operation.start(resources, .{ .held = &held, .published = &published, .recover = &recover }, original) catch |cause| {
+        resources.deinit();
+        return cause;
+    };
+    defer operation.deinit();
+    control.reject = true;
+    try std.testing.expectError(error.SessionLeaseLost, operation.waitWithAdmission(original));
+    runtime_io_abi_test_durability_owner_close(owner.?);
+    owner = null;
+    lease.deinit();
+    leased = false;
+    control.reject = false;
+    const result = try operation.waitWithAdmission(original);
+    try std.testing.expectEqual(@as(u64, 2), result.index_syncs);
+    try std.testing.expect(held and published == 0);
+    control.reject = true;
+    try std.testing.expectError(error.SessionLeaseLost, operation.publishWithAdmission(original));
+    try std.testing.expect(held and published == 0);
+    control.reject = false;
+    _ = try operation.publishWithAdmission(original);
+    _ = try operation.publishWithAdmission(original);
+    try std.testing.expect(!held and !recover and published == 1);
 }

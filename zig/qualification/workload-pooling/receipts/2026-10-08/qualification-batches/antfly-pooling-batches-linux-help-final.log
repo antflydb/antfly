@@ -1,0 +1,811 @@
+Usage: /nix/store/ms802lv410k52rd15fxpg4qllfw57baw-zig-0.17.0/bin/zig build [steps] [options]
+
+Steps:
+  install (default)            Copy build artifacts to prefix path
+  uninstall                    Remove build artifacts from prefix path
+  lib-platform-test            Run supervisor unit and process-lifecycle tests (Python 3 on POSIX)
+  regen-snowball               Regenerate checked-in Zig Snowball stemmers
+  check-snowball               Check checked-in Zig Snowball stemmers are current
+  regen-openapi                Regenerate checked-in OpenAPI sources
+  check-openapi                Compare checked-in OpenAPI sources without modifying them
+  yacc-zig                     Build and install the standalone Zig yacc generator
+  lib-yacc-test                Run standalone lib/yacc parser generator tests
+  regen-sql-grammar            Regenerate checked-in Antfly SQL grammar metadata
+  sql-grammar-generated-check  Check and compile the generated Antfly SQL grammar metadata
+  lib-sql-parser-test          Run the storage-independent SQL lexer and parser tests
+  lib-sql-parser-bench         Build and install lib-sql-parser-bench
+  sql-test                     Run SQL compilation, catalog binding, and native execution contract tests
+  pgwire-test                  Run PostgreSQL wire framing, session, and lifecycle tests
+  evented-enrichment-test      Test enrichment Evented lifetime, concurrent tasks, cancellation, and file I/O
+  lib-tokenizer-test           Run Hugging Face tokenizer tests
+  inference-run                Run the Antfly inference server
+  inference-finetune           Run Antfly inference finetune
+  inference-bench-server       Build the production HTTP server without the other CLI commands
+  inference-bench-paged-attention Run the native paged-attention benchmark
+  inference-bench-training     Run the native training benchmark
+  inference-bench-linalg       Run the shared linalg benchmark
+  inference-bench-gliner2-native Run an end-to-end GLiNER2 bench against the native backend with random weights
+  inference-bench-gliner25-decide-build Build the loaded-model GLiNER2.5-Decide request benchmark
+  inference-bench-gliner25-cpu-build Build the supervised GLiNER2.5 direct-core CPU benchmark worker (requires ReleaseFast)
+  inference-bench-gliner25-cuda-build Build the GLiNER2.5 CUDA direct-core worker (requires CUDA and ReleaseFast)
+  inference-bench-gliner25-cuda-training-build Build the supervised CUDA training parity/throughput worker
+  inference-bench-gliner25-metal-build Build the supervised GLiNER2.5 production-lifetime Metal comparison worker (requires ReleaseFast)
+  inference-gliner25-convert-build Build the atomic GLiNER2.5 converter and bundle verifier
+  inference-gliner25-bundle-check-build Build the converted GLiNER2.5 CPU diagnostic runner
+  inference-gliner25-trained-check-build Build the bounded trained GLiNER2.5 CPU/Metal artifact execution worker
+  inference-gliner25-trained-check-test Test trained GLiNER2.5 execution envelopes, identity, admission and lifetimes without a model
+  inference-bench-audio        Run the checked-in audio decode and synthesis benchmark
+  inference-finetune-test      Run focused fine-tuning tests and compile registered commands
+  inference-finetune-unit-test Run the shared finetuning unit executable
+  inference-finetune-command-check Compile and link all finetuning CLI entrypoints in shared configuration groups
+  inference-train-laya         Run native Laya finetuning with checkpoint resume and serving export
+  inference-materialize-gliner25-adapter Materialize a GLiNER2.5 adapter into an atomic FP32 bundle
+  inference-train-gliner25     Run a bounded GLiNER2.5 native training job
+  inference-gliner2-entity-training-readiness Run GLiNER2 entity training readiness
+  inference-test-gliner25-fuzz Run bounded GLiNER2.5 parser, schema and document property tests
+  inference-registry-test      Run Hub snapshot, artifact dependency and download tests
+  inference-build-bge-m3-benchmark Build the managed BGE-M3 format qualification probe
+  inference-test               Run unit tests
+  inference-test-cancellation-e2e Run HTTP inference cancellation and worker recovery E2E tests
+  inference-laya-cuda-test-build Build Laya CUDA qualification executable without running it
+  inference-laya-cuda-test     Require CUDA and pinned Laya fixtures
+  inference-test-gliner25-cuda Run required-hardware GLiNER2.5 CUDA parity, optimizer and lifecycle tests
+  inference-wasm               Build WASM module for browser inference
+  licenses-antfly-inference-wasm Install antfly-inference-wasm licenses and source map
+  aws-credentials-test         Test shared AWS discovery and credential cache ownership
+  antfly-embedded-inference-openai-test Run embedded inference OpenAI provider tests
+  antfly-embedded-inference-providers-test Run embedded inference provider and discovery tests
+  sql-native-refinement-bench  Compare native expression, aggregate and window spill refinements
+  sql-native-pipeline-bench    Compare shared typed DAGs and block result delivery
+  apple-bridge-loader-test     Test Apple bridge OS gating, ABI, concurrency, and relocated CLI/Lite layouts
+  embedded-wasm-module-boundary-check Resolve the browser engine and inference module boundary
+  licenses-antfly-wasm         Install antfly-wasm licenses and source map
+  wasm                         Build and install the unified Antfly WASM bundle
+  wasm-test                    Build the Antfly WASM bundle and run its Node smoke test
+  embedded-capi-check          Compile the public C API with its independent local source owner
+  embedded-native-module-boundary-check Resolve the native public C API source and module boundary
+  pkgconfig                    Install relocatable libantfly pkg-config metadata
+  embedded-package-test        Exercise lake readers and SQL through the public Zig package
+  licenses-antfly-lite         Install antfly-lite licenses and source map
+  capi                         Build the public libantfly C ABI shared library
+  capi-smoke                   Compile and run a C consumer smoke test for libantfly
+  capi-conformance             Run the shared libantfly conformance cases against the C ABI
+  lite-go-test                 Run Go Antfly Lite binding tests against libantfly
+  lite-py-test                 Run Python Antfly Lite binding tests against libantfly
+  lite-rs-test                 Run Rust Antfly Lite binding tests against libantfly
+  lite-ts-test                 Run TypeScript Antfly Lite binding tests against libantfly (needs pnpm install in ts/)
+  lite-go-example              Run the embedded Go Antfly Lite example app
+  lite-go-retrieval-template   Run the embedded Go Antfly Lite retrieval template
+  capi-package-test            Run Antfly C ABI release packaging regression tests
+  embedded-lake-test           Test lake readers and SQL cursors without the server
+  capi-test                    Run C API tests
+  lib-regex-test               Run standalone lib/regex tests
+  lib-scraping-test            Run standalone lib/scraping tests
+  lib-jsonschema-test          Run standalone lib/jsonschema tests
+  lib-json-test                Run standalone lib/json tests
+  lib-ml-test                  Run standalone lib/ml graph and optimizer tests
+  lib-ml-tabular-test          Run standalone lib/ml/tabular tests
+  lib-onnx-test                Run standalone lib/onnx tests
+  lib-ml-tabular-fuzz-test     Fuzz the tabular_model.json loader (--fuzz to keep running)
+  lib-toon-test                Run standalone lib/toon tests
+  lib-mcp-test                 Run standalone lib/mcp tests
+  lib-a2a-test                 Run standalone lib/a2a tests
+  lib-matcher-test             Run standalone lib/matcher tests
+  lib-resolver-test            Run standalone lib/resolver tests
+  lib-toon-conformance         Run lib/toon conformance (fetch missing fixtures)
+  lib-httpx-json-test          Run standalone lib/httpx JSON helper tests
+  lib-httpx-test               Run standalone lib/httpx tests
+  shared-signal-stack-test     Verify a native worker overflow uses the shared full-size signal stack
+  lib-httpx-protected-dispatch-test Run protected HTTP dispatch and executor reservation contracts
+  lib-httpx-client-lifecycle-test Run HTTP client admission, release, and shutdown contracts
+  lib-objectstore-test         Run standalone lib/objectstore tests
+  lib-generating-test          Run standalone lib/generating tests
+  lib-generating-check         Compile generating tests without executing them
+  lib-embeddings-test          Run standalone lib/embeddings tests
+  lib-hash-test                Run standalone lib/hash tests
+  lib-vectorindex-test         Run standalone lib/vectorindex tests
+  lib-vector-kernel-test       Run standalone quantizer kernel tests (no external recall fixtures)
+  bench-query-packing          Compare exact query bitplane packing and complete scoring kernels
+  bench-subgroup-scan          Build offline weighted selection and native range scan benchmark
+  vector-projection-bounds-bench Build and install persisted projection bounds benchmark
+  lib-vector-cancellation-test Run bounded vector-kernel cancellation tests
+  lib-chunking-test            Run standalone lib/chunking tests
+  lib-readers-test             Run standalone lib/readers tests
+  lib-readers-check            Compile reader tests without executing them
+  lib-extracting-test          Run standalone lib/extracting tests
+  lib-image-png-test           Run PNG codec and checksum compatibility tests
+  lib-image-jpeg2000-test      Run direct JPEG 2000 decoder tests
+  lib-image-test               Run shared image tests
+  lib-pdf-test                 Run shared PDF tests
+  apple-pdf-ocr-test           Run scanned PDF OCR and grounding through Apple Vision
+  pdf-ocr-integration-test     Run native PDF rendering and encoded reader batching through the OCR coordinator
+  pdf-model-qualification-test Run opt-in real Florence/Gemma4/ClipClap PDF qualification against ANTFLY_PDF_QUALIFICATION_URL
+  lib-image-bench              Build and install lib-image-bench
+  lib-pdf-bench                Build and install lib-pdf-bench
+  lib-pdf-safety-test          Run focused PDF OCR rendering and parser safety tests
+  lib-image-conformance        Run lib/image conformance (fetch missing fixtures)
+  image-jpeg-seed-corpora-e2e  Build the lib/image upstream JPEG seed-corpora e2e runner
+  image-jpeg2000-fuzz          Build the JPEG 2000 fuzz runner
+  lib-google-test              Run Google credential cache and transport tests
+  lib-reranking-test           Run standalone lib/reranking tests
+  lib-casbin-test              Run standalone lib/casbin tests
+  lib-raft-test                Run standalone raft library tests
+  antfly-producer-readiness-test Run durable producer completion, source readiness and metadata transport regressions
+  antfly-apple-provider-test   Run Apple OCR provider and PDF integration tests
+  replay-allocation-test       Run replay ownership, scratch retention and window contracts
+  lookup-key-bench             Measure document lookup key preparation with pooled and individual ownership
+  replay-allocation-bench      Build the allocation-counted replay benchmark
+  functions-test               Run provider and expression decision function contracts
+  query-contract-test          Run query parsing, worker transport and projection contracts
+  antfly-metadata-initial-fk-admission-test Run initial-FK preflight and stale-begin metadata fault regressions
+  antfly-store-observer-test   Run store report admission, fencing, and ownership regressions
+  antfly-system-catalog-store-test Run catalog report persistence, snapshot, drain, and migration regressions
+  antfly-system-catalog-projection-test Run immutable catalog generation publication and retention regressions
+  antfly-system-catalog-finalization-test Run migration finalization and opt-in readiness workload
+  antfly-system-catalog-progress-test Run schema migration readiness, acknowledged deltas, and opt-in collector workload
+  antfly-system-catalog-report-bench Run opt-in report apply, repair and selected admission workloads
+  antfly-system-catalog-api-test Run qualified catalog HTTP authorization and protocol tests
+  antfly-system-catalog-test   Run system catalog durability, identity, and routing tests
+  antfly-inference-worker-rpc-test Run actual worker RPC transport and phase handoff contracts
+  common-http-test             Run common HTTP listener and client tests
+  antfly-api-json-helpers-test Run standalone api/json_helpers tests
+  antfly-api-artifact-reprocess-jobs-test Run artifact reprocess job store tests
+  antfly-api-restore-owner-test Run authenticated source cache and replicated owner control integration
+  antfly-retirement-summary-test Verify authenticated retirement summary, bounded GC and native WAL amplification
+  antfly-relational-index-system-test Run LSM index lifecycle, standby replay, and work-count benchmarks
+  antfly-retained-transfer-test Run bounded retained-frame transfer, cold resume and corruption regressions
+  antfly-sql-primary-key-transform-test Run focused SQL primary-key native row-transform regression
+  antfly-api-restore-jobs-test Run durable restore job store tests
+  antfly-storage-portable-backup-test Run bounded portable backup tests
+  antfly-generating-test       Run generating backend adapter tests
+  antfly-inference-managed-embedder-test Run managed embedder contract and provider tests
+  antfly-reranking-test        Run reranking backend adapter tests
+  antfly-common-test           Run common/provider registry tests
+  antfly-common-config-test    Run common/config tests
+  antfly-common-preload-model-spec-test Run preload model CLI parser tests
+  antfly-provider-defaults-test Verify provider endpoint and credential defaults
+  antfly-common-secrets-test   Run common secret and remote-content reload tests
+  lib-common-secrets-abi-test  Run secret store tests across independently compiled runtime archives
+  runtime-io-abi-test          Run executor contracts across independent error domains
+  runtime-scan-sink-test       Run scan callbacks across independent error domains
+  runtime-shard-ops-abi-test   Run shard callbacks across independently compiled error domains
+  antfly-usermgr-test          Run standalone pkg/antfly/src/usermgr tests
+  lib-usermgr-abi-test         Run UserManager contracts across independent error domains
+  embedded-test                Run embedded API tests
+  antfly-embedded-test         Run the standalone antfly-embedded package compile test
+  antfly-client-test           Run the standalone antfly-client package compile test
+  antfly-retrieval-test        Run retrieval agent contracts and navigation regressions
+  root-test                    Run fast root-module compile smoke tests
+  antfly-inference-bedrock-test Run focused Bedrock provider tests
+  lake-api-test                Run mounted API lake and SQL integration tests
+  antfly-api-relational-index-http-test Run unified relational index CRUD and document index compatibility
+  antfly-api-test              Run API contracts and linked-boundary tests
+  public-limits-test           Run shared public transport limits contract
+  runtime-contract-test        Run shared runtime ABI and transport contracts
+  query-embedding-cache-test   Run query cache ownership and deadline contracts
+  antfly-api-sql-connections-test Run durable SQL connection ownership, DISCARD and crash-fence regressions
+  antfly-api-sql-node-local-session-test Run node-local durable session configuration regression
+  antfly-api-catalog-authority-test Run configured remote catalog publication authority regression
+  introducer-test              Run segment introducer unit tests
+  secret-backends-test         Run distributed and serverless encrypted persistence tests
+  lite-native-test             Run Lite native backend tests
+  lite-storage-test            Run all Lite storage tests without unrelated imported suites
+  lite-allocator-test          Qualify revision-4 ownership, retirement and independent page reuse
+  lite-reclamation-test        Qualify Lite owner reclamation, reader retention and storage pressure
+  portable-wal-test            Run hosted WAL durability and read-only tests
+  lite-native-benchmark        Benchmark native Lite transaction, commit, and sorted read scaling
+  antfly-cmd-test              Run Antfly command and client CLI tests
+  antfly-index-maintenance-cli-test Run existing and relational index maintenance CLI contracts
+  lite-cmd-test                Run command tests owned by Antfly Lite profiles
+  antfly-storage-vectorindex-recall-test Run HBC vector recall quality tests
+  antfly-system-catalog-host-test Run metadata checkpoint host persistence regressions
+  raft-read-gate-test          Run synchronous read ownership and restart identity contracts
+  graph-cleanup-runtime-test   Run cleanup routing scalability and protocol regressions
+  raft-snapshot-maintenance-vopr-test Run snapshot maintenance scheduling, wakeup, and shutdown contracts on VoprIo
+  http-low-fd-ratchet-test     Run the process-level low-FD HTTP worker ratchet regression
+  lib-raft-harness-test        Run the legacy Raft deterministic harness tests
+  antfly-raft-chaos-test       Run longer raft restart/HTTP simulation campaigns
+  raft-vopr-test               Run replayable per-group Raft VOPR campaigns
+  lib-lsm-backend-workload-test Run legacy LSM backend storage workload tests
+  antfly-storage-lsm-backend-chaos-test Run longer LSM backend compaction chaos campaigns
+  lsm-vopr-test                Run replayable real-backend LSM VOPR campaigns
+  antfly-storage-hot-standby-chaos-test Run hot-standby crash and partition hardening tests
+  standby-vopr-test            Run replayable standby lifecycle VOPR campaigns
+  antfly-storage-hot-standby-compat-test Run standby replication format compatibility tests
+  antfly-test                  Run default Antfly unit, VOPR, integration, chaos, and recall checks
+  antfly-unit-test             Run hermetic unit and focused integration test buckets without metadata chaos simulations
+  antfly-serverless-test       Run serverless and serverless transport tests
+  antfly-document-facts-test   Run focused immutable document facts and scheduling tests
+  antfly-graph-test            Run graph algorithms, topology, pages, query and recovery tests
+  antfly-serverless-manifest-test Run focused serverless manifest object-store tests
+  antfly-serverless-runtime-test Run focused serverless maintenance ownership and lifecycle tests
+  lake-integration-test        Run public lake binding and SQL cursor integration tests
+  lake-native-refinement-bench Compare repeated and reused native Parquet dictionary decoding
+  lake-test                    Run Antfly lake-native tests
+  antfly-data-runtime-test     Run focused data runtime tests
+  antfly-data-private-initial-owner-predicate-test Verify hidden initial-FK owner preflight excludes ordinary unpublished placements
+  antfly-data-storage-test     Run focused data storage tests
+  antfly-storage-producer-receipts-test Run primary revision receipt and cached graph publication regressions
+  antfly-storage-graph-identity-test Run relationship ownership, lifecycle, snapshot and replay regressions
+  antfly-storage-index-worker-lifecycle-test Run derived worker pause, replay retention, visibility and catalog retirement regressions
+  antfly-online-direct-vector-test Run ordered direct vector snapshot, retention, and repair regressions
+  antfly-cold-fk-retirement-test Run terminal local publication cancellation durability tests
+  antfly-ordered-artifact-test Run ordered artifact inventory, wire, and durable owner regressions
+  antfly-storage-repair-activation-test Run bounded index activation, coverage, and candidate-resume regressions
+  antfly-storage-db-enrichment-test Run DB enrichment, replay, and cutover tests; accepts runtime test filters
+  antfly-storage-db-query-test Run root-module DB query/indexing tests
+  antfly-storage-highlight-test Run source mapping and highlight analysis regressions
+  antfly-storage-db-text-query-test Run focused full-text query guardrail tests
+  antfly-storage-db-reopen-test Run root-module DB reopen/compaction tests
+  antfly-storage-db-txn-test   Run root-module DB TTL/transaction tests
+  antfly-metadata-test         Run root-module metadata tests only
+  antfly-metadata-backup-cohort-test Run durable backup cohort admission and recovery contracts
+  antfly-metadata-restore-staging-test Run atomic hidden restore target publication contracts
+  antfly-metadata-relational-topology-test Run distributed integrity topology capability and admission contracts
+  antfly-metadata-store-root-signing-test Run v18 store-root signing decoder, registration, and readiness admission contracts
+  antfly-metadata-table-workflow-test Run focused metadata table workflow tests
+  lib-metadata-vopr-http-integration-test Run metadata VOPR HTTP cluster fixtures, including native HTTP integration
+  lib-metadata-vopr-virtual-transport-test Run metadata virtual-Raft-transport convergence tests; median-key fixtures also use native HTTP
+  lib-metadata-vopr-virtual-smoke-test Run fast metadata virtual-transport smoke tests
+  antfly-metadata-vopr-test    Run seeded metadata virtual-operation campaign tests
+  metadata-vopr-replay-stability-test Exact-replay one metadata VOPR trace 100 consecutive times
+  lib-metadata-vopr-data-test  Run the distributed public-data VOPR durability scenario
+  antfly-metadata-vopr-chaos-test Run expanded metadata VOPR generated workload campaigns
+  lib-metadata-vopr-transition-chaos-test Run metadata VOPR split/merge transition restart and partition chaos tests
+  lib-metadata-vopr-public-chaos-test Run metadata VOPR public traffic split/merge chaos tests
+  lib-metadata-vopr-placement-chaos-test Run metadata VOPR placement restart chaos tests
+  lib-metadata-vopr-chaos-soak-test Run metadata VOPR delayed/restart/partition chaos tests
+  lib-metadata-vopr-public-integration-test Run metadata public lifecycle/split/merge integration tests
+  antfly-table-write-execution-contract-test Verify retained table-write teams across private callback dispatch
+  antfly-completion-task-test  Verify preauthorized joined completion tasks
+  antfly-sql-write-team-test   Run retained SQL write and protected commit CPU team contracts
+  antfly-inference-owner-handoff-test Run real shared-owner inference handoff and model-lock control progress contracts
+  antfly-http-cleanup-owner-test Run actual listener output through shared protected cleanup ownership
+  antfly-inference-worker-owner-handoff-test Run real owner capsules through the worker pipe phase transport
+  antfly-inference-worker-process-output-test Run actual worker subprocess output through API ownership, TCP waits and reaping
+  antfly-inference-worker-output-error-test Run caller-owned scheduler failures through output callback statuses
+  antfly-inference-parent-phase-test Run provider grant transfer, worker demand and owned-result cleanup contracts
+  antfly-workload-pooling-test Run all bounded waiting and shared HTTP/SQL admission contracts in serial compiler batches
+  antfly-read-authority-test   Run current SQL credential and retained read-policy contracts
+  public-api-parity-test       Run focused stateful public API parity tests
+  antfly-api-auth-test         Run focused API auth/usermgr HTTP tests
+  antfly-api-authorization-sink-test Run exploit regressions for API authorization sinks
+  authorization-audit          Run the authorization sink audit and broader API auth suite
+  antfly-storage-maintenance-test Run storage maintenance coordinator ownership and concurrency tests
+  antfly-api-connections-test  Run connection inventory and probe-admission tests
+  antfly-api-storage-authority-test Run remote backup credential-boundary tests
+  antfly-api-retained-quota-test Run retained-effects pressure outcome and retry contracts
+  antfly-api-session-maintenance-test Run durable session concurrency and background-maintenance tests
+  antfly-api-graph-snapshot-test Run distributed graph snapshot-vector regression tests
+  lib-api-graph-wire-test      Run canonical internal graph wire-contract regressions
+  lib-api-distributed-query-availability-test Run retryable distributed-query transport classification regressions
+  antfly-api-internal-read-availability-test Run internal scan leadership availability and wire classification regressions
+  antfly-api-internal-routed-batch-test Run exact private batch routing and rollback authority regressions
+  antfly-api-internal-batch-outcome-test Run forwarded batch outcome and admission classification regressions
+  antfly-api-aborted-prepare-unavailability-test Run durable-abort retryability classification regression
+  antfly-api-derived-coverage-test Run focused public derived coverage tests
+  antfly-api-transaction-commit-test Run routed transaction commit and entity promotion contracts
+  antfly-api-table-read-test   Run table-read routing and internal group contracts
+  antfly-api-statement-capture-retry-test Run bounded SQL statement capture retry regression
+  antfly-api-aggregation-test  Run captured aggregation collection, completeness and generation regressions
+  antfly-rewrite-admission-contract-test Verify scoped rewrite admission and durable intent binding
+  antfly-row-semantics-codec-test Verify fail-closed row semantics envelopes and allocation failure cleanup
+  antfly-api-transactions-test Run transaction coordinator and participant contracts
+  antfly-participant-team-test Require the actual coordinator participant team and bounded child allocation regression
+  antfly-api-public-table-http-test Run public table HTTP response contracts
+  antfly-api-relational-rows-test Run generated relational row and schema boundary contracts
+  antfly-api-restore-lookup-authority-test Run private restore lookup authority parsing and compiled wire regressions
+  antfly-api-index-maintenance-test Run generation-fenced index maintenance admission and recovery contracts
+  antfly-api-storage-capabilities-test Run backend relational capability admission contracts
+  antfly-api-relational-index-status-test Run unified relational index readiness and owner coverage contracts
+  antfly-api-relational-topology-test Run private lifecycle control and backup cohort contracts
+  antfly-api-restore-provisioning-test Run private hidden owner reservation and writer-cache admission
+  antfly-api-hosted-batch-test Run hosted batch forwarding authority and canonical wire regressions
+  antfly-api-table-writes-lifecycle-test Run focused restore and writer-cache lifecycle regressions
+  antfly-api-replica-retirement-batch-test Run the durable replica-retirement batch decoder regression
+  antfly-api-create-structural-retry-test Run isolated create metadata and structural-publication regressions
+  antfly-api-table-writes-restore-repeat-test Run focused native restore identity and shared-owner regressions
+  antfly-api-hosted-fk-placement-test Run mounted metadata and relational parent owner placement regression
+  antfly-api-sql-rewrite-receipt-test Run SQL rewrite receipt and unknown-admission response regression
+  antfly-api-sql-uuid-catalog-test Run prepared SQL UUID catalog and owner publication regression
+  antfly-api-pk-restore-error-identity-test Run exact native invalid-row restore error identity regression
+  antfly-api-sql-primary-key-rewrite-test Run mounted SQL primary-key rewrite publication and failure cases
+  antfly-api-hosted-initial-fk-test Run mounted hosted initial-FK owner publication regression
+  antfly-api-hosted-initial-fk-fault-test Run hosted initial CREATE lost-reply and cold owner release recovery
+  antfly-api-hosted-initial-fk-transfer-test Run hidden initial-child three-voter Raft leadership transfer
+  antfly-api-hosted-initial-fk-offline-test Run canceled and published obsolete initial-child offline physical retirement
+  antfly-api-hosted-fk-drop-test Run mounted external-parent FK DROP retirement and restart
+  antfly-api-hosted-fk-truncate-test Run mounted external-parent FK generation retirement and restart
+  antfly-api-hosted-graph-truncate-test Run public graph TRUNCATE seal and cold-restart recovery
+  antfly-api-hosted-self-fk-retry-test Run self-FK proven durable precommit retry regression
+  antfly-api-hosted-self-fk-test Run mounted public self-FK ADD/DROP/restart
+  antfly-api-hosted-cte-runtime-test Run linked hosted prepared CTE and recursive owner-snapshot regression
+  antfly-api-hosted-self-fk-fault-test Run mounted self-FK publication lost-reply recovery
+  antfly-api-hosted-self-fk-metadata-restart-test Run mounted self-FK metadata and owner cold restart at parent ACK
+  antfly-api-hosted-self-fk-leader-transfer-test Run mounted three-voter self-FK ADD/DROP owner leadership transfer
+  antfly-api-hosted-recovery-test Run native hosted owner recovery integration tests
+  antfly-api-staged-restore-driver-test Run bounded staged restore publication and cancellation driver regressions
+  antfly-api-staged-restore-proof-test Run portable accepted-generation and table-cohort restore regressions
+  antfly-api-staged-restore-portable-fk-test Run portable accepted-generation restore regression
+  antfly-api-portable-fk-restore-admission-test Run fail-closed public portable FK restore admission regression
+  antfly-api-staged-restore-benchmark-test Measure bounded native and portable LSM restore work
+  antfly-api-staged-restore-portable-terminal-test Prove large portable staged restore reaches durable publication
+  antfly-api-rewrite-driver-test Run real retained-source rewrite, hidden owner recovery and failed-tail cancellation
+  antfly-api-generated-restore-test Run generated mixed-table restore through HTTP owner faults
+  antfly-api-standalone-backup-restore-test Run the focused standalone-like backup/restore e2e test
+  openapi-root-check           Check that the bundled root OpenAPI spec matches the modular Zig specs
+  lib-metadata-vopr-forwarding-integration-test Run public table I/O forwarding integration tests only
+  antfly-metadata-service-test Run metadata service/control-loop integration tests
+  antfly-metadata-logic-test   Run metadata logic/state/planner tests
+  antfly-storage-test          Run local and server storage tests
+  antfly-storage-hot-standby-test Run hot-standby storage tests
+  lsm-backend-test             Run LSM backend unit tests only
+  lsm-native-checkpoint-test   Verify complete native checkpoint cuts across concurrent immutable publication
+  vector-migration-test        Run source ownership migration and recovery tests
+  resource-budget-test         Run storage resource-manager accounting tests
+  dense-index-lifecycle-regression-test Run focused durable dense-index repair and admission regressions
+  vopr-engine-test             Run the standalone VOPR engine and replay tests
+  vopr-contract-test           Run deterministic VOPR contract and replay-equivalence tests
+  vopr-benchmark               Run deterministic VOPR search-efficiency benchmarks
+  vopr-meta-test               Prove Antfly VOPR discovery, replay, reduction, and promotion end to end
+  vopr-registry-test           Record and exact-replay every context-free VOPR scenario through the CLI registry
+  antfly-transaction-abort-test Run transaction coordinator and bounded abort regressions
+  transaction-vopr-test        Run deterministic transaction VOPR and formal trace export tests
+  distributed-transaction-vopr-test Run distributed transaction lifecycle VOPR campaigns
+  data-plane-vopr-test         Run data-plane routing, persistence, apply, split, and read VOPR campaigns
+  request-lifecycle-vopr-test  Run production request lifecycle suspension points on VoprIo
+  replication-backfill-vopr-test Run production replication lifecycle suspension points and VOPR campaigns
+  supervision-vopr-test        Run standalone and serverless startup, failure, shutdown, deadline, and restart campaigns
+  auth-lifecycle-vopr-test     Run password, API-key, permission, row-filter, seed, revoke, reload, and crash campaigns
+  data-server-transition-vopr-test Run the isolated three-owner replicated merge/split VOPR history
+  data-server-vopr-test        Run production DataServer HTTP, ownership, and replicated merge/split actions on VoprIo
+  serverless-object-store-vopr-test Run real serverless object-store protocols with deterministic faults
+  serverless-workflow-vopr-test Run claim, build, compaction, publication, visibility, and recovery histories
+  db-index-race-vopr-test      Run DB/index delete, materialization, capture, admission, cancellation, and shutdown races
+  admission-vopr-test          Run shared production resource admission, quota, cancellation, and recovery under deterministic VOPR contention
+  provider-boundary-vopr-test  Run inference and PostgreSQL response-boundary fault campaigns
+  composed-query-vopr-test     Run vector, text, graph, and global-query assembly fault campaigns
+  query-embedding-cache-vopr-test Run query embedding coalescing, cancellation, timeout, admission, TTL, LRU, pin, and service-rate races on VoprIo
+  transaction-runtime-regression-test Check transaction identity, recovery clocks, and safe stateless retries
+  vopr-runtime-regression-test Run VOPR runtime ownership, clock, snapshot, and replay regressions
+  standby-production-vopr-test Exercise production standby public writes, standby reads, and promotion on VoprIo
+  standby-scaling-vopr-test    Replay production standby promotion with automatic split/merge and replica scale-out/drain
+  full-cluster-vopr-test       Run one shared-scheduler metadata, data, serverless, HTTP, and client deployment history
+  full-cluster-graph-replay-soak-test Repeat the graph restart recorded history and exact replay
+  full-cluster-graph-cutoff-test Verify graph restart hooks drain at a bounded replay cutoff
+  full-cluster-node-replacement-test Verify failed metadata replacement leaves a safe empty slot
+  extension-lifecycle-test     Test extension catalog identity, lifecycle, and Wasmtime ABI contracts
+  full-cluster-resource-pressure-vopr-test Replay public admission denial and recovery under node memory pressure
+  production-cluster-service-rate-vopr-test Run composed DataServer, graph, and serverless reversible service-rate history
+  production-cluster-query-cache-deadline-restart-vopr-test Run the production ApiHttpServer cache through slowdown, deadline, DataServer restart, recomputation, and durable recovery
+  production-cluster-serverless-fencing-vopr-test Run a stale enrichment generation and losing publication CAS beside live production metadata, DataServers, and public clients
+  production-cluster-authenticated-tenant-vopr-test Run two table-scoped identities through concurrent public writes, reads, bidirectional denials, and exact replay
+  production-cluster-disk-capacity-vopr-test Run a live DataServer capacity source through persistent-cache denial, healing, retry, and public-read continuity
+  production-cluster-managed-index-vopr-test Run public managed-index pending readiness through DataServer reconstruction, durable repair, and all-node semantic recovery
+  production-cluster-replication-backfill-vopr-test Run production snapshot and CDC batches through public HTTP, DataServer Raft, shared slowdown, and exact replay
+  production-cluster-replication-schema-change-vopr-test Run interrupted schema-change backfill, durable resume, public DataServer Raft visibility, and exact replay
+  production-cluster-replication-owner-restart-vopr-test Run replication through a stopped/reconstructed production DataServer owner and exact replay
+  production-cluster-replication-source-crash-vopr-test Run replication through a failed/replaced source session and exact replay
+  production-cluster-replication-cancellation-vopr-test Run replication through durable checkpoint lease cancellation and exact replay
+  production-cluster-replication-stale-owner-vopr-test Reject a stale replication owner before checkpoint publication, replay idempotently, and exact replay
+  production-cluster-replication-topology-change-vopr-test Rotate exact-cutover authority through metadata Raft after a replicated source-catalog change and exact replay
+  production-cluster-graph-hydration-vopr-test Run public production-owner graph expansion, document hydration, and exact replay
+  production-cluster-graph-cancellation-vopr-test Run public production-owner graph cancellation, recovery, and exact replay
+  production-cluster-graph-cancellation-transport-fault-vopr-test Run public graph cancellation with outstanding hydration under a scoped transport outage
+  production-cluster-graph-inflight-authorization-vopr-test Run in-flight authenticated public cross-table graph revocation, recovery, and exact replay
+  production-cluster-graph-stale-snapshot-vopr-test Run public graph stale-snapshot retry exhaustion, recovery, and exact replay
+  production-cluster-global-query-vopr-test Run ordered, table-isolated public global NDJSON query dispatch through production owners
+  production-cluster-global-query-cancellation-vopr-test Cancel global NDJSON dispatch after its first result and prove no-partial recovery
+  production-cluster-global-query-authorization-vopr-test Revoke live authority between global NDJSON results and prove fail-closed recovery
+  production-cluster-global-query-transport-vopr-test Cut the second table's production query link after the first result and prove fail-closed recovery
+  production-cluster-global-query-owner-restart-vopr-test Destroy the second table's production owner after the first result and prove reconstruction recovery
+  production-cluster-baseline-vopr-test Exact-replay the production DataServer baseline
+  production-cluster-vopr-smoke-test Exact-replay the production DataServer deployment baseline and bounded lifecycle
+  production-cluster-vopr-deep-test Exact-replay the complete metadata-driven production DataServer split history
+  production-cluster-graph-vopr-test Exact-replay a depth-two public graph across production DataServer owners
+  production-cluster-graph-split-vopr-test Exact-replay public graph queries before, during, and after a production DataServer active split
+  production-cluster-graph-split-transport-vopr-test Exact-replay a fail-closed public graph transport cut during a production DataServer active split
+  production-cluster-graph-split-owner-restart-vopr-test Exact-replay a fail-closed remote production DataServer restart during a public graph active split
+  production-cluster-graph-split-partial-write-vopr-test Exact-replay a scoped short graph HTTP write during a production DataServer active split
+  production-cluster-graph-split-resource-pressure-vopr-test Exact-replay production DataServer memory denial and recovery during a public graph active split
+  production-cluster-join-split-vopr-test Exact-replay a public distributed join before, during, and after a production DataServer active split
+  production-cluster-durable-join-takeover-vopr-test Exact-replay durable shuffle finalizer takeover after an unacknowledged persisted result
+  production-cluster-durable-join-cancellation-vopr-test Exact-replay public cancellation propagating into an outstanding durable-shuffle partition worker
+  production-cluster-durable-join-worker-retry-vopr-test Exact-replay durable-shuffle partition failover across production worker groups
+  production-cluster-durable-join-owner-restart-vopr-test Exact-replay durable partition-owner process destruction, reconstruction, and failover
+  production-cluster-durable-join-retry-exhaustion-vopr-test Exact-replay durable join retry exhaustion under overlapping resource and network faults
+  production-cluster-durable-join-cancellation-overlap-vopr-test Exact-replay durable join cancellation under overlapping resource and network faults
+  production-cluster-durable-join-cancellation-owner-restart-vopr-test Exact-replay durable join cancellation followed by production owner destruction and reconstruction
+  production-cluster-graph-split-overlapping-faults-vopr-test Exact-replay overlapping graph transport and all-owner memory faults during an active split
+  production-cluster-graph-split-socket-pressure-vopr-test Exact-replay a selected production listener socket denial and recovery during an active split
+  production-cluster-vopr-test Run every focused production DataServer cluster history through v53
+  generation-reranking-vopr-test Run local/remote generation and reranking fallback, replacement, validation, timeout, and cancellation histories on VoprIo
+  distributed-query-vopr-test  Run distributed graph planning, fanout, hydration, topology, snapshot, and cancellation histories on VoprIo
+  parquet-cache-vopr-test      Run persistent Parquet cache faults and crash recovery on VoprIo
+  provisioning-startup-vopr-test Run startup admission, provisioning, retry, and crash histories on VoprIo
+  restore-admission-vopr-test  Run three by three restore import and owner admission interleavings on VoprIo
+  generation-lifecycle-vopr-test Run generation publication, rollback, recovery, cleanup, and lock histories on VoprIo
+  backfill-marker-discovery-vopr-test Run metadata marker discovery, ownership, corruption, recheck, and throttle histories on VoprIo
+  config-extension-lifecycle-vopr-test Run cold config, secret rotation, refresh rollback, and extension activation histories on VoprIo
+  secrets-vopr-test            Replay secret persistence, CAS, rotation, outage and crash histories
+  secrets-test                 Qualify native adapters, Lite persistence, and replayable lifecycle
+  lite-secrets-test            Qualify Lite secret embedding, durability and restore rules
+  embedded-lite-lifecycle-vopr-test Run embedded, C ABI, and native Lite lifecycle, restore, callback, crash, and differential histories
+  vopr-determinism-audit       Reject uncontrolled entropy, clocks, host I/O, iteration, native libraries, and unstable identities in replayable VOPR adapters
+  external-lake-vopr-test      Run composed Iceberg discovery, Parquet query, cache, version, deletion, retry, eviction, and restart histories
+  media-runtime-vopr-test      Run production media HTTP, retry, timeout, cancellation, replacement, and cleanup histories on VoprIo
+  upgrade-compatibility-vopr-test Run explicit Antfly product storage and serverless artifact compatibility histories
+  derived-workflow-vopr-test   Run enrichment, indexing, repair, and compaction VOPR campaigns
+  backup-restore-vopr-test     Run backup publication, retention, restore, activation, and GC VOPR campaigns
+  clock-fault-vopr-test        Run wall-clock, monotonic-clock, lease, retention, and TTL fault VOPR campaigns
+  domain-vopr-test             Run all cross-domain Antfly VOPR protocol campaigns
+  vopr-runtime-test            Run Antfly background-service adapters on the deterministic VOPR runtime
+  vopr-build                   Install the VOPR campaign and replay executable
+  vopr-run                     Run one deterministic generated VOPR history
+  vopr-replay                  Replay one exact VOPR artifact
+  vopr-campaign                Run a bounded parallel VOPR campaign
+  vopr-reduce                  Reduce a VOPR failure while preserving its fingerprint
+  vopr-promote                 Promote a reviewed reduced VOPR failure fixture
+  vopr-tla                     Exact-replay a VOPR artifact and export TLA+ Raft NDJSON
+  vopr-explain                 Exact-replay a failing VOPR artifact and render its semantic causal slice
+  vopr-debug                   Inspect a replay-validated VOPR artifact at a choice prefix
+  vopr-results                 Render exact-replayed VOPR results as stable JSON and static HTML
+  vopr-events                  Validate or run a saved event-set query over exact-replayed VOPR histories
+  vopr-recipe                  Build a reduction, causal, counterfactual, query, and collector debug package
+  vopr-index                   Update and query the deterministic local VOPR run/results index
+  vopr-corpus-merge            Exact-replay and deterministically merge local, CI, and nightly VOPR corpora
+  vopr-test                    Run the fast deterministic Antfly VOPR suites
+  antfly-integration-test      Run focused real HTTP and public API integration suites
+  antfly-chaos-test            Run bounded generated chaos campaigns with labeled progress
+  vopr-soak-test               Run standby/scaling/Raft/data VOPR search campaigns and metadata/Raft native differentials
+  antfly-template-test         Run template rendering tests
+  antfly-audio-test            Run audio transcribing and synthesizing runtime tests
+  antfly-system-catalog-standalone-test Run standalone catalog checkpoint and rollback tests
+  antfly-inference-response-cleanup-test Verify post-dispatch cancellation retires host response ownership
+  antfly-inference-provider-context-test Run full request context propagation through provider adapters
+  antfly-standalone-runtime-test 
+  antfly-standalone-staged-restore-test Run shared standalone restore authority and mixed import regressions
+  antfly-raft-test             Run raft integration unit tests
+  antfly-raft-runtime-test     Run focused managed Raft runtime tests
+  antfly-raft-host-progress-test Run host progress notification and bounded inbound drain regressions
+  antfly-raft-restore-test     Run focused Raft restore authority and restart tests
+  antfly-http-scheduler-bench  Measure peer scheduling after node backlogs drain
+  antfly-raft-transport-test   Run raft transport and route reconciliation unit tests
+  antfly-local-transaction-recovery-test Run local transaction recovery regressions
+  antfly-server-db-test        Run server ordered apply and transaction recovery integration tests
+  antfly-raft-storage-test     Run Raft snapshot artifact storage tests
+  antfly-inference-contract-test Run shared inference work and provider contracts
+  lmdb-test                    Run Zig LMDB port unit tests
+  antfly-storage-lmdb-test     Run storage/lmdb wrapper unit tests
+  lmdb-replay-fixtures         Run only the LMDB replay fixture test
+  lmdb-vopr-test               Run replayable C-versus-Zig LMDB VOPR campaigns
+  storage-vopr-runtime-test    Run storage VOPR runtime and modeled-device tests
+  lmdb-workload-soak           Run only the legacy LMDB randomized workload soak
+  docstore-test                Run storage/docstore unit tests
+  docstore-retained-effects-test Run atomic source row retention, restart, bounds and GC regressions
+  docstore-transaction-reservations-test Run native transaction prepare, reserved retention and recovery regressions
+  vector-payload-bench         Build real-file source payload and hash benchmarks
+  vector-payload-test          Run source vector payload ownership and recovery tests
+  vector-block-store-test      Run native vector segment publication and recovery tests
+  shard-test                   Run storage/shard unit tests
+  wal-test                     Run storage/wal unit tests
+  wal-workload-test            Run only the legacy WAL randomized workload tests
+  wal-vopr-test                Run WAL modeled-time VOPR smoke tests
+  wal-replay-fixtures          Run only the WAL replay fixture tests
+  wal-workload-soak            Run only the legacy WAL randomized workload soak
+  storage-workload-soak        Run the legacy LMDB and WAL randomized workload soaks
+  persistent-rebuild-page-test Run atomic rebuild page regressions and optional scaling benchmark
+  persistent-test              Run storage/persistent unit tests
+  persistent-delete-regression-test Run atomic multi-segment deletion regressions
+  persistent-workload-test     Run only the legacy persistent randomized workload tests
+  persistent-replay-fixtures   Run only the persistent replay fixture tests
+  persistent-vopr-test         Run persistent modeled-storage VOPR smoke tests
+  persistent-workload-soak     Run only the legacy persistent randomized workload soak
+  index-manager-test           Run storage/db/catalog/index_manager unit tests
+  index-manager-resource-test  Run index manager resource-manager accounting tests
+  index-manager-workload-test  Run only the legacy index-manager randomized workload tests
+  index-manager-replay-fixtures Run only the index manager replay fixture tests
+  index-manager-vopr-test      Run index manager modeled-storage VOPR smoke tests
+  db-split-workload-test       Run only the legacy DB split randomized workload tests
+  antfly-storage-db-split-vopr-test Run only the DB split modeled-storage replay fixture tests
+  storage-workload-test        Run legacy deterministic storage workloads that still use real storage I/O
+  storage-vopr-test            Run deterministic storage modeled-time/model-I/O VOPR checks
+  antfly-graph-metric-contract-test Run graph metric request and response contract tests
+  document-lookup-bench        Build validated real document collector allocation/timing benchmark
+  document-collector-test      Verify synchronous document collector ownership and allocation failures
+  replay-document-integration-test Verify replay consumers across text, algebraic, graph and document bodies
+  lake-storage-test            Run native owner lake read-only and restart contracts
+  antfly-storage-db-test       Run storage/db owner tests using the shared unit artifacts
+  antfly-relational-index-lifecycle-test Run relational index dependency and retirement admission tests
+  graph-runtime-test           Run graph artifact replay, repair, and traversal integration tests
+  antfly-resolver-backfill-test Run resolver catalog and durable backfill regressions
+  release-blocker-regression-test Run selective ANN and post-delete full-text release-blocker regressions
+  antfly-local-maintenance-test Run local maintenance requirement and recovery contract regressions
+  antfly-producer-maintenance-test Run durable producer, publication recovery, and TTL observation regressions
+  storage-work-contract-test   Run storage boundary and bounded-work regressions
+  release-scale-test           Run corpus-scale ANN, full-text, bitmap, and compaction regressions
+  antfly-storage-db-restore-identity-test Run the focused run-backed identity restore regression
+  antfly-storage-db-handoff-reopen-test Run hidden-to-public generation handoff receipt persistence regression
+  antfly-storage-native-fk-test Run native and replicated FK publication receipt recovery tests
+  antfly-storage-db-restore-managed-test Run focused managed native restore DB tests
+  provisioned-write-cache-failed-close-test Run the focused provisioned write-cache failed-enrichment close regression
+  provisioned-query-visibility-test Run the focused managed dense query-visibility cache invalidation regression
+  antfly-storage-db-embeddings-update-test Run the explicit _embeddings update DB test
+  antfly-storage-db-merge-cutover-test Run the merge cutover enrichment reopen DB test
+  antfly-storage-db-shared-embedding-test Run the shared embedding enrichment DB test
+  antfly-storage-db-dense-parent-paging-test Run the dense parent paging enrichment DB test
+  db-split-replay-fixtures     Run only the DB split replay fixture tests
+  sparse-incarnation-test      Run exact sparse ordinal replacement, compaction and restart regressions
+  storage-foundation-test      Run common worker, storage runtime, and LMDB lifecycle fixtures
+  sparse-test                  Run sparse index unit tests
+  derived-log-test             Run storage/db/derived/derived_log unit tests
+  unit-storage-test            Run the storage portion of the default antfly-unit-test target in bounded codegen shards
+  unit-storage-test-audit      Verify every test-bearing storage module belongs to a bounded codegen shard
+  embedded-source-boundary-check Verify the authored local engine sources do not import server coordination
+  unit-storage-compile         Compile the three storage antfly-unit-test artifacts without running them
+  unit-storage-test-inventory  Verify the consolidated artifacts preserve the seven-shard named test inventory
+  unit-metadata-compile        Compile the two consolidated metadata antfly-unit-test artifacts without running them
+  unit-metadata-test-inventory Verify the two consolidated artifacts preserve the nine-shard named test inventory
+  test                         Run default package test aggregates
+  conformance-test             Fetch and run conformance suites
+  soak-test                    Run long-running soak test aggregates
+  lib-test                     Run default standalone library tests
+  lib-transcribing-test        Run standalone lib/transcribing tests
+  lib-transcribing-check       Compile transcribing tests without executing them
+  lib-audio-conformance        Run lib/audio conformance (fetch missing fixtures)
+  regex-bench                  Build and install regex_bench
+  json-bench                   Build and install json_bench
+  bench-tokenizer-build        Build the native Zig HuggingFace tokenizer benchmark binary
+  bench-tokenizer              Build and install tokenizer_benchmark
+  antfly-system-catalog-bench  Benchmark indexed catalog lookups and mutation planning
+  antfly-system-catalog-routing-bench Benchmark rebuilt and retained indexed routing generations
+  lmdb-bench                   Build and install both C and Zig LMDB benchmark binaries
+  split-bench                  Build and install split_bench
+  db-split-bench               Build and install db_split_bench
+  antfly-storage-bench         Build and install storage benchmarks and comparisons
+  backend-bench                Build and install backend_bench
+  antfly-graph-bench           Build and install graph preparation and query benchmarks
+  lsm-backend-bench            Build and install lsm_backend_bench
+  hbc-storage-read-bench       Build and install hbc_storage_read_bench
+  lsm-write-bench              Build and install lsm_write_bench
+  lsm-write-bench-compare      Build and install lsm_write_bench_compare
+  text-segment-write-bench     Build and install text_segment_write_bench
+  lsm-backend-bench-compare    Build and install lsm_backend_bench_compare
+  benchmark-io-test            Check benchmark partial-start cleanup under Io capacity exhaustion
+  antfly-storage-wal-bench     Build and install wal_bench
+  antfly-storage-db-derived-bench Build and install derived_log_bench
+  bench                        Build and install bench
+  quickstart-bench             Build and install quickstart_bench
+  compat                       Run the shared compatibility corpus
+  search-bench-test            Run search benchmark grammar and protocol tests
+  search-performance-test      Run focused full-text scorer regression tests
+  search-bench-codec-bench     Build and install search_benchmark_codec_bench
+  search-bench-bitpack-bench   Build and install search_benchmark_bitpack_bench
+  search-impact-layout-analyze Build and install search_impact_layout_analyze
+  wand-skip-bench              Build and install wand_skip_bench
+  search-bench                 Build search-benchmark-game antfly-zig adapter and search codec benchmark binaries
+  storage-fixture-promote      Build and install storage_fixture_promote
+  merge-cycle                  Build and install merge_cycle_bench
+  merge-cost                   Build and install merge_cost_bench
+  hbc-parity                   Build and install hbc_parity
+  hbc-isolate                  Build and install hbc_isolate
+  bench-build-quality          Build bounded-bootstrap held-out recall benchmark
+  dense-stack-bench            Build and install dense_stack_bench
+  rw-lock-bench                Build and install rw_lock_bench
+  provisioned-warmup-bench     Build and install provisioned_warmup_bench
+  antfly-api-bench             Build and install API benchmarks
+  raft-apply-bench             Build and install raft_apply_bench
+  managed-host-wal-bench       Build and install managed_host_wal_bench
+  dense-profile-summary        Build and install dense_profile_summary
+  lmdb-commit-compare          Build and install lmdb_commit_compare
+  sparse-split-bench           Build and install sparse_split_bench
+  rabitq-bench                 Build and install rabitq_bench
+  recall-harness               Build and install recall_harness
+  antfly-recall-test           Run storage-backed and per-metric recall checks concurrently
+  runtime-unit-api_kernel      Build only the api_kernel runtime library unit
+  runtime-unit-distributed     Build only the distributed runtime library unit
+  runtime-unit-storage_kernel  Build only the storage_kernel runtime library unit
+  runtime-unit-enrichment_compute Build only the enrichment_compute runtime library unit
+  runtime-unit-serverless      Build only the serverless runtime library unit
+  runtime-unit-inference       Build only the inference runtime library unit
+  runtime-unit-cli             Build only the cli runtime library unit
+  linked-inference-worker-integration-test Run actual worker CPU demand transport and parent ownership checks
+  linked-inference-abi-integration-test Run the production-linked inference function-table and binary-payload ABI probe
+  antfly-standalone-initial-fk-test Run linked native standalone initial-FK owner publication tests
+  antfly-graph-transfer-test   Validate certified graph artifact generation transfer
+  antfly-standalone-policy-ha-test Run native standalone and HA row-policy publication regressions
+  antfly-storage-owner-handoff-reopen-test Run physical shared-context owner handoff receipt reopen regression
+  antfly-storage-owner-test    Run real compiled storage owner ABI regressions
+  antfly-storage-owner-source-test Run compiled owner source and callback regressions
+  antfly-main-test             Run top-level Antfly CLI tests
+  antfly                       Build and install the top-level Antfly CLI
+  lite                         Build and install the Antfly Lite CLI and libantfly C ABI
+  lite-test                    Run Lite backend, CLI, bindings, examples, and C ABI packaging checks
+  hbc-trace                    Build and install hbc_trace
+  hbc-leaf-debug               Build and install hbc_leaf_debug
+  unit-test-inventory          Audit unique ownership across all four CI unit gates
+
+Project-Specific Options:
+  -Dembedded-only=[bool]       Compose only the Apache embedded products
+  -Dapi-bench-standalone=[bool] Build only the API benchmark for an existing server process
+  -Dconformance-fetch=[bool]   Fetch missing external conformance fixtures
+  -Dconformance-fixtures=[string] Cache directory for external conformance fixtures
+  -Dtarget=[string]            The CPU architecture, OS, and ABI to build for
+  -Dcpu=[string]               Target CPU features to add or subtract
+  -Dofmt=[string]              Target object format
+  -Ddynamic-linker=[string]    Path to interpreter on the target system
+  -Doptimize=[enum]            Prioritize performance, safety, or binary size
+                                 Supported Values:
+                                   debug
+                                   safe
+                                   fast
+                                   small
+  -Dstrip=[bool]               Omit debug information from release artifacts
+  -Dlmdb_backend=[enum]        Select the LMDB implementation for test and benchmark fixtures (c or zig)
+                                 Supported Values:
+                                   c
+                                   zig
+  -Dlmdb_evented_async_io=[bool] Use std.Io.Evented for standalone Zig LMDB test and benchmark fixtures
+  -Dwith_tla=[bool]            Enable TLA+ trace instrumentation (ndjson event logging)
+  -Dlink-libc=[bool]           Link Antfly runtime modules against libc
+  -Dsanitize-thread=[bool]     Enable ThreadSanitizer for the Antfly runtime
+  -Druntime-artifact-role=[enum] Build one focused runtime artifact: cli, data, inference, metadata, or standalone
+                                 Supported Values:
+                                   cli
+                                   data
+                                   inference
+                                   metadata
+                                   standalone
+  -Dantfly-bin-name=[string]   Installed filename for the top-level Antfly CLI
+  -Donnx=[bool]                Enable ONNX Runtime support for embedded inference
+  -Donnx-root=[string]         Path to ONNX Runtime root for embedded inference
+  -Dmetal=[bool]               Enable Apple Metal kernels for embedded inference
+  -Dcuda=[bool]                Enable CUDA inference support through the NVIDIA Driver API
+  -Dcuda-artifacts=[string]    CUDA artifact bundle: fatbin SASS+PTX, portable PTX, or sm89 cubin
+  -Dpjrt=[bool]                Enable PJRT inference support through runtime-loaded plugins
+  -Dblas-root=[string]         Path to system BLAS root with include/ and lib/ for non-macOS native acceleration
+  -Dblas=[enum]                CPU BLAS policy: auto (platform defaults), linked (require system BLAS), off (native kernels only)
+                                 Supported Values:
+                                   auto
+                                   linked
+                                   off
+  -Dsystem-blas=[bool]         Deprecated: link-time BLAS override; use -Dblas=auto|linked|off instead; cannot combine with -Dblas
+  -Druntime-openblas=[bool]    Deprecated: runtime loader override; use -Dblas=auto|linked|off instead; cannot combine with -Dblas
+  -Dantfly-version=[string]    Antfly version string
+  -Dlite-local-inference-runtime=[bool] Advertise an embedded local inference runtime in Antfly Lite status
+  -Dtest-filter=[list]         Compile-time test filters (runtime filters follow --)
+  -Dinference-openapi-spec=[string] Path to the inference OpenAPI YAML spec used to generate inference_api
+  -Dwasm-memory-model=[string] Inference WASM memory model: wasm32 or wasm64
+  -Dwebgpu=[bool]              Enable WebGPU for inference WASM
+  -Druntime-test-filter=[bool] Build inference tests once and filter them at runtime
+  -Dgliner25-fuzz-no-error-tracing=[bool] Work around Zig 0.16.0 fuzz runner error-trace mismatch for GLiNER25 only (use with --fuzz)
+  -Dapple-providers=[bool]     Enable native Apple OCR, generation, and transcription (macOS 27 SDK and Swift required)
+  -Dwasm-strip=[bool]          Strip embedded WASM debug information
+  -Dpdf-optimize=[enum]        Optimization for the isolated PDF executable
+                                 Supported Values:
+                                   debug
+                                   safe
+                                   fast
+                                   small
+  -Dvopr-soak-histories=[int]  Histories per VOPR soak campaign
+  -Dvopr-soak-production-histories=[int] Histories in the production standby/scaling soak campaign
+  -Dvopr-soak-seed=[int]       Base seed for VOPR soak campaigns
+  -Dvopr-soak-artifacts=[string] Persistent directory for VOPR soak reports and replay corpus
+  -Dstorage-owner-test-filter=[string] Compile and run one matching storage owner test subset
+  -Dstorage-owner-source-test-filter=[string] Compile and run matching provisioned storage owner tests
+  -Dtest-progress=[bool]       Label existing antfly-unit-test run nodes without changing test selection or scheduling
+  -Dunit-test-inventory-allow-overlap=[bool] Report overlapping unit ownership without failing (migration diagnostics)
+
+System Integration Options:
+  --search-prefix [path]       Add a path to look for binaries, libraries, headers
+  --sysroot [path]             Set the system root directory (usually /)
+  --libc [file]                Provide a file which specifies libc paths
+
+  --system [pkgdir]            Disable package fetching; enable all integrations
+  -fsys=[name]                 Enable a system integration
+  -fno-sys=[name]              Disable a system integration
+
+  -fdarling,  -fno-darling     Integration with system-installed Darling to
+                               execute macOS programs on Linux hosts
+                               (default: no)
+  -fqemu,     -fno-qemu        Integration with system-installed QEMU to execute
+                               foreign-architecture programs on Linux hosts
+                               (default: no)
+  --libc-runtimes [path]       Enhances QEMU integration by providing dynamic libc
+                               (e.g. glibc or musl) built for multiple foreign
+                               architectures, allowing execution of non-native
+                               programs that link with libc.
+  -frosetta,  -fno-rosetta     Rely on Rosetta to execute x86_64 programs on
+                               ARM64 macOS hosts. (default: no)
+  -fwasmtime, -fno-wasmtime    Integration with system-installed wasmtime to
+                               execute WASI binaries. (default: no)
+  -fwine,     -fno-wine        Integration with system-installed Wine to execute
+                               Windows programs on Linux hosts. (default: no)
+
+  Available System Integrations:                Enabled:
+  (none)                                        -
+
+General Options:
+  -h, --help                   Print this help to stdout and exit
+  -l, --list-steps             Print available steps to stdout and exit
+
+  -p, --prefix [path]          Where to install files (default: zig-out)
+  --prefix-lib-dir [path]      Where to install libraries
+  --prefix-exe-dir [path]      Where to install executables
+  --prefix-include-dir [path]  Where to install C header files
+  --release[=mode]             Request release mode, optionally specifying a
+                               preferred optimization mode: fast, safe, small
+
+  --verbose                    Print commands before executing them
+  --color [auto|off|on]        Enable or disable colored error messages
+  --error-style [style]        Control how build errors are printed
+    verbose                    (Default) Report errors with full context
+    minimal                    Report errors after summary, excluding context like command lines
+    verbose_clear              Like 'verbose', but clear the terminal at the start of each update
+    minimal_clear              Like 'minimal', but clear the terminal at the start of each update
+  --multiline-errors [style]   Control how multi-line error messages are printed
+    indent                     (Default) Indent non-initial lines to align with initial line
+    newline                    Include a leading newline so that the error message is on its own lines
+    none                       Print as usual so the first line is misaligned
+  --summary [mode]             Control the printing of the build summary
+    all                        Print the build summary in its entirety
+    new                        Omit cached steps
+    failures                   (Default if short-lived) Only print failed steps
+    line                       (Default if long-lived) Only print the single-line summary
+    none                       Do not print the build summary
+  -j<N>                        Limit concurrent jobs (default is to use all CPU cores)
+  --maxrss <bytes>             Limit memory usage (default is to use available memory)
+  --skip-oom-steps             Instead of failing, skip steps that would exceed --maxrss
+  --test-timeout <timeout>     Limit execution time of unit tests, terminating if exceeded.
+                               The timeout must include a unit: ns, us, ms, s, m, h
+  --watch                      Continuously rebuild when source files are modified
+  --debounce <ms>              Delay before rebuilding after changed file detected
+  --webui[=ip]                 Enable the web interface on the given IP address
+  --fuzz[=limit]               Continuously search for unit test failures with an optional 
+                               limit to the max number of iterations. The argument supports
+                               an optional 'K', 'M', or 'G' suffix (e.g. '10K'). Implies
+                               '--webui' when no limit is specified.
+  --listen=-                   Enable the build server protocol on stdio
+  --time-report                Force full rebuild and provide detailed information on
+                               compilation time of Zig source code (implies '--webui')
+  -fincremental                Enable incremental compilation
+  -fno-incremental             Disable incremental compilation
+
+Package Management Options:
+  --fetch[=mode]               Fetch dependency tree (optionally choose laziness) and exit
+    needed                     (Default) Lazy dependencies are fetched as needed
+    all                        Lazy dependencies are always fetched
+  --fork=[path], --fork [path] Override one or more projects from dependency tree
+
+Advanced Options:
+  -freference-trace[=num]      How many lines of reference trace should be shown per compile error
+  -fno-reference-trace         Disable reference trace
+  -fallow-so-scripts           Allows .so files to be GNU ld scripts
+  -fno-allow-so-scripts        (default) .so files must be ELF files
+  --error-limit [num]          Set the maximum amount of distinct error values
+  --build-file [file]          Override path to build.zig
+  --cache-dir [path]           Override path to local Zig cache directory
+  --zig-lib=[arg]              Override path to Zig lib directory
+  --seed [integer]             For shuffling dependency traversal order (default: random)
+  --cache-poison[=mode]        Override configuration caching behavior
+      pure                     (default) Avoid false positive cache hits
+      poisoned                 Don't cache the configuration
+      disallowed               Panics when cache would be poisoned
+      ignored                  A little poison never hurt anybody
+  --print-configuration        Render configuration as .zon to stdout
+  --print-configuration-path   Print the path to the binary configuration file to stdout
+  --build-id[=style]           At a minor link-time expense, embeds a build ID in binaries
+      fast                     8-byte non-cryptographic hash (COFF, ELF, WASM)
+      sha1, tree               20-byte cryptographic hash (ELF, WASM)
+      md5                      16-byte cryptographic hash (ELF)
+      uuid                     16-byte random UUID (ELF, WASM)
+      0x[hexstring]            Constant ID, maximum 32 bytes (ELF, WASM)
+      none                     (default) No build ID
+  --debug-log [scope]          Enable debugging the compiler
+  --debug-pkg-config           Fail if unknown pkg-config flags encountered
+  --verbose-link               Enable compiler debug output for linking
+  --verbose-air                Enable compiler debug output for Zig AIR
+  --verbose-llvm-ir            Enable compiler debug output for LLVM IR
+  --verbose-cimport            Enable compiler debug output for C imports
+  --verbose-cc                 Enable compiler debug output for C compilation
+  --verbose-llvm-cpu-features  Enable compiler debug output for LLVM CPU features

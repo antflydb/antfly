@@ -189,6 +189,7 @@ fn ensureModelExecutor(
             gpt_config,
             context.kv_dtype,
             context.shared_moe_cache,
+            context.device_memory_budget,
         ),
     };
     entry.compiled_model_executor = .{
@@ -360,6 +361,7 @@ fn directSessionRuntime(
         gpt_config,
         context.kv_dtype,
         context.shared_moe_cache,
+        context.device_memory_budget,
     );
     defer executor.deinit();
 

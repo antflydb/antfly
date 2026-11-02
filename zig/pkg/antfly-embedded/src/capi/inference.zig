@@ -25,6 +25,8 @@ const inference_provider = db.inference_provider;
 const alloc = std.heap.c_allocator;
 
 const known_flags: u32 = 0;
+// Owner-partition fixtures select a loopback Hub without a public request knob.
+var test_pull_hub_base_url: if (@import("builtin").is_test) ?[]const u8 else void = if (@import("builtin").is_test) null else {};
 
 const InferenceHandle = struct {
     io: *std.Io.Threaded,
@@ -405,6 +407,9 @@ const PullCall = struct {
     callback: ?capi.InferencePullProgressFn,
     callback_context: ?*anyopaque,
     io: std.Io,
+    handle: *anyopaque,
+    execution: inference_provider.inference_bridge.runnable_abi.Borrowed = undefined,
+    deadline_ns: u64,
     future: ?std.Io.Future(void) = null,
 
     /// Waits for the caller's callback, so returning 0 (cancel) reaches the
@@ -435,8 +440,13 @@ const PullCall = struct {
         self.result = alloc.dupe(u8, result.slice()) catch null;
     }
 
+    fn cancelled(raw: ?*const anyopaque) callconv(.c) u8 {
+        const self: *const PullCall = @ptrCast(@alignCast(raw.?));
+        return @intFromBool(self.relay.cancelled.load(.acquire));
+    }
+
     fn download(self: *PullCall, models_dir: ?[]const u8, request: []const u8) void {
-        self.outcome = inference_provider.pullEmbeddedInferenceModels(self.io, models_dir, request, self, onProgress, self, onResult);
+        self.outcome = inference_provider.pullEmbeddedInferenceModels(self.io, self.handle, if (@import("builtin").is_test) test_pull_hub_base_url else null, &self.execution, self.deadline_ns, .{ .context = self, .is_cancelled = cancelled }, models_dir, request, self, onProgress, self, onResult);
         self.relay.finish();
     }
 
@@ -483,6 +493,11 @@ fn pullErrorCode(name: []const u8) capi.ErrorCode {
         .{ "HubApiError", .busy },
         .{ "DownloadFailed", .busy },
         .{ "Timeout", .busy },
+        .{ "DeadlineExceeded", .busy },
+        .{ "SchedulerFull", .busy },
+        .{ "RunnableWaitTimeout", .busy },
+        .{ "SchedulerClosed", .busy },
+        .{ "ResourceBudgetExceeded", .busy },
         .{ "UnknownHostName", .busy },
         .{ "NameServerFailure", .busy },
         .{ "ConnectionRefused", .busy },
@@ -515,7 +530,24 @@ pub fn antfly_inference_pull_json(
         .callback = progress,
         .callback_context = progress_context,
         .io = io,
+        .handle = handle.lifetime.handle,
+        .deadline_ns = handle.deadline(),
     };
+    // Queue on the caller's existing synchronous lane, before creating a
+    // helper. Queued pulls never allocate an extra OS worker merely to wait.
+    const resource_owner = handle.lifetime.resource_owner orelse return capi.mapError(error.ResourceOwnerNotConfigured);
+    const owner = resource_owner.execution_port.owner();
+    var admitted: ?*anyopaque = null;
+    const executor = inference_provider.inference_bridge.native_abi.IoBorrow.init(&io);
+    const status = owner.start(owner.context, &.{ .io = &executor, .class = @backingInt(inference_provider.inference_bridge.runnable_abi.Class.background), .has_deadline = @intFromBool(call.deadline_ns != 0), .native_deadline = 1, .deadline_ns = call.deadline_ns, .cancellation = .{ .context = &call, .is_cancelled = PullCall.cancelled }, .retained_bytes = @as(u64, request_json.bytes().len) +| @sizeOf(PullCall), .out_handle = &admitted });
+    if (!status.isOk()) {
+        const cause = inference_provider.inference_bridge.errorFromStatus(status);
+        const failure = std.fmt.allocPrint(alloc, "{{\"error\":\"{s}\"}}", .{@errorName(cause)}) catch return capi.mapError(error.OutOfMemory);
+        out.* = .{ .ptr = failure.ptr, .len = failure.len };
+        return pullErrorCode(@errorName(cause));
+    }
+    defer owner.finish(admitted.?);
+    call.execution = .{ .context = admitted.?, .cpu_slots = 1, .parent_class = @intCast(@backingInt(inference_provider.inference_bridge.runnable_abi.Class.background)), .checkpoint = owner.checkpoint, .park = owner.park, .enter = owner.enter, .enter_checked = owner.enter_checked, .check_lifetime = owner.check_lifetime, .current_class = owner.current_class };
     call.future = io.concurrent(PullCall.download, .{ &call, handle.models_dir, request_json.bytes() }) catch |err|
         return capi.mapError(err);
     call.relay.run(&call, PullCall.deliver, PullCall.cancel);
@@ -1110,4 +1142,167 @@ comptime {
         "antfly_inference_pull_json",
         "antfly_inference_generate_stream_json",
     });
+}
+
+test "capi inference pull shared admission expires before helper publication" {
+    if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
+    const io = std.testing.io;
+    var options: capi.InferenceOptions = .{ .call_timeout_ms = 50 };
+    var inference_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_open(&options, &inference_handle));
+    defer antfly_inference_close(inference_handle);
+    const handle, const slot = registry.enter(inference_handle) orelse return error.TestExpectedNativeInferenceHandle;
+    defer @TypeOf(registry).leave(slot);
+    const resources = handle.lifetime.resource_owner.?;
+    const owner = resources.execution_port.owner();
+    const executor = inference_provider.inference_bridge.native_abi.IoBorrow.init(&io);
+    var held: ?*anyopaque = null;
+    try std.testing.expect(owner.start(owner.context, &.{ .io = &executor, .class = @backingInt(inference_provider.inference_bridge.runnable_abi.Class.inference), .slots = resources.runnable.scheduler.config.generalSlots(), .out_handle = &held }).isOk());
+    defer if (held) |value| owner.finish(value);
+    const retained = resources.runnable.scheduler.stats().retained_bytes;
+    var result: capi.Buffer = .{};
+    defer db.antfly_buffer_free(&result);
+    // Without admission this malformed request returns invalid_argument. Its
+    // deadline must expire in the original queue before a helper parses it.
+    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_inference_pull_json(inference_handle, testSlice("{}"), null, null, &result));
+    try std.testing.expect(std.mem.indexOf(u8, testBuffer(result), "DeadlineExceeded") != null);
+    try std.testing.expectEqual(@as(usize, 1), resources.runnable.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), resources.runnable.scheduler.stats().queued);
+    try std.testing.expectEqual(retained, resources.runnable.scheduler.stats().retained_bytes);
+    owner.finish(held.?);
+    held = null;
+    var retry: capi.Buffer = .{};
+    defer db.antfly_buffer_free(&retry);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_pull_json(inference_handle, testSlice("{}"), null, null, &retry));
+    try std.testing.expectEqual(@as(usize, 0), resources.runnable.scheduler.stats().operations);
+}
+
+test "capi inference pull shared admission installs through Hub waits and retains retry state" {
+    if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
+    const httpx = @import("httpx");
+    const RunnableAbi = inference_provider.inference_bridge.runnable_abi;
+    const Mode = enum { success, deadline, canceled };
+    const Fixture = struct {
+        var owner: *inference_provider.LiteInferenceResourceOwner = undefined;
+        var waits: std.atomic.Value(usize) = .init(0);
+        fn request(_: httpx.testing_mod.RequestInfo) !void {
+            const io = std.testing.io;
+            const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+            while (owner.runnable.scheduler.stats().resource_blocked == 0) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.TestExpectedParkedPull;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            const port = owner.execution_port.owner();
+            const executor = inference_provider.inference_bridge.native_abi.IoBorrow.init(&io);
+            for ([_]RunnableAbi.Class{ .query, .control }) |class| {
+                var work: ?*anyopaque = null;
+                const status = port.start(port.context, &.{ .io = &executor, .class = @backingInt(class), .allow_wait = 0, .out_handle = &work });
+                try std.testing.expect(status.isOk());
+                port.finish(work.?);
+            }
+            _ = waits.fetchAdd(1, .release);
+        }
+        fn serve(server: *httpx.TestServer) !void {
+            while (true) server.handleOne() catch |err| switch (err) {
+                error.ConnectionClosed, error.ConnectionResetByPeer, error.BrokenPipe, error.EndOfStream => continue,
+                else => return err,
+            };
+        }
+    };
+    const Progress = struct {
+        caller: std.Thread.Id,
+        cancel_after_bytes: u64 = 0,
+        off_thread: bool = false,
+        fn report(raw: ?*anyopaque, update: *const capi.InferencePullProgress) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.caller != std.Thread.getCurrentId()) self.off_thread = true;
+            return self.cancel_after_bytes == 0 or update.bytes_downloaded < self.cancel_after_bytes;
+        }
+    };
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+    for (std.enums.values(Mode)) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const directory = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(directory);
+        const payload = try a.alloc(u8, if (mode == .canceled) 17 * 1024 * 1024 else 4096);
+        defer a.free(payload);
+        @memset(payload, 'm');
+        // Valid ModelProto framing: IR version, empty graph, then an unknown
+        // length-delimited field. Dependency discovery skips this padding.
+        const prefix_len: usize = if (mode == .canceled) 10 else 8;
+        @memcpy(payload[0..6], &[_]u8{ 8, 9, 0x3a, 0, 0xfa, 7 });
+        var padding = payload.len - prefix_len;
+        var prefix_index: usize = 6;
+        while (padding >= 128) : (prefix_index += 1) {
+            payload[prefix_index] = @as(u8, @intCast(padding & 127)) | 128;
+            padding >>= 7;
+        }
+        payload[prefix_index] = @intCast(padding);
+        std.debug.assert(prefix_index + 1 == prefix_len);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+        const checksum = std.fmt.bytesToHex(digest, .lower);
+        const metadata = try std.fmt.allocPrint(a, "{{\"sha\":\"{s}\",\"siblings\":[{{\"rfilename\":\"model.onnx\",\"size\":{d},\"lfs\":{{\"size\":{d},\"sha256\":\"{s}\"}}}}]}}", .{ commit, payload.len, payload.len, checksum });
+        defer a.free(metadata);
+        const artifact_path = "/fixture/model/resolve/" ++ commit ++ "/model.onnx";
+        const routes = [_]httpx.TestRoute{
+            .{ .path = "/api/models/fixture/model", .respond = .{ .body = metadata, .delay_ns = if (mode == .deadline) std.time.ns_per_s else 0 }, .assert_request = Fixture.request },
+            .{ .method = .HEAD, .path = artifact_path, .respond = .{ .body = payload, .truncate_body_at = 0 }, .assert_request = Fixture.request },
+            .{ .path = artifact_path, .respond = .{ .body = payload }, .assert_request = Fixture.request },
+            .{ .method = .HEAD, .path = "/fixture/model/resolve/main/model.onnx", .respond = .{ .body = payload, .truncate_body_at = 0 }, .assert_request = Fixture.request },
+            .{ .path = "/fixture/model/resolve/main/model.onnx", .respond = .{ .body = payload }, .assert_request = Fixture.request },
+        };
+        var server = try httpx.TestServer.start(a, io, &routes);
+        defer server.deinit();
+        test_pull_hub_base_url = server.baseUrl();
+        defer test_pull_hub_base_url = null;
+        var options: capi.InferenceOptions = .{ .models_dir = testSlice(directory), .call_timeout_ms = if (mode == .deadline) 500 else 10_000 };
+        var inference_handle: ?*anyopaque = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_open(&options, &inference_handle));
+        defer antfly_inference_close(inference_handle);
+        const handle, const slot = registry.enter(inference_handle) orelse return error.TestExpectedNativeInferenceHandle;
+        defer @TypeOf(registry).leave(slot);
+        Fixture.owner = handle.lifetime.resource_owner.?;
+        Fixture.waits.store(0, .release);
+        const owner = Fixture.owner.execution_port.owner();
+        const executor = inference_provider.inference_bridge.native_abi.IoBorrow.init(&io);
+        const general_slots = Fixture.owner.runnable.scheduler.config.generalSlots();
+        var held: ?*anyopaque = null;
+        if (general_slots > 1) try std.testing.expect(owner.start(owner.context, &.{ .io = &executor, .class = @backingInt(RunnableAbi.Class.inference), .slots = general_slots - 1, .out_handle = &held }).isOk());
+        defer if (held) |value| owner.finish(value);
+        var serving = try io.concurrent(Fixture.serve, .{&server});
+        defer _ = serving.cancel(io) catch {};
+        var progress: Progress = .{ .caller = std.Thread.getCurrentId(), .cancel_after_bytes = if (mode == .canceled) 16 * 1024 * 1024 else 0 };
+        var out: capi.Buffer = .{};
+        defer db.antfly_buffer_free(&out);
+        const code = antfly_inference_pull_json(inference_handle, testSlice("{\"model\":\"fixture/model\"}"), Progress.report, &progress, &out);
+        try std.testing.expect(!progress.off_thread);
+        try std.testing.expect(Fixture.waits.load(.acquire) > 0);
+        if (mode == .success) {
+            try std.testing.expectEqual(capi.ErrorCode.ok, code);
+        } else {
+            try std.testing.expectEqual(if (mode == .deadline) capi.ErrorCode.busy else capi.ErrorCode.cancelled, code);
+            try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "fixture/model/model.onnx", .{}));
+            // A fresh call may reuse hidden verified artifacts or a digest-bound
+            // partial. It must not revive the failed execution or publish early.
+            handle.call_timeout_ms = 10_000;
+            progress.cancel_after_bytes = 0;
+            var retry: capi.Buffer = .{};
+            defer db.antfly_buffer_free(&retry);
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_pull_json(inference_handle, testSlice("{\"model\":\"fixture/model\"}"), Progress.report, &progress, &retry));
+        }
+        const downloaded = try tmp.dir.readFileAlloc(io, "fixture/model/model.onnx", a, .limited(payload.len + 1));
+        defer a.free(downloaded);
+        try std.testing.expectEqualSlices(u8, payload, downloaded);
+        const complete = try tmp.dir.openFile(io, "fixture/model/.antfly-download-complete.json", .{});
+        complete.close(io);
+        try std.testing.expectEqual(if (held == null) @as(usize, 0) else @as(usize, 1), Fixture.owner.runnable.scheduler.stats().operations);
+        _ = serving.cancel(io) catch |err| switch (err) {
+            error.Canceled => {},
+            else => return err,
+        };
+    }
 }

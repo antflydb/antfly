@@ -41,6 +41,8 @@ pub fn chargeReadBudget(remaining: *u64, amount: u64) !void {
 }
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
+pub const ReadContext = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
+const execution_wait = @import("antfly_local_sources").sql_execution_wait;
 
 pub const sha256_checksum_len: usize = std.crypto.hash.sha2.Sha256.digest_length * 2;
 pub const sha256_artifact_id_prefix = "sha256:";
@@ -274,12 +276,31 @@ pub const ArtifactStore = struct {
     // A serial publication's write/retention capability. Reads may escape to
     // independently admitted prefetch owners and never borrow its CPU callback.
     io_phase: ?*const IoPhase = null,
+    /// Borrowed by this operation only; shared provider handles stay unmodified.
+    write_context: ?ReadContext = null,
     pub fn beginIo(self: *const ArtifactStore, count: usize) !IoGuard {
+        if (self.write_context) |context| if (context.execution != null) return .{ .phase = null };
         if (self.io_phase) |phase| try phase.begin(phase.ptr, count);
         return .{ .phase = self.io_phase };
     }
 
     pub const VTable = struct {
+        get_bounded_alloc_for: ?*const fn (*anyopaque, Allocator, []const u8, usize, CancellationToken, ReadContext) anyerror![]u8 = null,
+        get_range_alloc_for: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize, CancellationToken, ReadContext) anyerror![]u8 = null,
+
+        verify_content_for: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, CancellationToken, ReadContext) anyerror!void = null,
+        retention_witness_for: ?*const fn (*anyopaque, UploadScope, CancellationToken, ReadContext) anyerror!?RetentionWitness = null,
+        retained_closure_for: ?*const fn (*anyopaque, []const u8, CancellationToken, ReadContext) anyerror!bool = null,
+        remember_closure_for: ?*const fn (*anyopaque, []const u8, []const RetentionWitness, CancellationToken, ReadContext) anyerror!void = null,
+        inherit_closure_for: ?*const fn (*anyopaque, []const u8, ?[]const u8, UploadScope, CancellationToken, ReadContext) anyerror!void = null,
+        seal_closures_for: ?*const fn (*anyopaque, CancellationToken, ReadContext) anyerror!void = null,
+
+        delete_for: ?*const fn (*anyopaque, []const u8, CancellationToken, ReadContext) anyerror!void = null,
+        visit_scoped_uploads_for: ?*const fn (*anyopaque, [32]u8, ScopedUploadVisitor, CancellationToken, ReadContext) anyerror!void = null,
+        reclaim_retired_scoped_inventory_for: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken, ReadContext) anyerror!void = null,
+        cleanup_retired_scoped_temporaries_for: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken, ReadContext) anyerror!void = null,
+
+        put_for: ?*const fn (*anyopaque, Allocator, ?UploadScope, []const u8, CancellationToken, ReadContext) anyerror!ArtifactMetadata = null,
         object_store: ?*const fn (*anyopaque) *@import("object_store.zig").ObjectStore = null,
         retention_witness: ?*const fn (*anyopaque, UploadScope, CancellationToken) anyerror!?RetentionWitness = null,
         retained_closure: ?*const fn (*anyopaque, []const u8, CancellationToken) anyerror!bool = null,
@@ -316,6 +337,13 @@ pub const ArtifactStore = struct {
     pub fn retentionWitness(self: *ArtifactStore, scope: UploadScope, cancellation: CancellationToken) !?RetentionWitness {
         try scope.validate();
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.retention_witness_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            const value = try call(self.ptr, scope, cancellation, context);
+            try op.ready();
+            return value;
+        };
         const call = self.vtable.retention_witness orelse return null;
         var phase = try self.beginIo(1);
         defer phase.abort();
@@ -325,6 +353,13 @@ pub const ArtifactStore = struct {
     }
     pub fn retainedClosure(self: *ArtifactStore, id: []const u8, cancellation: CancellationToken) !bool {
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.retained_closure_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            const value = try call(self.ptr, id, cancellation, context);
+            try op.ready();
+            return value;
+        };
         const call = self.vtable.retained_closure orelse return false;
         var phase = try self.beginIo(1);
         defer phase.abort();
@@ -334,6 +369,13 @@ pub const ArtifactStore = struct {
     }
     pub fn rememberClosure(self: *ArtifactStore, id: []const u8, witnesses: []const RetentionWitness, cancellation: CancellationToken) !void {
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.remember_closure_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            try call(self.ptr, id, witnesses, cancellation, context);
+            try op.ready();
+            return;
+        };
         if (self.vtable.remember_closure) |call| {
             var phase = try self.beginIo(1);
             defer phase.abort();
@@ -343,6 +385,13 @@ pub const ArtifactStore = struct {
     }
     pub fn inheritClosure(self: *ArtifactStore, id: []const u8, previous: ?[]const u8, cancellation: CancellationToken) !void {
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.inherit_closure_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            try call(self.ptr, id, previous, self.upload_scope orelse return error.InvalidArtifactUploadScope, cancellation, context);
+            try op.ready();
+            return;
+        };
         if (self.vtable.inherit_closure) |call| {
             var phase = try self.beginIo(1);
             defer phase.abort();
@@ -352,6 +401,13 @@ pub const ArtifactStore = struct {
     }
     pub fn sealClosures(self: *ArtifactStore, cancellation: CancellationToken) !void {
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.seal_closures_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            try call(self.ptr, cancellation, context);
+            try op.ready();
+            return;
+        };
         if (self.vtable.seal_closures) |call| {
             var phase = try self.beginIo(1);
             defer phase.abort();
@@ -379,7 +435,10 @@ pub const ArtifactStore = struct {
         const put_scoped = self.vtable.put_scoped orelse return error.ArtifactUploadScopesUnsupported;
         var phase = try self.beginIo(1);
         defer phase.abort();
-        var metadata = put_scoped(self.ptr, self.allocator, scope, contents, cancellation) catch |err| return phase.failed(err);
+        var metadata = (if (self.write_context != null and self.vtable.put_for != null)
+            self.vtable.put_for.?(self.ptr, self.allocator, scope, contents, cancellation, self.write_context.?)
+        else
+            put_scoped(self.ptr, self.allocator, scope, contents, cancellation)) catch |err| return phase.failed(err);
         errdefer metadata.deinit(self.allocator);
         try phase.finish();
         const expected = try scope.artifactId(metadata.checksum);
@@ -391,6 +450,7 @@ pub const ArtifactStore = struct {
     pub fn visitScopedUploads(self: *ArtifactStore, domain: [32]u8, visitor: ScopedUploadVisitor, cancellation: CancellationToken) !void {
         if (std.mem.allEqual(u8, &domain, 0)) return error.InvalidArtifactUploadScope;
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.visit_scoped_uploads_for) |call| return call(self.ptr, domain, visitor, cancellation, context);
         const visit = self.vtable.visit_scoped_uploads orelse return error.ArtifactUploadScopesUnsupported;
         try visit(self.ptr, domain, visitor, cancellation);
     }
@@ -400,6 +460,7 @@ pub const ArtifactStore = struct {
     pub fn reclaimRetiredScopedInventory(self: *ArtifactStore, domain: [32]u8, floor: u64, cutoff: u64, cancellation: CancellationToken) !void {
         if (std.mem.allEqual(u8, &domain, 0) or floor > cutoff or cutoff == 0) return error.InvalidArtifactUploadScope;
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.reclaim_retired_scoped_inventory_for) |call| return call(self.ptr, domain, floor, cutoff, cancellation, context);
         if (self.vtable.reclaim_retired_scoped_inventory) |reclaim| try reclaim(self.ptr, domain, floor, cutoff, cancellation);
     }
 
@@ -414,6 +475,7 @@ pub const ArtifactStore = struct {
         if (cutoff == 0 or std.mem.allEqual(u8, &domain, 0)) return error.InvalidArtifactUploadScope;
         if (floor > cutoff) return error.InvalidArtifactUploadScope;
         try cancellation.check();
+        if (self.write_context) |context| if (self.vtable.cleanup_retired_scoped_temporaries_for) |call| return call(self.ptr, domain, floor, cutoff, cancellation, context);
         if (self.vtable.cleanup_retired_scoped_temporaries) |cleanup| try cleanup(self.ptr, domain, floor, cutoff, cancellation);
     }
 
@@ -422,7 +484,9 @@ pub const ArtifactStore = struct {
         try cancellation.check();
         var phase = try self.beginIo(1);
         defer phase.abort();
-        var metadata = (if (self.vtable.put_with_cancellation) |put_with_cancellation|
+        var metadata = (if (self.write_context != null and self.vtable.put_for != null)
+            self.vtable.put_for.?(self.ptr, self.allocator, null, contents, cancellation, self.write_context.?)
+        else if (self.vtable.put_with_cancellation) |put_with_cancellation|
             put_with_cancellation(self.ptr, self.allocator, contents, cancellation)
         else
             self.vtable.put(self.ptr, self.allocator, contents)) catch |err| return phase.failed(err);
@@ -439,6 +503,9 @@ pub const ArtifactStore = struct {
     /// cancellation while the publication owner resumes CPU execution.
     pub fn putBatchWithCancellation(self: *ArtifactStore, io: ?std.Io, contents: []const []const u8, result: []ArtifactMetadata, cancellation: CancellationToken) !void {
         std.debug.assert(contents.len == result.len and contents.len <= max_upload_batch);
+        if (self.write_context) |context| if (context.execution != null) {
+            return self.putBatchFor(context, contents, result, cancellation);
+        };
         var completed: [max_upload_batch]?ArtifactMetadata = @splat(null);
         defer for (&completed) |*item| if (item.*) |*metadata| metadata.deinit(self.allocator);
         var begin: usize = 0;
@@ -475,6 +542,73 @@ pub const ArtifactStore = struct {
         for (result, completed[0..result.len]) |*output, *metadata| {
             output.* = metadata.*.?;
             metadata.* = null;
+        }
+    }
+
+    /// Each upload owns a retained child before publication. The coordinator
+    /// returns CPU before workers may activate, and all workers and provider
+    /// output owners drain before that same coordinator resumes.
+    fn putBatchFor(self: *ArtifactStore, context: ReadContext, contents: []const []const u8, result: []ArtifactMetadata, cancellation: CancellationToken) !void {
+        const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+        const executor = context.io orelse return error.BackendRuntimeIoUnavailable;
+        const parent = context.execution.?;
+        const class = try parent.retainedClass();
+        const Work = struct {
+            owner: ArtifactStore,
+            execution: Runnable.Execution = .{},
+            output: ?ArtifactMetadata = null,
+            failure: ?anyerror = null,
+            fn run(job: *@This(), bytes: []const u8, token: CancellationToken) void {
+                job.execution.activateChild() catch |err| {
+                    job.failure = err;
+                    return;
+                };
+                // A finished worker cannot pin CPU while its siblings queue.
+                // Keep its entry/output retained until the coordinator joins.
+                defer job.execution.park(.resource_blocked) catch {};
+                job.owner.write_context = job.owner.write_context.?.withExecution(&job.execution);
+                job.output = job.owner.putWithCancellation(bytes, token) catch |err| {
+                    job.failure = err;
+                    return;
+                };
+            }
+        };
+        var work: [max_upload_batch]Work = undefined;
+        var reserved: usize = 0;
+        defer for (work[0..reserved]) |*item| {
+            item.execution.finish();
+            if (item.output) |*metadata| metadata.deinit(self.allocator);
+        };
+        for (contents, 0..) |bytes, index| {
+            try context.ensureActive();
+            try cancellation.check();
+            work[index] = .{ .owner = self.* };
+            // A physical provider call owns its own wait; never borrow the
+            // serial coordinator's I/O-phase callback into concurrent work.
+            work[index].owner.io_phase = null;
+            try work[index].execution.reserveChild(parent, executor, @sizeOf(Work) +| bytes.len);
+            reserved += 1;
+        }
+        try parent.park(.resource_blocked);
+        var group: std.Io.Group = .init;
+        for (contents, 0..) |bytes, index| group.async(executor, Work.run, .{ &work[index], bytes, cancellation });
+        const joined = group.await(executor);
+        if (joined) |_| {} else |_| group.cancel(executor);
+        // Retained entries outlive physical joining, including denied
+        // activation or CPU return. Parent authority is never replaced.
+        for (work[0..reserved]) |*item| item.execution.finish();
+        parent.enter(class) catch |err| {
+            try cancellation.check();
+            try context.checkLifetime();
+            return err;
+        };
+        try context.ensureActive();
+        try cancellation.check();
+        try joined;
+        for (work[0..reserved]) |item| if (item.failure) |err| return err;
+        for (work[0..reserved], result) |*item, *output| {
+            output.* = item.output.?;
+            item.output = null;
         }
     }
 
@@ -534,23 +668,54 @@ pub const ArtifactStore = struct {
         expected_checksum: []const u8,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return self.getVerifiedAllocFor(result_alloc, artifact_id, expected_byte_len, expected_checksum, cancellation, .{});
+    }
+
+    /// The read context is borrowed only for this synchronous operation.
+    /// Provider calls relinquish CPU; integrity verification runs after resume.
+    pub fn getVerifiedAllocFor(
+        self: *ArtifactStore,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        cancellation: CancellationToken,
+        context: ReadContext,
+    ) ![]u8 {
+        try context.ensureActive();
         try cancellation.check();
+        const lifetime: ReadCancellation = .{ .context = context, .parent = cancellation };
+        const token = lifetime.token();
+        // Only converted providers may lend native CPU at verified physical
+        // boundaries. Explicit legacy wait-only callers retain their contract.
+        const legacy_wait = if (context.execution == null) context.wait else null;
         validateSha256ArtifactIdentity(artifact_id, expected_checksum) catch
             return error.ArtifactIntegrityMismatch;
         const expected_len = std.math.cast(usize, expected_byte_len) orelse
             return error.ArtifactTooLarge;
 
-        if (self.vtable.get_bounded_alloc_with_cancellation) |get_bounded| {
-            const payload = try get_bounded(self.ptr, result_alloc, artifact_id, expected_len, cancellation);
+        if (self.vtable.get_bounded_alloc_for != null or self.vtable.get_bounded_alloc_with_cancellation != null) {
+            const payload = (if (self.vtable.get_bounded_alloc_for) |call|
+                call(self.ptr, result_alloc, artifact_id, expected_len, token, context)
+            else
+                execution_wait.runOwned(legacy_wait, ArtifactStore.getBoundedAlloc, .{ self, result_alloc, artifact_id, expected_len, token }, discardPayload, .{result_alloc})) catch |err| {
+                try context.checkLifetime();
+                return err;
+            };
             errdefer result_alloc.free(payload);
+            try context.ensureActive();
             if (payload.len != expected_len) return error.ArtifactIntegrityMismatch;
-            try validatePayloadSha256WithCancellation(payload, expected_checksum, cancellation);
+            try validatePayloadSha256For(payload, expected_checksum, token, context);
             return payload;
         }
 
         {
-            var metadata = try self.statWithCancellationUsingAllocator(result_alloc, artifact_id, cancellation);
+            var metadata = execution_wait.runOwned(legacy_wait, ArtifactStore.statWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, token }, discardMetadata, .{result_alloc}) catch |err| {
+                try context.checkLifetime();
+                return err;
+            };
             defer metadata.deinit(result_alloc);
+            try context.ensureActive();
             if (!std.mem.eql(u8, metadata.artifact_id, artifact_id) or
                 metadata.byte_len != expected_byte_len or
                 !std.mem.eql(u8, metadata.checksum, expected_checksum))
@@ -562,21 +727,24 @@ pub const ArtifactStore = struct {
         if (expected_len == 0) {
             const payload = try result_alloc.alloc(u8, 0);
             errdefer result_alloc.free(payload);
-            try validatePayloadSha256WithCancellation(payload, expected_checksum, cancellation);
+            try context.ensureActive();
+            try validatePayloadSha256For(payload, expected_checksum, token, context);
             return payload;
         }
 
-        const payload = try self.getRangeAllocWithCancellationUsingAllocator(
-            result_alloc,
-            artifact_id,
-            0,
-            expected_len,
-            cancellation,
-        );
+        const payload = execution_wait.runOwned(legacy_wait, ArtifactStore.getRangeAllocWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, @as(u64, 0), expected_len, token }, discardPayload, .{result_alloc}) catch |err| {
+            try context.checkLifetime();
+            return err;
+        };
         errdefer result_alloc.free(payload);
+        try context.ensureActive();
         if (payload.len != expected_len) return error.ArtifactIntegrityMismatch;
-        try validatePayloadSha256WithCancellation(payload, expected_checksum, cancellation);
+        try validatePayloadSha256For(payload, expected_checksum, token, context);
         return payload;
+    }
+
+    fn getBoundedAlloc(self: *ArtifactStore, alloc: Allocator, id: []const u8, length: usize, cancellation: CancellationToken) ![]u8 {
+        return self.vtable.get_bounded_alloc_with_cancellation.?(self.ptr, alloc, id, length, cancellation);
     }
 
     pub fn getRangeAlloc(self: *ArtifactStore, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
@@ -591,6 +759,43 @@ pub const ArtifactStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         return try self.getRangeAllocWithCancellationUsingAllocator(self.allocator, artifact_id, offset, len, cancellation);
+    }
+
+    /// Only the physical read parks the caller. Authentication and decoding
+    /// execute after reacquiring this call's CPU grant.
+    pub fn getRangeAllocFor(
+        self: *ArtifactStore,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+        context: ReadContext,
+    ) ![]u8 {
+        try context.ensureActive();
+        try cancellation.check();
+        const lifetime: ReadCancellation = .{ .context = context, .parent = cancellation };
+        if (self.vtable.get_range_alloc_for) |call| {
+            const payload = call(self.ptr, result_alloc, artifact_id, offset, len, lifetime.token(), context) catch |err| {
+                try context.checkLifetime();
+                try cancellation.check();
+                return err;
+            };
+            errdefer result_alloc.free(payload);
+            try context.ensureActive();
+            try cancellation.check();
+            return payload;
+        }
+        const legacy_wait = if (context.execution == null) context.wait else null;
+        const payload = execution_wait.runOwned(legacy_wait, ArtifactStore.getRangeAllocWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, offset, len, lifetime.token() }, discardPayload, .{result_alloc}) catch |err| {
+            try context.checkLifetime();
+            try cancellation.check();
+            return err;
+        };
+        errdefer result_alloc.free(payload);
+        try context.ensureActive();
+        try cancellation.check();
+        return payload;
     }
 
     pub fn getRangeAllocWithCancellationUsingAllocator(
@@ -748,6 +953,7 @@ pub const ArtifactStore = struct {
     }
     pub fn deleteWithCancellation(self: *ArtifactStore, artifact_id: []const u8, token: CancellationToken) !void {
         try token.check();
+        if (self.write_context) |context| if (self.vtable.delete_for) |call| return call(self.ptr, artifact_id, token, context);
         if (self.vtable.delete_with_cancellation) |call| try call(self.ptr, artifact_id, token) else try self.vtable.delete(self.ptr, artifact_id);
         try token.check();
     }
@@ -765,6 +971,14 @@ pub const ArtifactStore = struct {
     ) !void {
         try cancellation.check();
         validateSha256ArtifactIdentity(artifact_id, expected_checksum) catch return error.ArtifactIntegrityMismatch;
+
+        if (self.write_context) |context| if (self.vtable.verify_content_for) |call| {
+            const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+            try op.ready();
+            try call(self.ptr, result_alloc, artifact_id, expected_byte_len, expected_checksum, cancellation, context);
+            try op.ready();
+            return;
+        };
 
         // A backend verifier owns the complete identity, length, and content
         // check. Calling stat here as well would duplicate provider HEADs on
@@ -803,16 +1017,43 @@ pub const ArtifactStore = struct {
     }
 };
 
+const ReadCancellation = struct {
+    context: ReadContext,
+    parent: CancellationToken,
+    fn canceled(raw: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        self.context.checkLifetime() catch return true;
+        self.parent.check() catch return true;
+        return false;
+    }
+    fn token(self: *const @This()) CancellationToken {
+        return .{ .ptr = self, .is_cancelled_fn = canceled };
+    }
+};
+fn discardPayload(bytes: []u8, alloc: Allocator) void {
+    alloc.free(bytes);
+}
+fn discardMetadata(value: ArtifactMetadata, alloc: Allocator) void {
+    var owned = value;
+    owned.deinit(alloc);
+}
+
 pub fn validatePayloadSha256WithCancellation(
     payload: []const u8,
     expected_checksum: []const u8,
     cancellation: CancellationToken,
 ) !void {
+    return validatePayloadSha256For(payload, expected_checksum, cancellation, .{});
+}
+
+pub fn validatePayloadSha256For(payload: []const u8, expected_checksum: []const u8, cancellation: CancellationToken, context: ReadContext) !void {
+    try context.ensureActive();
     validateSha256Checksum(expected_checksum) catch return error.ArtifactIntegrityMismatch;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    const cancellation_chunk_bytes = 1024 * 1024;
+    const cancellation_chunk_bytes = 256 * 1024;
     var offset: usize = 0;
     while (offset < payload.len) {
+        try context.ensureActive();
         try cancellation.check();
         const chunk_len = @min(cancellation_chunk_bytes, payload.len - offset);
         hasher.update(payload[offset..][0..chunk_len]);
@@ -822,6 +1063,7 @@ pub fn validatePayloadSha256WithCancellation(
     hasher.final(&digest);
     const actual = std.fmt.bytesToHex(digest, .lower);
     if (!std.mem.eql(u8, &actual, expected_checksum)) return error.ArtifactIntegrityMismatch;
+    try context.ensureActive();
     try cancellation.check();
 }
 
@@ -956,4 +1198,144 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "artifact reads suspend only provider waits and retire payloads on lost authority" {
+    const local = @import("antfly_local_sources");
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const Case = enum { success, canceled, expired, closed, provider_error, corrupt, source_canceled, caller_canceled, unscheduled };
+    const Clock = struct {
+        var value: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return value.load(.acquire);
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const Fixture = struct {
+        scheduler: *Runnable.Scheduler,
+        execution: *Runnable.Execution,
+        signal: *std.atomic.Value(bool),
+        caller: *std.atomic.Value(bool),
+        case: Case,
+        bytes: []const u8,
+        checksum: []const u8,
+        qualified: bool,
+        calls: usize = 0,
+        controls: usize = 0,
+        checkpoints: usize = 0,
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn check(raw: *anyopaque) !void {
+            const self = from(raw);
+            try self.execution.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().runnable_slots);
+            self.checkpoints += 1;
+        }
+        fn provider(self: *@This()) !void {
+            self.calls += 1;
+            if (self.case == .unscheduled or !self.qualified) {
+                try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().runnable_slots);
+            } else {
+                try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+                try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().resource_blocked);
+                var control: Runnable.Execution = .{};
+                try control.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                try control.checkpoint();
+                control.finish();
+                self.controls += 1;
+            }
+        }
+        fn boundedFor(raw: *anyopaque, a: Allocator, id: []const u8, len: usize, token: CancellationToken, context: ReadContext) ![]u8 {
+            return @import("antfly_local_sources").sql_execution_wait.runOwned(context.wait, bounded, .{ raw, a, id, len, token }, discardPayload, .{a});
+        }
+        fn bounded(raw: *anyopaque, a: Allocator, _: []const u8, len: usize, token: CancellationToken) ![]u8 {
+            const self = from(raw);
+            try self.provider();
+            try token.check();
+            if (self.case == .provider_error) return error.InputOutput;
+            try std.testing.expectEqual(self.bytes.len, len);
+            const bytes = try a.dupe(u8, self.bytes);
+            switch (self.case) {
+                .canceled => self.signal.store(true, .release),
+                .caller_canceled => self.caller.store(true, .release),
+                .expired => Clock.value.store(10, .release),
+                .closed => self.scheduler.close(),
+                .corrupt => bytes[0] ^= 1,
+                else => {},
+            }
+            return bytes;
+        }
+        fn stat(raw: *anyopaque, a: Allocator, id: []const u8) !ArtifactMetadata {
+            const self = from(raw);
+            try self.provider();
+            const owned = try a.dupe(u8, id);
+            errdefer a.free(owned);
+            return .{ .artifact_id = owned, .byte_len = self.bytes.len, .checksum = try a.dupe(u8, self.checksum) };
+        }
+        fn range(raw: *anyopaque, a: Allocator, id: []const u8, offset: u64, len: usize, token: CancellationToken) ![]u8 {
+            try std.testing.expectEqual(@as(u64, 0), offset);
+            return bounded(raw, a, id, len, token);
+        }
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn put(_: *anyopaque, _: Allocator, _: []const u8) !ArtifactMetadata {
+            return error.UnexpectedCall;
+        }
+        fn get(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedCall;
+        }
+        fn rawRange(_: *anyopaque, _: Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
+            return error.UnexpectedCall;
+        }
+        fn delete(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedCall;
+        }
+    };
+    const a = std.testing.allocator;
+    const payload: [300 * 1024]u8 = @splat(7);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&payload, &digest, .{});
+    const checksum = std.fmt.bytesToHex(digest, .lower);
+    const id = try std.fmt.allocPrint(a, "sha256:{s}", .{checksum});
+    defer a.free(id);
+    for ([_]bool{ true, false }) |bounded| for (std.enums.values(Case)) |case| {
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024 });
+        var signal: std.atomic.Value(bool) = .init(false);
+        var caller: std.atomic.Value(bool) = .init(false);
+        Clock.value.store(0, .release);
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Clock.requested } }, .query);
+        defer execution.finish();
+        var fixture: Fixture = .{ .scheduler = &scheduler, .execution = &execution, .signal = &signal, .caller = &caller, .case = case, .qualified = bounded, .bytes = &payload, .checksum = &checksum };
+        const vtable: ArtifactStore.VTable = .{ .deinit = Fixture.deinit, .put = Fixture.put, .get_alloc = Fixture.get, .get_range_alloc = Fixture.rawRange, .get_range_alloc_with_cancellation = Fixture.range, .stat = Fixture.stat, .delete = Fixture.delete, .get_bounded_alloc_for = if (bounded) Fixture.boundedFor else null, .get_bounded_alloc_with_cancellation = if (bounded) Fixture.bounded else null };
+        var store: ArtifactStore = .{ .allocator = a, .ptr = &fixture, .vtable = &vtable };
+        var context: ReadContext = .{ .io = std.testing.io, .cancellation = .fromAtomic(&signal) };
+        if (case != .unscheduled) {
+            context = context.withExecution(&execution);
+            context.checkpoint = .{ .ptr = &fixture, .check = Fixture.check };
+        }
+        if (case == .source_canceled) signal.store(true, .release);
+        const result = store.getVerifiedAllocFor(a, id, payload.len, &checksum, .{ .ptr = &caller, .is_cancelled_fn = Clock.requested }, context);
+        switch (case) {
+            .success, .unscheduled => {
+                const bytes = try result;
+                defer a.free(bytes);
+                try std.testing.expectEqualSlices(u8, &payload, bytes);
+                if (case == .success) try std.testing.expect(fixture.checkpoints >= 4);
+            },
+            .canceled, .source_canceled, .caller_canceled => try std.testing.expectError(error.Canceled, result),
+            .expired => try std.testing.expectError(error.DeadlineExceeded, result),
+            .closed => try std.testing.expectError(error.SchedulerClosed, result),
+            .provider_error => try std.testing.expectError(error.InputOutput, result),
+            .corrupt => try std.testing.expectError(error.ArtifactIntegrityMismatch, result),
+        }
+        const expected_calls: usize = if (case == .source_canceled) 0 else if (bounded) 1 else 2;
+        try std.testing.expectEqual(expected_calls, fixture.calls);
+        if (case != .unscheduled and bounded) try std.testing.expectEqual(fixture.calls, fixture.controls) else try std.testing.expectEqual(@as(usize, 0), fixture.controls);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    };
 }

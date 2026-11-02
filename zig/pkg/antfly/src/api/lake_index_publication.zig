@@ -239,7 +239,7 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     if (cloud_object) |object| object.cloud_io = context.io;
     const cloud_seed_candidate = if (!reuse) @as(?catalog.Publication, null) else if (current.value.checkpoint) |saved| if (saved.cloud_generations != null and std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) @as(?catalog.Publication, saved) else current.value.published else current.value.published;
     const cloud_seed = if (cloud_seed_candidate) |seed_| if (std.meta.eql(seed_.namespace, current.value.namespace) and std.mem.eql(u8, &seed_.signature.store, &store_identity)) @as(?catalog.Publication, seed_) else null else null;
-    var cloud_binding: ?cloud_api.Binding = if (cloud_object != null and cloud_seed != null) try cloud_api.Binding.init(std.heap.page_allocator, cloud_object.?, cloud_seed.?, cancellation) else null;
+    var cloud_binding: ?cloud_api.Binding = if (cloud_object != null and cloud_seed != null) try cloud_api.Binding.initFor(std.heap.page_allocator, cloud_object.?, cloud_seed.?, cancellation, context) else null;
     defer if (cloud_binding) |*held| held.deinit();
     // Fresh/checkpoint artifacts may not belong to the previous closure. A
     // builder verifies and records them; a query's complete binding stays strict.

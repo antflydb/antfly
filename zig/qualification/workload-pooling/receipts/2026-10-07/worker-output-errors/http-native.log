@@ -1,0 +1,59 @@
+1/54 httpx.test.h2 connection...OK
+2/54 httpx.test.socket...OK
+3/54 httpx.test.server...OK
+4/54 server.server.test.HTTP streaming headers and automatic preflight preserve middleware policy...OK
+5/54 server.server.test.H2 response serialization strips connection-specific headers...OK
+6/54 server.server.test.HTTP controlled streaming rejects expired headers and retains controls on delegated chunks...OK
+7/54 server.server.test.HTTP controlled H2 published headers survive denied reentry and late failure resets only the stream...OK
+8/54 server.server.test.HTTP controlled H2 reset cleanup bounds a contended connection mutex...OK
+9/54 server.server.test.HTTP controlled H2 reset cleanup survives actual task cancellation...OK
+10/54 server.server.test.HTTP controlled H2 reset cleanup bounds a stalled native peer...RESET_PREFILL bytes=472938 empty_sends=0 stalled=true
+RESET_BACKPRESSURE fallback=false elapsed_ms=250
+OK
+11/54 server.server.test.HTTP controlled H2 reset cleanup bounds a stalled fallback peer with zero async allowance...SKIP
+12/54 server.server.test.HTTP controlled scheduler failures map to retryable overload without replacing original fences...OK
+13/54 server.server.test.HTTP controlled H2 scheduler overload publishes retry guidance and a complete error body...OK
+14/54 server.server.test.HTTP controlled H1 scheduler overload publishes retry guidance and a complete error body...OK
+15/54 net.socket.test.resolveAddressFiltered applies policy to literal and DNS results...OK
+16/54 net.socket.test.Socket connect and close...OK
+17/54 net.socket.test.TcpListener accept...OK
+18/54 net.socket.test.Socket.writer writeAll and print over TCP...OK
+19/54 net.socket.test.UdpSocket send/recv localhost...OK
+20/54 net.socket.test.SocketIoWriter flush sends buffered bytes...OK
+21/54 net.socket.test.Socket recv timeout returns error.Timeout...OK
+22/54 net.socket.test.Socket cancellation polling preserves the configured receive timeout...OK
+23/54 net.socket.test.Socket abort interrupts a backpressured native send...OK
+24/54 net.socket.test.Socket send timeout reports backpressure without panicking...OK
+25/54 net.socket.test.SliceIoReader skips leading empty buffers...OK
+26/54 net.socket.test.PrefixedReader skips leading empty buffers...OK
+27/54 net.socket.test.ContentLengthReader skips leading empty buffers...OK
+28/54 net.socket.test.ContentLengthReader handles inner reader that buffers before producing bytes...OK
+29/54 net.socket.test.ContentLengthReader reports premature EOF as ReadFailed...OK
+30/54 net.socket.test.ChunkedBodyReader skips leading empty buffers...OK
+31/54 net.socket.test.ChunkedBodyReader handles inner reader that buffers before producing bytes...OK
+32/54 net.socket.test.timed fallback healthy read never runs timer eagerly...SKIP
+33/54 net.socket.test.timed fallback healthy write never runs timer eagerly...SKIP
+34/54 net.socket.test.timed fallback stalled read remains bounded at zero async allowance...SKIP
+35/54 net.socket.test.timed fallback stalled write remains bounded at zero async allowance...SKIP
+36/54 net.socket.test.timed fallback denied read preserves bytes...SKIP
+37/54 net.socket.test.timed fallback denied write sends no bytes...SKIP
+38/54 net.socket.test.ChunkedBodyReader preserves truncation versus invalid framing at every phase...OK
+39/54 net.socket.test.Socket controlled native write retains the original deadline under backpressure...CONTROLLED_WRITE backend=native cause=deadline elapsed_ms=259
+OK
+40/54 net.socket.test.Socket controlled native write observes original cancellation under backpressure...CONTROLLED_WRITE backend=native cause=canceled elapsed_ms=77
+OK
+41/54 net.socket.test.Socket controlled fallback write retains the original deadline with zero async allowance...SKIP
+42/54 net.socket.test.Socket controlled fallback write observes original cancellation with zero async allowance...SKIP
+43/54 net.socket.test.Socket controlled framing retires uncertainty and preserves a rejected next frame...OK
+44/54 net.socket.test.Socket controlled uncertain output retires after actual fallback task cancellation...SKIP
+45/54 net.socket.test.Socket output wait ownership restores CPU before formatting and rejects failed resumes...OK
+46/54 protocol.h2_connection.test.H2 controlled flow wait retains original deadline and permits connection control progress...OK
+47/54 protocol.h2_connection.test.H2 controlled lock wait honors original deadline without emitting a frame...OK
+48/54 protocol.h2_connection.test.H2 controlled flow wait observes original cancellation without END_STREAM...OK
+49/54 protocol.h2_connection.test.H2 controlled available credit sends valid DATA and END_STREAM...OK
+50/54 protocol.h2_connection.test.H2 controlled credit waits release CPU and restore it before frame serialization...OK
+51/54 protocol.h2_connection.test.H2 controlled header block remains atomic and unlocks before denied reentry...OK
+52/54 client.client.test.request cancellation before socket publication prevents sending...OK
+53/54 client.pool.test.outbound pool shared socket ceiling spans transports and failed creates reclaim reservations...OK
+54/54 tls.tls.test.residual TLS read preserves native socket timeout...SKIP
+43 passed; 11 skipped; 0 failed.

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const Allocator = std.mem.Allocator;
 const catalog_types = @import("types.zig");
 
@@ -21,8 +22,13 @@ pub const CatalogStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    context: ?@import("antfly_local_sources").serverless_query_lake_read_context.Context = null,
 
     pub const VTable = struct {
+        get_policy_for: ?*const fn (*anyopaque, []const u8, Context) anyerror!catalog_types.NamespacePolicy = null,
+        get_table_for: ?*const fn (*anyopaque, Allocator, []const u8, Context) anyerror!?catalog_types.TableNamespaceRecord = null,
+        list_tables_for: ?*const fn (*anyopaque, Allocator, Context) anyerror![]catalog_types.TableNamespaceRecord = null,
+        list_namespaces_for: ?*const fn (*anyopaque, Allocator, Context) anyerror![]catalog_types.NamespaceRecord = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         ensure_namespace: *const fn (*anyopaque, []const u8, u64, catalog_types.NamespacePolicy) anyerror!bool,
         ensure_table: *const fn (*anyopaque, []const u8, []const u8, u64, catalog_types.NamespacePolicy, []const u8, []const u8, []const u8) anyerror!bool,
@@ -67,14 +73,23 @@ pub const CatalogStore = struct {
     }
 
     pub fn listNamespacesAlloc(self: *CatalogStore, alloc: Allocator) ![]catalog_types.NamespaceRecord {
+        if (self.context) |context| if (self.vtable.list_namespaces_for != null) {
+            return self.vtable.list_namespaces_for.?(self.ptr, alloc, context);
+        };
         return try self.vtable.list_namespaces_alloc(self.ptr, alloc);
     }
 
     pub fn listTablesAlloc(self: *CatalogStore, alloc: Allocator) ![]catalog_types.TableNamespaceRecord {
+        if (self.context) |context| if (self.vtable.list_tables_for != null) {
+            return self.vtable.list_tables_for.?(self.ptr, alloc, context);
+        };
         return try self.vtable.list_tables_alloc(self.ptr, alloc);
     }
 
     pub fn getTableAlloc(self: *CatalogStore, alloc: Allocator, table_name: []const u8) !?catalog_types.TableNamespaceRecord {
+        if (self.context) |context| if (self.vtable.get_table_for != null) {
+            return self.vtable.get_table_for.?(self.ptr, alloc, table_name, context);
+        };
         return try self.vtable.get_table_alloc(self.ptr, alloc, table_name);
     }
 
@@ -99,6 +114,9 @@ pub const CatalogStore = struct {
     }
 
     pub fn getPolicy(self: *CatalogStore, namespace: []const u8) !catalog_types.NamespacePolicy {
+        if (self.context) |context| if (self.vtable.get_policy_for != null) {
+            return self.vtable.get_policy_for.?(self.ptr, namespace, context);
+        };
         return try self.vtable.get_policy(self.ptr, namespace);
     }
 

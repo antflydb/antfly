@@ -17,6 +17,7 @@ const common = @import("antfly_local_sources").common_http_http_common;
 
 pub const RequestCancellation = common.RequestCancellation;
 pub const RequestDeliveryTracker = common.RequestDeliveryTracker;
+pub const BorrowedControlPermit = common.BorrowedControlPermit;
 
 pub const Header = common.Header;
 pub const HttpRequest = common.HttpRequest;

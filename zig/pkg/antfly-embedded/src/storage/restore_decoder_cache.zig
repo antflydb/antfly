@@ -204,6 +204,33 @@ pub const Cache = struct {
         self.mutex.unlock(io);
     }
 
+    /// Exclusive close preflight after all restore/preparation producers drain.
+    /// Stop callbacks before physical decoder destruction, lending execution
+    /// while they finish. Every rejected stage retains its exact owned handle.
+    pub fn drainCallbacksWithAdmission(self: *Cache, io: std.Io, original: @import("../common/read_admission.zig").Port) !void {
+        const wait = @import("../common/cleanup_wait.zig");
+        // Reclaimer and timer callbacks both inspect registration metadata
+        // under mutex. Drain reclamation first, then publish its retirement
+        // under the same guard before stopping the timer. Never join either
+        // callback while holding that guard.
+        if (self.manager) |manager| try manager.unregisterReclaimerWithAdmission(self.reclaimer, io, original);
+        try wait.lockIo(&self.mutex, io, original);
+        self.reclaimer = 0;
+        self.manager = null;
+        self.mutex.unlock(io);
+        if (self.idle_handle) |*handle| {
+            try handle.cancelWithAdmission(io, original);
+            self.idle_handle = null;
+        }
+        while (true) {
+            try wait.lockIo(&self.mutex, io, original);
+            const drained = self.active_pages == 0 and !self.retiring;
+            self.mutex.unlock(io);
+            if (drained) return;
+            try wait.waitForRetry(io, original);
+        }
+    }
+
     pub fn deinit(self: *Cache, io: std.Io) void {
         self.retire(io);
     }

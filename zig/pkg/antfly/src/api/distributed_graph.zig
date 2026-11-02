@@ -14,6 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const runnable_fanout = @import("runnable_fanout_owner.zig");
+const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const relationship_filter = @import("antfly_local_sources").graph_relationship_filter;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const raft_mod = struct {
@@ -127,6 +129,9 @@ pub const Worker = struct {
     cancellation: ?CancellationToken = null,
     lifecycle_hook: ?LifecycleHook = null,
     work_cost_port: ?WorkCostPort = null,
+    /// Synchronous coordinator or independent child authority. Parallel tasks
+    /// replace this with their owned slot's child; never share a mutable root.
+    runnable: ?runnable_abi.Borrowed = null,
 
     pub const VTable = struct {
         execute_graph_expand: *const fn (
@@ -185,6 +190,7 @@ pub const Worker = struct {
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
+        controlled.execution_runnable = self.runnable;
         var response = try self.vtable.execute_graph_expand(self.ptr, alloc, group_id, table_name, controlled, consistency);
         errdefer response.deinit(alloc);
         try self.ensureActive();
@@ -205,6 +211,7 @@ pub const Worker = struct {
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
+        controlled.execution_runnable = self.runnable;
         var response = try self.vtable.execute_graph_hydrate(self.ptr, alloc, group_id, table_name, controlled, consistency);
         errdefer response.deinit(alloc);
         try self.ensureActive();
@@ -226,6 +233,7 @@ pub const Worker = struct {
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
+        controlled.execution_runnable = self.runnable;
         var response = try func(self.ptr, alloc, group_id, table_name, controlled, consistency);
         errdefer response.deinit(alloc);
         try self.ensureActive();
@@ -304,6 +312,7 @@ pub const Worker = struct {
     }
 
     fn ensureActive(self: Worker) !void {
+        if (self.runnable) |borrow| try runnable_fanout.checked(borrow.checkpoint(borrow.context));
         if (self.cancellation) |value| {
             if (value.isCancelled()) return error.Cancelled;
         }
@@ -1515,45 +1524,51 @@ const GraphHydrateBatchEntry = struct {
 
 const GraphExpandFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
+    owner: runnable_fanout.Owner = .{},
     result: ?GraphExpandResponse = null,
     err: ?anyerror = null,
 
-    fn init() GraphExpandFanoutSlot {
-        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    fn init(alloc: std.mem.Allocator) GraphExpandFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(alloc) };
     }
 
     pub fn deinit(self: *GraphExpandFanoutSlot) void {
         self.arena.deinit();
+        self.owner.retire();
         self.* = undefined;
     }
 };
 
 const GraphHydrateFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
+    owner: runnable_fanout.Owner = .{},
     result: ?GraphHydrateResponse = null,
     err: ?anyerror = null,
 
-    fn init() GraphHydrateFanoutSlot {
-        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    fn init(alloc: std.mem.Allocator) GraphHydrateFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(alloc) };
     }
 
     pub fn deinit(self: *GraphHydrateFanoutSlot) void {
         self.arena.deinit();
+        self.owner.retire();
         self.* = undefined;
     }
 };
 
 const GraphEdgesFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
+    owner: runnable_fanout.Owner = .{},
     result: ?GraphEdgesResponse = null,
     err: ?anyerror = null,
 
-    fn init() GraphEdgesFanoutSlot {
-        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    fn init(alloc: std.mem.Allocator) GraphEdgesFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(alloc) };
     }
 
     pub fn deinit(self: *GraphEdgesFanoutSlot) void {
         self.arena.deinit();
+        self.owner.retire();
         self.* = undefined;
     }
 };
@@ -1881,6 +1896,7 @@ fn executeCrossRangeWithMatchAnchorsLifecycle(
     var request_worker = worker;
     request_worker.execution_deadline_ns = worker.budget().deadlineFrom(.{ .deadline_ns = req.execution_deadline_ns });
     request_worker.cancellation = req.cancellation;
+    request_worker.runnable = req.execution_runnable orelse worker.runnable;
     try request_worker.ensureActive();
     if (emit_source_snapshot) request_worker.reachLifecycle(.{
         .phase = .source_snapshot_acquired,
@@ -3669,12 +3685,15 @@ const DistributedEdgeReader = struct {
 
         if (fanout_io) |io| {
             if (plan.parallel) {
+                var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+                fanout_memory.init(a, io, 64 << 20);
+                defer fanout_memory.deinit();
                 const slots = try a.alloc(GraphEdgesFanoutSlot, plan.width);
                 defer {
                     for (slots) |*slot| slot.deinit();
                     a.free(slots);
                 }
-                for (slots) |*slot| slot.* = .init();
+                for (slots) |*slot| slot.* = .init(fanout_memory.allocator());
 
                 const Fiber = struct {
                     fn run(
@@ -3690,7 +3709,13 @@ const DistributedEdgeReader = struct {
                         max_owned_bytes_inner: usize,
                         max_scanned_rows_inner: usize,
                     ) void {
-                        slot.result = reader.getEdgesFromGroup(
+                        var local_reader = reader;
+                        local_reader.worker.runnable = slot.owner.activate() catch |err| {
+                            slot.err = err;
+                            return;
+                        };
+                        defer slot.owner.park();
+                        slot.result = local_reader.getEdgesFromGroup(
                             slot.arena.allocator(),
                             table_name_inner,
                             table_state_inner,
@@ -3716,6 +3741,10 @@ const DistributedEdgeReader = struct {
                     const remaining_bytes = max_owned_bytes -| owned_bytes;
                     const fair_edges = @max(@as(usize, 1), std.math.divCeil(usize, remaining_edges, wave_len) catch 1);
                     const fair_bytes = @max(@as(usize, 1), std.math.divCeil(usize, remaining_bytes, wave_len) catch 1);
+                    for (slots[0..wave_len]) |*slot| {
+                        try slot.owner.reserve(self.worker.runnable, io, @as(u64, @sizeOf(GraphEdgesFanoutSlot)) +| key.len +| 1024);
+                    }
+                    const original_class = try runnable_fanout.parkCoordinator(self.worker.runnable);
                     var group: std.Io.Group = .init;
                     for (candidate_group_ids.items[start..end], 0..) |group_id, i| {
                         const group_direction: graph_mod.EdgeDirection = direction;
@@ -3733,7 +3762,8 @@ const DistributedEdgeReader = struct {
                             remaining_physical_rows,
                         });
                     }
-                    group.await(io) catch {};
+                    try group.await(io);
+                    try runnable_fanout.resumeCoordinator(self.worker.runnable, original_class);
 
                     // Balanced shards complete concurrently within a fair share
                     // of the remaining request budget. A skewed shard retries
@@ -3793,7 +3823,7 @@ const DistributedEdgeReader = struct {
                     }
                     for (slots[0..wave_len]) |*slot| {
                         slot.deinit();
-                        slot.* = .init();
+                        slot.* = .init(fanout_memory.allocator());
                     }
                 }
                 return SelectedGraphEdges.finish(a, &edges, &ownership);
@@ -5445,8 +5475,12 @@ fn executeDistributedTraverse(
                         break;
                     }
                 }
+                var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+                fanout_memory.init(alloc, io, 64 << 20);
+                defer fanout_memory.deinit();
                 const slots = try executeGraphExpandBatchesParallel(
                     alloc,
+                    fanout_memory.allocator(),
                     io,
                     graph_fanout_plan.width,
                     worker,
@@ -7955,10 +7989,10 @@ fn collectGraphExpandBatchEntries(
     return entries;
 }
 
-fn initGraphExpandFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]GraphExpandFanoutSlot {
+fn initGraphExpandFanoutSlots(alloc: std.mem.Allocator, worker_alloc: std.mem.Allocator, count: usize) ![]GraphExpandFanoutSlot {
     const slots = try alloc.alloc(GraphExpandFanoutSlot, count);
     errdefer alloc.free(slots);
-    for (slots) |*slot| slot.* = .init();
+    for (slots) |*slot| slot.* = .init(worker_alloc);
     return slots;
 }
 
@@ -7969,6 +8003,7 @@ fn deinitGraphExpandFanoutSlots(alloc: std.mem.Allocator, slots: []GraphExpandFa
 
 fn executeGraphExpandBatchesParallel(
     alloc: std.mem.Allocator,
+    worker_alloc: std.mem.Allocator,
     io: std.Io,
     width: usize,
     worker: Worker,
@@ -7983,7 +8018,7 @@ fn executeGraphExpandBatchesParallel(
     allow_legacy_wire_fallback: bool,
     consistency: raft_mod.ReadConsistency,
 ) ![]GraphExpandFanoutSlot {
-    const slots = try initGraphExpandFanoutSlots(alloc, entries.len);
+    const slots = try initGraphExpandFanoutSlots(alloc, worker_alloc, entries.len);
     errdefer deinitGraphExpandFanoutSlots(alloc, slots);
 
     const Fiber = struct {
@@ -8001,6 +8036,12 @@ fn executeGraphExpandBatchesParallel(
             allow_legacy_wire_fallback_inner: bool,
             consistency_inner: raft_mod.ReadConsistency,
         ) void {
+            var local_worker = worker_inner;
+            local_worker.runnable = slot.owner.activate() catch |err| {
+                slot.err = err;
+                return;
+            };
+            defer slot.owner.park();
             const arena = slot.arena.allocator();
             var step_req = makeGraphExpandRequestWithAlgebraicMode(
                 arena,
@@ -8020,7 +8061,7 @@ fn executeGraphExpandBatchesParallel(
             step_req.allow_legacy_wire_fallback = allow_legacy_wire_fallback_inner;
             step_req.max_scanned_rows = max_scanned_rows_inner;
             step_req.identity_read_generation = entry.identity_read_generation;
-            slot.result = worker_inner.executeGraphExpand(arena, entry.group_id, entry.table_name, step_req, consistency_inner) catch |err| {
+            slot.result = local_worker.executeGraphExpand(arena, entry.group_id, entry.table_name, step_req, consistency_inner) catch |err| {
                 slot.err = err;
                 return;
             };
@@ -8030,6 +8071,11 @@ fn executeGraphExpandBatchesParallel(
     var start: usize = 0;
     while (start < entries.len) : (start += width) {
         const end = @min(start + width, entries.len);
+        for (entries[start..end], start..end) |entry, i| {
+            const retained = @as(u64, @sizeOf(GraphExpandFanoutSlot)) +| entry.table_name.len +| @as(u64, entry.frontier_ids.len) *| @sizeOf(u32) +| 1024;
+            try slots[i].owner.reserve(worker.runnable, io, retained);
+        }
+        const original_class = try runnable_fanout.parkCoordinator(worker.runnable);
         var group: std.Io.Group = .init;
         for (entries[start..end], start..end) |entry, i| {
             group.async(io, Fiber.run, .{
@@ -8047,7 +8093,8 @@ fn executeGraphExpandBatchesParallel(
                 consistency,
             });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try runnable_fanout.resumeCoordinator(worker.runnable, original_class);
     }
 
     for (slots) |slot| {
@@ -8443,12 +8490,15 @@ fn hydrateHitsForKeys(
             entry_index += 1;
         }
 
+        var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+        fanout_memory.init(alloc, io, 64 << 20);
+        defer fanout_memory.deinit();
         const slots = try alloc.alloc(GraphHydrateFanoutSlot, entries.len);
         defer {
             for (slots) |*slot| slot.deinit();
             alloc.free(slots);
         }
-        for (slots) |*slot| slot.* = .init();
+        for (slots) |*slot| slot.* = .init(fanout_memory.allocator());
 
         const Fiber = struct {
             fn run(
@@ -8466,6 +8516,12 @@ fn hydrateHitsForKeys(
                 fields_inner: []const []const u8,
                 consistency_inner: raft_mod.ReadConsistency,
             ) void {
+                var local_worker = worker_inner;
+                local_worker.runnable = slot.owner.activate() catch |err| {
+                    slot.err = err;
+                    return;
+                };
+                defer slot.owner.park();
                 const arena = slot.arena.allocator();
                 const owned_keys = dupKeys(arena, entry.keys) catch |err| {
                     slot.err = err;
@@ -8483,7 +8539,7 @@ fn hydrateHitsForKeys(
                 req.fields = fields_inner;
                 req.resolved_doc_filter = resolved_doc_filter_inner;
                 req.resolved_doc_filter_wire_context = resolved_doc_filter_wire_context_inner;
-                slot.result = worker_inner.executeGraphHydrate(arena, entry.group_id, table_name_inner, req, consistency_inner) catch |err| {
+                slot.result = local_worker.executeGraphHydrate(arena, entry.group_id, table_name_inner, req, consistency_inner) catch |err| {
                     slot.err = err;
                     return;
                 };
@@ -8493,6 +8549,12 @@ fn hydrateHitsForKeys(
         var start: usize = 0;
         while (start < entries.len) : (start += graph_fanout_plan.width) {
             const end = @min(start + graph_fanout_plan.width, entries.len);
+            for (entries[start..end], start..end) |entry, i| {
+                var retained: u64 = @sizeOf(GraphHydrateFanoutSlot) + 1024;
+                for (entry.keys) |key| retained +|= key.len +| @sizeOf([]u8);
+                try slots[i].owner.reserve(worker.runnable, io, retained);
+            }
+            const original_class = try runnable_fanout.parkCoordinator(worker.runnable);
             var group: std.Io.Group = .init;
             for (entries[start..end], start..end) |entry, i| {
                 group.async(io, Fiber.run, .{ worker, &slots[i], table_name, entry, topology_epoch, filter_query_json, exclusion_query_json, resolved_doc_filter, resolved_doc_filter_wire_context, include_stored, include_all_fields, fields, consistency });
@@ -8502,7 +8564,8 @@ fn hydrateHitsForKeys(
                 .group_count = end - start,
                 .cancellation = worker.cancellation,
             });
-            group.await(io) catch {};
+            try group.await(io);
+            try runnable_fanout.resumeCoordinator(worker.runnable, original_class);
         }
         recordGraphParallelFanout(.hydrate, @intCast(platform_time.monotonicNs() - fanout_start_ns));
         for (slots) |slot| {
@@ -16389,14 +16452,37 @@ test "distributed graph stops after single retry on repeated topology churn" {
 }
 
 test "distributed graph fans out per-group expand and hydrate with worker io" {
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
     const TestState = struct {
         io_impl: *std.Io.Threaded,
+        scheduler: ?*native.Scheduler = null,
+        root_context: ?*anyopaque = null,
+
         expand_calls: std.atomic.Value(u32) = .init(0),
         hydrate_calls: std.atomic.Value(u32) = .init(0),
         expand_active: std.atomic.Value(u32) = .init(0),
         hydrate_active: std.atomic.Value(u32) = .init(0),
         max_expand_active: std.atomic.Value(u32) = .init(0),
         max_hydrate_active: std.atomic.Value(u32) = .init(0),
+        edge_calls: std.atomic.Value(u32) = .init(0),
+        edge_active: std.atomic.Value(u32) = .init(0),
+        max_edge_active: std.atomic.Value(u32) = .init(0),
+        cancel_on_edge: ?*std.atomic.Value(bool) = null,
+
+        fn verifyChild(self: *@This(), borrow: ?runnable_abi.Borrowed) !void {
+            const scheduler = self.scheduler orelse {
+                try std.testing.expect(borrow == null);
+                return;
+            };
+            const grant = borrow orelse return error.TestMissingChildCapability;
+            try std.testing.expect(grant.context != self.root_context.?);
+            try grant.checkLifetime();
+            try std.testing.expectEqual(runnable_abi.Class.query, try grant.currentClass());
+            try std.testing.expectEqual(@as(usize, 1), grant.cpu_slots);
+            const stats = scheduler.stats();
+            try std.testing.expect(stats.operations >= 3);
+            try std.testing.expect(stats.runnable_slots <= scheduler.config.slots - scheduler.config.control_slots);
+        }
 
         fn updateMax(max_value: *std.atomic.Value(u32), current: u32) void {
             var observed = max_value.load(.monotonic);
@@ -16455,6 +16541,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 .vtable = &.{
                     .execute_graph_expand = executeGraphExpand,
                     .execute_graph_hydrate = executeGraphHydrate,
+                    .execute_graph_get_edges = executeGraphEdges,
                     .fanout_io = fanoutIo,
                 },
             };
@@ -16477,6 +16564,12 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expect(req.timeout_ms != null);
             try std.testing.expect(req.cancellation != null);
+            try state.verifyChild(req.execution_runnable);
+            const local_graph = @import("antfly_local_sources").api_local_graph;
+            const search_req = try local_graph.frontierItemToSearchRequest(alloc, req, req.frontier[0]);
+            defer local_graph.freeExpandSearchRequest(alloc, search_req);
+            try state.verifyChild(search_req.execution_runnable);
+            try @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(search_req);
             _ = state.expand_calls.fetchAdd(1, .monotonic);
             const active = state.expand_active.fetchAdd(1, .monotonic) + 1;
             defer _ = state.expand_active.fetchSub(1, .monotonic);
@@ -16486,7 +16579,14 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 .raw = .fromNanoseconds(10 * std.time.ns_per_ms),
             }, state.io_impl.io());
 
-            try std.testing.expectEqual(@as(usize, 1), req.frontier.len);
+            // Entity-owned outgoing rows may reside on either source shard,
+            // so each owner receives the full frontier. This fixture owns one
+            // edge per shard and must return its matching frontier identity.
+            try std.testing.expectEqual(@as(usize, 2), req.frontier.len);
+            const owner_key = if (group_id == 11) "doc:a" else "doc:n";
+            const owner_frontier = for (req.frontier) |item| {
+                if (std.mem.eql(u8, item.key, owner_key)) break item;
+            } else return error.TestMissingOwnerFrontier;
             const node_key = if (group_id == 11) "doc:b" else "doc:o";
             const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
             nodes[0] = .{
@@ -16498,8 +16598,8 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
             };
             const expansions = try alloc.alloc(GraphExpansion, 1);
             expansions[0] = .{
-                .frontier_id = req.frontier[0].id,
-                .frontier_key = try alloc.dupe(u8, req.frontier[0].key),
+                .frontier_id = owner_frontier.id,
+                .frontier_key = try alloc.dupe(u8, owner_frontier.key),
                 .graph_result = .{
                     .name = try alloc.dupe(u8, req.name),
                     .nodes = nodes,
@@ -16509,6 +16609,41 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 },
             };
             return .{ .expansions = expansions };
+        }
+
+        fn executeGraphEdges(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: GraphEdgesRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphEdgesResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:a", req.key);
+            try std.testing.expectEqual(graph_mod.EdgeDirection.out, req.direction);
+            try state.verifyChild(req.execution_runnable);
+            _ = state.edge_calls.fetchAdd(1, .monotonic);
+            const active = state.edge_active.fetchAdd(1, .monotonic) + 1;
+            defer _ = state.edge_active.fetchSub(1, .monotonic);
+            TestState.updateMax(&state.max_edge_active, active);
+            try state.io_impl.io().sleep(.fromMilliseconds(10), .awake);
+            const edges = try alloc.alloc(graph_mod.Edge, 1);
+            errdefer alloc.free(edges);
+            edges[0] = try cloneOwnedGraphEdge(alloc, .{
+                .source = req.key,
+                .target = if (group_id == 11) "doc:b" else "doc:o",
+                .edge_type = "R",
+                .weight = 1,
+                .created_at = 0,
+                .updated_at = 0,
+                .metadata = "",
+            });
+            // Denied publication must still join this callback and destroy
+            // the slot's already allocated result before retiring its child.
+            if (state.cancel_on_edge) |flag| flag.store(true, .release);
+            return .{ .edges = edges, .scanned_rows = 1 };
         }
 
         fn executeGraphHydrate(
@@ -16523,6 +16658,11 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expect(req.timeout_ms != null);
             try std.testing.expect(req.cancellation != null);
+            try state.verifyChild(req.execution_runnable);
+            const contract = @import("antfly_local_sources").api_local_query_contract;
+            const search_req = contract.graphHydrateSearchRequest(req);
+            try state.verifyChild(search_req.execution_runnable);
+            try contract.checkQueryDeadline(search_req);
             _ = state.hydrate_calls.fetchAdd(1, .monotonic);
             const active = state.hydrate_active.fetchAdd(1, .monotonic) + 1;
             defer _ = state.hydrate_active.fetchSub(1, .monotonic);
@@ -16553,69 +16693,143 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
-    var state = TestState{ .io_impl = &io_impl };
-    var cancellation = std.atomic.Value(bool).init(false);
+    for ([_]usize{ 0, 2, 3 }) |capacity| {
+        var scheduler = try native.Scheduler.init(.{ .slots = @max(capacity, 2), .control_slots = 1 });
+        defer scheduler.close();
+        var parent: native.Execution = .{};
+        defer parent.finish();
+        var state = TestState{ .io_impl = &io_impl };
+        var cancellation = std.atomic.Value(bool).init(false);
 
-    const req = db_mod.types.SearchRequest{
-        .graph_queries = &[_]db_mod.types.NamedGraphQuery{
-            .{
-                .name = "walk",
-                .query = .{
-                    .query_type = .neighbors,
-                    .index_name = "graph_idx",
-                    .start_nodes = .{ .keys = &[_][]const u8{ "doc:a", "doc:n" } },
-                    .params = .{},
-                    .include_documents = true,
+        var req = db_mod.types.SearchRequest{
+            .graph_queries = &[_]db_mod.types.NamedGraphQuery{
+                .{
+                    .name = "walk",
+                    .query = .{
+                        .query_type = .neighbors,
+                        .index_name = "graph_idx",
+                        .start_nodes = .{ .keys = &[_][]const u8{ "doc:a", "doc:n" } },
+                        .params = .{},
+                        .include_documents = true,
+                    },
                 },
             },
-        },
-        .identity_read_generation = 77,
-        .execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
-        .cancellation = CancellationToken.fromAtomic(&cancellation),
-    };
-    const base_result = db_mod.types.SearchResult{
-        .alloc = std.testing.allocator,
-        .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
-        .total_hits = 0,
-        .graph_results = @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]),
-    };
+            .identity_read_generation = 77,
+            .execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
+            .cancellation = CancellationToken.fromAtomic(&cancellation),
+        };
+        var read: @import("runnable_local_read.zig").Read = .{ .execution = &parent, .allocator = std.testing.allocator };
+        var team: ?runnable_abi.Team = null;
+        if (capacity != 0) {
+            try parent.start(&scheduler, .{
+                .io = io_impl.io(),
+                .native_now_ns = platform_time.monotonicNs,
+                .deadline_ns = req.execution_deadline_ns,
+                .retained_bytes = 23,
+                .cancellation = .{ .ptr = &cancellation, .requested = struct {
+                    fn requested(raw: *const anyopaque) bool {
+                        return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+                    }
+                }.requested },
+            }, .query);
+            team = try read.team();
+            req.execution_runnable = team.?.borrow;
+            state.scheduler = &scheduler;
+            state.root_context = team.?.borrow.context;
+        }
+        const base_result = db_mod.types.SearchResult{
+            .alloc = std.testing.allocator,
+            .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
+            .total_hits = 0,
+            .graph_results = @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]),
+        };
 
-    const results = try executeCrossRange(
-        std.testing.allocator,
-        FakeCatalog.iface(),
-        FakeWorker.iface(&state),
-        "docs",
-        req,
-        base_result,
-        .read_index,
-    );
-    defer {
-        for (results) |*result| result.deinit(std.testing.allocator);
-        std.testing.allocator.free(results);
+        const results = try executeCrossRange(
+            std.testing.allocator,
+            FakeCatalog.iface(),
+            FakeWorker.iface(&state),
+            "docs",
+            req,
+            base_result,
+            .read_index,
+        );
+        defer {
+            for (results) |*result| result.deinit(std.testing.allocator);
+            std.testing.allocator.free(results);
+        }
+
+        try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
+        try std.testing.expectEqual(@as(u32, 2), state.hydrate_calls.load(.monotonic));
+        if (capacity != 0) std.debug.print("graph capacity={d} peak expand={d} hydrate={d} operations={d} runnable={d} bytes={d}\n", .{ capacity, state.max_expand_active.load(.monotonic), state.max_hydrate_active.load(.monotonic), scheduler.stats().operations, scheduler.stats().runnable_slots, scheduler.stats().retained_bytes });
+        if (capacity == 2) {
+            try std.testing.expectEqual(@as(u32, 1), state.max_expand_active.load(.monotonic));
+            try std.testing.expectEqual(@as(u32, 1), state.max_hydrate_active.load(.monotonic));
+        } else {
+            try std.testing.expect(state.max_expand_active.load(.monotonic) >= 2);
+            try std.testing.expect(state.max_hydrate_active.load(.monotonic) >= 2);
+        }
+        if (capacity != 0) {
+            try parent.checkLifetime();
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqual(@as(usize, 2), results[0].nodes.len);
+        try std.testing.expectEqual(@as(usize, 2), results[0].hits.len);
+        for (results[0].hits) |hit| {
+            try std.testing.expect(hit.doc_ordinal == null);
+        }
+
+        var edge_worker = FakeWorker.iface(&state);
+        edge_worker.execution_deadline_ns = edge_worker.budget().deadlineFrom(.init(req.execution_deadline_ns));
+        edge_worker.cancellation = req.cancellation;
+        edge_worker.runnable = req.execution_runnable;
+        const topology_epoch = try table_catalog.topologyEpoch(std.testing.allocator, FakeCatalog.iface(), "docs");
+        var admission = GraphNodeAdmissionContext.init(std.testing.allocator, FakeCatalog.iface(), edge_worker, "docs", "graph_idx", topology_epoch, req, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        const edge_reader = DistributedEdgeReader{ .catalog = FakeCatalog.iface(), .worker = edge_worker, .source_table = "docs", .index_name = "graph_idx", .consistency = .read_index, .admission = &admission };
+        const edges = try edge_reader.getEdgesBounded(std.testing.allocator, null, "doc:a", &.{"R"}, .out, 4, 4096);
+        defer edge_reader.freeEdges(std.testing.allocator, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+        try std.testing.expectEqualStrings("doc:b", edges[0].target);
+        try std.testing.expectEqualStrings("doc:o", edges[1].target);
+        try std.testing.expectEqual(@as(u64, 11), edges[0].origin_group_id);
+        try std.testing.expectEqual(@as(u64, 22), edges[1].origin_group_id);
+        try std.testing.expectEqual(@as(u32, 2), state.edge_calls.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), state.edge_active.load(.acquire));
+        if (capacity == 2) {
+            try std.testing.expectEqual(@as(u32, 1), state.max_edge_active.load(.acquire));
+        } else {
+            try std.testing.expect(state.max_edge_active.load(.acquire) >= 2);
+        }
+        if (capacity != 0) {
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        }
+        state.cancel_on_edge = &cancellation;
+        try std.testing.expectError(if (capacity == 0) error.Cancelled else error.Canceled, edge_reader.getEdgesBounded(std.testing.allocator, null, "doc:a", &.{"R"}, .out, 4, 4096));
+        try std.testing.expect(state.edge_calls.load(.acquire) > 2);
+        try std.testing.expectEqual(@as(u32, 0), state.edge_active.load(.acquire));
+        if (capacity != 0) {
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        }
+        cancellation.store(true, .release);
+        try std.testing.expectError(if (capacity == 0) error.Cancelled else error.Canceled, @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(req));
+        try std.testing.expectError(if (capacity == 0) error.Cancelled else error.Canceled, executeCrossRange(
+            std.testing.allocator,
+            FakeCatalog.iface(),
+            FakeWorker.iface(&state),
+            "docs",
+            req,
+            base_result,
+            .read_index,
+        ));
+        try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }
-
-    try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 2), state.hydrate_calls.load(.monotonic));
-    try std.testing.expect(state.max_expand_active.load(.monotonic) >= 2);
-    try std.testing.expect(state.max_hydrate_active.load(.monotonic) >= 2);
-    try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqual(@as(usize, 2), results[0].nodes.len);
-    try std.testing.expectEqual(@as(usize, 2), results[0].hits.len);
-    for (results[0].hits) |hit| {
-        try std.testing.expect(hit.doc_ordinal == null);
-    }
-
-    cancellation.store(true, .release);
-    try std.testing.expectError(error.Cancelled, executeCrossRange(
-        std.testing.allocator,
-        FakeCatalog.iface(),
-        FakeWorker.iface(&state),
-        "docs",
-        req,
-        base_result,
-        .read_index,
-    ));
-    try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
 }
 
 test "system catalog graph binding alone performs no admission hydration" {

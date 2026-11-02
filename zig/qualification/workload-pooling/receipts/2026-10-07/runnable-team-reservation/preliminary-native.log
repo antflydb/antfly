@@ -1,0 +1,33 @@
+1/32 runnable_scheduler.test.runnable scheduler weighted execution retains CPU demand across waits and class changes...OK
+2/32 runnable_scheduler.test.runnable scheduler node owner outlives independent borrowers and executions...OK
+3/32 runnable_scheduler.test.runnable scheduler preserves blocked ownership and protected capacity...OK
+4/32 runnable_scheduler.test.runnable scheduler bounds backfill and grants a large operation...OK
+5/32 runnable_scheduler.test.runnable scheduler weighted sharing charges slots across busy classes...OK
+6/32 runnable_scheduler.test.runnable scheduler cancellation after grant returns every reservation...OK
+7/32 runnable_scheduler.test.runnable scheduler deadline and shutdown retire blocked and queued owners...OK
+8/32 runnable_scheduler.test.runnable scheduler yield hands execution to another operation...OK
+9/32 runnable_scheduler.test.runnable scheduler queue bound starts at enqueue including grant race...OK
+10/32 runnable_scheduler.test.runnable scheduler real queue timeout releases count and bytes...OK
+11/32 runnable_scheduler.test.runnable scheduler rejects invalid policy and oversized demand atomically...OK
+12/32 runnable_scheduler.test.runnable scheduler shutdown racing a new block cannot strand an owner...OK
+13/32 runnable_scheduler.test.runnable scheduler execution quanta preserve deadline and parked ownership...OK
+14/32 runnable_scheduler.test.runnable scheduler checkpoint work budget and disabled execution...OK
+15/32 runnable_scheduler.test.runnable scheduler reserves control metadata at full ordinary outstanding limits...OK
+16/32 runnable_scheduler.test.runnable scheduler denied reentry retains borrowed reservations until owning finish...OK
+17/32 runnable_scheduler.test.runnable scheduler canceled yielded capsule retains ownership while peer computes...OK
+18/32 runnable_scheduler.test.runnable fail-fast initial control admission never waits or leaks a reservation...OK
+19/32 runnable_scheduler.test.runnable fail-fast acquisition retains fair bounded published reentry...OK
+20/32 runnable_scheduler.test.runnable scheduler running write retains completion ownership through cancellation and shutdown...OK
+21/32 runnable_scheduler.test.runnable scheduler team growth releases old CPU while preserving fair retained ownership...OK
+22/32 runnable_scheduler.test.runnable execution team reservations preserve original fencing and denied reentry ownership...OK
+23/32 runnable_scheduler.test.runnable scheduler team rejection and shutdown preserve existing running grant...OK
+24/32 bounded_admission.test.bounded admission contextual leases measure ownership once under both policies...OK
+25/32 bounded_admission.test.bounded admission FIFO grant cancellation and close transfer one owner...OK
+26/32 bounded_admission.test.bounded admission rejects count bytes oversized and invalid policies...OK
+27/32 bounded_admission.test.bounded admission wait ceiling and expired fast path never execute...OK
+28/32 bounded_admission.test.bounded admission native queue leaves completion capacity and drains a burst...OK
+29/32 bounded_admission.test.bounded admission queued external cancellation retires without execution...OK
+30/32 bounded_admission.test.bounded admission unsupported executor remains fail fast without enqueue...OK
+31/32 bounded_admission.test.bounded admission live shrink preserves grants and retires newest waiters...OK
+32/32 bounded_admission.test.bounded admission suspension and terminal drain reconcile caller ownership...OK
+All 32 tests passed.

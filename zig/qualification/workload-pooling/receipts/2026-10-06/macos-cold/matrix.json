@@ -1,0 +1,28 @@
+{
+  "passed": false,
+  "failures": [
+    "macos-mixed-load: comparison with candidate-failfast",
+    "macos-mixed-load: comparison with origin-main"
+  ],
+  "profiles": [
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "origin-main",
+      "receipt": "/private/tmp/antfly-pooling-stage-three-macos-matrix/macos-mixed-load-origin-main.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "candidate-fixed",
+      "receipt": "/private/tmp/antfly-pooling-stage-three-macos-matrix/macos-mixed-load-candidate-fixed.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-mixed-load.json",
+      "variant": "candidate-failfast",
+      "receipt": "/private/tmp/antfly-pooling-stage-three-macos-matrix/macos-mixed-load-candidate-failfast.json",
+      "exit_code": 0
+    }
+  ],
+  "automatic_defaults_qualified": false
+}

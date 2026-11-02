@@ -45,7 +45,70 @@ pub const PreDecisionContext = struct {
     restore_staging_plan_id: ?[16]u8 = null,
     deadline_ns: ?u64 = null,
     deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
+    /// Borrowed request executor; independent of the deadline clock domain.
+    fanout_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     cancellation: db_types.CancellationToken = .none,
+    /// Per-call worker authority retained through this synchronous participant
+    /// operation. Concurrent participants require independently owned children;
+    /// never forward the coordinator token to multiple workers or serialize it.
+    execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+
+    /// Preserve the local request executor without lending coordinator CPU to
+    /// participant children. Each worker attaches its own runnable separately.
+    pub fn fromRequest(request: @import("operation.zig").RequestContext) PreDecisionContext {
+        return .{ .deadline_ns = request.deadline_ns, .deadline_io = request.deadline_io, .fanout_io = request.fanout_io, .cancellation = request.cancellation };
+    }
+
+    /// Clamp an existing budget into the destination clock domain. Sampling
+    /// that clock first prevents translation from extending the caller's
+    /// remaining time. Preserve all identity and cancellation fences.
+    pub fn boundDeadline(self: PreDecisionContext, ceiling_ns: u64, clock_io: ?@import("antfly_runtime_abi").io_abi.Borrow) PreDecisionContext {
+        const routing = @import("routing_budget.zig");
+        const target: routing.RoutingBudget = .{ .io = clock_io };
+        var result = self;
+        result.deadline_ns = @min(ceiling_ns, target.deadlineFrom(.{ .deadline_ns = self.deadline_ns, .io = self.deadline_io }) orelse ceiling_ns);
+        result.deadline_io = clock_io;
+        return result;
+    }
+
+    /// A legacy callback cannot carry these admission fences or hidden-owner
+    /// identity. Even an inactive/incomplete supplied token must not be silently
+    /// discarded: its caller requires this context-aware operation contract.
+    pub fn requiresAwareCallback(self: PreDecisionContext) bool {
+        return self.route_fence != null or self.restore_staging_scope != null or self.restore_staging_plan_id != null or
+            self.deadline_ns != null or self.deadline_io != null or self.fanout_io != null or self.execution_runnable != null or self.cancellation.ptr != null or
+            self.cancellation.is_cancelled_fn != null or self.cancellation.check_fn != null;
+    }
+};
+
+/// Lease-fenced session storage for the original routed cohort. Bytes are
+/// private, versioned coordinator data, never a caller-supplied routing hint.
+/// Returned buffers belong to the invocation allocator.
+pub const ParticipantPlanStore = struct {
+    pub const Loaded = union(enum) { legacy, unplanned, planned: []u8 };
+    ptr: *anyopaque,
+    load: *const fn (*anyopaque, @import("std").mem.Allocator, db_types.TxnId) anyerror!Loaded,
+    seal: *const fn (*anyopaque, @import("std").mem.Allocator, db_types.TxnId, []const u8) anyerror![]u8,
+};
+
+/// Invocation-owned commit authority. The original pre-decision fences are
+/// separate from post-commit response cancellation; neither may replace the
+/// independent authority needed to finish or recover accepted mutations.
+pub const CommitControl = struct {
+    team: ?*@import("antfly_runtime_abi").runnable_abi.Team = null,
+    pre_decision: PreDecisionContext = .{},
+    participant_plan_store: ?ParticipantPlanStore = null,
+
+    pub fn requiresAwareCallback(self: CommitControl) bool {
+        return self.team != null or self.participant_plan_store != null or self.pre_decision.requiresAwareCallback();
+    }
+
+    pub fn fromRequest(request: @import("operation.zig").RequestContext) CommitControl {
+        return .{
+            .team = request.execution_team,
+            .pre_decision = PreDecisionContext.fromRequest(request),
+        };
+    }
 };
 
 /// Authenticated private recovery observation. A locator is never authority by
@@ -128,3 +191,16 @@ pub const CommitOutcome = union(enum) {
     committed: ExecuteResult,
     conflict: CommitConflict,
 };
+
+test "predecision commit context preserves execution IO separately from deadline clock" {
+    const std = @import("std");
+    const runtime = @import("antfly_runtime_abi");
+    var clock_marker: u8 = 1;
+    var execution_marker: u8 = 2;
+    const clock: std.Io = .{ .userdata = &clock_marker, .vtable = std.Io.failing.vtable };
+    const execution: std.Io = .{ .userdata = &execution_marker, .vtable = std.Io.failing.vtable };
+    const control = CommitControl.fromRequest(.{ .deadline_io = runtime.io_abi.Borrow.init(&clock), .fanout_io = runtime.io_abi.Borrow.init(&execution) });
+    try std.testing.expect(control.pre_decision.deadline_io.?.userdata == @as(?*anyopaque, &clock_marker));
+    try std.testing.expect(control.pre_decision.fanout_io.?.userdata == @as(?*anyopaque, &execution_marker));
+    try std.testing.expect((@as(PreDecisionContext, .{ .fanout_io = runtime.io_abi.Borrow.init(&execution) })).requiresAwareCallback());
+}

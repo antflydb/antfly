@@ -239,7 +239,7 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             const collected = try self.a.create(Collected);
             collected.* = .{ .backing = self.a, .locked = .{ .backing = self.a } };
             errdefer collected.deinit();
-            const grouped = try operators.Grouped.create(collected.locked.allocator(), specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill });
+            const grouped = try operators.Grouped.create(collected.locked.allocator(), specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill, .coordinator_scope = context.backend.coordinator_scope, .control = if (context.backend.scalar_control) |owner| .{ .ptr = owner.ptr, .checkpoint = owner.checkpoint } else null });
             collected.groups[0] = grouped;
             const child = if ((side == 0) != self.iterator.flipped_join) self.iterator.left.? else self.iterator.right.?;
             var scratch = std.heap.ArenaAllocator.init(self.a);
@@ -271,11 +271,11 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
                 @memset(inputs, .{ .dictionary = .{ .values = one, .indices = ones } });
                 for (self.side_inputs[side], inputs[1..]) |input, *value| value.* = try source.project(temporary, self.plan.inputs[input].?.column);
                 const io = context.backend.execution_io;
-                if (ordinal == 0 and lane_count == 0 and io != null and batch.len() >= 256 and parallel_keys and parallelReducers(specs)) {
+                if (ordinal == 0 and lane_count == 0 and io != null and context.backend.scalar_control == null and context.backend.coordinator_scope == null and batch.len() >= 256 and parallel_keys and parallelReducers(specs)) {
                     const requested = @min(4, scheduler.global().fanout(@min(4, batch.len() / 128), context.limits.retained_bytes / 4, 1024 * 1024));
                     if (requested > 1) {
                         // Choose fixed ownership before consuming the first page.
-                        for (lanes[1..requested]) |*lane| lane.* = try operators.Grouped.create(collected.locked.allocator(), specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4 / requested, .spill = context.spill });
+                        for (lanes[1..requested]) |*lane| lane.* = try operators.Grouped.create(collected.locked.allocator(), specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4 / requested, .spill = context.spill, .coordinator_scope = context.backend.coordinator_scope, .control = if (context.backend.scalar_control) |owner| .{ .ptr = owner.ptr, .checkpoint = owner.checkpoint } else null });
                         grouped.limits.bytes = context.limits.retained_bytes / 4 / requested;
                         grouped.budget.limit = grouped.limits.bytes;
                         lane_count = requested;
@@ -351,7 +351,7 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             const groups = try self.collect(self.build_side);
             defer groups.deinit();
             const context = self.engine.context;
-            self.build = try operators.HashJoin.create(self.a, .{ .rows = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill });
+            self.build = try operators.HashJoin.create(self.a, .{ .rows = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill, .execution = if (context.backend.coordinator_scope) |scope| scope.execution else null, .control = if (context.backend.scalar_control) |owner| .{ .ptr = owner.ptr, .checkpoint = owner.checkpoint } else null });
             var scratch = std.heap.ArenaAllocator.init(self.a);
             defer scratch.deinit();
             var packed_bytes: u64 = 0;
@@ -523,7 +523,7 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             const context = self.engine.context;
             const specs = try self.arena.allocator().alloc(operators.AggregateSpec, self.plan.recipe.inputs.len);
             for (specs, self.plan.recipe.inputs) |*spec, input| spec.* = input.spec;
-            self.reduced = try operators.Grouped.create(self.a, specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill });
+            self.reduced = try operators.Grouped.create(self.a, specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill, .coordinator_scope = context.backend.coordinator_scope, .control = if (context.backend.scalar_control) |owner| .{ .ptr = owner.ptr, .checkpoint = owner.checkpoint } else null });
             var scratch = std.heap.ArenaAllocator.init(self.a);
             defer scratch.deinit();
             while (true) {

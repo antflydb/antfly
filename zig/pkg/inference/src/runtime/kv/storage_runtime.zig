@@ -478,6 +478,9 @@ pub const KvStorageRuntime = struct {
     /// When set, `writeLayerKvSuffixDevice` goes through the hook; otherwise
     /// callers must materialize host slices and use `writeLayerKvSuffix`.
     device_write_hook: ?DeviceWriteHook = null,
+    /// Borrowed from the owning cache. Every physical allocation retains its
+    /// own credit beyond hook/cache teardown and through deferred driver free.
+    device_memory_budget: ?@import("device_memory.zig").Budget = null,
 
     pub fn init(allocator: std.mem.Allocator, config: pool_mod.KvPoolConfig) !KvStorageRuntime {
         var storage = try storage_mod.initHost(allocator, config);
@@ -799,6 +802,7 @@ pub const KvStorageRuntime = struct {
             return id;
         }
         const id = try self.storage.acquire(self.allocator);
+        errdefer _ = self.storage.releaseRef(self.allocator, id) catch {};
         try sequence_state.block_table.append(self.allocator, id);
         return id;
     }
@@ -1567,6 +1571,26 @@ test "storage runtime disables SWA ring for retained prompt prefixes" {
 
     try std.testing.expectEqual(@as(usize, 1), hook_context.calls);
     try std.testing.expect(!hook_context.last_allow_swa_ring);
+}
+
+test "KvStorageRuntime denied tail table growth returns the acquired block before retry" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    const config: pool_mod.KvPoolConfig = .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 };
+    var runtime = try KvStorageRuntime.init(allocator, config);
+    defer runtime.deinit();
+    const pool_id = runtime.poolId();
+    const sequence = try runtime.attachSequence(pool_id);
+    const pool = runtime.getPoolMut(pool_id).?;
+    const id = try pool.acquire(allocator);
+    _ = try pool.releaseRef(allocator, id);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, runtime.reserveTailBlock(sequence));
+    try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(id).?.refcount);
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(id, try runtime.reserveTailBlock(sequence));
+    try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(id).?.refcount);
+    try runtime.releaseSequence(sequence);
 }
 
 test "LightOnOCR3 CUDA graph reservation remains within a finite retention window" {

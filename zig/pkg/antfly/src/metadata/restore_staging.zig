@@ -298,14 +298,26 @@ fn foreignGenerationForTableId(alloc: std.mem.Allocator, child: Target, table_id
 }
 
 pub fn runtimeSchemaDigestForTable(alloc: std.mem.Allocator, schema_json: []const u8) !Digest {
+    return runtimeSchemaDigestForTableInner(alloc, schema_json, null);
+}
+
+pub fn runtimeSchemaDigestForTableWithAdmission(alloc: std.mem.Allocator, schema_json: []const u8, control: @import("antfly_local_sources").common_read_admission.Port) !Digest {
+    return runtimeSchemaDigestForTableInner(alloc, schema_json, control);
+}
+
+fn runtimeSchemaDigestForTableInner(alloc: std.mem.Allocator, schema_json: []const u8, control: ?@import("antfly_local_sources").common_read_admission.Port) !Digest {
+    if (control) |original| try original.checkpoint();
     const api_tables = @import("../api/tables.zig");
     const runtime_schema = @import("antfly_local_sources").storage_schema;
-    var schema = try api_tables.parseValidatedTableSchema(alloc, schema_json);
+    var schema = if (control) |original| try api_tables.parseValidatedTableSchemaWithAdmission(alloc, schema_json, original) else try api_tables.parseValidatedTableSchema(alloc, schema_json);
     defer schema.deinit(alloc);
+    if (control) |original| try original.checkpoint();
     const typed = try api_tables.deriveRuntimeTableSchema(alloc, schema);
     defer runtime_schema.freeSchema(alloc, typed);
+    if (control) |original| try original.checkpoint();
     const encoded = try runtime_schema.serializeSchema(alloc, typed);
     defer alloc.free(encoded);
+    if (control) |original| return @import("../storage/restore_plan_codec.zig").digestBytes(encoded, original);
     return @import("antfly_local_sources").storage_db_restore_staging_contract.digest(encoded);
 }
 
@@ -805,6 +817,10 @@ pub const Plan = struct {
         return value;
     }
 
+    pub fn digestWithAdmission(self: Plan, alloc: std.mem.Allocator, control: @import("antfly_local_sources").common_read_admission.Port) !Digest {
+        return @import("../storage/restore_plan_codec.zig").digestValue(self, alloc, control, max_encoded_bytes);
+    }
+
     /// Identity before source pin acquisition. Only authenticated artifact
     /// receipts and their aggregate digest may change when freezing the plan.
     pub fn rewriteIntentDigest(self: Plan, alloc: std.mem.Allocator) !Digest {
@@ -931,13 +947,26 @@ pub const Job = struct {
 /// One canonical derivation shared by metadata provisioning and the restore
 /// coordinator. Hash the encoded runtime schema, not the public JSON spelling.
 pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, range: records.RangeRecord) !@import("antfly_local_sources").storage_db_restore_staging_contract.Scope {
+    return ownerScopeInner(alloc, plan, plan_digest, target, range, null);
+}
+
+pub fn ownerScopeWithAdmission(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, range: records.RangeRecord, control: @import("antfly_local_sources").common_read_admission.Port) !@import("antfly_local_sources").storage_db_restore_staging_contract.Scope {
+    return ownerScopeInner(alloc, plan, plan_digest, target, range, control);
+}
+
+fn ownerScopeInner(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, range: records.RangeRecord, control: ?@import("antfly_local_sources").common_read_admission.Port) !@import("antfly_local_sources").storage_db_restore_staging_contract.Scope {
+    const codec = @import("../storage/restore_plan_codec.zig");
+    if (control) |original| try original.checkpoint();
     if (range.table_id != target.table.table_id) return error.InvalidRestoreStaging;
-    const schema_digest = target.target_schema_digest orelse try runtimeSchemaDigestForTable(alloc, target.table.schema_json);
+    const schema_digest = target.target_schema_digest orelse if (control) |original| try runtimeSchemaDigestForTableWithAdmission(alloc, target.table.schema_json, original) else try runtimeSchemaDigestForTable(alloc, target.table.schema_json);
+    if (control) |original| try original.checkpoint();
     if (target.empty_generation) {
         const old = target.replace orelse return error.InvalidRestoreStaging;
-        const source = for (old.ranges) |item| {
-            if (std.mem.eql(u8, item.start_key, range.start_key) and std.mem.eql(u8, item.end_key orelse "", range.end_key orelse "")) break item;
+        const source = for (old.ranges, 0..) |item, source_index| {
+            if (control) |original| if (source_index % 64 == 0) try original.checkpoint();
+            if (try codec.equal(item.start_key, range.start_key, control) and try codec.equal(item.end_key orelse "", range.end_key orelse "", control)) break item;
         } else return error.InvalidRestoreStaging;
+        if (control) |original| try original.checkpoint();
         return .{
             .plan_id = plan.id,
             .plan_digest = plan_digest,
@@ -949,14 +978,17 @@ pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, tar
             .graph_retirement_digest = target.graph_retirement_digest,
         };
     }
-    const artifact = for (target.source_artifacts) |source| {
+    const artifact = for (target.source_artifacts, 0..) |source, source_index| {
+        if (control) |original| if (source_index % 64 == 0) try original.checkpoint();
         if (source.target_group_id == range.group_id) break source;
     } else return error.RestoreSourceProofMissing;
+    const descriptor_digest = if (control) |original| try artifact.digestWithAdmission(alloc, original) else try artifact.digest(alloc);
+    if (control) |original| try original.checkpoint();
     return .{
         .plan_id = plan.id,
         .plan_digest = plan_digest,
         .source_artifact_digest = artifact.artifact_sha256,
-        .source_descriptor_digest = try artifact.digest(alloc),
+        .source_descriptor_digest = descriptor_digest,
         .source_namespace = artifact.source_namespace,
         .target_namespace = .{ .table_id = target.table.table_id, .shard_id = tables.rangeDocIdentityShardId(range), .range_id = tables.rangeDocIdentityRangeId(range) },
         .target_schema_digest = schema_digest,
@@ -978,10 +1010,20 @@ pub const MappedGenerationAdmission = struct {
 /// Callers already hold the validated immutable plan and an owner ordinal;
 /// never rediscover its proof by scanning the entire cohort.
 pub fn ownerBootstrapForRangeIndex(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, index: usize) !@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap {
+    return ownerBootstrapForRangeIndexInner(alloc, plan, plan_digest, target, index, null);
+}
+
+pub fn ownerBootstrapForRangeIndexWithAdmission(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, index: usize, control: @import("antfly_local_sources").common_read_admission.Port) !@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap {
+    return ownerBootstrapForRangeIndexInner(alloc, plan, plan_digest, target, index, control);
+}
+
+fn ownerBootstrapForRangeIndexInner(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, index: usize, control: ?@import("antfly_local_sources").common_read_admission.Port) !@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap {
+    if (control) |original| try original.checkpoint();
     const contract = @import("antfly_local_sources").storage_db_restore_staging_contract;
     if (index >= target.ranges.len) return error.InvalidRestoreStaging;
     const range = target.ranges[index];
-    const scope = try ownerScope(alloc, plan, plan_digest, target, range);
+    const scope = if (control) |original| try ownerScopeWithAdmission(alloc, plan, plan_digest, target, range, original) else try ownerScope(alloc, plan, plan_digest, target, range);
+    if (control) |original| try original.checkpoint();
     var bootstrap: contract.OwnerBootstrap = .{
         .scope = scope,
         .table_name = target.table.name,
@@ -1001,20 +1043,21 @@ pub fn ownerBootstrapForRangeIndex(alloc: std.mem.Allocator, plan: Plan, plan_di
             .retired_count = handoff.retired_count,
             .mappings = handoff.mappings,
         };
-        bootstrap.empty_generation_handoff = .{ .source_summary_digest = command.source_summary_digest, .retired_digest = command.retired_digest, .retired_count = command.retired_count, .expected_install_receipt_digest = try @import("antfly_local_sources").storage_db_empty_generation_handoff.installReceiptDigest(command) };
+        bootstrap.empty_generation_handoff = .{ .source_summary_digest = command.source_summary_digest, .retired_digest = command.retired_digest, .retired_count = command.retired_count, .expected_install_receipt_digest = if (control) |original| try @import("antfly_local_sources").storage_db_empty_generation_handoff.installReceiptDigestWithAdmission(command, original) else try @import("antfly_local_sources").storage_db_empty_generation_handoff.installReceiptDigest(command) };
     }
     if (target.source_generation_admissions.len != 0) {
         // Repository artifact order need not equal keyspace range order.
-        const proof = for (target.source_generation_admissions) |candidate| {
+        const proof = for (target.source_generation_admissions, 0..) |candidate, proof_index| {
+            if (control) |original| if (proof_index % 64 == 0) try original.checkpoint();
             if (candidate.target_group_id == range.group_id) break candidate;
         } else return error.InvalidRestoreStaging;
         bootstrap.source_generation_proof_digest = proof.digest;
         if (proof.entries.len != 0) {
             const command: contract.InstallGenerationAdmissions = .{ .scope = scope.digest(), .source_summary_digest = proof.digest, .mappings = proof.mappings };
-            bootstrap.generation_admission = .{ .source_summary_digest = proof.digest, .expected_receipt_digest = try contract.admissionReceiptDigest(command) };
+            bootstrap.generation_admission = .{ .source_summary_digest = proof.digest, .expected_receipt_digest = if (control) |original| try contract.admissionReceiptDigestWithAdmission(command, original) else try contract.admissionReceiptDigest(command) };
         }
     }
-    try bootstrap.validate();
+    if (control) |original| try bootstrap.validateWithAdmission(original) else try bootstrap.validate();
     return bootstrap;
 }
 

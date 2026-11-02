@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "ast-check",
+    "zig/pkg/antfly/src/api/distributed_txn.zig"
+  ],
+  "exit_code": 0,
+  "source_sha256": {
+    "zig/pkg/antfly/src/api/distributed_txn.zig": "3143e6926461f166405da7df4c39dba6645125081344e3505980c9fee2317562"
+  },
+  "scope": "Syntax only; coordinator type checking and runtime proof pending"
+}

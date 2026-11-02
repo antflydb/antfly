@@ -473,14 +473,44 @@ const ParsedTypeSpec = struct {
     allows_null: bool = false,
 };
 
+const SchemaAdmissionTrace = struct {
+    const admission = @import("../common/read_admission.zig");
+    original: ?admission.Port,
+    failure: ?anyerror = null,
+    payload: admission.Payload = undefined,
+
+    // Initialize the payload at its final address; returned ports do not escape
+    // the synchronous operation borrowing this trace.
+    fn bind(self: *@This()) ?admission.Port {
+        if (self.original == null) return null;
+        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = check } };
+        return admission.Port.init(&self.payload);
+    }
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.failure) |cause| return cause;
+        const original = self.original orelse return;
+        original.checkpoint() catch |err| {
+            self.failure = err;
+            return err;
+        };
+    }
+};
+
 const SchemaContext = struct {
     document_root: std.json.ObjectMap,
     scope_schema: std.json.ObjectMap,
     numeric_domain: bool = false,
+    control: ?@import("../common/read_admission.zig").Port = null,
+
+    fn checkpoint(self: SchemaContext) !void {
+        if (self.control) |original| try original.checkpoint();
+    }
 
     fn child(self: SchemaContext, object: std.json.ObjectMap) SchemaContext {
         return .{
             .document_root = self.document_root,
+            .control = self.control,
             .scope_schema = if (object.get("$defs") != null) object else self.scope_schema,
             .numeric_domain = self.numeric_domain or blk: {
                 const kind = object.get("x-antfly-sql-type") orelse break :blk false;
@@ -781,25 +811,52 @@ fn parseSchemaRequest(alloc: std.mem.Allocator, body: []const u8, allow_inferenc
 }
 
 pub fn parseSchema(alloc: std.mem.Allocator, schema_json: []const u8) !TableSchema {
+    return parseSchemaInner(alloc, schema_json, null);
+}
+
+pub fn parseSchemaWithAdmission(alloc: std.mem.Allocator, schema_json: []const u8, control: @import("../common/read_admission.zig").Port) !TableSchema {
+    return parseSchemaInner(alloc, schema_json, control);
+}
+
+fn parseSchemaInner(alloc: std.mem.Allocator, schema_json: []const u8, control: ?@import("../common/read_admission.zig").Port) !TableSchema {
+    if (control) |original| try original.checkpoint();
     if (schema_json.len == 0) {
-        return .{
-            .default_type = try alloc.dupe(u8, ""),
-            .ttl_field = try alloc.dupe(u8, "_timestamp"),
-        };
+        const default_type = try alloc.dupe(u8, "");
+        errdefer alloc.free(default_type);
+        const ttl_field = try alloc.dupe(u8, "_timestamp");
+        errdefer alloc.free(ttl_field);
+        if (control) |original| try original.checkpoint();
+        return .{ .default_type = default_type, .ttl_field = ttl_field };
     }
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{ .parse_numbers = false });
+    var parsed = if (control) |original| blk: {
+        const Adapter = struct {
+            port: @import("../common/read_admission.zig").Port,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.port.checkpoint();
+            }
+        };
+        var adapter: Adapter = .{ .port = original };
+        break :blk try @import("../sql/cooperative_json_source.zig").parse(std.json.Value, alloc, schema_json, .{ .parse_numbers = false }, .{ .ptr = &adapter, .check = Adapter.check });
+    } else try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{ .parse_numbers = false });
     defer parsed.deinit();
-    try validateSchemaValue(parsed.value);
+    try validateSchemaValueWithAdmission(parsed.value, control);
+    if (control) |original| try original.checkpoint();
     const schema = try parseTableSchemaValue(alloc, parsed.value);
     errdefer {
         var owned = schema;
         owned.deinit(alloc);
     }
+    if (control) |original| try original.checkpoint();
     try validateParsedStorageModeSchema(schema);
+    if (control) |original| try original.checkpoint();
     try validateParsedTtlSchema(schema);
+    if (control) |original| try original.checkpoint();
     try validateParsedRelationalSchema(schema);
+    if (control) |original| try original.checkpoint();
     try validateRelationalExpressions(alloc, schema);
+    if (control) |original| try original.checkpoint();
     return schema;
 }
 
@@ -1351,12 +1408,19 @@ fn validatePhysicalFieldValue(field_type: storage_schema.AntflyType, value: std.
 }
 
 pub fn globMatch(pattern: []const u8, text: []const u8) bool {
+    return globMatchWithAdmission(pattern, text, null) catch unreachable;
+}
+
+fn globMatchWithAdmission(pattern: []const u8, text: []const u8, control: ?@import("../common/read_admission.zig").Port) !bool {
+    var work: usize = 0;
     var pi: usize = 0;
     var ti: usize = 0;
     var star_pi: ?usize = null;
     var star_ti: usize = 0;
 
     while (ti < text.len) {
+        if (control) |original| if (work % 4096 == 0) try original.checkpoint();
+        work +%= 1;
         if (pi < pattern.len and (pattern[pi] == text[ti] or pattern[pi] == '?')) {
             pi += 1;
             ti += 1;
@@ -1373,7 +1437,12 @@ pub fn globMatch(pattern: []const u8, text: []const u8) bool {
         }
     }
 
-    while (pi < pattern.len and pattern[pi] == '*') pi += 1;
+    while (pi < pattern.len and pattern[pi] == '*') {
+        if (control) |original| if (work % 4096 == 0) try original.checkpoint();
+        work +%= 1;
+        pi += 1;
+    }
+    if (control) |original| try original.checkpoint();
     return pi == pattern.len;
 }
 
@@ -1388,12 +1457,17 @@ fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
 }
 
 fn validateSchemaValue(value: std.json.Value) !void {
+    return validateSchemaValueWithAdmission(value, null);
+}
+
+fn validateSchemaValueWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !void {
+    if (control) |original| try original.checkpoint();
     const root = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
     };
 
-    if (root.get("version")) |version| if (version != .null) try validateNonNegativeInteger(version);
+    if (root.get("version")) |version| if (version != .null) try validateNonNegativeIntegerWithAdmission(version, control);
     if (root.get("storage_mode")) |storage_mode| if (storage_mode != .null) switch (storage_mode) {
         .string => |text| {
             if (std.meta.stringToEnum(StorageMode, text) == null) return error.InvalidSchemaUpdateRequest;
@@ -1410,7 +1484,7 @@ fn validateSchemaValue(value: std.json.Value) !void {
         .string => |text| _ = try parseTtlDurationNs(text),
         else => return error.InvalidSchemaUpdateRequest,
     };
-    if (root.get("ttl_duration_ns")) |ttl_duration_ns| if (ttl_duration_ns != .null) try validateNonNegativeInteger(ttl_duration_ns);
+    if (root.get("ttl_duration_ns")) |ttl_duration_ns| if (ttl_duration_ns != .null) try validateNonNegativeIntegerWithAdmission(ttl_duration_ns, control);
     if (root.get("ttl_field")) |ttl_field| if (ttl_field != .null) switch (ttl_field) {
         .string => |text| {
             if (text.len == 0) return error.InvalidSchemaUpdateRequest;
@@ -1418,9 +1492,9 @@ fn validateSchemaValue(value: std.json.Value) !void {
         else => return error.InvalidSchemaUpdateRequest,
     };
     if (root.get("enforce_types")) |enforce_types| if (enforce_types != .null and enforce_types != .bool) return error.InvalidSchemaUpdateRequest;
-    if (root.get("document_schemas")) |document_schemas| if (document_schemas != .null) try validateDocumentSchemas(document_schemas);
-    if (root.get("dynamic_templates")) |dynamic_templates| if (dynamic_templates != .null) try validateDynamicTemplates(dynamic_templates);
-    if (root.get("index_sort")) |index_sort| if (index_sort != .null) try validateIndexSort(index_sort);
+    if (root.get("document_schemas")) |document_schemas| if (document_schemas != .null) try validateDocumentSchemasWithAdmission(document_schemas, control);
+    if (root.get("dynamic_templates")) |dynamic_templates| if (dynamic_templates != .null) try validateDynamicTemplatesWithAdmission(dynamic_templates, control);
+    if (root.get("index_sort")) |index_sort| if (index_sort != .null) try validateIndexSortWithAdmission(index_sort, control);
 }
 
 fn validateTtlConfig(value: std.json.Value) !void {
@@ -1450,6 +1524,11 @@ fn validateTtlConfig(value: std.json.Value) !void {
 }
 
 fn validateDocumentSchemas(value: std.json.Value) !void {
+    return validateDocumentSchemasWithAdmission(value, null);
+}
+
+fn validateDocumentSchemasWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !void {
+    if (control) |original| try original.checkpoint();
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
@@ -1457,27 +1536,35 @@ fn validateDocumentSchemas(value: std.json.Value) !void {
 
     var it = object.iterator();
     while (it.next()) |entry| {
+        if (control) |original| try original.checkpoint();
         const doc_schema = switch (entry.value_ptr.*) {
             .object => |doc_schema| doc_schema,
             else => return error.InvalidSchemaUpdateRequest,
         };
         const schema_value = doc_schema.get("schema") orelse return error.InvalidSchemaUpdateRequest;
-        try validateDocumentSchemaDefinition(schema_value);
+        try validateDocumentSchemaDefinitionWithAdmission(schema_value, control);
     }
 }
 
 fn validateDocumentSchemaDefinition(value: std.json.Value) anyerror!void {
+    return validateDocumentSchemaDefinitionWithAdmission(value, null);
+}
+
+fn validateDocumentSchemaDefinitionWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) anyerror!void {
+    if (control) |original| try original.checkpoint();
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
     };
     return validateDocumentSchemaDefinitionWithContext(.{
         .document_root = object,
+        .control = control,
         .scope_schema = object,
     }, value);
 }
 
 fn validateDocumentSchemaDefinitionWithContext(context: SchemaContext, value: std.json.Value) anyerror!void {
+    try context.checkpoint();
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
@@ -1495,6 +1582,7 @@ fn validateDocumentSchemaDefinitionWithContext(context: SchemaContext, value: st
 }
 
 fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
+    try context.checkpoint();
     // SQL identities belong to root column properties, never the row object.
     if (object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier")) return error.InvalidSchemaUpdateRequest;
     if (object.get("type")) |schema_type| {
@@ -1507,7 +1595,7 @@ fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.Objec
         if (nullable != .null and nullable != .bool) return error.InvalidSchemaUpdateRequest;
     }
     if (object.get("x-antfly-include-in-all")) |include_in_all| {
-        if (include_in_all != .null) try validateAntflyIncludeInAllDefinition(include_in_all);
+        if (include_in_all != .null) try validateAntflyIncludeInAllDefinitionWithAdmission(include_in_all, context.control);
     }
     if (object.get("$defs")) |definitions| {
         if (definitions != .null) try validateDefinitionsDefinition(context, definitions);
@@ -1517,6 +1605,7 @@ fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.Objec
             if (properties != .object) return error.InvalidSchemaUpdateRequest;
             var it = properties.object.iterator();
             while (it.next()) |entry| {
+                try context.checkpoint();
                 if (isReservedDocumentFieldName(entry.key_ptr.*)) return error.InvalidSchemaUpdateRequest;
                 try validatePropertySchemaDefinitionWithContext(context, entry.value_ptr.*);
             }
@@ -1526,6 +1615,7 @@ fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.Objec
         if (required != .null) {
             if (required != .array) return error.InvalidSchemaUpdateRequest;
             for (required.array.items) |entry| {
+                try context.checkpoint();
                 if (entry != .string) return error.InvalidSchemaUpdateRequest;
             }
         }
@@ -1549,7 +1639,7 @@ fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.Objec
         if (unevaluated_properties == .object) try validatePropertySchemaDefinitionWithContext(context, unevaluated_properties);
     }
     if (object.get("dependentRequired")) |dependent_required| {
-        if (dependent_required != .null) try validateDependentRequiredDefinition(dependent_required);
+        if (dependent_required != .null) try validateDependentRequiredDefinitionWithAdmission(dependent_required, context.control);
     }
     if (object.get("dependentSchemas")) |dependent_schemas| {
         if (dependent_schemas != .null) try validateDependentSchemasDefinition(context, dependent_schemas);
@@ -1578,16 +1668,16 @@ fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.Objec
         if (enum_values != .null) try validateEnumDefinition(enum_values);
     }
     if (object.get("minimum")) |minimum| {
-        if (minimum != .null) _ = parseJsonNumber(minimum) catch return error.InvalidSchemaUpdateRequest;
+        if (minimum != .null) _ = try parseSchemaFloat(minimum, context.control);
     }
     if (object.get("maximum")) |maximum| {
-        if (maximum != .null) _ = parseJsonNumber(maximum) catch return error.InvalidSchemaUpdateRequest;
+        if (maximum != .null) _ = try parseSchemaFloat(maximum, context.control);
     }
     if (object.get("exclusiveMinimum")) |exclusive_minimum| {
-        if (exclusive_minimum != .null) _ = parseJsonNumber(exclusive_minimum) catch return error.InvalidSchemaUpdateRequest;
+        if (exclusive_minimum != .null) _ = try parseSchemaFloat(exclusive_minimum, context.control);
     }
     if (object.get("exclusiveMaximum")) |exclusive_maximum| {
-        if (exclusive_maximum != .null) _ = parseJsonNumber(exclusive_maximum) catch return error.InvalidSchemaUpdateRequest;
+        if (exclusive_maximum != .null) _ = try parseSchemaFloat(exclusive_maximum, context.control);
     }
     if (object.get("multipleOf")) |multiple_of| {
         if (multiple_of != .null) try validatePositiveNumberForDomain(context, multiple_of);
@@ -1623,28 +1713,28 @@ fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.Objec
         }
     }
     if (object.get("minLength")) |min_length| {
-        if (min_length != .null) try validateNonNegativeInteger(min_length);
+        if (min_length != .null) try validateNonNegativeIntegerWithAdmission(min_length, context.control);
     }
     if (object.get("maxLength")) |max_length| {
-        if (max_length != .null) try validateNonNegativeInteger(max_length);
+        if (max_length != .null) try validateNonNegativeIntegerWithAdmission(max_length, context.control);
     }
     if (object.get("minProperties")) |min_properties| {
-        if (min_properties != .null) try validateNonNegativeInteger(min_properties);
+        if (min_properties != .null) try validateNonNegativeIntegerWithAdmission(min_properties, context.control);
     }
     if (object.get("maxProperties")) |max_properties| {
-        if (max_properties != .null) try validateNonNegativeInteger(max_properties);
+        if (max_properties != .null) try validateNonNegativeIntegerWithAdmission(max_properties, context.control);
     }
     if (object.get("minItems")) |min_items| {
-        if (min_items != .null) try validateNonNegativeInteger(min_items);
+        if (min_items != .null) try validateNonNegativeIntegerWithAdmission(min_items, context.control);
     }
     if (object.get("maxItems")) |max_items| {
-        if (max_items != .null) try validateNonNegativeInteger(max_items);
+        if (max_items != .null) try validateNonNegativeIntegerWithAdmission(max_items, context.control);
     }
     if (object.get("minContains")) |min_contains| {
-        if (min_contains != .null) try validateNonNegativeInteger(min_contains);
+        if (min_contains != .null) try validateNonNegativeIntegerWithAdmission(min_contains, context.control);
     }
     if (object.get("maxContains")) |max_contains| {
-        if (max_contains != .null) try validateNonNegativeInteger(max_contains);
+        if (max_contains != .null) try validateNonNegativeIntegerWithAdmission(max_contains, context.control);
     }
     if ((object.get("minContains") != null or object.get("maxContains") != null) and object.get("contains") == null) {
         return error.InvalidSchemaUpdateRequest;
@@ -1663,6 +1753,7 @@ fn validatePropertySchemaDefinition(value: std.json.Value) anyerror!void {
 }
 
 fn validatePropertySchemaDefinitionWithContext(context: SchemaContext, value: std.json.Value) anyerror!void {
+    try context.checkpoint();
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
@@ -1678,7 +1769,10 @@ fn validatePropertySchemaDefinitionWithContext(context: SchemaContext, value: st
     }
     try validatePropertyScalarKeywords(current_context, object);
     var children: PropertySchemaChildren = .{ .object = object };
-    while (try children.next()) |child| try validatePropertySchemaDefinitionWithContext(current_context, child);
+    while (try children.next()) |child| {
+        try current_context.checkpoint();
+        try validatePropertySchemaDefinitionWithContext(current_context, child);
+    }
 }
 
 // Scalar validation and child discovery return before descending. Keeping the
@@ -1695,10 +1789,10 @@ noinline fn validatePropertyScalarKeywords(context: SchemaContext, object: std.j
         if (nullable != .null and nullable != .bool) return error.InvalidSchemaUpdateRequest;
     }
     if (object.get("x-antfly-types")) |antfly_types| {
-        if (antfly_types != .null) try validateAntflyTypesDefinition(antfly_types);
+        if (antfly_types != .null) try validateAntflyTypesDefinitionWithAdmission(antfly_types, context.control);
     }
     if (object.get("x-antfly-field")) |antfly_field| {
-        if (antfly_field != .null) try validateFieldMappingObject(antfly_field, true);
+        if (antfly_field != .null) try validateFieldMappingObjectWithAdmission(antfly_field, true, context.control);
     }
     if (object.get("x-antfly-analyzer")) |analyzer| {
         if (analyzer != .null and analyzer != .string) return error.InvalidSchemaUpdateRequest;
@@ -1707,34 +1801,35 @@ noinline fn validatePropertyScalarKeywords(context: SchemaContext, object: std.j
         if (antfly_index != .null and antfly_index != .bool) return error.InvalidSchemaUpdateRequest;
     }
     if (object.get("x-antfly-include-in-all")) |include_in_all| {
-        if (include_in_all != .null) try validateAntflyIncludeInAllDefinition(include_in_all);
+        if (include_in_all != .null) try validateAntflyIncludeInAllDefinitionWithAdmission(include_in_all, context.control);
     }
     if (object.get("required")) |required| {
         if (required != .null) {
             if (required != .array) return error.InvalidSchemaUpdateRequest;
             for (required.array.items) |entry| {
+                try context.checkpoint();
                 if (entry != .string) return error.InvalidSchemaUpdateRequest;
             }
         }
     }
     if (object.get("dependentRequired")) |dependent_required| {
-        if (dependent_required != .null) try validateDependentRequiredDefinition(dependent_required);
+        if (dependent_required != .null) try validateDependentRequiredDefinitionWithAdmission(dependent_required, context.control);
     }
     if (object.get("const")) |_| {}
     if (object.get("enum")) |enum_values| {
         if (enum_values != .null) try validateEnumDefinition(enum_values);
     }
     if (object.get("minimum")) |minimum| {
-        if (minimum != .null) _ = parseJsonNumber(minimum) catch return error.InvalidSchemaUpdateRequest;
+        if (minimum != .null) _ = try parseSchemaFloat(minimum, context.control);
     }
     if (object.get("maximum")) |maximum| {
-        if (maximum != .null) _ = parseJsonNumber(maximum) catch return error.InvalidSchemaUpdateRequest;
+        if (maximum != .null) _ = try parseSchemaFloat(maximum, context.control);
     }
     if (object.get("exclusiveMinimum")) |exclusive_minimum| {
-        if (exclusive_minimum != .null) _ = parseJsonNumber(exclusive_minimum) catch return error.InvalidSchemaUpdateRequest;
+        if (exclusive_minimum != .null) _ = try parseSchemaFloat(exclusive_minimum, context.control);
     }
     if (object.get("exclusiveMaximum")) |exclusive_maximum| {
-        if (exclusive_maximum != .null) _ = parseJsonNumber(exclusive_maximum) catch return error.InvalidSchemaUpdateRequest;
+        if (exclusive_maximum != .null) _ = try parseSchemaFloat(exclusive_maximum, context.control);
     }
     if (object.get("multipleOf")) |multiple_of| {
         if (multiple_of != .null) try validatePositiveNumberForDomain(context, multiple_of);
@@ -1749,28 +1844,28 @@ noinline fn validatePropertyScalarKeywords(context: SchemaContext, object: std.j
         }
     }
     if (object.get("minLength")) |min_length| {
-        if (min_length != .null) try validateNonNegativeInteger(min_length);
+        if (min_length != .null) try validateNonNegativeIntegerWithAdmission(min_length, context.control);
     }
     if (object.get("maxLength")) |max_length| {
-        if (max_length != .null) try validateNonNegativeInteger(max_length);
+        if (max_length != .null) try validateNonNegativeIntegerWithAdmission(max_length, context.control);
     }
     if (object.get("minProperties")) |min_properties| {
-        if (min_properties != .null) try validateNonNegativeInteger(min_properties);
+        if (min_properties != .null) try validateNonNegativeIntegerWithAdmission(min_properties, context.control);
     }
     if (object.get("maxProperties")) |max_properties| {
-        if (max_properties != .null) try validateNonNegativeInteger(max_properties);
+        if (max_properties != .null) try validateNonNegativeIntegerWithAdmission(max_properties, context.control);
     }
     if (object.get("minItems")) |min_items| {
-        if (min_items != .null) try validateNonNegativeInteger(min_items);
+        if (min_items != .null) try validateNonNegativeIntegerWithAdmission(min_items, context.control);
     }
     if (object.get("maxItems")) |max_items| {
-        if (max_items != .null) try validateNonNegativeInteger(max_items);
+        if (max_items != .null) try validateNonNegativeIntegerWithAdmission(max_items, context.control);
     }
     if (object.get("minContains")) |min_contains| {
-        if (min_contains != .null) try validateNonNegativeInteger(min_contains);
+        if (min_contains != .null) try validateNonNegativeIntegerWithAdmission(min_contains, context.control);
     }
     if (object.get("maxContains")) |max_contains| {
-        if (max_contains != .null) try validateNonNegativeInteger(max_contains);
+        if (max_contains != .null) try validateNonNegativeIntegerWithAdmission(max_contains, context.control);
     }
     if (object.get("uniqueItems")) |unique_items| {
         if (unique_items != .null and unique_items != .bool) return error.InvalidSchemaUpdateRequest;
@@ -1864,8 +1959,14 @@ fn validateEnumDefinition(value: std.json.Value) !void {
 }
 
 fn validateAntflyTypesDefinition(value: std.json.Value) !void {
+    return validateAntflyTypesDefinitionWithAdmission(value, null);
+}
+
+fn validateAntflyTypesDefinitionWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !void {
+    if (control) |original| try original.checkpoint();
     if (value != .array) return error.InvalidSchemaUpdateRequest;
     for (value.array.items) |entry| {
+        if (control) |original| try original.checkpoint();
         const type_name = switch (entry) {
             .string => |name| name,
             else => return error.InvalidSchemaUpdateRequest,
@@ -1875,10 +1976,16 @@ fn validateAntflyTypesDefinition(value: std.json.Value) !void {
 }
 
 fn validateAntflyIncludeInAllDefinition(value: std.json.Value) !void {
+    return validateAntflyIncludeInAllDefinitionWithAdmission(value, null);
+}
+
+fn validateAntflyIncludeInAllDefinitionWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !void {
+    if (control) |original| try original.checkpoint();
     switch (value) {
         .bool => {},
         .array => |arr| {
             for (arr.items) |entry| {
+                if (control) |original| try original.checkpoint();
                 if (entry != .string) return error.InvalidSchemaUpdateRequest;
             }
         },
@@ -1887,12 +1994,13 @@ fn validateAntflyIncludeInAllDefinition(value: std.json.Value) !void {
 }
 
 fn validatePositiveNumberForDomain(context: SchemaContext, value: std.json.Value) !void {
-    if (!context.numeric_domain) return validatePositiveNumber(value);
+    try context.checkpoint();
+    if (!context.numeric_domain) return validatePositiveNumberWithAdmission(value, context.control);
     switch (value) {
         .integer => |number| if (number <= 0) return error.InvalidSchemaUpdateRequest,
         .float => |number| if (!std.math.isFinite(number) or number <= 0) return error.InvalidSchemaUpdateRequest,
         .number_string => |text| {
-            const number = normalizeJsonDecimal(text) orelse return error.InvalidSchemaUpdateRequest;
+            const number = (try normalizeJsonDecimalWithAdmission(text, context.control)) orelse return error.InvalidSchemaUpdateRequest;
             if (number.zero or number.negative) return error.InvalidSchemaUpdateRequest;
         },
         else => return error.InvalidSchemaUpdateRequest,
@@ -1900,7 +2008,11 @@ fn validatePositiveNumberForDomain(context: SchemaContext, value: std.json.Value
 }
 
 fn validatePositiveNumber(value: std.json.Value) !void {
-    const parsed = parseJsonNumber(value) catch return error.InvalidSchemaUpdateRequest;
+    return validatePositiveNumberWithAdmission(value, null);
+}
+
+fn validatePositiveNumberWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !void {
+    const parsed = try parseSchemaFloat(value, control);
     if (parsed <= 0) return error.InvalidSchemaUpdateRequest;
 }
 
@@ -1934,11 +2046,16 @@ fn resolveSchemaObject(context: SchemaContext, object: std.json.ObjectMap) !std.
 }
 
 fn resolveSchemaRef(context: SchemaContext, ref_path: []const u8) !std.json.ObjectMap {
+    try context.checkpoint();
     if (isRootSchemaRef(ref_path)) return context.document_root;
     if (!std.mem.startsWith(u8, ref_path, "#/")) return error.InvalidSchemaUpdateRequest;
 
-    return resolveSchemaRefWithin(context.scope_schema, ref_path) catch |scope_err| blk: {
-        if (resolveSchemaRefWithin(context.document_root, ref_path)) |resolved| break :blk resolved else |root_err| {
+    var trace: SchemaAdmissionTrace = .{ .original = context.control };
+    const control = trace.bind();
+    return resolveSchemaRefWithinWithAdmission(context.scope_schema, ref_path, control) catch |scope_err| blk: {
+        if (trace.failure) |cause| return cause;
+        if (scope_err != error.InvalidSchemaUpdateRequest) return scope_err;
+        if (resolveSchemaRefWithinWithAdmission(context.document_root, ref_path, control)) |resolved| break :blk resolved else |root_err| {
             if (scope_err == error.InvalidSchemaUpdateRequest and root_err == error.InvalidSchemaUpdateRequest) {
                 return error.InvalidSchemaUpdateRequest;
             }
@@ -1948,37 +2065,116 @@ fn resolveSchemaRef(context: SchemaContext, ref_path: []const u8) !std.json.Obje
 }
 
 fn resolveSchemaRefWithin(root_schema: std.json.ObjectMap, ref_path: []const u8) !std.json.ObjectMap {
+    return resolveSchemaRefWithinWithAdmission(root_schema, ref_path, null);
+}
+
+fn resolveSchemaRefWithinWithAdmission(root_schema: std.json.ObjectMap, ref_path: []const u8, control: ?@import("../common/read_admission.zig").Port) !std.json.ObjectMap {
+    if (control) |original| try original.checkpoint();
     var current: std.json.Value = .{ .object = root_schema };
-    var tokens = std.mem.tokenizeScalar(u8, ref_path[2..], '/');
-    while (tokens.next()) |token| {
+    var cursor: usize = 2;
+    while (cursor < ref_path.len) {
+        if (control) |original| try original.checkpoint();
+        while (cursor < ref_path.len and ref_path[cursor] == '/') : (cursor += 1) {
+            if (control) |original| if (cursor % 4096 == 0) try original.checkpoint();
+        }
+        if (cursor == ref_path.len) break;
+        const start = cursor;
+        while (cursor < ref_path.len and ref_path[cursor] != '/') : (cursor += 1) {
+            if (control) |original| if (cursor % 4096 == 0) try original.checkpoint();
+        }
         current = switch (current) {
-            .object => |object| try resolveSchemaRefToken(object, token),
+            .object => |object| try resolveSchemaRefTokenWithAdmission(object, ref_path[start..cursor], control),
             else => return error.InvalidSchemaUpdateRequest,
         };
     }
-
+    if (control) |original| try original.checkpoint();
     return switch (current) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
     };
 }
 
+// Keep the native map's indexed lookup while checking large key hashing and
+// comparisons. The adapter records a checkpoint failure because std's equality
+// callback returns bool; the original cause is rethrown before publishing a hit.
+fn schemaObjectGet(object: std.json.ObjectMap, key: []const u8, control: ?@import("../common/read_admission.zig").Port) !?std.json.Value {
+    const original = control orelse return object.get(key);
+    try original.checkpoint();
+    var hasher = std.hash.Wyhash.init(0);
+    var offset: usize = 0;
+    while (offset < key.len) {
+        try original.checkpoint();
+        const end = offset + @min(@as(usize, 4096), key.len - offset);
+        hasher.update(key[offset..end]);
+        offset = end;
+    }
+    const Query = struct {
+        port: @import("../common/read_admission.zig").Port,
+        failure: ?anyerror = null,
+        hash_value: u32,
+        fn equal(self: *@This(), left: []const u8, right: []const u8) !bool {
+            try self.port.checkpoint();
+            if (left.len != right.len) return false;
+            var cursor: usize = 0;
+            while (cursor < left.len) {
+                try self.port.checkpoint();
+                const end = cursor + @min(@as(usize, 4096), left.len - cursor);
+                if (!std.mem.eql(u8, left[cursor..end], right[cursor..end])) return false;
+                cursor = end;
+            }
+            return true;
+        }
+    };
+    const Adapter = struct {
+        query: *Query,
+        pub fn hash(self: @This(), _: []const u8) u32 {
+            return self.query.hash_value;
+        }
+        pub fn eql(self: @This(), left: []const u8, right: []const u8, _: usize) bool {
+            if (self.query.failure != null) return false;
+            return self.query.equal(left, right) catch |err| {
+                self.query.failure = err;
+                return false;
+            };
+        }
+    };
+    var query: Query = .{ .port = original, .hash_value = @truncate(hasher.final()) };
+    const result = object.getAdapted(key, Adapter{ .query = &query });
+    if (query.failure) |cause| return cause;
+    try original.checkpoint();
+    return result;
+}
+
 fn resolveSchemaRefToken(object: std.json.ObjectMap, token: []const u8) !std.json.Value {
-    if (std.mem.indexOfScalar(u8, token, '~') == null) {
-        return object.get(token) orelse return error.InvalidSchemaUpdateRequest;
+    return resolveSchemaRefTokenWithAdmission(object, token, null);
+}
+
+fn resolveSchemaRefTokenWithAdmission(object: std.json.ObjectMap, token: []const u8, control: ?@import("../common/read_admission.zig").Port) !std.json.Value {
+    if (control) |original| try original.checkpoint();
+    if (try schemaIndexOfByte(token, '~', control) == null) {
+        return (try schemaObjectGet(object, token, control)) orelse return error.InvalidSchemaUpdateRequest;
     }
 
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (try jsonPointerTokenMatches(token, entry.key_ptr.*)) return entry.value_ptr.*;
+        if (control) |original| try original.checkpoint();
+        if (try jsonPointerTokenMatchesWithAdmission(token, entry.key_ptr.*, control)) return entry.value_ptr.*;
     }
     return error.InvalidSchemaUpdateRequest;
 }
 
 fn jsonPointerTokenMatches(encoded_token: []const u8, key: []const u8) !bool {
+    return jsonPointerTokenMatchesWithAdmission(encoded_token, key, null);
+}
+
+fn jsonPointerTokenMatchesWithAdmission(encoded_token: []const u8, key: []const u8, control: ?@import("../common/read_admission.zig").Port) !bool {
+    if (control) |original| try original.checkpoint();
+    var work: usize = 0;
     var token_index: usize = 0;
     var key_index: usize = 0;
     while (token_index < encoded_token.len and key_index < key.len) {
+        if (control) |original| if (work % 4096 == 0) try original.checkpoint();
+        work +%= 1;
         const decoded: u8 = blk: {
             switch (encoded_token[token_index]) {
                 '~' => {
@@ -1997,6 +2193,7 @@ fn jsonPointerTokenMatches(encoded_token: []const u8, key: []const u8) !bool {
         token_index += 1;
         key_index += 1;
     }
+    if (control) |original| try original.checkpoint();
     return token_index == encoded_token.len and key_index == key.len;
 }
 
@@ -2070,6 +2267,11 @@ fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]
 }
 
 fn validateDependentRequiredDefinition(value: std.json.Value) !void {
+    return validateDependentRequiredDefinitionWithAdmission(value, null);
+}
+
+fn validateDependentRequiredDefinitionWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !void {
+    if (control) |original| try original.checkpoint();
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
@@ -2077,17 +2279,20 @@ fn validateDependentRequiredDefinition(value: std.json.Value) !void {
 
     var it = object.iterator();
     while (it.next()) |entry| {
+        if (control) |original| try original.checkpoint();
         const required = switch (entry.value_ptr.*) {
             .array => |required| required,
             else => return error.InvalidSchemaUpdateRequest,
         };
         for (required.items) |required_value| {
+            if (control) |original| try original.checkpoint();
             if (required_value != .string) return error.InvalidSchemaUpdateRequest;
         }
     }
 }
 
 fn validateDefinitionsDefinition(context: SchemaContext, value: std.json.Value) anyerror!void {
+    try context.checkpoint();
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
@@ -2095,11 +2300,13 @@ fn validateDefinitionsDefinition(context: SchemaContext, value: std.json.Value) 
 
     var it = object.iterator();
     while (it.next()) |entry| {
+        try context.checkpoint();
         try validatePropertySchemaDefinitionWithContext(context, entry.value_ptr.*);
     }
 }
 
 fn validateDependentSchemasDefinition(context: SchemaContext, value: std.json.Value) anyerror!void {
+    try context.checkpoint();
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
@@ -2107,11 +2314,13 @@ fn validateDependentSchemasDefinition(context: SchemaContext, value: std.json.Va
 
     var it = object.iterator();
     while (it.next()) |entry| {
+        try context.checkpoint();
         try validatePropertySchemaDefinitionWithContext(context, entry.value_ptr.*);
     }
 }
 
 fn validateDependenciesDefinition(context: SchemaContext, value: std.json.Value) anyerror!void {
+    try context.checkpoint();
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
@@ -2119,9 +2328,11 @@ fn validateDependenciesDefinition(context: SchemaContext, value: std.json.Value)
 
     var it = object.iterator();
     while (it.next()) |entry| {
+        try context.checkpoint();
         switch (entry.value_ptr.*) {
             .array => {
                 for (entry.value_ptr.array.items) |required_value| {
+                    try context.checkpoint();
                     if (required_value != .string) return error.InvalidSchemaUpdateRequest;
                 }
             },
@@ -2132,6 +2343,7 @@ fn validateDependenciesDefinition(context: SchemaContext, value: std.json.Value)
 }
 
 fn validatePatternPropertiesDefinition(context: SchemaContext, value: std.json.Value) anyerror!void {
+    try context.checkpoint();
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
@@ -2139,34 +2351,40 @@ fn validatePatternPropertiesDefinition(context: SchemaContext, value: std.json.V
 
     var it = object.iterator();
     while (it.next()) |entry| {
+        try context.checkpoint();
         try validatePropertySchemaDefinitionWithContext(context, entry.value_ptr.*);
         if (try regexMatch(entry.key_ptr.*, "_id")) {
-            if (documentPropertySchemaValueContainsSortableMapping(entry.value_ptr.*)) return error.InvalidSchemaUpdateRequest;
+            if (try documentPropertySchemaValueContainsSortableMappingWithAdmission(entry.value_ptr.*, context.control)) return error.InvalidSchemaUpdateRequest;
         }
     }
 }
 
 fn validatePrefixItemsDefinition(context: SchemaContext, value: std.json.Value) anyerror!void {
+    try context.checkpoint();
     if (value != .array) return error.InvalidSchemaUpdateRequest;
     for (value.array.items) |item| try validatePropertySchemaDefinitionWithContext(context, item);
 }
 
 fn validateAnyOfDefinition(context: SchemaContext, value: std.json.Value) anyerror!void {
+    try context.checkpoint();
     if (value != .array) return error.InvalidSchemaUpdateRequest;
     for (value.array.items) |variant| try validatePropertySchemaDefinitionWithContext(context, variant);
 }
 
 fn validateOneOfDefinition(context: SchemaContext, value: std.json.Value) anyerror!void {
+    try context.checkpoint();
     if (value != .array) return error.InvalidSchemaUpdateRequest;
     for (value.array.items) |variant| try validatePropertySchemaDefinitionWithContext(context, variant);
 }
 
 fn validateAllOfDefinition(context: SchemaContext, value: std.json.Value) anyerror!void {
+    try context.checkpoint();
     if (value != .array) return error.InvalidSchemaUpdateRequest;
     for (value.array.items) |variant| try validatePropertySchemaDefinitionWithContext(context, variant);
 }
 
 fn validateAdditionalItemsDefinition(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
+    try context.checkpoint();
     const additional_items = object.get("additionalItems") orelse return;
     if (additional_items == .null) return;
     if (object.get("prefixItems") == null) return error.InvalidSchemaUpdateRequest;
@@ -2176,19 +2394,29 @@ fn validateAdditionalItemsDefinition(context: SchemaContext, object: std.json.Ob
 }
 
 fn validateDynamicTemplates(value: std.json.Value) !void {
+    return validateDynamicTemplatesWithAdmission(value, null);
+}
+
+fn validateDynamicTemplatesWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !void {
+    if (control) |original| try original.checkpoint();
     switch (value) {
         .object => |object| {
             var it = object.iterator();
-            while (it.next()) |entry| try validateDynamicTemplate(entry.value_ptr.*);
+            while (it.next()) |entry| try validateDynamicTemplateWithAdmission(entry.value_ptr.*, control);
         },
         .array => |array| {
-            for (array.items) |entry| try validateDynamicTemplate(entry);
+            for (array.items) |entry| try validateDynamicTemplateWithAdmission(entry, control);
         },
         else => return error.InvalidSchemaUpdateRequest,
     }
 }
 
 fn validateDynamicTemplate(value: std.json.Value) !void {
+    return validateDynamicTemplateWithAdmission(value, null);
+}
+
+fn validateDynamicTemplateWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !void {
+    if (control) |original| try original.checkpoint();
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
@@ -2196,6 +2424,7 @@ fn validateDynamicTemplate(value: std.json.Value) !void {
 
     var keys = object.iterator();
     while (keys.next()) |entry| {
+        if (control) |original| try original.checkpoint();
         if (!isKnownDynamicTemplateKey(entry.key_ptr.*)) return error.InvalidSchemaUpdateRequest;
     }
 
@@ -2218,8 +2447,8 @@ fn validateDynamicTemplate(value: std.json.Value) !void {
     }
 
     const mapping = object.get("mapping") orelse return error.InvalidSchemaUpdateRequest;
-    try validateFieldMappingObject(mapping, false);
-    if (dynamicTemplateTargetsReservedId(object, mapping)) return error.InvalidSchemaUpdateRequest;
+    try validateFieldMappingObjectWithAdmission(mapping, false, control);
+    if (try dynamicTemplateTargetsReservedIdWithAdmission(object, mapping, control)) return error.InvalidSchemaUpdateRequest;
 }
 
 fn isKnownDynamicTemplateKey(key: []const u8) bool {
@@ -2237,12 +2466,17 @@ fn isReservedDocumentFieldName(name: []const u8) bool {
 }
 
 fn dynamicTemplateTargetsReservedId(object: std.json.ObjectMap, mapping: std.json.Value) bool {
+    return dynamicTemplateTargetsReservedIdWithAdmission(object, mapping, null) catch unreachable;
+}
+
+fn dynamicTemplateTargetsReservedIdWithAdmission(object: std.json.ObjectMap, mapping: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !bool {
+    if (control) |original| try original.checkpoint();
     const exact_target =
         optionalStringEquals(object.get("path_match"), "_id") or
         optionalStringEquals(object.get("match"), "_id");
     if (exact_target) return true;
-    if (!fieldMappingValueContainsSortable(mapping)) return false;
-    if (!dynamicTemplateMayMatchReservedId(object)) return false;
+    if (!try fieldMappingValueContainsSortableWithAdmission(mapping, control)) return false;
+    if (!try dynamicTemplateMayMatchReservedIdWithAdmission(object, control)) return false;
     return true;
 }
 
@@ -2252,30 +2486,41 @@ fn optionalStringEquals(value: ?std.json.Value, expected: []const u8) bool {
 }
 
 fn dynamicTemplateMayMatchReservedId(object: std.json.ObjectMap) bool {
+    return dynamicTemplateMayMatchReservedIdWithAdmission(object, null) catch unreachable;
+}
+
+fn dynamicTemplateMayMatchReservedIdWithAdmission(object: std.json.ObjectMap, control: ?@import("../common/read_admission.zig").Port) !bool {
+    if (control) |original| try original.checkpoint();
     const reserved = "_id";
     if (object.get("match")) |match| {
-        if (match == .string and !globMatch(match.string, reserved)) return false;
+        if (match == .string and !try globMatchWithAdmission(match.string, reserved, control)) return false;
     }
     if (object.get("unmatch")) |unmatch| {
-        if (unmatch == .string and globMatch(unmatch.string, reserved)) return false;
+        if (unmatch == .string and try globMatchWithAdmission(unmatch.string, reserved, control)) return false;
     }
     if (object.get("path_match")) |path_match| {
-        if (path_match == .string and !pathGlobMayMatchReservedId(path_match.string)) return false;
+        if (path_match == .string and !try pathGlobMayMatchReservedIdWithAdmission(path_match.string, control)) return false;
     }
     if (object.get("path_unmatch")) |path_unmatch| {
-        if (path_unmatch == .string and globMatch(path_unmatch.string, reserved)) return false;
+        if (path_unmatch == .string and try globMatchWithAdmission(path_unmatch.string, reserved, control)) return false;
     }
     return true;
 }
 
 fn pathGlobMayMatchReservedId(pattern: []const u8) bool {
-    if (globMatch(pattern, "_id")) return true;
+    return pathGlobMayMatchReservedIdWithAdmission(pattern, null) catch unreachable;
+}
+
+fn pathGlobMayMatchReservedIdWithAdmission(pattern: []const u8, control: ?@import("../common/read_admission.zig").Port) !bool {
+    if (control) |original| try original.checkpoint();
+    if (try globMatchWithAdmission(pattern, "_id", control)) return true;
 
     var rest = pattern;
     while (true) {
-        const dot = std.mem.indexOfScalar(u8, rest, '.');
+        if (control) |original| try original.checkpoint();
+        const dot = try schemaIndexOfDot(rest, control);
         const segment = if (dot) |idx| rest[0..idx] else rest;
-        if (globMatch(segment, "_id")) return true;
+        if (try globMatchWithAdmission(segment, "_id", control)) return true;
         if (dot) |idx| {
             rest = rest[idx + 1 ..];
         } else {
@@ -2285,6 +2530,11 @@ fn pathGlobMayMatchReservedId(pattern: []const u8) bool {
 }
 
 fn fieldMappingValueContainsSortable(mapping: std.json.Value) bool {
+    return fieldMappingValueContainsSortableWithAdmission(mapping, null) catch unreachable;
+}
+
+fn fieldMappingValueContainsSortableWithAdmission(mapping: std.json.Value, control: ?@import("../common/read_admission.zig").Port) anyerror!bool {
+    if (control) |original| try original.checkpoint();
     if (mapping != .object) return false;
     if (mapping.object.get("sortable")) |sortable| {
         if (sortable == .bool and sortable.bool) return true;
@@ -2293,7 +2543,8 @@ fn fieldMappingValueContainsSortable(mapping: std.json.Value) bool {
         if (fields == .object) {
             var it = fields.object.iterator();
             while (it.next()) |entry| {
-                if (fieldMappingValueContainsSortable(entry.value_ptr.*)) return true;
+                if (control) |original| try original.checkpoint();
+                if (try fieldMappingValueContainsSortableWithAdmission(entry.value_ptr.*, control)) return true;
             }
         }
     }
@@ -2301,21 +2552,28 @@ fn fieldMappingValueContainsSortable(mapping: std.json.Value) bool {
 }
 
 fn documentPropertySchemaValueContainsSortableMapping(value: std.json.Value) bool {
+    return documentPropertySchemaValueContainsSortableMappingWithAdmission(value, null) catch unreachable;
+}
+
+fn documentPropertySchemaValueContainsSortableMappingWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) anyerror!bool {
+    if (control) |original| try original.checkpoint();
     switch (value) {
         .object => |object| {
             if (object.get("x-antfly-field")) |mapping| {
-                if (fieldMappingValueContainsSortable(mapping)) return true;
+                if (try fieldMappingValueContainsSortableWithAdmission(mapping, control)) return true;
             }
             var it = object.iterator();
             while (it.next()) |entry| {
+                if (control) |original| try original.checkpoint();
                 if (std.mem.eql(u8, entry.key_ptr.*, "x-antfly-field")) continue;
-                if (documentPropertySchemaValueContainsSortableMapping(entry.value_ptr.*)) return true;
+                if (try documentPropertySchemaValueContainsSortableMappingWithAdmission(entry.value_ptr.*, control)) return true;
             }
             return false;
         },
         .array => |array| {
             for (array.items) |item| {
-                if (documentPropertySchemaValueContainsSortableMapping(item)) return true;
+                if (control) |original| try original.checkpoint();
+                if (try documentPropertySchemaValueContainsSortableMappingWithAdmission(item, control)) return true;
             }
             return false;
         },
@@ -2324,10 +2582,16 @@ fn documentPropertySchemaValueContainsSortableMapping(value: std.json.Value) boo
 }
 
 fn validateFieldMappingObject(mapping: std.json.Value, allow_fields: bool) !void {
+    return validateFieldMappingObjectWithAdmission(mapping, allow_fields, null);
+}
+
+fn validateFieldMappingObjectWithAdmission(mapping: std.json.Value, allow_fields: bool, control: ?@import("../common/read_admission.zig").Port) anyerror!void {
+    if (control) |original| try original.checkpoint();
     if (mapping == .null) return error.InvalidSchemaUpdateRequest;
     if (mapping != .object) return error.InvalidSchemaUpdateRequest;
     var keys = mapping.object.iterator();
     while (keys.next()) |entry| {
+        if (control) |original| try original.checkpoint();
         if (!isKnownFieldMappingKey(entry.key_ptr.*, allow_fields)) return error.InvalidSchemaUpdateRequest;
     }
     if (mapping.object.get("type")) |mapping_type| {
@@ -2352,8 +2616,9 @@ fn validateFieldMappingObject(mapping: std.json.Value, allow_fields: bool) !void
         if (fields != .object) return error.InvalidSchemaUpdateRequest;
         var it = fields.object.iterator();
         while (it.next()) |entry| {
-            if (!isValidMappingSubfieldName(entry.key_ptr.*)) return error.InvalidSchemaUpdateRequest;
-            try validateFieldMappingObject(entry.value_ptr.*, false);
+            if (control) |original| try original.checkpoint();
+            if (!try isValidMappingSubfieldNameWithAdmission(entry.key_ptr.*, control)) return error.InvalidSchemaUpdateRequest;
+            try validateFieldMappingObjectWithAdmission(entry.value_ptr.*, false, control);
         }
     }
     if (mapping.object.get("sortable")) |sortable| {
@@ -2448,18 +2713,45 @@ fn isKnownFieldMappingKey(key: []const u8, allow_fields: bool) bool {
         std.mem.eql(u8, key, "doc_values");
 }
 
+fn schemaIndexOfDot(name: []const u8, control: ?@import("../common/read_admission.zig").Port) !?usize {
+    return schemaIndexOfByte(name, '.', control);
+}
+
+fn schemaIndexOfByte(name: []const u8, byte: u8, control: ?@import("../common/read_admission.zig").Port) !?usize {
+    const original = control orelse return std.mem.indexOfScalar(u8, name, byte);
+    var offset: usize = 0;
+    while (offset < name.len) {
+        try original.checkpoint();
+        const end = offset + @min(@as(usize, 4096), name.len - offset);
+        if (std.mem.indexOfScalar(u8, name[offset..end], byte)) |index| return offset + index;
+        offset = end;
+    }
+    return null;
+}
+
 fn isValidMappingSubfieldName(name: []const u8) bool {
+    return isValidMappingSubfieldNameWithAdmission(name, null) catch unreachable;
+}
+
+fn isValidMappingSubfieldNameWithAdmission(name: []const u8, control: ?@import("../common/read_admission.zig").Port) !bool {
+    if (control) |original| try original.checkpoint();
     if (name.len == 0) return false;
-    return std.mem.indexOfScalar(u8, name, '.') == null;
+    return try schemaIndexOfDot(name, control) == null;
 }
 
 fn validateIndexSort(value: std.json.Value) !void {
+    return validateIndexSortWithAdmission(value, null);
+}
+
+fn validateIndexSortWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !void {
+    if (control) |original| try original.checkpoint();
     const array = switch (value) {
         .array => |array| array,
         else => return error.InvalidSchemaUpdateRequest,
     };
     if (array.items.len == 0) return error.InvalidSchemaUpdateRequest;
     for (array.items) |entry| {
+        if (control) |original| try original.checkpoint();
         const object = switch (entry) {
             .object => |object| object,
             else => return error.InvalidSchemaUpdateRequest,
@@ -2528,7 +2820,11 @@ fn mappingTypeIsKnown(mapping_type: []const u8) bool {
 }
 
 fn validateNonNegativeInteger(value: std.json.Value) !void {
-    _ = exactU64JsonNumber(value) orelse return error.InvalidSchemaUpdateRequest;
+    return validateNonNegativeIntegerWithAdmission(value, null);
+}
+
+fn validateNonNegativeIntegerWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !void {
+    _ = (try exactU64JsonNumberWithAdmission(value, control)) orelse return error.InvalidSchemaUpdateRequest;
 }
 
 pub fn parseTtlDurationNs(raw: []const u8) !u64 {
@@ -5921,6 +6217,12 @@ fn normalizedJsonScaleIsNonNegative(normalized: NormalizedJsonDecimal) bool {
 }
 
 fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
+    return normalizeJsonDecimalWithAdmission(text, null) catch unreachable;
+}
+
+fn normalizeJsonDecimalWithAdmission(text: []const u8, control: ?@import("../common/read_admission.zig").Port) !?NormalizedJsonDecimal {
+    if (control) |original| try original.checkpoint();
+    var work: usize = 0;
     if (text.len == 0) return null;
     var index: usize = 0;
     const negative = text[index] == '-';
@@ -5933,6 +6235,8 @@ fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
     var last_significant: ?usize = null;
     var fractional_digits: usize = 0;
     while (index < text.len and text[index] != 'e' and text[index] != 'E') : (index += 1) {
+        if (control) |original| if (work % 4096 == 0) try original.checkpoint();
+        work +%= 1;
         const byte = text[index];
         if (byte == '.') {
             if (decimal_index != null) return null;
@@ -5960,11 +6264,17 @@ fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
         if (index == text.len) return null;
         const exponent_start = index;
         while (index < text.len) : (index += 1) {
+            if (control) |original| if (work % 4096 == 0) try original.checkpoint();
+            work +%= 1;
             const byte = text[index];
             if (byte < '0' or byte > '9') return null;
         }
         var first_exponent_digit = exponent_start;
-        while (first_exponent_digit < text.len and text[first_exponent_digit] == '0') first_exponent_digit += 1;
+        while (first_exponent_digit < text.len and text[first_exponent_digit] == '0') {
+            if (control) |original| if (work % 4096 == 0) try original.checkpoint();
+            work +%= 1;
+            first_exponent_digit += 1;
+        }
         if (first_exponent_digit < text.len) {
             exponent = .{
                 .negative = exponent_negative,
@@ -5973,6 +6283,7 @@ fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
         }
     }
 
+    if (control) |original| try original.checkpoint();
     const first = first_significant orelse return .{
         .text = text,
         .negative = false,
@@ -5991,6 +6302,8 @@ fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
     var trailing_zeros: usize = 0;
     var reverse = mantissa_end;
     while (reverse > mantissa_start) {
+        if (control) |original| if (work % 4096 == 0) try original.checkpoint();
+        work +%= 1;
         reverse -= 1;
         if (text[reverse] == '.') continue;
         if (text[reverse] != '0') break;
@@ -5998,6 +6311,7 @@ fn normalizeJsonDecimal(text: []const u8) ?NormalizedJsonDecimal {
     }
     const fractional_i128: i128 = @intCast(fractional_digits);
     const trailing_i128: i128 = @intCast(trailing_zeros);
+    if (control) |original| try original.checkpoint();
     return .{
         .text = text,
         .negative = negative,
@@ -6307,6 +6621,32 @@ test "public schema mutations admit wired relational storage" {
     try std.testing.expect(std.mem.indexOf(u8, normalized, "\"storage_mode\":\"relational\"") != null);
 }
 
+fn parseSchemaFloat(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !f64 {
+    var trace: SchemaAdmissionTrace = .{ .original = control };
+    return parseJsonNumberWithAdmission(value, trace.bind()) catch {
+        if (trace.failure) |cause| return cause;
+        return error.InvalidSchemaUpdateRequest;
+    };
+}
+
+fn parseJsonNumberWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !f64 {
+    if (control) |original| try original.checkpoint();
+    return switch (value) {
+        .number_string => |text| if (control) |original| blk: {
+            const Adapter = struct {
+                port: @import("../common/read_admission.zig").Port,
+                fn check(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.port.checkpoint();
+                }
+            };
+            var adapter: Adapter = .{ .port = original };
+            break :blk @import("../sql/controlled_float.zig").parseFloatWithAdmission(f64, text, .{ .ptr = &adapter, .check = Adapter.check });
+        } else std.fmt.parseFloat(f64, text),
+        else => parseJsonNumber(value),
+    };
+}
+
 fn parseJsonNumber(value: std.json.Value) !f64 {
     return switch (value) {
         .integer => |integer| @floatFromInt(integer),
@@ -6333,10 +6673,15 @@ fn exactI64JsonNumber(value: std.json.Value) ?i64 {
 }
 
 fn exactU64JsonNumber(value: std.json.Value) ?u64 {
+    return exactU64JsonNumberWithAdmission(value, null) catch unreachable;
+}
+
+fn exactU64JsonNumberWithAdmission(value: std.json.Value, control: ?@import("../common/read_admission.zig").Port) !?u64 {
+    if (control) |original| try original.checkpoint();
     return switch (value) {
         .integer => |integer| if (integer >= 0) @intCast(integer) else null,
         .number_string => |text| blk: {
-            const exact = parseExactJsonInteger(text) orelse break :blk null;
+            const exact = (try parseExactJsonIntegerWithAdmission(text, control)) orelse break :blk null;
             break :blk if (exact.negative and exact.magnitude != 0) null else exact.magnitude;
         },
         else => null,
@@ -6352,7 +6697,11 @@ const ExactJsonInteger = struct {
 /// passing through floating point. Decimal and exponent spellings are accepted
 /// when their value is integral and representable as a u64 magnitude.
 fn parseExactJsonInteger(text: []const u8) ?ExactJsonInteger {
-    const normalized = normalizeJsonDecimal(text) orelse return null;
+    return parseExactJsonIntegerWithAdmission(text, null) catch unreachable;
+}
+
+fn parseExactJsonIntegerWithAdmission(text: []const u8, control: ?@import("../common/read_admission.zig").Port) !?ExactJsonInteger {
+    const normalized = (try normalizeJsonDecimalWithAdmission(text, control)) orelse return null;
     if (normalized.zero) return .{ .negative = false, .magnitude = 0 };
     if (!normalizedJsonScaleIsNonNegative(normalized)) return null;
 
@@ -7810,4 +8159,316 @@ test "validate generic json schema rejects integer mismatch" {
             \\{"count":2.5}
         ),
     );
+}
+
+test "controlled restore plan codec recursive schema validation retains original authority" {
+    const admission = @import("../common/read_admission.zig");
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"$defs\":{\"leaf\":{\"type\":\"string\"}},\"properties\":{");
+    for (0..131) |index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print("\"f{d}\":{{\"type\":\"object\",\"properties\":{{\"inner\":{{\"$ref\":\"#/$defs/leaf\"}}}},\"required\":[\"inner\"],\"dependentRequired\":{{\"inner\":[\"inner\"]}},\"anyOf\":[{{\"type\":\"object\"}},{{\"type\":\"null\"}}]}}", .{index});
+    }
+    try output.writer.writeAll("}}}}}");
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{ .parse_numbers = false });
+    defer parsed.deinit();
+    const Authority = struct {
+        checks: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.fail_at) return self.cause;
+        }
+    };
+    var authority: Authority = .{};
+    const payload: admission.Payload = .{ .ptr = &authority, .vtable = &.{ .checkpoint = Authority.check } };
+    const port = admission.Port.init(&payload);
+    try validateSchemaValue(parsed.value);
+    try validateSchemaValueWithAdmission(parsed.value, port);
+    const checks = authority.checks;
+    try std.testing.expect(checks > 1000);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        for (1..checks + 1) |fail_at| {
+            authority = .{ .cause = cause, .fail_at = fail_at };
+            try std.testing.expectError(cause, validateSchemaValueWithAdmission(parsed.value, port));
+        }
+    }
+    const documents = parsed.value.object.getPtr("document_schemas").?;
+    const document = documents.object.getPtr("doc").?;
+    const schema_value = document.object.getPtr("schema").?;
+    const properties = schema_value.object.getPtr("properties").?;
+    const field = properties.object.getPtr("f130").?;
+    field.object.getPtr("type").?.* = .{ .string = "invalid" };
+    authority = .{};
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, validateSchemaValue(parsed.value));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, validateSchemaValueWithAdmission(parsed.value, port));
+}
+
+test "controlled restore plan codec template mapping and glob validation retains original authority" {
+    const admission = @import("../common/read_admission.zig");
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"dynamic_templates\":[");
+    for (0..131) |index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print("{{\"name\":\"t{d}\",\"match\":\"field*\",\"mapping\":{{\"type\":\"keyword\",\"sortable\":true}}}}", .{index});
+    }
+    try output.writer.writeAll("],\"index_sort\":[");
+    for (0..131) |index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print("{{\"field\":\"f{d}\",\"order\":\"asc\"}}", .{index});
+    }
+    try output.writer.writeAll("],\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\",\"fields\":{");
+    for (0..131) |index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print("\"k{d}\":{{\"type\":\"keyword\",\"sortable\":false}}", .{index});
+    }
+    try output.writer.writeAll("}}}}}}}}");
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{ .parse_numbers = false });
+    defer parsed.deinit();
+    const Authority = struct {
+        checks: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.fail_at) return self.cause;
+        }
+    };
+    var authority: Authority = .{};
+    const payload: admission.Payload = .{ .ptr = &authority, .vtable = &.{ .checkpoint = Authority.check } };
+    const port = admission.Port.init(&payload);
+    try validateSchemaValue(parsed.value);
+    try validateSchemaValueWithAdmission(parsed.value, port);
+    const checks = authority.checks;
+    try std.testing.expect(checks > 1000);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        for (1..checks + 1) |fail_at| {
+            authority = .{ .cause = cause, .fail_at = fail_at };
+            try std.testing.expectError(cause, validateSchemaValueWithAdmission(parsed.value, port));
+        }
+    }
+    var pattern: [16385]u8 = @splat('*');
+    for (0..2) |mode| {
+        if (mode == 1) pattern[pattern.len - 1] = 'x';
+        authority = .{};
+        try std.testing.expectEqual(globMatch(&pattern, "_id"), try globMatchWithAdmission(&pattern, "_id", port));
+        const glob_checks = authority.checks;
+        authority = .{};
+        try std.testing.expectEqual(pathGlobMayMatchReservedId(&pattern), try pathGlobMayMatchReservedIdWithAdmission(&pattern, port));
+        const path_checks = authority.checks;
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+            for (1..glob_checks + 1) |fail_at| {
+                authority = .{ .cause = cause, .fail_at = fail_at };
+                try std.testing.expectError(cause, globMatchWithAdmission(&pattern, "_id", port));
+            }
+            for (1..path_checks + 1) |fail_at| {
+                authority = .{ .cause = cause, .fail_at = fail_at };
+                try std.testing.expectError(cause, pathGlobMayMatchReservedIdWithAdmission(&pattern, port));
+            }
+        }
+    }
+    authority = .{};
+    try std.testing.expectEqual(documentPropertySchemaValueContainsSortableMapping(parsed.value), try documentPropertySchemaValueContainsSortableMappingWithAdmission(parsed.value, port));
+    const templates = parsed.value.object.getPtr("dynamic_templates").?;
+    templates.array.items[130].object.getPtr("match").?.* = .{ .string = "_id" };
+    authority = .{};
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, validateSchemaValue(parsed.value));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, validateSchemaValueWithAdmission(parsed.value, port));
+}
+
+test "controlled restore plan codec schema references preserve fallback and original rejection" {
+    const admission = @import("../common/read_admission.zig");
+    const name: [16385]u8 = @splat('x');
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"$defs\":{");
+    for (0..131) |index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print("\"f{d}\":{{\"type\":\"string\"}}", .{index});
+    }
+    try output.writer.print(",\"{s}\":{{\"type\":\"string\"}},\"{s}/~\":{{\"type\":\"object\"}}}}}}", .{ name, name });
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+    defer parsed.deinit();
+    const plain = try std.fmt.allocPrint(std.testing.allocator, "#/$defs/{s}", .{name});
+    defer std.testing.allocator.free(plain);
+    const escaped = try std.fmt.allocPrint(std.testing.allocator, "#/$defs/{s}~1~0", .{name});
+    defer std.testing.allocator.free(escaped);
+    const separators = try std.fmt.allocPrint(std.testing.allocator, "#////$defs////{s}///", .{name});
+    defer std.testing.allocator.free(separators);
+    const Authority = struct {
+        checks: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            // Reject exactly once: a fallback retry must not erase this cause.
+            if (self.checks == self.fail_at) return self.cause;
+        }
+    };
+    var authority: Authority = .{};
+    const payload: admission.Payload = .{ .ptr = &authority, .vtable = &.{ .checkpoint = Authority.check } };
+    const port = admission.Port.init(&payload);
+    for ([_]bool{ false, true }) |fallback| {
+        const legacy: SchemaContext = .{ .document_root = parsed.value.object, .scope_schema = if (fallback) .empty else parsed.value.object };
+        var controlled = legacy;
+        controlled.control = port;
+        for ([_][]const u8{ plain, escaped, separators, "#" }) |path| {
+            authority = .{};
+            const expected = try resolveSchemaRef(legacy, path);
+            const actual = try resolveSchemaRef(controlled, path);
+            try std.testing.expectEqual(expected.count(), actual.count());
+            try std.testing.expectEqualDeep(expected.get("type"), actual.get("type"));
+            const checks = authority.checks;
+            if (path.len > 4096) try std.testing.expect(checks > 10);
+            for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged, error.InvalidSchemaUpdateRequest }) |cause| {
+                for (1..checks + 1) |fail_at| {
+                    authority = .{ .cause = cause, .fail_at = fail_at };
+                    try std.testing.expectError(cause, resolveSchemaRef(controlled, path));
+                }
+            }
+        }
+        authority = .{};
+        for ([_][]const u8{ "not-a-reference", "#/$defs/missing", "#/$defs/~2", "#/$defs/f0/type" }) |invalid| {
+            try std.testing.expectError(error.InvalidSchemaUpdateRequest, resolveSchemaRef(legacy, invalid));
+            try std.testing.expectError(error.InvalidSchemaUpdateRequest, resolveSchemaRef(controlled, invalid));
+        }
+    }
+}
+
+test "controlled restore plan codec ordinary numeric keywords retain float grammar and original rejection" {
+    const admission = @import("../common/read_admission.zig");
+    const zeros: [16385]u8 = @splat('0');
+    const literal = try std.fmt.allocPrint(std.testing.allocator, "1.{s}1", .{zeros});
+    defer std.testing.allocator.free(literal);
+    const Authority = struct {
+        checks: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.fail_at) return self.cause;
+        }
+    };
+    var authority: Authority = .{};
+    const payload: admission.Payload = .{ .ptr = &authority, .vtable = &.{ .checkpoint = Authority.check } };
+    const port = admission.Port.init(&payload);
+    for ([_][]const u8{ literal, "0", "-0", "1e-99999", "1e99999", "nan", "inf", "-inf", "1_000.25", "0x1.fp2" }) |text| {
+        authority = .{};
+        const value: std.json.Value = .{ .number_string = text };
+        const expected = try parseJsonNumber(value);
+        const actual = try parseSchemaFloat(value, port);
+        try std.testing.expectEqual(@as(u64, @bitCast(expected)), @as(u64, @bitCast(actual)));
+        const checks = authority.checks;
+        if (text.len > 4096) try std.testing.expect(checks > 10);
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged, error.InvalidCharacter, error.InvalidSchemaUpdateRequest }) |cause| {
+            for (1..checks + 1) |fail_at| {
+                authority = .{ .cause = cause, .fail_at = fail_at };
+                try std.testing.expectError(cause, parseSchemaFloat(value, port));
+            }
+        }
+    }
+    var property: std.json.ObjectMap = .empty;
+    defer property.deinit(std.testing.allocator);
+    try property.put(std.testing.allocator, "type", .{ .string = "number" });
+    try property.put(std.testing.allocator, "minimum", .{ .number_string = literal });
+    try property.put(std.testing.allocator, "multipleOf", .{ .number_string = literal });
+    const legacy: SchemaContext = .{ .document_root = property, .scope_schema = property };
+    var controlled = legacy;
+    controlled.control = port;
+    authority = .{};
+    try validatePropertySchemaDefinitionWithContext(legacy, .{ .object = property });
+    try validatePropertySchemaDefinitionWithContext(controlled, .{ .object = property });
+    const checks = authority.checks;
+    try std.testing.expect(checks > 20);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged, error.InvalidCharacter }) |cause| {
+        for (1..checks + 1) |fail_at| {
+            authority = .{ .cause = cause, .fail_at = fail_at };
+            try std.testing.expectError(cause, validatePropertySchemaDefinitionWithContext(controlled, .{ .object = property }));
+        }
+    }
+    authority = .{};
+    for ([_][]const u8{ "", "bad", "1e", "1..2" }) |text| {
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchemaFloat(.{ .number_string = text }, port));
+    }
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, validatePositiveNumberWithAdmission(.{ .number_string = "0" }, port));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, validatePositiveNumberWithAdmission(.{ .number_string = "-1" }, port));
+}
+
+test "controlled restore plan codec exact numeric normalization preserves decimal semantics and original rejection" {
+    const admission = @import("../common/read_admission.zig");
+    const zeros: [16385]u8 = @splat('0');
+    const nines: [16385]u8 = @splat('9');
+    const integral = try std.fmt.allocPrint(std.testing.allocator, "1.{s}", .{zeros});
+    defer std.testing.allocator.free(integral);
+    const tiny = try std.fmt.allocPrint(std.testing.allocator, "1e-{s}", .{nines});
+    defer std.testing.allocator.free(tiny);
+    const huge = try std.fmt.allocPrint(std.testing.allocator, "1e{s}", .{nines});
+    defer std.testing.allocator.free(huge);
+    const leading = try std.fmt.allocPrint(std.testing.allocator, "1e+{s}0", .{zeros});
+    defer std.testing.allocator.free(leading);
+    const Authority = struct {
+        checks: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.fail_at) return self.cause;
+        }
+    };
+    var authority: Authority = .{};
+    const payload: admission.Payload = .{ .ptr = &authority, .vtable = &.{ .checkpoint = Authority.check } };
+    const port = admission.Port.init(&payload);
+    for ([_][]const u8{ integral, tiny, huge, leading, "-0", "000123", "0.1e1", "18446744073709551615", "18446744073709551616", "-1", "1.25", "", "1e", "1..0" }) |text| {
+        authority = .{};
+        try std.testing.expectEqualDeep(normalizeJsonDecimal(text), try normalizeJsonDecimalWithAdmission(text, port));
+        const normalize_checks = authority.checks;
+        authority = .{};
+        const value: std.json.Value = .{ .number_string = text };
+        try std.testing.expectEqual(exactU64JsonNumber(value), try exactU64JsonNumberWithAdmission(value, port));
+        const integer_checks = authority.checks;
+        if (text.len > 4096) try std.testing.expect(normalize_checks > 5);
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged, error.InvalidSchemaUpdateRequest }) |cause| {
+            for (1..normalize_checks + 1) |fail_at| {
+                authority = .{ .cause = cause, .fail_at = fail_at };
+                try std.testing.expectError(cause, normalizeJsonDecimalWithAdmission(text, port));
+            }
+            for (1..integer_checks + 1) |fail_at| {
+                authority = .{ .cause = cause, .fail_at = fail_at };
+                try std.testing.expectError(cause, exactU64JsonNumberWithAdmission(value, port));
+            }
+        }
+    }
+    authority = .{};
+    try std.testing.expectEqual(@as(?u64, 1), try exactU64JsonNumberWithAdmission(.{ .number_string = integral }, port));
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), try exactU64JsonNumberWithAdmission(.{ .number_string = "18446744073709551615" }, port));
+    try std.testing.expectEqual(@as(?u64, null), try exactU64JsonNumberWithAdmission(.{ .number_string = "18446744073709551616" }, port));
+    const context: SchemaContext = .{ .document_root = .empty, .scope_schema = .empty, .numeric_domain = true, .control = port };
+    for ([_][]const u8{ tiny, huge }) |text| {
+        authority = .{};
+        try validatePositiveNumberForDomain(context, .{ .number_string = text });
+        const checks = authority.checks;
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+            for (1..checks + 1) |fail_at| {
+                authority = .{ .cause = cause, .fail_at = fail_at };
+                try std.testing.expectError(cause, validatePositiveNumberForDomain(context, .{ .number_string = text }));
+            }
+        }
+    }
+    authority = .{};
+    try validateNonNegativeIntegerWithAdmission(.{ .number_string = integral }, port);
+    const checks = authority.checks;
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        for (1..checks + 1) |fail_at| {
+            authority = .{ .cause = cause, .fail_at = fail_at };
+            try std.testing.expectError(cause, validateNonNegativeIntegerWithAdmission(.{ .number_string = integral }, port));
+        }
+    }
 }

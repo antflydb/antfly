@@ -175,24 +175,24 @@ pub const Coordinator = struct {
     /// The descriptor already holds its kernel shared lock. Registration may
     /// wait for a writer, which then treats this unregistered lock as external.
     pub fn register(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
-        return self.registerWithScope(file, inode, sequence, tip, false, null, false, null);
+        return self.registerWithScope(file, inode, sequence, tip, false, null, false, null, false);
     }
     pub fn registerFull(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
-        return self.registerWithScope(file, inode, sequence, tip, true, null, false, null);
+        return self.registerWithScope(file, inode, sequence, tip, true, null, false, null, false);
     }
     pub fn registerInodeOnly(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8) !*Fence {
-        return self.registerWithScope(file, inode, sequence, tip, false, null, true, null);
+        return self.registerWithScope(file, inode, sequence, tip, false, null, true, null, false);
     }
     /// The caller holds the data inode shared lock through registration.
     pub fn registerEpoch(self: *Coordinator, file: std.Io.File, path: []const u8, binding: [32]u8, inode: u64, sequence: u64, tip: [32]u8, metadata: bool) !*Fence {
         if (self.sharedEpoch(path, binding, inode, sequence, metadata)) |shared| {
             errdefer self.releaseSharedEpoch(shared);
-            const fence = try self.registerWithScope(file, inode, sequence, tip, metadata, null, false, shared);
+            const fence = try self.registerWithScope(file, inode, sequence, tip, metadata, null, false, shared, false);
             file.unlock(self.io);
             return fence;
         }
         const epoch = epochs.register(self.allocator, self.io, path, binding, inode, sequence, metadata) catch |err| switch (err) {
-            error.AccessDenied, error.ReadOnlyFileSystem, error.UnsafeNativeReaderAlias => return self.registerWithScope(file, inode, sequence, tip, metadata, null, true, null),
+            error.AccessDenied, error.ReadOnlyFileSystem, error.UnsafeNativeReaderAlias => return self.registerWithScope(file, inode, sequence, tip, metadata, null, true, null, false),
             else => return err,
         };
         const shared = self.shareNewEpoch(epoch, path, binding, inode, sequence, metadata) catch |err| {
@@ -200,12 +200,19 @@ pub const Coordinator = struct {
             return err;
         };
         errdefer if (shared) |retained| self.releaseSharedEpoch(retained) else epoch.close(self.allocator, self.io);
-        const fence = try self.registerWithScope(file, inode, sequence, tip, metadata, if (shared == null) epoch else null, false, shared);
+        const fence = try self.registerWithScope(file, inode, sequence, tip, metadata, if (shared == null) epoch else null, false, shared, false);
         file.unlock(self.io);
         return fence;
     }
-    fn registerWithScope(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, metadata: bool, epoch: ?epochs.Lease, inode_only: bool, shared: ?*SharedEpoch) !*Fence {
-        self.mutex.lockUncancelable(self.io);
+    /// Controlled captures retain the inode lock instead of entering epoch
+    /// setup, whose registration can wait behind a parked service owner.
+    pub fn registerControlled(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, nonblocking: bool) !*Fence {
+        return self.registerWithScope(file, inode, sequence, tip, false, null, true, null, nonblocking);
+    }
+    fn registerWithScope(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, metadata: bool, epoch: ?epochs.Lease, inode_only: bool, shared: ?*SharedEpoch, nonblocking: bool) !*Fence {
+        if (nonblocking) {
+            if (!self.mutex.tryLock()) return error.Backpressured;
+        } else self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const fence = try self.allocator.create(Fence);
         errdefer self.allocator.destroy(fence);

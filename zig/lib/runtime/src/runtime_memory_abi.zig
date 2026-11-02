@@ -17,6 +17,9 @@
 //! Allocation and destruction always execute in the compilation unit that
 //! supplied the allocator; consumers only borrow this C-layout callback table.
 
+pub const Parent = @import("runtime_memory_parent_abi.zig").Port;
+pub const ParentSnapshot = @import("runtime_memory_parent_abi.zig").Snapshot;
+
 const std = @import("std");
 
 pub const Bytes = extern struct {
@@ -80,6 +83,12 @@ pub const Allocator = extern struct {
 
     pub fn asStd(self: *const Allocator) std.mem.Allocator {
         return .{ .ptr = @ptrCast(@constCast(self)), .vtable = &std_vtable };
+    }
+
+    /// Recognize the local standard adapter without inspecting a foreign
+    /// allocator context. The copied callback descriptor remains its owner.
+    pub fn isStdAdapter(allocator: std.mem.Allocator) bool {
+        return allocator.vtable == &std_vtable;
     }
 
     pub fn valid(self: *const Allocator) bool {

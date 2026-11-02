@@ -28,6 +28,7 @@ pub const Factory = struct {
     /// Every child is already selected from the same complete publication.
     /// Opening is lazy so at most one root and block are retained at a time.
     open: *const fn (*anyopaque, usize) anyerror!Cursor,
+    open_for: ?*const fn (*anyopaque, usize, *local.common_request_admission.runnable_scheduler.Execution) anyerror!Cursor = null,
 };
 
 pub const Composition = struct {
@@ -36,6 +37,7 @@ pub const Composition = struct {
     width: usize,
     child: ?Cursor = null,
     slot: usize = 0,
+    execution: ?*local.common_request_admission.runnable_scheduler.Execution = null,
     consumed: [256]bool = @splat(false),
 
     pub fn create(a: A, recipe: Recipe, factory: Factory) !*Composition {
@@ -48,12 +50,22 @@ pub const Composition = struct {
         return self;
     }
     pub fn cursor(self: *Composition) Cursor {
-        return .{ .ptr = self, .next = next, .close = close };
+        return .{ .ptr = self, .next = next, .close = close, .coordinator_execution = if (self.factory.open_for != null) .{ .bind = bindExecution, .release = releaseExecution } else null };
+    }
+    fn bindExecution(raw: *anyopaque, execution: *local.common_request_admission.runnable_scheduler.Execution) !void {
+        const self: *Composition = @ptrCast(@alignCast(raw));
+        if (self.execution != null) return error.InvalidRunnableTransition;
+        try execution.checkpoint();
+        self.execution = execution;
+    }
+    fn releaseExecution(raw: *anyopaque) void {
+        const self: *Composition = @ptrCast(@alignCast(raw));
+        self.execution = null;
     }
     /// Preflight the first complete cohort without consuming any partials.
     pub fn prime(self: *Composition) !Cursor {
         if (self.slot != 0) return error.InvalidSqlBackendResponse;
-        if (self.child == null) self.child = try self.factory.open(self.factory.ptr, 0);
+        if (self.child == null) self.child = if (self.execution) |execution| try self.factory.open_for.?(self.factory.ptr, 0, execution) else try self.factory.open(self.factory.ptr, 0);
         return self.child.?;
     }
     fn next(raw: *anyopaque, a: A, maximum: u32) !?[]const GroupResult {
@@ -65,10 +77,10 @@ pub const Composition = struct {
                     self.slot += 1;
                     continue;
                 }
-                self.child = try self.factory.open(self.factory.ptr, self.slot);
+                self.child = if (self.execution) |execution| try self.factory.open_for.?(self.factory.ptr, self.slot, execution) else try self.factory.open(self.factory.ptr, self.slot);
             }
             const child = self.child.?;
-            const page = (try child.next(child.ptr, a, maximum)) orelse {
+            const page = (try child.nextFor(self.execution, a, maximum)) orelse {
                 child.close(child.ptr);
                 self.child = null;
                 self.slot += 1;

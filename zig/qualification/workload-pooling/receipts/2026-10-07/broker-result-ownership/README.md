@@ -1,0 +1,7 @@
+# Broker result ownership and publication fences
+
+All 23 native broker/owner-adapter tests pass. Owned slot values have explicit typed cleanup, so member cancellation/deadline and admission rejection after a physical callback release results once. Healthy peers retain their values. Late I/O executor cancellation still joins and returns owned output for caller cleanup; the existing regression passes unchanged. The new test covers rejected admission, partial member cancellation, repeated rejection, and admission-free publication with the testing allocator.
+
+The initial run exposed the old bounded-wave test expecting values after explicit original request cancellation. Its expectation now matches the post-execution request fence; later waves still do not run. Initial and successful logs are retained.
+
+`native.json` records exact arguments and source hashes. This focused gate compiles broker and owner adapter, not the production Node/tensor/embedding producers. Those owning producer conversions require production compilation and numerical tests. The same 23 tests also pass on pinned Nix/glibc Zig under GNU AArch64, with two CPUs and 2 GiB and no extra swap. The source mount is read-only, and cache/cwd are writable. `linux.json` retains exact container and compiler arguments and six combined-source hashes. The production owner installation and full design qualification remain pending.

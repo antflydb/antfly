@@ -19,27 +19,42 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const Allocator = std.mem.Allocator;
 
+pub const WorkControl = struct {
+    ptr: *anyopaque,
+    checkpoint: *const fn (*anyopaque) error{SqlPreparationInterrupted}!void,
+};
+
 pub fn has(node: *const ast.Scalar) bool {
+    return hasControlled(node, null) catch unreachable;
+}
+
+/// Per-call preparation checkpoints; immutable expression trees never retain
+/// this borrowed callback or its caller context.
+pub fn hasControlled(node: *const ast.Scalar, control: ?WorkControl) error{SqlPreparationInterrupted}!bool {
+    if (control) |work| try work.checkpoint(work.ptr);
     return switch (node.*) {
         .call => |part| blk: {
             if (part.subquery != null) break :blk true;
-            for (part.args) |arg| if (has(arg)) break :blk true;
+            for (part.args) |arg| if (try hasControlled(arg, control)) break :blk true;
             if (part.window) |window| {
-                for (window.partition) |value| if (has(value)) break :blk true;
-                for (window.order) |order| if (order.expression) |value| if (has(value)) break :blk true;
+                for (window.partition) |value| if (try hasControlled(value, control)) break :blk true;
+                for (window.order) |order| {
+                    if (control) |work| try work.checkpoint(work.ptr);
+                    if (order.expression) |value| if (try hasControlled(value, control)) break :blk true;
+                }
             }
-            break :blk if (part.filter) |filter| has(filter) else false;
+            break :blk if (part.filter) |filter| try hasControlled(filter, control) else false;
         },
-        .unary => |part| has(part.operand),
-        .binary => |part| has(part.left) or has(part.right),
-        .cast => |part| has(part.operand),
+        .unary => |part| try hasControlled(part.operand, control),
+        .binary => |part| try hasControlled(part.left, control) or try hasControlled(part.right, control),
+        .cast => |part| try hasControlled(part.operand, control),
         .case_when => |part| blk: {
-            for (part.branches) |branch| if (has(branch.condition) or has(branch.value)) break :blk true;
-            break :blk if (part.otherwise) |other| has(other) else false;
+            for (part.branches) |branch| if (try hasControlled(branch.condition, control) or try hasControlled(branch.value, control)) break :blk true;
+            break :blk if (part.otherwise) |other| try hasControlled(other, control) else false;
         },
         .in_list => |part| blk: {
-            if (has(part.operand)) break :blk true;
-            for (part.values) |value| if (has(value)) break :blk true;
+            if (try hasControlled(part.operand, control)) break :blk true;
+            for (part.values) |value| if (try hasControlled(value, control)) break :blk true;
             break :blk false;
         },
         else => false,
@@ -1343,4 +1358,44 @@ pub fn lowerWithPreparedScope(alloc: Allocator, statement: ast.Select, prepared_
         };
     }
     return result;
+}
+
+test "controlled preparation subquery scans interrupt long argument and window order arrays" {
+    const Probe = struct {
+        checks: usize = 0,
+        fail_at: ?usize = null,
+        fn checkpoint(raw: *anyopaque) error{SqlPreparationInterrupted}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.fail_at == self.checks) return error.SqlPreparationInterrupted;
+        }
+    };
+    const literal: ast.Scalar = .{ .literal = .{ .integer = 1 } };
+    var arguments: [4096]*const ast.Scalar = @splat(&literal);
+    const orders: [4096]ast.Order = @splat(.{});
+    var node: ast.Scalar = .{ .call = .{ .name = "coalesce", .args = &arguments } };
+    var probe: Probe = .{};
+    const control: WorkControl = .{ .ptr = &probe, .checkpoint = Probe.checkpoint };
+    try std.testing.expect(!has(&node));
+    try std.testing.expect(!try hasControlled(&node, control));
+    try std.testing.expectEqual(@as(usize, arguments.len + 1), probe.checks);
+    probe = .{ .fail_at = 2048 };
+    try std.testing.expectError(error.SqlPreparationInterrupted, hasControlled(&node, control));
+    try std.testing.expectEqual(@as(usize, 2048), probe.checks);
+    const select: ast.Select = .{};
+    const subquery: ast.Scalar = .{ .call = .{ .name = "$scalar", .args = &.{}, .subquery = &select } };
+    arguments[arguments.len - 1] = &subquery;
+    probe = .{};
+    try std.testing.expect(has(&node));
+    try std.testing.expect(try hasControlled(&node, control));
+    try std.testing.expectEqual(@as(usize, arguments.len + 1), probe.checks);
+    // Order keys with no scalar expression still consume traversal work.
+    node = .{ .call = .{ .name = "row_number", .args = &.{}, .window = .{ .order = &orders } } };
+    probe = .{};
+    try std.testing.expect(!has(&node));
+    try std.testing.expect(!try hasControlled(&node, control));
+    try std.testing.expectEqual(@as(usize, orders.len + 1), probe.checks);
+    probe = .{ .fail_at = 2048 };
+    try std.testing.expectError(error.SqlPreparationInterrupted, hasControlled(&node, control));
+    try std.testing.expectEqual(@as(usize, 2048), probe.checks);
 }

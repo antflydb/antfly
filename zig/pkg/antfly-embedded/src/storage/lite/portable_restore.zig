@@ -115,12 +115,22 @@ pub fn importPortableIntoLiteDb(
     lite_backend: *@import("backend.zig").Handle,
     backup: []const u8,
 ) !void {
+    return importPortableIntoLiteDbWithAdmissionControls(allocator, db, lite_backend, backup, null);
+}
+
+pub fn importPortableIntoLiteDbWithAdmissionControls(
+    allocator: Allocator,
+    db: *db_mod.DB,
+    lite_backend: *@import("backend.zig").Handle,
+    backup: []const u8,
+    controls: ?@import("../db/apply_rw_lock.zig").ApplyRwLock.Acquisition,
+) !void {
     const Populate = struct {
         fn run(bytes: []const u8, a: Allocator, prepared: *LiteDb) !void {
             try populateUnpublishedLiteDb(a, &prepared.db, bytes);
         }
     };
-    try importPreparedIntoLiteDb(allocator, db, lite_backend, connection.embeddedRootIdentity(), backup, Populate.run);
+    try importPreparedIntoLiteDbWithAdmissionControls(allocator, db, lite_backend, connection.embeddedRootIdentity(), backup, Populate.run, controls);
 }
 
 /// Publishes a fully populated database generation, including named namespaces.
@@ -132,6 +142,19 @@ pub fn importPreparedIntoLiteDb(
     context: anytype,
     comptime populate: anytype,
 ) !void {
+    return importPreparedIntoLiteDbWithAdmissionControls(allocator, db, lite_backend, root_identity, context, populate, null);
+}
+
+pub fn importPreparedIntoLiteDbWithAdmissionControls(
+    allocator: Allocator,
+    db: *db_mod.DB,
+    lite_backend: *@import("backend.zig").Handle,
+    root_identity: db_mod.DocIdentityNamespace,
+    context: anytype,
+    comptime populate: anytype,
+    controls: ?@import("../db/apply_rw_lock.zig").ApplyRwLock.Acquisition,
+) !void {
+    if (controls) |original| try original.lifetime.check();
     if (!(try db.isPortableImportTargetEmpty(allocator))) return error.LiteImportTargetNotEmpty;
     if (lite_backend.engine != .native_single_file) return error.UnsupportedOperation;
 
@@ -144,9 +167,9 @@ pub fn importPreparedIntoLiteDb(
     );
     defer allocator.free(tmp_path);
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    // Adoption swaps descriptors, preserving the live file's executor. Borrow
+    // that same authority through preparation, publication and staging cleanup.
+    const io = lite_backend.native_docstore.?.file.runtime();
     scavengePortableRestoreGenerations(allocator, io, target_path) catch |err| {
         std.log.warn("Lite portable restore scavenging failed target={s} class={s}", .{ target_path, @errorName(err) });
     };
@@ -165,6 +188,8 @@ pub fn importPreparedIntoLiteDb(
     }
     var staged_backend = try @import("backend.zig").Handle.createWithOptions(allocator, tmp_path, .{
         .exclusive = true,
+        .io = io,
+        .resource_manager = lite_backend.native_docstore.?.resource_manager,
         .reclamation = workspace.options,
         .no_sync = lite_backend.native_docstore.?.file.no_sync,
         .writer_lock_marker = portable_generation_lease_magic,
@@ -192,7 +217,7 @@ pub fn importPreparedIntoLiteDb(
     prepared = undefined;
     defer prepared_backend.deinit();
 
-    try db.adoptPreparedPortableGenerationIfEmpty(
+    try db.adoptPreparedPortableGenerationIfEmptyWithAdmissionControls(
         allocator,
         &prepared_runtime,
         PreparedGenerationAdoption{
@@ -200,6 +225,7 @@ pub fn importPreparedIntoLiteDb(
             .prepared = &prepared_backend,
         },
         PreparedGenerationAdoption.adopt,
+        controls,
     );
 }
 

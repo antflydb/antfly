@@ -240,6 +240,7 @@ describe("retrieval request cancellation", () => {
       ? client.streamRetrievalAgent(request, {}, { signal: controller.signal })
       : client.retrievalAgent(request, undefined, { signal: controller.signal });
     const rejection = expect(result).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(transportSignal).toBeDefined());
     controller.abort();
     await rejection;
     expect(transportSignal?.aborted).toBe(true);
@@ -268,25 +269,29 @@ describe("retrieval request cancellation", () => {
   });
 
   it("does not deliver a JSON fallback that finishes after caller cancellation", async () => {
-    let resolveJson: (value: unknown) => void = () => {};
-    const json = vi.fn(
-      () =>
-        new Promise((resolve) => {
-          resolveJson = resolve;
-        })
-    );
-    const response = new Response("{}", { headers: { "Content-Type": "application/json" } });
-    vi.spyOn(response, "json").mockImplementation(json);
+    let finishPull: () => void = () => {};
+    const pull = vi.fn((body: ReadableStreamDefaultController<Uint8Array>) => {
+      body.enqueue(encoder.encode('{"generation":"late"}'));
+      return new Promise<void>((resolve) => {
+        finishPull = () => {
+          body.close();
+          resolve();
+        };
+      });
+    });
+    const response = new Response(new ReadableStream<Uint8Array>({ pull }), {
+      headers: { "Content-Type": "application/json" },
+    });
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(response);
     const controller = new AbortController();
     const onDone = vi.fn();
     const pending = new AntflyClient({
       baseUrl: "http://localhost:8080",
     }).streamRetrievalAgent(request, { onDone }, { signal: controller.signal });
-    await vi.waitFor(() => expect(json).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(pull).toHaveBeenCalledOnce());
 
     controller.abort();
-    resolveJson({ generation: "late" });
+    finishPull();
 
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
     expect(onDone).not.toHaveBeenCalled();

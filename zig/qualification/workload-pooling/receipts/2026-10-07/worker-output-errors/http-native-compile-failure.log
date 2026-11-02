@@ -1,0 +1,9 @@
+lib/httpx/src/server/server.zig:7674:37: error: root source file struct 'ascii' has no member named 'indexOfIgnoreCase'
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(wire[0..used], "retry-after: 1\r\n") != null);
+                           ~~~~~~~~~^~~~~~~~~~~~~~~~~~
+/Users/ajroetker/bin/zig-0.17.0/lib/std/ascii.zig:1:1: note: struct declared here
+//! The 7-bit [ASCII](https://en.wikipedia.org/wiki/ASCII) character encoding standard.
+^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+referenced by:
+    server_mod: lib/httpx/src/httpx.zig:97:32
+    test.server: lib/httpx/src/httpx.zig:439:9

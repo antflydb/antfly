@@ -128,7 +128,7 @@ pub const Manager = struct {
     }
     /// Caller has resolved and authorized a fresh native catalog binding.
     pub fn handle(self: *Manager, a: A, io: std.Io, table: metadata.TableRecord, options: Options, method: @import("../serverless/api/http_routes.zig").HttpMethod, suffix: []const u8, body: []const u8, context: local.api_operation.RequestContext) !http.HttpResponse {
-        const guard = http.RequestGuard{ .context = try context.platformDeadline() };
+        var guard = http.RequestGuard{ .context = try context.platformDeadline() };
         const cancellation = guard.token();
         try guard.context.ensureActive();
         const entry = try self.acquire(a, io, table, options, guard.context);

@@ -1,0 +1,9 @@
+# Caller parking before independent broker admission
+
+Every singleton submission and native array wave parks its synchronous caller before enrollment/admission and reacquires that caller only after all borrowed tickets have joined. Callbacks and waits run outside shard locks. Native wave staging runs while the parent is runnable. Rejected parent reacquisition disposes every owned output from the current wave and prevents later waves; results already taken from earlier waves remain caller-owned for normal collection cleanup. Error/early-return paths balance wait cleanup.
+
+The inference provider supplies paired caller wait callbacks using the shared owning-thread ResourceWait scope. An independently admitted child scope restores the parked parent's state on teardown. The real owner fixture fills the sole ordinary slot with its query parent; singleton and native calls still complete because broker admission follows parking. During execution, exactly one inference CPU and one parked parent are present. Rejected query reacquisition cleans allocated outputs; the scheduler retires its entry and the original caller releases the C capsule.
+
+Native macOS and pinned Nix/glibc GNU AArch64 each pass 23 broker/adapter and 11 real-owner tests (34 per platform). Logs and source hashes are retained with exact commands and container limits. Initial fixture edits corrected a reserved function name and an expectation that incorrectly counted a scheduler entry after failed reacquisition; the latter retirement was confirmed against Scheduler.wait source.
+
+Production Node/host installation remains required. This fixture exercises actual admission, submission and typed ownership, but does not qualify multi-caller fairness, numerical inference, complete retained-memory coverage, physical subprocess waits or default enablement.

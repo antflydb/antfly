@@ -1,0 +1,35 @@
+1/34 runtime_runnable_abi.test.runnable execution ABI rejects malformed inputs before borrowing executor state...OK
+2/34 runtime_runnable_abi.test.runnable execution ABI retains C layout and validates the owner prefix...OK
+3/34 runtime_runnable_abi.test.runnable execution borrowed ABI validates demand and headers before calling a parent...OK
+4/34 runtime_error_abi.test.runnable demand error remains append-only and rejects forged behavior...OK
+5/34 runtime_error_abi.test.execution wait scheduling details are append-only and preserve behavior classes...OK
+6/34 runtime_error_abi.test.FK publication progress and corrupt retirement proofs retain distinct boundary semantics...OK
+7/34 runtime_error_abi.test.schema epoch conflicts retain a retryable public status...OK
+8/34 runtime_error_abi.test.transaction capacity rejection retains a permanent public status...OK
+9/34 runtime_error_abi.test.stable status preserves deterministic raft rejection and malformed response identity...OK
+10/34 runtime_error_abi.test.stable status preserves public boundary semantics...OK
+11/34 runtime_error_abi.test.stable status replaces private provider errors with a named fallback...OK
+12/34 runtime_error_abi.test.stable detail detection distinguishes private errors...OK
+13/34 runtime_error_abi.test.every classified boundary outcome retains its identity...OK
+14/34 runtime_error_abi.test.stable status has a C layout...OK
+15/34 runtime_error_abi.test.scheduler admission detail appends without renumbering existing wire outcomes...OK
+16/34 runtime_error_abi.test.unknown wire values fail closed...OK
+17/34 runtime_error_abi.test.table vector storage errors retain their runtime boundary classification...OK
+18/34 runtime_error_abi.test.provider quota errors retain stable boundary details...OK
+19/34 runtime_error_abi.test.generation capacity retains retryability across the runtime boundary...OK
+20/34 runtime_error_abi.test.system catalog errors retain their stable runtime boundary classification...OK
+21/34 runtime_error_abi.test.ambiguous backup outcome survives runtime transport without rollback authorization...OK
+22/34 runtime_error_abi.test.HA capture availability survives runtime callback transport...OK
+23/34 runtime_error_abi.test.storage owner contention retains retryability and exact identity...OK
+24/34 runtime_error_abi.test.released main Detail identifiers retain their exact names and numeric values...OK
+25/34 runtime_error_abi.test.metadata proposal recovery errors preserve identity across runtime archives...OK
+26/34 runtime_error_abi.test.SQL snapshot and range protection errors preserve runtime capability semantics...OK
+27/34 runtime_error_abi.test.online merge admission barrier preserves exact identity across runtime archives...OK
+28/34 runtime_error_abi.test.ordered receipt corruption preserves the released runtime status...OK
+29/34 runtime_error_abi.test.external lake and spill errors retain exact identity across runtime archives...OK
+30/34 runtime_native_abi.test.native type contracts reject layout and identity mismatches...OK
+31/34 runtime_native_abi.test.native shallow layout fingerprints include field order...OK
+32/34 runtime_native_abi.test.native method identifiers are deterministic...OK
+33/34 runtime_native_abi.test.native executor borrows validate before reconstructing std.Io...OK
+34/34 runtime_http_abi.test.runtime HTTP values retain C layout...OK
+All 34 tests passed.

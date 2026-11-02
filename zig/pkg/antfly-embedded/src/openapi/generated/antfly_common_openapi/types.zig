@@ -2171,11 +2171,19 @@ pub const ObjectStorageLocation = struct {
     }
 };
 
-/// Optional PostgreSQL wire listener. Requires authentication. Transactions remain unsupported. Remote bindings require externally protected transport.
+/// Optional PostgreSQL wire listener. Requires authentication. Supports native transactions. Remote bindings require externally protected transport.
 pub const PgwireConfig = struct {
     enabled: ?bool = null,
     bind_host: ?[]const u8 = null,
     bind_port: ?i64 = null,
+    /// Aggregate bytes allocated through pgwire connection budgets, covering protocol messages, prepared state, portals, and caller-owned response arenas. Zero preserves the sum of the per-connection ceilings. This is separate from global backend plan/cache and process memory budgets.
+    max_session_bytes: ?i64 = null,
+    /// Aggregate pgwire retained-state allocation ceiling for prepared plans, portals, cursor state/spools, and settings. Charged within max_session_bytes. Zero uses the sum of per-connection retained ceilings.
+    max_retained_bytes: ?i64 = null,
+    /// Per-connection retained-state allocation ceiling, separate from transient frames and response pages.
+    retained_bytes_per_connection: ?i64 = null,
+    /// Maximum wait for the next message in an active or failed transaction, capped by the ordinary connection idle timeout. Expiry disconnects the owner and runs normal cleanup; durable decisions remain recoverable.
+    idle_transaction_timeout_ms: ?i64 = null,
     max_connections: ?i64 = null,
     /// Acknowledges that a TLS proxy or authenticated private transport protects a non-loopback listener. Does not enable native TLS.
     externally_protected_transport: ?bool = null,
@@ -2185,6 +2193,10 @@ pub const PgwireConfig = struct {
         .{ "enabled", "enabled", true },
         .{ "bind_host", "bind_host", true },
         .{ "bind_port", "bind_port", true },
+        .{ "max_session_bytes", "max_session_bytes", true },
+        .{ "max_retained_bytes", "max_retained_bytes", true },
+        .{ "retained_bytes_per_connection", "retained_bytes_per_connection", true },
+        .{ "idle_transaction_timeout_ms", "idle_transaction_timeout_ms", true },
         .{ "max_connections", "max_connections", true },
         .{ "externally_protected_transport", "externally_protected_transport", true },
     };
@@ -2209,6 +2221,22 @@ pub const PgwireConfig = struct {
         }
         if (self.bind_port) |value| {
             try jw.objectField("bind_port");
+            try jw.write(value);
+        }
+        if (self.max_session_bytes) |value| {
+            try jw.objectField("max_session_bytes");
+            try jw.write(value);
+        }
+        if (self.max_retained_bytes) |value| {
+            try jw.objectField("max_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.retained_bytes_per_connection) |value| {
+            try jw.objectField("retained_bytes_per_connection");
+            try jw.write(value);
+        }
+        if (self.idle_transaction_timeout_ms) |value| {
+            try jw.objectField("idle_transaction_timeout_ms");
             try jw.write(value);
         }
         if (self.max_connections) |value| {

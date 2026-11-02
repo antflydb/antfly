@@ -21,6 +21,7 @@
 const std = @import("std");
 const numeric = @import("numeric_value.zig");
 const A = std.mem.Allocator;
+const Work = @import("operator_work.zig");
 const base: i128 = 10000;
 const header = 46;
 const guard_groups = 5; // 10000^5 exceeds the largest legal row count.
@@ -274,28 +275,44 @@ pub const Reducer = struct {
         self.* = undefined;
     }
     pub fn add(self: *Reducer, value: numeric.Value) !void {
-        var ctx: numeric.Context = .{ .alloc = self.alloc, .remaining = self.remaining };
+        return self.addControlled(value, null);
+    }
+    pub fn addControlled(self: *Reducer, value: numeric.Value, control: ?Work.Control) !void {
+        try Work.poll(control);
+        var ctx: numeric.Context = .{ .alloc = self.alloc, .remaining = self.remaining, .ptr = if (control) |owner| owner.ptr else null, .checkpoint = if (control) |owner| owner.checkpoint else null };
         defer self.remaining = ctx.remaining;
         try self.state.add(&ctx, value);
         self.invalidate();
     }
     pub fn merge(self: *Reducer, source: State) !void {
-        var ctx: numeric.Context = .{ .alloc = self.alloc, .remaining = self.remaining };
+        return self.mergeControlled(source, null);
+    }
+    pub fn mergeControlled(self: *Reducer, source: State, control: ?Work.Control) !void {
+        try Work.poll(control);
+        var ctx: numeric.Context = .{ .alloc = self.alloc, .remaining = self.remaining, .ptr = if (control) |owner| owner.ptr else null, .checkpoint = if (control) |owner| owner.checkpoint else null };
         defer self.remaining = ctx.remaining;
         try self.state.merge(&ctx, source);
         self.invalidate();
     }
     pub fn clone(self: Reducer, a: A) !Reducer {
-        var ctx: numeric.Context = .{ .alloc = a };
+        return self.cloneControlled(a, null);
+    }
+    pub fn cloneControlled(self: Reducer, a: A, control: ?Work.Control) !Reducer {
+        try Work.poll(control);
+        var ctx: numeric.Context = .{ .alloc = a, .ptr = if (control) |owner| owner.ptr else null, .checkpoint = if (control) |owner| owner.checkpoint else null };
         return .{ .alloc = a, .state = try self.state.clone(&ctx), .remaining = self.remaining };
     }
     pub fn finish(self: *Reducer, average: bool) !?*const numeric.Value {
+        return self.finishControlled(average, null);
+    }
+    pub fn finishControlled(self: *Reducer, average: bool, control: ?Work.Control) !?*const numeric.Value {
+        try Work.poll(control);
         if (self.state.count == 0) return null;
         if (self.result) |result| {
             if (self.result_average != average) return error.InvalidNumericAggregateState;
             return &result.value;
         }
-        var ctx: numeric.Context = .{ .alloc = self.alloc, .remaining = self.remaining };
+        var ctx: numeric.Context = .{ .alloc = self.alloc, .remaining = self.remaining, .ptr = if (control) |owner| owner.ptr else null, .checkpoint = if (control) |owner| owner.checkpoint else null };
         defer self.remaining = ctx.remaining;
         var result = try self.state.total(&ctx, average);
         errdefer result.deinit();

@@ -4,6 +4,7 @@
 import { readFileSync } from "node:fs";
 import { afterEach, expect, it, vi } from "vitest";
 import { AntflyClient } from "../src/client.js";
+import { RequestAdmission } from "../src/request-admission.js";
 import { parseMemoryJSON, stringifyMemoryJSON } from "../src/memory.js";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -126,4 +127,29 @@ it("decodes native discovery and proposal fixtures through the typed memory tran
   expect(details?.inputs.entities[0]?.revision).toBe(3);
   expect(details?.reason).toBeNull();
   expect(details?.stale_configuration).toBe(false);
+});
+
+it("shares ordinary admission with native memory requests and closes both transports", async () => {
+  const fetch = vi.fn(async () => new Response("{}"));
+  vi.stubGlobal("fetch", fetch);
+  const admission = new RequestAdmission({ maxConcurrent: 1, maxQueued: 0 });
+  const client = new AntflyClient({ baseUrl: "http://memory.test", requestAdmission: admission });
+  const held = await admission.fetch("http://memory.test/held");
+  await expect(
+    client.memoryApi.GET("/memory/v1/spaces/{space}", {
+      params: { path: { space: "team" } },
+    })
+  ).rejects.toMatchObject({ reason: "queue_full", requestSent: false });
+  expect(fetch).toHaveBeenCalledTimes(1);
+  await held.text();
+  await client.memoryApi.GET("/memory/v1/spaces/{space}", {
+    params: { path: { space: "team" } },
+  });
+  expect(fetch).toHaveBeenCalledTimes(2);
+  client.close();
+  await expect(client.memory.explain("team", "claim")).rejects.toMatchObject({
+    reason: "closed",
+    requestSent: false,
+  });
+  expect(fetch).toHaveBeenCalledTimes(2);
 });

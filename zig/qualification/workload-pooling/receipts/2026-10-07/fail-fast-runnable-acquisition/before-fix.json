@@ -1,0 +1,7 @@
+{
+  "state": "terminal",
+  "exit_code": 1,
+  "summary": "27 passed, 1 failed; expected ResourceTemporarilyUnavailable, found RunnableWaitTimeout",
+  "source_hashes": "before-fix/source-hashes.json",
+  "scope": "isolated candidate regression tests with only the new fail-fast branch removed"
+}

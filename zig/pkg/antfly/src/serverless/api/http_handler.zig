@@ -94,12 +94,17 @@ const SyncWaitCancellation = struct {
     deadline_ns: u64,
 
     fn token(self: *const @This()) CancellationToken {
-        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled, .check_fn = check };
     }
 
     fn isCancelled(ptr: *const anyopaque) bool {
+        check(ptr) catch return true;
+        return false;
+    }
+    fn check(ptr: *const anyopaque) !void {
         const state: *const @This() = @ptrCast(@alignCast(ptr));
-        return state.upstream.isCancelled() or platform_time.monotonicNs() >= state.deadline_ns;
+        try state.upstream.check();
+        if (platform_time.monotonicNs() >= state.deadline_ns) return error.DeadlineExceeded;
     }
 };
 const json_helpers = @import("antfly_local_sources").api_json_helpers;
@@ -227,6 +232,8 @@ fn normalizeServerlessCreateIndexConfig(
 
 pub const HttpHandler = struct {
     alloc: Allocator,
+    /// Compatible provenance-aware view of the same owner as alloc.
+    control_allocator: ?Allocator = null,
     api: *api_service.Service,
     catalog: *catalog_mod.CatalogService,
     manifests: *manifest_mod.ManifestStore,
@@ -241,7 +248,10 @@ pub const HttpHandler = struct {
     published_search_sources: search_sources.PublishedSearchSources = .{},
     runtime_status: *const api_types.RuntimeStatusResult,
     runtime_metrics: ?*runtime_manager.ManagedRuntime = null,
+    read_memory_pool: ?*@import("../../common/read_memory.zig").Pool = null,
     graph_execution_limits: @import("antfly_local_sources").graph_work_budget.Limits = .{},
+    write_runnable_slots: usize = 1,
+    runnable_scheduler: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Scheduler = null,
     query_admission: RequestAdmission = RequestAdmission.init(common_config.default_query_max_concurrent_requests),
     write_admission: RequestAdmission = RequestAdmission.init(common_config.default_write_max_concurrent_requests),
 
@@ -276,29 +286,166 @@ pub const HttpHandler = struct {
         self.graph_execution_limits = limits;
     }
 
+    const ResponseExecution = struct {
+        alloc: Allocator,
+        guard: http_types.RequestGuard,
+        execution: @import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution = .{},
+        admission: ?RequestAdmission.Lease = null,
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.execution.finish();
+            if (self.admission) |*lease| lease.release();
+            const alloc = self.alloc;
+            alloc.destroy(self);
+        }
+    };
+
+    pub fn requestRetainedBytes() usize {
+        return @sizeOf(ResponseExecution);
+    }
+
     pub fn handle(self: *HttpHandler, input: HttpRequest) !HttpResponse {
-        const guard = http_types.RequestGuard{ .context = try input.context().platformDeadline() };
+        var local_guard = http_types.RequestGuard{ .context = try input.context().platformDeadline() };
+        try local_guard.checkpoint();
+        const route = http_routes.match(input.method, input.path) orelse return try textResponse(self.alloc, 404, "not found");
+        const response_execution = if (self.runnable_scheduler != null) owned: {
+            const alloc = switch (route) {
+                .healthz, .readyz => self.control_allocator orelse self.alloc,
+                else => self.alloc,
+            };
+            const owner = try alloc.create(ResponseExecution);
+            owner.* = .{ .alloc = alloc, .guard = .{ .context = local_guard.context } };
+            break :owned owner;
+        } else null;
+        var transferred = false;
+        defer if (response_execution) |owner| {
+            if (!transferred) ResponseExecution.release(owner);
+        };
+        const guard = if (response_execution) |owner| &owner.guard else &local_guard;
         var req = input;
         req.cancellation = guard.token();
         const request_context = guard.context;
-        try guard.context.ensureActive();
-        const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
         const admission: ?*RequestAdmission = switch (http_routes.admissionClass(route)) {
             .none => null,
             .query => &self.query_admission,
             .write => &self.write_admission,
         };
+        var admission_lease: ?RequestAdmission.Lease = null;
+        defer if (response_execution == null) {
+            if (admission_lease) |*lease| lease.release();
+        };
         if (admission) |gate| {
-            if (!gate.tryAcquire()) {
+            const token = guard.token();
+            admission_lease = if (gate == &self.query_admission and gate.stats().waiting.max_wait_ms != 0 and self.io != null) gate.acquire(.{
+                .io = self.io orelse return error.MissingBackendRuntimeIo,
+                .native_now_ns = @import("antfly_platform").time.monotonicNs,
+                .deadline_ns = request_context.deadline_ns,
+                .cancellation = .{ .ptr = token.ptr.?, .requested = token.is_cancelled_fn.? },
+                .retained_bytes = @as(u64, requestRetainedBytes()) +| req.body.len,
+            }) catch |err| switch (err) {
+                error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge, error.AdmissionWaitTimeout, error.AdmissionClosed => null,
+                else => {
+                    // The admission token exposes a boolean. Recover the
+                    // original scoped rejection (including deadline expiry).
+                    try guard.checkpoint();
+                    return err;
+                },
+            } else gate.tryAcquireLease();
+            if (admission_lease == null) {
+                try guard.checkpoint();
                 var response = try textResponse(self.alloc, 429, if (gate == &self.query_admission) "query capacity exhausted" else "write capacity exhausted");
                 response.retry_after_seconds = 1;
                 return response;
             }
         }
-        defer if (admission) |gate| gate.release();
-        try guard.context.ensureActive();
+        if (response_execution) |owner| owner.admission = admission_lease;
+        try guard.checkpoint();
 
-        var response = switch (route) {
+        const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+        var local_execution: Runnable.Execution = .{};
+        const execution = if (response_execution) |owner| &owner.execution else &local_execution;
+        defer if (response_execution == null) local_execution.finish();
+        if (self.runnable_scheduler) |scheduler| {
+            const token = guard.token();
+            const class: Runnable.Class = switch (route) {
+                .healthz, .readyz => .control,
+                else => switch (http_routes.admissionClass(route)) {
+                    .query => .query,
+                    .write => .write,
+                    .none => if (req.method == .get) .query else .write,
+                },
+            };
+            const completion_bytes: u64 = switch (route) {
+                .ingest_batch, .ingest_table_batch => api_service.Service.completionRetainedBytes(),
+                .table_batch => publicBatchCompletionRetainedBytes(),
+                else => 0,
+            };
+            // WAL acceptance encodes and appends sequentially. Reserve graph
+            // parallelism only for routes that can materialize/build indexes.
+            const runnable_slots = switch (route) {
+                .ingest_batch, .ingest_table_batch => 1,
+                else => if (class == .write) self.write_runnable_slots else 1,
+            };
+            execution.startWithSlots(scheduler, .{
+                .io = self.io orelse return error.MissingBackendRuntimeIo,
+                .native_now_ns = @import("antfly_platform").time.monotonicNs,
+                .deadline_ns = request_context.deadline_ns,
+                .cancellation = .{ .ptr = token.ptr.?, .requested = token.is_cancelled_fn.? },
+                .retained_bytes = @as(u64, requestRetainedBytes()) +| req.body.len +| completion_bytes,
+                .allow_wait = class != .control,
+            }, class, runnable_slots) catch |err| {
+                try guard.checkpoint();
+                return err;
+            };
+            try guard.checkpoint();
+        }
+
+        var response = self.dispatchRoute(req, route, request_context, if (self.runnable_scheduler != null) execution else null) catch |err| {
+            // A boolean-only engine may return Canceled after observing a
+            // scoped rejection. Recover its first cause before the response.
+            // Accepted batches retain their existing durable response rules.
+            if (route != .table_batch and !retainedIngest(route, execution)) try guard.checkpoint();
+            return err;
+        };
+        errdefer response.deinit(self.alloc);
+        // Batch responses carry durable WAL acceptance, including pending
+        // publication. Never replace them with a pre-commit timeout response.
+        const accepted_ingest = response.status == 202 and switch (route) {
+            .ingest_batch, .ingest_table_batch => true,
+            else => false,
+        };
+        if (route != .table_batch and !accepted_ingest and !retainedIngest(route, execution)) try guard.checkpoint();
+        if (response_execution) |owner| {
+            execution.park(.output_blocked) catch |err| {
+                if (err != error.SchedulerClosed or (route != .table_batch and !accepted_ingest and !retainedIngest(route, execution))) return err;
+            };
+            response.retirement = .{ .ptr = owner, .release = ResponseExecution.release };
+            transferred = true;
+        }
+        return response;
+    }
+
+    fn retainedIngest(route: http_routes.Route, execution: *const @import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) bool {
+        return switch (route) {
+            .ingest_batch, .ingest_table_batch => if (execution.entry) |entry| entry.completion_active else false,
+            else => false,
+        };
+    }
+
+    fn dispatchRoute(self: *HttpHandler, req: HttpRequest, route: http_routes.Route, request_context: api_operation.RequestContext, execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !HttpResponse {
+        var query_context = request_context;
+        query_context.cancellation = req.cancellation;
+        var read: @import("../../api/runnable_local_read.zig").Read = undefined;
+        var team: @import("antfly_runtime_abi").runnable_abi.Team = undefined;
+        if (execution) |active| switch (route) {
+            .table_query_request, .query_search, .table_query_search => {
+                read = .{ .execution = active, .allocator = self.alloc };
+                team = try read.team();
+                query_context.execution_team = &team;
+            },
+            else => {},
+        };
+        return switch (route) {
             .health => try self.handleHealth(),
             .healthz => try self.handleHealthz(),
             .readyz => try self.handleReadyz(),
@@ -315,9 +462,9 @@ pub const HttpHandler = struct {
                 .delete => try self.handlePublicTableDeleteIndex(value.table_name, value.index_name),
                 else => unreachable,
             },
-            .ingest_batch => |value| try self.handleIngestBatch(value.namespace, req.body),
-            .ingest_table_batch => |value| try self.handleIngestTableBatch(value.table_name, req.body),
-            .table_batch => |value| try self.handleTableBatch(value.table_name, req.body, request_context),
+            .ingest_batch => |value| try self.handleIngestBatch(value.namespace, req.body, req.cancellation, execution),
+            .ingest_table_batch => |value| try self.handleIngestTableBatch(value.table_name, req.body, req.cancellation, execution),
+            .table_batch => |value| try self.handleTableBatch(value.table_name, req.body, request_context, execution),
             .build_namespace => |value| try self.handleBuildNamespace(value.namespace),
             .internal_table_build => |value| try self.handleBuildTable(value.table_name),
             .build_status => |value| try self.handleBuildStatus(value.namespace),
@@ -336,11 +483,11 @@ pub const HttpHandler = struct {
             .publish_head => |value| try self.handlePublishHead(value.namespace, req.body),
             .query => |value| try self.handleQuery(value.namespace, req.cancellation),
             .table_query => |value| try self.handleTableQuery(value.table_name, req.cancellation),
-            .table_query_request => |value| try self.handleTableQueryRequest(value.table_name, req.body, request_context),
+            .table_query_request => |value| try self.handleTableQueryRequest(value.table_name, req.body, query_context),
             .table_query_published => |value| try self.handleTableQueryPublished(value.table_name, req.cancellation),
             .table_query_latest => |value| try self.handleTableQueryLatest(value.table_name, req.cancellation),
-            .query_search => |value| try self.handleQuerySearch(value.namespace, req.body, req.cancellation),
-            .table_query_search => |value| try self.handleTableQuerySearch(value.table_name, req.body, req.cancellation),
+            .query_search => |value| try self.handleQuerySearch(value.namespace, req.body, query_context),
+            .table_query_search => |value| try self.handleTableQuerySearch(value.table_name, req.body, query_context),
             .table_query_graph_neighbors => |value| try self.handleTableQueryGraphNeighbors(value.table_name, req.body, req.cancellation),
             .table_query_graph_traverse => |value| try self.handleTableQueryGraphTraverse(value.table_name, req.body, req.cancellation),
             .table_query_graph_shortest_path => |value| try self.handleTableQueryGraphShortestPath(value.table_name, req.body, req.cancellation),
@@ -356,15 +503,15 @@ pub const HttpHandler = struct {
             .query_head_artifact => |value| try self.handleQueryHeadArtifact(value.namespace, value.artifact_index, req.cancellation),
             .query_version_artifact => |value| try self.handleQueryVersionArtifact(value.namespace, value.version.?, value.artifact_index, req.cancellation),
         };
-        errdefer response.deinit(self.alloc);
-        // Batch responses carry durable WAL acceptance, including pending
-        // publication. Never replace them with a pre-commit timeout response.
-        if (route != .table_batch) try guard.context.ensureActive();
-        return response;
     }
 
     pub fn configureAdmission(self: *HttpHandler, query_capacity: usize, write_capacity: usize) void {
         self.query_admission = RequestAdmission.init(query_capacity);
+        self.write_admission = RequestAdmission.init(write_capacity);
+    }
+
+    pub fn configureAdmissionWithWaiting(self: *HttpHandler, query_capacity: usize, write_capacity: usize, waiting: @import("antfly_local_sources").common_bounded_admission.Waiting) !void {
+        self.query_admission = try RequestAdmission.initConfigured(query_capacity, waiting);
         self.write_admission = RequestAdmission.init(write_capacity);
     }
 
@@ -431,12 +578,12 @@ pub const HttpHandler = struct {
     }
 
     fn handleHealthz(self: *HttpHandler) !HttpResponse {
-        return try jsonResponse(self.alloc, 200, .{ .status = "ok" });
+        return try jsonResponse(self.control_allocator orelse self.alloc, 200, .{ .status = "ok" });
     }
 
     fn handleReadyz(self: *HttpHandler) !HttpResponse {
         const ready = self.runtime_status.validated;
-        return try jsonResponse(self.alloc, if (ready) 200 else 503, .{
+        return try jsonResponse(self.control_allocator orelse self.alloc, if (ready) 200 else 503, .{
             .status = if (ready) "ready" else "not_ready",
             .validated = ready,
         });
@@ -1025,7 +1172,12 @@ pub const HttpHandler = struct {
         return try jsonResponse(self.alloc, 201, struct {}{});
     }
 
-    fn handleIngestBatch(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
+    fn ingestWithExecution(self: *HttpHandler, req: api_types.IngestBatchRequest, cancellation: @import("antfly_cancellation").CancellationToken, execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !api_types.IngestBatchResult {
+        if (execution) |active| return self.api.ingestBatchWithExecution(req, cancellation, active, self.io orelse return error.MissingBackendRuntimeIo);
+        return self.api.ingestBatchWithCancellation(req, cancellation);
+    }
+
+    fn handleIngestBatch(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
         self.catalog.ensureNamespaceWritesAllowed(namespace) catch |err| switch (err) {
             error.RelationalStorageUnavailable => return try textResponse(self.alloc, 405, "relational writes require the native storage-owner runtime"),
@@ -1041,12 +1193,16 @@ pub const HttpHandler = struct {
         const req = parseIngestBatchRequest(self.alloc, namespace, body) catch return try textResponse(self.alloc, 400, "invalid ingest request");
         defer freeDocumentMutations(self.alloc, req.mutations);
 
-        var result = self.api.ingestBatch(req) catch return try textResponse(self.alloc, 500, "ingest failed");
+        var acknowledgement = try PreparedIngestResponse.init(self.alloc, .{ .namespace = namespace, .mutation_count = req.mutations.len, .start_lsn = std.math.maxInt(u64), .end_lsn = std.math.maxInt(u64) });
+        var acknowledgement_transferred = false;
+        defer if (!acknowledgement_transferred) acknowledgement.response.deinit(self.alloc);
+        var result = self.ingestWithExecution(req, cancellation, execution) catch return try textResponse(self.alloc, 500, "ingest failed");
         defer result.deinit(self.alloc);
-        return try jsonResponse(self.alloc, 202, result);
+        acknowledgement_transferred = true;
+        return acknowledgement.finish(result.start_lsn, result.end_lsn);
     }
 
-    fn handleIngestTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleIngestTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
         self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
             error.RelationalStorageUnavailable => return try textResponse(self.alloc, 405, "relational writes require the native storage-owner runtime"),
@@ -1077,27 +1233,194 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
 
-        var result = self.api.ingestBatch(.{
+        var acknowledgement = try PreparedIngestResponse.init(self.alloc, .{ .table_name = table_name, .mutation_count = mutations.len, .start_lsn = std.math.maxInt(u64), .end_lsn = std.math.maxInt(u64) });
+        var acknowledgement_transferred = false;
+        defer if (!acknowledgement_transferred) acknowledgement.response.deinit(self.alloc);
+        var result = self.ingestWithExecution(.{
             .namespace = namespace,
             .timestamp_ns = parsed.value.timestamp_ns,
             .mutations = mutations,
-        }) catch return try textResponse(self.alloc, 500, "ingest failed");
+        }, cancellation, execution) catch return try textResponse(self.alloc, 500, "ingest failed");
         defer result.deinit(self.alloc);
 
-        var table_result = api_types.TableIngestBatchResult{
-            .table_name = try self.alloc.dupe(u8, table_name),
-            .mutation_count = result.mutation_count,
-            .start_lsn = result.start_lsn,
-            .end_lsn = result.end_lsn,
-        };
-        defer table_result.deinit(self.alloc);
-        return try jsonResponse(self.alloc, 202, table_result);
+        acknowledgement_transferred = true;
+        return acknowledgement.finish(result.start_lsn, result.end_lsn);
     }
 
-    fn handleTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8, request: api_operation.RequestContext) !HttpResponse {
+    /// Stable request-local binding; all provider callbacks retain the real
+    /// handler while the batch additionally borrows its original execution.
+    const PublicBatchWork = struct {
+        handler: *HttpHandler,
+        execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution,
+        table_name: []const u8,
+        body: []const u8,
+        request: api_operation.RequestContext,
+        result: ?public_table_http.OwnedResponse = null,
+
+        fn api(self: *PublicBatchWork) public_table_http.TableApi {
+            return .{ .ptr = self, .request = self.request, .vtable = &.{
+                .execute_table_batch = PublicBatchWork.executePublicTableBatch,
+                .execute_table_query_request = PublicBatchWork.executePublicTableQueryRequest,
+                .execute_table_query_view = PublicBatchWork.executePublicTableQueryView,
+                .execute_table_backup = PublicBatchWork.executePublicTableBackup,
+                .execute_table_restore = PublicBatchWork.executePublicTableRestore,
+                .execute_table_list_indexes = PublicBatchWork.executePublicTableListIndexes,
+                .execute_table_get_index = PublicBatchWork.executePublicTableGetIndex,
+                .execute_table_create_index = PublicBatchWork.executePublicTableCreateIndex,
+                .execute_table_delete_index = PublicBatchWork.executePublicTableDeleteIndex,
+            } };
+        }
+
+        fn run(raw: *anyopaque, _: @import("antfly_runtime_abi").runnable_abi.Borrowed, _: std.Io) !void {
+            const self: *PublicBatchWork = @ptrCast(@alignCast(raw));
+            self.result = try public_table_http.handleTableBatch(self.handler.alloc, self.table_name, self.body, self.api());
+        }
+
+        fn executePublicTableBatch(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            table_name: []const u8,
+            req: db_types.BatchRequest,
+            request: api_operation.RequestContext,
+        ) public_table_http.TableApi.ExecuteBatchError!void {
+            const scope: *PublicBatchWork = @ptrCast(@alignCast(ptr));
+            return HttpHandler.executePublicTableBatchWithExecution(scope.handler, alloc, table_name, req, request, scope.execution);
+        }
+
+        fn executePublicTableQueryRequest(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            table_name: []const u8,
+            body: []const u8,
+            row_filter_json: ?[]const u8,
+            request: api_operation.RequestContext,
+        ) public_table_http.TableApi.ExecuteQueryError![]u8 {
+            const scope: *PublicBatchWork = @ptrCast(@alignCast(ptr));
+            return HttpHandler.executePublicTableQueryRequest(scope.handler, alloc, table_name, body, row_filter_json, request);
+        }
+
+        fn executePublicTableQueryView(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            table_name: []const u8,
+            view: public_table_http.TableApi.TableQueryView,
+            request: api_operation.RequestContext,
+        ) public_table_http.TableApi.ExecuteQueryViewError![]u8 {
+            const scope: *PublicBatchWork = @ptrCast(@alignCast(ptr));
+            return HttpHandler.executePublicTableQueryView(scope.handler, alloc, table_name, view, request);
+        }
+
+        fn executePublicTableBackup(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            table_name: []const u8,
+            backup_id: []const u8,
+            format: backups_api.BackupFormat,
+            expected_fence: ?backups_api.TableBackupFence,
+            location_uri: []const u8,
+            connection: []const u8,
+            location: *backups_api.BackupLocation,
+            receipt: *public_table_http.TableApi.BackupExecutionReceipt,
+            request: api_operation.RequestContext,
+        ) public_table_http.TableApi.ExecuteBackupError!void {
+            const scope: *PublicBatchWork = @ptrCast(@alignCast(ptr));
+            return HttpHandler.executePublicTableBackup(scope.handler, alloc, table_name, backup_id, format, expected_fence, location_uri, connection, location, receipt, request);
+        }
+
+        fn executePublicTableRestore(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            table_name: []const u8,
+            backup_id: []const u8,
+            location_uri: []const u8,
+            connection: []const u8,
+            location: *backups_api.BackupLocation,
+            request: api_operation.RequestContext,
+        ) public_table_http.TableApi.ExecuteRestoreError!void {
+            const scope: *PublicBatchWork = @ptrCast(@alignCast(ptr));
+            return HttpHandler.executePublicTableRestore(scope.handler, alloc, table_name, backup_id, location_uri, connection, location, request);
+        }
+
+        fn executePublicTableListIndexes(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            table_name: []const u8,
+            request: api_operation.RequestContext,
+        ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
+            const scope: *PublicBatchWork = @ptrCast(@alignCast(ptr));
+            return HttpHandler.executePublicTableListIndexes(scope.handler, alloc, table_name, request);
+        }
+
+        fn executePublicTableGetIndex(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            request: api_operation.RequestContext,
+        ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
+            const scope: *PublicBatchWork = @ptrCast(@alignCast(ptr));
+            return HttpHandler.executePublicTableGetIndex(scope.handler, alloc, table_name, index_name, request);
+        }
+
+        fn executePublicTableCreateIndex(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            body: []const u8,
+            request: api_operation.RequestContext,
+        ) public_table_http.TableApi.ExecuteCreateIndexError![]u8 {
+            const scope: *PublicBatchWork = @ptrCast(@alignCast(ptr));
+            return HttpHandler.executePublicTableCreateIndex(scope.handler, alloc, table_name, index_name, body, request);
+        }
+
+        fn executePublicTableDeleteIndex(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            request: api_operation.RequestContext,
+        ) public_table_http.TableApi.ExecuteDeleteIndexError!void {
+            const scope: *PublicBatchWork = @ptrCast(@alignCast(ptr));
+            return HttpHandler.executePublicTableDeleteIndex(scope.handler, alloc, table_name, index_name, request);
+        }
+    };
+
+    fn publicBatchCompletionRetainedBytes() usize {
+        return @import("../catalog/service.zig").CatalogService.Scope.retained_bytes +
+            @sizeOf(PublicBatchWork) + @sizeOf(@import("../../api/runnable_local_completion.zig").Bridge) +
+            @sizeOf(@import("../../api/runnable_write_team.zig").Completion) + @import("../../api/runnable_completion_task.zig").Task.retainedBytes();
+    }
+
+    fn handleTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8, request: api_operation.RequestContext, execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !HttpResponse {
+        var owner: ?@import("../../api/runnable_write_team.zig").Completion = if (execution) |active|
+            try @import("../../api/runnable_write_team.zig").Completion.init(active, self.alloc)
+        else
+            null;
+        var team: @import("antfly_runtime_abi").runnable_abi.Team = undefined;
         var api = self.tableApi(request.cancellation);
         api.request = request;
-        var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, api);
+        if (owner) |*scope| {
+            team = try scope.team();
+            api.request.execution_team = &team;
+        }
+        var work: PublicBatchWork = .{ .handler = self, .execution = execution, .table_name = table_name, .body = body, .request = api.request };
+        defer if (work.result) |*result| result.deinit(self.alloc);
+        if (execution) |active| {
+            const io = self.io orelse return error.MissingBackendRuntimeIo;
+            var bridge: @import("../../api/runnable_local_completion.zig").Bridge = .{ .read = .{ .execution = active, .allocator = self.alloc }, .io = io };
+            const io_borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&io);
+            var task = try @import("../../api/runnable_completion_task.zig").Task.reserve(self.alloc, io, try bridge.borrow(), &.{
+                .io = &io_borrow,
+                .native_deadline = 1,
+                .deadline_ns = platform_time.monotonicNs() +| 30 * std.time.ns_per_s,
+            }, &work, PublicBatchWork.run);
+            defer task.deinit();
+            try request.ensureActive();
+            try task.runAndJoin();
+        } else work.result = try public_table_http.handleTableBatch(self.alloc, table_name, body, work.api());
+        var resp = work.result orelse return error.InvalidRunnableTransition;
+        work.result = null;
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201, 202 => blk: {
@@ -1151,6 +1474,11 @@ pub const HttpHandler = struct {
 
     fn publicationFailureResponse(alloc: std.mem.Allocator, err: anyerror) !?HttpResponse {
         return switch (err) {
+            error.SchedulerFull, error.ResourceTemporarilyUnavailable => blk: {
+                var response = try textResponse(alloc, 503, "publication capacity is busy; retry");
+                response.retry_after_seconds = 1;
+                break :blk response;
+            },
             error.ExternalSourcePlanResolverUnavailable, error.ExternalSourcePlanRequired => try textResponse(alloc, 503, "external source resolution is required; configure an external source resolver before publishing"),
             error.WorkLeaseLost, error.ManifestVersionRetired, error.ManifestReadLeaseExpired, error.ManifestReadLeaseContended, error.DocumentFactsSourceChanged => blk: {
                 var response = try textResponse(alloc, 503, "publication authority changed or another builder is active; retry");
@@ -1353,9 +1681,10 @@ pub const HttpHandler = struct {
         namespace: []const u8,
         table_name: ?[]const u8,
         body: []const u8,
-        cancellation: CancellationToken,
-        diagnostics: ?*api_operation.RequestDiagnostics,
+        request_context: api_operation.RequestContext,
     ) !SearchExecution {
+        const cancellation = request_context.cancellation;
+        const diagnostics = request_context.diagnostics;
         try cancellation.check();
         var status = try self.catalog.buildStatus(namespace);
         errdefer status.deinit(self.alloc);
@@ -1367,7 +1696,7 @@ pub const HttpHandler = struct {
             plan.request.offset = 0;
             plan.request.limit = std.math.maxInt(usize);
         }
-        try self.resolveSemanticQueryRequest(table_name, &plan, cancellation);
+        try self.resolveSemanticQueryRequest(table_name, &plan, request_context);
 
         var session = try self.query.openHeadSessionWithCancellation(namespace, cancellation);
         errdefer session.deinit();
@@ -1396,7 +1725,8 @@ pub const HttpHandler = struct {
         };
     }
 
-    fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+    fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, request_context: api_operation.RequestContext) anyerror![]u8 {
+        const cancellation = request_context.cancellation;
         try cancellation.check();
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
             return error.InvalidQueryRequest;
@@ -1421,7 +1751,7 @@ pub const HttpHandler = struct {
             return error.GraphQueryModeUnsupported;
         }
 
-        if (self.executeForeignPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation) catch |err| switch (err) {
+        if (self.executeForeignPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, request_context) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             else => return err,
@@ -1439,10 +1769,10 @@ pub const HttpHandler = struct {
                 var owned = parsed_join;
                 owned.deinit(self.alloc);
             }
-            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation, null);
+            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, request_context);
         }
 
-        return try self.executePlainPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation, null);
+        return try self.executePlainPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, request_context);
     }
 
     fn executeForeignPublicTableQueryJsonValueAlloc(
@@ -1450,8 +1780,9 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         body: []const u8,
         raw_request: std.json.Value,
-        cancellation: CancellationToken,
+        request_context: api_operation.RequestContext,
     ) anyerror!?[]u8 {
+        const cancellation = request_context.cancellation;
         try cancellation.check();
         if (raw_request != .object) return error.InvalidQueryRequest;
         if (!public_search_request.hasNonNullField(raw_request.object, "foreign_sources"))
@@ -1801,8 +2132,7 @@ pub const HttpHandler = struct {
         self: *HttpHandler,
         table_name: []const u8,
         body: []const u8,
-        cancellation: CancellationToken,
-        diagnostics: ?*api_operation.RequestDiagnostics,
+        request_context: api_operation.RequestContext,
     ) anyerror![]u8 {
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
             return error.InvalidQueryRequest;
@@ -1812,8 +2142,7 @@ pub const HttpHandler = struct {
             table_name,
             body,
             raw_request.value,
-            cancellation,
-            diagnostics,
+            request_context,
         );
     }
 
@@ -1822,14 +2151,14 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         body: []const u8,
         raw_request: std.json.Value,
-        cancellation: CancellationToken,
-        diagnostics: ?*api_operation.RequestDiagnostics,
+        request_context: api_operation.RequestContext,
     ) anyerror![]u8 {
+        const cancellation = request_context.cancellation;
         try cancellation.check();
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
-        const graph_response = self.handleTablePublicGraphQueryRequestValue(table_name, namespace, body, raw_request, cancellation, diagnostics) catch |err| switch (err) {
+        const graph_response = self.handleTablePublicGraphQueryRequestValue(table_name, namespace, body, raw_request, request_context) catch |err| switch (err) {
             // Once the graph boundary has recognized the request, unsupported
             // semantics are an exact-execution capability response, not a
             // malformed request or an internal server failure.
@@ -1854,7 +2183,8 @@ pub const HttpHandler = struct {
         };
         defer if (aggregations_json) |json| self.alloc.free(json);
 
-        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation, diagnostics) catch |err| {
+        var execution = self.executePublishedSearch(namespace, table_name, body, request_context) catch |err| {
+            try request_context.ensureExecutionActive();
             switch (err) {
                 error.InvalidQueryRequest,
                 error.EmbeddingIndexNotFound,
@@ -2533,9 +2863,9 @@ pub const HttpHandler = struct {
         body: []const u8,
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
-        cancellation: CancellationToken,
-        diagnostics: ?*api_operation.RequestDiagnostics,
+        request_context: api_operation.RequestContext,
     ) anyerror![]u8 {
+        const cancellation = request_context.cancellation;
         try cancellation.check();
         var contract_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
@@ -2549,7 +2879,7 @@ pub const HttpHandler = struct {
         const primary_body = rewrite.body;
         defer self.alloc.free(primary_body);
 
-        const primary_json = self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, cancellation, diagnostics) catch |err| {
+        const primary_json = self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, request_context) catch |err| {
             std.log.warn("serverless joined query rejected rewritten left input table={s} err={}", .{ table_name, err });
             return err;
         };
@@ -3005,8 +3335,7 @@ pub const HttpHandler = struct {
             namespace,
             body,
             raw_request.value,
-            cancellation,
-            null,
+            .{ .cancellation = cancellation },
         );
     }
 
@@ -3016,9 +3345,10 @@ pub const HttpHandler = struct {
         namespace: []const u8,
         body: []const u8,
         raw_request: std.json.Value,
-        cancellation: CancellationToken,
-        diagnostics: ?*api_operation.RequestDiagnostics,
+        request_context: api_operation.RequestContext,
     ) !?HttpResponse {
+        const cancellation = request_context.cancellation;
+        const diagnostics = request_context.diagnostics;
         try cancellation.check();
         if (raw_request != .object) return error.InvalidQueryRequest;
         if (raw_request.object.get("graph_searches")) |legacy_graph_request| {
@@ -3137,19 +3467,22 @@ pub const HttpHandler = struct {
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
-            var execution = self.executePublishedSearch(namespace, table_name, search_body, cancellation, diagnostics) catch |err| switch (err) {
-                error.InvalidQueryRequest,
-                error.EmbeddingIndexNotFound,
-                error.InvalidEmbeddingDimensions,
-                error.PermanentPromptFailure,
-                error.TransientPromptFailure,
-                error.VectorQueryRequired,
-                error.VectorDimsMismatch,
-                error.SparseQueryRequired,
-                => return error.InvalidQueryRequest,
-                error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
-                error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
-                else => return err,
+            var execution = self.executePublishedSearch(namespace, table_name, search_body, request_context) catch |err| blk: {
+                try request_context.ensureExecutionActive();
+                break :blk switch (err) {
+                    error.InvalidQueryRequest,
+                    error.EmbeddingIndexNotFound,
+                    error.InvalidEmbeddingDimensions,
+                    error.PermanentPromptFailure,
+                    error.TransientPromptFailure,
+                    error.VectorQueryRequired,
+                    error.VectorDimsMismatch,
+                    error.SparseQueryRequired,
+                    => return error.InvalidQueryRequest,
+                    error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
+                    error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
+                    else => return err,
+                };
             };
             defer execution.deinit(self.alloc);
 
@@ -4043,14 +4376,15 @@ pub const HttpHandler = struct {
         };
     }
 
-    fn handleQuerySearch(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
+    fn handleQuerySearch(self: *HttpHandler, namespace: []const u8, body: []const u8, request_context: api_operation.RequestContext) !HttpResponse {
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer if (aggregations_json) |json| self.alloc.free(json);
 
-        var execution = self.executePublishedSearch(namespace, null, body, cancellation, null) catch |err| {
+        var execution = self.executePublishedSearch(namespace, null, body, request_context) catch |err| {
+            try request_context.ensureExecutionActive();
             switch (err) {
                 error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled => return (try queryOperationalFailureResponse(self.alloc, err)).?,
 
@@ -4136,7 +4470,7 @@ pub const HttpHandler = struct {
         });
     }
 
-    fn handleTableQuerySearch(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
+    fn handleTableQuerySearch(self: *HttpHandler, table_name: []const u8, body: []const u8, request_context: api_operation.RequestContext) !HttpResponse {
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             else => return try textResponse(self.alloc, 500, "query failed"),
@@ -4145,7 +4479,7 @@ pub const HttpHandler = struct {
 
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
-        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation, null) catch |err| switch (err) {
+        var execution = self.executePublishedSearch(namespace, table_name, body, request_context) catch |err| switch (err) {
             error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled => return (try queryOperationalFailureResponse(self.alloc, err)).?,
 
             error.InvalidQueryRequest,
@@ -4269,7 +4603,8 @@ pub const HttpHandler = struct {
         return try self.tableQueryGraphShortestPathResponse(&session, table_name, namespace, req);
     }
 
-    fn resolveSemanticQueryRequest(self: *HttpHandler, table_name: ?[]const u8, plan: *query_mod.SearchPlan, cancellation: CancellationToken) !void {
+    fn resolveSemanticQueryRequest(self: *HttpHandler, table_name: ?[]const u8, plan: *query_mod.SearchPlan, request_context: api_operation.RequestContext) !void {
+        const cancellation = request_context.cancellation;
         try cancellation.check();
         const semantic_search = plan.request.semantic_search orelse return;
         if (plan.request.vector != null) return error.InvalidQueryRequest;
@@ -4279,6 +4614,12 @@ pub const HttpHandler = struct {
         _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
         defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
 
+        const model_context: ?managed_embedder.RequestContext = if (self.io) |io| .{
+            .io = io,
+            .deadline_ns = request_context.deadline_ns,
+            .cancellation = cancellation,
+            .runnable = if (request_context.execution_team) |team| team.borrow else null,
+        } else if (request_context.execution_team != null) return error.MissingBackendRuntimeIo else null;
         const index_name = (plan.vectorSource() orelse return error.InvalidQueryRequest).index_name;
         if (table_name) |name| {
             var table = (try self.catalog.getTableAlloc(self.alloc, name)) orelse return error.InvalidQueryRequest;
@@ -4286,13 +4627,21 @@ pub const HttpHandler = struct {
 
             var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(self.alloc, table.indexes_json, .{
                 .io = self.io,
+                .deadline_ns = request_context.deadline_ns,
+                .cancellation = cancellation,
+                .runnable = if (model_context) |context| context.runnable else null,
                 .remote_content = self.remote_content,
                 .provider_runtime = self.embedding_provider_runtime,
             });
             defer runtime.deinit();
             if (runtime.hasDenseEntries()) {
                 plan.request.vector = if (plan.request.embedding_template) |value|
-                    try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
+                    if (model_context) |context|
+                        try runtime.embedQueryWithTemplateAndContext(self.alloc, index_name, semantic_search, value, context)
+                    else
+                        try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
+                else if (model_context) |context|
+                    try runtime.embedQueryWithContext(self.alloc, index_name, semantic_search, context)
                 else
                     try runtime.embedQueryWithCancellation(self.alloc, index_name, semantic_search, cancellation);
                 return;
@@ -4301,7 +4650,12 @@ pub const HttpHandler = struct {
 
         const runtime = self.managed_query_embedder orelse return error.InvalidQueryRequest;
         plan.request.vector = if (plan.request.embedding_template) |value|
-            try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
+            if (model_context) |context|
+                try runtime.embedQueryWithTemplateAndContext(self.alloc, index_name, semantic_search, value, context)
+            else
+                try runtime.embedQueryWithTemplateAndCancellation(self.alloc, index_name, semantic_search, value, cancellation)
+        else if (model_context) |context|
+            try runtime.embedQueryWithContext(self.alloc, index_name, semantic_search, context)
         else
             try runtime.embedQueryWithCancellation(self.alloc, index_name, semantic_search, cancellation);
     }
@@ -5898,8 +6252,19 @@ pub const HttpHandler = struct {
         req: db_types.BatchRequest,
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
-        _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
+        return executePublicTableBatchWithExecution(self, alloc, table_name, req, request, null);
+    }
+
+    fn executePublicTableBatchWithExecution(
+        self: *HttpHandler,
+        alloc: Allocator,
+        table_name: []const u8,
+        req: db_types.BatchRequest,
+        request: api_operation.RequestContext,
+        execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution,
+    ) public_table_http.TableApi.ExecuteBatchError!void {
+        _ = alloc;
         if (self.runtime_status.role == .query_only) return error.Unavailable;
 
         self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
@@ -5943,11 +6308,8 @@ pub const HttpHandler = struct {
         defer freeDocumentMutations(self.alloc, mutations);
 
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
-        var result = self.api.ingestBatch(.{
-            .namespace = namespace,
-            .timestamp_ns = currentTimeNs(),
-            .mutations = mutations,
-        }) catch |err| {
+        const ingest: api_types.IngestBatchRequest = .{ .namespace = namespace, .timestamp_ns = currentTimeNs(), .mutations = mutations };
+        var result = (if (execution) |active| self.api.ingestBatchInCompletion(ingest, active) else self.api.ingestBatch(ingest)) catch |err| {
             std.log.err("serverless public table batch ingest failed table={s} namespace={s} err={}", .{ table_name, namespace, err });
             return error.InternalFailure;
         };
@@ -6005,14 +6367,39 @@ pub const HttpHandler = struct {
         const sync_request = request.platformDeadline() catch return error.CommittedPending;
         const timeout_ns = 30 * std.time.ns_per_s;
         const start_ns = platform_time.monotonicNs();
-        const deadline_ns = @min(start_ns +| timeout_ns, sync_request.deadline_ns orelse std.math.maxInt(u64));
+        var deadline_ns = @min(start_ns +| timeout_ns, sync_request.deadline_ns orelse std.math.maxInt(u64));
+        if (request.execution_team) |team| if (team.borrow.completion_remaining_ns != null) {
+            const remaining = team.borrow.completionRemainingNs() catch return error.CommittedPending;
+            // Leave bounded terminal-response time inside the already reserved
+            // completion; an optional sync wait cannot consume its whole tail.
+            deadline_ns = @min(deadline_ns, start_ns +| (remaining -| 250 * std.time.ns_per_ms));
+        };
         const sync_cancellation_state = SyncWaitCancellation{
             .upstream = sync_request.cancellation,
             .deadline_ns = deadline_ns,
         };
         const sync_cancellation = sync_cancellation_state.token();
+        const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+        var borrowed_execution: Runnable.Execution = .{};
+        defer borrowed_execution.finish();
+        var bridge: ?@import("../../api/runnable_native_borrow.zig").Bridge = null;
+        if (request.execution_team != null and self.io == null) return error.CommittedPending;
+        // Physical WAL service has joined before this optional sync phase.
+        // Borrow the existing producer authority; keep ordinary write callback
+        // guards and retained-completion activation independent.
+        if (request.execution_team) |team| {
+            const parent = team.borrow.producerParent() catch return error.CommittedPending;
+            bridge = @import("../../api/runnable_native_borrow.zig").Bridge.init(&parent, self.alloc) catch return error.CommittedPending;
+            bridge.?.bind(&borrowed_execution) catch return error.CommittedPending;
+        }
+        const execution: ?*Runnable.Execution = if (bridge != null) &borrowed_execution else null;
+        const wait: ?@import("../maintenance_cancellation.zig").Token = if (self.io) |io| .{
+            .io = io,
+            .cooperative = sync_cancellation,
+            .execution = execution,
+        } else null;
         while (true) {
-            sync_cancellation.check() catch return error.CommittedPending;
+            if (wait) |scope| scope.ownerCheckpoint() catch return error.CommittedPending else sync_cancellation.check() catch return error.CommittedPending;
             const build_result = self.catalog.buildTableWithCancellation(table_name, sync_cancellation) catch |err| switch (err) {
                 error.Canceled => return error.CommittedPending,
                 error.NamespaceNotFound => return error.CommittedRepairRequired,
@@ -6043,7 +6430,7 @@ pub const HttpHandler = struct {
 
             if (syncLevelNeedsBackgroundMaterialization(sync_level, status)) {
                 const runtime = self.runtime_metrics orelse return error.CommittedRepairRequired;
-                _ = runtime.runNamespaceMaterializationOnceWithCancellation(namespace, sync_cancellation) catch |err| switch (err) {
+                _ = runtime.runNamespaceMaterializationWithExecution(namespace, sync_cancellation, execution) catch |err| switch (err) {
                     error.Canceled => return error.CommittedPending,
                     else => {
                         std.log.err("serverless public table batch targeted materialization failed table={s} namespace={s} sync_level={} err={}", .{ table_name, namespace, sync_level, err });
@@ -6075,7 +6462,7 @@ pub const HttpHandler = struct {
                 return error.CommittedPending;
             }
 
-            sleepNs(10 * std.time.ns_per_ms);
+            if (wait) |scope| scope.sleep(.fromMilliseconds(10)) catch return error.CommittedPending else sleepNs(10 * std.time.ns_per_ms);
         }
     }
 
@@ -6160,9 +6547,11 @@ pub const HttpHandler = struct {
         _ = alloc;
         _ = row_filter_json;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        const guard = http_types.RequestGuard{ .context = request };
+        var guard = http_types.RequestGuard{ .context = request };
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
-        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (err) {
+        var query_request = request;
+        query_request.cancellation = guard.token();
+        return self.executePublicTableQueryJsonAlloc(table_name, body, query_request) catch |err| switch (err) {
             error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
@@ -6191,6 +6580,7 @@ pub const HttpHandler = struct {
             error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
             error.Canceled => return error.Canceled,
             else => {
+                guard.checkpoint() catch |cause| return if (cause == error.DeadlineExceeded) error.DeadlineExceeded else error.Canceled;
                 if (public_table_http.queryCancellationError(err)) |operation| return operation;
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -10090,6 +10480,58 @@ fn updateJoinedResponseMetadata(
     });
 }
 
+/// Reserve the entire acknowledgement before ingest can accept a WAL record.
+/// JSON permits leading whitespace before numbers, so fixed-width LSN fields
+/// can be filled without resizing or allocating after acceptance.
+const PreparedIngestResponse = struct {
+    response: HttpResponse,
+    start_offset: usize,
+    end_offset: usize,
+    fn init(alloc: Allocator, value: anytype) !PreparedIngestResponse {
+        var response = try jsonResponse(alloc, 202, value);
+        errdefer response.deinit(alloc);
+        const start_marker = "\"start_lsn\":";
+        const end_marker = "\"end_lsn\":";
+        return .{
+            .response = response,
+            .start_offset = (std.mem.lastIndexOf(u8, response.body, start_marker) orelse return error.InvalidIngestAcknowledgement) + start_marker.len,
+            .end_offset = (std.mem.lastIndexOf(u8, response.body, end_marker) orelse return error.InvalidIngestAcknowledgement) + end_marker.len,
+        };
+    }
+    fn finish(self: *PreparedIngestResponse, start_lsn: u64, end_lsn: u64) HttpResponse {
+        _ = std.fmt.bufPrint(self.response.body[self.start_offset..][0..20], "{d: >20}", .{start_lsn}) catch unreachable;
+        _ = std.fmt.bufPrint(self.response.body[self.end_offset..][0..20], "{d: >20}", .{end_lsn}) catch unreachable;
+        return self.response;
+    }
+};
+
+test "serverless execution ingest acknowledgement needs no memory after acceptance" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var prepared = try PreparedIngestResponse.init(alloc, .{ .namespace = "escaped\"\\\nname", .mutation_count = @as(usize, 2), .start_lsn = std.math.maxInt(u64), .end_lsn = std.math.maxInt(u64) });
+            var response = prepared.finish(1, std.math.maxInt(u64));
+            defer response.deinit(alloc);
+            var parsed = try std.json.parseFromSlice(api_types.IngestBatchResult, std.testing.allocator, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("escaped\"\\\nname", parsed.value.namespace);
+            try std.testing.expectEqual(@as(u64, 1), parsed.value.start_lsn);
+            try std.testing.expectEqual(std.math.maxInt(u64), parsed.value.end_lsn);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    var budget: @import("../../common/allocation_budget.zig").Shared = .{ .child = std.testing.allocator, .limit = 4096 };
+    var prepared = try PreparedIngestResponse.init(budget.allocator(), .{ .table_name = "docs", .mutation_count = @as(usize, 0), .start_lsn = std.math.maxInt(u64), .end_lsn = std.math.maxInt(u64) });
+    budget.limit = 0;
+    var response = prepared.finish(0, 0);
+    var parsed = try std.json.parseFromSlice(api_types.TableIngestBatchResult, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("docs", parsed.value.table_name);
+    try std.testing.expectEqual(@as(u64, 0), parsed.value.start_lsn);
+    try std.testing.expectEqual(@as(u64, 0), parsed.value.end_lsn);
+    response.deinit(budget.allocator());
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().used_bytes);
+}
+
 fn jsonResponse(alloc: Allocator, status: u16, value: anytype) !HttpResponse {
     const content_type = try alloc.dupe(u8, "application/json");
     errdefer alloc.free(content_type);
@@ -11391,7 +11833,7 @@ test "serverless local table query routes a foreign right join before plain sear
         "orders",
         body,
         raw.value,
-        .none,
+        .{},
     )) == null);
 
     var parsed_join = (try parseSupportedJoinRequestValueAlloc(alloc, body, raw.value)).?;
@@ -11599,7 +12041,7 @@ test "http handler executes direct foreign table query through registry" {
         "pg_customers",
         body,
         raw_request.value,
-        .none,
+        .{},
     )).?;
     defer alloc.free(json);
 
@@ -12692,14 +13134,31 @@ test "serverless request deadlines preserve accepted WAL and pending publication
     defer alloc.free(namespace);
     const Clock = struct {
         var ticks: i96 = 0;
+        var accepted: bool = false;
+        var scheduler: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Scheduler = null;
+        var close_after_append: bool = false;
         var append_fn: @FieldType(wal_mod.WalStore.VTable, "append") = undefined;
+        var append_execution_fn: @FieldType(wal_mod.WalStore.VTable, "append_with_execution") = null;
         fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
             return .{ .nanoseconds = ticks };
         }
         fn append(ptr: *anyopaque, ns: []const u8, timestamp: u64, payload: []const u8) !u64 {
-            const lsn = try append_fn(ptr, ns, timestamp, payload);
+            return acceptedLsn(try append_fn(ptr, ns, timestamp, payload));
+        }
+        fn appendWithExecution(ptr: *anyopaque, ns: []const u8, timestamp: u64, payload: []const u8, execution: *@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !u64 {
+            return acceptedLsn(try append_execution_fn.?(ptr, ns, timestamp, payload, execution));
+        }
+        fn acceptedLsn(lsn: u64) !u64 {
             // Deterministic expiry immediately after durable append.
             ticks = 100;
+            accepted = true;
+            if (scheduler) |owner| {
+                try std.testing.expect(owner.mutex.tryLock());
+                const retained = if (owner.entries) |entry| entry.completion_active else false;
+                owner.mutex.unlock();
+                try std.testing.expect(retained);
+                if (close_after_append) owner.close();
+            }
             return lsn;
         }
     };
@@ -12716,8 +13175,10 @@ test "serverless request deadlines preserve accepted WAL and pending publication
 
     const original_vtable = wal_store.vtable;
     Clock.append_fn = original_vtable.append;
+    Clock.append_execution_fn = original_vtable.append_with_execution;
     var wal_vtable = original_vtable.*;
     wal_vtable.append = Clock.append;
+    wal_vtable.append_with_execution = Clock.appendWithExecution;
     wal_store.vtable = &wal_vtable;
     defer wal_store.vtable = original_vtable;
     table_api.request.deadline_ns = 100;
@@ -12727,10 +13188,121 @@ test "serverless request deadlines preserve accepted WAL and pending publication
     try std.testing.expect(std.mem.indexOf(u8, pending.body, "committed") != null);
     try std.testing.expectEqual(@as(u64, 1), try wal_store.latestLsn(namespace));
 
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .cleanup_slots = 1 });
+    defer scheduler.close();
+    handler.setIo(std.testing.io);
+    // Both WAL endpoints must fit in the one general slot even when builds
+    // require a larger team. Keep original rejection and acceptance checks.
+    handler.write_runnable_slots = 2;
+    const namespace_path = try std.fmt.allocPrint(alloc, "/internal/v1/namespaces/{s}/ingest-batch", .{namespace});
+    defer alloc.free(namespace_path);
+    const Probe = struct {
+        cause: anyerror,
+        calls: usize = 0,
+        reject_call: ?usize = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (Clock.accepted or self.reject_call == self.calls) return self.cause;
+        }
+    };
+    const inputs = [_]struct { path: []const u8, body: []const u8 }{
+        .{ .path = namespace_path, .body = "{\"timestamp_ns\":1,\"mutations\":[{\"kind\":\"upsert\",\"doc_id\":\"doc:b\",\"body\":\"beta\"},{\"kind\":\"upsert\",\"doc_id\":\"doc:c\",\"body\":\"gamma\"}]}" },
+        .{ .path = "/tables/docs/ingest-batch", .body = "{\"timestamp_ns\":1,\"mutations\":[{\"kind\":\"upsert\",\"doc_id\":\"doc:b\",\"document\":{\"body\":\"beta\"}},{\"kind\":\"upsert\",\"doc_id\":\"doc:c\",\"document\":{\"body\":\"gamma\"}}]}" },
+    };
+    for ([_]bool{ false, true }) |scheduled| {
+        handler.runnable_scheduler = if (scheduled) &scheduler else null;
+        Clock.scheduler = handler.runnable_scheduler;
+        for (inputs) |input| for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+            Clock.accepted = false;
+            const original_lsn = try wal_store.latestLsn(namespace);
+            // Reject the original guard after input parsing, before durable
+            // completion activation. No mutation may reach the physical WAL.
+            var rejected: Probe = .{ .cause = cause, .reject_call = if (scheduled) 5 else 3 };
+            try std.testing.expectError(cause, handler.handle(.{ .method = .put, .path = input.path, .body = input.body, .cancellation = .{ .ptr = &rejected, .check_fn = Probe.check } }));
+            try std.testing.expectEqual(original_lsn, try wal_store.latestLsn(namespace));
+            try std.testing.expect(!Clock.accepted);
+            try std.testing.expectEqual(rejected.reject_call.?, rejected.calls);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+
+            // The first physical append rejects the foreground lifetime.
+            // Both mutations still finish and the actual handler returns 202.
+            var accepted: Probe = .{ .cause = cause };
+            var acknowledged = try handler.handle(.{ .method = .put, .path = input.path, .body = input.body, .cancellation = .{ .ptr = &accepted, .check_fn = Probe.check } });
+            var acknowledged_live = true;
+            defer if (acknowledged_live) acknowledged.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 202), acknowledged.status);
+            try std.testing.expect(Clock.accepted);
+            try std.testing.expectEqual(original_lsn + 2, try wal_store.latestLsn(namespace));
+            try std.testing.expect(std.mem.indexOf(u8, acknowledged.body, "mutation_count") != null);
+            try std.testing.expectEqual(@as(usize, if (scheduled) 1 else 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+            acknowledged.deinit(alloc);
+            acknowledged_live = false;
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        };
+    }
+    var public_scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .cleanup_slots = 1 });
+    defer public_scheduler.close();
+    handler.runnable_scheduler = &public_scheduler;
+    Clock.scheduler = &public_scheduler;
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        Clock.accepted = false;
+        const before = try wal_store.latestLsn(namespace);
+        var rejected: Probe = .{ .cause = cause };
+        var response = try handler.handle(.{ .method = .post, .path = "/tables/docs/batch", .body = body, .cancellation = .{ .ptr = &rejected, .check_fn = Probe.check } });
+        try std.testing.expectEqual(@as(u16, 202), response.status);
+        try std.testing.expect(Clock.accepted);
+        try std.testing.expectEqual(before + 1, try wal_store.latestLsn(namespace));
+        try std.testing.expectEqual(@as(usize, 1), public_scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), public_scheduler.stats().runnable_slots);
+        response.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), public_scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), public_scheduler.stats().retained_bytes);
+    }
+    var public_closing_scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .cleanup_slots = 1 });
+    defer public_closing_scheduler.close();
+    handler.runnable_scheduler = &public_closing_scheduler;
+    Clock.scheduler = &public_closing_scheduler;
+    Clock.close_after_append = true;
+    Clock.accepted = false;
+    const before_public_close = try wal_store.latestLsn(namespace);
+    var public_rejected: Probe = .{ .cause = error.Canceled };
+    var public_closed = try handler.handle(.{ .method = .post, .path = "/tables/docs/batch", .body = body, .cancellation = .{ .ptr = &public_rejected, .check_fn = Probe.check } });
+    try std.testing.expectEqual(@as(u16, 202), public_closed.status);
+    try std.testing.expectEqual(before_public_close + 1, try wal_store.latestLsn(namespace));
+    public_closed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), public_closing_scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), public_closing_scheduler.stats().retained_bytes);
+    Clock.close_after_append = false;
+    var closing_scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .cleanup_slots = 1, .checkpoint_budget = 1 });
+    defer closing_scheduler.close();
+    handler.runnable_scheduler = &closing_scheduler;
+    Clock.scheduler = &closing_scheduler;
+    Clock.close_after_append = true;
+    Clock.accepted = false;
+    const before_close_lsn = try wal_store.latestLsn(namespace);
+    var closed_response = try handler.handle(.{ .method = .put, .path = inputs[1].path, .body = inputs[1].body });
+    var closed_response_live = true;
+    defer if (closed_response_live) closed_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), closed_response.status);
+    try std.testing.expectEqual(before_close_lsn + 2, try wal_store.latestLsn(namespace));
+    try std.testing.expectEqual(@as(usize, 1), closing_scheduler.stats().operations);
+    closed_response.deinit(alloc);
+    closed_response_live = false;
+    try std.testing.expectEqual(@as(usize, 0), closing_scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), closing_scheduler.stats().runnable_slots);
+    handler.runnable_scheduler = null;
+    Clock.scheduler = null;
+    Clock.close_after_append = false;
+
     // Query read checkpoints preserve the deadline error rather than reducing
     // it to a disconnected-client cancellation.
     Clock.ticks = 0;
-    const guard = http_types.RequestGuard{ .context = .{ .deadline_ns = 100, .deadline_io = borrow } };
+    var guard = http_types.RequestGuard{ .context = .{ .deadline_ns = 100, .deadline_io = borrow } };
     try guard.token().check();
     Clock.ticks = 100;
     try std.testing.expectError(error.DeadlineExceeded, guard.token().check());
@@ -13665,6 +14237,19 @@ test "http handler honors public serverless sync levels on table batch writes" {
             return .{ .ptr = ptr, .vtable = &self.lease_vtable };
         }
 
+        fn acquireFor(ptr: *anyopaque, namespace: []const u8, owner: []const u8, now: u64, ttl: u64, context: Lease.Context) !?Lease.Acquisition {
+            try context.ensureActive();
+            const fs: *FsProgressStore = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("fs", fs);
+            if (self.denied_acquisitions > 0) {
+                self.denied_acquisitions -= 1;
+                return null;
+            }
+            var base = fs.progressStore();
+            const provider = try base.workLeaseProvider();
+            return provider.withContext(context).acquire(namespace, owner, now, ttl);
+        }
+
         fn acquire(ptr: *anyopaque, namespace: []const u8, owner: []const u8, now: u64, ttl: u64) !?Lease.Acquisition {
             const fs: *FsProgressStore = @ptrCast(@alignCast(ptr));
             const self: *@This() = @fieldParentPtr("fs", fs);
@@ -13684,6 +14269,7 @@ test "http handler honors public serverless sync levels on table batch writes" {
     defer progress_store.deinit();
     progress_fixture.lease_vtable = (try progress_store.workLeaseProvider()).vtable.*;
     progress_fixture.lease_vtable.acquire = ContendedProgress.acquire;
+    progress_fixture.lease_vtable.acquire_for = ContendedProgress.acquireFor;
     var progress_vtable = progress_store.vtable.*;
     progress_vtable.work_lease_provider = ContendedProgress.leaseProvider;
     progress_store.vtable = &progress_vtable;
@@ -13849,6 +14435,7 @@ test "serverless sync wait cancellation combines request cancellation and deadli
         .deadline_ns = 0,
     };
     try std.testing.expect(expired.token().isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, expired.token().check());
 
     const upstream_only = SyncWaitCancellation{
         .upstream = CancellationToken.fromAtomic(&upstream_signal),
@@ -15223,7 +15810,7 @@ test "serverless publication errors distinguish retryable authority from identit
         try std.testing.expectEqualStrings("external source resolution is required; configure an external source resolver before publishing", response.body);
         try std.testing.expectEqual(@as(?u32, null), response.retry_after_seconds);
     }
-    for ([_]anyerror{ error.WorkLeaseLost, error.ManifestVersionRetired, error.ManifestReadLeaseExpired, error.ManifestReadLeaseContended, error.DocumentFactsSourceChanged }) |err| {
+    for ([_]anyerror{ error.SchedulerFull, error.ResourceTemporarilyUnavailable, error.WorkLeaseLost, error.ManifestVersionRetired, error.ManifestReadLeaseExpired, error.ManifestReadLeaseContended, error.DocumentFactsSourceChanged }) |err| {
         var response = (try HttpHandler.publicationFailureResponse(alloc, err)).?;
         defer response.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 503), response.status);
@@ -15326,6 +15913,186 @@ test "serverless graph metric compact admission charges actual final backing" {
     try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, small.chargeRetained(partial));
     const zero = try graph_query_mod.GraphQueryEngine.compactMaterializationBytes(0, rows, n);
     try std.testing.expectEqual(@as(usize, 0), zero);
+}
+
+test "serverless execution semantic query routes lend invocation capacity and fence results" {
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const sources = @import("antfly_local_sources");
+    const App = struct {
+        received: std.atomic.Value(bool) = .init(false),
+        block_get: std.atomic.Value(bool) = .init(false),
+        block_post: std.atomic.Value(bool) = .init(false),
+        posts: std.atomic.Value(usize) = .init(0),
+        release: std.Io.Event = .unset,
+        fn execute(raw: *anyopaque, a: Allocator, req: sources.common_http_http_common.HttpRequest) !sources.common_http_http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (req.method == .POST) _ = self.posts.fetchAdd(1, .monotonic);
+            if (if (req.method == .GET) self.block_get.load(.acquire) else self.block_post.load(.acquire)) {
+                self.received.store(true, .release);
+                try self.release.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            }
+            return .{ .status = 200, .content_type = try a.dupe(u8, "text/plain"), .body = try a.dupe(u8, if (req.method == .GET) "alpha" else "{\"data\":[{\"embedding\":[1,0]}]}") };
+        }
+    };
+    const Job = struct {
+        handler: *HttpHandler,
+        request: HttpRequest,
+        done: std.atomic.Value(bool) = .init(false),
+        revoked: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.revoked.load(.acquire)) return error.SemanticRequestRevoked;
+        }
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.request.cancellation = .{ .ptr = self, .check_fn = check };
+            var response = self.handler.handle(self.request) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer response.deinit(std.testing.allocator);
+            if (response.status != 200 or std.mem.indexOf(u8, response.body, "doc-a") == null) {
+                std.debug.print("semantic route {s}: {d} {s}\n", .{ self.request.path, response.status, response.body });
+                self.failure = error.UnexpectedSemanticQueryResult;
+            }
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var app: App = .{};
+    var listener = sources.common_http_std_http_listener.StdHttpListener.init(alloc, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const url = try listener.baseUri(alloc);
+    defer alloc.free(url);
+    const indexes = try std.fmt.allocPrint(alloc, "{{\"semantic_idx\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"url\":\"{s}\"}}}}}}", .{url});
+    defer alloc.free(indexes);
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    var catalog_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-semantic-execution");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-semantic-execution");
+    const wal_root = tmpPath(&wal_root_buf, "wal-semantic-execution");
+    const catalog_root = tmpPath(&catalog_root_buf, "catalog-semantic-execution");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+    defer cleanupTmp(catalog_root);
+
+    var fs_artifacts = try @import("../artifacts/mod.zig").FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+
+    var fs_progress = try @import("../catalog/fs_progress_store.zig").FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+
+    var fs_wal = try @import("../wal/mod.zig").FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var fs_catalog = try @import("../catalog/fs_store.zig").FsStore.init(alloc, std.mem.span(catalog_root));
+    var catalog_store = fs_catalog.catalogStore();
+    defer catalog_store.deinit();
+
+    var builder = build_mod.Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var api = api_service.Service.init(alloc, &wal_store, &builder);
+    var catalog = catalog_mod.CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &catalog_store);
+    defer catalog.deinit();
+    var query = query_mod.QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
+    defer query.deinit();
+    var runtime_status = api_types.RuntimeStatusResult{
+        .role = .combined,
+        .tick_interval_ms = 1,
+        .validated = true,
+        .targets = try alloc.alloc(api_types.RuntimeStorageTarget, 0),
+    };
+    defer runtime_status.deinit(alloc);
+    var handler = HttpHandler.init(alloc, &api, &catalog, &manifest_store, &progress_store, &query, &runtime_status);
+
+    handler.io = io;
+    var remote_content: scraping.RemoteContentConfig = .{ .security = .{ .block_private_ips = false } };
+    handler.remote_content = &remote_content;
+    const create_body = try std.fmt.allocPrint(alloc, "{{\"created_at_ns\":1,\"schema\":{{\"default_type\":\"doc\"}},\"indexes\":{s}}}", .{indexes});
+    defer alloc.free(create_body);
+    var create = try handler.handle(.{ .method = .put, .path = "/tables/docs", .body = create_body });
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), create.status);
+    var ingest = try handler.handle(.{ .method = .put, .path = "/tables/docs/ingest-batch", .body = "{\"timestamp_ns\":2,\"mutations\":[{\"kind\":\"upsert\",\"doc_id\":\"doc-a\",\"document\":{\"body\":\"alpha\",\"embedding\":[1,0]}}]}" });
+    defer ingest.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), ingest.status);
+    var build = try handler.handle(.{ .method = .post, .path = "/internal/v1/tables/docs/build" });
+    defer build.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), build.status);
+    var managed = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes, .{ .io = io, .remote_content = &remote_content });
+    defer managed.deinit();
+    handler.setManagedDenseQueryEmbedder(&managed, "semantic_idx");
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_wait_ms = 5000 });
+    defer scheduler.close();
+    handler.runnable_scheduler = &scheduler;
+    const Terminal = enum { success, revoked, expired };
+    for ([_][]const u8{ "/tables/docs/query", "/tables/docs/query/search", "/internal/v1/namespaces/docs/query/search" }) |path| {
+        for ([_]bool{ false, true }) |templated| {
+            for (std.enums.values(Terminal)) |terminal| {
+                app.received.store(false, .release);
+                app.block_get.store(templated, .release);
+                app.block_post.store(!templated, .release);
+                app.release = .unset;
+                const previous_posts = app.posts.load(.acquire);
+                const body = try std.fmt.allocPrint(alloc, "{{\"semantic_search\":{f},\"limit\":1{s}}}", .{ std.json.fmt(if (templated) url else "alpha", .{}), if (templated) ",\"embedding_template\":\"{{remoteText url=this}}\"" else "" });
+                defer alloc.free(body);
+                var job: Job = .{ .handler = &handler, .request = .{ .method = .post, .path = path, .body = body, .deadline_ns = platform_time.monotonicNs() + if (terminal == .expired) @as(u64, 500 * std.time.ns_per_ms) else 5 * std.time.ns_per_s } };
+                var future = try io.concurrent(Job.run, .{&job});
+                defer future.cancel(io);
+                defer app.release.set(io);
+                const until = platform_time.monotonicNs() + 3 * std.time.ns_per_s;
+                while (!app.received.load(.acquire) or scheduler.stats().runnable_slots != 0) {
+                    if (job.done.load(.acquire)) return job.failure orelse error.SemanticQueryDidNotWait;
+                    if (platform_time.monotonicNs() >= until) return error.SemanticQueryKeptCapacity;
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                }
+                try std.testing.expect(scheduler.stats().retained_bytes >= HttpHandler.requestRetainedBytes());
+                var other_query = try handler.handle(.{ .method = .get, .path = "/health" });
+                try std.testing.expectEqual(@as(u16, 200), other_query.status);
+                other_query.deinit(alloc);
+                var held: Runnable.Execution = .{};
+                defer held.finish();
+                try held.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+                var health = try handler.handle(.{ .method = .get, .path = "/healthz" });
+                try std.testing.expectEqual(@as(u16, 200), health.status);
+                health.deinit(alloc);
+                app.release.set(io);
+                if (terminal == .success) held.finish() else {
+                    while (scheduler.stats().queued == 0) {
+                        if (job.done.load(.acquire)) return job.failure orelse error.SemanticQueryDidNotQueue;
+                        if (platform_time.monotonicNs() >= until) return error.SemanticQueryDidNotQueue;
+                        try io.sleep(.fromMilliseconds(1), .awake);
+                    }
+                    if (terminal == .revoked) job.revoked.store(true, .release);
+                    while (!job.done.load(.acquire)) {
+                        if (platform_time.monotonicNs() >= until) return error.SemanticQueryDidNotReject;
+                        try io.sleep(.fromMilliseconds(1), .awake);
+                    }
+                }
+                future.await(io);
+                if (terminal == .success) {
+                    if (job.failure) |err| return err;
+                } else try std.testing.expectEqual(if (terminal == .revoked) error.SemanticRequestRevoked else error.DeadlineExceeded, job.failure.?);
+                if (templated and terminal != .success) try std.testing.expectEqual(previous_posts, app.posts.load(.acquire));
+                try std.testing.expect(managed.entries[0].runnable == null and managed.entries[0].cancellation == null and managed.entries[0].http_control == null);
+                held.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+                try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().in_flight);
+            }
+        }
+    }
 }
 
 test "highlight query operational errors preserve public deadline and cancellation outcomes" {

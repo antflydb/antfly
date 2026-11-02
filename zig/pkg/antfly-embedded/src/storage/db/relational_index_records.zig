@@ -541,6 +541,7 @@ pub const RangeRepair = struct {
 pub const Staged = struct {
     arena: std.heap.ArenaAllocator,
     base: *docstore.DocStore.Txn,
+    observations: ?*@import("prepared_read_set.zig").Owned = null,
     pending: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     range_active: ?bool = null,
     touched_unchanged_spans: std.AutoHashMapUnmanaged([@import("../range_protection.zig").index_span_digest_bytes]u8, void) = .empty,
@@ -567,7 +568,7 @@ pub const Staged = struct {
     pub fn get(self: *Staged, key: []const u8) ![]const u8 {
         try self.requireOpen();
         if (self.pending.get(key)) |value| return value orelse error.NotFound;
-        return self.base.get(key);
+        return @import("prepared_read_set.zig").observeTxn(self.base, self.observations).get(key);
     }
 
     pub fn put(self: *Staged, key: []const u8, value: []const u8) !void {
@@ -598,7 +599,7 @@ pub const Staged = struct {
     /// still advance with the primary write even though no forward key moves.
     fn touchUnchangedSpan(self: *Staged, id: Id, tuple: []const u8) !void {
         const tracking = @import("../range_protection.zig");
-        if (self.range_active == null) self.range_active = try tracking.isActive(self.base);
+        if (self.range_active == null) self.range_active = try tracking.isActive(@import("prepared_read_set.zig").observeTxn(self.base, self.observations));
         if (!self.range_active.?) return;
         const digest = try tracking.indexTupleSpanDigest(id.encode(), tuple);
         const seen = try self.touched_unchanged_spans.getOrPut(self.arena.allocator(), digest);
@@ -666,7 +667,7 @@ pub const Staged = struct {
         try internal.appendDocumentPrefix(&prefix, alloc, document);
         try prefix.append(alloc, internal.relational_index_reverse_kind);
         var ids = std.AutoHashMapUnmanaged(u128, Id).empty;
-        var cursor = try self.base.openCursor();
+        var cursor = try @import("prepared_read_set.zig").observeTxn(self.base, self.observations).openCursor();
         defer cursor.close();
         var entry = try cursor.seekAtOrAfter(prefix.items);
         while (entry) |kv| : (entry = try cursor.next()) {
@@ -1224,4 +1225,73 @@ test "relational index records preserve primary and index pairs across LSM reope
         }
         try txn.commit();
     }
+}
+
+test "prepared transaction effects relational staging owns source observations without staged postimages" {
+    const alloc = std.testing.allocator;
+    const read_set = @import("prepared_read_set.zig");
+    const Backend = @import("../lsm_backend.zig").Backend;
+    var backend = Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+    var store = try docstore.DocStore.openRuntime(alloc, &runtime);
+    defer store.close();
+    var plan = try testPlan(alloc);
+    defer plan.release();
+    const document = "doc\x00:1";
+    var row = try testRow(alloc, plan, document, "{\"id\":7,\"tenant\":1,\"label\":\"Alpha\"}");
+    defer row.deinit(alloc);
+    var batch = plans.Batch.init(alloc, plan);
+    defer batch.deinit();
+    _ = try batch.appendPrepared(&row);
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try writer.upsertPrepared(&txn, plan, &batch, 0, document, .new_or_building);
+        try txn.put("observation", "before");
+        try txn.commit();
+    }
+    var captured = read_set.Owned.init(alloc, null);
+    defer captured.deinit();
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var stage = Staged.init(alloc, &txn);
+        defer stage.deinit();
+        stage.observations = &captured;
+        try std.testing.expectEqualStrings("before", try stage.get("observation"));
+        try stage.put("observation", "after");
+        try std.testing.expectEqualStrings("after", try stage.get("observation"));
+        try stage.delete("observation");
+        try std.testing.expectError(error.NotFound, stage.get("observation"));
+        try stage.deleteDocument(&writer, document);
+        const effects = try stage.seal();
+        try std.testing.expect(effects.deletes.len >= 5);
+        try std.testing.expectEqualStrings("before", try txn.get("observation"));
+        try captured.finish();
+    }
+    var owned = try captured.take();
+    defer owned.deinit();
+    try owned.validate(&store, null);
+    // Source values and reverse membership remain authoritative after staging
+    // and its source transaction retire; no staged tombstone becomes a proof.
+    try store.put("observation", "changed");
+    try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&store, null));
+    try store.put("observation", "before");
+    try owned.validate(&store, null);
+    var reverse: std.ArrayList(u8) = .empty;
+    defer reverse.deinit(alloc);
+    try appendReverseKey(alloc, &reverse, plan.boundIndexes()[0].id(), document);
+    const value = try store.get(alloc, reverse.items);
+    defer alloc.free(value);
+    try store.delete(reverse.items);
+    try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&store, null));
+    try store.put(reverse.items, value);
+    try owned.validate(&store, null);
+    try reverse.append(alloc, 0);
+    try store.put(reverse.items, "new reverse member");
+    try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&store, null));
 }

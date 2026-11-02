@@ -14,6 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const Provider = @import("../provider_operation.zig");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 fn transportCancellationRequested(raw: *const anyopaque) bool {
@@ -36,6 +38,7 @@ pub const ObjectStore = struct {
     opened: object_store_support.OpenedObjectStore,
     clock: platform_clock.Clock,
     write_version: u16 = manifest_codec.wire_version,
+    operation: Provider.Operation = .{},
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
         return try initRemoteUriWithS3Options(alloc, uri, null);
@@ -106,18 +109,28 @@ pub const ObjectStore = struct {
     }
 
     pub fn put(self: *ObjectStore, manifest: manifest_types.Manifest) !void {
+        return self.putForOperation(manifest, .{});
+    }
+    fn putFor(raw: *anyopaque, manifest: manifest_types.Manifest, context: Context) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        return self.putForOperation(manifest, .{ .context = context });
+    }
+    fn putForOperation(self: *ObjectStore, manifest: manifest_types.Manifest, operation: Provider.Operation) !void {
+        try operation.ready();
         const key = try manifestKeyAlloc(self.alloc, self.opened.prefix, manifest.namespace, manifest.version);
         defer self.alloc.free(key);
         const encoded = try manifest_codec.encodeForVersionAlloc(self.alloc, manifest, self.write_version);
         defer self.alloc.free(encoded);
 
-        if (try self.tryGetEncoded(self.alloc, key)) |existing| {
+        if (try self.tryGetEncodedFor(self.alloc, key, &operation)) |existing| {
             defer self.alloc.free(existing);
-            if (!std.mem.eql(u8, existing, encoded)) return error.ManifestVersionAlreadyExists;
+            const matches = std.mem.eql(u8, existing, encoded);
+            try operation.ready();
+            if (!matches) return error.ManifestVersionAlreadyExists;
             return;
         }
 
-        var result = self.opened.client.putObject(self.opened.bucket, key, encoded, .{
+        var result = operation.put(&self.opened.client, self.opened.bucket, key, encoded, .{
             .content_type = "application/octet-stream",
             .if_none_match = true,
         }) catch |err| switch (err) {
@@ -126,10 +139,12 @@ pub const ObjectStore = struct {
                 // publishers may both observe a missing key before one wins
                 // the conditional create. Treat the loser as idempotent only
                 // when the winner published exactly the same manifest.
-                const existing = (try self.getWinnerAfterPrecondition(self.alloc, key)) orelse
+                const existing = (try self.getWinnerAfterPreconditionFor(self.alloc, key, &operation)) orelse
                     return error.PreconditionFailed;
                 defer self.alloc.free(existing);
-                if (!std.mem.eql(u8, existing, encoded)) return error.ManifestVersionAlreadyExists;
+                const matches = std.mem.eql(u8, existing, encoded);
+                try operation.ready();
+                if (!matches) return error.ManifestVersionAlreadyExists;
                 return;
             },
             else => return err,
@@ -142,13 +157,25 @@ pub const ObjectStore = struct {
     }
 
     pub fn getAllocWithCancellation(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, version: u64, cancellation: CancellationToken) !manifest_types.Manifest {
+        return getAllocFor(self, alloc, namespace, version, cancellation, .{});
+    }
+    fn getAllocFor(raw: *anyopaque, alloc: std.mem.Allocator, namespace: []const u8, version: u64, cancellation: CancellationToken, context: Context) !manifest_types.Manifest {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        const operation: Provider.Operation = .{ .context = context, .cancellation = cancellation };
+
         const key = try manifestKeyAlloc(alloc, self.opened.prefix, namespace, version);
         defer alloc.free(key);
         var client = self.opened.client;
         client.allocator = alloc;
-        var result = try client.getObject(self.opened.bucket, key, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = transportCancellationRequested } });
+        var result = try operation.get(&client, self.opened.bucket, key, .{});
         defer result.deinit(alloc);
-        return try manifest_codec.decodeAlloc(alloc, result.body);
+        var manifest = manifest_codec.decodeAlloc(alloc, result.body) catch |err| {
+            try operation.check();
+            return err;
+        };
+        errdefer manifest.deinit(alloc);
+        try operation.ready();
+        return manifest;
     }
 
     fn borrowedProgress(self: *ObjectStore) @import("../catalog/object_progress_store.zig").ObjectProgressStore {
@@ -189,6 +216,13 @@ pub const ObjectStore = struct {
     }
 
     fn listVersionsAllocWithPageSize(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, page_size: u32) ![]u64 {
+        return self.listVersionsForOperation(alloc, namespace, page_size, &.{});
+    }
+    fn listVersionsFor(raw: *anyopaque, alloc: std.mem.Allocator, namespace: []const u8, context: Context) ![]u64 {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        return self.listVersionsForOperation(alloc, namespace, 1000, &.{ .context = context });
+    }
+    fn listVersionsForOperation(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, page_size: u32, operation: *const Provider.Operation) ![]u64 {
         if (page_size == 0) return error.InvalidPageSize;
         var client = self.opened.client;
         client.allocator = alloc;
@@ -200,7 +234,7 @@ pub const ObjectStore = struct {
         var continuation_token: ?[]u8 = null;
         defer if (continuation_token) |token| alloc.free(token);
         while (true) {
-            var listed = try client.listObjects(self.opened.bucket, .{
+            var listed = try operation.list(&client, self.opened.bucket, .{
                 .prefix = prefix,
                 .recursive = true,
                 .max_keys = page_size,
@@ -223,11 +257,14 @@ pub const ObjectStore = struct {
             if (continuation_token == null) break;
         }
         std.mem.sort(u64, versions.items, {}, std.sort.asc(u64));
-        return try versions.toOwnedSlice(alloc);
+        const result = try versions.toOwnedSlice(alloc);
+        errdefer alloc.free(result);
+        try operation.ready();
+        return result;
     }
 
     pub fn deleteVersion(self: *ObjectStore, namespace: []const u8, version: u64) !void {
-        const current_head = self.getHead(namespace) catch |err| switch (err) {
+        const current_head = self.headForOperation(namespace) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
@@ -235,14 +272,14 @@ pub const ObjectStore = struct {
 
         const key = try manifestKeyAlloc(self.alloc, self.opened.prefix, namespace, version);
         defer self.alloc.free(key);
-        try self.opened.client.deleteObject(self.opened.bucket, key, .{});
+        try self.operation.delete(&self.opened.client, self.opened.bucket, key, .{});
     }
 
     pub fn deleteRetiredCandidate(self: *ObjectStore, namespace: []const u8, version: u64, cutoff: u64) !bool {
         if (cutoff == 0) return error.InvalidPublicationFence;
         const key = try manifestKeyAlloc(self.alloc, self.opened.prefix, namespace, version);
         defer self.alloc.free(key);
-        var object = self.opened.client.getObject(self.opened.bucket, key, .{}) catch |err| switch (err) {
+        var object = self.operation.get(&self.opened.client, self.opened.bucket, key, .{}) catch |err| switch (err) {
             error.FileNotFound => return false,
             else => return err,
         };
@@ -253,12 +290,12 @@ pub const ObjectStore = struct {
         // Do not substitute a separate HEAD/STAT identity: recreation between
         // GET and STAT could pair old authority with the new object's ETag.
         const etag = object.metadata.etag orelse return error.ConditionalManifestDeletionUnsupported;
-        const head = self.getHead(namespace) catch |err| switch (err) {
+        const head = self.headForOperation(namespace) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
         if (head == version) return error.CannotDeleteHead;
-        self.opened.client.deleteObject(self.opened.bucket, key, .{ .if_match_etag = etag }) catch |err| switch (err) {
+        self.operation.delete(&self.opened.client, self.opened.bucket, key, .{ .if_match_etag = etag }) catch |err| switch (err) {
             error.FileNotFound, error.PreconditionFailed => return false,
             else => return err,
         };
@@ -266,7 +303,12 @@ pub const ObjectStore = struct {
     }
 
     fn tryGetEncoded(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
-        var result = self.opened.client.getObject(self.opened.bucket, key, .{}) catch |err| switch (err) {
+        return self.tryGetEncodedFor(alloc, key, &.{});
+    }
+    fn tryGetEncodedFor(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8, operation: *const Provider.Operation) !?[]u8 {
+        var client = self.opened.client;
+        client.allocator = alloc;
+        var result = operation.get(&client, self.opened.bucket, key, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -275,20 +317,44 @@ pub const ObjectStore = struct {
     }
 
     fn getWinnerAfterPrecondition(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+        return self.getWinnerAfterPreconditionFor(alloc, key, &.{});
+    }
+    fn getWinnerAfterPreconditionFor(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8, operation: *const Provider.Operation) !?[]u8 {
         // Native backends are read-after-write consistent. Keep host adapter
         // tolerance bounded so publication cannot block indefinitely or accept
         // an unverified winner after a conditional-create race.
         var backoff_ms = winner_visibility_initial_backoff_ms;
         for (0..winner_visibility_attempts) |attempt| {
-            if (try self.tryGetEncoded(alloc, key)) |existing| return existing;
+            if (try self.tryGetEncodedFor(alloc, key, operation)) |existing| return existing;
             if (attempt + 1 == winner_visibility_attempts) return null;
-            self.clock.sleepMs(backoff_ms);
+            if (operation.context.io != null) try operation.sleep(backoff_ms) else self.clock.sleepMs(backoff_ms);
             backoff_ms = @min(backoff_ms * 2, winner_visibility_max_backoff_ms);
         }
         unreachable;
     }
 
+    fn headForOperation(self: *ObjectStore, ns: []const u8) !u64 {
+        var backend = self.borrowedProgress();
+        var progress = backend.progressStore();
+        progress.context = self.operation.context;
+        return progress.getHeadWithCancellation(ns, self.operation.cancellation);
+    }
+    fn deleteFor(raw: *anyopaque, ns: []const u8, version: u64, context: Context) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        var view: ObjectStore = .{ .alloc = self.alloc, .opened = self.opened, .clock = self.clock, .write_version = self.write_version, .operation = .{ .context = context } };
+        try view.deleteVersion(ns, version);
+    }
+    fn candidateFor(raw: *anyopaque, ns: []const u8, version: u64, cutoff: u64, context: Context) !bool {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        var view: ObjectStore = .{ .alloc = self.alloc, .opened = self.opened, .clock = self.clock, .write_version = self.write_version, .operation = .{ .context = context } };
+        return view.deleteRetiredCandidate(ns, version, cutoff);
+    }
     const vtable: manifest_store.ManifestStore.VTable = .{
+        .delete_version_for = deleteFor,
+        .delete_retired_candidate_for = candidateFor,
+        .put_for = putFor,
+        .get_alloc_for = getAllocFor,
+        .list_versions_for = listVersionsFor,
         .deinit = erasedDeinit,
         .put = erasedPut,
         .get_alloc = erasedGetAlloc,

@@ -87,6 +87,10 @@ pub const Stream = struct {
     headers_flags: u8 = 0,
     /// Accumulated DATA frame payloads for this stream.
     data_buf: std.ArrayListUnmanaged(u8) = .empty,
+    data_allocator: ?Allocator = null,
+    protected_body_deadline_ms: ?i64 = null,
+    /// Original request lifetime, established once before handler publication.
+    request_deadline_ms: i64 = 0,
     /// Error from RST_STREAM or connection error, set by the receive loop.
     stream_error: ?anyerror = null,
     /// True once the receive loop has delivered HEADERS for this stream.
@@ -139,7 +143,7 @@ pub const Stream = struct {
         if (self.data_budget) |budget| budget.release(self.data_budget_reserved);
         self.data_budget = null;
         self.data_budget_reserved = 0;
-        self.data_buf.deinit(allocator);
+        self.data_buf.deinit(self.data_allocator orelse allocator);
         freeDecodedHeaders(allocator, self.request_headers);
         freeDecodedHeaders(allocator, self.trailer_headers);
     }
@@ -168,7 +172,7 @@ pub const Stream = struct {
     pub fn responseWriteError(self: *const Self, is_server: bool) ?anyerror {
         const err = self.stream_error orelse return null;
         return if (err == error.BodyCapacityExceeded or
-            (is_server and err == error.StreamDataOverflow)) null else err;
+            (is_server and (err == error.StreamDataOverflow or err == error.OutOfMemory))) null else err;
     }
 
     /// Transitions state after sending END_STREAM.
@@ -252,6 +256,8 @@ pub const StreamManager = struct {
     is_client: bool = true,
 
     /// Connection-level send window.
+    /// Peer INITIAL_WINDOW_SIZE applies to future streams as well as live ones.
+    initial_send_window: i32 = 65535,
     connection_send_window: i32 = 65535,
     /// Connection-level receive window.
     connection_recv_window: i32 = 65535,
@@ -315,6 +321,7 @@ pub const StreamManager = struct {
 
         const stream = try self.allocator.create(Stream);
         stream.* = Stream.init(id);
+        stream.send_window = self.initial_send_window;
         stream.state = .open;
         errdefer self.allocator.destroy(stream);
         try self.streams.put(self.allocator, id, stream);
@@ -361,6 +368,7 @@ pub const StreamManager = struct {
 
         const stream = try self.allocator.create(Stream);
         stream.* = Stream.init(id);
+        stream.send_window = self.initial_send_window;
         errdefer self.allocator.destroy(stream);
         try self.streams.put(self.allocator, id, stream);
         return stream;
@@ -397,6 +405,7 @@ pub const StreamManager = struct {
     pub fn applyInitialWindowSizeChange(self: *Self, io: Io, old_size: u32, new_size: u32) !void {
         if (new_size > std.math.maxInt(i32) or old_size > std.math.maxInt(i32)) return error.FlowControlError;
         const delta = @as(i32, @intCast(new_size)) - @as(i32, @intCast(old_size));
+        self.initial_send_window = @intCast(new_size);
         var it = self.streams.iterator();
         while (it.next()) |entry| {
             const s = entry.value_ptr.*;

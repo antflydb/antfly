@@ -249,7 +249,7 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
         job.state = .ready;
         job.declarations = ready;
         job.last_error = null;
-        if (map_writer) |*writer| if (try writer.finish(cancellation(context))) |root| {
+        if (map_writer) |*writer| if (try writer.finishFor(cancellation(context), context)) |root| {
             defer maps.freeRef(writer.a, root);
             job.cloud_generations = .{ .root = try maps.cloneRef(scratch, root), .complete = writer.complete and !writer.disabled };
         };

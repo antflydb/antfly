@@ -16,6 +16,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const admission = @import("../../../common/read_admission.zig");
+const cleanup_wait = @import("../../../common/cleanup_wait.zig");
+const maintenance_stop = @import("../maintenance_stop.zig");
+
 const Allocator = std.mem.Allocator;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
@@ -58,6 +62,11 @@ const UnsupportedSparseCompactionRuntime = struct {
         return false;
     }
 
+    pub fn stopWithAdmission(self: *@This(), original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.config.enabled) return error.UnsupportedPlatform;
+    }
+
     pub fn pause(_: *@This()) bool {
         return false;
     }
@@ -91,6 +100,12 @@ const PlatformSparseCompactionRuntime = struct {
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
     lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    closing: std.atomic.Value(bool) = .init(false),
+    join_finisher: bool = false,
+    joined: Io.Event = .unset,
+    join_changed: Io.Event = .unset,
+    join_generation: std.atomic.Value(u64) = .init(0),
+    join_waiters: std.atomic.Value(u32) = .init(0),
     desired_running: bool = false,
     paused: bool = false,
     shutdown: bool = false,
@@ -123,26 +138,78 @@ const PlatformSparseCompactionRuntime = struct {
     }
 
     pub fn start(self: *SparseCompactionRuntime) !void {
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (!self.config.enabled) return;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
+        if (self.closing.load(.acquire)) return error.Canceled;
         self.desired_running = true;
         self.paused = false;
         try self.startLocked();
     }
 
     pub fn stop(self: *SparseCompactionRuntime) bool {
+        if (self.closing.load(.acquire)) {
+            self.finalJoin().stop(self.io, false);
+            return false;
+        }
         if (!self.config.enabled) return false;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
+        if (self.closing.load(.acquire)) {
+            self.lifecycle_mutex.unlock();
+            self.finalJoin().stop(self.io, false);
+            return false;
+        }
         defer self.lifecycle_mutex.unlock();
         self.desired_running = false;
         self.paused = true;
         return self.stopLocked();
     }
 
+    fn finalJoin(self: *SparseCompactionRuntime) maintenance_stop.Borrowed {
+        return .{
+            .mutex = &self.lifecycle_mutex,
+            .registration = &self.future,
+            .stopping = &self.closing,
+            .finisher = &self.join_finisher,
+            .joined = &self.joined,
+            .changed = &self.join_changed,
+            .generation = &self.join_generation,
+            .waiters = &self.join_waiters,
+        };
+    }
+
+    /// Permanently fence new passes, then lend the original cleanup execution
+    /// while the accepted callback retires. A rejected wait retains its handle
+    /// and lease for retry; physical destruction owns lease release.
+    pub fn stopWithAdmission(self: *SparseCompactionRuntime, original: admission.Port) !void {
+        self.closing.store(true, .release);
+        if (self.io) |io| {
+            try cleanup_wait.lockAtomic(&self.lifecycle_mutex, io, original);
+            self.desired_running = false;
+            self.paused = true;
+            self.lifecycle_mutex.unlock();
+            try cleanup_wait.lockIo(&self.mutex, io, original);
+            self.shutdown = true;
+            self.notified = true;
+            self.cond.broadcast(io);
+            self.mutex.unlock(io);
+        }
+        try self.finalJoin().stopWithAdmission(self.io, original);
+    }
+
     pub fn pause(self: *SparseCompactionRuntime) bool {
+        if (self.closing.load(.acquire)) {
+            self.finalJoin().stop(self.io, false);
+            return false;
+        }
         if (!self.config.enabled) return false;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
+        if (self.closing.load(.acquire)) {
+            self.lifecycle_mutex.unlock();
+            self.finalJoin().stop(self.io, false);
+            return false;
+        }
         defer self.lifecycle_mutex.unlock();
         self.paused = true;
         const desired = self.desired_running;
@@ -151,17 +218,21 @@ const PlatformSparseCompactionRuntime = struct {
     }
 
     pub fn resumeAfterPause(self: *SparseCompactionRuntime) !void {
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (!self.config.enabled) return;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
+        if (self.closing.load(.acquire)) return error.Canceled;
         self.paused = false;
         if (self.desired_running) try self.startLocked();
     }
 
     pub fn ensureRunning(self: *SparseCompactionRuntime) !bool {
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (!self.config.enabled) return true;
         lockAtomicWithBackoff(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (!self.desired_running) return true;
         if (self.paused) return false;
         try self.startLocked();
@@ -175,6 +246,7 @@ const PlatformSparseCompactionRuntime = struct {
     }
 
     fn startLocked(self: *SparseCompactionRuntime) !void {
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (self.future != null or self.paused or !self.desired_running) return;
         const io = self.io orelse return error.MissingBackendRuntimeIo;
         if (builtin.is_test and consumeTestStartFailure()) return error.TestTransientMaintenanceRestart;
@@ -201,6 +273,7 @@ const PlatformSparseCompactionRuntime = struct {
     }
 
     pub fn notify(self: *SparseCompactionRuntime) void {
+        if (self.closing.load(.acquire)) return;
         if (self.backend_runtime) |backend| backend.wakeMaintenance(self);
         if (!self.config.enabled) return;
         const io = self.io orelse return;
@@ -220,6 +293,7 @@ const PlatformSparseCompactionRuntime = struct {
     }
 
     pub fn runOnce(self: *SparseCompactionRuntime) !bool {
+        if (self.closing.load(.acquire)) return error.Canceled;
         var maybe_task: ?index_manager_mod.IndexManager.SparseCompactionTask = null;
         if (!try lockApplyExclusiveCancellable(self)) return false;
         maybe_task = self.index_manager.beginSparseCompactionTask() catch |err| {
@@ -323,6 +397,7 @@ fn workerStep(runtime: *SparseCompactionRuntime) ?u64 {
 }
 
 fn isShutdown(runtime: *SparseCompactionRuntime) bool {
+    if (runtime.closing.load(.acquire)) return true;
     const io = runtime.io orelse return runtime.shutdown;
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);

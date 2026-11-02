@@ -143,6 +143,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
     const shared = &db.local_execution.online_merge_reader;
     try shared.mutex.lock(io);
     defer shared.mutex.unlock(io);
+    if (shared.closing.load(.acquire)) return error.Canceled;
     const progress = try db.onlineSourceStatus(scope);
     if (progress.phase == .released or progress.snapshot_phase != .published or !std.mem.eql(u8, &progress.snapshot_certificate, &try certificate.digest())) return error.SourceSnapshotCutMismatch;
     if (shared.scope == null or !std.meta.eql(shared.scope.?, scope)) {

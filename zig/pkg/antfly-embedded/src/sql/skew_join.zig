@@ -25,6 +25,7 @@ pub const NativePair = struct { left: ?NativeRow, right: ?NativeRow, match: ?usi
 pub const Join = struct {
     a: A,
     manager: *spill.Manager,
+    execution: ?*@import("../common/runnable_scheduler.zig").Execution = null,
     outer_left: bool,
     outer_right: bool,
     build_input: ?spill.Sequential.InputBlock = null,
@@ -46,11 +47,14 @@ pub const Join = struct {
     blocks_read: usize = 0,
 
     pub fn create(manager: *spill.Manager, outer_left: bool, outer_right: bool) !*Join {
+        return createFor(manager, outer_left, outer_right, null);
+    }
+    pub fn createFor(manager: *spill.Manager, outer_left: bool, outer_right: bool, execution: ?*@import("../common/runnable_scheduler.zig").Execution) !*Join {
         const a = manager.allocator();
         const self = try a.create(Join);
         errdefer a.destroy(self);
-        self.* = .{ .a = a, .manager = manager, .outer_left = outer_left, .outer_right = outer_right, .output = .init(a) };
-        if (outer_right) self.matches = try manager.create();
+        self.* = .{ .a = a, .manager = manager, .execution = execution, .outer_left = outer_left, .outer_right = outer_right, .output = .init(a) };
+        if (outer_right) self.matches = try manager.createFor(execution);
         if (self.matches) |*file| file.buffer_bytes = 256;
         return self;
     }
@@ -119,7 +123,7 @@ pub const Join = struct {
         self.last_match = null;
         self.last_probe = null;
         while (true) {
-            try self.manager.check();
+            try self.manager.checkFor(self.execution);
             if (self.probe_done) {
                 if (!self.outer_right) return null;
                 if (!try self.loadBuild(build)) return null;
@@ -166,7 +170,7 @@ pub const Join = struct {
             const build_block = self.build_input.?.view();
             if (build_block.keyWidth() != probe_block.keyWidth()) return error.InvalidSqlSpill;
             while (self.build_row < build_block.count()) {
-                try self.manager.check();
+                try self.manager.checkFor(self.execution);
                 while (self.probe_row < probe_block.count()) {
                     const row = self.probe_row;
                     self.probe_row += 1;

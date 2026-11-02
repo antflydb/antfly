@@ -111,10 +111,21 @@ pub fn validateTextDomain(value: Json, budget: *Budget, depth: usize) !void {
     }
 }
 
-fn validateText(text: []const u8, budget: *Budget) !void {
+pub fn validateText(text: []const u8, budget: *Budget) !void {
     try budget.consume(text.len);
-    if (!std.unicode.utf8ValidateSlice(text)) return error.SqlInvalidTextEncoding;
-    if (std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlUntranslatableCharacter;
+    var offset: usize = 0;
+    var checked: usize = 0;
+    while (offset < text.len) {
+        if (offset >= checked) {
+            try budget.poll();
+            checked = offset +| 4096;
+        }
+        if (text[offset] == 0) return error.SqlUntranslatableCharacter;
+        const width = std.unicode.utf8ByteSequenceLength(text[offset]) catch return error.SqlInvalidTextEncoding;
+        if (width > text.len - offset) return error.SqlInvalidTextEncoding;
+        _ = std.unicode.utf8Decode(text[offset..][0..width]) catch return error.SqlInvalidTextEncoding;
+        offset += width;
+    }
 }
 
 /// The caller owns the allocation region and its byte admission. All retained
@@ -267,6 +278,7 @@ const Decimal = struct {
     negative: bool,
     magnitude: i64,
     digits: []const u8,
+    float_compatible: bool = true,
 
     fn parse(text: []const u8, budget: *Budget) !Decimal {
         try budget.consume(text.len);
@@ -279,6 +291,7 @@ const Decimal = struct {
         var first: ?usize = null;
         var last: usize = 0;
         while (at < text.len and text[at] != 'e' and text[at] != 'E') : (at += 1) {
+            if (at % 4096 == 0) try budget.poll();
             if (text[at] == '.' and !seen_dot) {
                 seen_dot = true;
                 continue;
@@ -291,20 +304,24 @@ const Decimal = struct {
             } else if (first == null) leading += 1;
         }
         if (at == start) return error.SqlTypeMismatch;
-        const exponent = if (at < text.len) std.fmt.parseInt(i64, text[at + 1 ..], 10) catch return error.SqlNumericOutOfRange else 0;
+        var float_compatible = true;
+        const exponent = if (at < text.len) try parseExponent(text[at + 1 ..], budget, &float_compatible) else 0;
         if (first == null) return .{ .negative = false, .magnitude = 0, .digits = "" };
         const magnitude = std.math.add(i64, exponent, before - leading - 1) catch return error.SqlNumericOutOfRange;
-        return .{ .negative = text[0] == '-', .magnitude = magnitude, .digits = text[first.? .. last + 1] };
+        return .{ .negative = text[0] == '-', .magnitude = magnitude, .digits = text[first.? .. last + 1], .float_compatible = float_compatible };
     }
 
-    fn compare(a: Decimal, b: Decimal) Order {
+    fn compare(a: Decimal, b: Decimal, budget: *Budget) !Order {
         if (a.negative != b.negative) return if (a.negative) .lt else .gt;
         if (a.digits.len == 0 or b.digits.len == 0) return if (a.digits.len == b.digits.len) .eq else if (a.digits.len == 0) (if (b.negative) .gt else .lt) else if (a.negative) .lt else .gt;
         var order = std.math.order(a.magnitude, b.magnitude);
         if (order == .eq) {
             var i: usize = 0;
             var j: usize = 0;
+            var steps: usize = 0;
             while (i < a.digits.len or j < b.digits.len) {
+                if (steps % 4096 == 0) try budget.poll();
+                steps += 1;
                 if (i < a.digits.len and a.digits[i] == '.') i += 1;
                 if (j < b.digits.len and b.digits[j] == '.') j += 1;
                 const ac: u8 = if (i < a.digits.len) a.digits[i] else '0';
@@ -318,16 +335,63 @@ const Decimal = struct {
         return if (a.negative) order.invert() else order;
     }
 
-    fn hash(self: Decimal) u64 {
+    fn hash(self: Decimal, budget: *Budget) !u64 {
         var state = std.hash.Wyhash.init(2);
         state.update(&.{@intFromBool(self.negative)});
         var magnitude: [8]u8 = undefined;
         std.mem.writeInt(i64, &magnitude, self.magnitude, .little);
         state.update(&magnitude);
-        for (self.digits) |digit| if (digit != '.') state.update(&.{digit});
+        for (self.digits, 0..) |digit, index| {
+            if (index % 4096 == 0) try budget.poll();
+            if (digit != '.') state.update(&.{digit});
+        }
         return state.final();
     }
 };
+
+// Match signed base-10 parseInt, including interior underscores, but poll
+// long zero-prefixed exponents. Track parseFloat's stricter underscore syntax.
+fn parseExponent(text: []const u8, budget: *Budget, float_compatible: *bool) !i64 {
+    if (text.len == 0) return error.SqlNumericOutOfRange;
+    const negative = text[0] == '-';
+    const start: usize = @intFromBool(negative or text[0] == '+');
+    if (start == text.len or text[start] == '_' or text[text.len - 1] == '_') return error.SqlNumericOutOfRange;
+    var value: i64 = 0;
+    for (text[start..], start..) |byte, index| {
+        if ((index - start) % 4096 == 0) try budget.poll();
+        if (byte == '_') {
+            if (!std.ascii.isDigit(text[index - 1]) or !std.ascii.isDigit(text[index + 1])) float_compatible.* = false;
+            continue;
+        }
+        if (!std.ascii.isDigit(byte)) return error.SqlNumericOutOfRange;
+        value = std.math.mul(i64, value, 10) catch return error.SqlNumericOutOfRange;
+        value = if (negative) std.math.sub(i64, value, byte - '0') catch return error.SqlNumericOutOfRange else std.math.add(i64, value, byte - '0') catch return error.SqlNumericOutOfRange;
+    }
+    return value;
+}
+
+// Decimal.parse has already scanned the complete token under its owner. A
+// finite float's decimal rendering fits the existing 768-byte comparison
+// buffer; larger significant tokens cannot match it. Compact redundant zeros
+// and exponent spelling before the bounded native float conversion.
+fn boundedFloatToken(text: []const u8, normalized: Decimal, buffer: []u8) ?[]const u8 {
+    if (text.len <= 4096) return text;
+    if (normalized.digits.len > 768 or !normalized.float_compatible) return null;
+    var at: usize = 0;
+    if (normalized.negative) {
+        buffer[at] = '-';
+        at += 1;
+    }
+    var count: usize = 0;
+    for (normalized.digits) |digit| if (digit != '.') {
+        buffer[at] = digit;
+        at += 1;
+        count += 1;
+    };
+    const exponent: i128 = @as(i128, normalized.magnitude) - @as(i128, @intCast(count)) + 1;
+    const tail = std.fmt.bufPrint(buffer[at..], "e{d}", .{exponent}) catch unreachable;
+    return buffer[0 .. at + tail.len];
+}
 
 /// PostgreSQL NUMERIC-to-integer rounding (ties away from zero), without a
 /// float intermediate. Work is bounded by input bytes plus at most 20 digits.
@@ -377,9 +441,45 @@ fn decimal(value: Json, buffer: []u8, budget: *Budget) !Decimal {
     };
     return Decimal.parse(text, budget);
 }
-fn keyOrder(a: []const u8, b: []const u8) Order {
+fn operatorCheckpoint(raw: ?*anyopaque) !void {
+    const budget: *Budget = @ptrCast(@alignCast(raw.?));
+    try budget.poll();
+}
+fn operatorControl(budget: *Budget) ?@import("operator_work.zig").Control {
+    if (budget.shared == null) return null;
+    return .{ .ptr = budget, .checkpoint = operatorCheckpoint };
+}
+fn objectValue(object: std.json.ObjectMap, key: []const u8, budget: *Budget) !?Json {
+    const control = operatorControl(budget) orelse return object.get(key);
+    const known_hash: u32 = @truncate(try @import("operator_work.zig").hashBytes(control, 0, key));
+    var failure: ?anyerror = null;
+    const Lookup = struct {
+        control: @import("operator_work.zig").Control,
+        known_hash: u32,
+        failure: *?anyerror,
+        pub fn hash(self: @This(), _: []const u8) u32 {
+            return self.known_hash;
+        }
+        pub fn eql(self: @This(), left: []const u8, right: []const u8, _: usize) bool {
+            if (self.failure.* != null) return true;
+            return @import("operator_work.zig").equalBytes(self.control, left, right) catch |err| {
+                self.failure.* = err;
+                // Stop this read-only probe immediately. Its apparent match
+                // is discarded before use when the original error is raised.
+                return true;
+            };
+        }
+    };
+    // Read-only lookup: callbacks may stop work without partially mutating a
+    // hash map. Key bytes were charged by compare, so these polls do not charge
+    // the same lookup again or change the legacy per-value work allowance.
+    const value = object.getAdapted(key, Lookup{ .control = control, .known_hash = known_hash, .failure = &failure });
+    if (failure) |err| return err;
+    return value;
+}
+fn keyOrder(a: []const u8, b: []const u8, budget: *Budget) !Order {
     const lengths = std.math.order(a.len, b.len);
-    return if (lengths == .eq) std.mem.order(u8, a, b) else lengths;
+    return if (lengths == .eq) @import("operator_work.zig").orderBytes(operatorControl(budget), a, b) else lengths;
 }
 
 /// Every finite primitive number has one exact dyadic representation. Hash
@@ -439,12 +539,14 @@ fn tokenHash(text: []const u8, budget: *Budget) !u64 {
         const signed: i128 = if (normalized.negative) -@as(i128, magnitude) else magnitude;
         if (std.math.cast(i64, signed)) |n| return primitiveHash(.{ .integer = n });
     }
-    const number = std.fmt.parseFloat(f64, text) catch return normalized.hash();
+    var token_buffer: [816]u8 = undefined;
+    const token = boundedFloatToken(text, normalized, &token_buffer) orelse return normalized.hash(budget);
+    const number = std.fmt.parseFloat(f64, token) catch return normalized.hash(budget);
     if (std.math.isFinite(number)) {
         var buffer: [768]u8 = undefined;
-        if (Decimal.compare(normalized, try decimal(.{ .float = number }, &buffer, budget)) == .eq) return primitiveHash(.{ .float = number });
+        if (try Decimal.compare(normalized, try decimal(.{ .float = number }, &buffer, budget), budget) == .eq) return primitiveHash(.{ .float = number });
     }
-    return normalized.hash();
+    return normalized.hash(budget);
 }
 
 pub fn compare(a: Json, b: Json, budget: *Budget, depth: usize) anyerror!Order {
@@ -455,7 +557,7 @@ pub fn compare(a: Json, b: Json, budget: *Budget, depth: usize) anyerror!Order {
     if (rank(a) == 2) {
         var left: [768]u8 = undefined;
         var right: [768]u8 = undefined;
-        return Decimal.compare(try decimal(a, &left, budget), try decimal(b, &right, budget));
+        return Decimal.compare(try decimal(a, &left, budget), try decimal(b, &right, budget), budget);
     }
     return switch (a) {
         .null => .eq,
@@ -477,16 +579,16 @@ pub fn compare(a: Json, b: Json, budget: *Budget, depth: usize) anyerror!Order {
             var result: Order = .eq;
             for (a.object.keys(), a.object.values()) |key, value| {
                 try budget.consume(key.len + 1);
-                const other = b.object.get(key);
+                const other = try objectValue(b.object, key, budget);
                 const difference: Order = if (other) |item| try compare(value, item, budget, depth + 1) else .lt;
-                if (difference != .eq and (smallest == null or keyOrder(key, smallest.?) == .lt)) {
+                if (difference != .eq and (smallest == null or (try keyOrder(key, smallest.?, budget)) == .lt)) {
                     smallest = key;
                     result = difference;
                 }
             }
             for (b.object.keys()) |key| {
                 try budget.consume(key.len + 1);
-                if (!a.object.contains(key) and (smallest == null or keyOrder(key, smallest.?) == .lt)) {
+                if ((try objectValue(a.object, key, budget)) == null and (smallest == null or (try keyOrder(key, smallest.?, budget)) == .lt)) {
                     smallest = key;
                     result = .gt;
                 }
@@ -495,6 +597,16 @@ pub fn compare(a: Json, b: Json, budget: *Budget, depth: usize) anyerror!Order {
         },
         else => unreachable,
     };
+}
+
+fn updateHash(state: *std.hash.Wyhash, bytes: []const u8, budget: *Budget) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        try budget.poll();
+        const end = offset + @min(@as(usize, 4096), bytes.len - offset);
+        state.update(bytes[offset..end]);
+        offset = end;
+    }
 }
 
 pub fn hashBoolean(value: bool, budget: *Budget) !u64 {
@@ -507,7 +619,7 @@ pub fn hashString(value: []const u8, budget: *Budget) !u64 {
     try budget.consume(1);
     try budget.consume(value.len);
     var state = std.hash.Wyhash.init(1);
-    state.update(value);
+    try updateHash(&state, value, budget);
     return state.final();
 }
 pub fn hash(value: Json, budget: *Budget, depth: usize) anyerror!u64 {
@@ -536,7 +648,9 @@ pub fn hash(value: Json, budget: *Budget, depth: usize) anyerror!u64 {
             var mixed: u64 = 0;
             for (value.object.keys(), value.object.values()) |key, item| {
                 try budget.consume(key.len + 1);
-                const pair = std.hash.Wyhash.hash(try hash(item, budget, depth + 1), key);
+                var pair_state = std.hash.Wyhash.init(try hash(item, budget, depth + 1));
+                try updateHash(&pair_state, key, budget);
+                const pair = pair_state.final();
                 sum +%= pair;
                 mixed ^= std.math.rotl(u64, pair, 23);
             }
@@ -619,12 +733,95 @@ test "native pipeline refinements benchmark primitive numeric hashing" {
                     // Frozen prior primitive path, with the same exact decimal
                     // normalization and semantic hash used before this PR.
                     var buffer: [768]u8 = undefined;
-                    checksum ^= (try decimal(value, &buffer, &budget)).hash();
+                    checksum ^= try (try decimal(value, &buffer, &budget)).hash(&budget);
                 }
             }
             elapsed[slot] = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start;
             if (prior_checksums[slot]) |prior| try std.testing.expectEqual(prior, checksum) else prior_checksums[slot] = checksum;
         }
         std.debug.print("native_refinement {{\"case\":\"primitive_numeric_hash\",\"rows\":{d},\"sample\":{d},\"decimal_ns\":{d},\"primitive_ns\":{d}}}\n", .{ count, sample, elapsed[0], elapsed[1] });
+    }
+}
+
+test "SQL JSONB preflight polls long text keys and decimal tokens without changing work or hashes" {
+    const a = std.testing.allocator;
+    const Poll = struct {
+        checks: usize = 0,
+        fail_at: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.fail_at != 0 and self.checks == self.fail_at) return error.Canceled;
+        }
+    };
+    var text: [16384]u8 = @splat('x');
+    text[4095] = 0xce;
+    text[4096] = 0xbb;
+    var poll: Poll = .{};
+    var parent: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Poll.check, .ptr = &poll };
+    var child: @import("numeric_value.zig").Context = .{ .alloc = a, .parent = &parent };
+    var work: Budget = .{ .remaining = 1 << 20, .shared = &child };
+    try validateText(&text, &work);
+    try std.testing.expectEqual(std.hash.Wyhash.hash(1, &text), try hash(.{ .string = &text }, &work, 0));
+    try std.testing.expectEqual(@as(usize, (1 << 20) - text.len * 2 - 1), work.remaining);
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024 - text.len * 2 - 1), parent.remaining);
+    const checks = poll.checks;
+    try std.testing.expect(checks > 8);
+    for (1..checks + 1) |at| {
+        poll = .{ .fail_at = at };
+        parent = .{ .alloc = a, .checkpoint = Poll.check, .ptr = &poll };
+        child = .{ .alloc = a, .parent = &parent };
+        work = .{ .remaining = 1 << 20, .shared = &child };
+        const actual = operation: {
+            validateText(&text, &work) catch |err| break :operation err;
+            _ = hash(.{ .string = &text }, &work, 0) catch |err| break :operation err;
+            break :operation @as(anyerror, error.UnexpectedSuccessfulScan);
+        };
+        try std.testing.expectEqual(error.Canceled, actual);
+    }
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(a);
+    try object.put(a, &text, .{ .integer = 7 });
+    work = .{};
+    const element_hash = try hash(.{ .integer = 7 }, &work, 0);
+    const pair = std.hash.Wyhash.hash(element_hash, &text);
+    var expected = std.hash.Wyhash.init(rank(.{ .object = object }));
+    var bytes: [16]u8 = undefined;
+    std.mem.writeInt(u64, bytes[0..8], pair, .little);
+    std.mem.writeInt(u64, bytes[8..16], std.math.rotl(u64, pair, 23), .little);
+    expected.update(&bytes);
+    poll = .{};
+    parent = .{ .alloc = a, .checkpoint = Poll.check, .ptr = &poll };
+    work = .{ .shared = &parent };
+    try std.testing.expectEqual(expected.final(), try hash(.{ .object = object }, &work, 0));
+    try std.testing.expect(poll.checks > 3);
+    const fraction = try a.alloc(u8, 32780);
+    defer a.free(fraction);
+    @memcpy(fraction[0..2], "0.");
+    @memset(fraction[2..32770], '0');
+    @memcpy(fraction[32770..], "125e+32768");
+    poll = .{};
+    parent = .{ .alloc = a, .checkpoint = Poll.check, .ptr = &poll };
+    work = .{ .shared = &parent };
+    var reference: Budget = .{};
+    try std.testing.expectEqual(try hash(.{ .number_string = "0.125" }, &reference, 0), try hash(.{ .number_string = fraction }, &work, 0));
+    try std.testing.expect(poll.checks > 8);
+    const exponent = try a.alloc(u8, 32772);
+    defer a.free(exponent);
+    @memcpy(exponent[0..3], "1e+");
+    @memset(exponent[3..], '0');
+    poll = .{};
+    parent = .{ .alloc = a, .checkpoint = Poll.check, .ptr = &poll };
+    work = .{ .shared = &parent };
+    reference = .{};
+    try std.testing.expectEqual(try hash(.{ .integer = 1 }, &reference, 0), try hash(.{ .number_string = exponent }, &work, 0));
+    try std.testing.expect(poll.checks > 8);
+}
+
+test "SQL JSONB bounded exponent parsing matches signed decimal grammar and overflow" {
+    for ([_][]const u8{ "0", "-0", "+01", "1_2", "1__2", "9223372036854775807", "-9223372036854775808", "9223372036854775808", "-9223372036854775809", "", "+", "_1", "1_", "1x" }) |text| {
+        var work: Budget = .{};
+        var compatible = true;
+        if (std.fmt.parseInt(i64, text, 10)) |expected| try std.testing.expectEqual(expected, try parseExponent(text, &work, &compatible)) else |_| try std.testing.expectError(error.SqlNumericOutOfRange, parseExponent(text, &work, &compatible));
     }
 }

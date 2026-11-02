@@ -1,0 +1,84 @@
+antfly-inference-worker-process-output-test
++- run test inference-worker-process-output-tests w
+PROCESS_SINK transport=h1 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=7 ends=7
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h1 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=7 ends=7
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=34 ends=34
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=83 ends=83
+PROCESS_SINK await peer EOF
+failed command: cd /private/tmp/antfly-parent-phase-focused-cache/o/53cd813e257c1e2952141b155939b158 && ANTFLY_TEST_WORKER_OUTPUT_FIXTURE=./inference-worker-output-fixture /private/tmp/antfly-parent-phase-focused-cache/o/d1d8a6935f1811f0cc3d032a975c809c/inference-worker-process-output-tests --cache-dir=/private/tmp/antfly-parent-phase-focused-cache --seed=0x8d7a5eee --listen=-
+
+antfly-http-cleanup-owner-test
++- run test http-cleanup-owner-tests 1 pass, 1 fail (2 total)
+error: 'runnable_http_cleanup_test_root.test.runnable HTTP cleanup real shared owner parks on H2 credit permits ping and health and retires before finish' failed without output
+failed command: /private/tmp/antfly-parent-phase-focused-cache/o/a20b915d185239b5d2ce04446a663b89/http-cleanup-owner-tests --cache-dir=/private/tmp/antfly-parent-phase-focused-cache --seed=0x8d7a5eee --listen=-
+
+antfly-inference-worker-owner-handoff-test
++- run test inference-worker-owner-handoff-tests w
+REAL_SINK transport=h1 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h1 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=4 ends=4
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=95 ends=95
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=99 ends=99
+REAL_SINK await peer EOF
+failed command: /private/tmp/antfly-parent-phase-focused-cache/o/918376d2af21b4b41b102e6ad1d92bdd/inference-worker-owner-handoff-tests --cache-dir=/private/tmp/antfly-parent-phase-focused-cache --seed=0x8d7a5eee --listen=-
+
+antfly-inference-worker-rpc-test
++- run test inference-worker-rpc-contract-tests w
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidResourceFrame
+[default] (warn): inference worker transport closed err=ResourceCallbackCapacity
+failed command: /private/tmp/antfly-parent-phase-focused-cache/o/49c415a9590355e2a048f28a364d9c67/inference-worker-rpc-contract-tests --cache-dir=/private/tmp/antfly-parent-phase-focused-cache --seed=0x8d7a5eee --listen=-
+
+Build Summary: 17/19 steps succeeded (1 failed); 54/55 tests passed (1 failed)
+antfly-inference-worker-rpc-test success
++- run test inference-worker-rpc-contract-tests 26 pass (26 total) 286ms MaxRSS:271M
+|  +- compile test inference-worker-rpc-contract-tests safe native success 6s MaxRSS:413M
+|     +- WriteFile macos-sdk-libc.txt cached
++- run test 6 pass (6 total) 113ms MaxRSS:5M
+   +- compile test safe native success 7s MaxRSS:428M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-owner-handoff-test success
++- run test inference-owner-handoff-tests 18 pass (18 total) 121ms MaxRSS:2M
+   +- compile test inference-owner-handoff-tests safe native success 8s MaxRSS:461M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 2 pass (2 total) 1s MaxRSS:7M
+   +- compile test inference-worker-owner-handoff-tests safe native success 9s MaxRSS:479M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-worker-process-output-test success
++- run test inference-worker-process-output-tests 1 pass (1 total) 1s MaxRSS:4M
+   +- compile test inference-worker-process-output-tests safe native success 8s MaxRSS:474M
+   |  +- WriteFile macos-sdk-libc.txt (reused)
+   +- compile exe inference-worker-output-fixture safe native success 6s MaxRSS:323M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-http-cleanup-owner-test transitive failure
++- run test http-cleanup-owner-tests 1 pass, 1 fail (2 total)
+   +- compile test http-cleanup-owner-tests safe native success 9s MaxRSS:645M
+      +- WriteFile macos-sdk-libc.txt (reused)
+

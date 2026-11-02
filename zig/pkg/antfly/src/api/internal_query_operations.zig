@@ -86,6 +86,7 @@ pub const CatalogSource = struct {
 pub const QueryRouter = struct {
     ptr: *anyopaque,
     route_query_to_read_schema: *const fn (ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) anyerror!void,
+    route_with_context: ?*const fn (*anyopaque, std.mem.Allocator, @import("antfly_local_sources").api_operation.RequestContext, []const u8, *db_mod.types.SearchRequest) anyerror!void = null,
 
     fn route(self: QueryRouter, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
         return try self.route_query_to_read_schema(self.ptr, table_name, req);
@@ -116,15 +117,39 @@ pub const Context = struct {
         table_name: []const u8,
         body: []const u8,
     ) !query_api.OwnedQueryRequest {
-        var semantic_resolver = SemanticStatusResolver{ .planning = self.queryPlanning() };
-        var request = try query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, body);
+        return self.planQueryWithContext(alloc, table_name, body, .{});
+    }
+
+    pub fn planQueryWithContext(self: Context, alloc: std.mem.Allocator, table_name: []const u8, body: []const u8, request_context: @import("antfly_local_sources").api_operation.RequestContext) !query_api.OwnedQueryRequest {
+        const context = try request_context.platformDeadline();
+        try context.ensureActive();
+        const body_deadline = try query_contract.queryExecutionDeadlineNsFromBody(alloc, body);
+        const deadline = if (context.deadline_ns) |outer| if (body_deadline) |inner| @min(outer, inner) else outer else body_deadline;
+        var planning = self.queryPlanning();
+        if (planning) |*value| {
+            value.query_embedding_deadline_ns = deadline;
+            value.query_cancellation = context.cancellation;
+            value.query_runnable = if (context.execution_team) |team| team.borrow else null;
+        }
+        var semantic_resolver = SemanticStatusResolver{ .planning = planning };
+        var request = try query_contract.parseQueryRequestWithDeadline(alloc, semantic_resolver.iface(), table_name, body, deadline);
+        request.req.execution_deadline_ns = deadline;
+        request.req.cancellation = context.cancellation;
+        request.req.execution_runnable = if (context.execution_team) |team| team.borrow else null;
+        request.req.execution_remote_query = context.execution_remote_query;
         request.req.graph_execution_limits = self.graph_execution_limits;
+        errdefer request.deinit(alloc);
+        try context.ensureActive();
         return request;
     }
 
     /// Route a planned request to the schema generation that owns the read.
     pub fn routeQuery(self: Context, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
         return self.query_router.route(table_name, req);
+    }
+    pub fn routeQueryWithContext(self: Context, alloc: std.mem.Allocator, request: @import("antfly_local_sources").api_operation.RequestContext, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
+        const callback = self.query_router.route_with_context orelse return error.ExecutionWaitUnsupported;
+        return callback(self.query_router.ptr, alloc, request, table_name, req);
     }
 };
 
@@ -145,6 +170,7 @@ pub const QueryPlanningContext = struct {
     query_embedding_security_scope: []const u8 = "internal",
     query_embedding_deadline_ns: ?u64 = null,
     query_cancellation: ?CancellationToken = null,
+    query_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
 
     fn adminSnapshot(self: QueryPlanningContext) !metadata_api.AdminSnapshot {
         return try self.admin_snapshot(self.ptr);
@@ -231,6 +257,7 @@ pub fn planSemanticQuery(
         .io = planning.io,
         .deadline_ns = embedding_deadline_ns,
         .cancellation = planning.query_cancellation,
+        .runnable = planning.query_runnable,
         .remote_content = planning.remote_content,
         .inference_api_url = planning.inference_api_url,
         .inference_api_key = planning.inference_api_key,
@@ -318,13 +345,24 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     };
     const FakeProvider = struct {
         calls: usize = 0,
+        expected_borrow: ?*anyopaque = null,
 
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
                 .embed_dense_texts = embedDense,
+                .embed_dense_texts_with_context = embedDenseWithContext,
                 .embed_sparse_texts = embedSparse,
             };
+        }
+
+        fn embedDenseWithContext(ptr: *anyopaque, inner_alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, context: managed_embedder.EmbeddingRequestContext) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const grant = context.request.runnable orelse return error.TestMissingQueryRunnable;
+            try std.testing.expectEqual(self.expected_borrow.?, grant.context);
+            try grant.checkLifetime();
+            try std.testing.expectEqual(@import("antfly_runtime_abi").runnable_abi.Class.query, try grant.currentClass());
+            return embedDense(ptr, inner_alloc, model, texts);
         }
 
         fn embedDense(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
@@ -349,9 +387,17 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     var budget = cache_budget.CacheBudget.init(1024 * 1024);
     var cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, std.Io.Threaded.global_single_threaded.io(), .{});
     defer cache.deinit(&budget);
-    var provider = FakeProvider{};
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    var owner = try native.Scheduler.init(.{ .slots = 2 });
+    var execution: native.Execution = .{};
+    try execution.start(&owner, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+    defer execution.finish();
+    var read: @import("runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = alloc };
+    const team = try read.team();
+    var provider = FakeProvider{ .expected_borrow = team.borrow.context };
     const base: QueryPlanningContext = .{
         .ptr = undefined,
+        .query_runnable = team.borrow,
         .admin_snapshot = FakeCatalog.adminSnapshot,
         .free_admin_snapshot = FakeCatalog.freeAdminSnapshot,
         .antfly_provider = provider.provider(),

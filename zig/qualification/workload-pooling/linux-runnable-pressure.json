@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "kind": "load",
+  "name": "linux-release-safe-runnable-combined-pressure-api-key",
+  "fixture_rows": 256,
+  "fixture_payload_bytes": 4096,
+  "client_workers": 64,
+  "max_pending_clients": 256,
+  "request_timeout_seconds": 5,
+  "slow_reader_delay_seconds": 0.2,
+  "recovery_seconds": 3,
+  "recovery_fd_growth_max": 8,
+  "recovery_status_seconds_max": 2,
+  "process_limits": {
+    "cpu_count": 2,
+    "max_fds": 512
+  },
+  "container_limits": {
+    "cpu_count": 2,
+    "memory_bytes": 2147483648,
+    "pids": 512
+  },
+  "configuration": {
+    "pgwire": {
+      "max_connections": 96
+    },
+    "admission": {
+      "query": {
+        "max_concurrent_requests": 1
+      },
+      "write": {
+        "max_concurrent_requests": 2
+      }
+    }
+  },
+  "candidate_configuration": {
+    "admission": {
+      "max_request_memory_bytes": 67108864,
+      "max_retained_memory_bytes": 67108864,
+      "query": {
+        "max_concurrent_requests": 1,
+        "waiting": {
+          "max_queued_requests": 4,
+          "max_queued_bytes": 1048576,
+          "max_wait_ms": 250
+        }
+      }
+    }
+  },
+  "resource_thresholds": {
+    "rss_bytes": 1073741824,
+    "threads": 320,
+    "fds": 400
+  },
+  "comparison_thresholds": {
+    "low_load_p95_ratio_max": 1.25,
+    "throughput_ratio_min": 0.9
+  },
+  "phases": [
+    {
+      "name": "low-load",
+      "offered_per_second": 5,
+      "duration_seconds": 4,
+      "thresholds": {
+        "successful_per_second_min": 3,
+        "success_p95_seconds_max": 1,
+        "generator_dropped_max": 0,
+        "control_seconds_max": 2,
+        "runnable_observed_slot_ns_min": 1
+      },
+      "workload": "cheap"
+    },
+    {
+      "name": "burst",
+      "offered_per_second": 375,
+      "duration_seconds": 2,
+      "thresholds": {
+        "successful_per_second_min": 5,
+        "success_p95_seconds_max": 5,
+        "generator_dropped_max": 0,
+        "control_seconds_max": 2,
+        "runnable_observed_slot_ns_min": 1
+      }
+    },
+    {
+      "name": "sustained-overload",
+      "offered_per_second": 750,
+      "duration_seconds": 5,
+      "thresholds": {
+        "successful_per_second_min": 5,
+        "success_p95_seconds_max": 5,
+        "generator_dropped_max": 0,
+        "control_seconds_max": 2,
+        "fixed_wait_completed_min": 1,
+        "runnable_yields_min": 1,
+        "runnable_observed_slot_ns_min": 1
+      }
+    },
+    {
+      "name": "recovery",
+      "offered_per_second": 5,
+      "duration_seconds": 4,
+      "thresholds": {
+        "successful_per_second_min": 3,
+        "success_p95_seconds_max": 1,
+        "generator_dropped_max": 0,
+        "control_seconds_max": 2,
+        "runnable_observed_slot_ns_min": 1
+      },
+      "workload": "cheap"
+    }
+  ],
+  "verify_operator_controls": true,
+  "http_auth_mode": "api_key",
+  "warmup_operations": 16,
+  "retained_pressure": {
+    "http_connections": 32,
+    "pgwire_connections": 32,
+    "held_cursors": 8,
+    "slow_uploads": 8,
+    "upload_bytes": 4194304
+  },
+  "runnable_policy": {
+    "slots": 4,
+    "control_slots": 1,
+    "cleanup_slots": 1,
+    "weights": [
+      4,
+      2,
+      1,
+      1
+    ],
+    "max_operations": 128,
+    "max_bytes": 8388608,
+    "control_bytes": 65536,
+    "max_wait_ms": 250,
+    "max_backfills": 8,
+    "quantum_ms": 2,
+    "checkpoint_budget": 64
+  }
+}

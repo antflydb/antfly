@@ -493,6 +493,7 @@ const LocalChatSession = struct {
             .gpt_config = self.gpt_config,
             .kv_dtype = self.kv_dtype,
             .shared_moe_cache = self.model.shared_moe_cache,
+            .device_memory_budget = self.model.prompt_prefix_cache.device_memory_budget,
             .tokenizer = self.tokenizer,
             .add_bos_token = self.model.manifest.add_bos_token,
             .bos_token = self.model.manifest.bos_token,
@@ -717,6 +718,7 @@ fn runLocalChat(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     const pool_id = try kv_manager.addPool(pool_config);
     var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, pool_config);
     defer kv_storage.deinit();
+    kv_storage.device_memory_budget = model.prompt_prefix_cache.device_memory_budget;
     try cb.provisionKvDeviceWriteHook(&kv_storage);
 
     const ansi = supportsAnsi(io);

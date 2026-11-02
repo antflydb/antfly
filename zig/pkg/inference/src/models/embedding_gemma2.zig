@@ -20,6 +20,7 @@
 //! makes the bidirectional attention and per-layer geometry explicit.
 
 const std = @import("std");
+const admitted_json = @import("../util/admitted_json.zig");
 
 pub const max_layers = 64;
 pub const official_hidden_size: u32 = 512;
@@ -254,8 +255,8 @@ fn parseRopeTheta(rope: std.json.ObjectMap, kind: []const u8) !f32 {
 /// Parse the complete upstream config.json. Unknown fields remain forward
 /// compatible, while every execution-relevant text field is required.
 pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8) !Config {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch
-        return error.InvalidEmbeddingGemma2Config;
+    const parsed = admitted_json.parse(std.json.Value, allocator, bytes, .{}) catch |err|
+        return admitted_json.preserveRefusal(if (err == error.OutOfMemory) err else error.InvalidEmbeddingGemma2Config);
     defer parsed.deinit();
     const root = try requireObject(parsed.value);
     const model_type = root.get("model_type") orelse return error.InvalidEmbeddingGemma2Config;

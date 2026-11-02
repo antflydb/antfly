@@ -1,0 +1,135 @@
+{
+  "date": "2026-11-02",
+  "branch": "codex/workload-scheduling",
+  "branch_parent": "afab3b07380a0ebd5c812b4d8dc86622dc39a9f7",
+  "merged_origin_main": "df9f6d61a8bb04e7fdbaa4fac7c553cd20abd3bd",
+  "full_design_complete": false,
+  "full_qualification_waived": true,
+  "focused_results": {
+    "api_pgwire": {
+      "tests": 13,
+      "exit_code": 0,
+      "log": "merge-nov2-api-v6.log",
+      "scope": "Compiled production API before final allocator/range-only fixes."
+    },
+    "navigation_original_scope": {
+      "api_tests": 25,
+      "local_tests": 22,
+      "skipped": 0,
+      "leaked": 0,
+      "exit_code": 0,
+      "log": "merge-nov2-navigation-v5.log"
+    },
+    "spill_growth_retirement": {
+      "tests": 18,
+      "exit_code": 0,
+      "log": "merge-nov2-spill-v2.log"
+    },
+    "protected_http": {
+      "tests": 15,
+      "exit_code": 0,
+      "log": "merge-nov2-http-localhost.log"
+    },
+    "config": {
+      "component": "antfly-runnable-config-test",
+      "exit_code": 0,
+      "log": "merge-nov2-api-v4.log",
+      "note": "Config component passed; aggregate command failed before later query-call fixes."
+    },
+    "service_locks": {
+      "component": "antfly-controlled-service-lock-test",
+      "exit_code": 0,
+      "log": "merge-nov2-integration-v1.log",
+      "note": "Service-lock component passed; aggregate command had sandbox-blocked HTTP sockets, subsequently verified with localhost access."
+    }
+  },
+  "static_checks": [
+    {
+      "name": "apache",
+      "exit_code": 0,
+      "log": "merge-nov2-static-apache.log"
+    },
+    {
+      "name": "catalog",
+      "exit_code": 0,
+      "log": "merge-nov2-static-catalog.log"
+    },
+    {
+      "name": "errors",
+      "exit_code": 0,
+      "log": "merge-nov2-static-errors.log"
+    },
+    {
+      "name": "packaging",
+      "exit_code": 0,
+      "log": "merge-nov2-static-packaging.log"
+    },
+    {
+      "name": "format",
+      "exit_code": 0,
+      "log": "merge-nov2-static-format.log"
+    }
+  ],
+  "verification_limitations": [
+    "Additional aggregate/semantic repeat could not start after build-cache dependencies disappeared; see merge-nov2-final-checks.log and merge-nov2-api-semantic-resolved.log.",
+    "No cold full-qualification rebuild, deployment verification or universal performance claim."
+  ],
+  "preserved_pending_edits": [
+    "zig/WORKLOAD_POOLING_IMPLEMENTATION.md",
+    "zig/pkg/antfly/src/guarded_db_commit_test_root.zig"
+  ],
+  "resolved_source_sha256": {
+    "scripts/packaging/package_embedded_zig_source.py": "0cccb64656672740125a0f2294076306cb0ef369f589db520a2734b2b0671c58",
+    "specs/openapi/antfly/config.yaml": "5d3d5adfb3784ccc007ac6de308983eb777f52025a4a478c12e8acfbf020cfe5",
+    "ts/packages/sdk/src/inference-client.ts": "2cc4a88a8a5ea65432f77fb540f07c795f7461b278ba0e0d5df1c614a308f209",
+    "zig/build_support/antfly/test_partitions.zig": "2a815c5ebe9ca5735b485693a54757162d5b831a64d4caf20f0405cbb36c8ca3",
+    "zig/lib/httpx/src/server/server.zig": "ac6e9421784b009fbf887e9d63fe7ace9bb74d54048d1caa7afa69680a59812a",
+    "zig/lib/platform/src/resource_policy.zig": "c2a72845c844d7e65f09eaa30de2658a865b07ef804e12f941639a4dbc10d291",
+    "zig/lib/platform/src/runnable_policy.zig": "55e2a1a6d789c30e5647f2431939aa27070d215e11c03331b5c6f29778e95e54",
+    "zig/lib/readers/src/mod.zig": "0262f7a0b76815df06961bf642afd495f618eed6f35c403b6e25e703522999ee",
+    "zig/lib/runtime/src/runtime_error_abi.zig": "ee0371eb13e7bc918c3bbf9b94999da044d41155191e572f795495d898d5ab64",
+    "zig/pkg/antfly-embedded/src/common/config.zig": "c2ccfeda13e47e91a2e4673d205a974b395af2305c5b88a950a1e457ef17b2e8",
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "c8e0cb420e83c70734639ca96d3ceabba7caf7dc7abe67a96ed041a17c5d6859",
+    "zig/pkg/antfly-embedded/src/inference/managed_embedder.zig": "aee83e5a63da271faf1d6b35210cf515d07ed84c931c82534b3d8d8aa8826831",
+    "zig/pkg/antfly-embedded/src/openapi/generated/antfly_common_openapi/root.zig": "ba0562bc8a17faf20fc3482ce98d37066f315af71e2915dc96d9670d25d199b2",
+    "zig/pkg/antfly-embedded/src/openapi/generated/antfly_common_openapi/types.zig": "23647e7def895656359ca822e44e0498343d3c0967a85af31feb7675e7cad47a",
+    "zig/pkg/antfly-embedded/src/runtime_failure_abi.zig": "da81bd2bdb630cfcc2e242d9ceb6a665fc014772481b77cd9b5e4b9aa25ca0bd",
+    "zig/pkg/antfly-embedded/src/runtime_failure_identity.zig": "e1b2494c641229f1d7494acf3cc66a23495abc349ebbe89b9e0709445d428aed",
+    "zig/pkg/antfly-embedded/src/serverless/query/lake_read_context.zig": "61d34c0dcc9e5dab7c1a4b386365d073b66b253299a525eaf89073ded2fffd1d",
+    "zig/pkg/antfly-embedded/src/serverless/query/lake_stream.zig": "78f056d8c4d402431937ed33de3c4323f0f350fc7a5fd44d10b5b1bf854eee7d",
+    "zig/pkg/antfly-embedded/src/sql/spill.zig": "6bcccb5e62ee9c623939b1f31e7f214ca984dd7f8c22db42ce80bab8fa4c79ef",
+    "zig/pkg/antfly-embedded/src/storage/db/catalog/resolver_catalog.zig": "7b547269bfde547a7ee98ff92234d20804d3ed0ad3d4181ca440efa5b9a29ab2",
+    "zig/pkg/antfly-embedded/src/storage/db/db.zig": "626696735f7fe43ace0bf8c26e610956b4c4857e540527c7749eb19e99af008b",
+    "zig/pkg/antfly-embedded/src/storage/db/derived/catch_up_policy.zig": "5bc1872c61f67e7e8963e482a9a1d1912b434ce8887757c44824759f63576e5c",
+    "zig/pkg/antfly-embedded/src/storage/db/execution_resources.zig": "7afc84b9a51a42f5f12f71c3dd19c727703223892f6529c9222ea439358defa8",
+    "zig/pkg/antfly-embedded/src/storage/db/independent_maintenance.zig": "784ee4eaa373dab60af46a2d9221c58dc78b38b0117edc7e56237d06b4d84ecb",
+    "zig/pkg/antfly-embedded/src/storage/db/maintenance/text_merge_runtime.zig": "12a05d0f61d2146ce73d417ccb02500d4f25f105ef819f1bfe2d32540157fae4",
+    "zig/pkg/antfly-embedded/src/storage/db/mutation_commit.zig": "a67e2a917b6c31492e39971f88ab32df2bac54c9500eee1d66f862d7d5546742",
+    "zig/pkg/antfly-embedded/src/storage/lite/docstore.zig": "14a843ab321f49a153b6c528e295e604432f05a227ec01ded42e79e1b7ef494e",
+    "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "77c966fd142351922c7ac9e9ac977dce2faf4b69264f23e3fb8f17258ad9accb",
+    "zig/pkg/antfly-embedded/src/storage/lite/reader_coordinator.zig": "ffb2384f3f31891451563b5cf3a1f120150433507af9358433a3237a50e98d64",
+    "zig/pkg/antfly-embedded/src/storage/resource_manager.zig": "908691efe150900dcb25b638f86a8cd22f32d84f167264476d3b247cdc9b5a97",
+    "zig/pkg/antfly/src/api/http_server.zig": "89dca70eb0c4f963f3c6eaa54156c2c634d8316f31fa1650138d4e0b95e71c26",
+    "zig/pkg/antfly/src/api/httpx_handler.zig": "533f09bb6b73aa82858196c4122d935267dcab8ec971663debab6781800bf5cd",
+    "zig/pkg/antfly/src/api/kernel_abi.zig": "382da40e39dcb2eac8233749354dd125b0b14695bb191f5abdc44fc4cf6492df",
+    "zig/pkg/antfly/src/api/lake_artifact_ranges.zig": "b1fc108e912eb246998e54504f82375764006318cfe39025ce1271fb0e5133b1",
+    "zig/pkg/antfly/src/api/lake_index_aggregate_artifact.zig": "c57d818e0199f56fa435df235c662d9ec962163e19d8a30b4cde96f5fb30fc04",
+    "zig/pkg/antfly/src/api/lake_index_cover_columns.zig": "d1e1f4c1d1c4b290713ef0b6902a6552412a028d10a2561852254ce1cdc9b004",
+    "zig/pkg/antfly/src/api/lake_index_page_ranges.zig": "6c8099fa15ff29cd18a5b2d1dc99fe3bf3a5ff5746507ef1df5345a07b6fcc6b",
+    "zig/pkg/antfly/src/api/lake_index_sql_rows.zig": "9089480d5008f72b6097e197ed5c8dfce30cd82d2e27680525e3c5f82f42c7ad",
+    "zig/pkg/antfly/src/data/runtime.zig": "0e700e65dcca5e73f75e12a48be6faefb35e1f3a44cb5a4749352c20cf80e274",
+    "zig/pkg/antfly/src/metadata/runtime.zig": "730f9a2d0b0f547899923b410e9b706b0be6e41d8b36243d5c4598b44248b742",
+    "zig/pkg/antfly/src/metadata/topology_protocol.zig": "d1e07d322742049ccc687db36c45a271e54070a8a78baa2991351783d352f4f7",
+    "zig/pkg/antfly/src/runnable_config_test_root.zig": "c2f45b2d92a826dd313a34ba2c3bbb81d0abd9bb1c92373b4e9c4f8109f1e1a5",
+    "zig/pkg/antfly/src/serverless/api/http_handler.zig": "531b70c5c20c7f8d434372303dadac07ace3734ef1f756901a113831e85f0fe1",
+    "zig/pkg/antfly/src/serverless_main.zig": "30c48e461a7ac5f815f17805f7fc8832b81cf7a145ad58713e80aa4eb989c842",
+    "zig/pkg/antfly/src/standalone/runtime.zig": "ad164fd5453eacb96a31f3fac1eedc5bd35d1f4d16c1cf5eb5f2e2f5b1cf56fa",
+    "zig/pkg/inference/src/host/engine_errors.zig": "9b4a1788a5cf5ab404bca13515026f864dfc3c7493da14c3c9e298ea52d9ba0a",
+    "zig/pkg/inference/src/host/host.zig": "424ad0cb44f28068853c8172389a24d6ab380fab201b048db619e1827047011c",
+    "zig/pkg/inference/src/models/manifest.zig": "77974943456a11b8dd6153d5add65014fda854488a5cafa2db166072d50c0a17",
+    "zig/pkg/inference/src/runtime/tier/memory.zig": "38195bbf874e53acac3fc3c9f87f19d422e3ca7db6a9a8643990c975164e3efa",
+    "zig/pkg/inference/src/server/model_manager.zig": "6bf4c07a49826aec3b729f36333d4ae0edafe084ac9c39995a6f045f64455603",
+    "zig/pkg/inference/src/server/server.zig": "6327dd57cfda6f3746f4daab496150051e7c71d74e8c61aa7d0a4880552198f1"
+  },
+  "license_header_note": "Applied the repository header policy to the updated config fixture; production code unchanged."
+}

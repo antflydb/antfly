@@ -29,22 +29,28 @@ pub const service: u32 = 256;
 /// inference may synchronously submit nested work. Isolation avoids pool
 /// dependency deadlocks, but each pool needs its own small ceiling so lazy
 /// activation cannot ratchet the process to several multiples of `service`.
-/// The defaults, including dedicated service workers, sum to 252, leaving four
+/// The defaults, including separate service and shared SQL envelopes, sum to 286, leaving two
 /// threads of headroom under the explicit aggregate ceiling. These are a
 /// value-semantic default profile, not individual maxima: callers may
 /// redistribute capacity while keeping fixed lanes nonzero and the total
 /// bounded; dedicated workers may be disabled with a zero capacity.
-pub const backend_runtime_aggregate: u32 = service;
+pub const backend_runtime_sql_workers: u32 = 32;
+pub const backend_runtime_aggregate: u32 = service + backend_runtime_sql_workers;
 pub const backend_runtime_durable_background: u32 = 48;
 pub const backend_runtime_api: u32 = 16;
 pub const backend_runtime_request_forward: u32 = 32;
 /// Request/deadline, nested connect/deadline, and socket operation/deadline.
 /// Admission reserves the complete HTTP/1 task graph before sending a byte.
 pub const request_forward_workers_per_request: u32 = 6;
+/// Raft HTTP uses the same request/connect/socket deadline task graph.
+pub const raft_outbound_workers_per_request: u32 = request_forward_workers_per_request;
 pub const backend_runtime_raft_inbound: u32 = 32;
 pub const backend_runtime_raft_outbound: u32 = 32;
 pub const backend_runtime_inference: u32 = 48;
 pub const backend_runtime_control: u32 = 8;
+/// Permanently reserved finite-step recovery dispatchers. These are independent
+/// of general work and the control/completion lane, including its full floor.
+pub const backend_runtime_recovery: u32 = 2;
 pub const backend_runtime_workers: u32 = 32;
 /// Compatibility name for non-BackendRuntime inference executors.
 pub const inference: u32 = backend_runtime_inference;
@@ -75,8 +81,13 @@ pub const BackendRuntimeLaneLimits = struct {
     /// Zero explicitly disables dedicated worker admission.
     worker_capacity: u32 = backend_runtime_workers,
 
+    /// Shared SQL execution, control, cleanup, and bounded-read workers.
+    /// Independent of service admission so listeners and Raft can make progress.
+    sql_worker_capacity: u32 = backend_runtime_sql_workers,
+
     pub fn total(self: @This()) u64 {
-        return @as(u64, self.durable_background) +
+        return @as(u64, backend_runtime_recovery) +
+            @as(u64, self.durable_background) +
             @as(u64, self.api) +
             @as(u64, self.request_forward) +
             @as(u64, self.raft_inbound) +
@@ -84,19 +95,21 @@ pub const BackendRuntimeLaneLimits = struct {
             @as(u64, self.inference) +
             @as(u64, self.control) +
             @as(u64, self.pdf_render) +
-            @as(u64, self.worker_capacity);
+            @as(u64, self.worker_capacity) +
+            @as(u64, self.sql_worker_capacity);
     }
 
     pub fn validate(self: @This()) !void {
-        if (self.durable_background == 0 or self.durable_background > backend_runtime_aggregate or
-            self.api == 0 or self.api > backend_runtime_aggregate or
-            self.request_forward < request_forward_workers_per_request or self.request_forward > backend_runtime_aggregate or
-            self.raft_inbound == 0 or self.raft_inbound > backend_runtime_aggregate or
-            self.raft_outbound == 0 or self.raft_outbound > backend_runtime_aggregate or
-            self.inference == 0 or self.inference > backend_runtime_aggregate or
-            self.control == 0 or self.control > backend_runtime_aggregate or
-            self.pdf_render == 0 or self.pdf_render > backend_runtime_aggregate or
-            self.worker_capacity > backend_runtime_aggregate or
+        if (self.durable_background == 0 or self.durable_background > service or
+            self.api == 0 or self.api > service or
+            self.request_forward < request_forward_workers_per_request or self.request_forward > service or
+            self.raft_inbound == 0 or self.raft_inbound > service or
+            self.raft_outbound == 0 or self.raft_outbound > service or
+            self.inference == 0 or self.inference > service or
+            self.control == 0 or self.control > service or
+            self.pdf_render == 0 or self.pdf_render > service or
+            self.worker_capacity > service or
+            self.sql_worker_capacity > service or
             self.total() > backend_runtime_aggregate)
             return error.InvalidBackendRuntimeLaneLimits;
     }
@@ -113,6 +126,21 @@ pub fn initService(alloc: std.mem.Allocator) std.Io.Threaded {
     return std.Io.Threaded.init(alloc, .{
         .concurrent_limit = .limited(service),
     });
+}
+
+/// Owners that can outlive a storage handle must join actual workers before
+/// releasing allocator contexts or page mappings. Uses Antfly's pinned overlay.
+pub fn initOwnedService(alloc: std.mem.Allocator, stack_allocator: ?std.mem.Allocator) std.Io.Threaded {
+    if (comptime @import("builtin").os.tag == .freestanding) return std.Io.Threaded.init(alloc, .{});
+    if (comptime @hasField(std.Io.Threaded.InitOptions, "joinable_workers")) {
+        const cpus = std.Thread.getCpuCount() catch 1;
+        return std.Io.Threaded.init(alloc, .{
+            .joinable_workers = true,
+            .worker_stack_allocator = if (std.Thread.use_pthreads) stack_allocator orelse std.heap.page_allocator else null,
+            .async_limit = .limited(@min(@as(usize, service), cpus -| 1)),
+            .concurrent_limit = .limited(service),
+        });
+    } else @compileError("owned native storage requires Antfly's generated joinable Zig library");
 }
 
 pub fn initServerlessObjectStore(alloc: std.mem.Allocator) std.Io.Threaded {
@@ -157,8 +185,8 @@ test "threaded io production limits are finite" {
     const expected_runtime_total = @as(u64, backend_runtime_durable_background) +
         backend_runtime_api + backend_runtime_request_forward + backend_runtime_raft_inbound +
         backend_runtime_raft_outbound + backend_runtime_inference +
-        backend_runtime_control + pdf_render + backend_runtime_workers;
-    try std.testing.expectEqual(@as(u64, 252), expected_runtime_total);
+        backend_runtime_control + backend_runtime_recovery + pdf_render + backend_runtime_workers + backend_runtime_sql_workers;
+    try std.testing.expectEqual(@as(u64, 286), expected_runtime_total);
     try std.testing.expectEqual(expected_runtime_total, runtime_limits.total());
     try std.testing.expect(runtime_limits.total() <= backend_runtime_aggregate);
     try std.testing.expect(backend_runtime_control < backend_runtime_api);
@@ -185,4 +213,21 @@ test "threaded io production limits are finite" {
         std.Io.Limit.limited(serverless_object_store),
         object_store_io.concurrent_limit,
     );
+}
+
+test "threaded io shared SQL envelope is independent and inside the aggregate" {
+    var limits = BackendRuntimeLaneLimits{};
+    limits.worker_capacity = 0;
+    try limits.validate();
+    try std.testing.expectEqual(@as(u32, 32), limits.sql_worker_capacity);
+    limits.sql_worker_capacity = 0;
+    try limits.validate();
+    limits.sql_worker_capacity = service + 1;
+    try std.testing.expectError(error.InvalidBackendRuntimeLaneLimits, limits.validate());
+    limits = .{};
+    limits.sql_worker_capacity += 2;
+    try limits.validate();
+    try std.testing.expectEqual(@as(u64, backend_runtime_aggregate), limits.total());
+    limits.sql_worker_capacity += 1;
+    try std.testing.expectError(error.InvalidBackendRuntimeLaneLimits, limits.validate());
 }

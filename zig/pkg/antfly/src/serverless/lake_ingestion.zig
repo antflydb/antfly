@@ -36,6 +36,10 @@ fn attemptId(a: A, lsn: u64, table: catalog.types.Table) ![]u8 {
     return std.fmt.allocPrint(a, "wal-{d}-{s}", .{ lsn, catalog.types.digestHex(authority) });
 }
 pub fn openQueue(a: A, binding: Binding, options: Options) !local.serverless_object_store_support.OpenedObjectStore {
+    return openQueueFor(a, binding, options, .{});
+}
+pub fn openQueueFor(a: A, binding: Binding, options: Options, context: Context) !local.serverless_object_store_support.OpenedObjectStore {
+    try context.ensureActive();
     if (binding.write_policy != .iceberg_writer or binding.catalog == null) return error.ExternalLakeReadOnly;
     const config = options.node_config orelse return error.NativeArtifactStorageRequired;
     if (config.storage.artifacts.connection == null) {
@@ -46,9 +50,9 @@ pub fn openQueue(a: A, binding: Binding, options: Options) !local.serverless_obj
         defer a.free(root);
         const uri = try std.fmt.allocPrint(a, "file://{s}", .{root});
         defer a.free(uri);
-        return local.serverless_object_store_support.OpenedObjectStore.initFileUriWithOptions(a, uri, "native-lake-indexes", .{ .ensure_bucket = true });
+        return local.serverless_object_store_support.OpenedObjectStore.initFileUriWithOptions(a, uri, "native-lake-indexes", .{ .ensure_bucket = true, .context = context });
     }
-    return configured.openNativeArtifactObjectStoreAlloc(a, config, options.secret_store, false);
+    return configured.openNativeArtifactObjectStoreFor(a, config, options.secret_store, false, context);
 }
 pub fn prefix(a: A, base: []const u8, binding: Binding, options: Options) ![]u8 {
     const identity = try std.json.Stringify.valueAlloc(a, .{ .source = binding.source_uri, .catalog = binding.catalog }, .{});
@@ -86,7 +90,7 @@ pub fn accept(a: A, binding: Binding, options: Options, context: Context, body: 
     try catalog.row_commit.validate(a, current.table.metadata_json, batch, context);
     const payload = try std.json.Stringify.valueAlloc(a, batch, .{});
     defer a.free(payload);
-    var opened = try openQueue(a, binding, options);
+    var opened = try openQueueFor(a, binding, options, context);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);
     defer a.free(base);
@@ -128,7 +132,7 @@ fn keyFieldsEqual(left: []const []const u8, right: []const []const u8) bool {
 /// One bounded transaction per worker pass. Exact commit intents survive a
 /// restart/timeout. A confirmed conflict alone allows a new pinned attempt.
 pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
-    var opened = try openQueue(a, binding, options);
+    var opened = try openQueueFor(a, binding, options, context);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);
     defer a.free(base);
@@ -191,7 +195,7 @@ pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
 }
 
 pub fn watermark(a: A, binding: Binding, options: Options, context: Context) !u64 {
-    var opened = try openQueue(a, binding, options);
+    var opened = try openQueueFor(a, binding, options, context);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
@@ -262,7 +266,7 @@ pub const Pending = struct {
 };
 /// Caller arena owns the immutable WAL cut and its normalized final images.
 pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: u64) !Pending {
-    var opened = try openQueue(a, binding, options);
+    var opened = try openQueueFor(a, binding, options, context);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };

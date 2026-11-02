@@ -60,6 +60,7 @@ pub const AttachContext = struct {
     gpt_config: ?gpt_mod.Config = null,
     kv_dtype: ?runtime_mod.kv.pool.KvDType = null,
     shared_moe_cache: ?*runtime_mod.moe.shared.SharedExpertCache = null,
+    device_memory_budget: ?runtime_mod.kv.device_memory.Budget = null,
     attention_mode: ?cache_mod.AttentionMode = null,
     attachment_target: AttachmentTarget = .partitioned,
 };

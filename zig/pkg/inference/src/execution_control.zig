@@ -19,6 +19,128 @@ const CheckBoundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct
 });
 const platform_time = @import("antfly_platform").time;
 
+/// A synchronous caller may lend its scheduler checkpoint to this OS worker.
+/// Controls copied to watchdogs or parallel children carry no callback: those
+/// threads have their own empty TLS slot. The host must join synchronous work
+/// and restore this scope before returning the caller's borrowed grant.
+pub const SynchronousCheckpoint = struct {
+    context: *anyopaque,
+    check_fn: *const fn (*anyopaque) anyerror!void,
+    wait_begin_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    wait_end_fn: ?*const fn (*anyopaque) anyerror!void = null,
+};
+threadlocal var synchronous_checkpoint: ?SynchronousCheckpoint = null;
+threadlocal var synchronous_checkpoint_depth: usize = 0;
+threadlocal var checking_synchronous_checkpoint: bool = false;
+threadlocal var waiting_synchronous_resource: bool = false;
+threadlocal var synchronous_refusal: ?anyerror = null;
+
+pub const CheckpointScope = struct {
+    pub fn hasCurrent() bool {
+        return synchronous_checkpoint != null and !waiting_synchronous_resource;
+    }
+
+    previous: ?SynchronousCheckpoint,
+    previous_waiting: bool,
+    previous_refusal: ?anyerror,
+    depth: usize,
+    thread: if (@import("builtin").single_threaded) void else std.Thread.Id,
+    active: bool = true,
+
+    pub fn init(checkpoint: SynchronousCheckpoint) CheckpointScope {
+        std.debug.assert((checkpoint.wait_begin_fn == null) == (checkpoint.wait_end_fn == null));
+        const previous = synchronous_checkpoint;
+        const previous_waiting = waiting_synchronous_resource;
+        waiting_synchronous_resource = false;
+        synchronous_checkpoint_depth += 1;
+        synchronous_checkpoint = checkpoint;
+        return .{ .previous = previous, .previous_waiting = previous_waiting, .previous_refusal = synchronous_refusal, .depth = synchronous_checkpoint_depth, .thread = if (comptime @import("builtin").single_threaded) {} else std.Thread.getCurrentId() };
+    }
+
+    pub fn deinit(self: *CheckpointScope) void {
+        if (comptime !@import("builtin").single_threaded) std.debug.assert(self.thread == std.Thread.getCurrentId());
+        std.debug.assert(self.active and self.depth == synchronous_checkpoint_depth and !waiting_synchronous_resource);
+        synchronous_checkpoint = self.previous;
+        waiting_synchronous_resource = self.previous_waiting;
+        synchronous_refusal = self.previous_refusal;
+        synchronous_checkpoint_depth -= 1;
+        self.active = false;
+    }
+};
+
+fn checkSynchronousCheckpoint() !void {
+    if (synchronous_refusal) |err| return err;
+    if (checking_synchronous_checkpoint or waiting_synchronous_resource) return;
+    const checkpoint = synchronous_checkpoint orelse return;
+    checking_synchronous_checkpoint = true;
+    defer checking_synchronous_checkpoint = false;
+    checkpoint.check_fn(checkpoint.context) catch |err| {
+        synchronous_refusal = err;
+        return err;
+    };
+}
+
+/// Observe the original synchronous refusal without polling or acquiring CPU.
+/// Best-effort metadata fallback must not revive a fenced preparation scope.
+pub fn checkRetainedRefusal() !void {
+    if (synchronous_refusal) |err| return err;
+}
+
+/// Park only a contended resource wait. Original cancellation/deadline checks
+/// continue while parked, but a runnable-only scheduler checkpoint cannot run.
+/// The owning caller retires the operation if reacquisition fails.
+pub const ResourceWait = struct {
+    checkpoint: ?SynchronousCheckpoint = null,
+    scope_depth: usize = 0,
+
+    pub fn init() !ResourceWait {
+        if (waiting_synchronous_resource) return .{};
+        const checkpoint = synchronous_checkpoint orelse return .{};
+        const begin = checkpoint.wait_begin_fn orelse return .{};
+        try checkSynchronousCheckpoint();
+        begin(checkpoint.context) catch |err| {
+            synchronous_refusal = err;
+            return err;
+        };
+        waiting_synchronous_resource = true;
+        return .{ .checkpoint = checkpoint, .scope_depth = synchronous_checkpoint_depth };
+    }
+
+    pub fn finish(self: *ResourceWait) !void {
+        const checkpoint = self.checkpoint orelse return;
+        std.debug.assert(waiting_synchronous_resource and self.scope_depth == synchronous_checkpoint_depth);
+        self.checkpoint = null;
+        waiting_synchronous_resource = false;
+        checkpoint.wait_end_fn.?(checkpoint.context) catch |err| {
+            synchronous_refusal = err;
+            return err;
+        };
+    }
+};
+
+/// These adapters lend only the physical operation. The calling task retains
+/// allocation/parsing and closes newly acquired resources if reentry refuses.
+pub fn physicalWait(comptime operation: anytype, args: anytype) anyerror!@typeInfo(@TypeOf(@call(.auto, operation, args))).error_union.payload {
+    var wait = try ResourceWait.init();
+    const result = @call(.auto, operation, args) catch |err| {
+        try wait.finish();
+        return err;
+    };
+    try wait.finish();
+    return result;
+}
+
+pub fn ownedPhysicalWait(comptime operation: anytype, args: anytype, comptime discard: anytype) anyerror!@typeInfo(@TypeOf(@call(.auto, operation, args))).error_union.payload {
+    var wait = try ResourceWait.init();
+    const result = @call(.auto, operation, args) catch |err| {
+        try wait.finish();
+        return err;
+    };
+    errdefer discard(result, args);
+    try wait.finish();
+    return result;
+}
+
 /// Stable phases shared by API, enrichment, model loading, pipelines, and
 /// backends. Progress is advisory; cancellation and deadlines are mandatory.
 pub const Phase = enum(u8) {
@@ -172,6 +294,7 @@ pub const InferenceExecutionControl = struct {
     }
 
     pub fn check(self: InferenceExecutionControl) !void {
+        try checkSynchronousCheckpoint();
         if (self.check_fn) |check_fn| try CheckBoundary.call("check_fn", self.check_dispatch, check_fn, .{self.ptr});
         if (self.cancellation) |token| {
             if (token.isCancelled()) return error.Cancelled;
@@ -203,6 +326,27 @@ pub const InferenceExecutionControl = struct {
         });
     }
 
+    /// Wait for a shared model/assets load without retaining the synchronous
+    /// caller's CPU grant. Loader ownership is independent; only this waiter
+    /// parks, and checked CPU return precedes handle adoption by the caller.
+    pub fn waitForLoad(self: InferenceExecutionControl, io: std.Io, completed: *std.Io.Event, independently_admitted: bool) !void {
+        if (completed.isSet()) return self.check();
+        try self.update(.loading_model, 0, 1);
+        var wait = if (independently_admitted) try ResourceWait.init() else ResourceWait{};
+        defer wait.finish() catch {};
+        while (!completed.isSet()) {
+            try self.update(.loading_model, 0, 1);
+            completed.waitTimeout(io, .{
+                .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake },
+            }) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+        }
+        try wait.finish();
+        try self.check();
+    }
+
     /// Acquire a process-local execution gate without turning queueing behind
     /// another inference request into an uncancellable wait.
     pub fn lock(self: InferenceExecutionControl, mutex: *std.atomic.Mutex) !void {
@@ -215,9 +359,21 @@ pub const InferenceExecutionControl = struct {
     /// at 1ms so a caller cannot create an unbounded cancellation interval.
     /// Existing callers requesting 100us retain that interval.
     pub fn lockWithPoll(self: InferenceExecutionControl, mutex: *std.atomic.Mutex, poll_ns: u64) !void {
+        if (mutex.tryLock()) {
+            self.check() catch |err| {
+                mutex.unlock();
+                return err;
+            };
+            return;
+        }
+        var wait = try ResourceWait.init();
         var spins: usize = 0;
-        while (!mutex.tryLock()) {
-            try self.check();
+        while (true) {
+            self.check() catch |err| {
+                try wait.finish();
+                return err;
+            };
+            if (mutex.tryLock()) break;
             if (spins < 64) {
                 std.atomic.spinLoopHint();
                 spins += 1;
@@ -227,8 +383,39 @@ pub const InferenceExecutionControl = struct {
                 @import("antfly_platform").time.yieldNow();
             }
         }
+        wait.finish() catch |err| {
+            mutex.unlock();
+            return err;
+        };
         self.check() catch |err| {
             mutex.unlock();
+            return err;
+        };
+    }
+
+    /// Only the queued mutex wait parks capacity. Reacquire before returning
+    /// a held lock; an active worker RPC must retain its physical CPU grant.
+    pub fn lockIo(self: InferenceExecutionControl, io: std.Io, mutex: *std.Io.Mutex) !void {
+        try self.check();
+        if (mutex.tryLock()) return;
+        var wait = try ResourceWait.init();
+        while (true) {
+            self.check() catch |err| {
+                try wait.finish();
+                return err;
+            };
+            if (mutex.tryLock()) break;
+            io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                try wait.finish();
+                return err;
+            };
+        }
+        wait.finish() catch |err| {
+            mutex.unlock(io);
+            return err;
+        };
+        self.check() catch |err| {
+            mutex.unlock(io);
             return err;
         };
     }
@@ -309,6 +496,162 @@ test "uninterruptible work fails closed without a process owner" {
     );
     var cooperative = try control.enterUninterruptible(.cooperative);
     cooperative.deinit();
+}
+
+pub fn testSynchronousCheckpoint() !void {
+    const Probe = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail) return error.Forbidden;
+        }
+        fn child() void {
+            const control = InferenceExecutionControl{};
+            control.check() catch @panic("child inherited parent checkpoint");
+        }
+    };
+    const control = InferenceExecutionControl{};
+    var parent = Probe{};
+    var child = Probe{ .fail = true };
+    var outer = CheckpointScope.init(.{ .context = &parent, .check_fn = Probe.check });
+    defer if (outer.active) outer.deinit();
+    try control.check();
+    var inner = CheckpointScope.init(.{ .context = &child, .check_fn = Probe.check });
+    try std.testing.expectError(error.Forbidden, control.check());
+    child.fail = false;
+    try std.testing.expectError(error.Forbidden, checkRetainedRefusal());
+    try std.testing.expectError(error.Forbidden, control.check());
+    try std.testing.expectEqual(@as(usize, 1), child.calls);
+    inner.deinit();
+    try checkRetainedRefusal();
+    try control.check();
+    if (comptime !@import("builtin").single_threaded) {
+        const worker = try std.Thread.spawn(.{}, Probe.child, .{});
+        worker.join();
+    }
+    try std.testing.expectEqual(@as(usize, 2), parent.calls);
+    try std.testing.expectEqual(@as(usize, 1), child.calls);
+    outer.deinit();
+    try control.check();
+    try std.testing.expectEqual(@as(usize, 2), parent.calls);
+}
+
+test "runnable execution synchronous checkpoint stays on its worker and restores nested scopes" {
+    try testSynchronousCheckpoint();
+}
+
+pub fn testSynchronousResourceWait() !void {
+    const Mode = enum { success, canceled, resume_rejected };
+    const Probe = struct {
+        gate: std.atomic.Mutex = .unlocked,
+        mode: Mode,
+        parked: bool = false,
+        canceled: bool = false,
+        waits: usize = 0,
+        resumes: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.parked = true;
+            self.waits += 1;
+            self.canceled = self.mode == .canceled;
+            self.gate.unlock();
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.parked);
+            self.resumes += 1;
+            if (self.mode == .resume_rejected) return error.Forbidden;
+            self.parked = false;
+        }
+        fn canceledNow(raw: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.canceled;
+        }
+    };
+    for ([_]Mode{ .success, .canceled, .resume_rejected }) |mode| {
+        var probe = Probe{ .mode = mode };
+        const control = InferenceExecutionControl{ .cancellation = .{ .ptr = &probe, .is_cancelled_fn = Probe.canceledNow } };
+        var scope = CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.begin, .wait_end_fn = Probe.end });
+        defer if (scope.active) scope.deinit();
+        try std.testing.expect(probe.gate.tryLock());
+        switch (mode) {
+            .success => {
+                try control.lock(&probe.gate);
+                probe.gate.unlock();
+            },
+            .canceled => try std.testing.expectError(error.Cancelled, control.lock(&probe.gate)),
+            .resume_rejected => try std.testing.expectError(error.Forbidden, control.lock(&probe.gate)),
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.waits);
+        try std.testing.expectEqual(@as(usize, 1), probe.resumes);
+        try std.testing.expect(probe.gate.tryLock());
+        probe.gate.unlock();
+        scope.deinit();
+        try (InferenceExecutionControl{}).check();
+    }
+}
+
+test "runnable execution synchronous resource wait preserves cancellation and unlocks failures" {
+    try testSynchronousResourceWait();
+}
+
+pub fn testNestedSynchronousResourceWait() !void {
+    const Probe = struct {
+        parked: bool = false,
+        checks: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked);
+            self.checks += 1;
+            // Collective controls may check their members recursively. The
+            // owner checkpoint must not recursively yield the same capsule.
+            try (InferenceExecutionControl{}).check();
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked);
+            self.parked = true;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.parked);
+            self.parked = false;
+        }
+        fn checkpoint(self: *@This()) SynchronousCheckpoint {
+            return .{ .context = self, .check_fn = check, .wait_begin_fn = begin, .wait_end_fn = end };
+        }
+    };
+    var parent = Probe{};
+    var child = Probe{};
+    var outer = CheckpointScope.init(parent.checkpoint());
+    defer if (outer.active) outer.deinit();
+    var parent_wait = try ResourceWait.init();
+    var inner = CheckpointScope.init(child.checkpoint());
+    defer if (inner.active) inner.deinit();
+    try (InferenceExecutionControl{}).check();
+    var child_wait = try ResourceWait.init();
+    try (InferenceExecutionControl{}).check();
+    try child_wait.finish();
+    inner.deinit();
+    // The parent's checkpoint stays suspended until its own wait finishes.
+    try (InferenceExecutionControl{}).check();
+    try std.testing.expectEqual(@as(usize, 1), parent.checks);
+    try std.testing.expectEqual(@as(usize, 2), child.checks);
+    try parent_wait.finish();
+    try (InferenceExecutionControl{}).check();
+    try std.testing.expectEqual(@as(usize, 2), parent.checks);
+    outer.deinit();
+    try (InferenceExecutionControl{}).check();
+}
+
+test "runnable execution nested admitted scope restores a parked caller and prevents recursive checkpoints" {
+    try testNestedSynchronousResourceWait();
 }
 
 test "native call policy is scoped to the execution control" {
@@ -673,4 +1016,35 @@ test "LightOnOCR3 execution lane cleanup survives cancellation of its owning Io 
     cancel_task = null;
     try std.testing.expect(done.load(.acquire));
     try std.testing.expect(!lane.owned and lane.head == null and lane.tail == null);
+}
+
+test "runnable execution physical wait refusal survives optional and nested scopes" {
+    const Probe = struct {
+        discarded: usize = 0,
+        calls: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {
+            return error.PhysicalReturnDenied;
+        }
+        fn acquire(self: *@This()) !u8 {
+            self.calls += 1;
+            return 1;
+        }
+        fn discard(_: u8, args: anytype) void {
+            args[0].discarded += 1;
+        }
+    };
+    var probe: Probe = .{};
+    var scope = CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.begin, .wait_end_fn = Probe.end });
+    defer if (scope.active) scope.deinit();
+    try std.testing.expectError(error.PhysicalReturnDenied, ownedPhysicalWait(Probe.acquire, .{&probe}, Probe.discard));
+    try std.testing.expectEqual(@as(usize, 1), probe.discarded);
+    var nested = CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.begin, .wait_end_fn = Probe.end });
+    try std.testing.expectError(error.PhysicalReturnDenied, physicalWait(Probe.acquire, .{&probe}));
+    nested.deinit();
+    try std.testing.expectError(error.PhysicalReturnDenied, (InferenceExecutionControl{}).check());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    scope.deinit();
+    try (InferenceExecutionControl{}).check();
 }

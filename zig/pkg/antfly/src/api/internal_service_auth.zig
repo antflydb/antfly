@@ -53,6 +53,7 @@ pub const Config = struct {
     secret: []const u8,
     issuer: []const u8,
     subject: []const u8 = default_subject,
+    remote_attempt: ?@import("../common/remote_attempt_wire.zig").Context = null,
 };
 
 pub fn requestTargetsInternalApi(uri: []const u8) bool {
@@ -169,6 +170,14 @@ pub fn validateCredentialIsolation(
 
 pub fn tokenAlloc(alloc: std.mem.Allocator, config: Config, now_seconds: i64) ![]u8 {
     const header_json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    var encoded_attempt: [@import("../common/remote_attempt_wire.zig").encoded_size]u8 = undefined;
+    const Metadata = struct { remote_attempt: []const u8 };
+    const metadata: ?Metadata = if (config.remote_attempt) |context| value: {
+        const subject = context.subject();
+        if (!std.mem.eql(u8, config.subject, &subject)) return error.InvalidRemoteAttemptPrincipal;
+        encoded_attempt = try context.encode();
+        break :value .{ .remote_attempt = &encoded_attempt };
+    } else null;
     const payload_json = try std.json.Stringify.valueAlloc(alloc, .{
         .iss = config.issuer,
         .sub = config.subject,
@@ -177,7 +186,8 @@ pub fn tokenAlloc(alloc: std.mem.Allocator, config: Config, now_seconds: i64) ![
         .admin = true,
         .iat = now_seconds,
         .exp = now_seconds + token_ttl_seconds,
-    }, .{});
+        .metadata = metadata,
+    }, .{ .emit_null_optional_fields = false });
     defer alloc.free(payload_json);
 
     const header_b64 = try base64UrlEncodeAlloc(alloc, header_json);

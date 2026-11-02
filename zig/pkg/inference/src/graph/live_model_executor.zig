@@ -38,6 +38,7 @@ const ExecutorContext = struct {
     gpt_config: gpt_mod.Config,
     kv_dtype: ?runtime.kv.pool.KvDType = null,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+    device_memory_budget: ?runtime.kv.device_memory.Budget = null,
 };
 
 const RuntimeContext = struct {
@@ -48,6 +49,7 @@ const RuntimeContext = struct {
     pool_id: runtime.kv.block.KvPoolId,
     decode_runtime: decode_state_runtime.DecodeStateRuntime,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+    device_memory_budget: ?runtime.kv.device_memory.Budget = null,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -55,12 +57,17 @@ const RuntimeContext = struct {
         gpt_config: gpt_mod.Config,
         kv_dtype_override: ?runtime.kv.pool.KvDType,
         shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+        device_memory_budget: ?runtime.kv.device_memory.Budget,
     ) !*RuntimeContext {
+        const owned_budget = if (device_memory_budget) |budget| try budget.clone() else null;
+        errdefer if (owned_budget) |budget| budget.deinit();
         const cb = try session_factory.getComputeBackend(session, allocator);
         errdefer {
             var cb_mut = cb;
             cb_mut.deinit();
         }
+
+        if (owned_budget) |budget| try cb.configureDeviceMemoryBudget(budget);
 
         var kv_manager = runtime.kv.manager.KvManager.init(allocator);
         errdefer kv_manager.deinit();
@@ -94,6 +101,7 @@ const RuntimeContext = struct {
             .pool_id = pool_id,
             .decode_runtime = undefined,
             .shared_moe_cache = shared_moe_cache,
+            .device_memory_budget = owned_budget,
         };
         ctx.decode_runtime = decode_state_runtime.DecodeStateRuntime.initPaged(
             allocator,
@@ -120,7 +128,9 @@ const RuntimeContext = struct {
         self.decode_runtime.deinit();
         self.kv_manager.deinit();
         self.cb.deinit();
+        const budget = self.device_memory_budget;
         self.allocator.destroy(self);
+        if (budget) |owned| owned.deinit();
     }
 
     fn currentTokenCount(self: *const RuntimeContext) usize {
@@ -216,8 +226,11 @@ pub fn createModelExecutor(
     gpt_config: gpt_mod.Config,
     kv_dtype: ?runtime.kv.pool.KvDType,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+    device_memory_budget: ?runtime.kv.device_memory.Budget,
 ) !model_runtime.ModelExecutor {
     if (!supportsSession(session)) return error.UnsupportedCompileBackend;
+    const owned_budget = if (device_memory_budget) |budget| try budget.clone() else null;
+    errdefer if (owned_budget) |budget| budget.deinit();
     const ctx = try allocator.create(ExecutorContext);
     ctx.* = .{
         .allocator = allocator,
@@ -225,6 +238,7 @@ pub fn createModelExecutor(
         .gpt_config = gpt_config,
         .kv_dtype = kv_dtype,
         .shared_moe_cache = shared_moe_cache,
+        .device_memory_budget = owned_budget,
     };
     return .{ .ptr = ctx, .vtable = &executor_vtable };
 }
@@ -237,13 +251,16 @@ fn createRuntime(ctx: *anyopaque, allocator: std.mem.Allocator) !model_runtime.M
         exec_ctx.gpt_config,
         exec_ctx.kv_dtype,
         exec_ctx.shared_moe_cache,
+        exec_ctx.device_memory_budget,
     );
     return .{ .ptr = runtime_ctx, .vtable = &runtime_vtable };
 }
 
 fn executorDeinit(ctx: *anyopaque) void {
     const exec_ctx: *ExecutorContext = @ptrCast(@alignCast(ctx));
+    const budget = exec_ctx.device_memory_budget;
     exec_ctx.allocator.destroy(exec_ctx);
+    if (budget) |owned| owned.deinit();
 }
 
 fn runtimeCapabilities(ctx: *anyopaque) model_runtime.RuntimeCapabilities {

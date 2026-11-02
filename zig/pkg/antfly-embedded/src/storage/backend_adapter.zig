@@ -43,6 +43,21 @@ pub fn Store(
             return try ops.begin_read(self.impl);
         }
 
+        pub fn beginReadWithAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port) !ReadHandle {
+            if (comptime @hasField(@TypeOf(ops), "begin_read_with_admission")) return ops.begin_read_with_admission(self.impl, admission, control);
+            return error.ExecutionWaitUnsupported;
+        }
+
+        pub fn beginProbeWithAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port) !ReadHandle {
+            if (comptime @hasField(@TypeOf(ops), "begin_probe_with_admission")) return ops.begin_probe_with_admission(self.impl, admission, control);
+            return error.ExecutionWaitUnsupported;
+        }
+
+        pub fn beginCurrentScanWithAdmission(self: *@This(), control: @import("../common/read_admission.zig").Port) !ReadHandle {
+            if (comptime @hasField(@TypeOf(ops), "begin_current_scan_with_admission")) return ops.begin_current_scan_with_admission(self.impl, control);
+            return error.ExecutionWaitUnsupported;
+        }
+
         pub fn beginProbe(self: *@This()) !ReadHandle {
             if (comptime @hasField(@TypeOf(ops), "begin_probe")) {
                 return try ops.begin_probe(self.impl);

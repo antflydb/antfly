@@ -19,6 +19,8 @@ const artifact_store = @import("store.zig");
 const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const ReadContext = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
+const execution_wait = @import("antfly_local_sources").sql_execution_wait;
 
 pub const ObjectStore = struct {
     const verified_object_cache_limit: usize = 4096;
@@ -46,6 +48,8 @@ pub const ObjectStore = struct {
         }
     };
 
+    /// Borrowed only by this request-local store through synchronous upload.
+    upload_context: ReadContext = .{},
     alloc: std.mem.Allocator,
     client: objectstore.Client,
     fs_client: ?*objectstore.FilesystemClient = null,
@@ -199,13 +203,10 @@ pub const ObjectStore = struct {
 
     /// Borrow a configured client without widening its provisioning authority.
     /// Readers and require-existing writers must not create missing buckets.
-    pub fn initWithClientOptions(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8, options: struct { ensure_bucket: bool = false, read_only: bool = false, filesystem: ?*objectstore.FilesystemClient = null }) !ObjectStore {
+    pub fn initWithClientOptions(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8, options: struct { ensure_bucket: bool = false, read_only: bool = false, filesystem: ?*objectstore.FilesystemClient = null, context: ReadContext = .{} }) !ObjectStore {
         if (options.read_only and options.ensure_bucket) return error.InvalidArtifactStoreOptions;
         var owned_client = client;
-        if (!(try owned_client.bucketExists(bucket))) {
-            if (!options.ensure_bucket) return error.ArtifactBucketNotFound;
-            try owned_client.makeBucket(bucket);
-        }
+        try (object_store_support.OpenedObjectStore.OpenOptions{ .ensure_bucket = options.ensure_bucket, .context = options.context }).ensureClient(&owned_client, bucket, true);
         const owned_bucket = try alloc.dupe(u8, bucket);
         errdefer alloc.free(owned_bucket);
         const owned_prefix = try alloc.dupe(u8, prefix);
@@ -258,21 +259,33 @@ pub const ObjectStore = struct {
     }
 
     pub fn usesObjectVersions(self: *ObjectStore, token: CancellationToken) !bool {
+        return self.usesObjectVersionsFor(token, .{});
+    }
+    fn usesObjectVersionsFor(self: *ObjectStore, token: CancellationToken, context: ReadContext) !bool {
         try token.check();
         if (self.fs_client != null) return false;
         const held = self.version_operations.load(.acquire);
         if (held != 0) return held == 2;
-        const supported = try self.client.supportsObjectVersions(self.bucket, objectstore.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn));
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = token };
+        try op.ready();
+        const supported = self.client.supportsObjectVersions(self.bucket, op.token()) catch |err| {
+            try op.check();
+            return err;
+        };
+        try op.ready();
         self.version_operations.store(if (supported) 2 else 1, .release);
         return supported;
     }
     fn generation(self: *ObjectStore, id: []const u8, token: CancellationToken) !?[]u8 {
+        return self.generationFor(id, token, .{});
+    }
+    fn generationFor(self: *ObjectStore, id: []const u8, token: CancellationToken, context: ReadContext) !?[]u8 {
         // Range reads may borrow an arena-owned store. Reclaim selectors after
         // every request rather than retaining one parse per posting block.
         const a = std.heap.page_allocator;
-        var record = if (self.cloud_writer) |writer| try writer.lookup(a, id, token) else null;
+        var record = if (self.cloud_writer) |writer| try writer.lookupFor(a, id, token, context) else null;
         if (record == null) if (self.cloud_reader) |reader| {
-            record = try reader.lookup(a, id, token);
+            record = try reader.lookupFor(a, id, token, context);
         };
         if (record) |*value| {
             defer value.deinit(a);
@@ -281,7 +294,10 @@ pub const ObjectStore = struct {
         return null;
     }
     fn captureGeneration(self: *ObjectStore, id: []const u8, bytes: u64, version: ?[]const u8, token: CancellationToken) !void {
-        if (self.cloud_writer) |writer| try writer.capture(id, bytes, version, token);
+        return self.captureGenerationFor(id, bytes, version, token, .{});
+    }
+    fn captureGenerationFor(self: *ObjectStore, id: []const u8, bytes: u64, version: ?[]const u8, token: CancellationToken, context: ReadContext) !void {
+        if (self.cloud_writer) |writer| try writer.captureFor(id, bytes, version, token, context);
     }
     pub fn artifactStore(self: *ObjectStore) artifact_store.ArtifactStore {
         return .{
@@ -302,9 +318,16 @@ pub const ObjectStore = struct {
     }
 
     fn putInScope(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
-        try cancellation.check();
+        return self.putInScopeFor(alloc, scope, contents, cancellation, self.upload_context);
+    }
+
+    fn putInScopeFor(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken, context: ReadContext) !artifact_store.ArtifactMetadata {
+        try context.ensureActive();
+        const lifetime: UploadCancellation = .{ .context = context, .parent = cancellation };
+        const token = lifetime.token();
+        try token.check();
         if (self.read_only) return error.ArtifactStoreReadOnly;
-        const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
+        const checksum = try sha256StringWithCancellationAlloc(alloc, contents, token);
         errdefer alloc.free(checksum);
         const artifact_id = if (scope) |value| scoped: {
             const id = try value.artifactId(checksum);
@@ -314,12 +337,13 @@ pub const ObjectStore = struct {
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
 
-        if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.registerScopedUpload(upload, checksum, cancellation);
+        if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.registerScopedUploadFor(upload, checksum, token, context);
+        try context.ensureActive();
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, checksum) catch unreachable;
         var checksum_base64_buf: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
         const checksum_base64 = std.base64.standard.Encoder.encode(&checksum_base64_buf, &digest);
-        var result = self.client.putObject(self.bucket, key, contents, .{
+        const options: objectstore.PutOptions = .{
             .content_type = "application/octet-stream",
             .checksum_sha256_base64 = if (self.s3_client != null) checksum_base64 else null,
             // GCS exposes provider-computed CRC32C/MD5 metadata. A caller-owned
@@ -327,14 +351,19 @@ pub const ObjectStore = struct {
             // not be used to bypass content verification.
             .checksum_sha256_hex = null,
             .if_none_match = true,
-            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-        }) catch |err| switch (normalizeCancellationError(err, cancellation)) {
+            .cancellation = lifetime.providerToken(),
+        };
+        // Native execution is lent at provider readiness/physical-write
+        // boundaries. Legacy explicit wait-only adapters retain their contract.
+        const outer_wait = if (context.execution == null) context.wait else null;
+        var result = execution_wait.runOwned(outer_wait, objectstore.Client.putObject, .{ &self.client, self.bucket, key, contents, options }, discardProvider, .{self.client.allocator}) catch |err| switch (normalizeCancellationError(err, token)) {
             error.PreconditionFailed => {
                 // Content-addressed keys are immutable. Concurrent/idempotent
                 // writers may lose the create race, but the existing object is
                 // accepted only after authenticating it against the digest we
                 // computed from `contents`.
-                try self.verifyContent(alloc, artifact_id, contents.len, checksum, cancellation);
+                try context.ensureActive();
+                try self.verifyContentWithContext(artifact_id, contents.len, checksum, token, null, context);
                 var pin = try self.verifiedObjectPinAlloc(alloc, artifact_id, contents.len, null);
                 defer if (pin) |*value| value.deinit(alloc);
                 return .{
@@ -347,7 +376,8 @@ pub const ObjectStore = struct {
             else => |normalized| return normalized,
         };
         defer result.deinit(self.client.allocator);
-        try self.captureGeneration(artifact_id, contents.len, result.version_id, cancellation);
+        try context.ensureActive();
+        try self.captureGenerationFor(artifact_id, contents.len, result.version_id, token, context);
 
         return .{
             .provider_version = if (result.version_id) |version| if (!std.mem.eql(u8, version, "null")) try alloc.dupe(u8, version) else null else null,
@@ -355,6 +385,53 @@ pub const ObjectStore = struct {
             .byte_len = @intCast(contents.len),
             .checksum = checksum,
         };
+    }
+
+    const UploadCancellation = struct {
+        context: ReadContext,
+        parent: CancellationToken,
+        fn cancelled(raw: *const anyopaque) bool {
+            check(raw) catch return true;
+            return false;
+        }
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            try self.parent.check();
+            try self.context.checkLifetime();
+        }
+        fn providerToken(self: *const @This()) objectstore.CancellationToken {
+            return .{
+                .ptr = self,
+                .is_cancelled_fn = cancelled,
+                .execution_wait = if (self.context.execution != null and self.context.wait != null) .{
+                    .ptr = @constCast(self),
+                    .wait_begin_fn = begin,
+                    .wait_end_fn = end,
+                } else null,
+            };
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            try check(self);
+            const wait = self.context.wait.?;
+            try wait.begin(wait.ptr);
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            const wait = self.context.wait.?;
+            wait.end(wait.ptr) catch |err| {
+                try check(self);
+                return err;
+            };
+            try check(self);
+        }
+        fn token(self: *const @This()) CancellationToken {
+            return .{ .ptr = self, .is_cancelled_fn = cancelled, .check_fn = check };
+        }
+    };
+    fn discardProvider(value: anytype, alloc: std.mem.Allocator) void {
+        var result = value;
+        result.deinit(alloc);
     }
 
     pub fn getAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
@@ -370,15 +447,19 @@ pub const ObjectStore = struct {
         try cancellation.check();
         const selected_generation = try self.generation(artifact_id, cancellation);
         defer if (selected_generation) |value| std.heap.page_allocator.free(value);
-        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
-        defer self.alloc.free(key);
-        var result = self.client.getObject(self.bucket, key, .{
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
+        defer alloc.free(key);
+        var client = self.client;
+        client.allocator = alloc;
+        var result = client.getObject(self.bucket, key, .{
             .version_id = selected_generation,
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err, cancellation);
-        defer result.deinit(self.client.allocator);
+        defer result.deinit(alloc);
         try cancellation.check();
-        return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
+        const body = result.body;
+        result.body = &.{};
+        return body;
     }
 
     fn getBoundedAllocWithCancellation(
@@ -428,18 +509,22 @@ pub const ObjectStore = struct {
         try cancellation.check();
         const selected_generation = try self.generation(artifact_id, cancellation);
         defer if (selected_generation) |value| std.heap.page_allocator.free(value);
-        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
-        defer self.alloc.free(key);
-        var result = self.client.getObject(self.bucket, key, .{
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
+        defer alloc.free(key);
+        var client = self.client;
+        client.allocator = alloc;
+        var result = client.getObject(self.bucket, key, .{
             .range = .{ .offset = offset, .length = len },
             .skip_metadata_probe = true,
             .max_response_bytes = len,
             .version_id = selected_generation,
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err, cancellation);
-        defer result.deinit(self.client.allocator);
+        defer result.deinit(alloc);
         try cancellation.check();
-        return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
+        const body = result.body;
+        result.body = &.{};
+        return body;
     }
 
     pub fn getVerifiedRangeAllocWithCancellation(
@@ -553,17 +638,28 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
         remaining: ?*u64,
     ) !void {
-        const selected_generation = try self.generation(artifact_id, cancellation);
+        return self.verifyContentWithContext(artifact_id, expected_byte_len, expected_checksum, cancellation, remaining, .{});
+    }
+
+    fn verifyContentWithContext(self: *ObjectStore, artifact_id: []const u8, expected_byte_len: u64, expected_checksum: []const u8, cancellation: CancellationToken, remaining: ?*u64, context: ReadContext) !void {
+        try context.ensureActive();
+        const lifetime: UploadCancellation = .{ .context = context, .parent = cancellation };
+        const original = lifetime.token();
+        try original.check();
+        const outer_wait = if (context.execution == null) context.wait else null;
+        const selected_generation = try self.generationFor(artifact_id, original, context);
         defer if (selected_generation) |selected| std.heap.page_allocator.free(selected);
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
-        var meta = self.client.statObjectWithOptions(self.bucket, key, .{
+        const stat_options: objectstore.StatOptions = .{
             .version_id = selected_generation,
-            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-        }) catch |err| return normalizeCancellationError(err, cancellation);
+            .cancellation = lifetime.providerToken(),
+        };
+        var meta = execution_wait.runOwned(outer_wait, objectstore.Client.statObjectWithOptions, .{ &self.client, self.bucket, key, stat_options }, discardProvider, .{self.client.allocator}) catch |err| return normalizeCancellationError(err, original);
         defer meta.deinit(self.client.allocator);
+        try context.ensureActive();
         if (meta.content_length != expected_byte_len) return error.ArtifactIntegrityMismatch;
         if (meta.checksum_scope == .object) {
             if (meta.checksum) |native| {
@@ -571,7 +667,7 @@ pub const ObjectStore = struct {
                     .sha256_hex => {
                         if (!std.ascii.eqlIgnoreCase(native.value, expected_checksum)) return error.ArtifactIntegrityMismatch;
                         const identity = metadataIdentity(meta) orelse return error.ArtifactIdentityUnavailable;
-                        try self.rememberVerifiedObject(artifact_id, expected_byte_len, identity, meta.version_id, meta.etag);
+                        try self.rememberVerifiedObjectFor(artifact_id, expected_byte_len, identity, meta.version_id, meta.etag, original, context);
                         return;
                     },
                     .sha256_base64 => {
@@ -581,7 +677,7 @@ pub const ObjectStore = struct {
                         const value = std.base64.standard.Encoder.encode(&encoded, &digest);
                         if (!std.mem.eql(u8, native.value, value)) return error.ArtifactIntegrityMismatch;
                         const identity = metadataIdentity(meta) orelse return error.ArtifactIdentityUnavailable;
-                        try self.rememberVerifiedObject(artifact_id, expected_byte_len, identity, meta.version_id, meta.etag);
+                        try self.rememberVerifiedObjectFor(artifact_id, expected_byte_len, identity, meta.version_id, meta.etag, original, context);
                         return;
                     },
                     else => {},
@@ -595,8 +691,8 @@ pub const ObjectStore = struct {
             if (self.verified_objects.get(artifact_id)) |cached| {
                 if (cached.byte_len == expected_byte_len and std.mem.eql(u8, &cached.identity, &value)) {
                     self.verified_mu.unlock();
-                    try cancellation.check();
-                    try self.captureGeneration(artifact_id, expected_byte_len, meta.version_id, cancellation);
+                    try original.check();
+                    try self.captureGenerationFor(artifact_id, expected_byte_len, meta.version_id, original, context);
                     return;
                 }
             }
@@ -611,17 +707,20 @@ pub const ObjectStore = struct {
         const chunk_bytes: u64 = 8 * 1024 * 1024;
         var offset: u64 = 0;
         while (offset < expected_byte_len) {
-            try cancellation.check();
+            try context.ensureActive();
+            try original.check();
             const len = @min(chunk_bytes, expected_byte_len - offset);
-            var part = self.client.getObject(self.bucket, key, .{
+            const get_options: objectstore.GetOptions = .{
                 .range = .{ .offset = offset, .length = len },
                 .version_id = meta.version_id,
                 .if_match_etag = meta.etag,
                 .skip_metadata_probe = true,
                 .max_response_bytes = @intCast(len),
-                .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-            }) catch |err| return normalizeCancellationError(err, cancellation);
+                .cancellation = lifetime.providerToken(),
+            };
+            var part = execution_wait.runOwned(outer_wait, objectstore.Client.getObject, .{ &self.client, self.bucket, key, get_options }, discardProvider, .{self.client.allocator}) catch |err| return normalizeCancellationError(err, original);
             defer part.deinit(self.client.allocator);
+            try context.ensureActive();
             if (part.body.len != len) return error.ArtifactIntegrityMismatch;
             hasher.update(part.body);
             offset += len;
@@ -630,24 +729,29 @@ pub const ObjectStore = struct {
         hasher.final(&digest);
         const actual = std.fmt.bytesToHex(digest, .lower);
         if (!std.mem.eql(u8, &actual, expected_checksum)) return error.ArtifactIntegrityMismatch;
-        try cancellation.check();
+        try original.check();
         const value = identity orelse return error.ArtifactIdentityUnavailable;
-        try self.rememberVerifiedObject(artifact_id, expected_byte_len, value, meta.version_id, meta.etag);
+        try self.rememberVerifiedObjectFor(artifact_id, expected_byte_len, value, meta.version_id, meta.etag, original, context);
     }
 
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
         return self.deleteWithCancellation(artifact_id, .none);
     }
     pub fn deleteWithCancellation(self: *ObjectStore, artifact_id: []const u8, token: CancellationToken) !void {
+        return self.deleteForOperation(artifact_id, token, .{});
+    }
+    fn deleteForOperation(self: *ObjectStore, artifact_id: []const u8, token: CancellationToken, context: ReadContext) !void {
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = token };
+        try op.ready();
         try token.check();
         if (self.read_only) return error.ArtifactStoreReadOnly;
-        if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(fs, scope, .none);
+        if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidateFor(fs, scope, token, context);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
-        if (try self.usesObjectVersions(token)) {
-            try self.deleteVersions(key, token);
-        } else try self.client.deleteObject(self.bucket, key, .{ .cancellation = objectstore.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) });
-        if (self.local_inventory) |*fs| try @import("retained_closure.zig").forget(fs, artifact_id);
+        if (try self.usesObjectVersionsFor(token, context)) {
+            try self.deleteVersionsFor(key, token, context);
+        } else try op.delete(&self.client, self.bucket, key, .{});
+        if (self.local_inventory) |*fs| try @import("retained_closure.zig").forgetFor(fs, artifact_id, context);
         lockAtomic(&self.verified_mu);
         defer self.verified_mu.unlock();
         if (self.verified_objects.fetchRemove(artifact_id)) |removed| {
@@ -660,23 +764,34 @@ pub const ObjectStore = struct {
     /// Called only after the collector proved this artifact name is absent
     /// from every live closure. Never issue a current-name delete marker.
     fn deleteVersions(self: *ObjectStore, key: []const u8, token: CancellationToken) !void {
+        return self.deleteVersionsFor(key, token, .{});
+    }
+    fn deleteVersionsFor(self: *ObjectStore, key: []const u8, token: CancellationToken, context: ReadContext) !void {
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = token };
         var deleted: usize = 0;
         while (true) {
-            try token.check();
-            const remote_token = objectstore.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn);
-            var page = try self.client.listObjectVersions(self.bucket, .{ .prefix = key, .max_keys = 128, .cancellation = remote_token });
+            try op.ready();
+            const remote_token = op.token();
+            var page = self.client.listObjectVersions(self.bucket, .{ .prefix = key, .max_keys = 128, .cancellation = remote_token }) catch |err| {
+                try op.check();
+                return err;
+            };
             defer page.deinit(self.client.allocator);
             var found = false;
             var protected = false;
             for (page.entries) |entry| {
-                try token.check();
+                try op.ready();
                 if (!std.mem.eql(u8, entry.key, key)) continue;
                 found = true;
                 if (deleted == 256) return error.ArtifactVersionDeletionPaused;
-                self.client.deleteObject(self.bucket, key, .{ .version_id = entry.version_id, .cancellation = remote_token }) catch |err| switch (err) {
+                op.delete(&self.client, self.bucket, key, .{ .version_id = entry.version_id }) catch |err| switch (err) {
                     error.FileNotFound => {},
                     error.AccessDenied, error.PreconditionFailed => {
-                        const proof = try self.client.versionRetention(self.bucket, key, entry.version_id, remote_token);
+                        const proof = self.client.versionRetention(self.bucket, key, entry.version_id, remote_token) catch |failure| {
+                            try op.check();
+                            return failure;
+                        };
+                        try op.ready();
                         if (proof == null) return err;
                         protected = true;
                     },
@@ -684,6 +799,7 @@ pub const ObjectStore = struct {
                 };
                 deleted += 1;
             }
+            try op.ready();
             if (protected) return error.ArtifactRetentionActive;
             if (!found) return;
         }
@@ -697,8 +813,11 @@ pub const ObjectStore = struct {
         version_id: ?[]const u8,
         etag: ?[]const u8,
     ) !void {
+        return self.rememberVerifiedObjectFor(artifact_id, byte_len, identity, version_id, etag, .none, .{});
+    }
+    fn rememberVerifiedObjectFor(self: *ObjectStore, artifact_id: []const u8, byte_len: u64, identity: [32]u8, version_id: ?[]const u8, etag: ?[]const u8, token: CancellationToken, context: ReadContext) !void {
         if (version_id == null and etag == null) return error.ArtifactIdentityUnavailable;
-        try self.captureGeneration(artifact_id, byte_len, version_id, .none);
+        try self.captureGenerationFor(artifact_id, byte_len, version_id, token, context);
         const owned_id = try self.alloc.dupe(u8, artifact_id);
         errdefer self.alloc.free(owned_id);
         const owned_version_id = if (version_id) |value| try self.alloc.dupe(u8, value) else null;
@@ -748,8 +867,14 @@ pub const ObjectStore = struct {
     }
 
     fn visitScopedUploads(self: *ObjectStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
+        return self.visitForOperation(domain, visitor, cancellation, .{});
+    }
+    fn visitForOperation(self: *ObjectStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken, context: ReadContext) !void {
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+        try op.ready();
         if (!self.read_only and visitor.checkpoint != null) if (self.local_inventory) |*inventory| {
             var local_store = inventory.artifactStore();
+            local_store.write_context = context;
             return local_store.visitScopedUploads(domain, visitor, cancellation);
         };
         const prefix = if (self.prefix.len == 0)
@@ -757,28 +882,28 @@ pub const ObjectStore = struct {
         else
             try std.fmt.allocPrint(self.alloc, "{s}/graph/{s}/", .{ self.prefix, std.fmt.bytesToHex(&domain, .lower) });
         defer self.alloc.free(prefix);
-        if (try self.usesObjectVersions(cancellation)) return self.visitVersionedScopes(domain, prefix, visitor, cancellation);
+        if (try self.usesObjectVersionsFor(cancellation, context)) return self.visitVersionedScopesFor(domain, prefix, visitor, cancellation, context);
         const start = if (visitor.after_suffix) |after| try std.mem.concat(self.alloc, u8, &.{ prefix, after }) else null;
         defer if (start) |key| self.alloc.free(key);
         var visited: usize = 0;
         var token: ?[]u8 = null;
         defer if (token) |value| self.alloc.free(value);
         while (true) {
-            try cancellation.check();
-            var page = try self.client.listObjects(self.bucket, .{
+            try op.ready();
+            var page = try op.list(&self.client, self.bucket, .{
                 .prefix = prefix,
                 .recursive = true,
                 .max_keys = 256,
                 .continuation_token = token,
                 .start_after = if (token == null) start else null,
-                .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+                .cancellation = op.token(),
             });
             defer page.deinit(self.client.allocator);
             var next = if (page.next_continuation_token) |value| try self.alloc.dupe(u8, value) else null;
             errdefer if (next) |value| self.alloc.free(value);
             if (token != null and next != null and std.mem.eql(u8, token.?, next.?)) return error.InvalidContinuationToken;
             for (page.entries) |entry| {
-                try cancellation.check();
+                try op.ready();
                 if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidArtifactId;
                 const suffix = entry.key[prefix.len..];
                 if (suffix.len != 97 or suffix[32] != '/') continue;
@@ -800,7 +925,8 @@ pub const ObjectStore = struct {
         }
     }
 
-    fn visitVersionedScopes(self: *ObjectStore, domain: [32]u8, prefix: []const u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
+    fn visitVersionedScopesFor(self: *ObjectStore, domain: [32]u8, prefix: []const u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken, context: ReadContext) !void {
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
         const Position = struct { key: ?[]const u8 = null, version: ?[]const u8 = null, page_token: ?[]const u8 = null };
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -809,11 +935,14 @@ pub const ObjectStore = struct {
         defer if (start) |value| self.alloc.free(value);
         var visited: usize = 0;
         while (true) {
-            try cancellation.check();
-            var page = try self.client.listObjectVersions(self.bucket, .{ .prefix = prefix, .max_keys = 256, .key_marker = position.key, .version_id_marker = position.version, .continuation_token = position.page_token, .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn) });
+            try op.ready();
+            var page = self.client.listObjectVersions(self.bucket, .{ .prefix = prefix, .max_keys = 256, .key_marker = position.key, .version_id_marker = position.version, .continuation_token = position.page_token, .cancellation = op.token() }) catch |err| {
+                try op.check();
+                return err;
+            };
             defer page.deinit(self.client.allocator);
             for (page.entries) |entry| {
-                try cancellation.check();
+                try op.ready();
                 if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidArtifactId;
                 if (start) |after| if (std.mem.order(u8, entry.key, after) != .gt) continue;
                 const suffix = entry.key[prefix.len..];
@@ -829,6 +958,7 @@ pub const ObjectStore = struct {
                 try artifact_store.visitScopedSuffix(domain, suffix, visitor);
                 visited += 1;
             }
+            try op.ready();
             if (!page.is_truncated) return;
             const next: Position = .{ .key = page.next_key_marker, .version = page.next_version_id_marker, .page_token = page.next_continuation_token };
             if (next.key == null and next.page_token == null) return error.InvalidListVersionsResponse;
@@ -884,14 +1014,114 @@ pub const ObjectStore = struct {
     fn objectStore(raw: *anyopaque) *ObjectStore {
         return @ptrCast(@alignCast(raw));
     }
+    fn retentionWitnessFor(raw: *anyopaque, scope: artifact_store.UploadScope, token: CancellationToken, context: ReadContext) !?artifact_store.RetentionWitness {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.local_inventory) |*fs| return @import("retained_closure.zig").witnessFor(fs, scope, token, context);
+        return @import("remote_retained_closure.zig").witnessFor(self, scope, token, context);
+    }
+    fn retainedClosureFor(raw: *anyopaque, id: []const u8, token: CancellationToken, context: ReadContext) !bool {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.cloud_certificate_until_ms != 0) {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(id, &digest, .{});
+            for (self.cloud_certified_roots) |root| if (std.mem.eql(u8, &root, &digest)) {
+                const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = token };
+                try op.ready();
+                const value = self.client.providerTime(self.bucket, op.token()) catch |err| {
+                    try op.check();
+                    return err;
+                };
+                try op.ready();
+                const now = value orelse return false;
+                return now +| 60_000 < self.cloud_certificate_until_ms;
+            };
+        }
+        if (self.local_inventory) |*fs| return @import("retained_closure.zig").retainedFor(fs, id, token, context);
+        return @import("remote_retained_closure.zig").retainedFor(self, id, token, context);
+    }
+    fn rememberClosureFor(raw: *anyopaque, id: []const u8, witnesses: []const artifact_store.RetentionWitness, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.read_only) return;
+        if (self.local_inventory) |*fs| return @import("retained_closure.zig").rememberFor(fs, id, witnesses, token, context);
+        return @import("remote_retained_closure.zig").rememberFor(self, id, witnesses, token, context);
+    }
+    fn inheritClosureFor(raw: *anyopaque, id: []const u8, previous: ?[]const u8, scope: artifact_store.UploadScope, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.read_only) return;
+        if (self.local_inventory) |*fs| return @import("retained_closure.zig").inheritFor(&fs.retention, fs, id, previous, scope, token, context);
+        return @import("remote_retained_closure.zig").inheritFor(&self.remote_retention, self, id, previous, scope, token, context);
+    }
+    fn sealClosuresFor(raw: *anyopaque, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.read_only) return;
+        if (self.local_inventory) |*fs| return @import("retained_closure.zig").sealFor(&fs.retention, fs, token, context);
+        return @import("remote_retained_closure.zig").sealFor(&self.remote_retention, self, token, context);
+    }
+    fn verifyContentFor(raw: *anyopaque, _: std.mem.Allocator, id: []const u8, byte_len: u64, checksum: []const u8, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        return self.verifyContentWithContext(id, byte_len, checksum, token, null, context);
+    }
+    fn boundedFor(raw: *anyopaque, a: std.mem.Allocator, id: []const u8, maximum: usize, token: CancellationToken, context: ReadContext) ![]u8 {
+        return readFor(raw, a, id, null, maximum, token, context);
+    }
+    fn rangeFor(raw: *anyopaque, a: std.mem.Allocator, id: []const u8, offset: u64, len: usize, token: CancellationToken, context: ReadContext) ![]u8 {
+        return readFor(raw, a, id, offset, len, token, context);
+    }
+    fn readFor(raw: *anyopaque, a: std.mem.Allocator, id: []const u8, offset: ?u64, maximum: usize, token: CancellationToken, context: ReadContext) ![]u8 {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = token };
+        try op.ready();
+        const selected = try self.generationFor(id, token, context);
+        defer if (selected) |value| std.heap.page_allocator.free(value);
+        const key = try keyForArtifactIdAlloc(a, self.prefix, id);
+        defer a.free(key);
+        var client = self.client;
+        client.allocator = a;
+        if (offset != null and maximum == 0) {
+            var metadata = client.statObjectWithOptions(self.bucket, key, .{ .version_id = selected, .cancellation = op.token() }) catch |err| {
+                try op.check();
+                return err;
+            };
+            defer metadata.deinit(a);
+            try op.ready();
+            if (offset.? > metadata.content_length) return error.InvalidRange;
+            return a.alloc(u8, 0);
+        }
+        var result = op.get(&client, self.bucket, key, .{
+            .range = if (offset) |start| .{ .offset = start, .length = maximum } else null,
+            .skip_metadata_probe = true,
+            .max_response_bytes = @max(maximum, 1),
+            .version_id = selected,
+        }) catch |err| {
+            if (offset == null and err == error.ResponseTooLarge) return error.ArtifactIntegrityMismatch;
+            return err;
+        };
+        defer result.deinit(a);
+        const body = result.body;
+        result.body = &.{};
+        return body;
+    }
     const vtable: artifact_store.ArtifactStore.VTable = .{
+        .get_bounded_alloc_for = boundedFor,
+        .get_range_alloc_for = rangeFor,
+        .verify_content_for = verifyContentFor,
+        .delete_for = deleteFor,
+        .visit_scoped_uploads_for = visitFor,
+        .reclaim_retired_scoped_inventory_for = reclaimFor,
+        .cleanup_retired_scoped_temporaries_for = cleanupFor,
         .object_store = objectStore,
         .retention_witness = retentionWitness,
+        .retention_witness_for = retentionWitnessFor,
         .retained_closure = retainedClosure,
+        .retained_closure_for = retainedClosureFor,
         .remember_closure = rememberClosure,
+        .remember_closure_for = rememberClosureFor,
         .inherit_closure = inheritClosure,
+        .inherit_closure_for = inheritClosureFor,
         .seal_closures = sealClosures,
+        .seal_closures_for = sealClosuresFor,
         .deinit = erasedDeinit,
+        .put_for = erasedPutFor,
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,
         .put_scoped = erasedPutScoped,
@@ -914,6 +1144,35 @@ pub const ObjectStore = struct {
     fn erasedDeinit(_: std.mem.Allocator, ptr: *anyopaque) void {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         self.deinit();
+    }
+
+    fn deleteFor(raw: *anyopaque, id: []const u8, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        return self.deleteForOperation(id, token, context);
+    }
+    fn visitFor(raw: *anyopaque, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        return self.visitForOperation(domain, visitor, token, context);
+    }
+    fn reclaimFor(raw: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.local_inventory) |*inventory| {
+            var store = inventory.artifactStore();
+            store.write_context = context;
+            try store.reclaimRetiredScopedInventory(domain, floor, cutoff, token);
+        }
+    }
+    fn cleanupFor(raw: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, token: CancellationToken, context: ReadContext) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.local_inventory) |*inventory| {
+            var store = inventory.artifactStore();
+            store.write_context = context;
+            try store.cleanupRetiredScopedTemporaryRange(domain, floor, cutoff, token);
+        }
+    }
+    fn erasedPutFor(ptr: *anyopaque, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken, context: ReadContext) !artifact_store.ArtifactMetadata {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.putInScopeFor(alloc, scope, contents, cancellation, context);
     }
 
     fn erasedPut(ptr: *anyopaque, alloc: std.mem.Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
@@ -1274,6 +1533,10 @@ test "serverless objectstore verification caches immutable provider identities" 
 
     const EtagOnlyClient = struct {
         inner: objectstore.Client,
+        running: ?*bool = null,
+        fn assertProvider(self: *@This()) !void {
+            if (self.running) |running| try std.testing.expect(!running.*);
+        }
 
         fn client(self: *@This()) objectstore.Client {
             return .{ .allocator = self.inner.allocator, .ptr = self, .vtable = &vtable };
@@ -1307,10 +1570,12 @@ test "serverless objectstore verification caches immutable provider identities" 
         }
 
         fn putObject(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8, body: []const u8, options: objectstore.PutOptions) !objectstore.PutResult {
+            try from(ptr).assertProvider();
             return try from(ptr).inner.putObject(bucket, key, body, options);
         }
 
         fn getObject(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8, options: objectstore.GetOptions) !objectstore.GetResult {
+            try from(ptr).assertProvider();
             return try from(ptr).inner.getObject(bucket, key, options);
         }
 
@@ -1332,6 +1597,7 @@ test "serverless objectstore verification caches immutable provider identities" 
 
         fn statObjectWithOptions(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8, options: objectstore.StatOptions) !objectstore.ObjectMetadata {
             const self = from(ptr);
+            try self.assertProvider();
             var metadata = try self.inner.statObjectWithOptions(bucket, key, options);
             etagOnly(&metadata, self.inner.allocator);
             return metadata;
@@ -1371,6 +1637,64 @@ test "serverless objectstore verification caches immutable provider identities" 
     // The authenticated provider pin makes reuse one GET, without another HEAD.
     try std.testing.expectEqual(@as(u64, 4), memory.operationCount());
     try std.testing.expectEqual(@as(u64, 0), warm_allowance);
+    const WaitProbe = struct {
+        running: bool = true,
+        reject: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.running);
+            self.running = false;
+            self.begins += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.running);
+            self.ends += 1;
+            if (self.reject) return error.SchedulerClosed;
+            self.running = true;
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            try std.testing.expect(@as(*@This(), @ptrCast(@alignCast(raw))).running);
+        }
+    };
+    const Expired = struct {
+        fn check(_: *anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+    };
+    var expired_marker: u8 = 0;
+    const original: ObjectStore.UploadCancellation = .{ .parent = .none, .context = .{ .authority = .{ .ptr = &expired_marker, .check = Expired.check } } };
+    try std.testing.expectError(error.DeadlineExceeded, original.token().check());
+    try std.testing.expectEqual(error.DeadlineExceeded, normalizeCancellationError(error.Cancelled, original.token()));
+    for ([_]bool{ false, true }) |reject| {
+        var probe: WaitProbe = .{ .reject = reject };
+        etag_only.running = &probe.running;
+        impl.upload_context = .{ .checkpoint = .{ .ptr = &probe, .check = WaitProbe.checkpoint }, .wait = .{ .ptr = &probe, .begin = WaitProbe.begin, .end = WaitProbe.end } };
+        defer {
+            impl.upload_context = .{};
+            etag_only.running = null;
+        }
+        const body = if (reject) "uploaded-before-resume-rejection" else "request-owned-upload";
+        const result = store.put(body);
+        if (reject) {
+            try std.testing.expectError(error.SchedulerClosed, result);
+            try std.testing.expectEqual(@as(usize, 1), probe.ends);
+            // The provider physically published. A resume rejection frees its
+            // response but must not delete or reinterpret that durable object.
+            probe.reject = false;
+            probe.running = true;
+        } else {
+            var uploaded = try result;
+            defer uploaded.deinit(alloc);
+        }
+        const before = probe.begins;
+        var duplicate = try store.put(body);
+        defer duplicate.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 3), probe.begins - before); // PUT conflict, HEAD, authenticated GET.
+        try std.testing.expectEqual(probe.begins, probe.ends);
+    }
 }
 
 test "serverless objectstore-backed artifact initialization cleans up every allocation failure" {
@@ -1551,4 +1875,140 @@ test "external lake global frontier unversioned S3-compatible GC uses names thro
     try store.delete(&id);
     try std.testing.expectEqual(@as(usize, 1), state.lists);
     try std.testing.expectEqual(@as(usize, 1), state.deletes);
+}
+
+test "serverless execution filesystem uploads return CPU only after preparation and preserve durable rejection" {
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Probe = struct {
+        execution: *Runnable.Execution,
+        scheduler: *Runnable.Scheduler,
+        checks_on_cpu: usize = 0,
+        checks_in_io: usize = 0,
+        waits: usize = 0,
+        lost: bool = false,
+        mode: enum { success, lease_lost, scheduler_closed },
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.lost) return error.WorkLeaseLost;
+            if (self.execution.entry.?.state == .running) self.checks_on_cpu += 1 else self.checks_in_io += 1;
+        }
+        fn authority(raw: *anyopaque) !void {
+            try check(raw);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(Runnable.State.running, self.execution.entry.?.state);
+            try self.execution.park(.resource_blocked);
+            // With a single ordinary CPU, this proves a real provider wait
+            // leaves execution capacity available to an unrelated query.
+            var query: Runnable.Execution = .{};
+            defer query.finish();
+            try query.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query);
+            self.waits += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(Runnable.State.resource_blocked, self.execution.entry.?.state);
+            switch (self.mode) {
+                .success => {},
+                .lease_lost => self.lost = true,
+                .scheduler_closed => self.scheduler.close(),
+            }
+            try self.execution.enter(.background);
+        }
+    };
+    for (std.enums.values(@FieldType(Probe, "mode"))) |mode| {
+        var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("maintenance-upload");
+        defer directory.cleanup();
+        var filesystem = try objectstore.FilesystemClient.initWithIo(std.testing.allocator, directory.path(), std.testing.io);
+        defer filesystem.deinit();
+        var object = try ObjectStore.initWithClient(std.testing.allocator, filesystem.client(), "artifacts", "native");
+        var store = object.artifactStore();
+        defer store.deinit();
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_wait_ms = 1000 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = @sizeOf(Runnable.Execution) }, .background);
+        var probe: Probe = .{ .execution = &execution, .scheduler = &scheduler, .mode = mode };
+        store.write_context = .{
+            .io = std.testing.io,
+            .execution = &execution,
+            .authority = .{ .ptr = &probe, .check = Probe.authority },
+            .wait = .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end },
+        };
+        const body = "filesystem publication survives denied execution return";
+        const result = store.put(body);
+        if (mode == .success) {
+            var metadata = try result;
+            metadata.deinit(std.testing.allocator);
+        } else try std.testing.expectError(if (mode == .lease_lost) error.WorkLeaseLost else error.SchedulerClosed, result);
+        try std.testing.expect(probe.checks_on_cpu > 0);
+        try std.testing.expect(probe.checks_in_io > 0);
+        try std.testing.expectEqual(@as(usize, 1), probe.waits);
+        // Execution context is operation-local; the shared provider did not
+        // acquire the rejected owner's authority or lose its durable object.
+        try std.testing.expect(object.upload_context.execution == null);
+        store.write_context = null;
+        const checksum = try sha256StringWithCancellationAlloc(std.testing.allocator, body, .none);
+        defer std.testing.allocator.free(checksum);
+        const id = try makeArtifactIdAlloc(std.testing.allocator, checksum);
+        defer std.testing.allocator.free(id);
+        const bytes = try store.getAlloc(id);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualStrings(body, bytes);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "serverless execution page uploads own bounded children and join before parent retirement" {
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Mode = enum { serial, write_team, reservation_full };
+    for (std.enums.values(Mode)) |mode| {
+        const reject_reservation = mode == .reservation_full;
+        var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("maintenance-upload-batch");
+        defer directory.cleanup();
+        var filesystem = try objectstore.FilesystemClient.initWithIo(std.testing.allocator, directory.path(), std.testing.io);
+        defer filesystem.deinit();
+        var object = try ObjectStore.initWithClient(std.testing.allocator, filesystem.client(), "artifacts", "native");
+        var store = object.artifactStore();
+        defer store.deinit();
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = if (mode == .write_team) 3 else 2, .max_operations = if (reject_reservation) 3 else 32, .max_wait_ms = 2000 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.startWithSlots(&scheduler, .{ .io = std.testing.io, .retained_bytes = @sizeOf(Runnable.Execution) }, if (mode == .write_team) .write else .background, if (mode == .write_team) 2 else 1);
+        store.write_context = (ReadContext{ .io = std.testing.io }).withExecution(&execution);
+        const contents = [_][]const u8{ "first page", "second page", "third page", "first page" };
+        var output: [contents.len]artifact_store.ArtifactMetadata = undefined;
+        const result = store.putBatchWithCancellation(std.testing.io, &contents, &output, .none);
+        if (reject_reservation) {
+            try std.testing.expectError(error.SchedulerFull, result);
+            // Reservation failure publishes no worker or provider mutation.
+            var client = filesystem.client();
+            var listed = try client.listObjects("artifacts", .{});
+            defer listed.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 0), listed.entries.len);
+        } else {
+            result catch |err| {
+                std.debug.print("maintenance upload mode={s}: {s}\n", .{ @tagName(mode), @errorName(err) });
+                return err;
+            };
+            defer for (&output) |*metadata| metadata.deinit(std.testing.allocator);
+            for (output, contents) |metadata, expected| {
+                const bytes = try store.getAlloc(metadata.artifact_id);
+                defer std.testing.allocator.free(bytes);
+                try std.testing.expectEqualStrings(expected, bytes);
+            }
+        }
+        try std.testing.expectEqual(Runnable.State.running, execution.entry.?.state);
+        try std.testing.expectEqual(@as(usize, if (mode == .write_team) 2 else 1), execution.entry.?.slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
 }

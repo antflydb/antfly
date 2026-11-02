@@ -57,12 +57,12 @@ pub fn buildClusteredSegmentWithPolicyAllocUntil(
         for (entries) |*entry| entry.deinit(alloc);
         alloc.free(entries);
     }
-    try maintenance_cancellation.check(cancellation);
+    try maintenance_cancellation.ownerCheckpoint(cancellation);
     const dim_count: usize = @intCast(dims);
 
     if (metric == .cosine) {
         for (entries, 0..) |entry, idx| {
-            if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
+            if (idx % 64 == 0) try maintenance_cancellation.ownerCheckpoint(cancellation);
             _ = vector_types.normalize(entry.vector);
         }
     }
@@ -107,7 +107,7 @@ pub fn buildClusteredSegmentWithPolicyAllocUntil(
 
     var offset: u32 = 0;
     for (0..cluster_count) |cluster_idx| {
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const centroid = try alloc.dupe(f32, centroids[cluster_idx]);
         clusters[cluster_idx] = .{
             .centroid = centroid,
@@ -139,7 +139,7 @@ pub fn buildClusteredSegmentWithPolicyAllocUntil(
     for (clusters, 0..) |cluster, idx| write_offsets[idx] = cluster.start_index;
 
     for (entries, 0..) |entry, idx| {
-        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
+        if (idx % 64 == 0) try maintenance_cancellation.ownerCheckpoint(cancellation);
         const cluster_idx: usize = cluster_ids[idx];
         const dst = write_offsets[cluster_idx];
         write_offsets[cluster_idx] += 1;
@@ -150,7 +150,7 @@ pub fn buildClusteredSegmentWithPolicyAllocUntil(
     var quantizer = try vector_quantizer.RaBitQuantizer.init(alloc, dim_count, 42, metric);
     defer quantizer.deinit();
     for (clusters) |*cluster| {
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const start: usize = cluster.start_index;
         const end: usize = start + cluster.entry_count;
         alloc.free(cluster.quantized_set);
@@ -198,7 +198,7 @@ pub fn buildClusteredSegmentWithPolicyAllocUntil(
         cluster.quantized_set = encoded_quantized;
     }
 
-    try maintenance_cancellation.check(cancellation);
+    try maintenance_cancellation.ownerCheckpoint(cancellation);
 
     return .{
         .dims = dims,
@@ -255,7 +255,7 @@ fn rebalanceClusters(
     for (cluster_ids) |cluster_id| counts[cluster_id] += 1;
 
     for (entries, 0..) |entry, entry_idx| {
-        if (entry_idx % 64 == 0) try maintenance_cancellation.check(cancellation);
+        if (entry_idx % 64 == 0) try maintenance_cancellation.ownerCheckpoint(cancellation);
         const current_cluster: usize = cluster_ids[entry_idx];
         if (counts[current_cluster] <= max_size) continue;
 
@@ -292,7 +292,7 @@ fn initializeCentroids(
     centroids[0] = try centroidCopyAlloc(alloc, metric, entries[0].vector);
     initialized.* = 1;
     for (1..centroids.len) |idx| {
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         const selected = try selectFarthestEntryIndex(metric, entries, centroids[0..idx], cancellation);
         centroids[idx] = try centroidCopyAlloc(alloc, metric, entries[selected].vector);
         initialized.* = idx + 1;
@@ -317,7 +317,7 @@ fn selectFarthestEntryIndex(
     var best_index: usize = 0;
     var best_distance: f32 = -std.math.inf(f32);
     for (entries, 0..) |entry, idx| {
-        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
+        if (idx % 64 == 0) try maintenance_cancellation.ownerCheckpoint(cancellation);
         var closest_distance: f32 = std.math.inf(f32);
         for (centroids) |centroid| {
             const distance = routingDistance(entry.vector, centroid, metric);
@@ -339,7 +339,7 @@ fn assignClusters(
     cancellation: ?maintenance_cancellation.Token,
 ) !void {
     for (entries, 0..) |entry, idx| {
-        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
+        if (idx % 64 == 0) try maintenance_cancellation.ownerCheckpoint(cancellation);
         var best_cluster: usize = 0;
         var best_score: f32 = -std.math.inf(f32);
         for (centroids, 0..) |centroid, cluster_idx| {
@@ -368,7 +368,7 @@ fn recomputeCentroids(
     @memset(sums, 0);
 
     for (entries, 0..) |entry, idx| {
-        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
+        if (idx % 64 == 0) try maintenance_cancellation.ownerCheckpoint(cancellation);
         const cluster_idx: usize = cluster_ids[idx];
         counts[cluster_idx] += 1;
         const sum_slice = sums[cluster_idx * dim_count ..][0..dim_count];
@@ -376,7 +376,7 @@ fn recomputeCentroids(
     }
 
     for (centroids, 0..) |centroid, cluster_idx| {
-        try maintenance_cancellation.check(cancellation);
+        try maintenance_cancellation.ownerCheckpoint(cancellation);
         if (counts[cluster_idx] == 0) {
             const replacement = try selectFarthestEntryIndex(metric, entries, centroids, cancellation);
             @memcpy(centroid, entries[replacement].vector);
@@ -637,4 +637,64 @@ test "vector builder honors query tuning policy" {
 
     try std.testing.expectEqual(@as(u32, 5), segment.base_probe_count);
     try std.testing.expectEqual(@as(u32, 7), segment.shortlist_multiplier);
+}
+
+test "serverless execution serial vector construction yields to queued queries" {
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Job = struct {
+        scheduler: *Runnable.Scheduler,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) !void {
+            var query: Runnable.Execution = .{};
+            defer query.finish();
+            try query.start(self.scheduler, .{ .io = std.testing.io }, .query);
+            self.done.store(true, .release);
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    // Exactly one ordinary lane, plus independently protected control.
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1, .max_wait_ms = 5000 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = io }, .background);
+    var job: Job = .{ .scheduler = &scheduler };
+    var future = try io.concurrent(Job.run, .{&job});
+    defer _ = future.cancel(io) catch {};
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+    while (scheduler.stats().queued == 0) {
+        if (job.done.load(.acquire)) return error.QueryDidNotWaitForVectorOwner;
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.QueryDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    var control: Runnable.Execution = .{};
+    defer control.finish();
+    try control.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+    control.finish();
+
+    const entries = try alloc.alloc(vector_segment_mod.Entry, 32);
+    var initialized: usize = 0;
+    var entries_owned = true;
+    errdefer if (entries_owned) {
+        for (entries[0..initialized]) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    };
+    for (entries, 0..) |*entry, i| {
+        entry.* = .{
+            .doc_id = try std.fmt.allocPrint(alloc, "doc-{d}", .{i}),
+            .vector = try alloc.dupe(f32, &.{ @floatFromInt(i), 1 }),
+        };
+        initialized += 1;
+    }
+    entries_owned = false;
+    var segment = try buildClusteredSegmentWithPolicyAllocUntil(alloc, .l2_squared, 2, entries, .{}, .{ .io = io, .execution = &execution });
+    defer segment.deinit(alloc);
+    try future.await(io);
+    try std.testing.expect(job.done.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }

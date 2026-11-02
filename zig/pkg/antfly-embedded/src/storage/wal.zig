@@ -47,6 +47,36 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
 const large_entry_threshold = 4096;
 const storage_sim_soak = zig_lmdb.storage_sim_soak;
 var wal_tmp_nonce: u64 = 0;
+// Volatile owner identities are unique within this process, including across
+// statically linked source copies (each copy has a different origin address).
+var recovery_owner_counter: std.atomic.Value(u64) = .init(1);
+
+fn allocateRecoveryOwner(counter: *std.atomic.Value(u64)) !u64 {
+    var current = counter.load(.monotonic);
+    while (true) {
+        if (current == 0) return error.Overflow;
+        if (counter.cmpxchgWeak(current, current +% 1, .monotonic, .monotonic)) |changed| current = changed else return current;
+    }
+}
+
+/// An ephemeral position in one open WAL. Never persist it across process
+/// lifetimes. origin/owner are opaque identities, not dereferenceable handles.
+pub const RecoveryPosition = extern struct {
+    origin: u64 = 0,
+    owner: u64 = 0,
+    revision: u64 = 0,
+    next_lsn: u64 = 0,
+
+    pub fn valid(self: @This()) bool {
+        return self.origin != 0 and self.owner != 0 and self.revision != 0 and self.next_lsn != 0;
+    }
+};
+
+pub const RecoveryAppendResult = union(enum) {
+    changed,
+    busy,
+    appended: u64,
+};
 
 fn lsmOpenDebugLogsEnabled() bool {
     return platform.env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
@@ -153,6 +183,7 @@ const CommitRunStats = struct {
     txn_open_ns: u64 = 0,
     put_ns: u64 = 0,
     commit_ns: u64 = 0,
+    commit_attempted: bool = false,
     inner_segment_syncs: u64 = 0,
     inner_index_syncs: u64 = 0,
     post_commit_segment_syncs: u64 = 0,
@@ -172,6 +203,7 @@ const CommitAttempt = struct {
 const AppendRequest = struct {
     next: ?*AppendRequest = null,
     entries: []const []const u8,
+    encoded_entries: ?[]const []const u8 = null,
     result: BatchAppendResult = .{ .first_lsn = 0, .count = 0 },
     err: ?anyerror = null,
     done: bool = false,
@@ -260,9 +292,16 @@ const StoreOwner = union(enum) {
 };
 
 pub const WAL = struct {
+    /// Must outlive this WAL and every joined backend operation.
+    allocator: Allocator = std.heap.page_allocator,
     store: backend_erased.NamespaceStore,
     store_owner: StoreOwner,
     next_lsn: u64,
+    recovery_owner: u64 = 0,
+    destructive_revision: std.atomic.Value(u64) = .init(1),
+    // A failed storage commit can have applied data before reporting failure.
+    // Reopen must reconstruct the durable cursor before any further mutation.
+    recovery_poisoned: std.atomic.Value(bool) = .init(false),
     group_commit_window_ns: u64,
     group_commit_max_requests: usize,
     commit_completion_delay_ns: u64,
@@ -281,6 +320,247 @@ pub const WAL = struct {
     pending_head: ?*AppendRequest = null,
     pending_tail: ?*AppendRequest = null,
     stats: WalStats = .{},
+
+    owned_read_mutex: std.atomic.Mutex = .unlocked,
+    owned_read_closing: bool = false,
+    owned_read_starting: usize = 0,
+    owned_read_retiring: usize = 0,
+    owned_reads: [owned_read_capacity]OwnedReadSlot = @splat(.{}),
+
+    pub const owned_read_capacity: usize = 16;
+    const ReadPort = @import("../common/read_admission.zig").Port;
+    const OwnedReadSlot = struct {
+        owner: ?*WAL = null,
+        operation: ?*OwnedRead = null,
+        starting: bool = false,
+        claimed: bool = false,
+        retiring: bool = false,
+    };
+
+    /// Caller-allocator-owned handle. WAL close retires its data and snapshot,
+    /// detaches the parent, and leaves this closed handle safe to destroy. The
+    /// supplied allocator context must outlive the handle, independently of WAL.
+    pub const OwnedRead = struct {
+        pub const Status = enum { pending, ready };
+        pub const Chunk = struct { len: usize, done: bool };
+        const Phase = enum { lookup, header, checksum, ready, failed, closed };
+        allocator: Allocator,
+        mutex: std.atomic.Mutex = .unlocked,
+        closing: std.atomic.Value(bool) = .init(false),
+        slot: ?*OwnedReadSlot = null,
+        lookup: ?backend_erased.OwnedValueRead = null,
+        value: ?backend_erased.OwnedValue = null,
+        phase: Phase = .lookup,
+        failure: ?anyerror = null,
+        data_len: usize = 0,
+        checksum_offset: usize = 0,
+        crc: Crc32 = .init(),
+        expected_crc: u32 = 0,
+
+        pub fn step(self: *@This(), quantum: usize, control: ReadPort) !Status {
+            if (quantum == 0 or quantum > 64 * 1024) return error.InvalidArgument;
+            if (self.closing.load(.acquire)) return error.TransactionClosed;
+            if (!self.mutex.tryLock()) return error.Backpressured;
+            defer self.mutex.unlock();
+            if (self.closing.load(.acquire)) return error.TransactionClosed;
+            if (self.failure) |err| return err;
+            return self.advance(quantum, control) catch |err| {
+                const cause = blk: {
+                    control.checkpoint() catch |original| break :blk original;
+                    break :blk err;
+                };
+                self.retire();
+                self.phase = .failed;
+                self.failure = cause;
+                return cause;
+            };
+        }
+
+        fn advance(self: *@This(), quantum: usize, control: ReadPort) !Status {
+            try control.checkpoint();
+            switch (self.phase) {
+                .lookup => if (try self.lookup.?.step(quantum, control) == .ready) {
+                    self.value = try self.lookup.?.takeOutput();
+                    self.lookup = null;
+                    self.phase = .header;
+                },
+                .header => {
+                    const bytes = self.value.?.bytes();
+                    if (bytes.len < 8) return error.CorruptWal;
+                    self.data_len = std.mem.readInt(u32, bytes[0..4], .little);
+                    const end = std.math.add(usize, 4, self.data_len) catch return error.CorruptWal;
+                    const crc_end = std.math.add(usize, end, 4) catch return error.CorruptWal;
+                    if (bytes.len < crc_end) return error.CorruptWal;
+                    self.expected_crc = std.mem.readInt(u32, bytes[end..][0..4], .little);
+                    self.phase = .checksum;
+                },
+                .checksum => {
+                    const end = 4 + self.data_len;
+                    const take = @min(quantum, end - self.checksum_offset);
+                    self.crc.update(self.value.?.bytes()[self.checksum_offset..][0..take]);
+                    self.checksum_offset += take;
+                    if (self.checksum_offset == end) {
+                        if (self.crc.final() != self.expected_crc) return error.CorruptWal;
+                        self.phase = .ready;
+                    }
+                },
+                .ready => {},
+                .closed => return error.TransactionClosed,
+                .failed => return self.failure.?,
+            }
+            try control.checkpoint();
+            return if (self.phase == .ready) .ready else .pending;
+        }
+
+        /// Copy at most one caller-funded window. No result or borrowed span
+        /// escapes the operation lock, so close cannot invalidate caller bytes.
+        pub fn readChunk(self: *@This(), offset: usize, out: []u8, control: ReadPort) !Chunk {
+            if (out.len > 64 * 1024) return error.InvalidArgument;
+            if (self.closing.load(.acquire)) return error.TransactionClosed;
+            if (!self.mutex.tryLock()) return error.Backpressured;
+            defer self.mutex.unlock();
+            if (self.closing.load(.acquire)) return error.TransactionClosed;
+            if (self.failure) |err| return err;
+            if (self.phase != .ready or offset > self.data_len or (out.len == 0 and offset < self.data_len)) return error.InvalidArgument;
+            return self.copyChunk(offset, out, control) catch |err| {
+                self.retire();
+                self.phase = .failed;
+                self.failure = err;
+                return err;
+            };
+        }
+
+        fn copyChunk(self: *@This(), offset: usize, out: []u8, control: ReadPort) !Chunk {
+            try control.checkpoint();
+            const take = @min(out.len, self.data_len - offset);
+            @memcpy(out[0..take], self.value.?.bytes()[4 + offset ..][0..take]);
+            try control.checkpoint();
+            return .{ .len = take, .done = offset + take == self.data_len };
+        }
+
+        fn retire(self: *@This()) void {
+            if (self.lookup) |*lookup| lookup.deinit();
+            self.lookup = null;
+            if (self.value) |*value| value.deinit();
+            self.value = null;
+        }
+
+        pub fn destroy(self: *@This()) void {
+            self.closing.store(true, .release);
+            while (true) {
+                platform.sync.lockYielding(&self.mutex);
+                if (self.slot) |slot| {
+                    const parent = slot.owner.?;
+                    platform.sync.lockYielding(&parent.owned_read_mutex);
+                    if (slot.claimed) {
+                        // Close owns this slot and needs the operation lock.
+                        // Keep caller metadata/allocator alive until detachment.
+                        parent.owned_read_mutex.unlock();
+                        self.mutex.unlock();
+                        platform.time.yieldBriefly();
+                        continue;
+                    }
+                    slot.operation = null;
+                    slot.retiring = true;
+                    self.slot = null;
+                    parent.owned_read_retiring += 1;
+                    parent.owned_read_mutex.unlock();
+                    self.retire();
+                    // The parent cannot tear down store/allocator while this
+                    // grant-free retirement is still using either of them.
+                    platform.sync.lockYielding(&parent.owned_read_mutex);
+                    slot.retiring = false;
+                    parent.owned_read_retiring -= 1;
+                    parent.owned_read_mutex.unlock();
+                } else self.retire();
+                const allocation = self.allocator;
+                self.mutex.unlock();
+                allocation.destroy(self);
+                return;
+            }
+        }
+    };
+
+    pub fn beginOwnedRead(self: *WAL, allocator: Allocator, lsn: u64, control: ReadPort) !*OwnedRead {
+        try control.checkpoint();
+        if (lsn == 0) return error.InvalidLsn;
+        try @import("../common/bounded_mutex.zig").lockAtomic(&self.owned_read_mutex, control);
+        if (self.owned_read_closing) {
+            self.owned_read_mutex.unlock();
+            return error.TransactionClosed;
+        }
+        if (self.store.vtable.begin_owned_value_read == null) {
+            self.owned_read_mutex.unlock();
+            return error.ExecutionWaitUnsupported;
+        }
+        const slot = for (&self.owned_reads) |*candidate| {
+            if (candidate.operation == null and !candidate.starting and !candidate.claimed and !candidate.retiring) break candidate;
+        } else {
+            self.owned_read_mutex.unlock();
+            return error.Backpressured;
+        };
+        slot.* = .{ .owner = self, .starting = true };
+        self.owned_read_starting += 1;
+        self.owned_read_mutex.unlock();
+        var registered = false;
+        defer {
+            platform.sync.lockYielding(&self.owned_read_mutex);
+            self.owned_read_starting -= 1;
+            slot.starting = false;
+            if (!registered) slot.operation = null;
+            self.owned_read_mutex.unlock();
+        }
+        const operation = try allocator.create(OwnedRead);
+        operation.* = .{ .allocator = allocator };
+        errdefer {
+            operation.retire();
+            allocator.destroy(operation);
+        }
+        const key = std.mem.toBytes(std.mem.nativeToBig(u64, lsn));
+        operation.lookup = try self.store.beginOwnedValueRead(allocator, default_namespace, &key, control);
+        try control.checkpoint();
+        try @import("../common/bounded_mutex.zig").lockAtomic(&self.owned_read_mutex, control);
+        defer self.owned_read_mutex.unlock();
+        if (self.owned_read_closing) return error.TransactionClosed;
+        operation.slot = slot;
+        slot.operation = operation;
+        registered = true;
+        return operation;
+    }
+
+    fn closeOwnedReads(self: *WAL) void {
+        platform.sync.lockYielding(&self.owned_read_mutex);
+        self.owned_read_closing = true;
+        self.owned_read_mutex.unlock();
+        while (true) {
+            platform.sync.lockYielding(&self.owned_read_mutex);
+            const slot = for (&self.owned_reads) |*candidate| {
+                if (candidate.operation != null and !candidate.claimed) break candidate;
+            } else null;
+            if (slot) |claimed| {
+                claimed.claimed = true;
+                const operation = claimed.operation.?;
+                operation.closing.store(true, .release);
+                self.owned_read_mutex.unlock();
+                platform.sync.lockYielding(&operation.mutex);
+                operation.retire();
+                operation.phase = .closed;
+                operation.slot = null;
+                platform.sync.lockYielding(&self.owned_read_mutex);
+                claimed.operation = null;
+                claimed.claimed = false;
+                self.owned_read_mutex.unlock();
+                // No further operation access after unlocking: caller destroy
+                // can now free its independent metadata immediately.
+                operation.mutex.unlock();
+            } else {
+                const finished = self.owned_read_starting == 0 and self.owned_read_retiring == 0;
+                self.owned_read_mutex.unlock();
+                if (finished) return;
+                platform.time.yieldBriefly();
+            }
+        }
+    }
 
     pub const BackendStore = backend_adapter.Store(WAL, Txn, Txn, Txn, .{
         .capabilities = backendCapabilities,
@@ -333,6 +613,13 @@ pub const WAL = struct {
             };
         }
 
+        fn getWithAdmission(self: *Txn, key: []const u8, control: @import("../common/read_admission.zig").Port) ![]const u8 {
+            return switch (self.inner) {
+                .read => |*txn| try txn.getWithAdmission(default_namespace, key, control),
+                .write => error.ReadOnlyTransaction,
+            };
+        }
+
         fn put(self: *Txn, key: []const u8, value: []const u8) !void {
             switch (self.inner) {
                 .read => return error.ReadOnlyTransaction,
@@ -382,6 +669,10 @@ pub const WAL = struct {
         };
     }
 
+    fn beginReadTxnWithAdmission(self: *WAL, control: @import("../common/read_admission.zig").Port) !Txn {
+        return .{ .inner = .{ .read = try self.store.beginReadWithAdmission(control) } };
+    }
+
     fn beginWriteTxn(self: *WAL) !Txn {
         return .{
             .inner = .{
@@ -392,10 +683,14 @@ pub const WAL = struct {
 
     /// Open or create a WAL at the given path.
     pub fn open(path: [*:0]const u8, opts: WalOptions) !WAL {
-        var store_owner = try openStoreOwner(std.heap.page_allocator, path, opts);
-        errdefer store_owner.close(std.heap.page_allocator);
+        return openWithAllocator(std.heap.page_allocator, path, opts);
+    }
 
-        var store = try store_owner.runtimeNamespaceStore(std.heap.page_allocator);
+    pub fn openWithAllocator(allocator: Allocator, path: [*:0]const u8, opts: WalOptions) !WAL {
+        var store_owner = try openStoreOwner(allocator, path, opts);
+        errdefer store_owner.close(allocator);
+
+        var store = try store_owner.runtimeNamespaceStore(allocator);
         errdefer store.deinit();
 
         // Scan for the highest existing LSN
@@ -424,9 +719,11 @@ pub const WAL = struct {
         const sync_after_commit = !opts.no_sync and !store_owner.commitProvidesDurability();
 
         return .{
+            .allocator = allocator,
             .store = store,
             .store_owner = store_owner,
             .next_lsn = next_lsn,
+            .recovery_owner = try allocateRecoveryOwner(&recovery_owner_counter),
             .group_commit_window_ns = opts.group_commit_window_ns,
             .group_commit_max_requests = @max(@as(usize, 1), opts.group_commit_max_requests),
             .commit_completion_delay_ns = resolvedCommitCompletionDelayNs(opts),
@@ -437,8 +734,9 @@ pub const WAL = struct {
     }
 
     pub fn close(self: *WAL) void {
+        self.closeOwnedReads();
         self.store.deinit();
-        self.store_owner.close(std.heap.page_allocator);
+        self.store_owner.close(self.allocator);
         self.* = undefined;
     }
 
@@ -447,8 +745,9 @@ pub const WAL = struct {
     /// durable state; a normal close would let the stale pre-crash owner write
     /// into the recovered generation.
     pub fn abandonAfterCrash(self: *WAL) void {
+        self.closeOwnedReads();
         self.store.deinit();
-        self.store_owner.abandonAfterCrash(std.heap.page_allocator);
+        self.store_owner.abandonAfterCrash(self.allocator);
         self.* = undefined;
     }
 
@@ -474,6 +773,141 @@ pub const WAL = struct {
         return result.first_lsn;
     }
 
+    /// Owned WAL encoding funded before the caller's irreversible decision.
+    /// The stable WAL and its allocator owner outlive this grant. Join publish
+    /// before destroying it. No construction control or LSN is retained.
+    pub const PreparedAppend = struct {
+        allocator: Allocator,
+        wal: *WAL,
+        issuer: u64,
+        encoded: []u8,
+        prefix_len: usize,
+        tail_crc: u32,
+        shift: CrcShift,
+        attempted: std.atomic.Value(bool) = .init(false),
+
+        pub fn publish(self: *PreparedAppend, prefix: []const u8) !u64 {
+            const encoded = try self.seal(prefix);
+            var request: AppendRequest = .{
+                .entries = &.{encoded[4 .. encoded.len - 4]},
+                .encoded_entries = &.{encoded},
+            };
+            return (try self.wal.appendRequest(&request)).first_lsn;
+        }
+
+        fn seal(self: *PreparedAppend, prefix: []const u8) ![]const u8 {
+            if (self.attempted.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.InvalidArgument;
+            if (prefix.len != self.prefix_len or self.issuer == 0 or self.wal.recovery_owner != self.issuer) return error.InvalidArgument;
+            @memcpy(self.encoded[4..][0..prefix.len], prefix);
+            const crc = self.shift.apply(Crc32.hash(self.encoded[0 .. 4 + prefix.len])) ^ self.tail_crc;
+            std.mem.writeInt(u32, self.encoded[self.encoded.len - 4 ..][0..4], crc, .little);
+            return self.encoded;
+        }
+
+        pub fn deinit(self: *PreparedAppend) void {
+            self.allocator.free(self.encoded);
+            self.* = undefined;
+        }
+    };
+
+    pub fn prepareAppend(self: *WAL, prefix_len: usize, tail: []const u8, control: ?@import("../common/read_admission.zig").Port) !PreparedAppend {
+        if (control) |port| try port.checkpoint();
+        if (prefix_len > 4096 or self.recovery_owner == 0) return error.InvalidArgument;
+        if (self.recovery_poisoned.load(.acquire)) return error.CorruptWal;
+        const data_len = std.math.add(usize, prefix_len, tail.len) catch return error.InvalidArgument;
+        const wire_len = std.math.cast(u32, data_len) orelse return error.InvalidArgument;
+        const total = std.math.add(usize, data_len, 8) catch return error.InvalidArgument;
+        const encoded = self.allocator.alloc(u8, total) catch |cause| {
+            if (control) |port| try port.checkpoint();
+            return cause;
+        };
+        errdefer self.allocator.free(encoded);
+        std.mem.writeInt(u32, encoded[0..4], wire_len, .little);
+        var crc = Crc32.init();
+        var offset: usize = 0;
+        while (offset < tail.len) {
+            if (control) |port| try port.checkpoint();
+            const end = offset + @min(tail.len - offset, 4096);
+            @memcpy(encoded[4 + prefix_len + offset .. 4 + prefix_len + end], tail[offset..end]);
+            crc.update(tail[offset..end]);
+            offset = end;
+        }
+        const shift = try CrcShift.init(tail.len, control);
+        if (control) |port| try port.checkpoint();
+        return .{ .allocator = self.allocator, .wal = self, .issuer = self.recovery_owner, .encoded = encoded, .prefix_len = prefix_len, .tail_crc = crc.final(), .shift = shift };
+    }
+
+    /// Bootstrap an empty logical log under the same serialization as append.
+    /// A completion error after commit must retain the committed append cursor.
+    pub fn appendAt(self: *WAL, expected_lsn: u64, data: []const u8) !u64 {
+        if (expected_lsn == 0) return error.InvalidArgument;
+        _ = try std.math.add(u64, expected_lsn, 1);
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        while (self.coordinator_active or self.pending_head != null) self.completed.waitUncancelable(self.sync_io, &self.mutex);
+        if (self.recovery_poisoned.load(.acquire)) return error.CorruptWal;
+        if (self.next_lsn != 1) return error.WalLsnMismatch;
+        self.next_lsn = expected_lsn;
+        errdefer if (self.next_lsn == expected_lsn) {
+            self.next_lsn = 1;
+        };
+        return try self.commitSingleLocked(data, null);
+    }
+
+    /// Try one coherent position without waiting behind a writer/coordinator.
+    /// The caller retires every retained dependency before retrying busy.
+    pub fn tryRecoveryPosition(self: *WAL, original: ?@import("../common/read_admission.zig").Port) !?RecoveryPosition {
+        var retained: @import("../common/read_admission.zig").RetainedDependency = .{};
+        const control = retained.bind(original);
+        if (control) |port| try port.checkpoint();
+        if (!self.mutex.tryLock()) return null;
+        defer self.mutex.unlock(self.sync_io);
+        if (control) |port| try port.checkpoint();
+        // The normal coordinator publishes next_lsn outside this mutex while
+        // active. Never observe that mutable field during its commit.
+        if (self.coordinator_active or self.pending_head != null) return null;
+        if (self.recovery_poisoned.load(.acquire)) return error.CorruptWal;
+        const revision = self.destructive_revision.load(.acquire);
+        if (revision == 0 or self.recovery_owner == 0) return error.Overflow;
+        return .{ .origin = @intFromPtr(&recovery_owner_counter), .owner = self.recovery_owner, .revision = revision, .next_lsn = self.next_lsn };
+    }
+
+    /// Check the full absence witness and append while retaining writer
+    /// serialization. No lifetime check may replace committed completion.
+    pub fn appendIfRecoveryPosition(self: *WAL, expected: RecoveryPosition, data: []const u8, original: ?@import("../common/read_admission.zig").Port) !RecoveryAppendResult {
+        if (!expected.valid()) return error.InvalidArgument;
+        var retained: @import("../common/read_admission.zig").RetainedDependency = .{};
+        const control = retained.bind(original);
+        if (control) |port| try port.checkpoint();
+        if (!self.mutex.tryLock()) return .busy;
+        defer self.mutex.unlock(self.sync_io);
+        if (control) |port| try port.checkpoint();
+        if (self.coordinator_active or self.pending_head != null) return .busy;
+        if (self.recovery_poisoned.load(.acquire)) return .changed;
+        if (expected.origin != @intFromPtr(&recovery_owner_counter) or expected.owner != self.recovery_owner or
+            expected.revision != self.destructive_revision.load(.acquire) or expected.next_lsn != self.next_lsn) return .changed;
+        return .{ .appended = try self.commitSingleLocked(data, control) };
+    }
+
+    fn commitSingleLocked(self: *WAL, data: []const u8, control: ?@import("../common/read_admission.zig").Port) !u64 {
+        var request: AppendRequest = .{ .entries = &.{data} };
+        const batch: CommitBatch = .{ .head = &request, .tail = &request, .request_count = 1, .entry_count = 1 };
+        self.stats.append_calls += 1;
+        self.stats.logical_entries += 1;
+        const attempt = self.commitAppendBatch(batch, control);
+        self.recordCommitStatsLocked(batch, attempt.stats, 0);
+        return switch (attempt.result) {
+            .success => |result| result.first_lsn,
+            .failure => |err| err,
+        };
+    }
+
+    fn invalidateRecoveryPositionsLocked(self: *WAL) void {
+        const old = self.destructive_revision.load(.monotonic);
+        // Exhaustion permanently disables witnesses for this open owner.
+        self.destructive_revision.store(if (old == 0 or old == std.math.maxInt(u64)) 0 else old + 1, .release);
+    }
+
     /// Append multiple entries in one durable transaction. Returns the assigned
     /// contiguous LSN range.
     pub fn appendBatch(self: *WAL, entries: []const []const u8) !BatchAppendResult {
@@ -481,19 +915,27 @@ pub const WAL = struct {
             return .{ .first_lsn = self.next_lsn, .count = 0 };
         }
 
-        const wait_started = self.nowNs();
         var request = AppendRequest{ .entries = entries };
+        return self.appendRequest(&request);
+    }
+
+    fn appendRequest(self: *WAL, request: *AppendRequest) !BatchAppendResult {
+        const wait_started = self.nowNs();
 
         self.mutex.lockUncancelable(self.sync_io);
+        if (self.recovery_poisoned.load(.acquire)) {
+            self.mutex.unlock(self.sync_io);
+            return error.CorruptWal;
+        }
 
-        if (entries.len == 1) {
+        if (request.entries.len == 1) {
             self.stats.append_calls += 1;
         } else {
             self.stats.append_batch_calls += 1;
         }
-        self.stats.logical_entries += entries.len;
+        self.stats.logical_entries += request.entries.len;
 
-        self.enqueueAppendRequestLocked(&request);
+        self.enqueueAppendRequestLocked(request);
         const leader = if (!self.coordinator_active) blk: {
             self.coordinator_active = true;
             break :blk true;
@@ -530,8 +972,8 @@ pub const WAL = struct {
     ) !IdempotentAppendResult {
         if (idempotency_key.len == 0 or idempotency_key.len > 1024 or digest.len == 0 or digest.len > 1024)
             return error.InvalidIdempotencyKey;
-        const metadata_key = try idempotencyMetadataKeyAlloc(idempotency_key);
-        defer std.heap.page_allocator.free(metadata_key);
+        const metadata_key = try idempotencyMetadataKeyAlloc(self.allocator, idempotency_key);
+        defer self.allocator.free(metadata_key);
 
         self.mutex.lockUncancelable(self.sync_io);
         defer self.mutex.unlock(self.sync_io);
@@ -539,27 +981,34 @@ pub const WAL = struct {
             self.completed.waitUncancelable(self.sync_io, &self.mutex);
         }
 
-        var txn = try self.beginWriteTxn();
-        errdefer txn.abort();
-        if (txn.get(metadata_key)) |raw| {
-            const existing = try decodeIdempotencyMetadata(raw);
-            if (!std.mem.eql(u8, existing.digest, digest)) return error.IdempotencyConflict;
-            txn.abort();
-            return .{ .lsn = existing.lsn, .appended = false };
-        } else |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        }
+        if (self.recovery_poisoned.load(.acquire)) return error.CorruptWal;
+        const lsn = committed: {
+            var txn = try self.beginWriteTxn();
+            errdefer txn.abort();
+            if (txn.get(metadata_key)) |raw| {
+                const existing = try decodeIdempotencyMetadata(raw);
+                if (!std.mem.eql(u8, existing.digest, digest)) return error.IdempotencyConflict;
+                txn.abort();
+                return .{ .lsn = existing.lsn, .appended = false };
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
 
-        const lsn = self.next_lsn;
-        const next_lsn = try std.math.add(u64, lsn, 1);
-        try putEncodedEntry(&txn, lsn, data);
-        try putNextLsnMeta(&txn, next_lsn);
-        const metadata = try encodeIdempotencyMetadataAlloc(digest, lsn);
-        defer std.heap.page_allocator.free(metadata);
-        try txn.put(metadata_key, metadata);
-        try txn.commit();
-        self.next_lsn = next_lsn;
+            const assigned_lsn = self.next_lsn;
+            const next_lsn = try std.math.add(u64, assigned_lsn, 1);
+            try putEncodedEntry(self.allocator, &txn, assigned_lsn, data);
+            try putNextLsnMeta(&txn, next_lsn);
+            const metadata = try encodeIdempotencyMetadataAlloc(self.allocator, digest, assigned_lsn);
+            defer self.allocator.free(metadata);
+            try txn.put(metadata_key, metadata);
+            txn.commit() catch |err| {
+                self.recovery_poisoned.store(true, .release);
+                return err;
+            };
+            break :committed assigned_lsn;
+        };
+        self.next_lsn = lsn + 1;
         if (self.sync_after_commit) _ = try self.store_owner.syncCommitDurability();
         try self.waitForCommitCompletion(self.commit_completion_delay_ns);
         return .{ .lsn = lsn, .appended = true };
@@ -575,11 +1024,17 @@ pub const WAL = struct {
         while (self.coordinator_active or self.pending_head != null) {
             self.completed.waitUncancelable(self.sync_io, &self.mutex);
         }
-        var txn = try self.beginWriteTxn();
-        errdefer txn.abort();
-        const key = std.mem.toBytes(std.mem.nativeToBig(u64, lsn));
-        try txn.put(&key, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
-        try txn.commit();
+        {
+            var txn = try self.beginWriteTxn();
+            errdefer txn.abort();
+            const key = std.mem.toBytes(std.mem.nativeToBig(u64, lsn));
+            try txn.put(&key, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+            self.invalidateRecoveryPositionsLocked();
+            txn.commit() catch |err| {
+                self.recovery_poisoned.store(true, .release);
+                return err;
+            };
+        }
         if (self.sync_after_commit) _ = try self.store_owner.syncCommitDurability();
     }
 
@@ -613,6 +1068,7 @@ pub const WAL = struct {
         while (self.coordinator_active or self.pending_head != null) {
             self.completed.waitUncancelable(self.sync_io, &self.mutex);
         }
+        if (self.recovery_poisoned.load(.acquire)) return error.CorruptWal;
         try self.store_owner.checkpointLsmWalAfterDurableBoundary();
     }
 
@@ -626,16 +1082,21 @@ pub const WAL = struct {
         // Never spin or sleep an OS thread if that contract is violated.
         if (self.coordinator_active or self.pending_head != null)
             return error.WalAppendInProgress;
+        if (self.recovery_poisoned.load(.acquire)) return error.CorruptWal;
         return try self.store_owner.pinNativeCheckpoint();
     }
 
     /// Truncate all entries with LSN <= the given value.
     pub fn truncate(self: *WAL, up_to_lsn: u64) !void {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        while (self.coordinator_active or self.pending_head != null) self.completed.waitUncancelable(self.sync_io, &self.mutex);
+        if (self.recovery_poisoned.load(.acquire)) return error.CorruptWal;
         var txn = try self.beginWriteTxn();
         errdefer txn.abort();
 
         var to_delete = std.ArrayListUnmanaged([8]u8).empty;
-        defer to_delete.deinit(std.heap.page_allocator);
+        defer to_delete.deinit(self.allocator);
 
         {
             var cur = try txn.cursor();
@@ -643,7 +1104,10 @@ pub const WAL = struct {
 
             var maybe_entry = try cur.first();
             if (maybe_entry == null) {
-                try txn.commit();
+                txn.commit() catch |err| {
+                    self.recovery_poisoned.store(true, .release);
+                    return err;
+                };
                 return;
             }
 
@@ -657,7 +1121,7 @@ pub const WAL = struct {
 
                 var key: [8]u8 = undefined;
                 @memcpy(&key, entry.key[0..8]);
-                try to_delete.append(std.heap.page_allocator, key);
+                try to_delete.append(self.allocator, key);
 
                 maybe_entry = try cur.next();
             }
@@ -670,7 +1134,11 @@ pub const WAL = struct {
             };
         }
 
-        try txn.commit();
+        if (to_delete.items.len != 0) self.invalidateRecoveryPositionsLocked();
+        txn.commit() catch |err| {
+            self.recovery_poisoned.store(true, .release);
+            return err;
+        };
     }
 
     /// Truncate all entries with LSN > the given value and move the append
@@ -684,6 +1152,7 @@ pub const WAL = struct {
             self.completed.waitUncancelable(self.sync_io, &self.mutex);
         }
 
+        if (self.recovery_poisoned.load(.acquire)) return error.CorruptWal;
         const next_lsn = try std.math.add(u64, keep_lsn, 1);
         if (next_lsn >= self.next_lsn) return;
 
@@ -691,7 +1160,7 @@ pub const WAL = struct {
         errdefer txn.abort();
 
         var to_delete = std.ArrayListUnmanaged([8]u8).empty;
-        defer to_delete.deinit(std.heap.page_allocator);
+        defer to_delete.deinit(self.allocator);
 
         {
             var cur = try txn.cursor();
@@ -704,7 +1173,7 @@ pub const WAL = struct {
 
                 var key: [8]u8 = undefined;
                 @memcpy(&key, entry.key[0..8]);
-                try to_delete.append(std.heap.page_allocator, key);
+                try to_delete.append(self.allocator, key);
 
                 maybe_entry = try cur.next();
             }
@@ -717,7 +1186,11 @@ pub const WAL = struct {
             };
         }
         try putNextLsnMeta(&txn, next_lsn);
-        try txn.commit();
+        self.invalidateRecoveryPositionsLocked();
+        txn.commit() catch |err| {
+            self.recovery_poisoned.store(true, .release);
+            return err;
+        };
         self.next_lsn = next_lsn;
     }
 
@@ -772,6 +1245,40 @@ pub const WAL = struct {
             .lsn = lsn,
             .data = try alloc.dupe(u8, decoded),
         };
+    }
+
+    /// Visit one exact, checksum-verified entry without copying its payload.
+    /// Entry bytes are borrowed only through the synchronous callback. The
+    /// callback must not retain them or reenter a write on this WAL while the
+    /// read transaction is held. Callback failure still retires the snapshot.
+    pub fn withEntryAt(self: *WAL, lsn: u64, context: anytype, comptime callback: fn (@TypeOf(context), WalEntry) anyerror!void) !bool {
+        return self.withEntryAtWithAdmission(lsn, null, context, callback);
+    }
+
+    /// Bounded checksum quanta with lifetime checks around snapshot access.
+    /// Namespace snapshot creation/get still need physical admission. A snapshot
+    /// is a retained dependency: preserve lifetime without transferring CPU.
+    pub fn withEntryAtWithAdmission(self: *WAL, lsn: u64, original: ?@import("../common/read_admission.zig").Port, context: anytype, comptime callback: fn (@TypeOf(context), WalEntry) anyerror!void) !bool {
+        var retained: @import("../common/read_admission.zig").RetainedDependency = .{};
+        const control = retained.bind(original);
+        if (control) |port| try port.checkpoint();
+        var txn = if (control) |port| try self.beginReadTxnWithAdmission(port) else try self.beginReadTxn();
+        defer txn.abort();
+        if (control) |port| try port.checkpoint();
+        const key = std.mem.toBytes(std.mem.nativeToBig(u64, lsn));
+        const fetched = if (control) |port| txn.getWithAdmission(&key, port) else txn.get(&key);
+        const value = fetched catch |err| switch (err) {
+            error.NotFound => {
+                if (control) |port| try port.checkpoint();
+                return false;
+            },
+            else => return err,
+        };
+        const data = try decodeWalValueWithAdmission(value, control);
+        if (control) |port| try port.checkpoint();
+        try callback(context, .{ .lsn = lsn, .data = data });
+        if (control) |port| try port.checkpoint();
+        return true;
     }
 
     /// Import ScanAction from docstore for consistent API.
@@ -854,6 +1361,16 @@ pub const WAL = struct {
         return self.lastLsn();
     }
 
+    /// Synchronous snapshot under the original caller's authority. Progress
+    /// occurs only before acquisition; rejection racing acquisition releases it.
+    pub fn lastLsnSnapshotWithAdmission(self: *WAL, control: @import("../common/read_admission.zig").Port) !u64 {
+        try @import("../common/bounded_mutex.zig").lock(&self.mutex, self.sync_io, control);
+        defer self.mutex.unlock(self.sync_io);
+        const lsn = self.lastLsn();
+        try control.checkpoint();
+        return lsn;
+    }
+
     fn enqueueAppendRequestLocked(self: *WAL, request: *AppendRequest) void {
         request.next = null;
         if (self.pending_tail) |tail| {
@@ -911,7 +1428,7 @@ pub const WAL = struct {
                 return;
             }
 
-            const attempt = self.commitAppendBatch(batch);
+            const attempt = self.commitAppendBatch(batch, null);
 
             self.mutex.lockUncancelable(self.sync_io);
             self.recordCommitStatsLocked(batch, attempt.stats, coalesce_ns);
@@ -964,11 +1481,13 @@ pub const WAL = struct {
         return @min(self.group_commit_window_ns, baseline_ns);
     }
 
-    fn commitAppendBatch(self: *WAL, batch: CommitBatch) CommitAttempt {
+    fn commitAppendBatch(self: *WAL, batch: CommitBatch, control: ?@import("../common/read_admission.zig").Port) CommitAttempt {
         var stats = CommitRunStats{
             .request_count = batch.request_count,
             .entry_count = batch.entry_count,
         };
+        if (self.recovery_poisoned.load(.acquire)) return .{ .result = .{ .failure = error.CorruptWal }, .stats = stats };
+        if (control) |port| port.checkpoint() catch |err| return .{ .result = .{ .failure = err }, .stats = stats };
         const first_lsn = self.next_lsn;
         const entry_count = std.math.cast(u64, batch.entry_count) orelse return .{
             .result = .{ .failure = error.Overflow },
@@ -989,13 +1508,16 @@ pub const WAL = struct {
             };
         };
         stats.txn_open_ns = self.elapsedSince(txn_open_started);
-        errdefer txn.abort();
 
         var request = batch.head;
         while (request) |current| : (request = current.next) {
-            for (current.entries) |data| {
+            for (current.entries, 0..) |data, index| {
                 const put_started = self.nowNs();
-                putEncodedEntry(&txn, lsn, data) catch |err| {
+                const put = if (current.encoded_entries) |encoded| blk: {
+                    const key = std.mem.toBytes(std.mem.nativeToBig(u64, lsn));
+                    break :blk putWalValue(&txn, &key, encoded[index]);
+                } else putEncodedEntry(self.allocator, &txn, lsn, data);
+                put catch |err| {
                     txn.abort();
                     stats.put_ns += self.elapsedSince(put_started);
                     return .{
@@ -1016,9 +1538,16 @@ pub const WAL = struct {
             };
         };
 
+        if (control) |port| port.checkpoint() catch |err| {
+            txn.abort();
+            return .{ .result = .{ .failure = err }, .stats = stats };
+        };
         const lsm_stats_before = self.store_owner.lsmWriteStatsSnapshot();
         const commit_started = self.nowNs();
+        stats.commit_attempted = true;
         txn.commit() catch |err| {
+            self.recovery_poisoned.store(true, .release);
+            txn.abort();
             stats.commit_ns = self.elapsedSince(commit_started);
             return .{
                 .result = .{ .failure = err },
@@ -1065,6 +1594,9 @@ pub const WAL = struct {
     fn recordCommitStatsLocked(self: *WAL, batch: CommitBatch, stats: CommitRunStats, coalesce_ns: u64) void {
         _ = batch;
         self.stats.total_coalesce_ns += coalesce_ns;
+        self.stats.total_txn_open_ns += stats.txn_open_ns;
+        self.stats.total_put_ns += stats.put_ns;
+        if (!stats.commit_attempted) return;
         self.stats.physical_commits += 1;
         if (stats.request_count > 1) {
             self.stats.grouped_commits += 1;
@@ -1072,8 +1604,7 @@ pub const WAL = struct {
         }
         self.stats.max_requests_per_commit = @max(self.stats.max_requests_per_commit, stats.request_count);
         self.stats.max_entries_per_commit = @max(self.stats.max_entries_per_commit, stats.entry_count);
-        self.stats.total_txn_open_ns += stats.txn_open_ns;
-        self.stats.total_put_ns += stats.put_ns;
+
         self.stats.total_commit_ns += stats.commit_ns;
         self.stats.inner_segment_syncs += stats.inner_segment_syncs;
         self.stats.inner_index_syncs += stats.inner_index_syncs;
@@ -1223,7 +1754,7 @@ fn putWalValue(txn: anytype, key: []const u8, value: []const u8) !void {
     };
 }
 
-fn putEncodedEntry(txn: anytype, lsn: u64, data: []const u8) !void {
+fn putEncodedEntry(allocator: Allocator, txn: anytype, lsn: u64, data: []const u8) !void {
     const key = std.mem.toBytes(std.mem.nativeToBig(u64, lsn));
     const data_len: u32 = @intCast(data.len);
     const value_len = 4 + data.len + 4;
@@ -1236,8 +1767,8 @@ fn putEncodedEntry(txn: anytype, lsn: u64, data: []const u8) !void {
         return;
     }
 
-    const buf = try std.heap.page_allocator.alloc(u8, value_len);
-    defer std.heap.page_allocator.free(buf);
+    const buf = try allocator.alloc(u8, value_len);
+    defer allocator.free(buf);
 
     encodeEntryValue(buf, data_len, data, checksum);
     try putWalValue(txn, &key, buf);
@@ -1251,16 +1782,16 @@ const IdempotencyMetadata = struct {
     lsn: u64,
 };
 
-fn idempotencyMetadataKeyAlloc(key: []const u8) ![]u8 {
-    const out = try std.heap.page_allocator.alloc(u8, idempotency_metadata_prefix.len + key.len);
+fn idempotencyMetadataKeyAlloc(allocator: Allocator, key: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, idempotency_metadata_prefix.len + key.len);
     @memcpy(out[0..idempotency_metadata_prefix.len], idempotency_metadata_prefix);
     @memcpy(out[idempotency_metadata_prefix.len..], key);
     return out;
 }
 
-fn encodeIdempotencyMetadataAlloc(digest: []const u8, lsn: u64) ![]u8 {
+fn encodeIdempotencyMetadataAlloc(allocator: Allocator, digest: []const u8, lsn: u64) ![]u8 {
     const digest_len: u16 = std.math.cast(u16, digest.len) orelse return error.InvalidIdempotencyKey;
-    const out = try std.heap.page_allocator.alloc(u8, 2 + digest.len + 8);
+    const out = try allocator.alloc(u8, 2 + digest.len + 8);
     out[0..2].* = std.mem.toBytes(std.mem.nativeToLittle(u16, digest_len));
     @memcpy(out[2..][0..digest.len], digest);
     out[2 + digest.len ..][0..8].* = std.mem.toBytes(std.mem.nativeToLittle(u64, lsn));
@@ -1292,6 +1823,11 @@ fn readNextLsnMeta(txn: anytype) !?u64 {
 }
 
 fn decodeWalValue(value: []const u8) error{CorruptWal}![]const u8 {
+    return decodeWalValueWithAdmission(value, null) catch return error.CorruptWal;
+}
+
+fn decodeWalValueWithAdmission(value: []const u8, control: ?@import("../common/read_admission.zig").Port) ![]const u8 {
+    if (control) |port| try port.checkpoint();
     if (value.len < 8) return error.CorruptWal;
 
     const data_len: usize = std.mem.readInt(u32, value[0..4], .little);
@@ -1304,7 +1840,16 @@ fn decodeWalValue(value: []const u8) error{CorruptWal}![]const u8 {
 
     var crc = Crc32.init();
     crc.update(value[0..4]);
-    crc.update(data);
+    if (control) |port| {
+        var offset: usize = 0;
+        while (offset < data.len) {
+            try port.checkpoint();
+            const end = offset + @min(64 * 1024, data.len - offset);
+            crc.update(data[offset..end]);
+            offset = end;
+        }
+        try port.checkpoint();
+    } else crc.update(data);
     if (crc.final() != stored_crc) return error.CorruptWal;
 
     return data;
@@ -1322,6 +1867,52 @@ fn checksumForEntry(data_len: u32, data: []const u8) u32 {
     crc.update(data);
     return crc.final();
 }
+
+/// IEEE CRC concatenation, specialized to the immutable tail length during
+/// preparation. Publication applies one 32-column matrix to the short prefix
+/// CRC and XORs the saved tail CRC; it never revisits payload bytes.
+const CrcShift = struct {
+    columns: [32]u32,
+
+    fn times(matrix: *const [32]u32, value: u32) u32 {
+        var bits = value;
+        var result: u32 = 0;
+        var index: usize = 0;
+        while (bits != 0) : (index += 1) {
+            if (bits & 1 != 0) result ^= matrix[index];
+            bits >>= 1;
+        }
+        return result;
+    }
+
+    fn compose(left: *const [32]u32, right: *const [32]u32) [32]u32 {
+        var result: [32]u32 = undefined;
+        for (&result, 0..) |*column, i| column.* = times(left, right[i]);
+        return result;
+    }
+
+    fn init(length: usize, control: ?@import("../common/read_admission.zig").Port) !CrcShift {
+        var identity: [32]u32 = undefined;
+        for (&identity, 0..) |*column, i| column.* = @as(u32, 1) << @as(u5, @intCast(i));
+        var power: [32]u32 = undefined;
+        power[0] = 0xedb88320;
+        for (power[1..], 0..) |*column, i| column.* = @as(u32, 1) << @as(u5, @intCast(i));
+        // The reflected polynomial matrix advances one bit; square to one byte.
+        for (0..3) |_| power = compose(&power, &power);
+        var remaining = length;
+        while (remaining != 0) {
+            if (control) |port| try port.checkpoint();
+            if (remaining & 1 != 0) identity = compose(&power, &identity);
+            remaining >>= 1;
+            if (remaining != 0) power = compose(&power, &power);
+        }
+        return .{ .columns = identity };
+    }
+
+    fn apply(self: *const CrcShift, prefix_crc: u32) u32 {
+        return times(&self.columns, prefix_crc);
+    }
+};
 
 // ============================================================================
 // Tests
@@ -2753,6 +3344,132 @@ test "wal sim soak stays green" {
     try runWalSoak(std.testing.allocator);
 }
 
+test "wal append prepared CRC transform matches full wire checksum for arbitrary partitions" {
+    var bytes: [16385]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i *% 73 +% 41);
+    for ([_]usize{ 0, 1, 2, 7, 31, 100, 4096 }) |prefix_len| {
+        for ([_]usize{ 0, 1, 2, 3, 31, 127, 4095, 4096, 8193 }) |tail_len| {
+            const prefix = bytes[0..prefix_len];
+            const tail = bytes[prefix_len..][0..tail_len];
+            const shift = try CrcShift.init(tail.len, null);
+            const actual = shift.apply(Crc32.hash(prefix)) ^ Crc32.hash(tail);
+            try std.testing.expectEqual(Crc32.hash(bytes[0 .. prefix_len + tail_len]), actual);
+        }
+    }
+    // Repeated squaring handles large lengths without allocating the suffix.
+    const once = try CrcShift.init(1 << 30, null);
+    const twice = try CrcShift.init(@as(usize, 1) << 31, null);
+    try std.testing.expectEqual(twice.apply(0x12345678), once.apply(once.apply(0x12345678)));
+}
+
+test "wal append prepared encoding preserves owned bytes and rejects reuse without spending an LSN" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&path_buf, "prepared-encoding");
+    defer cleanupWalDir(path);
+    var wal = try WAL.openWithAllocator(a, path, .{ .no_sync = true, .commit_backend = .sync });
+    defer wal.close();
+    var input: [8193]u8 = @splat(51);
+    const original = input;
+    var abandoned = try wal.prepareAppend(4, &input, null);
+    abandoned.deinit();
+    try std.testing.expectEqual(@as(u64, 0), wal.lastLsn());
+    var entry = try wal.prepareAppend(4, &input, null);
+    defer entry.deinit();
+    @memset(&input, 17);
+    var empty: [0]u8 = .{};
+    var deny = std.heap.FixedBufferAllocator.init(&empty);
+    wal.allocator = deny.allocator();
+    defer wal.allocator = a;
+    try std.testing.expectError(error.OutOfMemory, wal.append(&input));
+    try std.testing.expectEqual(@as(u64, 1), try entry.publish("head"));
+    try std.testing.expectError(error.InvalidArgument, entry.publish("head"));
+    wal.allocator = a;
+    const stored = (try wal.readAt(a, 1)).?;
+    defer a.free(stored.data);
+    try std.testing.expectEqualSlices(u8, "head", stored.data[0..4]);
+    try std.testing.expectEqualSlices(u8, &original, stored.data[4..]);
+    try std.testing.expectEqual(@as(u64, 1), wal.lastLsn());
+}
+
+test "wal append prepared construction preserves original refusal and unwinds allocation failures" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&path_buf, "prepared-refusal");
+    defer cleanupWalDir(path);
+    var wal = try WAL.openWithAllocator(a, path, .{ .no_sync = true });
+    defer wal.close();
+    const read = @import("../common/read_admission.zig");
+    const State = struct {
+        checks: usize = 0,
+        reject: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.reject) return error.DeadlineExceeded;
+        }
+    };
+    var state: State = .{};
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+    const input: [8193]u8 = @splat(7);
+    var grant = try wal.prepareAppend(100, &input, read.Port.init(&payload));
+    grant.deinit();
+    const checks = state.checks;
+    for (1..checks + 1) |reject| {
+        state = .{ .reject = reject };
+        try std.testing.expectError(error.DeadlineExceeded, wal.prepareAppend(100, &input, read.Port.init(&payload)));
+        try std.testing.expectEqual(reject, state.checks);
+        try std.testing.expectEqual(@as(u64, 0), wal.lastLsn());
+    }
+    const Fixture = struct {
+        fn run(allocator: Allocator, target: *WAL) !void {
+            const previous = target.allocator;
+            target.allocator = allocator;
+            defer target.allocator = previous;
+            var prepared = try target.prepareAppend(100, &input, null);
+            prepared.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{&wal});
+    try std.testing.expectEqual(@as(u64, 0), wal.lastLsn());
+}
+
+test "wal append prepared and ordinary entries share one physical coordinator commit" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&path_buf, "prepared-coalesce");
+    defer cleanupWalDir(path);
+    var wal = try WAL.openWithAllocator(a, path, .{ .no_sync = true, .commit_backend = .sync });
+    defer wal.close();
+    const input: [8193]u8 = @splat(29);
+    var prepared = try wal.prepareAppend(4, &input, null);
+    defer prepared.deinit();
+    const encoded = try prepared.seal("head");
+    var ordinary: AppendRequest = .{ .entries = &.{"ordinary"} };
+    var funded: AppendRequest = .{ .entries = &.{encoded[4 .. encoded.len - 4]}, .encoded_entries = &.{encoded}, .next = &ordinary };
+    const batch: CommitBatch = .{ .head = &funded, .tail = &ordinary, .request_count = 2, .entry_count = 2 };
+    var empty: [0]u8 = .{};
+    var deny = std.heap.FixedBufferAllocator.init(&empty);
+    wal.allocator = deny.allocator();
+    defer wal.allocator = a;
+    wal.mutex.lockUncancelable(wal.sync_io);
+    const attempt = wal.commitAppendBatch(batch, null);
+    wal.mutex.unlock(wal.sync_io);
+    switch (attempt.result) {
+        .success => |result| try std.testing.expectEqual(@as(u64, 1), result.first_lsn),
+        .failure => |cause| return cause,
+    }
+    wal.allocator = a;
+    try std.testing.expectEqual(@as(u64, 2), wal.lastLsn());
+    const first = (try wal.readAt(a, 1)).?;
+    defer a.free(first.data);
+    const second = (try wal.readAt(a, 2)).?;
+    defer a.free(second.data);
+    try std.testing.expectEqualSlices(u8, "head", first.data[0..4]);
+    try std.testing.expectEqualSlices(u8, &input, first.data[4..]);
+    try std.testing.expectEqualSlices(u8, "ordinary", second.data);
+}
+
 test "wal append and last lsn" {
     var buf: [256]u8 = undefined;
     const path = walTmpPath(&buf);
@@ -2958,6 +3675,52 @@ test "wal post-commit completion failure does not reuse durable lsn" {
     try std.testing.expectEqualStrings("first", entries[0].data);
     try std.testing.expectEqual(@as(u64, 2), entries[1].lsn);
     try std.testing.expectEqualStrings("second", entries[1].data);
+}
+
+test "wal post-commit idempotent completion failure preserves receipt and append cursor" {
+    const Completion = struct {
+        calls: usize = 0,
+        fn wait(raw: ?*anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 1) return error.InjectedCompletionFailure;
+        }
+    };
+    var completion: Completion = .{};
+    var buf: [256]u8 = undefined;
+    const path = walTmpPath(&buf);
+    defer cleanupWalDir(path);
+    {
+        var wal = try WAL.open(path, .{
+            .commit_scheduler = .{ .ctx = &completion, .wait_ns_fn = Completion.wait },
+            .artificial_sync_delay_ns = 1,
+        });
+        defer wal.close();
+        try std.testing.expectError(error.InjectedCompletionFailure, wal.appendIdempotent("first", "digest", "committed"));
+        try std.testing.expectEqual(@as(u64, 2), wal.next_lsn);
+        try std.testing.expect(!wal.recovery_poisoned.load(.acquire));
+        const retry = try wal.appendIdempotent("first", "digest", "must not replace");
+        try std.testing.expectEqualDeep(IdempotentAppendResult{ .lsn = 1, .appended = false }, retry);
+        try std.testing.expectEqual(@as(usize, 1), completion.calls);
+        try std.testing.expectError(error.IdempotencyConflict, wal.appendIdempotent("first", "other digest", "conflict"));
+        const second = try wal.appendIdempotent("second", "digest", "second");
+        try std.testing.expectEqualDeep(IdempotentAppendResult{ .lsn = 2, .appended = true }, second);
+        try std.testing.expectEqual(@as(u64, 3), try wal.append("ordinary"));
+    }
+    var reopened = try WAL.open(path, .{});
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 4), reopened.next_lsn);
+    try std.testing.expectEqualDeep(IdempotentAppendResult{ .lsn = 1, .appended = false }, try reopened.appendIdempotent("first", "digest", "must not replace"));
+    try std.testing.expectEqualDeep(IdempotentAppendResult{ .lsn = 2, .appended = false }, try reopened.appendIdempotent("second", "digest", "must not replace"));
+    const entries = try reopened.iterateFrom(std.testing.allocator, 1);
+    defer {
+        for (entries) |entry| std.testing.allocator.free(entry.data);
+        std.testing.allocator.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqualStrings("committed", entries[0].data);
+    try std.testing.expectEqualStrings("second", entries[1].data);
+    try std.testing.expectEqualStrings("ordinary", entries[2].data);
 }
 
 test "wal group commit coalesces concurrent appends" {
@@ -3684,4 +4447,819 @@ fn cleanupWalDir(path: [*:0]const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "WAL borrowed entry visit retires read snapshots and rejects corrupt bytes" {
+    var buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&buf, "borrowed-entry");
+    defer cleanupWalDir(path);
+    var wal = try WAL.open(path, .{ .backend = .lsm_memory, .commit_backend = .sync });
+    defer wal.close();
+    const lsn = try wal.append("borrowed");
+    const Visit = struct {
+        calls: usize = 0,
+        reject: bool = false,
+        fn run(self: *@This(), entry: WalEntry) !void {
+            try std.testing.expectEqual(@as(u64, 1), entry.lsn);
+            try std.testing.expectEqualStrings("borrowed", entry.data);
+            self.calls += 1;
+            if (self.reject) return error.InjectedWalVisitRejection;
+        }
+    };
+    var visit: Visit = .{};
+    try std.testing.expect(try wal.withEntryAt(lsn, &visit, Visit.run));
+    try std.testing.expect(!try wal.withEntryAt(99, &visit, Visit.run));
+    try std.testing.expectEqual(@as(usize, 1), visit.calls);
+    visit.reject = true;
+    try std.testing.expectError(error.InjectedWalVisitRejection, wal.withEntryAt(lsn, &visit, Visit.run));
+    try std.testing.expectEqual(@as(usize, 2), visit.calls);
+    // Callback rejection releases its transaction before another write.
+    {
+        var txn = try wal.beginWriteTxn();
+        errdefer txn.abort();
+        const key = std.mem.toBytes(std.mem.nativeToBig(u64, lsn));
+        try txn.put(&key, "bad");
+        try txn.commit();
+    }
+    try std.testing.expectError(error.CorruptWal, wal.withEntryAt(lsn, &visit, Visit.run));
+    try std.testing.expectEqual(@as(usize, 2), visit.calls);
+}
+
+test "WAL borrowed controlled entry retires snapshots after every checksum and visitor rejection" {
+    const read = @import("../common/read_admission.zig");
+    const State = struct {
+        checks: usize = 0,
+        reject_at: usize = 0,
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.reject_at) return self.cause;
+        }
+    };
+    const a = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&buf, "controlled-borrow");
+    defer cleanupWalDir(path);
+    var wal = try WAL.open(path, .{ .backend = .lsm_memory, .commit_backend = .sync });
+    defer wal.close();
+    const bytes = try a.alloc(u8, 2 * 64 * 1024 + 17);
+    defer a.free(bytes);
+    @memset(bytes, 91);
+    _ = try wal.append(bytes);
+    var state: State = .{};
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .check_lifetime = State.check } };
+    const control = read.Port.init(&payload);
+    const Visit = struct {
+        expected: []const u8,
+        calls: usize = 0,
+        fn run(self: *@This(), entry: WalEntry) !void {
+            try std.testing.expectEqualSlices(u8, self.expected, entry.data);
+            self.calls += 1;
+        }
+    };
+    var visit: Visit = .{ .expected = bytes };
+    try std.testing.expect(try wal.withEntryAtWithAdmission(1, control, &visit, Visit.run));
+    const checks = state.checks;
+    try std.testing.expectEqual(@as(usize, 0), wal.store_owner.lsm.backend.active_readers);
+    try std.testing.expect(checks >= 8);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        for (1..checks + 1) |reject_at| {
+            state = .{ .reject_at = reject_at, .cause = cause };
+            try std.testing.expectError(cause, wal.withEntryAtWithAdmission(1, control, &visit, Visit.run));
+            try std.testing.expectEqual(@as(usize, 0), wal.store_owner.lsm.backend.active_readers);
+            // A write after each failure observes leaked read ownership.
+            _ = try wal.append("after rejection");
+        }
+    }
+    state = .{};
+    try std.testing.expect(!try wal.withEntryAtWithAdmission(std.math.maxInt(u64), control, &visit, Visit.run));
+    try std.testing.expect(try wal.withEntryAtWithAdmission(1, control, &visit, Visit.run));
+}
+
+test "WAL recovery position rejects tail ABA prefix deletion foreign owners and reopen" {
+    const a = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&buf, "recovery-position-identity");
+    defer cleanupWalDir(path);
+    var old: RecoveryPosition = undefined;
+    {
+        var wal = try WAL.open(path, .{ .commit_backend = .sync });
+        defer wal.close();
+        _ = try wal.append("first");
+        _ = try wal.append("old tail");
+        old = (try wal.tryRecoveryPosition(null)).?;
+        try wal.truncateAfter(1);
+        _ = try wal.append("replacement");
+        try std.testing.expectEqual(old.next_lsn, wal.next_lsn);
+        try std.testing.expectEqual(@as(RecoveryAppendResult, .changed), try wal.appendIfRecoveryPosition(old, "must not append", null));
+        const before_prefix = (try wal.tryRecoveryPosition(null)).?;
+        try wal.truncate(1);
+        try std.testing.expectEqual(@as(RecoveryAppendResult, .changed), try wal.appendIfRecoveryPosition(before_prefix, "must not append", null));
+        const after_prefix = (try wal.tryRecoveryPosition(null)).?;
+        try wal.truncate(0);
+        try wal.truncateAfter(wal.lastLsn());
+        try std.testing.expectEqualDeep(after_prefix, (try wal.tryRecoveryPosition(null)).?);
+        var other_buf: [256]u8 = undefined;
+        const other_path = walTmpPathWithSuffix(&other_buf, "recovery-position-other");
+        defer cleanupWalDir(other_path);
+        var other = try WAL.open(other_path, .{ .backend = .lsm_memory, .commit_backend = .sync });
+        defer other.close();
+        _ = try other.append("first");
+        _ = try other.append("replacement");
+        try std.testing.expectEqual(@as(RecoveryAppendResult, .changed), try other.appendIfRecoveryPosition(after_prefix, "foreign", null));
+    }
+    var reopened = try WAL.open(path, .{ .commit_backend = .sync });
+    defer reopened.close();
+    const current = (try reopened.tryRecoveryPosition(null)).?;
+    try std.testing.expectEqual(old.next_lsn, current.next_lsn);
+    try std.testing.expectEqual(old.revision, current.revision);
+    try std.testing.expect(old.owner != current.owner);
+    try std.testing.expectEqual(@as(RecoveryAppendResult, .changed), try reopened.appendIfRecoveryPosition(old, "old lifetime", null));
+    const entry = (try reopened.readAt(a, 2)).?;
+    defer a.free(entry.data);
+    try std.testing.expectEqualStrings("replacement", entry.data);
+}
+
+test "WAL recovery position busy and cancellation preserve ownership before the commit boundary" {
+    const read = @import("../common/read_admission.zig");
+    var buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&buf, "recovery-position-control");
+    defer cleanupWalDir(path);
+    var wal = try WAL.open(path, .{ .backend = .lsm_memory, .commit_backend = .sync });
+    defer wal.close();
+    const first = (try wal.tryRecoveryPosition(null)).?;
+    const before = wal.stats;
+    try std.testing.expect(wal.mutex.tryLock());
+    const busy_position = wal.tryRecoveryPosition(null);
+    const busy_append = wal.appendIfRecoveryPosition(first, "busy", null);
+    wal.mutex.unlock(wal.sync_io);
+    try std.testing.expectEqual(@as(?RecoveryPosition, null), try busy_position);
+    try std.testing.expectEqual(@as(RecoveryAppendResult, .busy), try busy_append);
+    try std.testing.expectEqualDeep(before, wal.stats);
+    wal.coordinator_active = true;
+    const active_position = wal.tryRecoveryPosition(null);
+    const active_append = wal.appendIfRecoveryPosition(first, "active", null);
+    wal.coordinator_active = false;
+    try std.testing.expectEqual(@as(?RecoveryPosition, null), try active_position);
+    try std.testing.expectEqual(@as(RecoveryAppendResult, .busy), try active_append);
+    const State = struct {
+        wal: *WAL,
+        expected_next: u64,
+        checks: usize = 0,
+        reject_at: usize = 0,
+        cause: anyerror = error.Canceled,
+        after_commit: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.wal.next_lsn != self.expected_next) {
+                self.after_commit = true;
+                return error.Canceled;
+            }
+            if (self.checks == self.reject_at) return self.cause;
+        }
+        fn wait(_: *anyopaque) !void {
+            return error.UnexpectedWriterWait;
+        }
+    };
+    var state: State = .{ .wal = &wal, .expected_next = first.next_lsn };
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .check_lifetime = State.check, .wait_for_progress = State.wait } };
+    const control = read.Port.init(&payload);
+    try std.testing.expectEqual(@as(u64, 1), (try wal.appendIfRecoveryPosition(first, "committed", control)).appended);
+    try std.testing.expect(!state.after_commit);
+    const checks = state.checks;
+    try std.testing.expect(checks >= 4);
+    const next = (try wal.tryRecoveryPosition(null)).?;
+    const commits = wal.stats.physical_commits;
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        for (1..checks + 1) |reject_at| {
+            state = .{ .wal = &wal, .expected_next = next.next_lsn, .reject_at = reject_at, .cause = cause };
+            try std.testing.expectError(cause, wal.appendIfRecoveryPosition(next, "rejected", control));
+            try std.testing.expectEqual(next.next_lsn, wal.next_lsn);
+            try std.testing.expectEqual(commits, wal.stats.physical_commits);
+            try std.testing.expectEqual(reject_at, state.checks);
+            try std.testing.expectEqualDeep(next, (try wal.tryRecoveryPosition(null)).?);
+        }
+    }
+}
+
+test "WAL recovery position competing writers append once and completion failure keeps committed cursor" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&buf, "recovery-position-compete");
+    defer cleanupWalDir(path);
+    var wal = try WAL.open(path, .{ .backend = .lsm_memory, .commit_backend = .sync });
+    defer wal.close();
+    const position = (try wal.tryRecoveryPosition(null)).?;
+    const Call = struct {
+        wal: *WAL,
+        position: RecoveryPosition,
+        start: *std.atomic.Value(bool),
+        result: ?RecoveryAppendResult = null,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            self.result = self.wal.appendIfRecoveryPosition(self.position, "one record", null) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var start: std.atomic.Value(bool) = .init(false);
+    var left: Call = .{ .wal = &wal, .position = position, .start = &start };
+    var right: Call = .{ .wal = &wal, .position = position, .start = &start };
+    {
+        const first = try std.Thread.spawn(.{}, Call.run, .{&left});
+        errdefer {
+            start.store(true, .release);
+            first.join();
+        }
+        const second = try std.Thread.spawn(.{}, Call.run, .{&right});
+        start.store(true, .release);
+        first.join();
+        second.join();
+    }
+    try std.testing.expect(left.failure == null and right.failure == null);
+    var successes: usize = 0;
+    for ([_]RecoveryAppendResult{ left.result.?, right.result.? }) |result| switch (result) {
+        .appended => |lsn| {
+            successes += 1;
+            try std.testing.expectEqual(@as(u64, 1), lsn);
+        },
+        .busy, .changed => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), successes);
+    try std.testing.expectEqual(@as(u64, 1), wal.lastLsn());
+    const Fail = struct {
+        fn complete(_: ?*anyopaque, _: u64) !void {
+            return error.InjectedCompletionFailure;
+        }
+    };
+    const prior_scheduler = wal.commit_scheduler;
+    const next = (try wal.tryRecoveryPosition(null)).?;
+    wal.commit_scheduler = .{ .wait_ns_fn = Fail.complete };
+    const failed = wal.appendIfRecoveryPosition(next, "committed before failure", null);
+    wal.commit_scheduler = prior_scheduler;
+    try std.testing.expectError(error.InjectedCompletionFailure, failed);
+    try std.testing.expectEqual(@as(u64, 3), wal.next_lsn);
+    try std.testing.expectEqual(@as(RecoveryAppendResult, .changed), try wal.appendIfRecoveryPosition(next, "duplicate", null));
+    const entry = (try wal.readAt(a, 2)).?;
+    defer a.free(entry.data);
+    try std.testing.expectEqualStrings("committed before failure", entry.data);
+    var boot_buf: [256]u8 = undefined;
+    const boot_path = walTmpPathWithSuffix(&boot_buf, "recovery-position-bootstrap");
+    defer cleanupWalDir(boot_path);
+    var boot = try WAL.open(boot_path, .{ .backend = .lsm_memory, .commit_backend = .sync });
+    defer boot.close();
+    boot.commit_scheduler = .{ .wait_ns_fn = Fail.complete };
+    const failed_boot = boot.appendAt(7, "bootstrap committed");
+    boot.commit_scheduler = prior_scheduler;
+    try std.testing.expectError(error.InjectedCompletionFailure, failed_boot);
+    try std.testing.expectEqual(@as(u64, 8), boot.next_lsn);
+    try std.testing.expectEqual(@as(u64, 8), try boot.append("next"));
+}
+
+test "WAL recovery position invalidation exhausts fail closed and prefix writes hold serialization" {
+    var counter: std.atomic.Value(u64) = .init(std.math.maxInt(u64));
+    try std.testing.expectEqual(std.math.maxInt(u64), try allocateRecoveryOwner(&counter));
+    try std.testing.expectError(error.Overflow, allocateRecoveryOwner(&counter));
+    try std.testing.expectError(error.Overflow, allocateRecoveryOwner(&counter));
+    var buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&buf, "recovery-position-exhaust");
+    defer cleanupWalDir(path);
+    var wal = try WAL.open(path, .{ .backend = .lsm_memory, .commit_backend = .sync });
+    defer wal.close();
+    _ = try wal.append("retained");
+    const Observer = struct {
+        var wal_ptr: *WAL = undefined;
+        var original: @FieldType(backend_erased.NamespaceStore.VTable, "begin_write") = undefined;
+        var observed: bool = false;
+        fn begin(alloc: Allocator, ptr: *anyopaque) !backend_erased.NamespaceWriteTxn {
+            observed = true;
+            if (wal_ptr.mutex.tryLock()) {
+                wal_ptr.mutex.unlock(wal_ptr.sync_io);
+                return error.UnserializedPrefixMutation;
+            }
+            return original(alloc, ptr);
+        }
+    };
+    Observer.wal_ptr = &wal;
+    Observer.observed = false;
+    Observer.original = wal.store.vtable.begin_write;
+    const prior_vtable = wal.store.vtable;
+    var vtable = prior_vtable.*;
+    vtable.begin_write = Observer.begin;
+    wal.store.vtable = &vtable;
+    defer wal.store.vtable = prior_vtable;
+    wal.destructive_revision.store(std.math.maxInt(u64), .release);
+    const before = (try wal.tryRecoveryPosition(null)).?;
+    try wal.truncate(1);
+    try std.testing.expect(Observer.observed);
+    wal.store.vtable = prior_vtable;
+    try std.testing.expectError(error.Overflow, wal.tryRecoveryPosition(null));
+    try std.testing.expectEqual(@as(RecoveryAppendResult, .changed), try wal.appendIfRecoveryPosition(before, "stale", null));
+    try std.testing.expectEqual(@as(u64, 2), try wal.append("legacy append remains valid"));
+}
+
+test "WAL recovery position quarantines ambiguous commit errors and reopens from durable state" {
+    const Proxy = struct {
+        inner: backend_erased.NamespaceWriteTxn,
+        alive: bool = true,
+        apply: bool,
+        pub fn abort(self: *@This()) void {
+            if (self.alive) self.inner.abort();
+            retired += 1;
+        }
+        pub fn commit(self: *@This()) !void {
+            if (self.apply) {
+                try self.inner.commit();
+                self.alive = false;
+            }
+            return error.InjectedCommitBoundaryFailure;
+        }
+        pub fn get(self: *@This(), ns: backend_types.Namespace, key: []const u8) ![]const u8 {
+            return self.inner.get(ns, key);
+        }
+        pub fn put(self: *@This(), ns: backend_types.Namespace, key: []const u8, value: []const u8) !void {
+            return self.inner.put(ns, key, value);
+        }
+        pub fn delete(self: *@This(), ns: backend_types.Namespace, key: []const u8) !void {
+            return self.inner.delete(ns, key);
+        }
+        pub fn openCursor(self: *@This(), ns: backend_types.Namespace) !backend_erased.Cursor {
+            return self.inner.openCursor(ns);
+        }
+        var retired: usize = 0;
+        var apply_before_error: bool = false;
+        var original: @FieldType(backend_erased.NamespaceStore.VTable, "begin_write") = undefined;
+        fn map(ns: backend_types.Namespace) !backend_types.Namespace {
+            return ns;
+        }
+        fn begin(alloc: Allocator, ptr: *anyopaque) !backend_erased.NamespaceWriteTxn {
+            var inner = try original(alloc, ptr);
+            errdefer inner.abort();
+            return backend_erased.namespaceWriteTxnFrom(alloc, @This(){ .inner = inner, .apply = apply_before_error }, backend_types.Namespace, map);
+        }
+    };
+    for ([_]bool{ false, true }) |apply_before_error| {
+        var buf: [256]u8 = undefined;
+        const path = walTmpPathWithSuffix(&buf, "recovery-position-commit-failure");
+        defer cleanupWalDir(path);
+        var old: RecoveryPosition = undefined;
+        {
+            var wal = try WAL.open(path, .{ .commit_backend = .sync });
+            defer wal.close();
+            old = (try wal.tryRecoveryPosition(null)).?;
+            const prior = wal.store.vtable;
+            var vtable = prior.*;
+            vtable.begin_write = Proxy.begin;
+            Proxy.original = prior.begin_write;
+            Proxy.retired = 0;
+            Proxy.apply_before_error = apply_before_error;
+            wal.store.vtable = &vtable;
+            const attempt = wal.appendIfRecoveryPosition(old, "uncertain", null);
+            wal.store.vtable = prior;
+            try std.testing.expectError(error.InjectedCommitBoundaryFailure, attempt);
+            try std.testing.expectEqual(@as(usize, 1), Proxy.retired);
+            try std.testing.expect(wal.recovery_poisoned.load(.acquire));
+            try std.testing.expectError(error.CorruptWal, wal.tryRecoveryPosition(null));
+            try std.testing.expectEqual(@as(RecoveryAppendResult, .changed), try wal.appendIfRecoveryPosition(old, "overwrite", null));
+            try std.testing.expectError(error.CorruptWal, wal.append("overwrite"));
+            try std.testing.expectError(error.CorruptWal, wal.appendAt(1, "overwrite"));
+            try std.testing.expectError(error.CorruptWal, wal.appendIdempotent("key", "digest", "overwrite"));
+            try std.testing.expectError(error.CorruptWal, wal.truncate(1));
+            try std.testing.expectError(error.CorruptWal, wal.truncateAfter(0));
+        }
+        var reopened = try WAL.open(path, .{ .commit_backend = .sync });
+        defer reopened.close();
+        const fresh = (try reopened.tryRecoveryPosition(null)).?;
+        try std.testing.expectEqual(@as(u64, if (apply_before_error) 2 else 1), fresh.next_lsn);
+        try std.testing.expectEqual(@as(RecoveryAppendResult, .changed), try reopened.appendIfRecoveryPosition(old, "old owner", null));
+        try std.testing.expectEqual(fresh.next_lsn, (try reopened.appendIfRecoveryPosition(fresh, "after reopen", null)).appended);
+    }
+}
+
+test "WAL borrowed namespace read admission refuses legacy and contended snapshot access" {
+    const read = @import("../common/read_admission.zig");
+    const Check = struct {
+        fn lifetime(_: *anyopaque) !void {}
+        fn yield(_: *anyopaque) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var unused: u8 = 0;
+    const payload: read.Payload = .{ .ptr = &unused, .vtable = &.{ .checkpoint = Check.yield, .check_lifetime = Check.lifetime, .wait_for_progress = Check.yield } };
+    const control = read.Port.init(&payload);
+    var buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&buf, "namespace-read-admission");
+    var wal = try WAL.open(path, .{ .backend = .lsm_memory });
+    defer wal.close();
+    _ = try wal.append("payload");
+    const Visit = struct {
+        fn run(_: *u8, entry: WalEntry) !void {
+            try std.testing.expectEqualStrings("payload", entry.data);
+        }
+    };
+    var legacy = wal.store.vtable.*;
+    legacy.begin_read_with_admission = null;
+    const original = wal.store.vtable;
+    wal.store.vtable = &legacy;
+    const refused = wal.withEntryAtWithAdmission(1, control, &unused, Visit.run);
+    wal.store.vtable = original;
+    try std.testing.expectError(error.ExecutionWaitUnsupported, refused);
+    const backend = wal.store_owner.lsm.backend;
+    try std.testing.expect(backend.mu.tryLock());
+    const contended = wal.withEntryAtWithAdmission(1, control, &unused, Visit.run);
+    backend.mu.unlock();
+    try std.testing.expectError(error.Backpressured, contended);
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    try std.testing.expect(try wal.withEntryAtWithAdmission(1, control, &unused, Visit.run));
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+}
+
+test "WAL borrowed namespace read admission never yields while capturing backend sources" {
+    const read = @import("../common/read_admission.zig");
+    var buf: [256]u8 = undefined;
+    const path = walTmpPathWithSuffix(&buf, "namespace-capture-lifetime");
+    var wal = try WAL.open(path, .{ .backend = .lsm_memory });
+    defer wal.close();
+    _ = try wal.append("value");
+    const State = struct {
+        backend: *lsm_backend.Backend,
+        checkpoints: usize = 0,
+        lifetimes: usize = 0,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.backend.mu.tryLock()) return error.CpuHandoffWhileBackendLocked;
+            self.backend.mu.unlock();
+            self.checkpoints += 1;
+        }
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.lifetimes += 1;
+        }
+    };
+    var state: State = .{ .backend = wal.store_owner.lsm.backend };
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.checkpoint, .check_lifetime = State.lifetime } };
+    const control = read.Port.init(&payload);
+    {
+        var txn = try wal.store.beginReadWithAdmission(control);
+        defer txn.abort();
+        const key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
+        _ = try txn.getWithAdmission(default_namespace, &key, control);
+    }
+    {
+        var bound = try state.backend.runtimeStore(std.testing.allocator, default_namespace);
+        defer bound.deinit();
+        var txn = try bound.beginReadWithAdmission(.retain, control);
+        defer txn.abort();
+    }
+    try std.testing.expect(state.checkpoints > 0 and state.lifetimes > 0);
+    try std.testing.expectEqual(@as(usize, 0), state.backend.active_readers);
+}
+
+test "WAL allocator owner uses caller storage root and retires append and truncation allocations" {
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = tracking.allocator();
+    {
+        var wal = try WAL.openWithAllocator(allocator, "/unused-memory-wal", .{ .backend = .lsm_memory, .no_sync = true });
+        defer wal.close();
+        try std.testing.expect(tracking.allocated_bytes > 0);
+        try std.testing.expectEqual(allocator.ptr, wal.allocator.ptr);
+        tracking.fail_index = tracking.alloc_index;
+        try std.testing.expectError(error.OutOfMemory, wal.appendIdempotent("id", "digest", "first"));
+        try std.testing.expectEqual(@as(u64, 0), wal.lastLsn());
+        tracking.fail_index = std.math.maxInt(usize);
+        const bytes = try std.testing.allocator.alloc(u8, 8193);
+        defer std.testing.allocator.free(bytes);
+        @memset(bytes, 42);
+        const first = try wal.appendIdempotent("id", "digest", bytes);
+        try std.testing.expectEqual(@as(u64, 1), first.lsn);
+        try std.testing.expect(!(try wal.appendIdempotent("id", "digest", bytes)).appended);
+        _ = try wal.append("second");
+        try wal.truncate(1);
+        try wal.truncateAfter(1);
+        try std.testing.expectEqual(@as(u64, 2), try wal.append("replacement"));
+    }
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+}
+
+test "WAL allocator owner rejects large envelope allocation before invoking the store" {
+    const TxnProbe = struct {
+        calls: usize = 0,
+        fn appendPut(_: *@This(), _: []const u8, _: []const u8) anyerror!void {
+            return error.Unsupported;
+        }
+        fn put(self: *@This(), _: []const u8, _: []const u8) !void {
+            self.calls += 1;
+        }
+    };
+    var txn: TxnProbe = .{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var bytes: [8193]u8 = @splat(31);
+    try std.testing.expectError(error.OutOfMemory, putEncodedEntry(failing.allocator(), &txn, 1, &bytes));
+    try std.testing.expectEqual(@as(usize, 0), txn.calls);
+    try putEncodedEntry(std.testing.allocator, &txn, 1, &bytes);
+    try std.testing.expectEqual(@as(usize, 1), txn.calls);
+}
+
+test "WAL allocator owner failed memory storage opens retire their caller allocations" {
+    const Fixture = struct {
+        fn run(allocator: Allocator) !void {
+            var wal = try WAL.openWithAllocator(allocator, "/unused-memory-wal", .{ .backend = .lsm_memory, .no_sync = true });
+            defer wal.close();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+const OwnedWalTestBudget = struct {
+    pub fn checkpoint(_: *@This()) !void {}
+    pub fn waitForProgress(_: *@This()) !void {
+        return error.TestUnexpectedWalOwnedWait;
+    }
+};
+
+fn drainOwnedWalForTest(operation: *WAL.OwnedRead, control: WAL.ReadPort) !void {
+    var steps: usize = 0;
+    while (try operation.step(4093, control) == .pending) {
+        steps += 1;
+        try std.testing.expect(steps < 4096);
+    }
+}
+
+test "WAL owned read registry bounds pending snapshots reuses slots and closes detached handles" {
+    const a = std.testing.allocator;
+    var memory = lsm_storage.MemoryStorage.init(a);
+    defer memory.deinit();
+    var wal = try WAL.openWithAllocator(a, "/owned-wal-registry", .{ .no_sync = true, .storage = memory.storage(), .lsm_options = .{ .wal_enabled = false, .flush_threshold = std.math.maxInt(usize) } });
+    var wal_live = true;
+    defer if (wal_live) wal.close();
+    _ = try wal.append("record");
+    var budget: OwnedWalTestBudget = .{};
+    var adapter: @import("../common/read_admission.zig").Adapter(*OwnedWalTestBudget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    const control = WAL.ReadPort.init(&payload);
+    const Failures = struct {
+        fn run(allocator: Allocator, parent: *WAL, port: WAL.ReadPort) !void {
+            const operation = try parent.beginOwnedRead(allocator, 1, port);
+            operation.destroy();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failures.run, .{ &wal, control });
+    try std.testing.expectEqual(@as(usize, 0), wal.owned_read_starting);
+    var reads: [WAL.owned_read_capacity]?*WAL.OwnedRead = @splat(null);
+    defer for (&reads) |*read| if (read.*) |operation| operation.destroy();
+    for (&reads) |*read| read.* = try wal.beginOwnedRead(a, 1, control);
+    try std.testing.expectError(error.Backpressured, wal.beginOwnedRead(a, 1, control));
+    reads[0].?.destroy();
+    reads[0] = try wal.beginOwnedRead(a, 1, control);
+    try drainOwnedWalForTest(reads[0].?, control);
+    var copied: [6]u8 = undefined;
+    const chunk = try reads[0].?.readChunk(0, &copied, control);
+    try std.testing.expect(chunk.done and chunk.len == copied.len);
+    wal.close();
+    wal_live = false;
+    wal = undefined;
+    try std.testing.expectEqualStrings("record", &copied);
+    for (reads) |read| {
+        try std.testing.expectError(error.TransactionClosed, read.?.step(1, control));
+        try std.testing.expectError(error.TransactionClosed, read.?.readChunk(0, &copied, control));
+    }
+}
+
+test "WAL owned read checksum quanta preserve framing corruption and caller chunk ownership" {
+    const a = std.testing.allocator;
+    var memory = lsm_storage.MemoryStorage.init(a);
+    defer memory.deinit();
+    var wal = try WAL.openWithAllocator(a, "/owned-wal-crc", .{ .no_sync = true, .storage = memory.storage(), .lsm_options = .{ .wal_enabled = false, .flush_threshold = std.math.maxInt(usize) } });
+    defer wal.close();
+    const source = try a.alloc(u8, 128 * 1024 + 19);
+    defer a.free(source);
+    for (source, 0..) |*byte, index| byte.* = @truncate(index);
+    const lsn = try wal.append(source);
+    var budget: OwnedWalTestBudget = .{};
+    var adapter: @import("../common/read_admission.zig").Adapter(*OwnedWalTestBudget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    const control = WAL.ReadPort.init(&payload);
+    const operation = try wal.beginOwnedRead(a, lsn, control);
+    defer operation.destroy();
+    var crc_steps: usize = 0;
+    while (true) {
+        const before = operation.checksum_offset;
+        const state = try operation.step(4093, control);
+        try std.testing.expect(operation.checksum_offset - before <= 4093);
+        if (operation.checksum_offset != before) crc_steps += 1;
+        if (state == .ready) break;
+    }
+    try std.testing.expect(crc_steps > 16);
+    var output: [997]u8 = undefined;
+    var offset: usize = 0;
+    while (true) {
+        const chunk = try operation.readChunk(offset, &output, control);
+        try std.testing.expectEqualSlices(u8, source[offset..][0..chunk.len], output[0..chunk.len]);
+        offset += chunk.len;
+        if (chunk.done) break;
+    }
+    try std.testing.expectEqual(source.len, offset);
+    try wal.injectCorruptEntryForTest(lsn);
+    const corrupt = try wal.beginOwnedRead(a, lsn, control);
+    defer corrupt.destroy();
+    try std.testing.expectError(error.CorruptWal, drainOwnedWalForTest(corrupt, control));
+    try std.testing.expect(corrupt.lookup == null and corrupt.value == null);
+    try std.testing.expectError(error.CorruptWal, corrupt.step(1, control));
+    const missing = try wal.beginOwnedRead(a, lsn + 99, control);
+    defer missing.destroy();
+    try std.testing.expectError(error.NotFound, drainOwnedWalForTest(missing, control));
+}
+
+test "WAL owned read close joins an in-flight step and concurrent caller destruction before backend teardown" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Fixture = struct {
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        retired: std.atomic.Value(usize) = .init(0),
+        var current: *@This() = undefined;
+        fn begin(allocator: Allocator, _: *anyopaque, _: backend_types.Namespace, _: []const u8, _: WAL.ReadPort) !backend_erased.OwnedValueRead {
+            return .{ .allocator = allocator, .ptr = current, .vtable = &.{ .deinit = deinit, .step = step, .take_output = take } };
+        }
+        fn step(raw: *anyopaque, _: usize, _: WAL.ReadPort) !backend_erased.OwnedValueRead.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered.set(std.testing.io);
+            self.release.waitUncancelable(std.testing.io);
+            return .pending;
+        }
+        fn take(_: *anyopaque) !backend_erased.OwnedValue {
+            return error.TestUnexpectedWalOwnedTake;
+        }
+        fn deinit(_: Allocator, raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.retired.fetchAdd(1, .acq_rel);
+        }
+    };
+    var memory = lsm_storage.MemoryStorage.init(a);
+    defer memory.deinit();
+    var wal = try WAL.openWithAllocator(a, "/owned-wal-race", .{ .no_sync = true, .storage = memory.storage(), .lsm_options = .{ .wal_enabled = false } });
+    var wal_live = true;
+    defer if (wal_live) wal.close();
+    var fixture: Fixture = .{};
+    Fixture.current = &fixture;
+    var table = wal.store.vtable.*;
+    table.begin_owned_value_read = Fixture.begin;
+    wal.store.vtable = &table;
+    var budget: OwnedWalTestBudget = .{};
+    var adapter: @import("../common/read_admission.zig").Adapter(*OwnedWalTestBudget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    const control = WAL.ReadPort.init(&payload);
+    const operation = try wal.beginOwnedRead(a, 1, control);
+    var operation_live = true;
+    defer if (operation_live) operation.destroy();
+    const Step = struct {
+        operation: *WAL.OwnedRead,
+        control: WAL.ReadPort,
+        failure: ?anyerror = null,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            _ = self.operation.step(1, self.control) catch |err| {
+                self.failure = err;
+                self.done.set(std.testing.io);
+                return;
+            };
+            self.done.set(std.testing.io);
+        }
+    };
+    const Close = struct {
+        wal: *WAL,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            self.wal.close();
+            self.done.set(std.testing.io);
+        }
+    };
+    const Destroy = struct {
+        operation: *WAL.OwnedRead,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            self.operation.destroy();
+            self.done.set(std.testing.io);
+        }
+    };
+    var step: Step = .{ .operation = operation, .control = control };
+    const step_thread = try std.Thread.spawn(.{}, Step.run, .{&step});
+    var step_joined = false;
+    defer if (!step_joined) {
+        fixture.release.set(io);
+        step_thread.join();
+    };
+    fixture.entered.waitUncancelable(io);
+    var close: Close = .{ .wal = &wal };
+    const close_thread = try std.Thread.spawn(.{}, Close.run, .{&close});
+    wal_live = false;
+    var close_joined = false;
+    defer if (!close_joined) {
+        fixture.release.set(io);
+        close_thread.join();
+    };
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+    while (true) {
+        platform.sync.lockYielding(&wal.owned_read_mutex);
+        const claimed = operation.slot.?.claimed;
+        wal.owned_read_mutex.unlock();
+        if (claimed) break;
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) @panic("owned read close did not claim active operation");
+        platform.time.yieldBriefly();
+    }
+    var destroy: Destroy = .{ .operation = operation };
+    const destroy_thread = try std.Thread.spawn(.{}, Destroy.run, .{&destroy});
+    operation_live = false;
+    var destroy_joined = false;
+    defer if (!destroy_joined) {
+        fixture.release.set(io);
+        destroy_thread.join();
+    };
+    fixture.release.set(io);
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+    step.done.waitTimeout(io, timeout) catch @panic("owned read step failed to join");
+    close.done.waitTimeout(io, timeout) catch @panic("WAL close failed to join owned read");
+    destroy.done.waitTimeout(io, timeout) catch @panic("owned read destruction failed to join close");
+    step_thread.join();
+    step_joined = true;
+    close_thread.join();
+    close_joined = true;
+    destroy_thread.join();
+    destroy_joined = true;
+    try std.testing.expect(step.failure == null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.retired.load(.acquire));
+}
+
+test "WAL owned read retiring callbacks retain capacity until resource retirement returns" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Fixture = struct {
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        var current: *@This() = undefined;
+        fn begin(allocator: Allocator, _: *anyopaque, _: backend_types.Namespace, _: []const u8, _: WAL.ReadPort) !backend_erased.OwnedValueRead {
+            return .{ .allocator = allocator, .ptr = current, .vtable = &.{ .deinit = deinit, .step = step, .take_output = take } };
+        }
+        fn step(_: *anyopaque, _: usize, _: WAL.ReadPort) !backend_erased.OwnedValueRead.Status {
+            return .pending;
+        }
+        fn take(_: *anyopaque) !backend_erased.OwnedValue {
+            return error.TestUnexpectedWalOwnedTake;
+        }
+        fn deinit(_: Allocator, raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered.set(std.testing.io);
+            self.release.waitUncancelable(std.testing.io);
+        }
+    };
+    var memory = lsm_storage.MemoryStorage.init(a);
+    defer memory.deinit();
+    var wal = try WAL.openWithAllocator(a, "/owned-wal-retiring-capacity", .{ .no_sync = true, .storage = memory.storage(), .lsm_options = .{ .wal_enabled = false } });
+    defer wal.close();
+    var fixture: Fixture = .{};
+    Fixture.current = &fixture;
+    var table = wal.store.vtable.*;
+    table.begin_owned_value_read = Fixture.begin;
+    wal.store.vtable = &table;
+    var budget: OwnedWalTestBudget = .{};
+    var adapter: @import("../common/read_admission.zig").Adapter(*OwnedWalTestBudget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    const control = WAL.ReadPort.init(&payload);
+    var operations: [WAL.owned_read_capacity]?*WAL.OwnedRead = @splat(null);
+    defer for (operations) |operation| if (operation) |owned| owned.destroy();
+    defer fixture.release.set(io);
+    for (&operations) |*operation| operation.* = try wal.beginOwnedRead(a, 1, control);
+    const Destroy = struct {
+        operation: *WAL.OwnedRead,
+        done: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            self.operation.destroy();
+            self.done.set(std.testing.io);
+        }
+    };
+    var destroy: Destroy = .{ .operation = operations[0].? };
+    const thread = try std.Thread.spawn(.{}, Destroy.run, .{&destroy});
+    operations[0] = null;
+    var joined = false;
+    defer if (!joined) {
+        fixture.release.set(io);
+        thread.join();
+    };
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+    fixture.entered.waitTimeout(io, timeout) catch @panic("owned retirement callback was not entered");
+    const saturated = wal.beginOwnedRead(a, 1, control);
+    fixture.release.set(io);
+    destroy.done.waitTimeout(io, timeout) catch @panic("owned retirement failed to join");
+    thread.join();
+    joined = true;
+    if (saturated) |unexpected| {
+        unexpected.destroy();
+        return error.TestRetirementEscapedCapacity;
+    } else |err| try std.testing.expectEqual(error.Backpressured, err);
+    operations[0] = try wal.beginOwnedRead(a, 1, control);
 }

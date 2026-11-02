@@ -249,6 +249,112 @@ fn checkStackGuard(task: *Task) void {
     );
 }
 
+// Keep live scheduler/task values outside the assembly's function. The
+// pinned std.Io.fiber ARM64 assembly lists x1 as both an input/output and a
+// clobber, which produces incorrect register allocation in optimized builds.
+// Tie the input to the output and omit that duplicate clobber. A C call
+// boundary also preserves the caller's values across the stack transfer.
+noinline fn switchContexts(message: *const std.Io.fiber.Switch) callconv(.c) void {
+    _ = switch (builtin.cpu.arch) {
+        .aarch64 => asm volatile (
+            \\ ldp x0, x2, [x1]
+            \\ ldr x3, [x2, #16]
+            \\ mov x4, sp
+            \\ stp x4, fp, [x0]
+            \\ adr x5, 0f
+            \\ ldp x4, fp, [x2]
+            \\ str x5, [x0, #16]
+            \\ mov sp, x4
+            \\ br x3
+            \\0:
+            : [received_message] "={x1}" (-> *const std.Io.fiber.Switch),
+            : [message_to_send] "0" (message),
+            : .{
+              .x0 = true,
+              .x2 = true,
+              .x3 = true,
+              .x4 = true,
+              .x5 = true,
+              .x6 = true,
+              .x7 = true,
+              .x8 = true,
+              .x9 = true,
+              .x10 = true,
+              .x11 = true,
+              .x12 = true,
+              .x13 = true,
+              .x14 = true,
+              .x15 = true,
+              .x16 = true,
+              .x17 = true,
+              .x19 = true,
+              .x20 = true,
+              .x21 = true,
+              .x22 = true,
+              .x23 = true,
+              .x24 = true,
+              .x25 = true,
+              .x26 = true,
+              .x27 = true,
+              .x28 = true,
+              .x30 = true,
+              .z0 = true,
+              .z1 = true,
+              .z2 = true,
+              .z3 = true,
+              .z4 = true,
+              .z5 = true,
+              .z6 = true,
+              .z7 = true,
+              .z8 = true,
+              .z9 = true,
+              .z10 = true,
+              .z11 = true,
+              .z12 = true,
+              .z13 = true,
+              .z14 = true,
+              .z15 = true,
+              .z16 = true,
+              .z17 = true,
+              .z18 = true,
+              .z19 = true,
+              .z20 = true,
+              .z21 = true,
+              .z22 = true,
+              .z23 = true,
+              .z24 = true,
+              .z25 = true,
+              .z26 = true,
+              .z27 = true,
+              .z28 = true,
+              .z29 = true,
+              .z30 = true,
+              .z31 = true,
+              .p0 = true,
+              .p1 = true,
+              .p2 = true,
+              .p3 = true,
+              .p4 = true,
+              .p5 = true,
+              .p6 = true,
+              .p7 = true,
+              .p8 = true,
+              .p9 = true,
+              .p10 = true,
+              .p11 = true,
+              .p12 = true,
+              .p13 = true,
+              .p14 = true,
+              .p15 = true,
+              .fpcr = true,
+              .fpsr = true,
+              .ffr = true,
+              .memory = true,
+            }),
+        else => std.Io.fiber.contextSwitch(message),
+    };
+}
+
 fn taskIdentityAnchor(_: *const anyopaque, _: *anyopaque) void {}
 
 fn taskCallsite(start: *const fn (*const anyopaque, *anyopaque) void) u64 {
@@ -993,7 +1099,7 @@ pub const Kernel = struct {
     noinline fn switchToTask(self: *Kernel, task: *Task) void {
         self.execution_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
         const message: std.Io.fiber.Switch = .{ .old = &self.main_context, .new = &task.context };
-        _ = std.Io.fiber.contextSwitch(&message);
+        switchContexts(&message);
         // Check before touching anything else: every resume cycle returns
         // here, so this is the earliest point to catch an overflow this
         // task's own fiber just caused, before the corrupted neighbor (or
@@ -1007,7 +1113,7 @@ pub const Kernel = struct {
     noinline fn yieldCurrent(self: *Kernel, task: *Task) void {
         std.debug.assert(self.currentTask() == task);
         const message: std.Io.fiber.Switch = .{ .old = &task.context, .new = &self.main_context };
-        _ = std.Io.fiber.contextSwitch(&message);
+        switchContexts(&message);
         self.setCurrent(task);
     }
 

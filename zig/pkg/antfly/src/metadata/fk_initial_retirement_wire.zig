@@ -82,6 +82,8 @@ pub const SignedPageRequest = struct {
 };
 
 pub const Control = union(enum) {
+    remote_initialization_preflight: @import("remote_attempt_initialization.zig").Request,
+    remote_initialization_status: @import("remote_attempt_initialization.zig").Request,
     preflight_enrollment: @import("store_root_enrollment.zig").Request,
     enrollment_status: @import("store_root_enrollment.zig").Identity,
     authorized_page: SignedPageRequest,

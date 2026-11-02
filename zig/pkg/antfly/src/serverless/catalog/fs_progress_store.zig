@@ -124,6 +124,10 @@ pub const FsProgressStore = struct {
     }
 
     const lease_vtable: work_lease.Provider.VTable = .{
+        .acquire_for = leaseAcquireFor,
+        .validate_for = leaseValidateFor,
+        .release_for = leaseReleaseFor,
+        .renew_for = leaseRenewFor,
         .acquire = leaseAcquire,
         .validate = leaseValidate,
         .renew = leaseRenew,
@@ -182,6 +186,127 @@ pub const FsProgressStore = struct {
         try self.writeHeadUnlocked(ns, proposed);
     }
 
+    fn closeControlledFile(file: std.Io.File, args: anytype) void {
+        file.close(args[1]);
+    }
+    const LeaseAccess = enum { acquire, validate, renew, release };
+    const LeaseAccessResult = struct { acquisition: ?work_lease.Acquisition = null, expiry: u64 = 0 };
+    fn leaseAcquireFor(raw: *anyopaque, ns: []const u8, owner: []const u8, now: u64, ttl: u64, context: work_lease.Context) !?work_lease.Acquisition {
+        return (try leaseAccessFor(raw, ns, owner, 0, now, ttl, .acquire, context)).acquisition;
+    }
+    fn leaseValidateFor(raw: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64, context: work_lease.Context) !void {
+        _ = try leaseAccessFor(raw, ns, owner, token, now, 0, .validate, context);
+    }
+    fn leaseReleaseFor(raw: *anyopaque, ns: []const u8, owner: []const u8, token: u64, context: work_lease.Context) !bool {
+        _ = leaseAccessFor(raw, ns, owner, token, 0, 0, .release, context) catch |err| switch (err) {
+            error.WorkLeaseLost => return false,
+            else => return err,
+        };
+        return true;
+    }
+    fn leaseRenewFor(raw: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64, ttl: u64, context: work_lease.Context) !u64 {
+        return (try leaseAccessFor(raw, ns, owner, token, now, ttl, .renew, context)).expiry;
+    }
+    fn leaseAccessFor(raw: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64, ttl: u64, access: LeaseAccess, context: work_lease.Context) !LeaseAccessResult {
+        const self: *FsProgressStore = @ptrCast(@alignCast(raw));
+        const io = context.io orelse return error.BackendRuntimeIoUnavailable;
+        const expiry = if (access == .acquire or access == .renew) std.math.add(u64, now, ttl) catch return error.LeaseExpiryOverflow else 0;
+        // The namespace file lock serializes this conditional replacement
+        // with every legacy writer. Readers consume atomic HEAD snapshots;
+        // no process-local cache mutex is needed across renewal I/O.
+        const Provider = @import("../provider_operation.zig");
+        var guard: Provider.Guard = .{ .original = .{ .context = context } };
+        defer guard.deinit();
+        // A renewal child already owns protected control return capacity.
+        // Ordinary acquisition/release needs publication return capacity while
+        // holding the namespace lock, just like manifest read-pin replacement.
+        const control_child = if (context.execution) |execution| (try execution.retainedClass()) == .control else false;
+        const op = if (control_child) guard.original else guard.operation();
+        try op.ready();
+        const control: @import("httpx").socket.WriteControl = op.token().execution_wait orelse .{};
+        const path = try headPathAlloc(self.alloc, self.root_dir, ns);
+        defer self.alloc.free(path);
+        const parent = std.fs.path.dirname(path) orelse return error.InvalidLeaseNamespace;
+        try control.withWait(fs_paths.createDirPathPortable, .{ io, parent });
+        const lock_path = try std.fs.path.join(self.alloc, &.{ parent, ".progress.lock" });
+        defer self.alloc.free(lock_path);
+        var rejected = false;
+        const file_lock = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, lock_path, std.Io.Dir.CreateFileOptions{ .truncate = false, .read = true } }, closeControlledFile);
+        defer file_lock.close(io);
+        // A blocking kernel flock cannot observe a request deadline. Poll the
+        // real lock while lending CPU between attempts, before owning it.
+        while (!try control.withWait(std.Io.File.tryLock, .{ file_lock, io, std.Io.File.Lock.exclusive })) try op.sleep(1);
+        var locked = true;
+        defer if (locked) file_lock.unlock(io);
+        const file = control.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.OpenFileOptions{} }, closeControlledFile) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        var contents: std.ArrayList(u8) = .empty;
+        defer contents.deinit(self.alloc);
+        if (file) |input| {
+            defer input.close(io);
+            var buffer: [4096]u8 = undefined;
+            while (true) {
+                const count = control.withWait(std.Io.File.readStreaming, .{ input, io, &.{&buffer} }) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    else => return err,
+                };
+                if (count == 0) break;
+                if (count > (16 * 1024 * 1024) -| contents.items.len) return error.InvalidHeadCoordinationRecord;
+                try contents.appendSlice(self.alloc, buffer[0..count]);
+            }
+        }
+        var parsed = try std.json.parseFromSlice(head_coordination.Record, self.alloc, if (file == null) "{}" else contents.items, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        if (!head_coordination.valid(parsed.value)) return error.InvalidHeadCoordinationRecord;
+        var proposed = parsed.value;
+        if (access == .acquire) {
+            if (!parsed.value.released and parsed.value.expires_at_unix_ns > now) {
+                file_lock.unlock(io);
+                locked = false;
+                try guard.finish();
+                return .{};
+            }
+            proposed.fencing_token = std.math.add(u64, parsed.value.fencing_token, 1) catch return error.LeaseFencingTokenOverflow;
+            proposed.owner_id = owner;
+            proposed.released = false;
+        } else {
+            try requireFence(parsed.value, owner, token);
+            if (access == .validate) {
+                if (parsed.value.expires_at_unix_ns <= now) return error.WorkLeaseLost;
+                file_lock.unlock(io);
+                locked = false;
+                try guard.finish();
+                return .{};
+            }
+            proposed.released = access == .release;
+        }
+        proposed.expires_at_unix_ns = expiry;
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, proposed, .{});
+        defer self.alloc.free(payload);
+        const tmp = try std.fmt.allocPrint(self.alloc, "{s}.tmp-{d}", .{ path, test_nonce.fetchAdd(1, .monotonic) });
+        defer self.alloc.free(tmp);
+        defer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        {
+            const output = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, tmp, std.Io.Dir.CreateFileOptions{} }, closeControlledFile);
+            defer output.close(io);
+            try control.withWait(std.Io.File.writeStreamingAll, .{ output, io, payload });
+            try control.withWait(std.Io.File.sync, .{ output, io });
+        }
+        try control.withWait(std.Io.Dir.rename, .{ std.Io.Dir.cwd(), tmp, std.Io.Dir.cwd(), path, io });
+        try control.withWait(fs_paths.syncDirPortable, .{ io, parent });
+        try control.withWait(fs_paths.syncDirPortable, .{ io, self.root_dir });
+        file_lock.unlock(io);
+        locked = false;
+        try guard.finish();
+        return .{ .expiry = expiry, .acquisition = if (access == .acquire) .{
+            .fencing_token = proposed.fencing_token,
+            .expires_at_unix_ns = expiry,
+            .took_over = !parsed.value.released,
+        } else null };
+    }
+
     fn leaseRenew(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64, ttl: u64) !u64 {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
         const expiry = std.math.add(u64, now, ttl) catch return error.LeaseExpiryOverflow;
@@ -225,6 +350,176 @@ pub const FsProgressStore = struct {
         if (current != expected) return false;
         if (current != null and watermark < current.?) return false;
         try self.writeU64Unlocked(namespace, .gc_watermark, watermark);
+        return true;
+    }
+
+    fn readPinNumber(self: *FsProgressStore, path: []const u8, context: work_lease.Context) !?u64 {
+        _ = self;
+        const io = context.io orelse return error.BackendRuntimeIoUnavailable;
+        const op: @import("../provider_operation.zig").Operation = .{ .context = context };
+        try op.ready();
+        const control: @import("httpx").socket.WriteControl = op.token().execution_wait orelse .{};
+        var rejected = false;
+        const file = control.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.OpenFileOptions{} }, closeControlledFile) catch |err| {
+            try op.check();
+            if (err == error.FileNotFound) return null;
+            return err;
+        };
+        defer file.close(io);
+        var buffer: [128]u8 = undefined;
+        var length: usize = 0;
+        while (true) {
+            if (length == buffer.len) return error.InvalidManifestReadDeadline;
+            const count = control.withWait(std.Io.File.readStreaming, .{ file, io, &.{buffer[length..]} }) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (count == 0) break;
+            length += count;
+        }
+        try op.ready();
+        return try std.fmt.parseInt(u64, std.mem.trim(u8, buffer[0..length], " \t\r\n"), 10);
+    }
+    fn headFor(raw: *anyopaque, ns: []const u8, cancellation: CancellationToken, context: work_lease.Context) !u64 {
+        const self: *FsProgressStore = @ptrCast(@alignCast(raw));
+        const operation: @import("../provider_operation.zig").Operation = .{ .context = context, .cancellation = cancellation };
+        const path = try headPathAlloc(self.alloc, self.root_dir, ns);
+        defer self.alloc.free(path);
+        const bytes = try operation.readFile(self.alloc, path, 16 * 1024 * 1024);
+        defer self.alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(head_coordination.Record, self.alloc, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        if (!head_coordination.valid(parsed.value)) return error.InvalidHeadCoordinationRecord;
+        if (parsed.value.head_version == 0) return error.FileNotFound;
+        return parsed.value.head_version;
+    }
+    fn watermarkFor(raw: *anyopaque, ns: []const u8, context: work_lease.Context) !?u64 {
+        const self: *FsProgressStore = @ptrCast(@alignCast(raw));
+        const path = try pathForAlloc(self.alloc, self.root_dir, ns, .gc_watermark);
+        defer self.alloc.free(path);
+        return self.readPinNumber(path, context);
+    }
+    fn casWatermarkFor(raw: *anyopaque, ns: []const u8, expected: ?u64, value: u64, context: work_lease.Context) !bool {
+        const self: *FsProgressStore = @ptrCast(@alignCast(raw));
+        const path = try pathForAlloc(self.alloc, self.root_dir, ns, .gc_watermark);
+        defer self.alloc.free(path);
+        return self.casNumberPathFor(ns, path, expected, value, context);
+    }
+    fn casFloorFor(raw: *anyopaque, ns: []const u8, expected: ?u64, value: u64, context: work_lease.Context) !bool {
+        const self: *FsProgressStore = @ptrCast(@alignCast(raw));
+        const path = try pathForAlloc(self.alloc, self.root_dir, ns, .manifest_gc_floor);
+        defer self.alloc.free(path);
+        return self.casNumberPathFor(ns, path, expected, value, context);
+    }
+    fn prunePinsFor(raw: *anyopaque, ns: []const u8, floor: u64, expired_before: u64, cancellation: CancellationToken, context: work_lease.Context) !void {
+        const self: *FsProgressStore = @ptrCast(@alignCast(raw));
+        const Provider = @import("../provider_operation.zig");
+        var guard: Provider.Guard = .{ .original = .{ .context = context, .cancellation = cancellation } };
+        defer guard.deinit();
+        const op = guard.operation();
+        const io = try op.receiver();
+        const control = op.control();
+        const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, ns, "READ_PINS" });
+        defer self.alloc.free(path);
+        const dir = op.openDir(path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var entries = dir.iterate();
+        while (try control.withWait(std.Io.Dir.Iterator.next, .{ &entries, io })) |entry| {
+            try op.ready();
+            if (entry.kind != .file) continue;
+            const version = std.fmt.parseInt(u64, entry.name, 10) catch continue;
+            if (version >= floor) continue;
+            const lock_path = try std.fs.path.join(self.alloc, &.{ self.root_dir, ns, ".progress.lock" });
+            defer self.alloc.free(lock_path);
+            var rejected = false;
+            const lock = try control.withOwnedWait(&rejected, std.Io.Dir.openFile, .{ std.Io.Dir.cwd(), io, lock_path, std.Io.Dir.OpenFileOptions{ .mode = .read_write } }, closeControlledFile);
+            defer lock.close(io);
+            while (!try control.withWait(std.Io.File.tryLock, .{ lock, io, std.Io.File.Lock.exclusive })) try op.sleep(1);
+            var locked = true;
+            defer if (locked) lock.unlock(io);
+            const deadline_path = try std.fs.path.join(self.alloc, &.{ path, entry.name });
+            defer self.alloc.free(deadline_path);
+            if (try self.readPinNumber(deadline_path, op.context)) |deadline| if (deadline < expired_before) {
+                op.removeFile(deadline_path) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
+            };
+            lock.unlock(io);
+            locked = false;
+        }
+        try guard.finish();
+    }
+    fn floorFor(raw: *anyopaque, ns: []const u8, context: work_lease.Context) !?u64 {
+        const self: *FsProgressStore = @ptrCast(@alignCast(raw));
+        const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, ns, "MANIFEST_GC_FLOOR" });
+        defer self.alloc.free(path);
+        return self.readPinNumber(path, context);
+    }
+    fn pinFor(raw: *anyopaque, ns: []const u8, version: u64, context: work_lease.Context) !?u64 {
+        const self: *FsProgressStore = @ptrCast(@alignCast(raw));
+        const path = try self.readDeadlinePathAlloc(ns, version);
+        defer self.alloc.free(path);
+        return self.readPinNumber(path, context);
+    }
+    fn casPinFor(raw: *anyopaque, ns: []const u8, version: u64, expected: ?u64, deadline: u64, context: work_lease.Context) !bool {
+        const self: *FsProgressStore = @ptrCast(@alignCast(raw));
+        if (expected) |prior| if (deadline < prior) return false;
+        const path = try self.readDeadlinePathAlloc(ns, version);
+        defer self.alloc.free(path);
+        return self.casNumberPathFor(ns, path, expected, deadline, context);
+    }
+    fn casNumberPathFor(self: *FsProgressStore, ns: []const u8, path: []const u8, expected: ?u64, deadline: u64, context: work_lease.Context) !bool {
+        if (expected) |prior| if (deadline < prior) return false;
+        const io = context.io orelse return error.BackendRuntimeIoUnavailable;
+        const Provider = @import("../provider_operation.zig");
+        var guard: Provider.Guard = .{ .original = .{ .context = context } };
+        defer guard.deinit();
+        // Ordinary callers reserve return CPU before waiting under a file
+        // lock. The dedicated renewal child already has protected control CPU.
+        const control_child = if (context.execution) |execution| (try execution.retainedClass()) == .control else false;
+        const op = if (control_child) guard.original else guard.operation();
+        try op.ready();
+        const control: @import("httpx").socket.WriteControl = op.token().execution_wait orelse .{};
+        const parent = std.fs.path.dirname(path) orelse return error.InvalidLeaseNamespace;
+        const ns_path = try std.fs.path.join(self.alloc, &.{ self.root_dir, ns });
+        defer self.alloc.free(ns_path);
+        try control.withWait(fs_paths.createDirPathPortable, .{ io, parent });
+        const lock_path = try std.fs.path.join(self.alloc, &.{ ns_path, ".progress.lock" });
+        defer self.alloc.free(lock_path);
+        var rejected = false;
+        const lock = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, lock_path, std.Io.Dir.CreateFileOptions{ .truncate = false, .read = true } }, closeControlledFile);
+        defer lock.close(io);
+        while (!try control.withWait(std.Io.File.tryLock, .{ lock, io, std.Io.File.Lock.exclusive })) try op.sleep(1);
+        var locked = true;
+        defer if (locked) lock.unlock(io);
+        if (try self.readPinNumber(path, op.context) != expected) {
+            lock.unlock(io);
+            locked = false;
+            try guard.finish();
+            return false;
+        }
+        var buffer: [20]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&buffer, "{d}", .{deadline});
+        const tmp = try std.fmt.allocPrint(self.alloc, "{s}.tmp-{d}", .{ path, test_nonce.fetchAdd(1, .monotonic) });
+        defer self.alloc.free(tmp);
+        defer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        {
+            const file = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, tmp, std.Io.Dir.CreateFileOptions{} }, closeControlledFile);
+            defer file.close(io);
+            try control.withWait(std.Io.File.writeStreamingAll, .{ file, io, payload });
+            try control.withWait(std.Io.File.sync, .{ file, io });
+        }
+        try control.withWait(std.Io.Dir.rename, .{ std.Io.Dir.cwd(), tmp, std.Io.Dir.cwd(), path, io });
+        try control.withWait(fs_paths.syncDirPortable, .{ io, parent });
+        try control.withWait(fs_paths.syncDirPortable, .{ io, ns_path });
+        try control.withWait(fs_paths.syncDirPortable, .{ io, self.root_dir });
+        lock.unlock(io);
+        locked = false;
+        try guard.finish();
         return true;
     }
 
@@ -706,6 +1001,14 @@ pub const FsProgressStore = struct {
     }
 
     const vtable: progress_store.ProgressStore.VTable = .{
+        .get_head_for = headFor,
+        .get_gc_watermark_for = watermarkFor,
+        .cas_gc_watermark_for = casWatermarkFor,
+        .cas_manifest_gc_floor_for = casFloorFor,
+        .prune_manifest_read_deadlines_for = prunePinsFor,
+        .get_manifest_gc_floor_for = floorFor,
+        .get_manifest_read_deadline_for = pinFor,
+        .cas_manifest_read_deadline_for = casPinFor,
         .work_lease_provider = erasedWorkLeaseProvider,
         .deinit = erasedDeinit,
         .get_head = erasedGetHead,

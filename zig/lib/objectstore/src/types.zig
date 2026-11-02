@@ -21,6 +21,9 @@ const Allocator = std.mem.Allocator;
 /// returns. Providers adapt this directly to their HTTP transport so an active
 /// request can be interrupted instead of merely discarded after completion.
 pub const CancellationToken = struct {
+    /// Operation-local execution transitions. Only the calling provider task
+    /// may use these; cancellation monitors borrow the predicate alone.
+    execution_wait: ?@import("httpx").socket.WriteControl = null,
     ptr: *const anyopaque,
     is_cancelled_fn: *const fn (*const anyopaque) bool,
 
@@ -44,6 +47,21 @@ pub const CancellationToken = struct {
             .ptr = ptr orelse return null,
             .is_cancelled_fn = is_cancelled_fn orelse return null,
         };
+    }
+
+    /// The transport loan is independent of whether a caller has a cancel
+    /// predicate. Its callbacks remain borrowed until the operation joins.
+    pub fn withExecutionWait(token: ?CancellationToken, control: ?@import("httpx").socket.WriteControl) ?CancellationToken {
+        if (token == null and control == null) return null;
+        const Inert = struct {
+            const value: u8 = 0;
+            fn never(_: *const anyopaque) bool {
+                return false;
+            }
+        };
+        var result = token orelse CancellationToken{ .ptr = &Inert.value, .is_cancelled_fn = Inert.never };
+        result.execution_wait = control orelse result.execution_wait;
+        return result;
     }
 
     pub fn isCancelled(self: CancellationToken) bool {

@@ -1,0 +1,170 @@
+1/165 httpx.test.h2 connection...OK
+2/165 httpx.test.socket...OK
+3/165 httpx.test.server...OK
+4/165 server.server.test.buffered H1 probe frames bodies without retaining them...OK
+5/165 server.server.test.Server initialization...OK
+6/165 server.server.test.bound handlers keep independent instance context...OK
+7/165 server.server.test.wrapped handlers preserve the supplied handler target...OK
+8/165 server.server.test.Context response helpers...OK
+9/165 server.server.test.Server with config...OK
+10/165 server.server.test.Context query parsing...OK
+11/165 server.server.test.Context cookie helpers...OK
+12/165 server.server.test.Router allowed methods for path...OK
+13/165 server.server.test.Server any() registers all methods...OK
+14/165 server.server.test.ServerConfig defaults...OK
+15/165 server.server.test.routeErrorStatus maps oversized route errors to payload too large...OK
+16/165 server.server.test.HTTP/2 pre-dispatch body admission errors retain client-visible status...OK
+17/165 server.server.test.HTTP/2 oversized body before handler claim writes 413...OK
+18/165 server.server.test.route body limits resolve before transport body admission...OK
+19/165 server.server.test.attachment body streaming requires route opt-in and framed content type...OK
+20/165 server.server.test.Context queryDecoded decodes percent escapes exactly once...OK
+21/165 server.server.test.Context max_file_size default and override...OK
+22/165 server.server.test.Context file rejects path traversal...OK
+23/165 server.server.test.Parser max_headers is configurable...OK
+24/165 server.server.test.Parser max_body_size is configurable...OK
+25/165 server.server.test.Context.streamH2 returns NotH2 for HTTP/1.1 context...OK
+26/165 server.server.test.H2StreamWriter write and close...OK
+27/165 server.server.test.H2StreamReader reads pre-buffered data and returns EOF...OK
+28/165 server.server.test.H2StreamReader.readAll buffers entire body...OK
+29/165 server.server.test.H2StreamReader body deadline cannot be renewed by trickle data...OK
+30/165 server.server.test.H1 body deadline starts after headers and rejects a stalled upload...OK
+31/165 server.server.test.H1 opted-in framed route dispatches before the full body arrives...OK
+32/165 server.server.test.raw streaming routes stream every content type...OK
+33/165 server.server.test.H1 raw streaming route reads a chunked upload while streaming its response...OK
+34/165 server.server.test.H1 raw streaming route delivers large chunked pieces before the terminator...OK
+35/165 server.server.test.H1 oversized content length returns 413 before handler admission...OK
+36/165 server.server.test.HTTP/2 prior-knowledge preface can arrive in separate TCP reads...OK
+37/165 server.server.test.HTTP streaming headers and automatic preflight preserve middleware policy...OK
+38/165 server.server.test.H1 streaming advertises and honors connection retirement...OK
+39/165 server.server.test.H1 handler failure after stream commit closes without a second response...OK
+40/165 server.server.test.H2StreamReader reports terminal stream errors instead of truncated EOF...OK
+41/165 server.server.test.H2 body admission exhaustion writes retryable 429 before stream reset...OK
+42/165 server.server.test.Context.body() returns request.body for HTTP/1.1...OK
+43/165 server.server.test.Context.body() buffers from H2StreamReader...OK
+44/165 server.server.test.Context.body() treats unframed H2 EndOfStream as absent body...OK
+45/165 server.server.test.Context.body() preserves H2 EndOfStream when content length promised bytes...OK
+46/165 server.server.test.Context.parseBody() returns null without a body...OK
+47/165 server.server.test.Context.parseBody() delegates raw bytes to a custom parser...OK
+48/165 server.server.test.Context.parseJson() parses through the shared body parser path...OK
+49/165 server.server.test.H2 request rejection resets an unprocessed stream and unwinds ownership...OK
+50/165 server.server.test.h2c applyPeerSettings propagates INITIAL_WINDOW_SIZE and HPACK table size...OK
+51/165 server.server.test.handleH2Stream cleanup skips RST_STREAM on already-closed stream...OK
+52/165 server.server.test.H2 handler stream lookups share the receive mutex...OK
+53/165 server.server.test.isH2ForbiddenHeader rejects connection-specific headers...OK
+54/165 server.server.test.H2 response serialization strips connection-specific headers...OK
+55/165 server.server.test.shutdown publishes graceful listener-thread work...OK
+56/165 server.server.test.stop publishes synchronized listener-thread shutdown...OK
+57/165 server.server.test.requestStop only publishes synchronized listener-thread work...OK
+58/165 server.server.test.listener wake does not dereference a concurrently released lease...OK
+59/165 server.server.test.listener bind and wake share the borrowed connection lane...OK
+60/165 server.server.test.repeated stop requests do not inflate connection admission permits...OK
+61/165 server.server.test.listener cancellation exits without accept error or retry...OK
+62/165 server.server.test.accept backoff is normalized and bounded...OK
+63/165 server.server.test.cross-thread stop wakes an ephemeral listener...OK
+64/165 server.server.test.multiple listeners share one HTTP runtime lifecycle...OK
+65/165 server.server.test.shared HTTP runtime preserves each listener request reservation...OK
+66/165 server.server.test.bind establishes HTTP runtime ownership before publishing an address...OK
+67/165 server.server.test.bind rejects a connection limit larger than shared HTTP runtime capacity...OK
+68/165 server.server.test.bounded control listener serves without H1 observer capacity...OK
+69/165 server.server.test.listener task binds synchronously and joins before executor teardown...OK
+70/165 server.server.test.HTTP runtime tasks do not consume the nested-operation executor...OK
+71/165 server.server.test.HTTP/1 and h2c request saturation reject before application work...OK
+72/165 server.server.test.canceled route is a response-free terminal transport outcome...OK
+73/165 server.server.test.listener task remains valid after its owning handle moves...OK
+74/165 server.server.test.reuse address preserves exclusive live listener ownership...OK
+75/165 server.server.test.reuse address permits an immediate listener restart...OK
+76/165 server.server.test.ephemeral listeners remain independently bindable...OK
+77/165 server.server.test.reuse port is an explicit live listener opt in...OK
+78/165 server.server.test.cross-thread graceful shutdown is listener-owned...OK
+79/165 server.server.test.H1 context preserves buffered pipeline input across client SHUT_WR...OK
+80/165 server.server.test.H1 client cancellation reaches active server work...OK
+81/165 server.server.test.H1 orderly half close does not cancel an active response...OK
+82/165 server.server.test.H1 hard disconnect remains observable behind pipelined input...OK
+83/165 server.server.test.H1 context does not treat a partial pipeline suffix as buffered input...OK
+84/165 server.server.test.connection interruption preserves the fiber-owned descriptor...OK
+85/165 server.server.test.immediate stop preempts graceful request drain...OK
+86/165 server.server.test.containsTraversal rejects double-encoded dot-dot...OK
+87/165 server.server.test.containsTraversal rejects percent-encoded slashes...OK
+88/165 server.server.test.containsTraversal rejects backslashes...OK
+89/165 server.server.test.containsTraversal rejects null bytes...OK
+90/165 server.server.test.containsTraversal rejects absolute paths...OK
+91/165 server.server.test.containsTraversal allows safe paths...OK
+92/165 server.server.test.stream writer preserves small SSE write density and supports oversized events...OK
+93/165 server.server.test.H1 chunked frames coalesce into one write and keep wire format for oversized data...OK
+94/165 server.server.test.SSE rejects CR in id field...OK
+95/165 server.server.test.SSE rejects LF in event field...OK
+96/165 server.server.test.setCookie rejects CR/LF in name...OK
+97/165 server.server.test.setCookie rejects CR/LF in value...OK
+98/165 server.server.test.removeCookie rejects CR/LF in name...OK
+99/165 server.server.test.protected dispatch reserves slots and returns them after completion...OK
+100/165 server.server.test.protected dispatch H2 frame pump serves controls with full handlers and exhausted body heap...OK
+101/165 server.server.test.protected dispatch idle H2 connections leave shared scheduling capacity available...OK
+102/165 server.server.test.protected dispatch memory reserve survives retained foreground output...OK
+103/165 server.server.test.protected dispatch H1 rejects bulk allocation failure and parses bounded controls...OK
+104/165 server.server.test.protected dispatch H2 payload OOM leaves the connection usable for status...OK
+105/165 server.server.test.HTTP controlled streaming rejects expired headers and retains controls on delegated chunks...OK
+106/165 server.server.test.HTTP controlled H2 published headers survive denied reentry and late failure resets only the stream...OK
+107/165 server.server.test.HTTP controlled H2 reset cleanup bounds a contended connection mutex...OK
+108/165 server.server.test.HTTP controlled H2 reset cleanup survives actual task cancellation...OK
+109/165 server.server.test.HTTP controlled H2 reset cleanup bounds a stalled native peer...FAIL (FixtureFillBudgetExceeded)
+110/165 server.server.test.HTTP controlled H2 reset cleanup bounds a stalled fallback peer with zero async allowance...SKIP
+111/165 server.server.test.HTTP controlled scheduler failures map to retryable overload without replacing original fences...OK
+112/165 server.server.test.HTTP controlled H2 scheduler overload publishes retry guidance and a complete error body...OK
+113/165 server.server.test.HTTP controlled H1 scheduler overload publishes retry guidance and a complete error body...OK
+114/165 server.server.test.HTTP controlled H1 error cleanup bounds a stalled native peer...FAIL (FixtureFillBudgetExceeded)
+115/165 server.server.test.HTTP controlled H2 error cleanup bounds a stalled native peer...FAIL (FixtureFillBudgetExceeded)
+116/165 server.server.test.HTTP controlled H1 error cleanup bounds a stalled fallback peer with zero async allowance...SKIP
+117/165 server.server.test.HTTP controlled H2 error cleanup bounds a stalled fallback peer with zero async allowance...SKIP
+118/165 server.server.test.HTTP controlled H2 error cleanup bounds a contended mutex without unlocked stream mutation...OK
+119/165 server.server.test.HTTP controlled H2 error cleanup bounds credit waits and releases the mutex...OK
+120/165 server.server.test.HTTP controlled H2 pump error with no credit resets only its stream without waiting...OK
+121/165 server.server.test.HTTP controlled H1 error cleanup survives actual task cancellation...OK
+122/165 server.server.test.HTTP controlled H2 error cleanup survives actual task cancellation...OK
+123/165 server.server.test.HTTP controlled owned error cleanup acquires and resumes outside H2 locks through H1 handler pump and reset paths...OK
+124/165 server.server.test.HTTP controlled owned error cleanup admission denial emits no response and retires the socket...OK
+125/165 server.server.test.HTTP controlled owned error cleanup retires denied resume before releasing its retained owner...OK
+126/165 net.socket.test.resolveAddressFiltered applies policy to literal and DNS results...OK
+127/165 net.socket.test.Socket connect and close...OK
+128/165 net.socket.test.TcpListener accept...OK
+129/165 net.socket.test.Socket.writer writeAll and print over TCP...OK
+130/165 net.socket.test.UdpSocket send/recv localhost...OK
+131/165 net.socket.test.SocketIoWriter flush sends buffered bytes...OK
+132/165 net.socket.test.Socket recv timeout returns error.Timeout...OK
+133/165 net.socket.test.Socket cancellation polling preserves the configured receive timeout...OK
+134/165 net.socket.test.Socket abort interrupts a backpressured native send...OK
+135/165 net.socket.test.Socket send timeout reports backpressure without panicking...OK
+136/165 net.socket.test.SliceIoReader skips leading empty buffers...OK
+137/165 net.socket.test.PrefixedReader skips leading empty buffers...OK
+138/165 net.socket.test.ContentLengthReader skips leading empty buffers...OK
+139/165 net.socket.test.ContentLengthReader handles inner reader that buffers before producing bytes...OK
+140/165 net.socket.test.ContentLengthReader reports premature EOF as ReadFailed...OK
+141/165 net.socket.test.ChunkedBodyReader skips leading empty buffers...OK
+142/165 net.socket.test.ChunkedBodyReader handles inner reader that buffers before producing bytes...OK
+143/165 net.socket.test.timed fallback healthy read never runs timer eagerly...SKIP
+144/165 net.socket.test.timed fallback healthy write never runs timer eagerly...SKIP
+145/165 net.socket.test.timed fallback stalled read remains bounded at zero async allowance...SKIP
+146/165 net.socket.test.timed fallback stalled write remains bounded at zero async allowance...SKIP
+147/165 net.socket.test.timed fallback denied read preserves bytes...SKIP
+148/165 net.socket.test.timed fallback denied write sends no bytes...SKIP
+149/165 net.socket.test.ChunkedBodyReader preserves truncation versus invalid framing at every phase...OK
+150/165 net.socket.test.Socket controlled native write retains the original deadline under backpressure...CONTROLLED_WRITE backend=native cause=deadline elapsed_ms=247
+OK
+151/165 net.socket.test.Socket controlled native write observes original cancellation under backpressure...CONTROLLED_WRITE backend=native cause=canceled elapsed_ms=82
+OK
+152/165 net.socket.test.Socket controlled fallback write retains the original deadline with zero async allowance...SKIP
+153/165 net.socket.test.Socket controlled fallback write observes original cancellation with zero async allowance...SKIP
+154/165 net.socket.test.Socket controlled framing retires uncertainty and preserves a rejected next frame...OK
+155/165 net.socket.test.Socket controlled uncertain output retires after actual fallback task cancellation...SKIP
+156/165 net.socket.test.Socket output wait ownership restores CPU before formatting and rejects failed resumes...OK
+157/165 protocol.h2_connection.test.H2 controlled flow wait retains original deadline and permits connection control progress...OK
+158/165 protocol.h2_connection.test.H2 controlled lock wait honors original deadline without emitting a frame...OK
+159/165 protocol.h2_connection.test.H2 controlled flow wait observes original cancellation without END_STREAM...OK
+160/165 protocol.h2_connection.test.H2 controlled available credit sends valid DATA and END_STREAM...OK
+161/165 protocol.h2_connection.test.H2 controlled credit waits release CPU and restore it before frame serialization...OK
+162/165 protocol.h2_connection.test.H2 controlled header block remains atomic and unlocks before denied reentry...OK
+163/165 client.client.test.request cancellation before socket publication prevents sending...OK
+164/165 client.pool.test.outbound pool shared socket ceiling spans transports and failed creates reclaim reservations...OK
+165/165 tls.tls.test.residual TLS read preserves native socket timeout...SKIP
+149 passed; 13 skipped; 3 failed.
+error: the following test command failed with exit code 1:
+/private/tmp/antfly-worker-phase-native-cache/o/0d3903f800e4ca38b8989d6c081b9c2e/root --seed=0xa752db6c

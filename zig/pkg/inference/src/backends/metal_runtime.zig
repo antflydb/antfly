@@ -23443,6 +23443,12 @@ pub extern fn termite_metal_decode_runtime_acquire_paged_kv_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot_out: *usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_kv_device_budget_identity(runtime: ?*RawMetalDecodeRuntime) ?*anyopaque;
+pub extern fn termite_metal_device_budget_fixture_runtime() ?*RawMetalDecodeRuntime;
+pub extern fn termite_metal_decode_runtime_install_kv_device_budget(
+    runtime: ?*RawMetalDecodeRuntime,
+    budget: *const @import("metal_device_credit.zig").Port,
+) c_int;
 pub extern fn termite_metal_decode_runtime_release_paged_kv_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,

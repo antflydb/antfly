@@ -51,7 +51,7 @@ describe("shared index maintenance", () => {
     await expect(
       client.indexes.retry("rows", "by_id", request, { signal: controller.signal })
     ).rejects.toThrow();
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(2);
   });
 
   it.each([

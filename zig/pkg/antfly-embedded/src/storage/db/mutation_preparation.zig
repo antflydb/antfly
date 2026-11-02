@@ -148,7 +148,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub const GeneratedWriteReadSnapshot = struct {
             pub const revisions = @import("../document_mutation_revision.zig");
-            pub const Entry = struct { key: revisions.Key, revision: u64 };
+            pub const Entry = @import("prepared_mutation_dependencies.zig").GeneratedRead;
             entries: []Entry = &.{},
             pub fn deinit(self: *@This(), alloc: Allocator) void {
                 alloc.free(self.entries);
@@ -167,11 +167,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         };
 
         pub const TransformReadSnapshot = struct {
-            pub const Entry = struct {
-                key: []const u8,
-                value: ?[]u8,
-                expected_version: u64,
-            };
+            pub const Entry = @import("prepared_mutation_dependencies.zig").TransformRead;
 
             entries: []Entry = &.{},
             positions: std.StringHashMapUnmanaged(usize) = .empty,
@@ -210,6 +206,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             deletes: []const []const u8,
             transforms: []const types.DocumentTransform,
         ) !TransformReadSnapshot {
+            return captureTransformReadSnapshotWithAuthority(self, alloc, T, writes, deletes, transforms, null);
+        }
+
+        pub fn captureTransformReadSnapshotWithAuthority(
+            self: anytype,
+            alloc: Allocator,
+            comptime T: type,
+            writes: []const T,
+            deletes: []const []const u8,
+            transforms: []const types.DocumentTransform,
+            original: ?@import("../../search/work_authority.zig").Authority,
+        ) !TransformReadSnapshot {
+            var poll: @import("../../search/work_authority.zig").Poller = .{ .authority = original };
+            try poll.tick();
             var result = TransformReadSnapshot{};
             errdefer result.deinit(alloc);
             if (transforms.len == 0) return result;
@@ -219,19 +229,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // entirely request-local base.
             var request_keys = std.StringHashMapUnmanaged(void).empty;
             defer request_keys.deinit(alloc);
-            for (writes) |write| try request_keys.put(alloc, write.key, {});
-            for (deletes) |key| try request_keys.put(alloc, key, {});
+            for (writes) |write| {
+                try poll.tick();
+                try request_keys.put(alloc, write.key, {});
+            }
+            for (deletes) |key| {
+                try poll.tick();
+                try request_keys.put(alloc, key, {});
+            }
 
             var keys = std.ArrayListUnmanaged([]const u8).empty;
             defer keys.deinit(alloc);
             for (transforms) |transform| {
+                try poll.tick();
                 if (request_keys.contains(transform.key)) continue;
                 try request_keys.put(alloc, transform.key, {});
                 try keys.append(alloc, transform.key);
             }
             if (keys.items.len == 0) return result;
 
-            // Read values and version timestamps from the same MVCC snapshot. This
+            // Read values, version timestamps and mutation revisions from one MVCC snapshot. This
             // replaces two point transactions per transform and allows transform
             // parsing/expansion to proceed without holding the DB-wide apply lock.
             var read_txn = try S.ownerField(self, "core").*.store.beginReadTxn();
@@ -247,6 +264,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.items.len) orelse
                 return error.InvalidBatchRequest);
             for (keys.items, 0..) |key, index| {
+                try poll.tick();
                 const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
                 defer alloc.free(store_key);
                 const raw = read_txn.get(store_key) catch |err| switch (err) {
@@ -308,6 +326,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .key = key,
                     .value = value,
                     .expected_version = expected_version,
+                    .revision = if (@import("../document_mutation_revision.zig").keyForPhysical(store_key)) |revision_key|
+                        .{ .key = revision_key, .revision = try @import("../document_mutation_revision.zig").load(&read_txn, revision_key) }
+                    else
+                        null,
                 };
                 initialized += 1;
                 result.positions.putAssumeCapacity(key, index);
@@ -325,6 +347,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             transforms: []const types.DocumentTransform,
             transform_snapshot: ?*const TransformReadSnapshot,
         ) !CoalescedKeyValueRequest(T) {
+            return coalesceKeyValueRequestWithAuthority(self, alloc, T, writes, deletes, transforms, transform_snapshot, null);
+        }
+
+        pub fn coalesceKeyValueRequestWithAuthority(
+            self: anytype,
+            alloc: Allocator,
+            comptime T: type,
+            writes: []const T,
+            deletes: []const []const u8,
+            transforms: []const types.DocumentTransform,
+            transform_snapshot: ?*const TransformReadSnapshot,
+            original: ?@import("../../search/work_authority.zig").Authority,
+        ) !CoalescedKeyValueRequest(T) {
+            var poll: @import("../../search/work_authority.zig").Poller = .{ .authority = original };
+            try poll.tick();
             // SQL mutations lower to complete replacements. A document transform
             // cannot retain the provenance of JSON null after reconstructing JSON.
             if (transforms.len != 0) for (writes) |write| if (write.json_null_fields.len != 0) return error.UnsupportedTransformOperation;
@@ -346,6 +383,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer positions.deinit(alloc);
 
             for (writes) |write| {
+                try poll.tick();
                 const gop = try positions.getOrPut(alloc, write.key);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = order.items.len;
@@ -364,6 +402,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             for (deletes) |key| {
+                try poll.tick();
                 const gop = try positions.getOrPut(alloc, key);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = order.items.len;
@@ -380,6 +419,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             for (transforms) |transform| {
+                try poll.tick();
                 const maybe_index = positions.get(transform.key);
                 const base_json = blk: {
                     if (maybe_index) |entry_index| {
@@ -405,6 +445,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }).empty;
                 defer graph_operations.deinit(alloc);
                 for (transform.operations) |operation| {
+                    try poll.tick();
                     const graph_path = try transform_mod.graphProjectionPath(operation.path);
                     if (graph_path) |path| {
                         switch (operation.op) {
@@ -503,6 +544,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var write_count: usize = 0;
             var delete_count: usize = 0;
             for (order.items) |entry| {
+                try poll.tick();
                 switch (entry.kind) {
                     .write => write_count += 1,
                     .delete => delete_count += 1,
@@ -517,6 +559,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var write_index: usize = 0;
             var delete_index: usize = 0;
             for (final_entries) |entry| {
+                try poll.tick();
                 switch (entry.kind) {
                     .write => {
                         result.writes[write_index] = .{
@@ -725,17 +768,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn validateTransformReadSnapshot(self: anytype, read_snapshot: TransformReadSnapshot) !void {
-            if (read_snapshot.entries.len == 0) return;
-            const predicates = try S.ownerField(self, "alloc").*.alloc(transactions_mod.VersionPredicate, read_snapshot.entries.len);
-            defer S.ownerField(self, "alloc").*.free(predicates);
-            for (read_snapshot.entries, predicates) |entry, *predicate| predicate.* = .{
-                .key = entry.key,
-                .expected_version = entry.expected_version,
-            };
-            S.ownerField(self, "core").*.checkVersionPredicates(predicates, null) catch |err| switch (err) {
-                error.VersionConflict => return error.PreparedReadSetChanged,
-                else => return err,
-            };
+            return validateTransformReadSnapshotWithAdmission(self, read_snapshot, null);
+        }
+
+        pub fn validateTransformReadSnapshotWithAdmission(self: anytype, read_snapshot: TransformReadSnapshot, original: ?@import("../../common/read_admission.zig").Port) !void {
+            return @import("prepared_mutation_dependencies.zig").validateExplicitReads(S.ownerField(self, "core").*, &.{}, read_snapshot.entries, original);
         }
 
         pub fn attachPreparedUpsertDocumentProjections(
@@ -1137,6 +1174,57 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preplanned: ?*const GeneratedBatchWritePlan,
             generated_memo: ?*GeneratedEmbeddingMemo,
         ) !PrecomputedGeneratedBatch {
+            return prepareGeneratedEnrichmentsWithContext(self, alloc, req, extracted, precompute_mode, force_generated_artifact_names, preplanned, generated_memo, null, null);
+        }
+
+        pub fn prepareGeneratedEnrichmentsWithContext(
+            self: anytype,
+            alloc: Allocator,
+            req: types.BatchRequest,
+            extracted: []const mapper.ExtractedWrite,
+            precompute_mode: GeneratedPrecomputeMode,
+            force_generated_artifact_names: []const []const u8,
+            preplanned: ?*const GeneratedBatchWritePlan,
+            generated_memo: ?*GeneratedEmbeddingMemo,
+            context: ?@import("antfly_inference_execution_context").RequestContext,
+            stage: ?*const @import("preparation_execution.zig").Stage,
+        ) !PrecomputedGeneratedBatch {
+            const selected = if (stage) |execution| try execution.requestContext() else context;
+            if (selected) |original| {
+                try original.check();
+                if (preplanned == null and !S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets()) return .{};
+                if (S.ownerField(self, "enrichment_runtime").*) |parent| {
+                    const invocation = if (stage != null and stage.?.active)
+                        try enrichment_runtime_mod.PrecommitDocumentExecution.createWithIndependentContext(parent, alloc, &.{}, "", original)
+                    else
+                        try enrichment_runtime_mod.PrecommitDocumentExecution.createWithContext(parent, alloc, &.{}, "", original);
+                    defer invocation.destroy();
+                    // The enclosing scope carries provider controls only. A real
+                    // document invocation installs its own nonempty PDF scheduler.
+                    invocation.runtime.shared_pdf_windows = null;
+                    var runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = &invocation.runtime;
+                    var receiver = if (@TypeOf(self) == *S.PreparedBatchOwner) self.* else S.PreparedBatchOwner.from(self);
+                    receiver.enrichment_runtime = &runtime;
+                    var result = try prepareGeneratedEnrichmentsImpl(&receiver, alloc, req, extracted, precompute_mode, force_generated_artifact_names, preplanned, generated_memo, original);
+                    errdefer result.deinit(alloc);
+                    try original.check();
+                    return result;
+                }
+            }
+            return prepareGeneratedEnrichmentsImpl(self, alloc, req, extracted, precompute_mode, force_generated_artifact_names, preplanned, generated_memo, selected);
+        }
+
+        fn prepareGeneratedEnrichmentsImpl(
+            self: anytype,
+            alloc: Allocator,
+            req: types.BatchRequest,
+            extracted: []const mapper.ExtractedWrite,
+            precompute_mode: GeneratedPrecomputeMode,
+            force_generated_artifact_names: []const []const u8,
+            preplanned: ?*const GeneratedBatchWritePlan,
+            generated_memo: ?*GeneratedEmbeddingMemo,
+            context: ?@import("antfly_inference_execution_context").RequestContext,
+        ) !PrecomputedGeneratedBatch {
             if (preplanned == null and !S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets()) return .{};
             if (preplanned) |plan| if (plan.rows.len != req.writes.len) return error.InvalidArgument;
             var fallback_write_plan = if (preplanned == null)
@@ -1208,6 +1296,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             for (req.writes, 0..) |_, i| {
+                if (context) |original| try original.check();
                 if (!extracted[i].hasDocument()) continue;
                 var owned_row_plan: ?GeneratedBatchWritePlan = null;
                 defer if (owned_row_plan) |*plan| plan.deinit();
@@ -1259,11 +1348,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer inline_embedding_cleanup.deinit(alloc);
 
                 const document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution = if (S.ownerField(self, "enrichment_runtime").*) |runtime|
-                    if (precompute_mode == .all and enrichment_runtime_mod.PrecommitDocumentExecution.useful(generated)) try enrichment_runtime_mod.PrecommitDocumentExecution.create(runtime, generated, (try extracted[i].logicalJson()).?) else null
+                    if (precompute_mode == .all and enrichment_runtime_mod.PrecommitDocumentExecution.useful(generated)) try enrichment_runtime_mod.PrecommitDocumentExecution.createWithAllocator(runtime, alloc, generated, (try extracted[i].logicalJson()).?) else null
                 else
                     null;
                 defer if (document_execution) |execution| execution.destroy();
                 for (generated, 0..) |request, request_index| {
+                    if (context) |original| try original.check();
                     if (document_execution) |execution| execution.select(request_index);
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) {
                         if (request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request))) {
@@ -1533,6 +1623,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const max_bytes = generatedEmbedBatchBytes();
 
             for (req.writes, 0..) |_, row_index| {
+                if (runtime.provider_request_context) |original| try original.check();
                 for (plan.rows[row_index].requests) |request| {
                     if (request.kind != .dense_embedding or request.input_kind != .document) continue;
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) continue;
@@ -1654,7 +1745,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             plan: *const GeneratedBatchWritePlan,
             memo: *GeneratedEmbeddingMemo,
         ) !void {
-            if (S.ownerField(self, "enrichment_runtime").* == null or S.ownerField(self, "enrichment_runtime").*.?.config.sparse_embedder == null) return;
+            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
+            if (runtime.config.sparse_embedder == null) return;
             var jobs = std.ArrayListUnmanaged(GeneratedSparseMemoJob).empty;
             defer {
                 clearGeneratedSparseMemoJobs(memo.alloc, &jobs);
@@ -1667,6 +1759,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const max_bytes = generatedEmbedBatchBytes();
 
             for (req.writes, 0..) |_, row_index| {
+                if (runtime.provider_request_context) |original| try original.check();
                 for (plan.rows[row_index].requests) |request| {
                     if (request.kind != .sparse_embedding or request.input_kind != .document) continue;
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) continue;

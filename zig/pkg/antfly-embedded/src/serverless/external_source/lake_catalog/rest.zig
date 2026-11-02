@@ -48,11 +48,24 @@ pub const HttpTransport = struct {
     }
     fn canceled(raw: *const anyopaque) bool {
         const context: *const types.Context = @ptrCast(@alignCast(raw));
-        context.ensureActive() catch return true;
+        if (context.wait != null) {
+            context.checkLifetime() catch return true;
+        } else {
+            context.ensureActive() catch return true;
+        }
         return false;
+    }
+    fn discardResponse(response: anytype) void {
+        var owned = response;
+        owned.deinit();
     }
     fn request(raw: *anyopaque, a: A, method: httpx.Method, uri: []const u8, body: ?[]const u8, id: ?[]const u8, context: types.Context) !Response {
         const self: *HttpTransport = @ptrCast(@alignCast(raw));
+        // Catalog mutations keep their existing durable completion ownership.
+        // This read/spill wait contract applies only to read requests.
+        const read_request = method == .GET or method == .HEAD;
+        var transport_context = context;
+        if (!read_request) transport_context.wait = null;
         var headers: std.ArrayList([2][]const u8) = .empty;
         defer headers.deinit(a);
         try headers.appendSlice(a, self.headers);
@@ -61,11 +74,12 @@ pub const HttpTransport = struct {
         if (id) |value| try headers.append(a, .{ "Idempotency-Key", value });
         const timeout_ms: u64 = if (context.deadline_ns) |deadline| @min(@as(u64, 30_000), (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms) else 30_000;
         if (timeout_ms == 0) return error.DeadlineExceeded;
-        var response = self.client.request(method, uri, .{ .headers = headers.items, .borrowed_body = body, .follow_redirects = false, .max_retries = 0, .cookies_enabled = false, .max_response_size = types.max_metadata_bytes, .timeout_ms = timeout_ms, .cancellation = .{ .ptr = &context, .is_cancelled_fn = canceled } }) catch |err| {
-            try context.ensureActive();
+        var response = @import("../../../sql/execution_wait.zig").runOwned(transport_context.wait, httpx.Client.request, .{ self.client, method, uri, httpx.RequestOptions{ .headers = headers.items, .borrowed_body = body, .follow_redirects = false, .max_retries = 0, .cookies_enabled = false, .max_response_size = types.max_metadata_bytes, .timeout_ms = timeout_ms, .cancellation = .{ .ptr = &transport_context, .is_cancelled_fn = canceled } } }, discardResponse, .{}) catch |err| {
+            if (read_request) try context.checkLifetime() else try context.ensureActive();
             return err;
         };
         defer response.deinit();
+        if (read_request) try context.ensureActive();
         return .{ .status = response.status.code, .body = try a.dupe(u8, response.body orelse "") };
     }
 };
@@ -286,7 +300,7 @@ pub const Rest = struct {
     }
     fn canceled(raw: *const anyopaque) bool {
         const self: *const Rest = @ptrCast(@alignCast(raw));
-        self.context.ensureActive() catch return true;
+        self.context.checkLifetime() catch return true;
         return false;
     }
     pub fn resolve(self: *const Rest, a: A, id: []const u8, hash: []const u8) !types.Outcome {

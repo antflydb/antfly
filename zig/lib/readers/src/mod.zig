@@ -459,6 +459,7 @@ pub const RemoteOptions = struct {
     source_table: []const u8 = "",
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
+    socket_control: ?httpx.socket.WriteControl = null,
 };
 
 fn initReader(alloc: Allocator, http: *httpx.Client, cfg: Config) !Reader {
@@ -569,6 +570,7 @@ const AntflyReaderState = struct {
     max_tokens: ?i64 = null,
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
+    socket_control: ?httpx.socket.WriteControl = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
         const state = try alloc.create(AntflyReaderState);
@@ -600,6 +602,7 @@ const AntflyReaderState = struct {
             .source_table = source_table,
             .timeout_ms = options.timeout_ms,
             .cancellation = options.cancellation,
+            .socket_control = options.socket_control,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
@@ -654,7 +657,7 @@ const AntflyReaderState = struct {
                 headers[count] = .{ "X-Antfly-Capability-Revision", v };
                 count += 1;
             }
-            var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms", .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
+            var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms", .cancellation = self.cancellation, .socket_control = self.socket_control, .max_response_size = req.max_response_bytes });
             defer response.deinit();
             if (!response.ok()) return readHttpStatusError(response.status.code, responseCapabilityStale(response));
             return documentBatchResult(alloc, response.body orelse return error.InvalidReadResultCount);
@@ -699,6 +702,7 @@ const AntflyReaderState = struct {
             .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .max_response_size = req.max_response_bytes,
             .cancellation = self.cancellation,
+            .socket_control = self.socket_control,
         });
         defer resp.deinit();
         if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
@@ -764,6 +768,7 @@ const AntflyReaderState = struct {
             .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .max_response_size = req.max_response_bytes,
             .cancellation = self.cancellation,
+            .socket_control = self.socket_control,
         });
         defer resp.deinit();
         if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
@@ -962,7 +967,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         }
 
         fn readOpenAi(self: *Self, alloc: Allocator, req: Request) !BatchResult {
-            const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
+            const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation).withExecutionWait(self.options.socket_control);
             var content = std.json.Array.init(alloc);
             defer {
                 for (content.items) |*item| deinitJsonValue(alloc, item);
@@ -998,6 +1003,7 @@ fn CloudReaderState(comptime provider: Provider) type {
                 .max_response_size = req.max_response_bytes,
                 .timeout_ms = try control.remainingTimeoutMs(),
                 .cancellation = self.options.cancellation,
+                .socket_control = self.options.socket_control,
                 .max_retries = 0,
                 .follow_redirects = false,
                 .cookies_enabled = false,
@@ -1008,7 +1014,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         }
 
         fn readVertex(self: *Self, alloc: Allocator, req: Request) !BatchResult {
-            const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
+            const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation).withExecutionWait(self.options.socket_control);
             var parts = std.json.Array.init(alloc);
             defer {
                 for (parts.items) |*item| deinitJsonValue(alloc, item);
@@ -1046,6 +1052,7 @@ fn CloudReaderState(comptime provider: Provider) type {
                 .max_response_size = req.max_response_bytes,
                 .timeout_ms = try control.remainingTimeoutMs(),
                 .cancellation = self.options.cancellation,
+                .socket_control = self.options.socket_control,
                 .max_retries = 0,
                 .follow_redirects = false,
                 .cookies_enabled = false,

@@ -107,6 +107,21 @@ pub const Runtime = struct {
     limits: *quotas.Registry = &quotas.process_registry,
     http: *httpx.Client,
     io: std.Io,
+    /// A scheduled parent without independently admitted children evaluates
+    /// provider jobs on its own worker. Preserve parallel batches otherwise.
+    parallel_work: bool = true,
+    /// Borrowed until evaluation returns. A parent grant can only be checked
+    /// from its worker, so attaching it also disables provider task fan-out.
+    parent_execution: ?struct {
+        ptr: *anyopaque,
+        checkpoint: *const fn (*anyopaque) anyerror!void,
+        /// Remote transport waits release CPU capacity. Resume must reacquire
+        /// the same operation and validate its authority before using results.
+        resource_wait: ?struct {
+            begin: *const fn (*anyopaque) anyerror!void,
+            end: *const fn (*anyopaque) anyerror!void,
+        } = null,
+    } = null,
     context: ?execution.RequestContext = null,
     secret_store: ?*secrets.FileStore = null,
     antfly_provider: ?managed.AntflyProvider = null,
@@ -209,6 +224,7 @@ pub const Runtime = struct {
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         if (self.context) |ctx| try ctx.check();
+        if (self.parent_execution) |parent| try parent.checkpoint(parent.ptr);
     }
     fn validate(ptr: *anyopaque, name: []const u8, questions: decisions.Json, source_table: []const u8) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
@@ -410,6 +426,7 @@ pub const Runtime = struct {
                     if (err == error.DecisionRateLimited) feedback = httpx.Response.init(a, 429);
                     return operationalError(err);
                 };
+                try checkpoint(self.runtime);
                 const parsed = try parseResponse(a, bytes);
                 self.observeUsage(&reservation, parsed);
                 return parsed;
@@ -438,6 +455,9 @@ pub const Runtime = struct {
                 count += 1;
             }
             const ctx = self.runtime.context;
+            const timeout_ms = if (ctx) |context| try context.remainingTimeoutMs() else 30000;
+            const parent = self.runtime.parent_execution;
+            if (parent) |active| if (active.resource_wait) |wait| try wait.begin(active.ptr);
             var response = self.runtime.http.post(url, .{
                 .body = body,
                 .max_response_size = max_response_bytes,
@@ -445,10 +465,16 @@ pub const Runtime = struct {
                 .cookies_enabled = false,
                 .attempt_observer = observer,
                 .headers = headers[0..count],
-                .timeout_ms = if (ctx) |context| try context.remainingTimeoutMs() else 30000,
+                .timeout_ms = timeout_ms,
                 .cancellation = if (ctx) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else null,
-            }) catch |err| return operationalError(err);
+            }) catch |err| {
+                if (parent) |active| if (active.resource_wait) |wait| try wait.end(active.ptr);
+                return operationalError(err);
+            };
             defer response.deinit();
+            // Resume failure discards even a successful transport response.
+            if (parent) |active| if (active.resource_wait) |wait| try wait.end(active.ptr);
+            try checkpoint(self.runtime);
             const bytes = response.body orelse return if (response.ok()) error.InvalidDecisionOutput else upstreamFailure(response.status.code);
             const parsed = parseResponse(a, bytes) catch |err| return if (response.ok()) err else upstreamFailure(response.status.code);
             // Account usage before semantic output validation, including refused
@@ -493,6 +519,7 @@ pub const Runtime = struct {
         var batch_size: usize = 32;
         var estimated = self.estimated_input_tokens;
         for (requests) |request| {
+            try checkpoint(ptr);
             const cfg = try self.registry.getDeciderConfig(request.decider);
             if (cfg.decision_method == .generated) _ = try self.resolveGenerator(request.decider, if (request.source_table.len > 0) request.source_table else self.source_table);
             if (self.reserved_rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
@@ -573,15 +600,14 @@ pub const Runtime = struct {
                 job.* = .{ .runtime = self, .request = request, .cfg = try self.registry.getDeciderConfig(request.decider), .arena = undefined, .budget = .{ .backing = std.heap.smp_allocator, .limit = 8 * 1024 * 1024 } };
                 job.arena = std.heap.ArenaAllocator.init(job.budget.allocator());
                 initialized += 1;
-                // A single decision already runs on its caller's execution
-                // lane. Requiring another worker can reject otherwise valid
-                // concurrent queries on a bounded backend IO runtime.
-                if (jobs.len == 1) job.run() else try group.concurrent(self.io, Job.run, .{job});
+                // Run single decisions and borrowed parent executions inline.
+                if (jobs.len > 1 and self.parallel_work and self.parent_execution == null) try group.concurrent(self.io, Job.run, .{job}) else Job.run(job);
             }
             try group.await(self.io);
             self.batches += 1;
             try checkpoint(ptr);
             for (jobs, out[begin..end], failures[begin..end]) |*job, *value, *failure| {
+                try checkpoint(ptr);
                 const usage = if (job.response) |response| reportedUsage(response) orelse job.usage else job.usage;
                 self.input_tokens +|= usage.input_tokens;
                 self.output_tokens +|= usage.output_tokens;
@@ -968,6 +994,261 @@ test "decision functions OpenAI HTTP routing alignment provenance budgets and er
     var cancelled = std.atomic.Value(bool).init(true);
     runtime.context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) };
     try std.testing.expectError(error.Cancelled, runtime.provider().evaluateBatch(alloc, &.{.{ .input = .{ .text = "refund" }, .decider = "openai", .questions = questions }}));
+}
+
+test "decision functions remote transport parks its parent and discards failed resumptions" {
+    try qualifyRemoteTransportRetirement();
+}
+
+pub fn qualifyRemoteTransportRetirement() !void {
+    if (!@import("builtin").is_test) @compileError("test fixture only");
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Runnable = admission_mod.runnable_scheduler;
+    const Parent = struct {
+        grant: *Runnable.Execution,
+        reject_result: bool,
+        thread: ?std.Thread.Id = null,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.thread) |worker| try std.testing.expectEqual(worker, std.Thread.getCurrentId()) else self.thread = std.Thread.getCurrentId();
+            try self.grant.checkpoint();
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.thread.?, std.Thread.getCurrentId());
+            try self.grant.park(.resource_blocked);
+            self.begins += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.thread.?, std.Thread.getCurrentId());
+            self.ends += 1;
+            try self.grant.enter(.query);
+            if (self.reject_result) return error.Forbidden;
+        }
+    };
+    const Check = struct {
+        var owner: ?*Runnable.Scheduler = null;
+        var close_owner: bool = false;
+        fn request(_: httpx.testing_mod.RequestInfo) !void {
+            const scheduler = owner.?;
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+            var other: Runnable.Execution = .{};
+            try other.start(scheduler, .{ .io = std.testing.io }, .query);
+            defer other.finish();
+            var control: Runnable.Execution = .{};
+            try control.start(scheduler, .{ .io = std.testing.io }, .control);
+            defer control.finish();
+            try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+            if (close_owner) scheduler.close();
+        }
+    };
+    defer Check.owner = null;
+    const Run = struct {
+        fn run(runtime: *Runtime, alloc: std.mem.Allocator, questions: decisions.Json, failure: *?anyerror) void {
+            _ = runtime.provider().evaluateBatch(alloc, &.{.{ .input = .{ .text = "refund" }, .decider = "remote", .questions = questions }}) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    const good = "{\"model\":\"test-model\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
+    for (0..5) |scenario| {
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+        Check.owner = &scheduler;
+        Check.close_owner = scenario == 3;
+        var server = try httpx.TestServer.start(a, io, &.{.{
+            .method = .POST,
+            .path = "/decisions",
+            .assert_request = Check.request,
+            .respond = .{
+                .status = if (scenario == 2) 429 else 200,
+                .body = if (scenario == 1) "invalid-json" else good,
+                .disconnect_before_response = scenario == 4,
+            },
+        }});
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var registry = registry_mod.Registry.init(a);
+        defer registry.deinit();
+        try registry.registerDeciderConfig("remote", .{ .provider = .antfly, .model = "test-model", .url = server.baseUrl(), .api_key = "decision-test" });
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const questions = try decisions.questionsFor(arena.allocator(), .ai_probability, &.{ .{ .string = "refund" }, .{ .string = "Refund?" }, .{ .string = "remote" } });
+        var grant: Runnable.Execution = .{};
+        try grant.start(&scheduler, .{ .io = io, .retained_bytes = 17 }, .query);
+        defer grant.finish();
+        var parent: Parent = .{ .grant = &grant, .reject_result = scenario == 1 };
+        var runtime: Runtime = .{
+            .registry = &registry,
+            .http = &client,
+            .io = io,
+            .parent_execution = .{ .ptr = &parent, .checkpoint = Parent.checkpoint, .resource_wait = .{ .begin = Parent.begin, .end = Parent.end } },
+        };
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Run.run, .{ &runtime, arena.allocator(), questions, &failure });
+        try server.handleOne();
+        try group.await(io);
+        try std.testing.expectEqual(@as(usize, 1), parent.begins);
+        try std.testing.expectEqual(@as(usize, 1), parent.ends);
+        const expected: ?anyerror = switch (scenario) {
+            0 => null,
+            1 => error.Forbidden,
+            2 => error.DecisionRateLimited,
+            3 => error.SchedulerClosed,
+            4 => error.DecisionUpstreamFailure,
+            else => unreachable,
+        };
+        try std.testing.expectEqual(expected, failure);
+        try std.testing.expectEqual(@as(u64, if (scenario == 0) 1 else 0), runtime.rows);
+        grant.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "decision functions serial provider batches remain on the admitted parent worker" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("serial", .{ .provider = .antfly, .model = "serial-model", .api_key = "serial-test", .batch_size = 2, .max_rows = 2 });
+    const Provider = struct {
+        const Runnable = admission_mod.runnable_scheduler;
+        thread: std.Thread.Id,
+        calls: usize = 0,
+        checkpoints: usize = 0,
+        stop_after_provider: bool = false,
+        parent_grant: ?*Runnable.Execution = null,
+        scheduler: ?*Runnable.Scheduler = null,
+        close_after_provider: bool = false,
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
+            self.checkpoints += 1;
+            if (self.stop_after_provider and self.calls != 0) return error.ParentExecutionStopped;
+            if (self.parent_grant) |grant| try grant.checkpoint();
+        }
+        fn decide(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
+            var parsed = try std.json.parseFromSlice(decisions.Json, alloc, body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(if (self.calls == 0) "first" else "second", parsed.value.object.get("state").?.string);
+            self.calls += 1;
+            if (self.scheduler) |scheduler| {
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+                var control: Runnable.Execution = .{};
+                defer control.finish();
+                try control.start(scheduler, .{ .io = self.parent_grant.?.entry.?.options.io }, .control);
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().control_slots);
+                if (self.close_after_provider) scheduler.close();
+            }
+            return std.fmt.allocPrint(alloc, "{{\"model\":\"serial-model\",\"answers\":{{\"answer\":{{\"type\":\"noul\",\"noul\":{d}}}}},\"usage\":{{\"input_tokens\":2,\"output_tokens\":0}}}}", .{@as(f64, if (self.calls == 1) 0.1 else 0.9)});
+        }
+    };
+    var embedded: Provider = .{ .thread = std.Thread.getCurrentId() };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const questions = try decisions.questionsFor(arena.allocator(), .ai_probability, &.{ .{ .string = "first" }, .{ .string = "Question?" }, .{ .string = "serial" } });
+    var runtime: Runtime = .{
+        .registry = &registry,
+        .http = &client,
+        .io = io,
+        .parallel_work = false,
+        .antfly_provider = .{ .ptr = &embedded, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Provider.decide },
+    };
+    const results = try runtime.provider().evaluateBatch(arena.allocator(), &.{
+        .{ .input = .{ .text = "first" }, .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "second" }, .decider = "serial", .questions = questions },
+    });
+    try std.testing.expectEqual(@as(usize, 2), embedded.calls);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results, [_]f64{ 0.1, 0.9 }) |result, expected| {
+        try std.testing.expectEqual(expected, result.object.get("answers").?.object.get("answer").?.object.get("noul").?.float);
+    }
+    try std.testing.expectEqual(@as(u64, 2), runtime.rows);
+    try std.testing.expectEqual(@as(u64, 1), runtime.batches);
+    try std.testing.expectEqual(@as(u64, 4), runtime.input_tokens);
+
+    // A borrowed parent is sufficient to prevent unsafe child tasks even when
+    // the caller leaves the ordinary parallel-batch default enabled.
+    embedded.calls = 0;
+    runtime = .{
+        .registry = &registry,
+        .http = &client,
+        .io = io,
+        .parent_execution = .{ .ptr = &embedded, .checkpoint = Provider.checkpoint },
+        .antfly_provider = .{ .ptr = &embedded, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Provider.decide },
+    };
+    _ = try runtime.provider().evaluateBatch(arena.allocator(), &.{
+        .{ .input = .{ .text = "first" }, .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "second" }, .decider = "serial", .questions = questions },
+    });
+    try std.testing.expectEqual(@as(usize, 2), embedded.calls);
+    try std.testing.expect(embedded.checkpoints > 0);
+
+    // Revocation after provider completion must stop before parsing/consuming
+    // its result, and before invoking the next provider request.
+    embedded.calls = 0;
+    embedded.stop_after_provider = true;
+    runtime.rows = 0;
+    try std.testing.expectError(error.ParentExecutionStopped, runtime.provider().evaluateBatch(arena.allocator(), &.{
+        .{ .input = .{ .text = "first" }, .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "second" }, .decider = "serial", .questions = questions },
+    }));
+    try std.testing.expectEqual(@as(usize, 1), embedded.calls);
+    try std.testing.expectEqual(@as(u64, 0), runtime.rows);
+
+    var scheduler = try admission_mod.runnable_scheduler.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+    defer scheduler.close();
+    var parent_grant: admission_mod.runnable_scheduler.Execution = .{};
+    defer parent_grant.finish();
+    embedded.parent_grant = &parent_grant;
+    embedded.scheduler = &scheduler;
+    embedded.stop_after_provider = false;
+    embedded.calls = 0;
+    try parent_grant.start(&scheduler, .{ .io = io, .retained_bytes = 17 }, .query);
+    _ = try runtime.provider().evaluateBatch(arena.allocator(), &.{
+        .{ .input = .{ .text = "first" }, .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "second" }, .decider = "serial", .questions = questions },
+    });
+    try std.testing.expect(parent_grant.resume_generation > 1);
+    try std.testing.expectEqual(@as(usize, 2), embedded.calls);
+    parent_grant.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+
+    embedded.calls = 0;
+    embedded.close_after_provider = true;
+    runtime.rows = 0;
+    try parent_grant.start(&scheduler, .{ .io = io, .retained_bytes = 17 }, .query);
+    try std.testing.expectError(error.SchedulerClosed, runtime.provider().evaluateBatch(arena.allocator(), &.{
+        .{ .input = .{ .text = "first" }, .decider = "serial", .questions = questions },
+        .{ .input = .{ .text = "second" }, .decider = "serial", .questions = questions },
+    }));
+    try std.testing.expectEqual(@as(usize, 1), embedded.calls);
+    try std.testing.expectEqual(@as(u64, 0), runtime.rows);
+    parent_grant.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }
 
 test "generating backend generated decisions batch through native constrained output" {

@@ -22,6 +22,7 @@ const tree = @import("page_tree.zig");
 const graph = @import("page_graph.zig");
 const keys = @import("page_keys.zig");
 const data = @import("topology_data.zig");
+const preparation = @import("antfly_local_sources").graph_preparation;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const Kind = struct { name: []u8, count: u64 };
@@ -54,6 +55,12 @@ fn intern(alloc: Allocator, nodes: *std.StringArrayHashMapUnmanaged([32]u8), nam
 /// null selects every local edge type; a non-null empty list selects none.
 /// The caller supplies its operation-local admitted allocator and store budget.
 pub fn readAlloc(alloc: Allocator, store: tree.Store, root: graph.Root, requested: ?[]const []const u8, max_nodes: usize, max_edges: usize) !data.Topology {
+    return readControlledAlloc(alloc, store, root, requested, max_nodes, max_edges, .{});
+}
+
+pub fn readControlledAlloc(alloc: Allocator, store: tree.Store, root: graph.Root, requested: ?[]const []const u8, max_nodes: usize, max_edges: usize, control: preparation.Control) !data.Topology {
+    const cancellation = control.token();
+    try control.check();
     try store.check(store.ptr);
     var kinds: std.ArrayListUnmanaged(Kind) = .empty;
     var edge_count: usize = 0;
@@ -64,11 +71,11 @@ pub fn readAlloc(alloc: Allocator, store: tree.Store, root: graph.Root, requeste
     if (requested) |names| {
         const ordered = try alloc.dupe([]const u8, names);
         defer alloc.free(ordered);
-        std.mem.sort([]const u8, ordered, {}, struct {
+        try preparation.sort([]const u8, ordered, {}, struct {
             fn less(_: void, a: []const u8, b: []const u8) bool {
                 return std.mem.order(u8, a, b) == .lt;
             }
-        }.less);
+        }.less, cancellation);
         for (ordered, 0..) |name, i| {
             if (i != 0 and std.mem.eql(u8, ordered[i - 1], name)) continue;
             try addKind(alloc, store, root, &kinds, name, &edge_count, max_edges);
@@ -123,6 +130,7 @@ pub fn readAlloc(alloc: Allocator, store: tree.Store, root: graph.Root, requeste
         defer cursor.deinit();
         var actual: u64 = 0;
         while (try cursor.next()) |edge| {
+            if (edge_index % 1024 == 0) try control.check();
             if (edge_index >= edges.len or actual >= kind.count or !std.mem.eql(u8, edge.kind, kind.name)) return error.InvalidGraphRoot;
             const source = try intern(alloc, &nodes, edge.source, max_nodes);
             const target = try intern(alloc, &nodes, edge.target, max_nodes);
@@ -140,14 +148,20 @@ pub fn readAlloc(alloc: Allocator, store: tree.Store, root: graph.Root, requeste
     defer alloc.free(order);
     const mapping = try alloc.alloc(u32, nodes.count());
     defer alloc.free(mapping);
-    for (order, 0..) |*index, i| index.* = @intCast(i);
-    std.mem.sort(u32, order, nodes.keys(), struct {
+    for (order, 0..) |*index, i| {
+        if (i % 1024 == 0) try control.check();
+        index.* = @intCast(i);
+    }
+    try preparation.sort(u32, order, nodes.keys(), struct {
         fn less(names: []const []const u8, a: u32, b: u32) bool {
             return std.mem.order(u8, names[a], names[b]) == .lt;
         }
-    }.less);
+    }.less, cancellation);
     var byte_count: usize = 0;
-    for (nodes.keys()) |node| byte_count = try std.math.add(usize, byte_count, node.len);
+    for (nodes.keys(), 0..) |node, i| {
+        if (i % 1024 == 0) try control.check();
+        byte_count = try std.math.add(usize, byte_count, node.len);
+    }
     for (kinds.items) |kind| byte_count = try std.math.add(usize, byte_count, kind.name.len);
     const strings = try alloc.alloc(u8, byte_count);
     errdefer alloc.free(strings);
@@ -157,7 +171,10 @@ pub fn readAlloc(alloc: Allocator, store: tree.Store, root: graph.Root, requeste
     errdefer alloc.free(edge_types);
     var position: usize = 0;
     for (order, 0..) |old, index| {
-        if (index % 1024 == 0) try store.check(store.ptr);
+        if (index % 1024 == 0) {
+            try store.check(store.ptr);
+            try control.check();
+        }
         const name = nodes.keys()[old];
         @memcpy(strings[position..][0..name.len], name);
         node_ids[index] = strings[position..][0..name.len];
@@ -170,7 +187,10 @@ pub fn readAlloc(alloc: Allocator, store: tree.Store, root: graph.Root, requeste
         position += kind.name.len;
     }
     for (edges, 0..) |*edge, i| {
-        if (i % 1024 == 0) try store.check(store.ptr);
+        if (i % 1024 == 0) {
+            try store.check(store.ptr);
+            try control.check();
+        }
         edge.source = mapping[edge.source];
         edge.target = mapping[edge.target];
     }
@@ -212,6 +232,30 @@ test "serverless paged topology selects local connectivity with computation-loca
     defer duplicate_filter.deinit(alloc);
     try std.testing.expectEqualSlices(data.Edge, selected.edges, duplicate_filter.edges);
     try std.testing.expectEqualSlices([32]u8, selected.type_checksums, duplicate_filter.type_checksums);
+    const Probe = struct {
+        calls: usize = 0,
+        refuse_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.refuse_at) return error.Canceled;
+        }
+        fn control(self: *@This()) preparation.Control {
+            return .{ .checkpoint = .{ .ptr = self, .check = check } };
+        }
+    };
+    var probe: Probe = .{};
+    var cooperative = try readControlledAlloc(alloc, backing.store(), root, &.{"link"}, 2, 2, probe.control());
+    defer cooperative.deinit(alloc);
+    try std.testing.expect(probe.calls > 1);
+    try std.testing.expectEqualSlices(data.Edge, selected.edges, cooperative.edges);
+    try std.testing.expectEqualSlices([32]u8, selected.type_checksums, cooperative.type_checksums);
+    // Refuse every actual preparation boundary, including sorting and output
+    // remapping, with the leak-checking allocator. Immutable pages remain usable.
+    for (1..probe.calls + 1) |refuse_at| {
+        var refusal: Probe = .{ .refuse_at = refuse_at };
+        try std.testing.expectError(error.Canceled, readControlledAlloc(alloc, backing.store(), root, &.{"link"}, 2, 2, refusal.control()));
+    }
     const reads = backing.reads;
     try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, readAlloc(alloc, backing.store(), root, null, 0, 0));
     try std.testing.expectEqual(2, backing.reads - reads); // first kind only, no endpoint scan

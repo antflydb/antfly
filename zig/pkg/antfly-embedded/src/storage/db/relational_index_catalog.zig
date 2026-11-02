@@ -423,6 +423,10 @@ pub const WriteSnapshot = struct {
     head: Head,
     plan: plans.View,
 
+    pub fn clone(self: WriteSnapshot) WriteSnapshot {
+        return .{ .head = self.head, .plan = self.plan.clone() };
+    }
+
     pub fn deinit(self: *WriteSnapshot) void {
         self.plan.release();
         self.* = undefined;

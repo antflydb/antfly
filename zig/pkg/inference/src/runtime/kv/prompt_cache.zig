@@ -139,6 +139,7 @@ pub const PromptPrefixCache = struct {
     /// budget here, but only this model's serialized generation path may apply
     /// it and evict retained blocks.
     pending_config: ?Config = null,
+    device_memory_budget: ?@import("device_memory.zig").Budget = null,
     manager: manager_mod.KvManager,
     storage: ?storage_runtime_mod.KvStorageRuntime = null,
     pool_id: ?block.KvPoolId = null,
@@ -186,6 +187,7 @@ pub const PromptPrefixCache = struct {
         self.radix_edge_index.deinit(self.allocator);
         if (self.storage) |*storage| storage.deinit();
         self.manager.deinit();
+        if (self.device_memory_budget) |budget| budget.deinit();
     }
 
     pub fn configure(self: *PromptPrefixCache, config: Config) void {
@@ -215,11 +217,26 @@ pub const PromptPrefixCache = struct {
                 false;
             if (!same_observer) old_observer.update(old_observer.context, &self.resource_accounted_bytes, 0);
         }
-        if (self.config.mode != config.mode) self.clearEntries();
+        if (!config.enabled or self.config.mode != config.mode) self.clearEntries();
         self.config = config;
         if (!config.enabled) self.activation_pending = false;
         self.evictToBudget();
+        self.trimFreeBackingLocked();
         self.updateResourceUsage();
+    }
+
+    /// Only called from the owning lane. scheduleConfigure must never free
+    /// buffers that a foreign request may still be using.
+    fn trimFreeBackingLocked(self: *PromptPrefixCache) void {
+        const target = if (!self.config.enabled) 0 else self.config.max_bytes / @as(usize, if (self.storage != null) 2 else 1);
+        if (self.pool_id) |id| {
+            if (self.manager.getPoolMut(id)) |storage| {
+                if (storage.hostPool()) |pool| _ = pool.trimFreeBacking(self.allocator, target);
+            }
+        }
+        if (self.storage) |*runtime| {
+            if (runtime.storage.hostPool()) |pool| _ = pool.trimFreeBacking(self.allocator, target);
+        }
     }
 
     pub fn detachResourceUsageObserver(self: *PromptPrefixCache) void {
@@ -283,6 +300,7 @@ pub const PromptPrefixCache = struct {
             return .{ .storage = storage, .created = false };
         }
         self.storage = try storage_runtime_mod.KvStorageRuntime.init(self.allocator, config);
+        self.storage.?.device_memory_budget = self.device_memory_budget;
         return .{ .storage = &self.storage.?, .created = true };
     }
 
@@ -378,6 +396,7 @@ pub const PromptPrefixCache = struct {
         if (self.storage) |*storage| storage.releaseSequence(attached.sequence_id) catch |err| {
             std.log.warn("failed to release attached prompt-cache storage: {s}", .{@errorName(err)});
         };
+        self.trimFreeBackingLocked();
     }
 
     pub fn storeFromSequence(
@@ -2002,4 +2021,48 @@ test "prompt cache mode changes clear unreachable entries" {
     cache.configure(radix_config);
     try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
     try std.testing.expectEqual(@as(usize, 0), cache.stats().live_bytes);
+}
+
+test "prompt cache owner rebalance trims cold backing and preserves pinned prefixes in every mode" {
+    for ([_]Mode{ .simple, .block_hash, .radix }) |mode| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var cache = PromptPrefixCache.init(failing.allocator());
+        defer cache.deinit();
+        cache.configure(.{ .enabled = true, .mode = mode, .min_tokens = 2, .max_bytes = 1 << 20 });
+        const storage = (try cache.ensureStorage(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 })).?.storage;
+        const source = try cache.manager.attachSequence(cache.pool_id.?);
+        try cache.manager.appendTokens(source, 4);
+        const storage_source = try storage.attachSequence(storage.poolId());
+        try std.testing.expectEqual(source, storage_source);
+        try storage.appendTokens(source, 4);
+        try cache.storeFromSequence("reclaim", &.{ 1, 2, 3, 4 }, source);
+        const attached = (try cache.attachLongestPrefix("reclaim", &.{ 1, 2, 9 }, 2)).?;
+        try cache.manager.releaseSequence(source);
+        try storage.releaseSequence(source);
+        const pool = cache.manager.getPoolMut(cache.pool_id.?).?.hostPool().?;
+        const storage_pool = storage.storage.hostPool().?;
+        const before = failing.freed_bytes;
+        const allocations = failing.alloc_index;
+        failing.fail_index = allocations;
+        cache.scheduleConfigure(.{ .enabled = false, .mode = mode, .max_bytes = 1 << 20 });
+        try std.testing.expectEqual(before, failing.freed_bytes);
+        // The foreign publication cannot reclaim buffers; the owner can.
+        cache.configure(cache.pending_config.?);
+        try std.testing.expect(failing.freed_bytes > before);
+        try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+        try std.testing.expectEqual(@as(u32, 1), pool.storage(0).?.meta.refcount);
+        try std.testing.expect(pool.storage(0).?.k_data.len > 0);
+        try std.testing.expectEqual(@as(usize, 0), pool.storage(1).?.k_data.len);
+        try std.testing.expectEqual(@as(usize, 0), storage_pool.storage(1).?.k_data.len);
+        cache.releaseAttachedPrefix(attached);
+        try std.testing.expectEqual(@as(usize, 0), pool.storage(0).?.k_data.len);
+        try std.testing.expectEqual(@as(usize, 0), storage_pool.storage(0).?.k_data.len);
+        try std.testing.expectEqual(allocations, failing.alloc_index);
+        // Re-enable after reclaim: pool/sequence identities remain reusable.
+        failing.fail_index = std.math.maxInt(usize);
+        cache.configure(.{ .enabled = true, .mode = mode, .min_tokens = 2, .max_bytes = 1 << 20 });
+        const again = try cache.manager.attachSequence(cache.pool_id.?);
+        try cache.manager.appendTokens(again, 2);
+        try cache.manager.releaseSequence(again);
+    }
 }

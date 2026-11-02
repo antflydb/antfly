@@ -28,6 +28,32 @@ const settings = @import("antfly_local_sources").system_catalog_settings;
 
 pub const Request = domain.Request;
 
+pub fn remoteAttemptInitialization(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/remote_attempt_initialization.zig").Request) ![]u8 {
+    try request.validate();
+    try context.ensureActive();
+    if (request.action == .status) {
+        try svc.ensureLinearizableReadWithContext(context);
+        const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+        return store.storeRootControlJson(alloc, svc.metadata_group_id, .{ .remote_initialization_status = request });
+    }
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.remote_attempt_initialization_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var held = true;
+    defer if (held) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const checked = try store.storeRootControlJson(alloc, svc.metadata_group_id, .{ .remote_initialization_preflight = request });
+    alloc.free(checked);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(bytes);
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_remote_attempt_initialization = bytes });
+    svc.unlockCatalogMutation();
+    held = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    return store.storeRootControlJson(alloc, svc.metadata_group_id, .{ .remote_initialization_status = request }) catch return error.MetadataMutationOutcomeUnknown;
+}
+
 pub fn storeRootMutation(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) ![]u8 {
     const enroll = input == .store_root_enroll;
     if (enroll and !context.setting_admin) return error.Forbidden;
@@ -573,6 +599,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         // a future store-bound transport, but never serve it through this
         // generic operation.
         .fk_initial_retirement_page => error.InitialFkRetirementNotActivated,
+        .remote_attempt_initialization => |request| remoteAttemptInitialization(svc, alloc, context, request),
         .store_root_enroll, .fk_initial_retirement_ack => storeRootMutation(svc, alloc, context, input),
         .store_root_enrollment_status => |identity| storeRootEnrollmentStatus(svc, alloc, context, identity),
         .fk_initial_retirement_signed_page => |request| storeRootPage(svc, alloc, context, request),
@@ -703,4 +730,93 @@ pub fn restore(svc: anytype, alloc: std.mem.Allocator, context: operation.Reques
     defer table_manager.freeTable(alloc, bound);
     if (bound.table_id != table.table_id) return error.MetadataMutationOutcomeUnknown;
     svc.verifyTableCreateProjection(alloc, table, ranges) catch return error.MetadataMutationOutcomeUnknown;
+}
+
+test "remote initialization operation waits for commit and preserves ambiguous outcomes without an admin grant" {
+    const alloc = std.testing.allocator;
+    const wire = @import("../metadata/remote_attempt_initialization.zig");
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    const realm = "11111111111111111111111111111111".*;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/initialization-operation", .{tmp.sub_path});
+    defer alloc.free(path);
+    var store = try storage.RaftApplyStore.init(alloc, .{ .root_dir = path });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = realm });
+    const seed: [32]u8 = @splat(7);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const identity: wire.Identity = .{ .metadata_incarnation = realm, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+    try store.applyStandaloneCommand(group, .{ .register_store = .{ .store_id = 3, .node_id = 2, .reporter_incarnation = 4, .replica_root_incarnation = 7, .replica_root_public_key = identity.public_key } });
+    const Service = struct {
+        metadata_group_id: u64 = group,
+        store: *storage.RaftApplyStore,
+        decoder: u16 = protocol.remote_attempt_initialization_version - 1,
+        held: bool = false,
+        proposals: u64 = 0,
+        unknown: bool = false,
+        pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: operation.RequestContext, required: u16) !u16 {
+            if (required != protocol.remote_attempt_initialization_version or self.decoder < required) return error.TableTopologyProtocolUpgradeRequired;
+            return required;
+        }
+        pub fn ensureLinearizableReadWithContext(_: *@This(), request: operation.RequestContext) !void {
+            try request.ensureActive();
+        }
+        pub fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.held);
+            self.held = true;
+        }
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.held);
+            self.held = false;
+        }
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, required: u16) !void {
+            if (!self.held or self.decoder < required) return error.TableTopologyProtocolUpgradeRequired;
+        }
+        pub fn projectedStore(self: *@This()) ?*storage.RaftApplyStore {
+            return self.store;
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !u64 {
+            std.debug.assert(self.held);
+            try self.store.applyStandaloneCommand(group, command);
+            self.proposals += 1;
+            return self.proposals;
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: operation.RequestContext) !void {
+            std.debug.assert(!self.held);
+            if (self.unknown) return error.MetadataMutationOutcomeUnknown;
+        }
+    };
+    var svc = Service{ .store = &store };
+    const prepare = try wire.Request.sign(identity, 4, .prepare, @splat(1), seed);
+    const status = try wire.Request.sign(identity, 4, .status, @splat(0), seed);
+    const initialization_call = @import("server_call.zig").Call{ .remote_attempt_initialization = prepare };
+    try std.testing.expect(initialization_call.isMutation());
+    try std.testing.expect(!initialization_call.requiresAdministrativeGrant());
+    try std.testing.expect(!(@import("server_call.zig").Call{ .remote_attempt_initialization = status }).isMutation());
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, remoteAttemptInitialization(&svc, alloc, .{}, prepare));
+    try std.testing.expectEqual(@as(u64, 0), svc.proposals);
+    svc.decoder = protocol.remote_attempt_initialization_version;
+    svc.unknown = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, remoteAttemptInitialization(&svc, alloc, .{}, prepare));
+    try std.testing.expectEqual(@as(u64, 1), svc.proposals);
+    const observed = try remoteAttemptInitialization(&svc, alloc, .{}, status);
+    defer alloc.free(observed);
+    var parsed = try std.json.parseFromSlice(wire.Entry, alloc, observed, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(wire.Phase.prepared, parsed.value.phase);
+    try std.testing.expectEqualDeep(prepare.initialization_id, parsed.value.initialization_id);
+    svc.unknown = false;
+    const activated = try remoteAttemptInitialization(&svc, alloc, .{}, try wire.Request.sign(identity, 4, .activate, prepare.initialization_id, seed));
+    defer alloc.free(activated);
+    var active = try std.json.parseFromSlice(wire.Entry, alloc, activated, .{});
+    defer active.deinit();
+    try std.testing.expectEqual(wire.Phase.active, active.value.phase);
+    const retry = try remoteAttemptInitialization(&svc, alloc, .{}, try wire.Request.sign(identity, 4, .prepare, @splat(2), seed));
+    defer alloc.free(retry);
+    try std.testing.expectEqualStrings(activated, retry);
+    var forged = prepare;
+    forged.signature[0] ^= 1;
+    try std.testing.expectError(error.InvalidStoreRootEnrollment, remoteAttemptInitialization(&svc, alloc, .{}, forged));
+    try std.testing.expectEqual(@as(u64, 3), svc.proposals);
 }

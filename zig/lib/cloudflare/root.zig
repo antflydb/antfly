@@ -75,6 +75,7 @@ pub fn postNative(client: anytype, a: A, config: Config, payload: V, options: an
         .max_response_size = options.max_response_bytes,
         .timeout_ms = options.timeout_ms,
         .cancellation = options.cancellation,
+        .socket_control = if (@hasField(@TypeOf(options), "socket_control")) options.socket_control else null,
     });
     errdefer response.deinit();
     if (response.status.code == 429) return error.CloudflareRateLimited;

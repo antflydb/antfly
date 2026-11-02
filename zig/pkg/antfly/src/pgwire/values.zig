@@ -162,13 +162,57 @@ pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Co
 }
 
 /// Native pages retain typed arrays and numerics through the wire boundary.
+// The forwarding writer bounds copying between consumer checkpoints. It does
+// not retain the callback or turn a writer failure into a cancellation error.
+const ConsumerWriter = struct {
+    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{}, .end = 0 },
+    destination: *std.Io.Writer,
+    control: @import("backend.zig").ReadControl,
+    failure: ?anyerror = null,
+    fn copy(self: *@This(), bytes: []const u8) std.Io.Writer.Error!void {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            self.control.checkpoint(self.control.ptr) catch |err| {
+                self.failure = err;
+                return error.WriteFailed;
+            };
+            const end = offset + @min(@as(usize, 4096), bytes.len - offset);
+            try self.destination.writeAll(bytes[offset..end]);
+            offset = end;
+        }
+    }
+    fn drain(raw: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *@This() = @alignCast(@fieldParentPtr("writer", raw));
+        var count: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            try self.copy(bytes);
+            count += bytes.len;
+        }
+        for (0..splat) |_| {
+            try self.copy(data[data.len - 1]);
+            count += data[data.len - 1].len;
+        }
+        return count;
+    }
+};
+pub fn encodeCellIntoControlled(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, cell: @import("backend.zig").Cell, wire_bytes: usize, control: ?@import("backend.zig").ReadControl) !void {
+    const owner = control orelse return encodeCellInto(a, writer, column, format, cell, wire_bytes);
+    try owner.checkpoint(owner.ptr);
+    var output: ConsumerWriter = .{ .destination = writer, .control = owner };
+    encodeCellIntoWithControl(a, &output.writer, column, format, cell, wire_bytes, owner) catch |err| return output.failure orelse err;
+    try owner.checkpoint(owner.ptr);
+}
+
 pub fn encodeCellInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, cell: @import("backend.zig").Cell, wire_bytes: usize) !void {
+    return encodeCellIntoWithControl(a, writer, column, format, cell, wire_bytes, null);
+}
+fn encodeCellIntoWithControl(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, cell: @import("backend.zig").Cell, wire_bytes: usize, control: ?@import("backend.zig").ReadControl) !void {
     if (cell.sql_null or format > 1) return error.InvalidResult;
     if (cell.frozen_json) |frozen| {
         if (column.type != .json or cell.value != .null or cell.array != null or cell.numeric != null or cell.json_bytes != null) return error.InvalidResult;
         var bounded: BoundedWriter = .{ .destination = writer, .remaining = wire_bytes };
         if (format == 1) bounded.writer.writeByte(1) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err;
-        @import("antfly_local_sources").sql_spill.writeFrozenJson(&bounded.writer, frozen) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err;
+        @import("antfly_local_sources").sql_spill.writeFrozenJsonControlled(&bounded.writer, frozen, control) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err;
         return;
     }
     if (cell.json_bytes) |json| {
@@ -941,4 +985,53 @@ test "pgwire frozen JSONB cells stream exact values directly with bounded output
         try std.testing.expectError(error.InvalidResult, encodeCellInto(scratch.allocator(), &denied, column, format, .{ .frozen_json = frozen, .json_bytes = "{}", .sql_null = false }, 256));
     }
     std.debug.print("PGWIRE_FROZEN_STREAM formats=2 scratch_allocations=0 identical_frames=true\n", .{});
+}
+
+test "pgwire consumer frozen JSONB encoding preserves cancellation quota and writer identities in both formats" {
+    const sources = @import("antfly_local_sources");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try a.alloc(u8, 32768);
+    @memset(body, 'x');
+    const items = try a.dupe(std.json.Value, &.{.{ .string = body }});
+    const root: std.json.Value = .{ .array = .fromOwnedSlice(a, items) };
+    const wire = try sources.sql_spill.encodeColumnarBlockVersionAlloc(a, &.{.{ .values = &.{sources.sql_scalar.Datum.json(root)}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+    const block = try sources.sql_spill.decodeColumnarBlockForForwarding(a, std.testing.allocator, wire, 1 << 20);
+    defer block.deinit();
+    const cell: @import("backend.zig").Cell = .{ .frozen_json = (try block.frozenJson(0, 0, false)).?, .sql_null = false };
+    const Counter = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        fn checkpoint(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == self.stop) return error.Cancelled;
+        }
+        fn control(self: *@This()) @import("backend.zig").ReadControl {
+            return .{ .ptr = self, .checkpoint = checkpoint };
+        }
+    };
+    var scratch = std.heap.FixedBufferAllocator.init(&.{});
+    const column: Column = .{ .name = "j", .type = .json };
+    for ([_]u16{ 0, 1 }) |format| {
+        const buffer = try a.alloc(u8, 65536);
+        var expected: std.Io.Writer = .fixed(buffer);
+        try encodeCellInto(scratch.allocator(), &expected, column, format, cell, buffer.len);
+        const controlled_buffer = try a.alloc(u8, 65536);
+        var output: std.Io.Writer = .fixed(controlled_buffer);
+        var stopped: Counter = .{ .stop = 16 };
+        try std.testing.expectError(error.Cancelled, encodeCellIntoControlled(scratch.allocator(), &output, column, format, cell, buffer.len, stopped.control()));
+        try std.testing.expectEqual(@as(usize, 16), stopped.calls);
+        try std.testing.expect(output.end < expected.end);
+        output.end = 0;
+        var current: Counter = .{};
+        try encodeCellIntoControlled(scratch.allocator(), &output, column, format, cell, buffer.len, current.control());
+        try std.testing.expectEqualSlices(u8, expected.buffered(), output.buffered());
+        try std.testing.expect(current.calls > 16);
+        output.end = 0;
+        try std.testing.expectError(error.ProgramLimitExceeded, encodeCellIntoControlled(scratch.allocator(), &output, column, format, cell, expected.end - 1, current.control()));
+        var denied: std.Io.Writer = .fixed(&.{});
+        try std.testing.expectError(error.WriteFailed, encodeCellIntoControlled(scratch.allocator(), &denied, column, format, cell, buffer.len, current.control()));
+    }
 }

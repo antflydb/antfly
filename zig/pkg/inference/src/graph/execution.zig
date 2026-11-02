@@ -113,6 +113,10 @@ fn compiledBackendAttachContext(
     requested_backend: ?contracts.BackendKind,
     attention_mode: ?cache_mod.AttentionMode,
 ) compiled_backend.AttachContext {
+    const Pipeline = switch (@typeInfo(@TypeOf(pipeline))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(pipeline),
+    };
     return .{
         .cb = &pipeline.cb,
         .requested_backend = requested_backend,
@@ -123,6 +127,7 @@ fn compiledBackendAttachContext(
         .gpt_config = pipeline.gpt_config,
         .kv_dtype = pipeline.kv_dtype,
         .shared_moe_cache = pipeline.shared_moe_cache,
+        .device_memory_budget = if (@hasField(Pipeline, "device_memory_budget")) pipeline.device_memory_budget else null,
         .attention_mode = attention_mode,
         .attachment_target = pipeline.compiled_attachment_target,
     };

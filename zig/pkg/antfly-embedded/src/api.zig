@@ -16,6 +16,7 @@
 const embedded = @import("embedded_api_surface");
 
 pub const OpenOptions = embedded.OpenOptions;
+pub const OperationContext = embedded.OperationContext;
 pub const Api = embedded.Api;
 pub const checkLiteFileJson = embedded.checkLiteFileJson;
 pub const copyStableLiteSnapshotFileJson = embedded.copyStableLiteSnapshotFileJson;

@@ -1,0 +1,9 @@
+{
+  "baseline_head": "b79388a7d67f812f46d34c75cabe404836ed2a6a",
+  "binary_sha256": "4e2f6b2ca83f6f9b7eec315558e6b4c9f3f2e90b60f935fb4997aa6fbcdcb69c",
+  "build_steps_passed": 45,
+  "default_connector_enabled": true,
+  "startup_reached_public_listener": true,
+  "shutdown_exit_code": 0,
+  "qualification": false
+}

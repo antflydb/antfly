@@ -76,6 +76,7 @@ pub const CredentialSource = union(enum) {
 /// invocation. Computing a residual timeout for every network hop prevents a
 /// credential refresh from restarting the caller's timeout budget.
 pub const RequestContext = struct {
+    execution_wait: ?httpx.socket.WriteControl = null,
     deadline_ns: ?i96 = null,
     cancellation: ?CancellationToken = null,
 
@@ -94,11 +95,21 @@ pub const RequestContext = struct {
         return .{ .deadline_ns = deadline_ns, .cancellation = cancellation };
     }
 
+    pub fn withExecutionWait(self: RequestContext, control: ?httpx.socket.WriteControl) RequestContext {
+        var result = self;
+        result.execution_wait = control;
+        return result;
+    }
+
     pub fn isBounded(self: RequestContext) bool {
-        return self.deadline_ns != null or self.cancellation != null;
+        return self.deadline_ns != null or self.cancellation != null or self.execution_wait != null;
     }
 
     pub fn check(self: RequestContext, io: std.Io) !void {
+        if (self.execution_wait) |control| control.check() catch |err| return switch (err) {
+            error.Canceled => error.Cancelled,
+            else => err,
+        };
         if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         if (self.deadline_ns) |deadline| {
             if (std.Io.Timestamp.now(io, .awake).toNanoseconds() >= deadline) return error.Timeout;
@@ -131,8 +142,13 @@ pub const RequestContext = struct {
         try self.check(io);
         const remaining_ms = try self.remainingTimeoutMs(io);
         const poll_ms: u64 = @min(remaining_ms orelse 5, 5);
-        io.sleep(.fromMilliseconds(@intCast(@max(poll_ms, 1))), .awake) catch |err| switch (err) {
-            error.Canceled => return error.Cancelled,
+        const duration = std.Io.Duration.fromMilliseconds(@intCast(@max(poll_ms, 1)));
+        (if (self.execution_wait) |control|
+            control.withWait(std.Io.sleep, .{ io, duration, std.Io.Clock.awake })
+        else
+            io.sleep(duration, .awake)) catch |err| {
+            try self.check(io);
+            return if (err == error.Canceled) error.Cancelled else err;
         };
         try self.check(io);
     }
@@ -218,13 +234,23 @@ pub const CredentialCache = struct {
     fn getWithContext(self: *CredentialCache, result_alloc: std.mem.Allocator, cache_alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, context: RequestContext) !Credentials {
         var lease = try self.getLeaseForSourceWithContext(cache_alloc, http, region, .default, context);
         defer lease.release();
-        return try lease.credentials().clone(result_alloc);
+        var result = try lease.credentials().clone(result_alloc);
+        errdefer result.deinit(result_alloc);
+        try context.check(http.io);
+        return result;
     }
 
     pub fn getForSourceWithContext(self: *CredentialCache, result_alloc: std.mem.Allocator, cache_alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource, context: RequestContext) !Credentials {
-        var lease = try self.getLeaseForSourceWithContext(cache_alloc, http, region, source, context);
+        return self.getForSourceWithContextAndIo(result_alloc, cache_alloc, http, null, region, source, context);
+    }
+
+    pub fn getForSourceWithContextAndIo(self: *CredentialCache, result_alloc: std.mem.Allocator, cache_alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, region: []const u8, source: CredentialSource, context: RequestContext) !Credentials {
+        var lease = try self.getLeaseForSourceWithContextAndIo(cache_alloc, http, filesystem_io, region, source, context);
         defer lease.release();
-        return try lease.credentials().clone(result_alloc);
+        var result = try lease.credentials().clone(result_alloc);
+        errdefer result.deinit(result_alloc);
+        try context.check(http.io);
+        return result;
     }
 
     /// Returns a ref-counted immutable credential snapshot. Storage clients use
@@ -290,7 +316,7 @@ pub const CredentialCache = struct {
                 if (std.mem.eql(u8, &snapshot.source_key, &source_key) and snapshot.credentials.isFresh(now)) {
                     snapshot.retain();
                     self.mutex.unlock(io);
-                    return .{ .snapshot = snapshot };
+                    return checkedLease(snapshot, context, io);
                 }
             }
 
@@ -301,7 +327,7 @@ pub const CredentialCache = struct {
                     if (std.mem.eql(u8, &snapshot.source_key, &source_key) and snapshot.credentials.isUnexpired(now)) {
                         snapshot.retain();
                         self.mutex.unlock(io);
-                        return .{ .snapshot = snapshot };
+                        return checkedLease(snapshot, context, io);
                     }
                 }
                 if (context.isBounded()) {
@@ -317,6 +343,10 @@ pub const CredentialCache = struct {
             self.mutex.unlock(io);
 
             var fresh = resolveCredentialsUncachedWithContextAndIo(alloc, http, filesystem_io, region, source, context) catch |err| {
+                context.check(io) catch |original| {
+                    self.finishFailedRefresh(io);
+                    return original;
+                };
                 const request_aborted = err == error.Timeout or err == error.Cancelled or err == error.Canceled;
                 if (request_aborted) {
                     self.finishFailedRefresh(io);
@@ -338,16 +368,23 @@ pub const CredentialCache = struct {
                 self.refreshed.broadcast(io);
                 self.mutex.unlock(io);
                 if (closing) return error.CredentialCacheClosed;
-                if (fallback) |snapshot| return .{ .snapshot = snapshot };
+                if (fallback) |snapshot| return checkedLease(snapshot, context, io);
                 return err;
             };
-            errdefer fresh.deinit(alloc);
+            var fresh_owned = true;
+            errdefer if (fresh_owned) fresh.deinit(alloc);
+            context.check(io) catch |err| {
+                fresh.deinit(alloc);
+                fresh_owned = false;
+                self.finishFailedRefresh(io);
+                return err;
+            };
             const snapshot = alloc.create(Snapshot) catch |err| {
                 self.finishFailedRefresh(io);
                 return err;
             };
             snapshot.* = .{ .alloc = alloc, .source_key = source_key, .credentials = fresh };
-            fresh = undefined;
+            fresh_owned = false;
 
             self.mutex.lockUncancelable(io);
             if (self.closing) {
@@ -364,8 +401,15 @@ pub const CredentialCache = struct {
             self.refreshed.broadcast(io);
             self.mutex.unlock(io);
             if (old) |previous| previous.release();
-            return .{ .snapshot = snapshot };
+            return checkedLease(snapshot, context, io);
         }
+    }
+
+    fn checkedLease(snapshot: *Snapshot, context: RequestContext, io: std.Io) !Lease {
+        var lease: Lease = .{ .snapshot = snapshot };
+        errdefer lease.release();
+        try context.check(io);
+        return lease;
     }
 
     fn finishFailedRefresh(self: *CredentialCache, io: std.Io) void {
@@ -433,6 +477,7 @@ fn credentialHttpRequest(
     options.timeout_ms = try context.remainingTimeoutMs(http.io);
     options.cookies_enabled = false;
     options.cancellation = context.httpCancellation();
+    options.socket_control = context.execution_wait;
     return http.request(method, url, options) catch |err| switch (err) {
         error.Timeout, error.Cancelled, error.Canceled => err,
         else => error.MissingAwsCredentials,
@@ -472,12 +517,12 @@ fn resolveCredentialsUncachedWithContextAndIo(
             // A configured browser or role identity is authoritative. Never fall through
             // to instance metadata or a stale static key when its login expires.
             if (builtin.os.tag != .freestanding) {
-                const resolved = try cloud_credentials.resolveAwsProfile(alloc, filesystem_io orelse http.io, profile);
+                const resolved = try cloud_credentials.resolveAwsProfileWithControl(alloc, filesystem_io orelse http.io, profile, context.execution_wait);
                 defer alloc.free(resolved.login_profile);
                 if (resolved.requires_export)
                     break :blk try credentialsFromExportedProfile(alloc, http, filesystem_io, profile, context);
             }
-            if (credentialsFromSharedFiles(alloc, filesystem_io, profile, null)) |creds| break :blk creds else |_| {}
+            if (credentialsFromSharedFilesWithContext(alloc, filesystem_io, profile, null, context)) |creds| break :blk creds else |_| {}
             try context.check(http.io);
             if (credentialsFromEcsMetadata(alloc, http, filesystem_io, context)) |creds| break :blk creds else |err| switch (err) {
                 error.Timeout, error.Cancelled, error.Canceled => return err,
@@ -494,18 +539,18 @@ fn resolveCredentialsUncachedWithContextAndIo(
 
 fn credentialsFromProfile(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, profile: ProfileCredentialSource, context: RequestContext) !Credentials {
     if (builtin.os.tag != .freestanding and profile.shared_credentials_file == null) {
-        const resolved = try cloud_credentials.resolveAwsProfile(alloc, filesystem_io orelse http.io, profile.name);
+        const resolved = try cloud_credentials.resolveAwsProfileWithControl(alloc, filesystem_io orelse http.io, profile.name, context.execution_wait);
         defer alloc.free(resolved.login_profile);
         if (resolved.requires_export)
             return credentialsFromExportedProfile(alloc, http, filesystem_io, profile.name, context);
     }
-    return credentialsFromSharedFiles(alloc, filesystem_io, profile.name, profile.shared_credentials_file);
+    return credentialsFromSharedFilesWithContext(alloc, filesystem_io, profile.name, profile.shared_credentials_file, context);
 }
 
 fn credentialsFromExportedProfile(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, profile: []const u8, context: RequestContext) !Credentials {
     try context.check(http.io);
     const timeout_ms = @min(try context.remainingTimeoutMs(http.io) orelse 30_000, 30_000);
-    var exported = try cloud_credentials.exportAwsCredentials(alloc, filesystem_io orelse http.io, profile, timeout_ms, context.cancellation);
+    var exported = try cloud_credentials.exportAwsCredentialsWithControl(alloc, filesystem_io orelse http.io, profile, timeout_ms, context.cancellation, context.execution_wait);
     defer exported.deinit();
     try context.check(http.io);
     return credentialsFromTemporaryExport(alloc, exported.value, try currentUnixSeconds());
@@ -532,6 +577,10 @@ pub fn testBrowserProfileCredentialExpiration() !void {
 }
 
 fn credentialsFromSharedFiles(alloc: std.mem.Allocator, filesystem_io: ?std.Io, profile: []const u8, explicit_path: ?[]const u8) !Credentials {
+    return credentialsFromSharedFilesWithContext(alloc, filesystem_io, profile, explicit_path, .{});
+}
+
+fn credentialsFromSharedFilesWithContext(alloc: std.mem.Allocator, filesystem_io: ?std.Io, profile: []const u8, explicit_path: ?[]const u8, context: RequestContext) !Credentials {
     const path = if (explicit_path) |value| try alloc.dupe(u8, value) else getEnvOwned(alloc, "AWS_SHARED_CREDENTIALS_FILE") orelse blk: {
         const home = getEnvOwned(alloc, "HOME") orelse return error.MissingAwsCredentials;
         defer alloc.free(home);
@@ -541,7 +590,10 @@ fn credentialsFromSharedFiles(alloc: std.mem.Allocator, filesystem_io: ?std.Io, 
     var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const io = filesystem_io orelse io_impl.?.io();
-    const data = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch return error.MissingAwsCredentials;
+    const data = @import("controlled_file.zig").readAlloc(alloc, io, path, 1 << 20, context.execution_wait) catch |err| {
+        if (context.execution_wait) |wait| try wait.check();
+        return if (err == error.Canceled or err == error.Cancelled or err == error.Timeout) err else error.MissingAwsCredentials;
+    };
     defer alloc.free(data);
     return try parseProfileCredentials(alloc, data, profile);
 }
@@ -609,7 +661,7 @@ fn credentialsFromWebIdentityFromEnv(alloc: std.mem.Allocator, http: *httpx.Clie
 
 fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, region: []const u8, identity: WebIdentityCredentialSource, context: RequestContext) !Credentials {
     try context.check(http.io);
-    const token = try webIdentityTokenFileAlloc(alloc, filesystem_io, identity.token_file);
+    const token = try webIdentityTokenFileAllocWithContext(alloc, filesystem_io, identity.token_file, context);
     defer alloc.free(token);
 
     const sts_endpoint = if (identity.sts_endpoint) |endpoint| try alloc.dupe(u8, endpoint) else try std.fmt.allocPrint(alloc, "https://sts.{s}.amazonaws.com", .{region});
@@ -640,11 +692,17 @@ fn webIdentityTokenFileAlloc(
     filesystem_io: ?std.Io,
     path: []const u8,
 ) ![]u8 {
+    return webIdentityTokenFileAllocWithContext(alloc, filesystem_io, path, .{});
+}
+
+fn webIdentityTokenFileAllocWithContext(alloc: std.mem.Allocator, filesystem_io: ?std.Io, path: []const u8, context: RequestContext) ![]u8 {
     var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const io = filesystem_io orelse io_impl.?.io();
-    return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch
-        return error.MissingAwsCredentials;
+    return @import("controlled_file.zig").readAlloc(alloc, io, path, 1 << 20, context.execution_wait) catch |err| {
+        if (context.execution_wait) |wait| try wait.check();
+        return if (err == error.Canceled or err == error.Cancelled or err == error.Timeout) err else error.MissingAwsCredentials;
+    };
 }
 
 fn credentialsFromEcsMetadata(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, context: RequestContext) !Credentials {
@@ -661,7 +719,7 @@ fn credentialsFromEcsMetadata(alloc: std.mem.Allocator, http: *httpx.Client, fil
         return error.MissingAwsCredentials;
     defer alloc.free(url);
 
-    const auth_token = containerAuthorizationToken(alloc, filesystem_io);
+    const auth_token = try containerAuthorizationTokenWithContext(alloc, filesystem_io, context);
     defer if (auth_token) |value| alloc.free(value);
     const headers = if (auth_token) |token| &[_]HeaderPair{.{ "authorization", token }} else &[_]HeaderPair{};
     var resp = try credentialHttpRequest(http, context, .GET, url, .{ .headers = headers });
@@ -726,18 +784,26 @@ fn imdsToken(alloc: std.mem.Allocator, http: *httpx.Client, endpoint: []const u8
     return try alloc.dupe(u8, std.mem.trim(u8, body, " \t\r\n"));
 }
 
-fn containerAuthorizationToken(alloc: std.mem.Allocator, filesystem_io: ?std.Io) ?[]u8 {
+fn containerAuthorizationTokenWithContext(alloc: std.mem.Allocator, filesystem_io: ?std.Io, context: RequestContext) !?[]u8 {
     if (getEnvOwned(alloc, "AWS_CONTAINER_AUTHORIZATION_TOKEN")) |token| return token;
     const token_file = getEnvOwned(alloc, "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") orelse return null;
     defer alloc.free(token_file);
-    return containerAuthorizationTokenFileAlloc(alloc, filesystem_io, token_file) catch null;
+    return containerAuthorizationTokenFileAllocWithContext(alloc, filesystem_io, token_file, context) catch |err| {
+        if (context.execution_wait) |wait| try wait.check();
+        if (err == error.Canceled or err == error.Cancelled or err == error.Timeout) return err;
+        return null;
+    };
 }
 
 fn containerAuthorizationTokenFileAlloc(alloc: std.mem.Allocator, filesystem_io: ?std.Io, token_file: []const u8) ![]u8 {
+    return containerAuthorizationTokenFileAllocWithContext(alloc, filesystem_io, token_file, .{});
+}
+
+fn containerAuthorizationTokenFileAllocWithContext(alloc: std.mem.Allocator, filesystem_io: ?std.Io, token_file: []const u8, context: RequestContext) ![]u8 {
     var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const io = filesystem_io orelse io_impl.?.io();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io, token_file, alloc, .limited(1 << 20));
+    const raw = try @import("controlled_file.zig").readAlloc(alloc, io, token_file, 1 << 20, context.execution_wait);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == raw.len) return raw;
     const out = alloc.dupe(u8, trimmed) catch |err| {
@@ -1111,4 +1177,41 @@ pub fn endpointBaseAlloc(alloc: std.mem.Allocator, endpoint: []const u8) ![]u8 {
     while (end > 0 and endpoint[end - 1] == '/') end -= 1;
     if (end == 0) return error.InvalidEndpoint;
     return try alloc.dupe(u8, endpoint[0..end]);
+}
+
+test "AWS credential files keep bounded chunked reads under execution control" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try a.alloc(u8, 40 * 1024);
+    defer a.free(data);
+    @memset(data, 'x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "large-token", .data = data });
+    const path = try tmp.dir.realPathFileAlloc(io, "large-token", a);
+    defer a.free(path);
+    const State = struct {
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.begins += 1;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.ends += 1;
+        }
+    };
+    var state: State = .{};
+    const control: httpx.socket.WriteControl = .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end };
+    const read = try @import("controlled_file.zig").readAlloc(a, io, path, data.len, control);
+    defer a.free(read);
+    try std.testing.expectEqualSlices(u8, data, read);
+    // Open, three bounded reads and the EOF probe each have a paired return.
+    try std.testing.expectEqual(@as(usize, 5), state.begins);
+    try std.testing.expectEqual(state.begins, state.ends);
+    try std.testing.expectError(error.StreamTooLong, @import("controlled_file.zig").readAlloc(a, io, path, data.len - 1, control));
+    try std.testing.expectEqual(state.begins, state.ends);
+    try std.testing.expectError(error.StreamTooLong, @import("controlled_file.zig").readAlloc(a, io, path, 0, control));
+    try std.testing.expectEqual(state.begins, state.ends);
 }

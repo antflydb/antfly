@@ -46,11 +46,13 @@ export function stringifyMemoryJSON(value: unknown): string {
 /** Use the same auth/configuration as ordinary requests with an exact numeric codec. */
 export function createMemoryClient(
   baseUrl: string,
-  headers: Record<string, string>
+  headers: Record<string, string>,
+  fetchRequest?: typeof globalThis.fetch
 ): Client<MemoryPaths> {
   const transport = createClient<MemoryPaths>({
     baseUrl,
     headers,
+    fetch: fetchRequest,
     bodySerializer: stringifyMemoryJSON,
   });
   // openapi-fetch's default JSON parsing rounds numbers, including on its error

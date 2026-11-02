@@ -103,10 +103,10 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         if (backend_options.storage) |storage| {
             backend.storage = storage;
         } else {
-            const owned = try std.heap.page_allocator.create(storage_io.NativeStorage);
-            errdefer std.heap.page_allocator.destroy(owned);
+            const owned = try backend.allocator.create(storage_io.NativeStorage);
+            errdefer backend.allocator.destroy(owned);
             owned.* = try storage_io.NativeStorage.initWithPool(
-                std.heap.page_allocator,
+                backend.allocator,
                 backend_options.io_runtime,
                 backend_options.native_storage_pool,
             );
@@ -303,6 +303,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
             };
         }
     }
+    if (@hasDecl(BackendType, "drainManifestPreparations")) backend.drainManifestPreparations();
     if (@hasDecl(BackendType, "drainRetiredLedgers")) backend.drainRetiredLedgers();
     if (@hasDecl(BackendType, "drainRetiredMemtables")) backend.drainRetiredMemtables();
     if (@hasField(BackendType, "mutable_read_snapshot")) {
@@ -313,7 +314,8 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     backend.mutable.deinit(backend.allocator);
     if (@hasField(BackendType, "immutable_memtables")) {
-        for (backend.immutable_memtables.items) |state| {
+        const head = if (@hasField(BackendType, "immutable_head")) backend.immutable_head else 0;
+        for (backend.immutable_memtables.items[head..]) |state| {
             state.deinit(backend.allocator);
             backend.allocator.destroy(state);
         }
@@ -328,6 +330,14 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
             backend.allocator.destroy(state);
         }
         backend.retired_immutable_memtables.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "admitted_retired_immutable")) {
+        var retired = backend.admitted_retired_immutable;
+        while (retired) |state| {
+            retired = state.admitted_retired_next;
+            state.deinit(backend.allocator);
+            backend.allocator.destroy(state);
+        }
     }
     if (@hasField(BackendType, "immutable_memtable_pins")) {
         backend.immutable_memtable_pins.deinit(backend.allocator);
@@ -389,7 +399,9 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (@hasDecl(BackendType, "deinitRunSources")) backend.deinitRunSources();
     if (@hasField(BackendType, "local_reader")) backend.local_reader.deinit();
     if (@hasField(BackendType, "point_reader")) backend.point_reader.deinit();
-    if (@hasField(BackendType, "run_block_cache")) {
+    if (@hasDecl(BackendType, "deinitRunBlockCache")) {
+        backend.deinitRunBlockCache();
+    } else if (@hasField(BackendType, "run_block_cache")) {
         for (backend.run_block_cache.items) |*cached| cached.deinit(backend.allocator);
         backend.run_block_cache.deinit(backend.allocator);
         if (@hasField(BackendType, "run_block_cache_bytes")) backend.run_block_cache_bytes = 0;
@@ -416,7 +428,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (@hasField(BackendType, "storage_owner")) {
         if (backend.storage_owner) |owned| {
             owned.deinit();
-            std.heap.page_allocator.destroy(owned);
+            backend.allocator.destroy(owned);
         }
     }
     if (backend.root_dir) |root_dir| backend.allocator.free(root_dir);

@@ -76,18 +76,10 @@ pub const Cache = struct {
     fn resolveWithEntryLimit(self: *Cache, io: std.Io, alloc: std.mem.Allocator, json: []const u8, id: u64, physical_name: []const u8, requested_limit: usize) !catalog.Table {
         const limit = @min(entry_budget, requested_limit);
         const cached = if (json.len <= limit) self.acquire(io, alloc, json, limit) catch |err| switch (err) {
-            error.SchemaCacheEntryTooLarge => null,
+            error.SchemaCacheEntryTooLarge, error.SqlPlanCacheBusy => null,
             else => return err,
         } else null;
-        const entry = cached orelse {
-            // Cache admission is optional. The statement allocator remains the
-            // authority for layouts that exceed the compact retention budget.
-            try io.checkCancel();
-            var layout: Layout = .{};
-            try derive(&layout, json, alloc, alloc);
-            try io.checkCancel();
-            return layout.table(id, physical_name);
-        };
+        const entry = cached orelse return resolveUncached(io, alloc, json, id, physical_name);
         defer {
             self.mutex.lockUncancelable(io);
             entry.refs -= 1;
@@ -114,6 +106,16 @@ pub const Cache = struct {
         }
         return .{ .external_base_source = if (entry.layout.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.layout.version, .storage_mode = entry.layout.storage_mode, .columns = columns, .indexes = indexes, .constraints = constraints };
     }
+    /// Derive entirely within caller storage. Reserved continuation validation
+    /// must not acquire optional cache memory or depend on available cache slots.
+    pub fn resolveUncached(io: std.Io, alloc: std.mem.Allocator, json: []const u8, id: u64, physical_name: []const u8) !catalog.Table {
+        try io.checkCancel();
+        var layout: Layout = .{};
+        try derive(&layout, json, alloc, alloc);
+        try io.checkCancel();
+        return layout.table(id, physical_name);
+    }
+
     fn acquire(self: *Cache, io: std.Io, scratch: std.mem.Allocator, json: []const u8, limit: usize) !*Entry {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(json, &digest, .{});
@@ -492,4 +494,30 @@ test "external lake SQL schema cache separates wide source derivation scratch fr
         };
         try std.testing.expectEqual(@as(usize, 1), entries);
     }
+}
+
+test "SQL schema cache busy derives in caller storage without acquiring cache backing" {
+    const a = std.testing.allocator;
+    var unavailable = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var cache = Cache.init(unavailable.allocator());
+    defer cache.deinit();
+    // Model all four builder slots occupied; no background worker is spawned.
+    cache.builds = 4;
+    for (cache.slots[0..4]) |*slot| slot.building = true;
+    defer {
+        cache.builds = 0;
+        for (cache.slots[0..4]) |*slot| slot.building = false;
+    }
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const table = try cache.resolve(std.testing.io, arena.allocator(), json, 7, "private-7");
+    try std.testing.expectEqual(@as(u64, 7), table.id);
+    try std.testing.expectEqual(@as(u32, 1), table.schema_version);
+    try std.testing.expectEqual(@as(usize, 1), table.columns.len);
+    try std.testing.expectEqualStrings("n", table.columns[0].name);
+    try std.testing.expect(!unavailable.has_induced_failure);
+    for (cache.slots) |slot| try std.testing.expect(slot.entry == null);
 }

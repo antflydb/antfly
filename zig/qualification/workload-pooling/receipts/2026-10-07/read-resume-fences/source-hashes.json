@@ -1,0 +1,11 @@
+{
+  "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "7c01918fde064aa99128429ff99b1c8c53012eff11a0db6a79b43adde5f22a01",
+  "zig/pkg/antfly-embedded/src/source_catalog.zig": "bd78edb171d524b9e341f6b719411769c7f674082ae8146019c72755bba26beb",
+  "zig/pkg/antfly-embedded/src/usermgr/user_manager.zig": "05492406a21aeef96ef7aabe937017c2ba5302ef5da8a55fc0aed834a9baa64c",
+  "zig/pkg/antfly-embedded/src/sql/read_fence.zig": "b4c1058ea2cfb8dc3aec9b15d88b1385c9461b4e1bac497e93863de08b3beef4",
+  "zig/pkg/antfly/build/api_tests.zig": "66f4497707a0170ce0c32575a924defea334bb371569a73ffbc133f0fa231f2a",
+  "zig/pkg/antfly/src/api/http_server.zig": "63de3b5501895ed4403412be63fb44e32e10671939ab3f39684d370c94bc06f4",
+  "zig/pkg/antfly/src/api/sql_execution.zig": "9af91374c42f8e9b834a84801a501c1aba35ee959cd67e510d1e81c4345d48a3",
+  "zig/pkg/antfly/src/api/sql_pgwire.zig": "e118931d1d7a52d1674acdab809850ce56423009e86f2e2cf26b31ebac01f1ad",
+  "zig/pkg/antfly/src/api_http_runtime_test_root.zig": "b293af77fe25311feda97e9d52043ad2cbd9a0e23b4cf5849a5b3a07041163c1"
+}

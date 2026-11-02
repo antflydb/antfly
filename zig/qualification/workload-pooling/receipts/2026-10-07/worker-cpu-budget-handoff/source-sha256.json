@@ -1,0 +1,7 @@
+{
+  "zig/pkg/inference/src/host/bridge.zig": "9157f112c6191f5e44d3343741d138035999be49696f10b37235af41dbd28c4e",
+  "zig/pkg/inference/src/host/host.zig": "38f0cc56a2071704b14e9166ec9f131573bd4603e52cbf55a94c0b786a4315c2",
+  "zig/pkg/inference/src/host/worker.zig": "ac2f920973c7045630cb98316d44f3512353836d21f456772b6cb45b245bc9ff",
+  "zig/pkg/inference/src/host/worker_wire.zig": "9fccb0482f6584dc69fb089d7879fa5474ce08162896370a24553f5f88fc0dd3",
+  "zig/pkg/antfly/build/api_tests.zig": "443567dd0835720efc90f9b3ce6288d9c4938e45759701c136755555830479c6"
+}

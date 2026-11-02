@@ -129,6 +129,10 @@ pub const Runtime = struct {
         if (self.external) |runtime| return runtime.vtable.stop(runtime.ptr);
         return self.local.?.stop();
     }
+    pub fn stopWithAdmission(self: *Runtime, original: @import("../../../common/read_admission.zig").Port) !void {
+        if (self.external) |runtime| return try runtime.stopWithAdmission(original);
+        return try self.local.?.stopWithAdmission(original);
+    }
     pub fn pause(self: *Runtime) bool {
         if (self.external) |runtime| return runtime.vtable.pause(runtime.ptr);
         return self.local.?.pause();

@@ -121,7 +121,7 @@ pub const Collector = struct {
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         const a = scratch.allocator();
-        var binding: ?@import("lake_cloud_publication.zig").Binding = if (self.store.providerStore()) |object| try @import("lake_cloud_publication.zig").Binding.init(std.heap.page_allocator, object, publication, self.cancellation()) else null;
+        var binding: ?@import("lake_cloud_publication.zig").Binding = if (self.store.providerStore()) |object| try @import("lake_cloud_publication.zig").Binding.initFor(std.heap.page_allocator, object, publication, self.cancellation(), self.context) else null;
         defer if (binding) |*value| value.deinit();
         var hydrated = publication;
         if (hydrated.directory) |directory| {
@@ -174,7 +174,7 @@ pub const Collector = struct {
                 pub fn record(_: *@This(), _: @import("../serverless/artifacts/cloud_generations.zig").Record) !void {}
             };
             var visitor: Visitor = .{ .collector = self };
-            try held.reader.walk(self.a, &visitor, self.cancellation());
+            try held.reader.walkFor(self.a, &visitor, self.cancellation(), self.context);
         }
     }
     pub fn cancellation(self: *Collector) @import("antfly_cancellation").CancellationToken {

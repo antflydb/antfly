@@ -41,15 +41,105 @@ fn main() {
         .generate_tokens(&openapi)
         .expect("failed to generate client");
 
-    let ast = syn::parse2(tokens).expect("failed to parse generated tokens");
+    let mut ast: syn::File = syn::parse2(tokens).expect("failed to parse generated tokens");
+    inject_request_admission(&mut ast);
     let mut code = prettyplease::unparse(&ast);
     inject_create_index_validation(&mut code);
     inject_create_table_validation(&mut code);
     inject_mutation_success_decoding(&mut code);
+    assert_eq!(code.matches(".connect_timeout(dur)").count(), 1);
+    code = code.replace(".connect_timeout(dur)", ".pool_max_idle_per_host(crate::RequestAdmissionConfig::default().max_active).redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).connect_timeout(dur)");
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("client.rs");
     fs::write(&out_path, code).expect("failed to write generated client");
+}
+
+// Adapt the generator AST, never the generated output. Every request acquires
+// before URL/body construction, and transfers the permit into the response body.
+fn inject_request_admission(file: &mut syn::File) {
+    use syn::visit_mut::{self, VisitMut};
+    struct Transport {
+        count: usize,
+    }
+    impl VisitMut for Transport {
+        fn visit_expr_mut(&mut self, expression: &mut syn::Expr) {
+            if let syn::Expr::Await(awaited) = expression {
+                if let syn::Expr::MethodCall(call) = &*awaited.base {
+                    if call.method == "exec" {
+                        assert!(
+                            matches!(&*call.receiver, syn::Expr::Path(p) if p.path.is_ident("self"))
+                        );
+                        let original = expression.clone();
+                        *expression = syn::parse_quote! {
+                            crate::request_admission::retain_response(#original, __antfly_admission_permit)
+                        };
+                        self.count += 1;
+                        return;
+                    }
+                }
+            }
+            visit_mut::visit_expr_mut(self, expression);
+        }
+    }
+    let mut fields = 0;
+    let mut constructors = 0;
+    let mut methods = 0;
+    for item in &mut file.items {
+        match item {
+            syn::Item::Struct(item) if item.ident == "Client" => {
+                let syn::Fields::Named(named) = &mut item.fields else {
+                    panic!("Client fields changed")
+                };
+                named
+                    .named
+                    .push(syn::parse_quote! { pub(crate) admission: crate::RequestAdmission });
+                fields += 1;
+            }
+            syn::Item::Impl(item)
+                if matches!(&*item.self_ty, syn::Type::Path(p) if p.path.is_ident("Client"))
+                    && item.trait_.is_none() =>
+            {
+                for member in &mut item.items {
+                    let syn::ImplItem::Fn(function) = member else {
+                        continue;
+                    };
+                    if function.sig.ident == "new_with_client" {
+                        let Some(syn::Stmt::Expr(syn::Expr::Struct(value), None)) =
+                            function.block.stmts.last_mut()
+                        else {
+                            panic!("Client constructor changed")
+                        };
+                        assert!(value.path.is_ident("Self"));
+                        value.fields.push(
+                            syn::parse_quote! { admission: crate::RequestAdmission::default() },
+                        );
+                        constructors += 1;
+                    }
+                    if function.sig.asyncness.is_some() {
+                        let mut transport = Transport { count: 0 };
+                        transport.visit_block_mut(&mut function.block);
+                        assert_eq!(
+                            transport.count, 1,
+                            "every async operation must have one transport"
+                        );
+                        function.block.stmts.insert(
+                            0,
+                            syn::parse_quote! {
+                                let __antfly_admission_permit = self.admission.acquire().await
+                                    .map_err(|error| Error::Custom(error.to_string()))?;
+                            },
+                        );
+                        methods += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(fields, 1);
+    assert_eq!(constructors, 1);
+    assert!(methods > 0, "no generated requests were protected");
 }
 
 // Progenitor includes `default` in its success response set, so a typed 200

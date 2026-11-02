@@ -18,6 +18,31 @@
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
+mod request_admission;
+pub use request_admission::{
+    ClientCapacityError, RequestAdmission, RequestAdmissionConfig, RequestAdmissionStats,
+    client_capacity_error,
+};
+
+impl Client {
+    /// Share a bounded request owner with this handle. Existing clones retain
+    /// their previous owner; clones created afterward share the supplied owner.
+    pub fn with_request_admission(mut self, admission: RequestAdmission) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    pub fn request_admission(&self) -> &RequestAdmission {
+        &self.admission
+    }
+
+    /// Reject new and queued requests across every handle sharing this owner.
+    /// Active response bodies retain capacity until EOF, failure or drop.
+    pub fn close(&self) {
+        self.admission.close();
+    }
+}
+
 pub const MAX_ARTIFACT_SOURCES: usize = 64;
 
 /// A successful metadata mutation. `Committed` is not a failed write: observe
@@ -581,6 +606,9 @@ pub fn new_client_with_token(
         HeaderValue::from_str(&format!("Bearer {token}"))?,
     );
     let http_client = reqwest::Client::builder()
+        .pool_max_idle_per_host(RequestAdmissionConfig::default().max_active)
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .default_headers(headers)
         .build()?;
     Ok(new_client(base_url, http_client))

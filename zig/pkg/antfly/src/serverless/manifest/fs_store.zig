@@ -22,7 +22,10 @@ const manifest_codec = @import("codec.zig");
 const manifest_store = @import("store.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
+const Provider = @import("../provider_operation.zig");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 pub const FsStore = struct {
+    operation: ?Provider.Operation = null,
     alloc: Allocator,
     root_dir: []u8,
     durable_dirs: @import("objectstore").durable_directory.Cache = .{},
@@ -89,10 +92,60 @@ pub const FsStore = struct {
         };
     }
 
+    fn putFor(raw: *anyopaque, manifest: manifest_types.Manifest, context: Context) !void {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        var native: Provider.Native = undefined;
+        try native.init(context, .none);
+        defer native.deinit();
+        var guard: Provider.Guard = .{ .original = native.operation };
+        defer guard.deinit();
+        try guard.lock(&self.mutex);
+        const op = guard.operation();
+        const io = try op.receiver();
+        var view = scoped(raw, op.context, .none);
+        const namespace_dir = try std.fs.path.join(self.alloc, &.{ self.root_dir, manifest.namespace });
+        defer self.alloc.free(namespace_dir);
+        try self.durable_dirs.ensureWithControl(self.alloc, io, namespace_dir, op.control());
+        var mutation_lock = try view.lockManifestMutations(io, manifest.namespace);
+        defer mutation_lock.close(io);
+        var mutation_locked = true;
+        defer if (mutation_locked) mutation_lock.unlock(io);
+        const path = try manifestPathAlloc(self.alloc, self.root_dir, manifest.namespace, manifest.version);
+        defer self.alloc.free(path);
+        const encoded = try manifest_codec.encodeAlloc(self.alloc, manifest);
+        defer self.alloc.free(encoded);
+        const parent = std.fs.path.dirname(path) orelse ".";
+        try self.durable_dirs.ensureWithControl(self.alloc, io, parent, op.control());
+        const existing = op.readFile(self.alloc, path, encoded.len) catch |err| switch (err) {
+            error.FileNotFound => null,
+            error.StreamTooLong => return error.ManifestVersionAlreadyExists,
+            else => return err,
+        };
+        if (existing) |bytes| {
+            defer self.alloc.free(bytes);
+            if (!std.mem.eql(u8, bytes, encoded)) return error.ManifestVersionAlreadyExists;
+            try op.control().withWait(fs_paths.syncDirPortable, .{ io, parent });
+        } else {
+            writeManifestFor(self.alloc, path, encoded, manifest.publication_fencing_token, &op) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    const winner = try op.readFile(self.alloc, path, encoded.len);
+                    defer self.alloc.free(winner);
+                    if (!std.mem.eql(u8, winner, encoded)) return error.ManifestVersionAlreadyExists;
+                    try op.control().withWait(fs_paths.syncDirPortable, .{ io, parent });
+                },
+                else => return err,
+            };
+        }
+        // Release the cross-process lock before leaving protected CPU return.
+        mutation_lock.unlock(io);
+        mutation_locked = false;
+        try guard.finish();
+    }
+
     pub fn getAlloc(self: *FsStore, alloc: Allocator, namespace: []const u8, version: u64) !manifest_types.Manifest {
         const path = try manifestPathAlloc(alloc, self.root_dir, namespace, version);
         defer alloc.free(path);
-        const raw = try readFileAlloc(alloc, path);
+        const raw = if (self.operation) |op| try op.readFile(alloc, path, std.math.maxInt(usize)) else try readFileAlloc(alloc, path);
         defer alloc.free(raw);
         return try manifest_codec.decodeAlloc(alloc, raw);
     }
@@ -120,6 +173,12 @@ pub const FsStore = struct {
     }
 
     fn getHeadUnlocked(self: *FsStore, namespace: []const u8) !u64 {
+        if (self.operation) |op| {
+            var backend: @import("../catalog/fs_progress_store.zig").FsProgressStore = .{ .alloc = self.alloc, .root_dir = self.root_dir };
+            var progress = backend.progressStore();
+            progress.context = op.context;
+            return progress.getHeadWithCancellation(namespace, op.cancellation);
+        }
         var progress = try @import("../catalog/fs_progress_store.zig").FsProgressStore.init(self.alloc, self.root_dir);
         defer progress.deinit();
         return progress.getHead(namespace);
@@ -141,10 +200,11 @@ pub const FsStore = struct {
     pub fn listVersionsAlloc(self: *FsStore, alloc: Allocator, namespace: []const u8) ![]u64 {
         const path = try std.fs.path.join(alloc, &.{ self.root_dir, namespace, "manifests" });
         defer alloc.free(path);
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        var io_impl: ?std.Io.Threaded = if (self.operation == null) threadedIo() else null;
+        defer if (io_impl) |*value| value.deinit();
+        const io = if (self.operation) |op| try op.receiver() else io_impl.?.io();
+        const control: @import("httpx").socket.WriteControl = if (self.operation) |*op| op.control() else .{};
+        var dir = (if (self.operation) |op| op.openDir(path) else std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true })) catch |err| switch (err) {
             error.FileNotFound => return alloc.alloc(u64, 0),
             else => return err,
         };
@@ -152,7 +212,8 @@ pub const FsStore = struct {
         var versions = std.ArrayListUnmanaged(u64).empty;
         errdefer versions.deinit(alloc);
         var entries = dir.iterate();
-        while (try entries.next(io)) |entry| {
+        while (try control.withWait(std.Io.Dir.Iterator.next, .{ &entries, io })) |entry| {
+            if (self.operation) |op| try op.ready();
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bin")) continue;
             const stem = entry.name[0 .. entry.name.len - 4];
             if (stem.len == 0 or stem[0] == '0') continue;
@@ -173,10 +234,27 @@ pub const FsStore = struct {
 
         const path = try manifestPathAlloc(self.alloc, self.root_dir, namespace, version);
         defer self.alloc.free(path);
-        try deleteFile(path);
+        if (self.operation) |op| try op.removeFile(path) else try deleteFile(path);
     }
 
     fn lockManifestMutations(self: *FsStore, io: std.Io, namespace: []const u8) !std.Io.File {
+        if (self.operation) |op| {
+            const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, namespace, "MANIFEST_MUTATIONS.lock" });
+            defer self.alloc.free(path);
+            const control = op.control();
+            try op.ready();
+            try control.withWait(fs_paths.createDirPathPortable, .{ io, std.fs.path.dirname(path).? });
+            var rejected = false;
+            const Close = struct {
+                fn discard(file: std.Io.File, args: anytype) void {
+                    file.close(args[1]);
+                }
+            };
+            const file = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, path, std.Io.Dir.CreateFileOptions{ .truncate = false, .read = true } }, Close.discard);
+            errdefer file.close(io);
+            while (!try control.withWait(std.Io.File.tryLock, .{ file, io, std.Io.File.Lock.exclusive })) try op.sleep(1);
+            return file;
+        }
         const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, namespace, "MANIFEST_MUTATIONS.lock" });
         defer self.alloc.free(path);
         try self.durable_dirs.ensure(self.alloc, io, std.fs.path.dirname(path).?);
@@ -188,9 +266,9 @@ pub const FsStore = struct {
 
     pub fn deleteRetiredCandidate(self: *FsStore, namespace: []const u8, version: u64, cutoff: u64) !bool {
         if (cutoff == 0) return error.InvalidPublicationFence;
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
+        var io_impl: ?std.Io.Threaded = if (self.operation == null) threadedIo() else null;
+        defer if (io_impl) |*value| value.deinit();
+        const io = if (self.operation) |op| try op.receiver() else io_impl.?.io();
         var mutation_lock = try self.lockManifestMutations(io, namespace);
         defer mutation_lock.close(io);
         defer mutation_lock.unlock(io);
@@ -207,31 +285,74 @@ pub const FsStore = struct {
     fn cleanupRetiredTemporaries(self: *FsStore, namespace: []const u8, cutoff: u64, cancellation: CancellationToken) !void {
         const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, namespace, "manifests" });
         defer self.alloc.free(path);
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        var io_impl: ?std.Io.Threaded = if (self.operation == null) threadedIo() else null;
+        defer if (io_impl) |*value| value.deinit();
+        const io = if (self.operation) |op| try op.receiver() else io_impl.?.io();
+        const control: @import("httpx").socket.WriteControl = if (self.operation) |*op| op.control() else .{};
+        var dir = (if (self.operation) |op| op.openDir(path) else std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true })) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer dir.close(io);
         var changed = false;
         var entries = dir.iterate();
-        while (try entries.next(io)) |entry| {
+        while (try control.withWait(std.Io.Dir.Iterator.next, .{ &entries, io })) |entry| {
             try cancellation.check();
+            if (self.operation) |op| try op.ready();
             if (entry.kind != .file) continue;
             const token = temporaryPublicationToken(entry.name) orelse continue;
             if (token == 0 or token >= cutoff) continue;
-            dir.deleteFile(io, entry.name) catch |err| switch (err) {
+            control.withWait(std.Io.Dir.deleteFile, .{ dir, io, entry.name }) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
             changed = true;
         }
-        if (changed) try fs_paths.syncDirPortable(io, path);
+        if (changed) try control.withWait(fs_paths.syncDirPortable, .{ io, path });
     }
 
+    fn scoped(raw: *anyopaque, context: Context, cancellation: CancellationToken) FsStore {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return .{ .alloc = self.alloc, .root_dir = self.root_dir, .operation = .{ .context = context, .cancellation = cancellation } };
+    }
+    fn getFor(raw: *anyopaque, a: Allocator, ns: []const u8, version: u64, cancellation: CancellationToken, context: Context) !manifest_types.Manifest {
+        var view = scoped(raw, context, cancellation);
+        var result = try view.getAlloc(a, ns, version);
+        errdefer result.deinit(a);
+        try view.operation.?.ready();
+        return result;
+    }
+    fn listFor(raw: *anyopaque, a: Allocator, ns: []const u8, context: Context) ![]u64 {
+        var view = scoped(raw, context, .none);
+        const result = try view.listVersionsAlloc(a, ns);
+        errdefer a.free(result);
+        try view.operation.?.ready();
+        return result;
+    }
+    fn deleteFor(raw: *anyopaque, ns: []const u8, version: u64, context: Context) !void {
+        var view = scoped(raw, context, .none);
+        try view.deleteVersion(ns, version);
+    }
+    fn candidateFor(raw: *anyopaque, ns: []const u8, version: u64, cutoff: u64, context: Context) !bool {
+        var guard: Provider.Guard = .{ .original = .{ .context = context } };
+        defer guard.deinit();
+        var view = scoped(raw, guard.operation().context, .none);
+        const result = try view.deleteRetiredCandidate(ns, version, cutoff);
+        try guard.finish();
+        return result;
+    }
+    fn cleanupFor(raw: *anyopaque, ns: []const u8, cutoff: u64, cancellation: CancellationToken, context: Context) !void {
+        var view = scoped(raw, context, cancellation);
+        try view.cleanupRetiredTemporaries(ns, cutoff, cancellation);
+        try view.operation.?.ready();
+    }
     const vtable: manifest_store.ManifestStore.VTable = .{
+        .put_for = putFor,
+        .get_alloc_for = getFor,
+        .list_versions_for = listFor,
+        .delete_version_for = deleteFor,
+        .delete_retired_candidate_for = candidateFor,
+        .cleanup_retired_temporaries_for = cleanupFor,
         .deinit = erasedDeinit,
         .put = erasedPut,
         .get_alloc = erasedGetAlloc,
@@ -351,6 +472,40 @@ fn writeFileAtomically(path: []const u8, contents: []const u8, publication_token
     try std.Io.Dir.renamePreserve(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
     owns_temp = false;
     try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
+}
+
+fn cleanupTemporary(io: std.Io, path: []const u8) void {
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+fn discardCreatedFile(file: std.Io.File, args: anytype) void {
+    file.close(args[1]);
+}
+fn writeManifestFor(a: Allocator, path: []const u8, contents: []const u8, token: u64, op: *const Provider.Operation) !void {
+    const io = try op.receiver();
+    const control = op.control();
+    var nonce: [16]u8 = undefined;
+    io.random(&nonce);
+    const temporary = try std.fmt.allocPrint(a, "{s}.tmp-{x:0>16}-{s}", .{ path, token, std.fmt.bytesToHex(&nonce, .lower) });
+    defer a.free(temporary);
+    defer cleanupTemporary(io, temporary);
+    var rejected = false;
+    const file = try control.withOwnedWait(&rejected, std.Io.Dir.createFile, .{ std.Io.Dir.cwd(), io, temporary, std.Io.Dir.CreateFileOptions{ .exclusive = true } }, discardCreatedFile);
+    {
+        defer file.close(io);
+        var offset: usize = 0;
+        while (offset < contents.len) {
+            try op.ready();
+            const end = offset + @min(contents.len - offset, 64 * 1024);
+            try control.withWait(std.Io.File.writeStreamingAll, .{ file, io, contents[offset..end] });
+            offset = end;
+        }
+        try control.withWait(std.Io.File.sync, .{ file, io });
+    }
+    try control.withWait(std.Io.Dir.renamePreserve, .{ std.Io.Dir.cwd(), temporary, std.Io.Dir.cwd(), path, io });
+    try control.withWait(fs_paths.syncDirPortable, .{ io, std.fs.path.dirname(path) orelse "." });
+    try op.ready();
 }
 
 fn temporaryPublicationToken(name: []const u8) ?u64 {

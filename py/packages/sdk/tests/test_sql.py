@@ -203,13 +203,20 @@ def test_sql_bound_parameters_and_exact_integer_results():
         "rows_affected": 0,
         "command_tag": "SELECT 1",
     }
-    with patch.object(client, "_request", return_value=result) as request:
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json=result)
+
+    with client:
+        client._client.set_httpx_client(httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(respond)))
         response = client.execute_sql(SQLRequest(statement="SELECT $1", parameters=[9223372036854775807]))
     assert response.rows == result["rows"]
-    assert request.call_args.args == ("POST", "/db/v1/sql")
-    assert json.loads(request.call_args.kwargs["content"])["parameters"] == [9223372036854775807]
-    assert request.call_args.kwargs["follow_redirects"] is False
-    assert request.call_args.kwargs["_max_response_bytes"] == 16 << 20
+    assert len(calls) == 1
+    assert calls[0].method == "POST"
+    assert calls[0].url.path == "/db/v1/sql"
+    assert json.loads(calls[0].content)["parameters"] == [9223372036854775807]
 
 
 def test_public_numeric_schema_expression_round_trip_retains_exact_literal_text():
@@ -290,13 +297,22 @@ def test_sql_keeps_committed_repair_receipt():
     assert response.mutation_outcome == result["mutation_outcome"]
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), "x" * (4 << 20)])
+@pytest.mark.parametrize(
+    "value",
+    [float("nan"), float("inf"), -float("inf"), "x" * (4 << 20)],
+    ids=["nan", "infinity", "negative-infinity", "oversized"],
+)
 def test_sql_rejects_invalid_or_oversized_requests_before_dispatch(value):
     client = AntflyClient(base_url="http://localhost:8080")
-    with patch.object(client, "_request") as request:
+
+    def refuse(request):
+        pytest.fail("invalid SQL reached the HTTP transport")
+
+    with client:
+        client._client.set_httpx_client(httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(refuse)))
         with pytest.raises(AntflyException, match="Invalid SQL request"):
             client.execute_sql(SQLRequest(statement="SELECT $1", parameters=[value]))
-    request.assert_not_called()
+        assert client._admission._active == 0
 
 
 def test_generated_sql_disables_redirects_on_borrowed_client():

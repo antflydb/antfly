@@ -101,10 +101,32 @@ pub const GraphLimits = struct {
     }
 };
 
+pub const runnable = @import("runnable_policy.zig");
+pub const Waiting = struct {
+    max_queued_requests: u32 = 0,
+    max_queued_bytes: u64 = 0,
+    max_wait_ms: u32 = 0,
+    pub fn validate(self: @This()) !void {
+        if (self.max_wait_ms > 60_000) return error.InvalidConfig;
+        if (self.max_wait_ms == 0) {
+            if (self.max_queued_requests != 0 or self.max_queued_bytes != 0) return error.InvalidConfig;
+        } else if (self.max_queued_requests == 0 or self.max_queued_bytes == 0) return error.InvalidConfig;
+    }
+};
+pub const Execution = struct {
+    runnable: ?runnable.Config = .{ .capacity_mode = .automatic, .max_bytes = 16 << 20, .control_bytes = 8 << 20 },
+    max_request_duration_ms: u64 = 300_000,
+    max_request_memory_bytes: u64 = 256 << 20,
+    max_retained_memory_bytes: u64 = 256 << 20,
+};
 pub const Resources = struct {
+    execution: Execution = .{},
     memory: Memory = .{},
     query: struct {
-        admission: Admission = .{},
+        admission: struct {
+            max_concurrent_requests: u32 = 32,
+            waiting: ?Waiting = null,
+        } = .{},
         request_limits: struct { graph: GraphLimits = .{} } = .{},
     } = .{},
     write: struct {
@@ -117,6 +139,11 @@ pub const Resources = struct {
     } = .{},
 
     pub fn validate(self: @This()) !void {
+        if (self.execution.runnable) |policy| try policy.validateManagedCleanupCapacity();
+        if (self.query.admission.waiting) |waiting| try waiting.validate();
+        if (self.execution.max_request_duration_ms == 0 or self.execution.max_request_duration_ms > 86_400_000 or
+            self.execution.max_request_memory_bytes < 1 << 20 or self.execution.max_retained_memory_bytes < 1 << 20 or
+            self.execution.max_request_memory_bytes > std.math.maxInt(usize) or self.execution.max_retained_memory_bytes > std.math.maxInt(usize)) return error.InvalidConfig;
         try self.query.request_limits.graph.validate();
         try self.inference.request_limits.validate();
     }
@@ -135,7 +162,12 @@ fn rejectNull(value: std.json.Value) !void {
     if (value == .null) return error.InvalidInferenceConfig;
     if (value == .object) {
         var fields = value.object.iterator();
-        while (fields.next()) |field| try rejectNull(field.value_ptr.*);
+        while (fields.next()) |field| {
+            // Explicit null disables node scheduling; other null policy values
+            // retain the canonical contract's fail-closed validation.
+            if (std.mem.eql(u8, field.key_ptr.*, "runnable")) continue;
+            try rejectNull(field.value_ptr.*);
+        }
     }
 }
 

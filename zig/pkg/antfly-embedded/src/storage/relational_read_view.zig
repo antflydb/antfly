@@ -81,17 +81,31 @@ pub const View = struct {
             self.* = undefined;
         }
     };
-
+    pub const Admission = @import("../common/read_admission.zig").Port;
     pub const VTable = struct {
         range_proofs: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]@import("range_protection.zig").Proof = null,
         next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!Page,
         normalize: ?*const fn (*anyopaque, std.mem.Allocator, []const types.BatchWrite) anyerror![]types.BatchWrite = null,
         close: *const fn (*anyopaque) void,
+        /// Borrowed for one page call only; never retained by the cursor.
+        next_with_admission: ?*const fn (*anyopaque, std.mem.Allocator, u32, Admission) anyerror!Page = null,
+        range_proofs_with_admission: ?*const fn (*anyopaque, std.mem.Allocator, Admission) anyerror![]@import("range_protection.zig").Proof = null,
+        normalize_with_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const types.BatchWrite, Admission) anyerror![]types.BatchWrite = null,
     };
     const Abi = callbacks.Boundary(VTable);
 
     pub fn next(self: View, alloc: std.mem.Allocator, limit: u32) !Page {
         return Abi.call("next", self.boundary_dispatch, self.vtable.next, .{ self.ptr, alloc, limit });
+    }
+    pub fn nextWithAdmission(self: View, alloc: std.mem.Allocator, limit: u32, control: Admission) !Page {
+        try control.checkpoint();
+        var page = if (self.vtable.next_with_admission) |admitted_next|
+            try Abi.call("next_with_admission", self.boundary_dispatch, admitted_next, .{ self.ptr, alloc, limit, control })
+        else
+            try self.next(alloc, limit);
+        errdefer page.deinit();
+        try control.checkpoint();
+        return page;
     }
     pub fn rangeProofs(self: View, alloc: std.mem.Allocator) ![]@import("range_protection.zig").Proof {
         const callback = self.vtable.range_proofs orelse return error.SqlRangeTrackingRequired;
@@ -100,6 +114,26 @@ pub const View = struct {
     pub fn normalize(self: View, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
         const callback = self.vtable.normalize orelse return error.UnsupportedSqlExecution;
         return Abi.call("normalize", self.boundary_dispatch, callback, .{ self.ptr, alloc, writes });
+    }
+    pub fn rangeProofsWithAdmission(self: View, alloc: std.mem.Allocator, control: Admission) ![]@import("range_protection.zig").Proof {
+        try control.checkpoint();
+        const result = if (self.vtable.range_proofs_with_admission) |callback|
+            try Abi.call("range_proofs_with_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, control })
+        else
+            try self.rangeProofs(alloc);
+        errdefer alloc.free(result);
+        try control.checkpoint();
+        return result;
+    }
+    pub fn normalizeWithAdmission(self: View, alloc: std.mem.Allocator, writes: []const types.BatchWrite, control: Admission) ![]types.BatchWrite {
+        try control.checkpoint();
+        const result = if (self.vtable.normalize_with_admission) |callback|
+            try Abi.call("normalize_with_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, writes, control })
+        else
+            try self.normalize(alloc, writes);
+        errdefer types.freeNormalizedWrites(alloc, result);
+        try control.checkpoint();
+        return result;
     }
     pub fn deinit(self: View) void {
         Abi.call("close", self.boundary_dispatch, self.vtable.close, .{self.ptr}) catch unreachable;

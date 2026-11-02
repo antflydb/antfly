@@ -1,0 +1,12 @@
+antfly-completion-task-test
++- run test completion-task-tests 1 pass, 1 fail (2 total)
+error: 'runnable_completion_task_test_root.test.completion task foreground cancellation joins independent accepted work through close' failed:
+       expected 1, found 0
+failed command: /private/tmp/antfly-parent-phase-focused-cache/o/61ac61892db842838b1651b1393bc083/completion-task-tests --cache-dir=/private/tmp/antfly-parent-phase-focused-cache --seed=0x8ccb26b8 --listen=-
+
+Build Summary: 2/4 steps succeeded (1 failed); 1/2 tests passed (1 failed)
+antfly-completion-task-test transitive failure
++- run test completion-task-tests 1 pass, 1 fail (2 total)
+   +- compile test completion-task-tests safe native success 7s MaxRSS:616M
+      +- WriteFile macos-sdk-libc.txt cached
+

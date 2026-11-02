@@ -147,25 +147,34 @@ pub fn loadRangeAtKey(alloc: Allocator, store: anytype, key: []const u8) !docsto
     return try decodeRangeAlloc(alloc, raw);
 }
 
-pub fn decodeRangeAlloc(alloc: Allocator, raw: []const u8) !docstore_mod.ByteRange {
+/// The returned bounds borrow raw; the caller must keep it alive until both
+/// bounds have been consumed. Validate all lengths before exposing either span.
+pub fn decodeRangeBorrowed(raw: []const u8) !docstore_mod.ByteRange {
     if (raw.len < 8) return error.InvalidRangeState;
     var pos: usize = 0;
     const start_len: usize = std.mem.readInt(u32, raw[pos..][0..4], .little);
     pos += 4;
     if (start_len > raw.len - pos or raw.len - pos - start_len < 4) return error.InvalidRangeState;
-    const start = try alloc.dupe(u8, raw[pos .. pos + start_len]);
+    const start = raw[pos .. pos + start_len];
     pos += start_len;
-    errdefer alloc.free(start);
 
     const end_len: usize = std.mem.readInt(u32, raw[pos..][0..4], .little);
     pos += 4;
     if (end_len != raw.len - pos) return error.InvalidRangeState;
-    const end = try alloc.dupe(u8, raw[pos .. pos + end_len]);
+    const end = raw[pos .. pos + end_len];
 
     return .{
         .start = start,
         .end = end,
     };
+}
+
+pub fn decodeRangeAlloc(alloc: Allocator, raw: []const u8) !docstore_mod.ByteRange {
+    const borrowed = try decodeRangeBorrowed(raw);
+    const start = try alloc.dupe(u8, borrowed.start);
+    errdefer alloc.free(start);
+    const end = try alloc.dupe(u8, borrowed.end);
+    return .{ .start = start, .end = end };
 }
 
 pub fn freeRange(alloc: Allocator, byte_range: docstore_mod.ByteRange) void {
@@ -344,6 +353,24 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
         .store = try backend_erased.storeFrom(alloc, store),
         .owned = true,
     };
+}
+
+test "range state borrowed decode validates complete framing before allocation and retains binary bounds" {
+    const raw = "\x02\x00\x00\x00\x00a\x02\x00\x00\x00\xff\x00";
+    const borrowed = try decodeRangeBorrowed(raw);
+    try std.testing.expectEqualStrings("\x00a", borrowed.start);
+    try std.testing.expectEqualStrings("\xff\x00", borrowed.end);
+    const owned = try decodeRangeAlloc(std.testing.allocator, raw);
+    defer freeRange(std.testing.allocator, owned);
+    try std.testing.expectEqualStrings(borrowed.start, owned.start);
+    try std.testing.expectEqualStrings(borrowed.end, owned.end);
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    for (0..raw.len) |length| {
+        try std.testing.expectError(error.InvalidRangeState, decodeRangeBorrowed(raw[0..length]));
+        try std.testing.expectError(error.InvalidRangeState, decodeRangeAlloc(none.allocator(), raw[0..length]));
+    }
+    try std.testing.expectError(error.InvalidRangeState, decodeRangeBorrowed(raw ++ "extra"));
+    try std.testing.expectError(error.InvalidRangeState, decodeRangeBorrowed("\xff\xff\xff\xff\x00\x00\x00\x00"));
 }
 
 test "range state saves and loads namespaced ranges" {

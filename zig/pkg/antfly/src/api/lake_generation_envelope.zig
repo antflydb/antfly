@@ -54,6 +54,10 @@ pub fn decode(a: A, prefix: []const u8, token: []const u8, limit: usize) !Envelo
     return .{ .id = id, .bytes = length, .generation = generation };
 }
 pub fn read(store: *stores.ArtifactStore, envelope: Envelope, token: Token) ![]u8 {
+    return readFor(store, envelope, token, .{});
+}
+pub fn readFor(store: *stores.ArtifactStore, envelope: Envelope, token: Token, context: stores.ReadContext) ![]u8 {
+    try context.ensureActive();
     if (envelope.generation) |generation| {
         const object = store.providerStore() orelse return error.CloudGenerationStoreUnavailable;
         const suffix = try stores.storageSuffixAlloc(store.allocator, envelope.id);
@@ -62,15 +66,17 @@ pub fn read(store: *stores.ArtifactStore, envelope: Envelope, token: Token) ![]u
         defer store.allocator.free(path);
         var client = object.client;
         client.allocator = store.allocator;
-        var result = try client.getObject(object.bucket, path, .{ .version_id = generation, .skip_metadata_probe = true, .max_response_bytes = envelope.bytes, .cancellation = @import("objectstore").CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) });
+        const options: @import("objectstore").GetOptions = .{ .version_id = generation, .skip_metadata_probe = true, .max_response_bytes = envelope.bytes, .cancellation = @import("objectstore").CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) };
+        var result = try @import("antfly_local_sources").sql_execution_wait.runOwned(context.wait, @import("objectstore").Client.getObject, .{ &client, object.bucket, path, options }, discardGet, .{store.allocator});
         defer result.deinit(store.allocator);
         if (result.body.len != envelope.bytes) return error.ArtifactIntegrityMismatch;
-        try stores.validatePayloadSha256WithCancellation(result.body, try stores.sha256ChecksumFromArtifactId(envelope.id), token);
+        try context.ensureActive();
+        try stores.validatePayloadSha256For(result.body, try stores.sha256ChecksumFromArtifactId(envelope.id), token, context);
         const body = result.body;
         result.body = &.{};
         return body;
     }
-    return store.getVerifiedAllocWithCancellation(envelope.id, envelope.bytes, try stores.sha256ChecksumFromArtifactId(envelope.id), token);
+    return store.getVerifiedAllocFor(store.allocator, envelope.id, envelope.bytes, try stores.sha256ChecksumFromArtifactId(envelope.id), token, context);
 }
 test "external lake global frontier retained envelopes preserve exact cloud selectors and legacy identities" {
     const a = std.testing.allocator;
@@ -90,4 +96,9 @@ test "external lake global frontier retained envelopes preserve exact cloud sele
     defer a.free(old);
     try std.testing.expect((try decode(a, "lake2:", old, 42)).generation == null);
     try std.testing.expectError(error.InvalidQueryRequest, decode(a, "lake2:", token, 41));
+}
+
+fn discardGet(value: @import("objectstore").GetResult, a: A) void {
+    var result = value;
+    result.deinit(a);
 }

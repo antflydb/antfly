@@ -82,6 +82,9 @@ pub const ExecutionEnvironment = struct {
     /// retain it beyond their durable provider owner. Standalone invocations
     /// may create a call-scoped compatibility client when it is absent.
     http_client: ?*httpx.Client = null,
+    /// Invocation-only borrowed execution. Durable provider constructors leave
+    /// this null; callers may bind it on a synchronous provider view.
+    runnable: @FieldType(RequestContext, "runnable") = null,
 
     pub fn resolveAntflyEndpoint(
         self: ExecutionEnvironment,
@@ -105,11 +108,18 @@ pub const ExecutionEnvironment = struct {
         };
     }
 
+    pub fn waitContextWithControl(self: ExecutionEnvironment, control: httpx.socket.WriteControl) remote_capabilities.WaitContext {
+        var result = self.waitContext();
+        result.execution_wait = control;
+        return result;
+    }
+
     pub fn requestContext(self: ExecutionEnvironment, io: std.Io) RequestContext {
         return .{
             .io = io,
             .deadline_ns = self.deadline_ns,
             .cancellation = self.cancellation,
+            .runnable = self.runnable,
         };
     }
 
@@ -198,3 +208,108 @@ test "request context preserves absolute deadlines and cancellation" {
     expired.deadline_ns = 0;
     try std.testing.expectError(error.Timeout, expired.remainingTimeoutMs());
 }
+
+/// Invocation-local HTTP control. Persistent clients retain neither this
+/// adapter nor the request grant; physical waits run on the calling task.
+pub const HttpWait = struct {
+    const runtime = @import("antfly_runtime_abi");
+    context: RequestContext,
+    saved_class: ?runtime.runnable_abi.Class = null,
+    failure: ?anyerror = null,
+    refusal: @import("antfly_cancellation").Rejection = .{},
+
+    pub fn ready(self: *HttpWait) !void {
+        try self.refusal.check();
+        if (self.failure) |failure| return failure;
+        try self.context.check();
+    }
+    fn from(raw: ?*anyopaque) *HttpWait {
+        return @ptrCast(@alignCast(raw.?));
+    }
+    fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
+        // Watchdogs inspect lifetime only, without touching owner state.
+        const self = from(raw);
+        self.refusal.check() catch |err| return switch (err) {
+            error.Timeout, error.DeadlineExceeded => error.Timeout,
+            else => error.Canceled,
+        };
+        self.context.check() catch |err| return switch (self.refusal.remember(err)) {
+            error.Timeout, error.DeadlineExceeded => error.Timeout,
+            else => error.Canceled,
+        };
+    }
+    fn remaining(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
+        try check(raw);
+        return from(raw).context.remainingTimeoutMs() catch |err| return switch (err) {
+            error.Timeout, error.DeadlineExceeded => error.Timeout,
+            else => error.Canceled,
+        };
+    }
+    fn restriction(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        self.ready() catch |err| {
+            self.failure = self.failure orelse err;
+            return runtime.error_abi.statusFromError(if (err == error.Timeout or err == error.DeadlineExceeded) error.Timeout else error.Canceled);
+        };
+        return .ok;
+    }
+    fn begin(raw: ?*anyopaque) !void {
+        beginOwned(raw) catch |err| return from(raw).refusal.remember(err);
+    }
+    fn beginOwned(raw: ?*anyopaque) !void {
+        const self = from(raw);
+        try self.ready();
+        if (self.saved_class != null) return error.InvalidRunnableTransition;
+        const borrow = self.context.runnable.?;
+        if (borrow.enter_checked == null) return error.UnsupportedOperation;
+        const class = try borrow.currentClass();
+        const status = borrow.park(borrow.context, @backingInt(runtime.runnable_abi.Wait.resource));
+        if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+        self.saved_class = class;
+    }
+    fn end(raw: ?*anyopaque) !void {
+        endOwned(raw) catch |err| return from(raw).refusal.remember(err);
+    }
+    fn endOwned(raw: ?*anyopaque) !void {
+        return endWithControl(raw, from(raw).control());
+    }
+    fn endChecked(raw: ?*anyopaque, ceiling: httpx.socket.WriteControl) !void {
+        endWithControl(raw, ceiling) catch |err| return from(raw).refusal.remember(err);
+    }
+    fn endWithControl(raw: ?*anyopaque, ceiling: httpx.socket.WriteControl) !void {
+        const self = from(raw);
+        const class = self.saved_class orelse return error.InvalidRunnableTransition;
+        self.saved_class = null;
+        const Fence = struct {
+            wait: *HttpWait,
+            ceiling: httpx.socket.WriteControl,
+            fn check(pointer: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const fence: *@This() = @ptrCast(@alignCast(pointer));
+                const original = restriction(fence.wait);
+                if (!original.isOk()) return original;
+                fence.ceiling.check() catch |err| {
+                    fence.wait.failure = fence.wait.failure orelse err;
+                    return runtime.error_abi.statusFromError(err);
+                };
+                return .ok;
+            }
+        };
+        var fence: Fence = .{ .wait = self, .ceiling = ceiling };
+        // A process monitor publishes its stop before canceling its physical
+        // task. Preserve that cause through teardown instead of letting the
+        // mechanical Io cancellation replace a deadline with Canceled.
+        const previous = if (ceiling.protect_reentry) self.context.io.swapCancelProtection(.blocked) else null;
+        defer if (previous) |protection| {
+            _ = self.context.io.swapCancelProtection(protection);
+        };
+        self.context.runnable.?.enterChecked(class, &.{ .context = &fence, .check = Fence.check }) catch |err| {
+            self.failure = self.failure orelse err;
+            try self.ready();
+            return err;
+        };
+        try self.ready();
+    }
+    pub fn control(self: *HttpWait) httpx.socket.WriteControl {
+        return .{ .ptr = self, .check_fn = check, .remaining_ms_fn = remaining, .wait_begin_fn = if (self.context.runnable != null) begin else null, .wait_end_fn = if (self.context.runnable != null) end else null, .wait_end_checked_fn = if (self.context.runnable != null) endChecked else null };
+    }
+};

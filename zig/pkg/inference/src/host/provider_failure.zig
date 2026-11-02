@@ -19,7 +19,7 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const diagnostics = @import("antfly_private_error_diagnostics");
 
-const operation_slots = @backingInt(bridge.ProviderOperation.classify_texts) + 1;
+const operation_slots = @backingInt(bridge.ProviderOperation.decide_json) + 1;
 var overflow_counts = @as([operation_slots]@import("antfly_platform").atomic.Value(u64), @splat(.init(0)));
 var failures = @as([diagnostics.slots_count]diagnostics.Diagnostic, @splat(.{}));
 

@@ -159,6 +159,18 @@ pub const Metrics = struct {
         }
     }
 
+    /// A control refusal owns no model, request scratch or admission lease.
+    /// Record it with fixed scalar series and the original control-check start.
+    pub fn recordDirectExtractionControlFailure(self: *Metrics, version_two: bool, started_ns: u64, err: anyerror) void {
+        self.incRequest("extract.local");
+        defer self.decActive();
+        self.incError();
+        if (version_two) {
+            var trace = self.extraction_v2.beginAt(.direct, started_ns);
+            trace.finish(err);
+        }
+    }
+
     pub fn incPredictError(self: *Metrics) void {
         self.predict_errors.incr();
     }
@@ -321,4 +333,20 @@ test "metrics render" {
     try std.testing.expect(std.mem.indexOf(u8, embed_output, "antfly_inference_embed_batch_duration_ns_total 3000\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, embed_output, "antfly_inference_embed_batch_last_items 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, embed_output, "antfly_inference_embed_batch_max_items 3\n") != null);
+}
+
+test "direct extraction control refusal preserves metric meaning and reconciles active gauges" {
+    var m = Metrics.default;
+    const started = @import("antfly_platform").time.monotonicNs();
+    m.recordDirectExtractionControlFailure(true, started, error.Cancelled);
+    m.recordDirectExtractionControlFailure(false, started, error.Timeout);
+    m.recordDirectExtractionControlFailure(true, started, error.DeadlineExceeded);
+    try std.testing.expectEqual(@as(u64, 3), m.extract_requests.impl.count);
+    try std.testing.expectEqual(@as(u64, 3), m.errors_total.impl.count);
+    try std.testing.expectEqual(@as(u64, 2), m.extraction_v2.requests.get(.direct));
+    try std.testing.expectEqual(@as(u64, 1), m.extraction_v2.outcomes.get(.cancelled));
+    try std.testing.expectEqual(@as(u64, 1), m.extraction_v2.outcomes.get(.timeout));
+    try std.testing.expectEqual(@as(u64, 2), m.extraction_v2.failure_stages.get(.admission));
+    try std.testing.expectEqual(@as(i64, 0), m.requests_active.impl.value);
+    try std.testing.expectEqual(@as(i64, 0), m.extraction_v2.active.impl.value);
 }

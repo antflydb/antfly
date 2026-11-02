@@ -82,7 +82,10 @@ pub fn acquire(self: *Owner) !Lease {
     // Allocation and native execution never hold the lane bookkeeping lock.
     // All lanes, including retained idle ones, share actual-byte admission.
     const a = self.budget.allocator();
-    const lane = a.create(Lane) catch |err| return self.mapError(err);
+    const lane = self.budget.create(Lane) catch |err| return switch (err) {
+        error.MemoryBudgetExceeded => error.SqlProgramLimitExceeded,
+        error.OutOfMemory => error.OutOfMemory,
+    };
     const heap = @min(8 * 1024 * 1024, self.budget.limit / 4);
     lane.* = .{ .session = native.Session.init(a, .{ .heap_bytes = heap }, @min(16 * 1024 * 1024, self.budget.limit / 2)) };
     self.lock();
@@ -204,4 +207,23 @@ test "SQL regex execution releases partially admitted lanes on allocation failur
     defer owner.deinit();
     try std.testing.expectError(error.SqlProgramLimitExceeded, owner.acquire());
     try std.testing.expectEqual(@as(usize, 0), owner.snapshot().active);
+}
+
+test "SQL regex lane creation preserves physical OOM after recovered quota refusal" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var owner = init(failing.allocator(), 1024 * 1024);
+    defer owner.deinit();
+    try std.testing.expectError(error.OutOfMemory, owner.budget.allocator().alloc(u8, owner.budget.limit + 1));
+    try std.testing.expect(owner.budget.isExhausted());
+    try std.testing.expectError(error.OutOfMemory, owner.acquire());
+    try std.testing.expectEqual(@as(usize, 0), owner.snapshot().lanes);
+    try std.testing.expectEqual(@as(usize, 0), owner.budget.live);
+    failing.fail_index = std.math.maxInt(usize);
+    const lane = try owner.acquire();
+    lane.deinit();
+    try std.testing.expectEqual(@as(usize, 1), owner.snapshot().lanes);
+    var limited = init(std.testing.allocator, 1);
+    defer limited.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.acquire());
+    try std.testing.expectEqual(@as(usize, 0), limited.budget.live);
 }

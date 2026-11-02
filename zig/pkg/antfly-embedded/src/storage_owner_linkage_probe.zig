@@ -64,6 +64,7 @@ pub fn main(init: std.process.Init) !void {
     incompatible.db_layout.size += 1;
     engine.validateDescriptor(&incompatible) catch |err| {
         if (err != error.UnsupportedVersion) return err;
+        try exercisePreparedDrain(alloc, root);
         try exerciseBorrowedRuntime(alloc, root, init.io);
         return exercise(alloc, root, physical, init.io);
     };
@@ -417,4 +418,66 @@ fn exerciseFactoryAggregationBackup(alloc: std.mem.Allocator, database: *db_mod.
     const shards = try write.copyPreparedNativeBackupShardSnapshot(alloc, &snapshot);
     defer write.freeBackupShards(alloc, shards);
     if (shards.len != 1 or shards[0].artifact_size_bytes == 0) return error.SharedStorageReadBackFailed;
+}
+
+/// A real consumer call must reach the physical archive and return its named
+/// failure. No fixture registration or caller-side DB close substitutes for it.
+fn exercisePreparedDrain(alloc: std.mem.Allocator, root: []const u8) !void {
+    const path = try std.fs.path.join(alloc, &.{ root, "prepared-drain" });
+    defer alloc.free(path);
+    const db = try db_mod.DB.openOwned(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.closeOwned();
+    const owner = db.local_execution.retained_preparation_owner orelse return error.SharedStorageQueryFailed;
+    var guard = try owner.enter();
+    const Guard = @TypeOf(guard);
+    const Port = @typeInfo(@typeInfo(@FieldType(engine.VTable, "drainPreparedAssembliesWithAdmission")).pointer.child).@"fn".param_types[1].?;
+    const Payload = @typeInfo(@typeInfo(@TypeOf(Port.init)).@"fn".param_types[0].?).pointer.child;
+    const Hook = struct {
+        guard: *Guard,
+        guard_live: bool = true,
+        rejected: bool = true,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.rejected) return error.TestWindowFailed;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            self.guard.deinit();
+            self.guard_live = false;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            return error.DeadlineExceeded;
+        }
+    };
+    var hook: Hook = .{ .guard = &guard };
+    defer if (hook.guard_live) guard.deinit();
+    var payload: Payload = .{ .ptr = &hook, .vtable = &.{ .checkpoint = Hook.checkpoint, .check_lifetime = Hook.lifetime, .deadline_ns = Hook.deadline }, .execution_wait = .{ .ptr = &hook, .begin = Hook.begin, .end = Hook.end } };
+    if (db.drainPreparedAssembliesWithAdmission(.init(&payload))) |_| {
+        return error.SharedStorageErrorIdentityLost;
+    } else |cause| if (cause != error.TestWindowFailed) return error.SharedStorageErrorIdentityLost;
+    if (!owner.closing.load(.acquire) or owner.closed.load(.acquire) or hook.begins != 0)
+        return error.SharedStorageQueryFailed;
+    hook.rejected = false;
+    if (db.drainPreparedAssembliesWithAdmission(.init(&payload))) |_| {
+        return error.SharedStorageErrorIdentityLost;
+    } else |cause| if (cause != error.DeadlineExceeded) return error.SharedStorageErrorIdentityLost;
+    if (owner.closed.load(.acquire) or hook.begins != 1 or hook.ends != 1)
+        return error.SharedStorageQueryFailed;
+    try db.drainPreparedAssembliesWithAdmission(.init(&payload));
+    if (!owner.closed.load(.acquire) or hook.begins != 1 or hook.ends != 1 or db.isClosed())
+        return error.SharedStorageQueryFailed;
+    if (owner.enter()) |unexpected| {
+        var acquired = unexpected;
+        acquired.deinit();
+        return error.SharedStorageQueryFailed;
+    } else |cause| if (cause != error.Canceled) return error.SharedStorageErrorIdentityLost;
 }

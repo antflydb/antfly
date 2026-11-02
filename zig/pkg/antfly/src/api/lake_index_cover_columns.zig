@@ -259,6 +259,12 @@ fn interpretation(buffer: []u8, section: Section) ![]const u8 {
 /// The returned projected block uses SQL-null placeholders for omitted columns.
 /// Consumers must request every projection/predicate dependency before loading.
 pub fn load(backing: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns: []const usize, width: usize, token: Token, cached: ?artifacts.CachedRead, limit: usize, reads: *u64, prepared: ?Prepared) !Loaded {
+    return loadFor(backing, store, ref, striped, columns, width, token, cached, limit, reads, prepared, if (cached) |cache| cache.context else .{});
+}
+pub fn loadFor(backing: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns: []const usize, width: usize, token: Token, cached: ?artifacts.CachedRead, limit: usize, reads: *u64, prepared: ?Prepared, context: local.serverless_query_lake_read_context.Context) !Loaded {
+    try context.ensureActive();
+    var scoped_cache = cached;
+    if (scoped_cache) |*cache| cache.context = context;
     const budget = try backing.create(local.sql_memory_budget);
     budget.* = .{ .backing = backing, .limit = limit };
     errdefer backing.destroy(budget);
@@ -268,7 +274,7 @@ pub fn load(backing: A, store: stores.ArtifactStore, ref: Ref, striped: bool, co
         arena.deinit();
         backing.destroy(arena);
     }
-    var loaded = loadInner(arena.allocator(), store, ref, striped, columns, width, token, cached, limit, reads, prepared) catch |err| {
+    var loaded = loadInner(arena.allocator(), store, ref, striped, columns, width, token, scoped_cache, limit, reads, prepared, context) catch |err| {
         if (err == error.OutOfMemory and budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
         return err;
     };
@@ -277,7 +283,8 @@ pub fn load(backing: A, store: stores.ArtifactStore, ref: Ref, striped: bool, co
     loaded.scratch_owner = arena;
     return loaded;
 }
-fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns: []const usize, width: usize, token: Token, cached: ?artifacts.CachedRead, limit: usize, reads: *u64, prepared: ?Prepared) !Loaded {
+fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns: []const usize, width: usize, token: Token, cached: ?artifacts.CachedRead, limit: usize, reads: *u64, prepared: ?Prepared, context: local.serverless_query_lake_read_context.Context) !Loaded {
+    try context.ensureActive();
     try token.check();
     if (width > 1024) return error.InvalidNativeLakeRowIndex;
     for (columns) |column| if (column >= width) return error.InvalidNativeLakeRowIndex;
@@ -291,7 +298,7 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
             try leases.append(a, owned);
             return .{ .a = a, .block = owned.value.*, .hashed = false, .leases = leases };
         }
-        const block = try local.sql_spill.decodeColumnarBlockInArena(a, try artifacts.readArtifact(a, store, ref, token, null), artifacts.max_block_bytes);
+        const block = try local.sql_spill.decodeColumnarBlockInArena(a, try artifacts.readArtifactFor(a, store, ref, token, null, context), artifacts.max_block_bytes);
         if (block.values.len != width) return error.InvalidNativeLakeRowIndex;
         return .{ .a = a, .block = block, .hashed = false };
     }
@@ -356,7 +363,7 @@ fn loadInner(a: A, store: stores.ArtifactStore, ref: Ref, striped: bool, columns
         admitted += section.bytes;
         try units.append(a, .{ .object = directory.pack, .offset = section.offset, .bytes = section.bytes, .digest = section.digest });
     }
-    var wire = try ranges.loadManyLeased(result.wire_allocator.?, store, units.items, token, cached, .{ .ptr = &admitted, .charge = Charge.charge }, .{ .max_range = artifacts.max_block_bytes });
+    var wire = try ranges.loadManyLeased(result.wire_allocator.?, store, units.items, token, cached, .{ .ptr = &admitted, .charge = Charge.charge }, .{ .max_range = artifacts.max_block_bytes, .context = context });
     defer wire.deinit();
     for (selected.items, 0..) |index, position| {
         const section = directory.sections[index];

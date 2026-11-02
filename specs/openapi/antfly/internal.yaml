@@ -13,10 +13,317 @@ servers:
   - url: /internal/v1
     description: Node-local internal API
 tags:
+  - name: remote-attempt-control
+    description: Authenticated remote status and durable quiescence fencing.
   - name: standby-replication
     x-displayName: Hot Standby Replication
     description: Runtime-to-runtime hot-standby replication protocol.
 paths:
+  /attempt/status:
+    post:
+      tags: [remote-attempt-control]
+      operationId: getRemoteAttemptStatus
+      summary: Read signed remote attempt status
+      description: |
+        Requires X-Antfly-Trusted-Principal with a verified service JWT carrying
+        the exact versioned remote-attempt context bound to POST, this path and
+        the canonical two-byte body {}. Legacy unsigned migration is forbidden.
+        Only identity content encoding and no query parameters are accepted.
+        A 200 response is a 368-character version-1 hexadecimal signed reply.
+        Verify its exact request binding and independently enrolled root key
+        before reconciling capacity. HTTP errors never prove terminal ownership.
+      parameters:
+        - in: header
+          name: X-Antfly-Trusted-Principal
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        "200":
+          description: Signed status or completed fence evidence.
+          content:
+            text/plain:
+              schema:
+                type: string
+                minLength: 368
+                maxLength: 368
+                pattern: '^[0-9a-f]{368}$'
+        "400":
+          description: Invalid control request.
+        "401":
+          description: Signed service context required.
+        "409":
+          description: Fence pending; physical work still owns capacity. No acknowledgment.
+        "415":
+          description: Content encoding must be identity.
+        "503":
+          description: Control owner, recovery, membership or durability unavailable.
+        "504":
+          description: Original request deadline exceeded. No terminal evidence.
+  /attempt/cancel:
+    post:
+      tags: [remote-attempt-control]
+      operationId: cancelRemoteAttempt
+      summary: Cancel one remote attempt and suppress delayed dispatch
+      description: |
+        Requires X-Antfly-Trusted-Principal with a verified service JWT carrying
+        the exact versioned remote-attempt context bound to POST, this path and
+        the canonical two-byte body {}. Legacy unsigned migration is forbidden.
+        Only identity content encoding and no query parameters are accepted.
+        A 200 response is a 368-character version-1 hexadecimal signed reply.
+        Verify its exact request binding and independently enrolled root key
+        before reconciling capacity. HTTP errors never prove terminal ownership.
+        The operation owner explicitly abandons the exact attempt. A worker
+        records a bounded tombstone if dispatch has not arrived, or signals
+        cancellation while retaining every live resource. Only a signed terminal
+        or higher quiescent generation reply permits capacity retirement.
+      parameters:
+        - in: header
+          name: X-Antfly-Trusted-Principal
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        "200":
+          description: Signed status or completed fence evidence.
+          content:
+            text/plain:
+              schema:
+                type: string
+                minLength: 368
+                maxLength: 368
+                pattern: '^[0-9a-f]{368}$'
+        "400":
+          description: Invalid control request.
+        "401":
+          description: Signed service context required.
+        "409":
+          description: Fence pending; physical work still owns capacity. No acknowledgment.
+        "415":
+          description: Content encoding must be identity.
+        "503":
+          description: Control owner, recovery, membership or durability unavailable.
+        "504":
+          description: Original request deadline exceeded. No terminal evidence.
+  /attempt/fence:
+    post:
+      tags: [remote-attempt-control]
+      operationId: fenceRemoteAttempts
+      summary: Fence a coordinator generation after physical quiescence
+      description: |
+        Requires X-Antfly-Trusted-Principal with a verified service JWT carrying
+        the exact versioned remote-attempt context bound to POST, this path and
+        the canonical two-byte body {}. Legacy unsigned migration is forbidden.
+        Only identity content encoding and no query parameters are accepted.
+        A 200 response is a 368-character version-1 hexadecimal signed reply.
+        Verify its exact request binding and independently enrolled root key
+        before reconciling capacity. HTTP errors never prove terminal ownership.
+      parameters:
+        - in: header
+          name: X-Antfly-Trusted-Principal
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        "200":
+          description: Signed status or completed fence evidence.
+          content:
+            text/plain:
+              schema:
+                type: string
+                minLength: 368
+                maxLength: 368
+                pattern: '^[0-9a-f]{368}$'
+        "400":
+          description: Invalid control request.
+        "401":
+          description: Signed service context required.
+        "409":
+          description: Fence pending; physical work still owns capacity. No acknowledgment.
+        "415":
+          description: Content encoding must be identity.
+        "503":
+          description: Control owner, recovery, membership or durability unavailable.
+        "504":
+          description: Original request deadline exceeded. No terminal evidence.
+  /attempt/capabilities:
+    post:
+      tags: [remote-attempt-control]
+      operationId: getRemoteOwnedReadCapabilities
+      summary: Probe signed owned-read support for an enrolled process
+      description: |
+        Requires a service JWT with AFAT capability context binding this exact
+        path and a fresh 32-byte nonce. The 352-character hexadecimal AFAC v2
+        reply binds the nonce, root and process reporter, and independent group
+        query and retained-read family bits. Version 2 promises process-scoped
+        owned endpoints; version 1 observations must not activate these routes.
+        Discovery is not admission or evidence of retirement. Only identity
+        content encoding and no query parameters are accepted.
+      parameters:
+        - in: header
+          name: X-Antfly-Trusted-Principal
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              minLength: 32
+              maxLength: 32
+      responses:
+        "200":
+          description: Nonce-bound process capability observation, never retirement proof.
+          content:
+            text/plain:
+              schema:
+                type: string
+                minLength: 352
+                maxLength: 352
+        "401":
+          description: Service context is missing or invalid.
+        "503":
+          description: Discovery admission or protected capacity unavailable.
+  /groups/{group_id}/tables/{table_name}/owned-query/{root_incarnation}/{reporter_incarnation}:
+    post:
+      tags: [remote-attempt-control]
+      operationId: executeProcessOwnedGroupQuery
+      summary: Execute a process-scoped owned read
+      description: |
+        Requires verified AFAT read context whose digest covers this entire URI
+        and the versioned owned request body. The receiver must match the root
+        and process reporter before any data admission or provider work. Legacy
+        service credentials cannot select these endpoints, and no fallback to a
+        legacy query route is permitted. A response never retires sender charges;
+        only independently verified signed retirement evidence may do so.
+      parameters:
+        - in: path
+          name: group_id
+          required: true
+          schema:
+            type: integer
+            format: uint64
+        - in: path
+          name: table_name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: root_incarnation
+          required: true
+          description: Nonzero unsigned 128-bit root identity in decimal.
+          schema:
+            type: string
+            maxLength: 39
+        - in: path
+          name: reporter_incarnation
+          required: true
+          schema:
+            type: integer
+            format: uint64
+        - in: header
+          name: X-Antfly-Trusted-Principal
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Bounded owned read output; sender ownership is still retained.
+        "400":
+          description: Invalid owned envelope or route scope.
+        "401":
+          description: Verified read context is required.
+        "503":
+          description: Scope, recovery, scheduling or provider admission unavailable.
+  /groups/{group_id}/tables/{table_name}/owned-retained-read/{root_incarnation}/{reporter_incarnation}:
+    post:
+      tags: [remote-attempt-control]
+      operationId: executeProcessOwnedRetainedRead
+      summary: Execute a process-scoped owned read
+      description: |
+        Requires verified AFAT read context whose digest covers this entire URI
+        and the versioned owned request body. The receiver must match the root
+        and process reporter before any data admission or provider work. Legacy
+        service credentials cannot select these endpoints, and no fallback to a
+        legacy query route is permitted. A response never retires sender charges;
+        only independently verified signed retirement evidence may do so.
+      parameters:
+        - in: path
+          name: group_id
+          required: true
+          schema:
+            type: integer
+            format: uint64
+        - in: path
+          name: table_name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: root_incarnation
+          required: true
+          description: Nonzero unsigned 128-bit root identity in decimal.
+          schema:
+            type: string
+            maxLength: 39
+        - in: path
+          name: reporter_incarnation
+          required: true
+          schema:
+            type: integer
+            format: uint64
+        - in: header
+          name: X-Antfly-Trusted-Principal
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Bounded owned read output; sender ownership is still retained.
+        "400":
+          description: Invalid owned envelope or route scope.
+        "401":
+          description: Verified read context is required.
+        "503":
+          description: Scope, recovery, scheduling or provider admission unavailable.
   /standby/replication/identify:
     get:
       tags: [standby-replication]

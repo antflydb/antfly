@@ -81,6 +81,19 @@ pub const Context = struct {
         };
     }
 
+    /// Poll an already charged scan without charging its work a second time.
+    /// Preserve the enclosing context's original failure and authority.
+    pub fn checkpointNow(self: *Context) !void {
+        if (self.failure) |err| return err;
+        if (self.parent) |parent| parent.checkpointNow() catch |err| {
+            self.failure = err;
+            return err;
+        } else if (self.checkpoint) |checkpoint| checkpoint(self.ptr) catch |err| {
+            self.failure = err;
+            return err;
+        };
+    }
+
     /// Shared admission failure for typed codecs using this execution budget.
     pub fn limit(self: *Context) anyerror {
         if (self.failure) |err| return err;

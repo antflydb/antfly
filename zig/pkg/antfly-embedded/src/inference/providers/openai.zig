@@ -27,6 +27,7 @@ pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
     attempt_observer: ?httpx.AttemptObserver = null,
+    socket_control: ?httpx.socket.WriteControl = null,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
     gateway_id: ?[]const u8 = null,
@@ -147,6 +148,7 @@ pub const Provider = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
             .attempt_observer = self.attempt_observer,
+            .socket_control = self.socket_control,
             .json = json_body,
             .headers = self.authHeaders(),
             .max_response_size = self.max_response_bytes,
@@ -288,6 +290,7 @@ pub const Provider = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
             .attempt_observer = self.attempt_observer,
+            .socket_control = self.socket_control,
             .json = json_body,
             .headers = self.authHeaders(),
             .max_response_size = self.max_response_bytes,

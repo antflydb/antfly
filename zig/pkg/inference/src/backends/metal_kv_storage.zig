@@ -131,6 +131,8 @@ const SlotBinding = struct {
     }
 };
 
+pub const device_credit_bridge = @import("metal_device_credit.zig");
+
 pub const MetalKvStorage = struct {
     allocator: std.mem.Allocator,
     runtime: *metal_runtime.RawMetalDecodeRuntime,
@@ -929,8 +931,9 @@ pub const MetalKvStorage = struct {
         }
     }
 
-    fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    fn hookDeinit(ctx: *anyopaque, _: std.mem.Allocator) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        const allocator = self.allocator;
         var binding_it = self.slot_map.valueIterator();
         while (binding_it.next()) |binding| {
             if (binding.selected_positions) |positions| allocator.free(positions);
@@ -1740,4 +1743,17 @@ test "Metal paged KV keeps layer-global pages across source sequence release" {
         try std.testing.expectEqualSlices(f32, &expected_v, gathered.v);
     }
     try storage.releaseSequence(derived_id);
+}
+
+pub fn qualifyHostAllocatorOwnership() !void {
+    var owner = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = owner.allocator();
+    // No slots are leased, so this exercises host metadata ownership without
+    // creating a device or accessing the borrowed runtime.
+    const storage = try MetalKvStorage.create(allocator, undefined, .f32, 1, 64, 16);
+    try storage.slot_map.ensureTotalCapacity(allocator, 8);
+    try storage.global_layer_slots.ensureTotalCapacity(allocator, 8);
+    const allocated = owner.allocated_bytes;
+    storage.deviceWriteHook().deinit(std.testing.allocator);
+    try std.testing.expectEqual(allocated, owner.freed_bytes);
 }

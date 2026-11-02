@@ -1,0 +1,22 @@
+{
+  "base_revision": "c01a26488ac2bee110df3eaec5008722413b3d94",
+  "scope": "Runnable execution capsule and reserved control metadata; core tests only",
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "085bfd633e348ef3d6bf1dbb5d89ced7b724c7b529d27b1644eedf011accf95a",
+    "zig/pkg/antfly-embedded/src/common/request_admission.zig": "0253df710032d76a55cc9ffaabdf24748ecb38c3b6a6a797e133e6f49a131778"
+  },
+  "native_named_scheduler_tests": 13,
+  "native_total_tests": 14,
+  "linux_named_scheduler_tests": 13,
+  "linux_total_tests": 14,
+  "linux_toolchain": "Pinned Nix glibc Zig 0.17.0",
+  "production_default_enabled": false,
+  "repository_pooling_target_result": "pending; not established by these core results",
+  "openapi_checked_sha256": {
+    "specs/openapi/antfly/config.yaml": "5719273b1328cdc190129e74b34c8e71899b7c0c2fab64644c0cf4e2c3861719",
+    "zig/pkg/antfly-embedded/src/openapi/generated/antfly_common_openapi/root.zig": "bc1b2dc44a547e67de0c3d956686ef67d68facb8e63731e2e2ce01063dc7d873",
+    "zig/pkg/antfly-embedded/src/openapi/generated/antfly_common_openapi/types.zig": "aa9733f1f2f8690f41299f493afb5e573601941eddf819b30ac6db16f622f270"
+  },
+  "openapi_build_steps_passed": 85,
+  "openapi_generator_tests_passed": 2
+}

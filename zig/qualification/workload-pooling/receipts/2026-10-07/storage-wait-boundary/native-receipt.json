@@ -1,0 +1,74 @@
+{
+  "passed": true,
+  "target": "native",
+  "source_sha256": {
+    "pkg/antfly-embedded/src/common/execution_wait.zig": "27f6cc4bdf3e12d4af6c847deacbec7550c8a140a6664a982f817fa4b62c85aa",
+    "pkg/antfly-embedded/src/execution_wait_archive_fixture.zig": "fdd7eba9d893efd81e8c092865ae82341e1c15c9d3dfbc89d6b3ccd7232179e0",
+    "pkg/antfly-embedded/src/execution_wait_test_root.zig": "bc30d303c5c0ffea881673ad5b55d8be1c795a70b932f7262ac81e02071f8d70",
+    "pkg/antfly-embedded/src/runtime_callback_abi.zig": "4d24732bb41b72278337b577c9690e73ce9b6b0bf9690c2bbb3a004e9bf4a8ba",
+    "pkg/antfly-embedded/src/source_catalog.zig": "e856e9c93b453f1aaf0a984cc72dfea7a8a507f20858adcf46186f49b9e40cb8",
+    "pkg/antfly-embedded/src/source_catalog_control.zig": "3689cacddbb2e683bc0dc2f3860e8cbea756b24ba6ae029a22b188eb0a072dc1",
+    "lib/runtime/src/runtime_error_abi.zig": "2e82c90e1d6ce130d11ece469fca5691eb0c84527f48b9a8f54218ae564d1e97",
+    "lib/runtime/src/runtime_native_abi.zig": "c3e1a1ee797683f342cfa1b2de5fcb512df20bc5540da9ada4985fe4825bdd9f",
+    "qualification/workload-pooling/check_execution_wait.py": "a96d2f077308be996e6a470ae7386276e689f684cf2c8185951dc35b10cc25f0"
+  },
+  "stages": [
+    {
+      "name": "owner",
+      "command": [
+        "/Users/ajroetker/bin/zig-0.17.0/zig",
+        "build-obj",
+        "-Osafe",
+        "--cache-dir",
+        "/private/tmp/antfly-checked-wait-native-cache",
+        "--global-cache-dir",
+        "/private/tmp/antfly-default-pooling-global",
+        "--dep",
+        "antfly_runtime_abi",
+        "-Mroot=pkg/antfly-embedded/src/execution_wait_archive_fixture.zig",
+        "-Mantfly_runtime_abi=lib/runtime/src/root.zig",
+        "-femit-bin=/private/tmp/antfly-checked-wait-native-committed/wait-owner.o"
+      ],
+      "exit_code": 0,
+      "passed": true
+    },
+    {
+      "name": "callbacks",
+      "command": [
+        "/Users/ajroetker/bin/zig-0.17.0/zig",
+        "test",
+        "/private/tmp/antfly-checked-wait-native-committed/wait-owner.o",
+        "-Osafe",
+        "--cache-dir",
+        "/private/tmp/antfly-checked-wait-native-cache",
+        "--global-cache-dir",
+        "/private/tmp/antfly-default-pooling-global",
+        "--test-filter",
+        "execution wait",
+        "--dep",
+        "antfly_runtime_abi",
+        "-Mroot=pkg/antfly-embedded/src/execution_wait_test_root.zig",
+        "-Mantfly_runtime_abi=lib/runtime/src/root.zig"
+      ],
+      "exit_code": 0,
+      "passed": true
+    },
+    {
+      "name": "error-abi",
+      "command": [
+        "/Users/ajroetker/bin/zig-0.17.0/zig",
+        "test",
+        "lib/runtime/src/runtime_error_abi.zig",
+        "-Osafe",
+        "--cache-dir",
+        "/private/tmp/antfly-checked-wait-native-cache",
+        "--global-cache-dir",
+        "/private/tmp/antfly-default-pooling-global"
+      ],
+      "exit_code": 0,
+      "passed": true
+    }
+  ],
+  "zig_version": "0.17.0",
+  "owner_sha256": "2f4c700cdcabb84ca8204691d32c9006455b51ffee4c3d3cf72e9f04b22ff83e"
+}

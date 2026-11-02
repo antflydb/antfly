@@ -636,7 +636,7 @@ fn startPublicApiServers(
         cluster,
         roots,
         forward_executor.executor(),
-        forward_executor.io_impl,
+        forward_executor.io_impl.?,
         null,
         listeners,
         servers,
@@ -749,7 +749,7 @@ fn startPublicApiServersWithSharedSessionStorePath(
             forward_executor.executor(),
         );
         _ = read_sources[i].withInternalServiceAuth(internal_service_test_secret, internal_service_test_issuer);
-        _ = read_sources[i].withIo(forward_executor.io_impl);
+        _ = read_sources[i].withIo(forward_executor.io_impl.?);
         _ = read_sources[i].withBackendRuntime(cluster.backendRuntime(i));
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],

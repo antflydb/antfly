@@ -23,6 +23,7 @@ const runtime = @import("runtime.zig");
 const clock = @import("antfly_platform").time;
 
 pub const Job = struct {
+    pub var test_admission_hook: ?*const fn (@import("../../common/read_admission.zig").Port) anyerror!void = null;
     header: *State,
     reclaimer: State.Reclaimer,
     account: ?*Account,
@@ -36,9 +37,23 @@ pub const Job = struct {
             .account = if (state.account) |account| account.retain() else null,
             // Flat published generations freeze their charge at publication,
             // not on last-reader release. Never inspect freed entries off-lock.
-            .fallback_bytes = if (state.account == null) state.frozen_memory_bytes.? else 0,
+            .fallback_bytes = if (state.account == null) state.retirement_memory_bytes orelse state.frozen_memory_bytes.? else 0,
             .array_bytes = state.entries.capacity * @sizeOf(@import("state.zig").OwnedEntry),
         };
+    }
+
+    /// Each State credit destroys at most one fixed header or 16 KiB chunk.
+    /// Check the independent cleanup scope between every such physical unit.
+    pub fn stepWithAdmission(self: *Job, allocator: std.mem.Allocator, credits: *usize, original: ?@import("../../common/read_admission.zig").Port) !bool {
+        if (comptime @import("builtin").is_test) if (original) |port| if (test_admission_hook) |hook| try hook(port);
+        while (credits.* != 0) {
+            if (original) |port| try port.checkpoint();
+            var part: usize = 1;
+            const done = self.reclaimer.step(allocator, &part);
+            credits.* -= 1 - part;
+            if (done) return true;
+        }
+        return false;
     }
 
     pub fn memoryBytes(self: *const Job, pass: u64) u64 {
@@ -54,7 +69,7 @@ pub const Job = struct {
 pub var test_slice_hook: ?*const fn (*anyopaque) void = null;
 
 pub fn retire(backend: anytype, state: *State) void {
-    std.debug.assert(state.account != null or state.frozen_memory_bytes != null);
+    std.debug.assert(state.account != null or state.frozen_memory_bytes != null or state.retirement_memory_bytes != null);
     state.retired_next = null;
     if (backend.retired_memory_tail) |tail| tail.retired_next = state else backend.retired_memory_head = state;
     backend.retired_memory_tail = state;
@@ -69,7 +84,12 @@ pub fn pending(backend: anytype) bool {
 /// Called with Backend.mu held; returns with it held. A lifecycle pin prevents
 /// close from destroying the backend during the unlocked portion.
 pub fn reclaimSliceLocked(backend: anytype) void {
-    if (!pending(backend)) return;
+    if (@import("retirement_execution.zig").deferred(backend)) return;
+    reclaimControlledSliceLocked(backend);
+}
+
+pub fn reclaimControlledSliceLocked(backend: anytype) void {
+    if (clock.monotonicNs() < backend.retirement_execution_retry_at_ns or !pending(backend)) return;
     backend.memtable_reclaim_in_flight = true;
     backend.retainReaderKind(.other);
     const started = runtime.workNowNs(backend);
@@ -83,17 +103,17 @@ pub fn reclaimSliceLocked(backend: anytype) void {
             backend.memtable_reclaimer = .init(state);
         }
         backend.mu.unlock();
-        var quantum: usize = @min(credits, 64);
-        const before = quantum;
-        const done = backend.memtable_reclaimer.?.reclaimer.step(backend.allocator, &quantum);
+        const result = @import("retirement_execution.zig").step(backend, &backend.memtable_reclaimer.?, credits, deadline);
         if (@import("builtin").is_test) if (test_slice_hook) |hook| hook(backend);
         _ = runtime.lockBackend(@TypeOf(backend.*), backend);
-        credits -= before - quantum;
-        if (done) {
+        credits -= result.units;
+        if (result.refused) backend.retirement_execution_retry_at_ns = clock.monotonicNs() +| 10 * std.time.ns_per_ms;
+        if (result.done) {
             backend.memtable_reclaimer.?.finish(backend.allocator);
             backend.memtable_reclaimer = null;
             backend.memtable_reclaim_pending -= 1;
         }
+        if (!result.done) break;
     }
     backend.memtable_reclaim_slices +|= 1;
     backend.memtable_reclaim_units +|= 2048 - credits;
@@ -103,13 +123,45 @@ pub fn reclaimSliceLocked(backend: anytype) void {
     backend.syncTrackedInMemoryStateUsageCurrentLocked();
 }
 
+/// Exclusive close has fenced every producer, reader and accounting mutation.
+/// The backend retains the queue and partial destructor across rejection. This
+/// performs no observer scan or refund: close reconciles after physical release.
+pub fn reclaimQuiescedStep(backend: anytype, credits: *usize) bool {
+    std.debug.assert(backend.active_readers == 0 and !backend.memtable_reclaim_in_flight);
+    const started = runtime.workNowNs(backend);
+    const before = credits.*;
+    while (credits.* != 0) {
+        if (backend.memtable_reclaimer == null) {
+            const state = backend.retired_memory_head orelse break;
+            credits.* -= 1;
+            backend.retired_memory_head = state.retired_next;
+            if (backend.retired_memory_head == null) backend.retired_memory_tail = null;
+            backend.memtable_reclaimer = .init(state);
+        }
+        if (credits.* == 0) break;
+        // Reserve a unit for fixed header/account retirement before stepping.
+        credits.* -= 1;
+        if (!backend.memtable_reclaimer.?.reclaimer.step(backend.allocator, credits)) break;
+        backend.memtable_reclaimer.?.finish(backend.allocator);
+        backend.memtable_reclaimer = null;
+        backend.memtable_reclaim_pending -= 1;
+    }
+    backend.memtable_reclaim_slices +|= 1;
+    backend.memtable_reclaim_units +|= before - credits.*;
+    backend.memtable_reclaim_max_slice_ns = @max(backend.memtable_reclaim_max_slice_ns, runtime.workNowNs(backend) -| started);
+    return backend.memtable_reclaimer == null and backend.retired_memory_head == null;
+}
+
 /// All external owners have stopped. Drain through the same bounded primitive
 /// before destroying allocator, accounting, and storage dependencies.
 pub fn drain(backend: anytype) void {
     _ = runtime.lockBackend(@TypeOf(backend.*), backend);
     std.debug.assert(!backend.memtable_reclaim_in_flight);
     while (pending(backend)) {
-        reclaimSliceLocked(backend);
+        if (backend.closing.load(.acquire) and backend.active_readers == 0) {
+            var credits: usize = 2048;
+            _ = reclaimQuiescedStep(backend, &credits);
+        } else reclaimControlledSliceLocked(backend);
         backend.mu.unlock();
         if (backend.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) catch {};
         _ = runtime.lockBackend(@TypeOf(backend.*), backend);

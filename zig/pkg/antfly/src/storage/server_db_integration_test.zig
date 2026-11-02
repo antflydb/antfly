@@ -1230,20 +1230,50 @@ test "db participant recovery callbacks run outside the apply lock" {
     });
     try db.resolveTransactionIntents(txn_id, .committed, 2_000);
 
+    const contract = @import("antfly_local_sources").storage_db_replication_contract;
+    const outbox = @import("antfly_local_sources").storage_db_durable_outbox;
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    var barrier: Barrier = .{};
     const ReentrantResolver = struct {
         db: *DB,
+        barrier: *Barrier,
         calls: usize = 0,
 
         fn resolve(ctx: *anyopaque, resolved_txn_id: transactions_mod.TxnId, participant: []const u8, _: transactions_mod.TxnStatus, _: u64) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             try std.testing.expectEqualStrings("remote", participant);
+            var capture = self.barrier.tryAcquireExclusive() orelse return error.RecoveryNotificationBlockedCapture;
+            capture.release();
             // This acquires the DB apply lock. It would deadlock if recovery
             // still held that lock while invoking participant callbacks.
             try self.db.markTransactionParticipantResolved(resolved_txn_id, participant);
             self.calls += 1;
         }
+        fn next(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(_: contract.AsyncEffectMirror, _: outbox.Kind, _: []const u8, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedRecoveryPublication;
+        }
+        fn recover(_: contract.AsyncEffectMirror, _: outbox.Kind, _: outbox.DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedRecoveryPublication;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn complete(_: contract.AsyncEffectMirror, _: u64) !void {
+            return error.UnexpectedRecoveryPublication;
+        }
+        fn publisher(self: *@This()) contract.Publisher {
+            return .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } };
+        }
     };
-    var resolver = ReentrantResolver{ .db = &db };
+    var resolver = ReentrantResolver{ .db = &db, .barrier = &barrier };
+    // Bind capture admission after the transaction's local resolution. This
+    // pass only delivers an existing decision and guards ACK/cleanup stages.
+    db.local_execution.replication_async_effect_mirror = .{ .publisher = resolver.publisher(), .mutation_barrier = &barrier };
+    defer db.local_execution.replication_async_effect_mirror = null;
     const stats = try server_recovery.runDbRecoveryOnce(&db, .{
         .enabled = true,
         .lease_owned = true,
@@ -4241,4 +4271,262 @@ test "server index status reports ready for converged plural-source dense artifa
         }
     };
     try engine.test_support.expectPluralSourceDenseConvergence(Observer.observe);
+}
+
+test "db transaction outbox retirement preserves partial acknowledgement and fenced debt" {
+    const contract = @import("antfly_local_sources").storage_db_replication_contract;
+    const Outbox = @import("antfly_local_sources").storage_db_durable_outbox;
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    const Failure = enum { replay_reply_loss, fence_after_reply, fence_at_cleanup_apply };
+    const Fixture = struct {
+        db: *DB,
+        barrier: *Barrier,
+        root: ?*Barrier.RootSharedLease = null,
+        rooted_cleanup_observations: usize = 0,
+        transition: *std.atomic.Mutex,
+        failure: ?Failure,
+        closed: bool = false,
+        appended: usize = 0,
+        completed: usize = 0,
+        expected_appends: usize = 2,
+        captured: bool = false,
+
+        fn next(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(mirror: contract.AsyncEffectMirror, kind: Outbox.Kind, payload: []const u8, _: doc_identity.Namespace) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            // Appends still belong to the protected local commit/tail phase.
+            if (self.root) |root| {
+                try std.testing.expect(root.held);
+                try std.testing.expectEqual(@as(usize, 1), root.borrowers.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 1), self.barrier.reader_count);
+            }
+            if (self.barrier.tryAcquireExclusive()) |lease| {
+                var unexpected = lease;
+                unexpected.release();
+                return error.OutboxAppendOutsideMutationProtection;
+            }
+            try std.testing.expectEqualStrings(if (kind == .batch) "batch-debt" else "replay-debt", payload);
+            self.appended += 1;
+            return if (kind == .batch) 1 else 2;
+        }
+        fn recover(_: contract.AsyncEffectMirror, _: Outbox.Kind, _: Outbox.DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedOutboxRecovery;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn capture(self: *@This()) void {
+            if (self.barrier.tryAcquireExclusive()) |lease| {
+                var owned = lease;
+                owned.release();
+                self.captured = true;
+            }
+        }
+        fn complete(mirror: contract.AsyncEffectMirror, lsn: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            try std.testing.expectEqual(self.expected_appends, self.appended);
+            if (self.root) |root| {
+                try std.testing.expect(!root.held);
+                try std.testing.expectEqual(@as(usize, 0), root.borrowers.load(.acquire));
+            }
+            try std.testing.expect(self.transition.tryLock());
+            self.transition.unlock();
+            try std.testing.expect(self.db.core.apply_mutex.tryLockShared());
+            self.db.core.apply_mutex.unlockShared();
+            self.captured = false;
+            const worker = try std.Thread.spawn(.{}, capture, .{self});
+            worker.join();
+            try std.testing.expect(self.captured);
+            self.completed += 1;
+            if (self.failure == .replay_reply_loss and lsn == 2) return error.InjectedOutboxReplyLoss;
+            if (self.failure == .fence_after_reply) self.closed = true;
+        }
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            // Close when cleanup has obtained the exclusive apply fence. The
+            // post-grant check must reject deletion, including on empty retries.
+            if (self.failure == .fence_at_cleanup_apply and self.completed != 0) {
+                if (self.db.core.apply_mutex.tryLockShared()) self.db.core.apply_mutex.unlockShared() else self.closed = true;
+            }
+            if (self.root) |root| {
+                if (self.completed != 0) {
+                    if (self.db.core.apply_mutex.tryLockShared()) {
+                        self.db.core.apply_mutex.unlockShared();
+                    } else {
+                        // Observe the actual deletion phase under apply. It
+                        // must use this invocation root rather than legacy TLS.
+                        try std.testing.expect(root.held);
+                        try std.testing.expectEqual(@as(usize, 1), root.borrowers.load(.acquire));
+                        self.rooted_cleanup_observations += 1;
+                    }
+                }
+            }
+            if (self.closed) return error.Forbidden;
+        }
+        fn publisher(self: *@This()) contract.Publisher {
+            return .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } };
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |explicit_root| {
+        for ([_]Failure{ .replay_reply_loss, .fence_after_reply, .fence_at_cleanup_apply }) |failure| {
+            var directory = try TestDirectory.init("transaction-outbox-retirement");
+            defer directory.cleanup();
+            var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer db.close();
+            const txn = try db.beginTransaction(1_000);
+            try db.commitTransaction(txn, 2_000);
+            const batch_key = transactions_mod.makeTransactionReplicationBatchOutboxKey(txn);
+            const replay_key = transactions_mod.makeTransactionReplicationReplayOutboxKey(txn);
+            // Model durable obligations surviving a restart before notification.
+            // The real DB resolver must retire its reader on this no-intents retry.
+            try db.core.store.putBatch(&.{ .{ .key = &batch_key, .value = "batch-debt" }, .{ .key = &replay_key, .value = "replay-debt" } }, &.{});
+            var barrier: Barrier = .{};
+            var root = Barrier.RootSharedLease.initRetired(&barrier);
+            defer root.release();
+            var transition: std.atomic.Mutex = .unlocked;
+            var fixture: Fixture = .{ .db = &db, .barrier = &barrier, .transition = &transition, .failure = failure, .root = if (explicit_root) &root else null };
+            const mirror: contract.AsyncEffectMirror = .{ .publisher = fixture.publisher(), .mutation_barrier = &barrier, .transition_mutex = &transition, .requirements = .{ .synchronous = true, .durable_outbox = true } };
+            db.local_execution.replication_async_batch_mirror = mirror;
+            db.local_execution.replication_async_effect_mirror = mirror;
+            db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &fixture, .check_fn = Fixture.check } };
+            defer {
+                db.local_execution.replication_async_batch_mirror = null;
+                db.local_execution.replication_async_effect_mirror = null;
+                db.local_execution.replication_write_gate = null;
+            }
+            const result = if (explicit_root) db.flushTransactionReplicationOutboxWithRoot(txn, &root) else db.commitTransaction(txn, 2_000);
+            try std.testing.expectError(if (failure == .replay_reply_loss) error.InjectedOutboxReplyLoss else error.Forbidden, result);
+            try std.testing.expect(!root.held);
+            try std.testing.expectEqual(@as(usize, 0), root.borrowers.load(.acquire));
+            try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn));
+            var pending = try db.core.loadTransactionReplicationOutbox(alloc, txn);
+            defer pending.deinit(alloc);
+            try std.testing.expectEqual(failure != .replay_reply_loss, pending.batch_payload != null);
+            try std.testing.expect(pending.replay_payload != null);
+            try std.testing.expectEqual(@as(usize, if (failure == .replay_reply_loss) 2 else 1), fixture.completed);
+            fixture.failure = null;
+            fixture.closed = false;
+            fixture.appended = 0;
+            fixture.completed = 0;
+            fixture.expected_appends = if (pending.batch_payload == null) 1 else 2;
+            if (explicit_root) try db.flushTransactionReplicationOutboxWithRoot(txn, &root) else try db.commitTransaction(txn, 2_000);
+            try std.testing.expect(!root.held);
+            if (explicit_root) try std.testing.expect(fixture.rooted_cleanup_observations != 0);
+            try std.testing.expectEqual(fixture.expected_appends, fixture.completed);
+            var remaining = try db.core.loadTransactionReplicationOutbox(alloc, txn);
+            defer remaining.deinit(alloc);
+            try std.testing.expect(remaining.batch_payload == null and remaining.replay_payload == null);
+            var capture = barrier.tryAcquireExclusive() orelse return error.OutboxRetirementLeakedMutationReader;
+            capture.release();
+        }
+    }
+}
+
+test "db child range outbox retires capture admission and retains reply loss or fenced debt" {
+    const outbox = @import("antfly_local_sources").storage_db_document_child_range_outbox;
+    const contract = @import("antfly_local_sources").storage_db_replication_contract;
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    const Fixture = struct {
+        db: *DB,
+        barrier: *Barrier,
+        root: ?*Barrier.RootSharedLease,
+        failure: enum { reply_loss, fence, none },
+        calls: usize = 0,
+        closed: bool = false,
+        captured: bool = false,
+        fn capture(self: *@This()) void {
+            if (self.barrier.tryAcquireExclusive()) |lease| {
+                var owned = lease;
+                owned.release();
+                self.captured = true;
+            }
+        }
+        fn select(_: *anyopaque, _: engine.test_support.types.DocumentArtifactChildRange) ?u64 {
+            return 7;
+        }
+        fn apply(raw: *anyopaque, _: Allocator, dispatch: outbox.DocumentArtifactChildRangeDispatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 7), dispatch.owner_group_id);
+            if (self.root) |root| try std.testing.expect(!root.held);
+            try std.testing.expect(self.db.core.apply_mutex.tryLockShared());
+            self.db.core.apply_mutex.unlockShared();
+            self.captured = false;
+            const worker = try std.Thread.spawn(.{}, capture, .{self});
+            worker.join();
+            try std.testing.expect(self.captured);
+            self.calls += 1;
+            if (self.calls == 2) {
+                if (self.failure == .reply_loss) return error.CommitCompletionPending;
+                if (self.failure == .fence) self.closed = true;
+            }
+        }
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.closed) return error.Forbidden;
+        }
+        fn next(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(_: contract.AsyncEffectMirror, _: @import("antfly_local_sources").storage_db_durable_outbox.Kind, _: []const u8, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedChildOutboxPublish;
+        }
+        fn recover(_: contract.AsyncEffectMirror, _: @import("antfly_local_sources").storage_db_durable_outbox.Kind, _: @import("antfly_local_sources").storage_db_durable_outbox.DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedChildOutboxRecovery;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn complete(_: contract.AsyncEffectMirror, _: u64) !void {
+            return error.UnexpectedChildOutboxComplete;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |explicit_root| {
+        inline for (.{ .reply_loss, .fence }) |failure| {
+            var directory = try TestDirectory.init("child-outbox-retirement");
+            defer directory.cleanup();
+            var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer db.close();
+            const first = try internal_keys.documentChildRangeOutboxKeyAlloc(alloc, 1, 0);
+            defer alloc.free(first);
+            const second = try internal_keys.documentChildRangeOutboxKeyAlloc(alloc, 1, 1);
+            defer alloc.free(second);
+            const value = try outbox.encodeDocumentChildRangeOutboxRecordAlloc(alloc, .{ .owner_group_id = 7, .doc_key = "doc", .artifact_name = "units", .child_batch = .{} });
+            defer alloc.free(value);
+            try db.core.store.putBatch(&.{ .{ .key = first, .value = value }, .{ .key = second, .value = value } }, &.{});
+            var barrier: Barrier = .{};
+            var root = Barrier.RootSharedLease.initRetired(&barrier);
+            defer root.release();
+            var fixture: Fixture = .{ .db = &db, .barrier = &barrier, .root = if (explicit_root) &root else null, .failure = failure };
+            db.local_execution.replication_async_effect_mirror = .{ .publisher = .{ .ptr = &fixture, .vtable = &.{ .next_lsn = Fixture.next, .identity = Fixture.identity, .publish = Fixture.publish, .recover = Fixture.recover, .preflight = Fixture.preflight, .complete = Fixture.complete } }, .mutation_barrier = &barrier };
+            db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &fixture, .check_fn = Fixture.check } };
+            defer {
+                db.local_execution.replication_async_effect_mirror = null;
+                db.local_execution.replication_write_gate = null;
+            }
+            const dispatcher: outbox.DocumentArtifactChildRangeDispatcher = .{ .ptr = &fixture, .select_destination = Fixture.select, .apply = Fixture.apply };
+            try std.testing.expectError(if (failure == .reply_loss) error.CommitCompletionPending else error.Forbidden, db.drainDocumentArtifactChildRangeOutboxWithRoot(dispatcher, 0, fixture.root));
+            try std.testing.expect(!root.held);
+            try std.testing.expectError(error.NotFound, db.core.store.get(alloc, first));
+            const debt = db.core.store.get(alloc, second) catch |err| switch (err) {
+                error.NotFound => return error.ChildOutboxDebtLost,
+                else => return err,
+            };
+            defer alloc.free(debt);
+            fixture.failure = .none;
+            fixture.closed = false;
+            fixture.calls = 0;
+            const retried = try db.drainDocumentArtifactChildRangeOutboxWithRoot(dispatcher, 0, fixture.root);
+            try std.testing.expectEqual(@as(usize, 1), retried.deleted);
+            try std.testing.expectError(error.NotFound, db.core.store.get(alloc, second));
+            try std.testing.expect(!root.held);
+            var after = barrier.tryAcquireExclusive() orelse return error.ChildOutboxCaptureLeaked;
+            after.release();
+        }
+    }
 }

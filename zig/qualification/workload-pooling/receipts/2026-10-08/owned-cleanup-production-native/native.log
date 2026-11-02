@@ -1,0 +1,409 @@
+antfly-inference-worker-process-output-test
++- run test inference-worker-process-output-tests w
+PROCESS_SINK transport=h1 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=7 ends=7
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h1 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=7 ends=7
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=78 ends=78
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=84 ends=84
+PROCESS_SINK await peer EOF
+failed command: cd /private/tmp/antfly-default-pooling-cache/o/a5f18ab3072fa9d49c5cc07b5b938fe1 && ANTFLY_TEST_WORKER_OUTPUT_FIXTURE=./inference-worker-output-fixture /private/tmp/antfly-default-pooling-cache/o/5b5caa7d7fbefaa3bd9d64e491e40506/inference-worker-process-output-tests --cache-dir=/private/tmp/antfly-default-pooling-cache --seed=0x67ed6107 --listen=-
+
+antfly-inference-worker-rpc-test
++- run test inference-worker-rpc-contract-tests w
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidResourceFrame
+[default] (warn): inference worker transport closed err=ResourceCallbackCapacity
+failed command: /private/tmp/antfly-default-pooling-cache/o/c646f095675b8256ccddb7bf682b0ad0/inference-worker-rpc-contract-tests --cache-dir=/private/tmp/antfly-default-pooling-cache --seed=0x67ed6107 --listen=-
+
+antfly-inference-provider-context-test
++- run test inference-provider-context-tests w
+1/2 standalone.runtime.test.runnable execution context adapters preserve parent authority...OK
+2/2 standalone.runtime.test.runnable execution context adapters install immutable production broker admission...info: standalone inference paths models_dir=. ml_dir=.
+info: inference resource policy ownership=external_required process_memory_limit_bytes=18446744073709551615 process_memory_limit_provenance=automatic
+error: standalone inference bridge failed operation=handle_http err=error.Forbidden
+error: standalone inference bridge failed operation=handle_http err=error.Timeout
+error: standalone inference bridge failed operation=handle_http err=error.Timeout
+OK
+2 passed; 0 skipped; 0 failed; 0 leaked.
+failed command: /private/tmp/antfly-default-pooling-cache/o/c8f7322283fc1b091ad0a1fc02ff7e3a/inference-provider-context-tests --suite-filter "runnable execution context adapters" --allow-empty-test-filter --allow-empty-owner
+
+antfly-http-cleanup-owner-test
++- run test http-cleanup-owner-tests w
+H2 stream handler error: error.DeadlineExceeded
+failed command: /private/tmp/antfly-default-pooling-cache/o/e0a8a1480a860701894e8a865a2819aa/http-cleanup-owner-tests --cache-dir=/private/tmp/antfly-default-pooling-cache --seed=0x67ed6107 --listen=-
+
+antfly-inference-worker-owner-handoff-test
++- run test inference-worker-owner-handoff-tests w
+REAL_SINK transport=h1 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h1 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=4 ends=4
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=34 ends=34
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=34 ends=34
+REAL_SINK await peer EOF
+failed command: /private/tmp/antfly-default-pooling-cache/o/5c0a7184386e7cf1ba4a50782579fc85/inference-worker-owner-handoff-tests --cache-dir=/private/tmp/antfly-default-pooling-cache --seed=0x67ed6107 --listen=-
+
+antfly-workload-pooling-test
++- run test default-workload-pooling-tests
+   +- run test default-workload-pooling-tests-local w
+1/41 sql.read_fence.test.read fence validates each resumed grant and forced output without caching failure...OK
+2/41 sql.read_fence.test.read fence owns bounded immutable table and policy pins across allocation failure...OK
+3/41 sql.read_fence.test.read fence invalidates a grant when binding adds a table and protects validation ownership...OK
+4/41 common.config.test.config query waiting validates complete bounds and keeps legacy defaults...OK
+5/41 common.config.test.config query waiting pgwire aggregate memory round trips...OK
+6/41 common.config.test.config query waiting retained pgwire policy validates independent budgets...OK
+7/41 common.config.test.config workload envelope validates finite allocation limits...OK
+8/41 common.config.test.config workload envelope validates retained allocation limits...OK
+9/41 common.config.test.config runnable scheduler validates canonical opt-in policy...OK
+10/41 common.request_admission.test.request admission bounds positive capacity and preserves unlimited mode...OK
+11/41 common.request_admission.test.request admission lease releases exactly once...OK
+12/41 common.request_admission.test.request admission metrics use the shared admission namespace...OK
+13/41 common.bounded_admission.test.bounded admission contextual leases measure ownership once under both policies...OK
+14/41 common.bounded_admission.test.bounded admission FIFO grant cancellation and close transfer one owner...OK
+15/41 common.bounded_admission.test.bounded admission rejects count bytes oversized and invalid policies...OK
+16/41 common.bounded_admission.test.bounded admission wait ceiling and expired fast path never execute...OK
+17/41 common.bounded_admission.test.bounded admission native queue leaves completion capacity and drains a burst...OK
+18/41 common.bounded_admission.test.bounded admission queued external cancellation retires without execution...OK
+19/41 common.bounded_admission.test.bounded admission unsupported executor remains fail fast without enqueue...OK
+20/41 common.bounded_admission.test.bounded admission live shrink preserves grants and retires newest waiters...OK
+21/41 common.bounded_admission.test.bounded admission suspension and terminal drain reconcile caller ownership...OK
+22/41 functions.runtime.test.decision functions remote transport parks its parent and discards failed resumptions...OK
+23/41 common.runnable_scheduler.test.runnable scheduler weighted execution retains CPU demand across waits and class changes...OK
+24/41 common.runnable_scheduler.test.runnable scheduler node owner outlives independent borrowers and executions...OK
+25/41 common.runnable_scheduler.test.runnable scheduler preserves blocked ownership and protected capacity...OK
+26/41 common.runnable_scheduler.test.runnable scheduler bounds backfill and grants a large operation...OK
+27/41 common.runnable_scheduler.test.runnable scheduler weighted sharing charges slots across busy classes...OK
+28/41 common.runnable_scheduler.test.runnable scheduler cancellation after grant returns every reservation...OK
+29/41 common.runnable_scheduler.test.runnable scheduler deadline and shutdown retire blocked and queued owners...OK
+30/41 common.runnable_scheduler.test.runnable scheduler yield hands execution to another operation...OK
+31/41 common.runnable_scheduler.test.runnable scheduler queue bound starts at enqueue including grant race...OK
+32/41 common.runnable_scheduler.test.runnable scheduler real queue timeout releases count and bytes...OK
+33/41 common.runnable_scheduler.test.runnable scheduler rejects invalid policy and oversized demand atomically...OK
+34/41 common.runnable_scheduler.test.runnable scheduler shutdown racing a new block cannot strand an owner...OK
+35/41 common.runnable_scheduler.test.runnable scheduler execution quanta preserve deadline and parked ownership...OK
+36/41 common.runnable_scheduler.test.runnable scheduler checkpoint work budget and disabled execution...OK
+37/41 common.runnable_scheduler.test.runnable scheduler reserves control metadata at full ordinary outstanding limits...OK
+38/41 common.runnable_scheduler.test.runnable scheduler denied reentry retains borrowed reservations until owning finish...OK
+39/41 common.runnable_scheduler.test.runnable scheduler canceled yielded capsule retains ownership while peer computes...OK
+40/41 common.runnable_metrics.test.runnable metrics distinguish disabled scheduling from configured capacity...OK
+41/41 common.runnable_metrics.test.runnable metrics preserve parked memory and separate protected execution...OK
+41 passed; 0 skipped; 0 failed; 0 leaked.
+failed command: /private/tmp/antfly-default-pooling-cache/o/1fd64f658a8490686131786b4915e782/default-workload-pooling-tests-local --suite-filter "bounded admission" --suite-filter "runnable scheduler" --suite-filter "runnable execution" --suite-filter "decision functions remote transport" --suite-filter "runnable metrics" --suite-filter "workload envelope" --suite-filter "workload deadline" --suite-filter "config workload envelope" --suite-filter "pgwire retained budget" --suite-filter "pgwire shared session budget" --suite-filter "request admission bounds" --suite-filter "request admission lease" --suite-filter "request admission metrics" --suite-filter "config query waiting" --suite-filter "config runnable scheduler" --suite-filter "httpx workload policy" --suite-filter "httpx query waiting" --suite-filter "SQL query waiting" --suite-filter "httpx query admission" --suite-filter "httpx write admission" --suite-filter "SQL protected executor" --suite-filter "SQL protected control" --suite-filter "httpx stable transaction commit" --suite-filter "httpx SQL executes one relational page" --suite-filter "httpx SQL connection routes" --suite-filter "httpx SQL durable session settings" --suite-filter "SQL pgwire credential snapshot" --suite-filter "SQL read resume fences" --suite-filter "read fence validates each" --suite-filter "read fence owns bounded" --suite-filter "read fence invalidates" --allow-empty-test-filter --allow-empty-owner
+
+antfly-workload-pooling-test
++- run test default-workload-pooling-tests w
+1/53 api.sql_pgwire.test.SQL pgwire credential snapshot observes policy revocation and password rotation...OK
+2/53 api.sql_pgwire.test.SQL query waiting pgwire preserves deadline cancellation and typed parameters...OK
+3/53 api.sql_pgwire.test.workload deadline normalizes pgwire clock before native metadata handoff...OK
+4/53 api.sql_execution.test.SQL read resume fences validate live policy and catalog before continuing...read fence case success: no runnable or metadata charges
+read fence case filter: no runnable or metadata charges
+read fence case permission: no runnable or metadata charges
+read fence case roles: no runnable or metadata charges
+read fence case roles_without_filter: no runnable or metadata charges
+read fence case metadata_without_filter: no runnable or metadata charges
+read fence case unprotected_roles_change: no runnable or metadata charges
+read fence case unprotected_metadata_change: no runnable or metadata charges
+read fence case account: no runnable or metadata charges
+read fence case replacement: no runnable or metadata charges
+read fence case schema: no runnable or metadata charges
+read fence case revision: no runnable or metadata charges
+read fence case physical: no runnable or metadata charges
+read fence case key_expiry: no runnable or metadata charges
+read fence case key_deletion: no runnable or metadata charges
+read fence case during_catalog: no runnable or metadata charges
+read fence case deadline: no runnable or metadata charges
+read fence case policy_enable: no runnable or metadata charges
+read fence case policy_generation: no runnable or metadata charges
+read fence case policy_disable: no runnable or metadata charges
+read fence case policy_pending: no runnable or metadata charges
+read fence case policy_transition: no runnable or metadata charges
+OK
+5/53 api.distributed_join.test.workload envelope distributed join fanout bounds concurrency drains errors and preserves group order...OK
+6/53 api.http_server.test.workload envelope fail-fast transport reserves controls within its task ceiling...OK
+7/53 api.http_server.test.workload envelope preserves control allocation under aggregate foreground exhaustion...OK
+8/53 api.http_server.test.workload envelope pins HTTP transport and control through node memory exhaustion...OK
+9/53 api.http_server.test.workload deadline survives NDJSON lines and MCP dispatch...OK
+10/53 api.http_server.test.workload envelope accounts persistent MCP sessions and recovers from exhaustion...OK
+11/53 api.http_server.test.workload deadline bounds internal planning retrieval and administrative waits...OK
+12/53 api.httpx_handler.test.httpx stable transaction commit durably hands off recovery before acknowledgement...[warn] (default): row policy publication deferred err=UnsupportedOperation
+[warn] (default): stable transaction recovered coordinator acknowledgement deferred txn_id=000000000000000018dc7a0dc022b3b0 err=InjectedAcknowledgementFailure
+[warn] (default): row policy publication deferred err=UnsupportedOperation
+[warn] (default): row policy publication deferred err=UnsupportedOperation
+OK
+13/53 api.httpx_handler.test.httpx query admission rejects saturated queries without blocking control routes...OK
+14/53 api.httpx_handler.test.httpx query admission releases a cancelled query slot...OK
+15/53 api.httpx_handler.test.httpx write admission rejects saturated table mutations...OK
+16/53 api.httpx_handler.test.httpx query admission treats zero capacity as unlimited...OK
+17/53 api.httpx_handler.test.httpx SQL durable session settings enforce scoped typed authority...OK
+18/53 api.httpx_handler.test.httpx SQL connection routes preserve settings and retire prepared resources...OK
+19/53 api.httpx_handler.test.httpx SQL executes one relational page with exact integer parameters...H2 stream handler error: error.StreamReset
+OK
+20/53 api.httpx_handler.test.httpx query waiting expires before execution and preserves original timeout...OK
+21/53 api.httpx_handler.test.SQL query waiting shares HTTP owner and retains fail fast writes...OK
+22/53 api.httpx_handler.test.httpx query waiting real sockets absorb burst and keep status responsive...OK
+23/53 api.httpx_handler.test.SQL protected executor reserves bounded workers and rolls back exhaustion...OK
+24/53 api.httpx_handler.test.SQL protected executor preserves an explicitly disabled dedicated worker budget...OK
+25/53 api.httpx_handler.test.SQL protected control transport validates typed paths before granting reserve...OK
+26/53 api.httpx_handler.test.httpx workload policy requires admin and versioned bounded updates...OK
+27/53 api.kernel_bridge.test.runnable scheduler opaque node owner retains its allocator after refused destruction...OK
+28/53 api.kernel_exports.test.runnable scheduler API kernel node owner rejects unsafe creation and destruction...OK
+29/53 api.runnable_owner_execution.test.runnable execution port retains parked weighted capsules and protects control progress...OK
+30/53 api.runnable_owner_execution.test.runnable execution port resumes with original deadline and cancellation...OK
+31/53 api.runnable_owner_execution.test.runnable execution port rejects malformed borrows and impossible demand without leaking ownership...OK
+32/53 api.runnable_owner_execution.test.runnable execution port allocation failure releases its owner lease...OK
+33/53 api.runnable_owner_execution.test.runnable execution consumer lease validates before retaining and refuses shutdown...OK
+34/53 api.runnable_owner_execution.test.runnable execution borrowed child transfers one weighted operation without nested admission...OK
+35/53 api.runnable_owner_execution.test.runnable execution borrowed child rejects stale deadlines headers and shutdown without retiring its parent...OK
+36/53 api.runnable_owner_execution.test.runnable execution port forwards fail-fast control admission without publishing rejected capsules...OK
+37/53 api.runnable_owner_execution.test.runnable execution cleanup subquota preserves health headroom with all ordinary operations retained...OK
+38/53 api.runnable_owner_execution.test.runnable execution cleanup rejects oversized unbounded and failed allocations without consuming its subquota...OK
+39/53 api.runnable_owner_execution.test.runnable execution cleanup keeps its gate and bytes through denied reentry until owning finish...OK
+40/53 api.runnable_owner_execution.test.runnable execution HTTP cleanup callbacks borrow the real shared owner until writer finish...OK
+41/53 common.allocation_budget.test.workload envelope preserves allocation provenance across control ownership transfers...OK
+42/53 common.allocation_budget.test.workload envelope node accounting rolls back allocation and growth failures...OK
+43/53 common.allocation_budget.test.workload envelope service control survives node exhaustion and returns its pin after joins...OK
+44/53 pgwire.server.test.pgwire shared session budget rejects impossible aggregate limits...OK
+45/53 pgwire.protocol.test.workload envelope pgwire authenticated startup retires partitioned frames under bulk OOM...OK
+46/53 pgwire.protocol.test.workload envelope pgwire frame parsing preserves control reserve under bulk OOM...OK
+47/53 pgwire.protocol.test.workload envelope pgwire verified simple controls acknowledge under bulk OOM...OK
+48/53 api.sql_control.test.SQL protected control classification rejects fresh work and multiple statements...OK
+49/53 pgwire.budget.test.pgwire shared session budget bounds aggregate connections and reclaims capacity...OK
+50/53 pgwire.budget.test.pgwire shared session budget rolls back a failed backing allocation...OK
+51/53 pgwire.budget.test.pgwire retained budget independently charges aggregate and connection allocation...OK
+52/53 pgwire.budget.test.pgwire retained budget rolls back failed backing allocation...OK
+53/53 common.fanout_memory.test.workload envelope fanout children share caller charge and retire after joins...OK
+53 passed; 0 skipped; 0 failed; 0 leaked.
+failed command: /private/tmp/antfly-default-pooling-cache/o/8f192d4f542c7828899fcb57d7b67cdb/default-workload-pooling-tests --suite-filter "bounded admission" --suite-filter "runnable scheduler" --suite-filter "runnable execution" --suite-filter "decision functions remote transport" --suite-filter "runnable metrics" --suite-filter "workload envelope" --suite-filter "workload deadline" --suite-filter "config workload envelope" --suite-filter "pgwire retained budget" --suite-filter "pgwire shared session budget" --suite-filter "request admission bounds" --suite-filter "request admission lease" --suite-filter "request admission metrics" --suite-filter "config query waiting" --suite-filter "config runnable scheduler" --suite-filter "httpx workload policy" --suite-filter "httpx query waiting" --suite-filter "SQL query waiting" --suite-filter "httpx query admission" --suite-filter "httpx write admission" --suite-filter "SQL protected executor" --suite-filter "SQL protected control" --suite-filter "httpx stable transaction commit" --suite-filter "httpx SQL executes one relational page" --suite-filter "httpx SQL connection routes" --suite-filter "httpx SQL durable session settings" --suite-filter "SQL pgwire credential snapshot" --suite-filter "SQL read resume fences" --suite-filter "read fence validates each" --suite-filter "read fence owns bounded" --suite-filter "read fence invalidates" --allow-empty-test-filter --allow-empty-owner
+
+Build Summary: 98/98 steps succeeded; 40/40 tests passed
+antfly-http-cleanup-owner-test success
++- run test http-cleanup-owner-tests 2 pass (2 total) 354ms MaxRSS:2M
+   +- compile test http-cleanup-owner-tests safe native success 10s MaxRSS:514M
+      +- WriteFile macos-sdk-libc.txt cached
+antfly-inference-worker-process-output-test success
++- run test inference-worker-process-output-tests 1 pass (1 total) 1s MaxRSS:4M
+   +- compile test inference-worker-process-output-tests safe native success 10s MaxRSS:913M
+   |  +- WriteFile macos-sdk-libc.txt (reused)
+   +- compile exe inference-worker-output-fixture safe native success 6s MaxRSS:376M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-worker-output-error-test success
++- run test inference-worker-output-error-tests 3 pass (3 total) 127ms MaxRSS:2M
+   +- compile test inference-worker-output-error-tests safe native success 6s MaxRSS:368M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-workload-pooling-test success
++- run test default-workload-pooling-tests success 10s
+   +- compile test default-workload-pooling-tests safe native success 16m MaxRSS:14G
+   |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  +- options cached
+   |  +- options cached
+   |  +- options success
+   |  +- options cached
+   |  +- WriteFile tokenizer.json success
+   |  +- translate-c lmdb success 345ms
+   |  |  +- compile exe translate-c debug native success 6s MaxRSS:841M
+   |  |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  |  +- options cached
+   |  |  |  +- options cached
+   |  |  |  +- options cached
+   |  |  |  +- run exe generate-def (aarch64.zig) success 36ms
+   |  |  |  |  +- compile exe generate-def debug native cached 40ms MaxRSS:31M
+   |  |  |  |     +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  |  +- run exe generate-def (amdgcn.zig) success 156ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (arm.zig) success 26ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (bpf.zig) success 4ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (common.zig) success 155ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (hexagon.zig) success 221ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (loongarch.zig) success 109ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (mips.zig) success 49ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (neon.zig) success 132ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (nvptx.zig) success 109ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (powerpc.zig) success 53ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (riscv.zig) success 12ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (s390x.zig) success 19ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (ve.zig) success 128ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (wasm.zig) success 41ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (x86_64.zig) success 34ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (x86.zig) success 270ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (xcore.zig) success 3ms
+   |  |  |     +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  +- options cached
+   |  +- options cached
+   |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf success
+   |  +- run exe jit-source-identity (metal_identity.zig) success 11ms
+   |  |  +- compile exe jit-source-identity safe native cached 40ms MaxRSS:31M
+   |  |     +- WriteFile macos-sdk-libc.txt (reused)
+   |  +- options cached
+   |  +- options cached
+   |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) success 6ms
+   |     +- compile exe patch_sentencepiece_proto safe native cached 37ms MaxRSS:31M
+   |     |  +- WriteFile macos-sdk-libc.txt (reused)
+   |     +- run exe protoc-zig (sentencepiece_proto_raw) success 6ms
+   |     |  +- compile exe protoc-zig safe native cached 40ms MaxRSS:31M
+   |     |     +- WriteFile macos-sdk-libc.txt (reused)
+   |     +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+   +- run test default-workload-pooling-tests-local success 13ms
+      +- compile test default-workload-pooling-tests-local safe native success 46s MaxRSS:2G
+      |  +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- options success
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- WriteFile tokenizer.json (reused)
+      |  +- translate-c lmdb (+2 more reused dependencies)
+      |  +- options (reused)
+      |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+      |  +- run exe jit-source-identity (metal_identity.zig) (+1 more reused dependencies)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+      +- run python3 success 41ms
+         +- run test default-workload-pooling-tests success 469ms
+         |  +- compile test default-workload-pooling-tests safe native (+14 more reused dependencies)
+         +- run test default-workload-pooling-tests-local success 131ms
+            +- compile test default-workload-pooling-tests-local safe native (+14 more reused dependencies)
+antfly-inference-worker-rpc-test success
++- run test inference-worker-rpc-contract-tests 26 pass (26 total) 389ms MaxRSS:271M
+|  +- compile test inference-worker-rpc-contract-tests safe native success 8s MaxRSS:419M
+|     +- WriteFile macos-sdk-libc.txt (reused)
++- run test 6 pass (6 total) 119ms MaxRSS:5M
+   +- compile test safe native success 8s MaxRSS:364M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 2 pass (2 total) 1s MaxRSS:7M
+   +- compile test inference-worker-owner-handoff-tests safe native success 9s MaxRSS:516M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-provider-context-test success
++- run test inference-provider-context-tests success 24ms
+   +- compile test inference-provider-context-tests safe native success 4m MaxRSS:4G
+   |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  +- WriteFile cached
+   |  +- compile obj antfly-build-info safe native cached 34ms MaxRSS:31M
+   |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  +- options cached
+   |  +- WriteFile cached
+   |  +- compile lib antfly-storage-kernel safe native success 16m MaxRSS:9G
+   |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  +- options (reused)
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- options (reused)
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- WriteFile tokenizer.json (reused)
+   |  |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+   |  |  +- options (reused)
+   |  |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+   |  +- WriteFile cached
+   |  +- compile lib antfly-runtime-enrichment_compute safe native success 32s MaxRSS:1G
+   |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- options (reused)
+   |  |  +- options cached
+   |  |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+   |  +- WriteFile cached
+   |  +- compile lib antfly-runtime-inference safe native success 15m MaxRSS:8G
+   |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  +- options cached
+   |  |  +- options (reused)
+   |  |  +- options (reused)
+   |  |  +- options (reused)
+   |  |  +- run exe jit-source-identity (metal_identity.zig) (+1 more reused dependencies)
+   |  |  +- options (reused)
+   |  |  +- WriteFile tokenizer.json (reused)
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+   |  +- compile obj antfly-build-info safe native (+2 more reused dependencies)
+   |  +- compile lib antfly-storage-kernel safe native (+11 more reused dependencies)
+   |  +- compile lib antfly-runtime-enrichment_compute safe native (+6 more reused dependencies)
+   |  +- compile lib antfly-runtime-inference safe native (+11 more reused dependencies)
+   |  +- options (reused)
+   |  +- options (reused)
+   |  +- options cached
+   |  +- options (reused)
+   |  +- WriteFile tokenizer.json (reused)
+   |  +- translate-c lmdb (+2 more reused dependencies)
+   |  +- options cached
+   |  +- options (reused)
+   |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+   |  +- run exe jit-source-identity (metal_identity.zig) (+1 more reused dependencies)
+   |  +- options (reused)
+   |  +- options (reused)
+   |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+   +- run test inference-provider-context-tests-local success 4ms
+      +- compile test inference-provider-context-tests-local safe native success 15s MaxRSS:1G
+      |  +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- compile obj antfly-build-info safe native (+2 more reused dependencies)
+      |  +- compile lib antfly-storage-kernel safe native (+11 more reused dependencies)
+      |  +- compile lib antfly-runtime-enrichment_compute safe native (+6 more reused dependencies)
+      |  +- compile lib antfly-runtime-inference safe native (+11 more reused dependencies)
+      |  +- options cached
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- WriteFile tokenizer.json (reused)
+      |  +- translate-c lmdb (+2 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile obj antfly-build-info safe native (+2 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile lib antfly-storage-kernel safe native (+11 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile lib antfly-runtime-enrichment_compute safe native (+6 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile lib antfly-runtime-inference safe native (+11 more reused dependencies)
+      |  +- options (reused)
+      |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+      |  +- run exe jit-source-identity (metal_identity.zig) (+1 more reused dependencies)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+      +- run python3 success 112ms
+         +- run test inference-provider-context-tests success 394ms
+         |  +- compile test inference-provider-context-tests safe native (+26 more reused dependencies)
+         +- run test inference-provider-context-tests-local success 115ms
+            +- compile test inference-provider-context-tests-local safe native (+26 more reused dependencies)
+

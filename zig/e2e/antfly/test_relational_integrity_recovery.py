@@ -18,6 +18,7 @@
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 
 import pytest
 import requests
@@ -464,13 +465,68 @@ def _schema(parent=None):
     return result
 
 
+@contextmanager
+def _suspend_query_admission(cluster, table):
+    """Keep fresh SQL closed while an already decided mutation retires."""
+    previous = []
+    auth = ("admin", backups.AUTH_BOOTSTRAP_PASSWORD)
+    try:
+        for origin, api in zip(cluster.data_urls, cluster.data_api_urls):
+            endpoint = f"{origin}/admin/v1/workload/query"
+            response = requests.get(endpoint, auth=auth, timeout=5)
+            assert response.status_code == 200, response.text
+            original = response.json()["query"]
+            previous.append((endpoint, original))
+            replacement = {
+                "expected_version": original["policy_version"],
+                "capacity": original["capacity"],
+                "waiting": original["waiting"],
+                "suspended": True,
+            }
+            response = requests.put(endpoint, json=replacement, auth=auth, timeout=5)
+            assert response.status_code == 200, response.text
+            assert response.json()["query"]["suspended"]
+            rejected = requests.post(
+                f"{api}/sql",
+                json={"statement": f"SELECT id FROM {table}"},
+                auth=auth,
+                timeout=5,
+            )
+            assert rejected.status_code == 503, rejected.text
+        yield
+    finally:
+        # Restart resets policy/version. Observe the current version for CAS.
+        for endpoint, original in reversed(previous):
+            current = requests.get(endpoint, auth=auth, timeout=5)
+            assert current.status_code == 200, current.text
+            response = requests.put(
+                endpoint,
+                json={
+                    "expected_version": current.json()["query"]["policy_version"],
+                    "capacity": original["capacity"],
+                    "waiting": original["waiting"],
+                    "suspended": original["suspended"],
+                },
+                auth=auth,
+                timeout=5,
+            )
+            assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("suspend_foreground", [False, True])
+@pytest.mark.parametrize(
+    "three_by_three_backup_cluster",
+    [{"data_auth_enabled": True}],
+    ids=["authenticated-data"],
+    indirect=True,
+)
 @pytest.mark.parametrize(
     "owner_link_fault,crash",
     [("transaction_resolve", "owner"), ("transaction_resolve", "reply_loss")],
     indirect=["owner_link_fault"],
 )
 def test_fk_cascade_recovers_claims_references_and_rows(
-    integrity_cluster, owner_link_fault, crash
+    integrity_cluster, owner_link_fault, crash, suspend_foreground
 ):
     cluster, fault = integrity_cluster, owner_link_fault
     fault.heal()  # Only the test mutation, not activation/seed, is faulted.
@@ -550,28 +606,34 @@ def test_fk_cascade_recovers_claims_references_and_rows(
                     f"transaction transport={fault.transaction_observations}\n"
                     f"{cluster.debug_logs()}"
                 )
-            if crash == "reply_loss":
-                assert fault.reply_dropped.is_set(), (
-                    "no accepted resolution reply dropped"
-                )
-                fault.heal()
-            else:
-                # Kill an owner reached by the transaction protocol, then
-                # reopen its existing logs. Do not synthesize storage effects.
-                index = next(iter(fault.observed()))
-                cluster.data_procs[index].kill()
-                cluster.data_procs[index].wait(timeout=10)
-                try:
+            pressure = (
+                _suspend_query_admission(cluster, child)
+                if suspend_foreground
+                else nullcontext()
+            )
+            with pressure:
+                if crash == "reply_loss":
+                    assert fault.reply_dropped.is_set(), (
+                        "no accepted resolution reply dropped"
+                    )
                     fault.heal()
-                finally:
-                    cluster.restart_crashed_node(metadata=False, index=index)
-            try:
-                result = pending.result(timeout=65)
-                assert result.status_code in (200, 201, 202, 503), result.text
-            except requests.RequestException:
-                # Killing the frontend can lose the response after a durable
-                # commit. The externally observed database below is the proof.
-                pass
+                else:
+                    # Kill an owner reached by the transaction protocol, then
+                    # reopen its existing logs. Do not synthesize storage effects.
+                    index = next(iter(fault.observed()))
+                    cluster.data_procs[index].kill()
+                    cluster.data_procs[index].wait(timeout=10)
+                    try:
+                        fault.heal()
+                    finally:
+                        cluster.restart_crashed_node(metadata=False, index=index)
+                try:
+                    result = pending.result(timeout=65)
+                    assert result.status_code in (200, 201, 202, 503), result.text
+                except requests.RequestException:
+                    # Killing the frontend can lose the response after a durable
+                    # commit. The externally observed database below is the proof.
+                    pass
 
         parent_keys = ["0:parent"]
 

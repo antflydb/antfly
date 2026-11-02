@@ -1,0 +1,30 @@
+{
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "build",
+    "antfly-workload-pooling-test",
+    "-Doptimize=ReleaseSafe",
+    "-j1",
+    "--maxrss",
+    "23622320128",
+    "--cache-dir",
+    "/private/tmp/antfly-default-pooling-cache",
+    "--summary",
+    "all"
+  ],
+  "source_sha256": {
+    "pkg/inference/src/host/host.zig": "bec73dd2a86dca381f304fe049e8ffbb7ceea7bab5cdc7bafe90f4f03e2251ac",
+    "pkg/inference/src/host/execution_control.zig": "d510f07c0abec62d61617c3f5bc7638b3ca06b759bb599985a797b0d579b5f90",
+    "pkg/inference/src/host/bridge.zig": "7298acbc7566e3a3eb8a79cd7463f071bfdeadbcc5006935ef87ddd3a57a7251",
+    "pkg/antfly/src/api/sql_execution.zig": "f76bb66a01e3996ed78dd4f9714876182ef247552b86cadbb8df2855654089bc",
+    "pkg/antfly/src/api/httpx_handler.zig": "2ccafd2a682700323a6062dbac937108148df6f2424a61476ba3e58864a34e01",
+    "pkg/antfly-embedded/src/storage/inference_provider.zig": "3af15bbabb6faa20df5358a759176e10e5f34616fda59edd38df1a25311671ce",
+    "pkg/antfly/build/api_tests.zig": "4c3f8ee24353b586584dee6a7b540a3c3ea3d1795e2e4cdca1533790338bfb6d",
+    "build_support/antfly/dependencies.zig": "a1ecc88fd426fef0cd3bc065c7f4f19848c9d978476ac29db132048b5c714fc8",
+    "build_support/embedded/wasm.zig": "316a6fb7e008063f04c835bf79b9f77b71512f61afd5eed3857eb8541e1da648"
+  },
+  "pid": 80967,
+  "exit_code": 0,
+  "finished": 1791398713.94674,
+  "state": "terminal"
+}

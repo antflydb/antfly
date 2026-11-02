@@ -1,0 +1,95 @@
+1/63 httpx.test.h2 connection...OK
+2/63 httpx.test.socket...OK
+3/63 httpx.test.server...OK
+4/63 server.server.test.HTTP streaming headers and automatic preflight preserve middleware policy...OK
+5/63 server.server.test.H2 response serialization strips connection-specific headers...OK
+6/63 server.server.test.HTTP controlled streaming rejects expired headers and retains controls on delegated chunks...OK
+7/63 server.server.test.HTTP controlled H2 published headers survive denied reentry and late failure resets only the stream...OK
+8/63 server.server.test.HTTP controlled H2 reset cleanup bounds a contended connection mutex...OK
+9/63 server.server.test.HTTP controlled H2 reset cleanup survives actual task cancellation...OK
+10/63 server.server.test.HTTP controlled H2 reset cleanup bounds a stalled native peer...RESET_PREFILL bytes=0 empty_sends=0 stalled=true
+CLEANUP_BACKPRESSURE mode=reset fallback=false elapsed_ms=251
+OK
+11/63 server.server.test.HTTP controlled H2 reset cleanup bounds a stalled fallback peer with zero async allowance...RESET_PREFILL bytes=0 empty_sends=0 stalled=true
+CLEANUP_BACKPRESSURE mode=reset fallback=true elapsed_ms=258
+OK
+12/63 server.server.test.HTTP controlled scheduler failures map to retryable overload without replacing original fences...OK
+13/63 server.server.test.HTTP controlled H2 scheduler overload publishes retry guidance and a complete error body...OK
+14/63 server.server.test.HTTP controlled H1 scheduler overload publishes retry guidance and a complete error body...OK
+15/63 server.server.test.HTTP controlled H1 error cleanup bounds a stalled native peer...RESET_PREFILL bytes=0 empty_sends=0 stalled=true
+CLEANUP_BACKPRESSURE mode=h1_error fallback=false elapsed_ms=251
+OK
+16/63 server.server.test.HTTP controlled H2 error cleanup bounds a stalled native peer...RESET_PREFILL bytes=0 empty_sends=0 stalled=true
+CLEANUP_BACKPRESSURE mode=h2_error fallback=false elapsed_ms=251
+OK
+17/63 server.server.test.HTTP controlled H1 error cleanup bounds a stalled fallback peer with zero async allowance...RESET_PREFILL bytes=0 empty_sends=0 stalled=true
+CLEANUP_BACKPRESSURE mode=h1_error fallback=true elapsed_ms=251
+OK
+18/63 server.server.test.HTTP controlled H2 error cleanup bounds a stalled fallback peer with zero async allowance...RESET_PREFILL bytes=0 empty_sends=0 stalled=true
+CLEANUP_BACKPRESSURE mode=h2_error fallback=true elapsed_ms=260
+OK
+19/63 server.server.test.HTTP controlled H2 error cleanup bounds a contended mutex without unlocked stream mutation...OK
+20/63 server.server.test.HTTP controlled H2 error cleanup bounds credit waits and releases the mutex...OK
+21/63 server.server.test.HTTP controlled H2 pump error with no credit resets only its stream without waiting...OK
+22/63 server.server.test.HTTP controlled H1 error cleanup survives actual task cancellation...OK
+23/63 server.server.test.HTTP controlled H2 error cleanup survives actual task cancellation...OK
+24/63 net.socket.test.resolveAddressFiltered applies policy to literal and DNS results...OK
+25/63 net.socket.test.Socket connect and close...OK
+26/63 net.socket.test.TcpListener accept...OK
+27/63 net.socket.test.Socket.writer writeAll and print over TCP...OK
+28/63 net.socket.test.UdpSocket send/recv localhost...OK
+29/63 net.socket.test.SocketIoWriter flush sends buffered bytes...OK
+30/63 net.socket.test.Socket recv timeout returns error.Timeout...OK
+31/63 net.socket.test.Socket cancellation polling preserves the configured receive timeout...OK
+32/63 net.socket.test.Socket abort interrupts a backpressured native send...OK
+33/63 net.socket.test.Socket send timeout reports backpressure without panicking...OK
+34/63 net.socket.test.SliceIoReader skips leading empty buffers...OK
+35/63 net.socket.test.PrefixedReader skips leading empty buffers...OK
+36/63 net.socket.test.ContentLengthReader skips leading empty buffers...OK
+37/63 net.socket.test.ContentLengthReader handles inner reader that buffers before producing bytes...OK
+38/63 net.socket.test.ContentLengthReader reports premature EOF as ReadFailed...OK
+39/63 net.socket.test.ChunkedBodyReader skips leading empty buffers...OK
+40/63 net.socket.test.ChunkedBodyReader handles inner reader that buffers before producing bytes...OK
+41/63 net.socket.test.timed fallback healthy read never runs timer eagerly...HEALTHY direction=read elapsed_ms=0 timeout_ms=250 count=1
+OK
+42/63 net.socket.test.timed fallback healthy write never runs timer eagerly...HEALTHY direction=write elapsed_ms=0 timeout_ms=250 count=1
+OK
+43/63 net.socket.test.timed fallback stalled read remains bounded at zero async allowance...STALLED_WAIT direction=read
+STALLED_TIMEOUT direction=read elapsed_ms=258
+OK
+44/63 net.socket.test.timed fallback stalled write remains bounded at zero async allowance...STALLED_WAIT direction=write
+STALLED_TIMEOUT direction=write elapsed_ms=255
+OK
+45/63 net.socket.test.timed fallback denied read preserves bytes...RESIDUAL_RED admission direction=read limit=0
+ADMISSION_DENIED direction=read limit=0 elapsed_ms=0
+RESIDUAL_RED admission direction=read limit=1
+ADMISSION_DENIED direction=read limit=1 elapsed_ms=0
+OK
+46/63 net.socket.test.timed fallback denied write sends no bytes...RESIDUAL_RED admission direction=write limit=0
+ADMISSION_DENIED direction=write limit=0 elapsed_ms=0
+RESIDUAL_RED admission direction=write limit=1
+ADMISSION_DENIED direction=write limit=1 elapsed_ms=0
+OK
+47/63 net.socket.test.ChunkedBodyReader preserves truncation versus invalid framing at every phase...OK
+48/63 net.socket.test.Socket controlled native write retains the original deadline under backpressure...CONTROLLED_WRITE backend=native cause=deadline elapsed_ms=250
+OK
+49/63 net.socket.test.Socket controlled native write observes original cancellation under backpressure...CONTROLLED_WRITE backend=native cause=canceled elapsed_ms=78
+OK
+50/63 net.socket.test.Socket controlled fallback write retains the original deadline with zero async allowance...CONTROLLED_WRITE backend=fallback cause=deadline elapsed_ms=242
+OK
+51/63 net.socket.test.Socket controlled fallback write observes original cancellation with zero async allowance...CONTROLLED_WRITE backend=fallback cause=canceled elapsed_ms=57
+OK
+52/63 net.socket.test.Socket controlled framing retires uncertainty and preserves a rejected next frame...OK
+53/63 net.socket.test.Socket controlled uncertain output retires after actual fallback task cancellation...OK
+54/63 net.socket.test.Socket output wait ownership restores CPU before formatting and rejects failed resumes...OK
+55/63 protocol.h2_connection.test.H2 controlled flow wait retains original deadline and permits connection control progress...OK
+56/63 protocol.h2_connection.test.H2 controlled lock wait honors original deadline without emitting a frame...OK
+57/63 protocol.h2_connection.test.H2 controlled flow wait observes original cancellation without END_STREAM...OK
+58/63 protocol.h2_connection.test.H2 controlled available credit sends valid DATA and END_STREAM...OK
+59/63 protocol.h2_connection.test.H2 controlled credit waits release CPU and restore it before frame serialization...OK
+60/63 protocol.h2_connection.test.H2 controlled header block remains atomic and unlocks before denied reentry...OK
+61/63 client.client.test.request cancellation before socket publication prevents sending...OK
+62/63 client.pool.test.outbound pool shared socket ceiling spans transports and failed creates reclaim reservations...OK
+63/63 tls.tls.test.residual TLS read preserves native socket timeout...RESIDUAL_RED TLS transport expects=Timeout
+OK
+All 63 tests passed.

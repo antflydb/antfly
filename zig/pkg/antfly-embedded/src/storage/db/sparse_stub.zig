@@ -193,6 +193,11 @@ pub const SparseIndex = struct {
 
     pub fn abortBulkIngestSession(_: *SparseIndex) void {}
 
+    pub fn statsWithAdmission(_: *SparseIndex, original: @import("../../common/read_admission.zig").Port) !Stats {
+        try original.checkpoint();
+        return .{};
+    }
+
     pub fn stats(_: *SparseIndex) Stats {
         return .{};
     }

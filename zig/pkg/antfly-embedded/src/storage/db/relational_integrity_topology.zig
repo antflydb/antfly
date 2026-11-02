@@ -192,6 +192,7 @@ pub fn requireUnfenced(txn: anytype) !void {
 /// Runtime reconciliation of an already-published identical producer catalog
 /// is harmless while frozen; delayed *changes* may not create new callbacks.
 pub fn requireUnfencedOrUnchanged(txn: anytype, key: []const u8, candidate: []const u8) !void {
+    try @import("artifact_inventory.zig").requirePreparedCatalogUnchanged(txn, key, candidate);
     if (try @import("artifact_reconcile_intent.zig").permitCatalog(std.heap.page_allocator, txn, key, candidate)) return;
     if (try current(txn) == null and try @import("online_integrity_shadow.zig").rawRange(txn) == null) return;
     const existing = (try optional(txn, key)) orelse return error.IntegrityTopologyBusy;

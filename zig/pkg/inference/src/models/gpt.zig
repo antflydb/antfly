@@ -24,6 +24,7 @@
 // differences.
 
 const std = @import("std");
+const admitted_json = @import("../util/admitted_json.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 
@@ -733,7 +734,7 @@ pub const Config = struct {
 };
 
 pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    const parsed = try admitted_json.parse(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
     const obj = parsed.value.object;
@@ -1317,7 +1318,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
 }
 
 pub fn applyGenerationConfigJson(allocator: std.mem.Allocator, config: *Config, json_bytes: []const u8) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    const parsed = try admitted_json.parse(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return;
     const obj = parsed.value.object;

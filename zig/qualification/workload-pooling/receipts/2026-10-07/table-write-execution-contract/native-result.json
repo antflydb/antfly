@@ -1,0 +1,13 @@
+{
+  "exit_code": 0,
+  "tool_session_id": 76999,
+  "tests_passed": 3,
+  "named_regressions": 2,
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/api/table_write_source.zig": "7dd9379cbd8890cd459a0b7ef70a24d1db9e67cf80a79588164d990028c93ca7",
+    "zig/pkg/antfly-embedded/src/table_write_execution_test_root.zig": "0eb3517db2803b87358b065c73200302b3d861ea8d0ebdf78fd12327c037fe1d",
+    "zig/lib/runtime/src/runtime_runnable_abi.zig": "dfb687000c090fcc75f563b5c97ce4d69c4c0b343054338ebf63291f4b177049"
+  },
+  "log": "native.log",
+  "scope": "Direct callback contracts only; production forwarding is supplemental"
+}

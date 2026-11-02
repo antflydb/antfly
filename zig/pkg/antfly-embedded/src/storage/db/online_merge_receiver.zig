@@ -59,6 +59,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, request: wire.Request, cancellatio
     const owner_cache = &db.local_execution.online_merge_reader;
     try owner_cache.mutex.lock(io);
     defer owner_cache.mutex.unlock(io);
+    if (owner_cache.closing.load(.acquire)) return error.Canceled;
     const cache = &owner_cache.receiver;
     errdefer cache.clear();
     db.core.lockApplyShared();

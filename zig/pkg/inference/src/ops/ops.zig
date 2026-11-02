@@ -1785,6 +1785,12 @@ pub const ComputeBackend = struct {
         return self.vtable.backendKind(self.ptr);
     }
 
+    /// Configure physical device ownership before a live/compiled runtime can
+    /// allocate KV buffers. Backends that retain the capability clone it.
+    pub fn configureDeviceMemoryBudget(self: *const ComputeBackend, budget: runtime.kv.device_memory.Budget) !void {
+        if (self.vtable.configureDeviceMemoryBudget) |configure| try configure(self.ptr, budget);
+    }
+
     pub fn immutableResidentScalarF32(self: *const ComputeBackend, name: []const u8) !ImmutableScalarF32Lookup {
         const op = self.vtable.immutableResidentScalarF32 orelse return .unsupported;
         return op(self.ptr, name);
@@ -1798,6 +1804,7 @@ pub const ComputeBackend = struct {
         self: *const ComputeBackend,
         storage: *runtime.kv.storage_runtime.KvStorageRuntime,
     ) anyerror!void {
+        if (storage.device_memory_budget) |budget| try self.configureDeviceMemoryBudget(budget);
         const hook = self.vtable.provisionKvDeviceWriteHook orelse return;
         return hook(self.ptr, storage);
     }
@@ -1924,6 +1931,7 @@ pub const ComputeBackend = struct {
         /// fast paths; backends without a device KV implementation leave it
         /// null.
         provisionKvDeviceWriteHook: ?*const fn (ctx: *anyopaque, storage: *runtime.kv.storage_runtime.KvStorageRuntime) anyerror!void = null,
+        configureDeviceMemoryBudget: ?*const fn (ctx: *anyopaque, budget: runtime.kv.device_memory.Budget) anyerror!void = null,
 
         /// Read immutable scalar inference metadata from resident model
         /// storage. Implementations may cache both values and missing names.

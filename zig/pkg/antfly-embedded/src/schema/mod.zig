@@ -59,6 +59,10 @@ pub fn parseValidatedTableSchema(alloc: std.mem.Allocator, schema_json: []const 
     return try impl.parseSchema(alloc, schema_json);
 }
 
+pub fn parseValidatedTableSchemaWithAdmission(alloc: std.mem.Allocator, schema_json: []const u8, control: @import("../common/read_admission.zig").Port) !ParsedTableSchema {
+    return impl.parseSchemaWithAdmission(alloc, schema_json, control);
+}
+
 pub fn validateBatchWritesAgainstTableSchema(
     alloc: std.mem.Allocator,
     schema: ParsedTableSchema,

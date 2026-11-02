@@ -409,6 +409,8 @@ pub const Runtime = struct {
     capability_cache: remote_capabilities.Cache,
     execution: execution_context.Context = .{},
     request_progress: ?execution_context.ProgressSink = null,
+    http_wait: ?*execution_context.HttpWait = null,
+    request_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
     owned_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
@@ -536,6 +538,17 @@ pub const Runtime = struct {
         return self.execution.capability_cache orelse &self.capability_cache;
     }
 
+    fn httpControl(self: *Runtime) httpx.socket.WriteControl {
+        return if (self.http_wait) |wait| wait.control() else .{};
+    }
+    fn waitContext(self: *Runtime) remote_capabilities.WaitContext {
+        return self.execution.waitContextWithControl(self.httpControl());
+    }
+    fn transportReady(self: *Runtime) !void {
+        if (self.http_wait) |wait| try wait.ready();
+        try self.requestContext().check();
+    }
+
     fn requestContext(self: *const Runtime) RequestContext {
         return .{
             .io = self.execution.io orelse self.http.io,
@@ -545,6 +558,7 @@ pub const Runtime = struct {
             else
                 null,
             .progress = self.request_progress,
+            .runnable = self.request_runnable,
         };
     }
 
@@ -1093,10 +1107,19 @@ pub const Runtime = struct {
     const RuntimeInvocationCancellation = struct {
         configured: CancellationToken,
         invocation: CancellationToken,
+        rejection: @import("antfly_cancellation").Rejection = .{},
+
+        fn check(ptr: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            try self.rejection.check();
+            self.configured.check() catch |err| return self.rejection.remember(err);
+            self.invocation.check() catch |err| return self.rejection.remember(err);
+            try self.rejection.check();
+        }
 
         fn isCancelled(ptr: *const anyopaque) bool {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            return self.configured.isCancelled() or self.invocation.isCancelled();
+            check(ptr) catch return true;
+            return false;
         }
     };
 
@@ -1106,7 +1129,12 @@ pub const Runtime = struct {
         cancellation: *RuntimeInvocationCancellation,
     ) Runtime {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
-        var scoped = self.*;
+        var scoped: Runtime = undefined;
+        inline for (@typeInfo(Runtime).@"struct".field_names) |name| {
+            // Do not even read the concurrently mutated cache or its mutex.
+            if (comptime std.mem.eql(u8, name, "capability_cache")) continue;
+            @field(scoped, name) = @field(self.*, name);
+        }
         // A copied Runtime must never operate on its copied cache mutex. Bind
         // every scoped call to the original synchronized cache explicitly.
         scoped.execution.capability_cache = self.capabilityCache();
@@ -1122,12 +1150,15 @@ pub const Runtime = struct {
         scoped.execution.cancellation = .{
             .ptr = cancellation,
             .is_cancelled_fn = RuntimeInvocationCancellation.isCancelled,
+            .check_fn = if (cancellation.configured.check_fn != null or cancellation.invocation.check_fn != null) RuntimeInvocationCancellation.check else null,
         };
         scoped.execution.max_response_bytes = if (context.max_response_bytes) |requested|
             if (self.execution.max_response_bytes) |configured| @min(requested, configured) else requested
         else
             self.execution.max_response_bytes;
         scoped.request_progress = context.progress orelse self.request_progress;
+        scoped.request_runnable = context.runnable orelse self.request_runnable;
+        scoped.execution.runnable = scoped.request_runnable;
         scoped.document_checkpoints = context.document_checkpoints orelse self.document_checkpoints;
         return scoped;
     }
@@ -1135,33 +1166,48 @@ pub const Runtime = struct {
     fn produceWithContext(ptr: *anyopaque, alloc: Allocator, request: asset_producer.Request, context: asset_producer.InvocationContext) ![]u8 {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
-        try scoped.execution.check(platform.time.monotonicNs());
-        const output = try scoped.produceOne(alloc, request);
+        var wait: execution_context.HttpWait = .{ .context = scoped.requestContext() };
+        scoped.http_wait = &wait;
+        try wait.ready();
+        const output = scoped.produceOne(alloc, request) catch |err| {
+            try wait.ready();
+            return err;
+        };
         errdefer alloc.free(output);
-        try scoped.execution.check(platform.time.monotonicNs());
+        try wait.ready();
         return output;
     }
 
     fn produceBatchWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) ![][]u8 {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
-        try scoped.execution.check(platform.time.monotonicNs());
-        const outputs = try produceBatch(&scoped, alloc, requests);
+        var wait: execution_context.HttpWait = .{ .context = scoped.requestContext() };
+        scoped.http_wait = &wait;
+        try wait.ready();
+        const outputs = produceBatch(&scoped, alloc, requests) catch |err| {
+            try wait.ready();
+            return err;
+        };
         errdefer {
             for (outputs) |output| if (output.len > 0) alloc.free(output);
             alloc.free(outputs);
         }
-        try scoped.execution.check(platform.time.monotonicNs());
+        try wait.ready();
         return outputs;
     }
 
     fn produceBatchReportedWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) !asset_producer.ProducedBatch {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
-        try scoped.execution.check(platform.time.monotonicNs());
-        var batch = try produceBatchReported(&scoped, alloc, requests);
+        var wait: execution_context.HttpWait = .{ .context = scoped.requestContext() };
+        scoped.http_wait = &wait;
+        try wait.ready();
+        var batch = produceBatchReported(&scoped, alloc, requests) catch |err| {
+            try wait.ready();
+            return err;
+        };
         errdefer batch.deinit(alloc);
-        try scoped.execution.check(platform.time.monotonicNs());
+        try wait.ready();
         return batch;
     }
 
@@ -1174,10 +1220,15 @@ pub const Runtime = struct {
     ) !asset_producer.ProducedBatch {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
-        try scoped.execution.check(platform.time.monotonicNs());
-        var batch = try produceBorrowedRasterBatchReported(&scoped, alloc, requests, rasters);
+        var wait: execution_context.HttpWait = .{ .context = scoped.requestContext() };
+        scoped.http_wait = &wait;
+        try wait.ready();
+        var batch = produceBorrowedRasterBatchReported(&scoped, alloc, requests, rasters) catch |err| {
+            try wait.ready();
+            return err;
+        };
         errdefer batch.deinit(alloc);
-        try scoped.execution.check(platform.time.monotonicNs());
+        try wait.ready();
         return batch;
     }
 
@@ -1189,9 +1240,14 @@ pub const Runtime = struct {
     ) !bool {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
-        try scoped.execution.check(platform.time.monotonicNs());
-        const available = try borrowedRasterBatchAvailable(&scoped, alloc, requests);
-        try scoped.execution.check(platform.time.monotonicNs());
+        var wait: execution_context.HttpWait = .{ .context = scoped.requestContext() };
+        scoped.http_wait = &wait;
+        try wait.ready();
+        const available = borrowedRasterBatchAvailable(&scoped, alloc, requests) catch |err| {
+            try wait.ready();
+            return err;
+        };
+        try wait.ready();
         return available;
     }
 
@@ -1199,27 +1255,42 @@ pub const Runtime = struct {
         if (context.document_checkpoints != null) return .none;
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
-        try scoped.execution.check(platform.time.monotonicNs());
-        const mode = try batchMode(&scoped, alloc, requests);
-        try scoped.execution.check(platform.time.monotonicNs());
+        var wait: execution_context.HttpWait = .{ .context = scoped.requestContext() };
+        scoped.http_wait = &wait;
+        try wait.ready();
+        const mode = batchMode(&scoped, alloc, requests) catch |err| {
+            try wait.ready();
+            return err;
+        };
+        try wait.ready();
         return mode;
     }
 
     fn capabilitiesForRequestsWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) !?inference_work.InferenceCapabilities {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
-        try scoped.execution.check(platform.time.monotonicNs());
-        const capabilities = try capabilitiesForRequests(&scoped, alloc, requests);
-        try scoped.execution.check(platform.time.monotonicNs());
+        var wait: execution_context.HttpWait = .{ .context = scoped.requestContext() };
+        scoped.http_wait = &wait;
+        try wait.ready();
+        const capabilities = capabilitiesForRequests(&scoped, alloc, requests) catch |err| {
+            try wait.ready();
+            return err;
+        };
+        try wait.ready();
         return capabilities;
     }
 
     fn invocationMemoryForRequestsWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) !inference_work.InvocationMemoryPlan {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
-        try scoped.execution.check(platform.time.monotonicNs());
-        const plan = try invocationMemoryForRequests(&scoped, alloc, requests);
-        try scoped.execution.check(platform.time.monotonicNs());
+        var wait: execution_context.HttpWait = .{ .context = scoped.requestContext() };
+        scoped.http_wait = &wait;
+        try wait.ready();
+        const plan = invocationMemoryForRequests(&scoped, alloc, requests) catch |err| {
+            try wait.ready();
+            return err;
+        };
+        try wait.ready();
         return plan;
     }
 
@@ -1468,10 +1539,11 @@ pub const Runtime = struct {
                 cfg.model orelse "",
                 .read,
                 headers,
-                self.execution.waitContext(),
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => null,
+                self.waitContext(),
+            ) catch |err| {
+                try self.transportReady();
+                if (err == error.OutOfMemory) return err;
+                return null;
             };
         }
         const local = self.antfly_provider orelse return null;
@@ -1550,7 +1622,7 @@ pub const Runtime = struct {
             cfg.model,
             .generate_batch,
             header_storage[0..header_count],
-            self.execution.waitContext(),
+            self.waitContext(),
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
@@ -1611,7 +1683,7 @@ pub const Runtime = struct {
             cfg.model,
             .extract,
             headers,
-            self.execution.waitContext(),
+            self.waitContext(),
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
@@ -1637,7 +1709,7 @@ pub const Runtime = struct {
             cfg.model,
             .extract,
             headers,
-            self.execution.waitContext(),
+            self.waitContext(),
         );
         try replaceCapabilityLeaseFields(alloc, cfg, lease);
         cfg.framed_attachments = lease.capabilities != null and lease.capabilities.?.framed_attachments;
@@ -2043,29 +2115,42 @@ pub const Runtime = struct {
         const Task = struct {
             runtime: *Runtime,
             request: asset_producer.Request,
+            child: ?@import("antfly_runtime_abi").runnable_abi.Child = null,
             output: ?[]u8 = null,
             failure: ?anyerror = null,
-
+            fn restriction(raw: *anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+                const task: *@This() = @ptrCast(@alignCast(raw));
+                task.runtime.requestContext().check() catch |err| return @import("antfly_runtime_abi").error_abi.statusFromError(err);
+                return .ok;
+            }
             fn run(task: *@This()) std.Io.Cancelable!void {
-                task.runtime.execution.check(platform.time.monotonicNs()) catch |err| {
-                    task.failure = err;
-                    return;
-                };
-                task.output = task.runtime.produceOne(std.heap.smp_allocator, task.request) catch |err| {
-                    task.failure = err;
-                    return;
-                };
-                task.runtime.execution.check(platform.time.monotonicNs()) catch |err| {
-                    std.heap.smp_allocator.free(task.output.?);
-                    task.output = null;
+                defer if (task.child) |*child| child.deinit();
+                task.invoke() catch |err| {
                     task.failure = err;
                 };
+            }
+            fn invoke(task: *@This()) !void {
+                var context = task.runtime.requestContext();
+                if (task.child) |*child| {
+                    child.activateChecked(&.{ .context = task, .check = restriction }) catch |err| {
+                        try context.check();
+                        return err;
+                    };
+                    context.runnable = child.borrow;
+                }
+                task.output = try produceWithContext(task.runtime, std.heap.smp_allocator, task.request, .{
+                    .io = context.io,
+                    .deadline_ns = context.deadline_ns,
+                    .cancellation = context.cancellation orelse .none,
+                    .runnable = context.runnable,
+                });
             }
         };
 
         const tasks = try alloc.alloc(Task, requests.len);
         defer alloc.free(tasks);
         for (tasks, requests) |*task, request| task.* = .{ .runtime = self, .request = request };
+        defer for (tasks) |*task| if (task.child) |*child| child.deinit();
         errdefer for (tasks) |*task| if (task.output) |output| std.heap.smp_allocator.free(output);
 
         const out = try alloc.alloc([]u8, requests.len);
@@ -2079,15 +2164,34 @@ pub const Runtime = struct {
         while (start < tasks.len) : (start += width) {
             const end = @min(start + width, tasks.len);
             var group: std.Io.Group = .init;
-            for (tasks[start..end]) |*task| group.async(io, Task.run, .{task});
-            try group.await(io);
+            defer group.cancel(io);
+            if (self.request_runnable) |parent| {
+                const io_borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&io);
+                // Reserve every physical participant before publishing any task.
+                for (tasks[start..end]) |*task| {
+                    var child: @import("antfly_runtime_abi").runnable_abi.Child = undefined;
+                    try parent.reserveChild(&.{ .io = &io_borrow, .retained_bytes = @sizeOf(Task), .out_child = &child });
+                    task.child = child;
+                }
+                for (tasks[start..end]) |*task| try group.concurrent(io, Task.run, .{task});
+            } else {
+                for (tasks[start..end]) |*task| group.async(io, Task.run, .{task});
+            }
+            // Even cancellation physically joins workers before their grants or
+            // request/cancellation pointers can be retired.
+            const joined = self.httpControl().withWait(std.Io.Group.await, .{ &group, io });
+            group.cancel(io);
+            for (tasks[start..end]) |*task| if (task.child) |*child| child.deinit();
+            try joined;
             // A concurrent wave can exceed the inference node's admission
             // budget; such items are retried one at a time rather than
             // failing the whole batch.
             for (tasks[start..end]) |*task| {
                 const failure = task.failure orelse continue;
+                try self.transportReady();
                 if (failure == error.QueueFull and task.output == null) {
                     task.failure = null;
+                    task.child = null;
                     try Task.run(task);
                 }
             }
@@ -2252,6 +2356,7 @@ pub const Runtime = struct {
         } else extracting.extractWithConfigAndOptions(alloc, self.http, cfg, extract_request, .{
             .source_table = self.execution.routing.source_table,
             .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+            .socket_control = self.httpControl(),
             .cancellation = httpx.CancellationToken.fromCallback(
                 self.execution.cancellation.ptr,
                 self.execution.cancellation.is_cancelled_fn,
@@ -2357,7 +2462,7 @@ pub const Runtime = struct {
             cfg.model,
             .generate_batch,
             auth_headers,
-            self.execution.waitContext(),
+            self.waitContext(),
         );
         capabilities = capability_lease.capabilities orelse return error.InvalidInferenceCapabilities;
         if (capability_lease.routing_token) |*value| {
@@ -2407,6 +2512,7 @@ pub const Runtime = struct {
                     max_asset_provider_timeout_ms,
                 ),
                 .max_response_size = self.responseLimitForTask(.generator, chunk.len),
+                .socket_control = self.httpControl(),
                 .cancellation = httpx.CancellationToken.fromCallback(
                     self.execution.cancellation.ptr,
                     self.execution.cancellation.is_cancelled_fn,
@@ -2500,7 +2606,7 @@ pub const Runtime = struct {
             cfg.model,
             .generate,
             headers,
-            self.execution.waitContext(),
+            self.waitContext(),
         );
         try replaceCapabilityLeaseFields(alloc, cfg, lease);
         return lease.capabilities;
@@ -3014,6 +3120,7 @@ pub const Runtime = struct {
             .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .body_stream = .{ .context = &transport.upload, .read = protocol.Queue.read },
             .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+            .socket_control = self.httpControl(),
             .cancellation = httpx.CancellationToken.fromCallback(self.execution.cancellation.ptr, self.execution.cancellation.is_cancelled_fn),
             .max_retries = 0,
             .follow_redirects = false,
@@ -3170,6 +3277,7 @@ pub const Runtime = struct {
     fn appleReaderOptions(self: *Runtime) !readers.RemoteOptions {
         return .{
             .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+            .socket_control = self.httpControl(),
             .cancellation = httpx.CancellationToken.fromCallback(self.execution.cancellation.ptr, self.execution.cancellation.is_cancelled_fn),
         };
     }
@@ -3215,7 +3323,7 @@ pub const Runtime = struct {
                 execution_cfg.model orelse "",
                 .read,
                 capability_auth_headers,
-                self.execution.waitContext(),
+                self.waitContext(),
             );
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
@@ -3268,6 +3376,7 @@ pub const Runtime = struct {
         return readers.readWithConfigReported(alloc, self.http, execution_cfg, request, .{
             .source_table = self.execution.routing.source_table,
             .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+            .socket_control = self.httpControl(),
             .cancellation = httpx.CancellationToken.fromCallback(
                 self.execution.cancellation.ptr,
                 self.execution.cancellation.is_cancelled_fn,
@@ -3351,7 +3460,7 @@ pub const Runtime = struct {
                 execution_cfg.model orelse "",
                 .read,
                 capability_auth_headers,
-                self.execution.waitContext(),
+                self.waitContext(),
             );
             capability_lease_fields = CapabilityLeaseFields.init(lease);
             capability_lease_fields.apply(&execution_cfg);
@@ -3445,6 +3554,7 @@ pub const Runtime = struct {
             return readers.readEncodedWithConfigReported(alloc, self.http, execution_cfg, request, .{
                 .source_table = self.execution.routing.source_table,
                 .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+                .socket_control = self.httpControl(),
                 .cancellation = httpx.CancellationToken.fromCallback(
                     self.execution.cancellation.ptr,
                     self.execution.cancellation.is_cancelled_fn,
@@ -3645,7 +3755,7 @@ pub const Runtime = struct {
                 antfly_model.?,
                 .transcribe,
                 capability_auth_headers,
-                self.execution.waitContext(),
+                self.waitContext(),
             );
             if (lease.capabilities) |capabilities| {
                 try capabilities.validateInvocation(.transcribe, .{
@@ -3682,6 +3792,7 @@ pub const Runtime = struct {
                 .resolved_audio = if (request.media.len == 1) request.media[0].bytes else null,
                 .source_table = self.execution.routing.source_table,
                 .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+                .socket_control = self.httpControl(),
                 .cancellation = httpx.CancellationToken.fromCallback(
                     self.execution.cancellation.ptr,
                     self.execution.cancellation.is_cancelled_fn,
@@ -3837,6 +3948,7 @@ pub const Runtime = struct {
         } else extracting.extractWithConfigAndOptions(alloc, self.http, cfg, extract_request, .{
             .source_table = self.execution.routing.source_table,
             .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+            .socket_control = self.httpControl(),
             .cancellation = httpx.CancellationToken.fromCallback(
                 self.execution.cancellation.ptr,
                 self.execution.cancellation.is_cancelled_fn,
@@ -3931,11 +4043,68 @@ test "asset producer runtime invocation context can only tighten configured cont
     try std.testing.expectEqual(@as(?u64, 200), scoped.execution.deadline_ns);
     try std.testing.expectEqual(@as(?usize, 1024), scoped.execution.max_response_bytes);
     try std.testing.expect(!scoped.execution.cancellation.isCancelled());
+    var transport_only = scoped.requestContext();
+    transport_only.deadline_ns = null;
+    try std.testing.expect(!transport_only.requiresControlledProvider());
     invocation_canceled.store(true, .release);
     try std.testing.expect(scoped.execution.cancellation.isCancelled());
     invocation_canceled.store(false, .release);
     configured_canceled.store(true, .release);
     try std.testing.expect(scoped.execution.cancellation.isCancelled());
+
+    const Authority = struct {
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.failure) |cause| return cause;
+        }
+    };
+    configured_canceled.store(false, .release);
+    runtime.execution.deadline_ns = std.math.maxInt(u64);
+    var authority: Authority = .{};
+    for ([_]anyerror{ error.OriginalAssetAuthorityRejected, error.Forbidden, error.DeadlineExceeded, error.Canceled }) |cause| {
+        authority.failure = cause;
+        var original_cancellation: Runtime.RuntimeInvocationCancellation = undefined;
+        const controlled = Runtime.invocationRuntime(&runtime, .{
+            .deadline_ns = std.math.maxInt(u64),
+            .cancellation = .{ .ptr = &authority, .check_fn = Authority.check },
+        }, &original_cancellation);
+        const expected = switch (cause) {
+            error.Canceled => error.Cancelled,
+            error.DeadlineExceeded => error.Timeout,
+            else => cause,
+        };
+        try std.testing.expect(controlled.execution.cancellation.isCancelled());
+        authority.failure = null;
+        try std.testing.expectError(expected, controlled.requestContext().check());
+        try std.testing.expect(controlled.execution.cancellation.isCancelled());
+    }
+    const runtime_abi = @import("antfly_runtime_abi");
+    const Child = struct {
+        calls: usize = 0,
+        reject: bool = false,
+        fn check(raw: *anyopaque) callconv(.c) runtime_abi.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return if (self.reject) runtime_abi.error_abi.statusFromError(error.SchedulerClosed) else .ok;
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime_abi.error_abi.Status {
+            return .ok;
+        }
+    };
+    var child: Child = .{};
+    const child_borrow: runtime_abi.runnable_abi.Borrowed = .{ .context = &child, .cpu_slots = 1, .parent_class = @backingInt(runtime_abi.runnable_abi.Class.write), .checkpoint = Child.check, .park = Child.phase, .enter = Child.phase, .check_lifetime = Child.check };
+    const invocation = asset_producer.InvocationContext.fromRequestContext(.{ .io = std.testing.io, .deadline_ns = null, .runnable = child_borrow });
+    try std.testing.expect(invocation.requiresControlledProvider());
+    var scoped_cancellation: Runtime.RuntimeInvocationCancellation = undefined;
+    const child_scoped = Runtime.invocationRuntime(&runtime, invocation, &scoped_cancellation);
+    try std.testing.expect(child_scoped.requestContext().runnable.?.context == @as(*anyopaque, &child));
+    try child_scoped.requestContext().check();
+    try std.testing.expectEqual(@as(usize, 1), child.calls);
+    try std.testing.expect(runtime.request_runnable == null);
+    child.reject = true;
+    try std.testing.expectError(error.SchedulerClosed, child_scoped.requestContext().check());
+    try std.testing.expectError(error.SchedulerClosed, invocation.check());
 }
 
 const producer_config = @import("generating/producer_config.zig");

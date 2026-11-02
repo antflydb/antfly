@@ -24,6 +24,10 @@ const resource_manager_mod = @import("../resource_manager.zig");
 const state_mod = @import("state.zig");
 const storage_io = @import("storage_io.zig");
 pub const manifest_set = @import("manifest_set.zig");
+pub const OwnedStreamingRunFileWriter = @import("owned_run_writer.zig").Writer;
+pub const OwnedStreamingRunOutput = @import("owned_run_writer.zig").Output;
+pub const OutputCleanup = @import("output_cleanup.zig");
+pub const OwnedManifestSetPublication = @import("owned_manifest_set.zig").Publication;
 pub const ObsoleteLedger = @import("obsolete_ledger.zig").Ledger;
 
 const max_run_file_read_bytes = 512 * 1024 * 1024;
@@ -56,6 +60,7 @@ pub const ObsoletePath = struct {
 pub const RunOwner = struct {
     refs: std.atomic.Value(usize) = .init(1),
     raw: *Run,
+    registered: ?*@import("../resource_manager.zig").PayloadRetirement = null,
     destroy: *const fn (*RunOwner, Allocator) void,
     pub fn retain(self: *RunOwner) *RunOwner {
         _ = self.refs.fetchAdd(1, .monotonic);
@@ -104,6 +109,8 @@ pub const Run = struct {
         self.state = null;
         return true;
     }
+    /// Immutable physical generation, preserved by revisions and read projections.
+    read_identity: @import("read_generation.zig").Identity = .{},
     owner: ?*RunOwner = null,
     output_ticket: ?*@import("output_cleanup.zig").Ticket = null,
     id: u64,
@@ -136,6 +143,10 @@ pub const Run = struct {
     shared_read_version: bool = false,
     state: ?state_mod.State,
     shared_memory: ?*SharedMemory = null,
+
+    pub fn ensureReadIdentity(self: *Run) !void {
+        if (!self.read_identity.valid()) self.read_identity = try @import("read_generation.zig").allocate();
+    }
 
     pub fn deinit(self: *Run, allocator: Allocator) void {
         if (self.owner) |owner| {
@@ -218,6 +229,7 @@ pub const Run = struct {
 
     pub fn ensureState(self: *Run, allocator: Allocator) !*state_mod.State {
         if (self.state == null) {
+            if (self.owner) |owner| if (owner.registered != null) return error.ExecutionWaitUnsupported;
             const path = self.path orelse return error.RunStateUnavailable;
             self.state = try loadRunStateAlloc(allocator, path);
         }
@@ -226,6 +238,7 @@ pub const Run = struct {
 
     pub fn ensureStateWithStorage(self: *Run, allocator: Allocator, storage: storage_io.Storage) !*state_mod.State {
         if (self.state == null) {
+            if (self.owner) |owner| if (owner.registered != null) return error.ExecutionWaitUnsupported;
             const path = self.path orelse return error.RunStateUnavailable;
             self.state = try loadRunStateAllocWithStorage(storage, allocator, path);
         }
@@ -234,6 +247,7 @@ pub const Run = struct {
 
     pub fn ensureBloomFilter(self: *Run, allocator: Allocator) !bloom.OwnedFilter {
         if (self.bloom_filter) |filter| return filter;
+        if (self.owner) |owner| if (owner.registered != null) return error.ExecutionWaitUnsupported;
         var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
         defer native.deinit();
         return try self.ensureBloomFilterWithStorage(allocator, native.storage());
@@ -247,6 +261,7 @@ pub const Run = struct {
     pub fn ensureBloomFilterWithStorage(self: *Run, allocator: Allocator, storage: storage_io.Storage) !bloom.OwnedFilter {
         if (self.bloom_filter) |filter| return filter;
         if (self.table_index) |index| return index.filter;
+        if (self.owner) |owner| if (owner.registered != null) return error.ExecutionWaitUnsupported;
         const path = self.path orelse return error.RunBloomFilterUnavailable;
         self.table_index = try loadRunTableIndexAllocWithStorage(storage, allocator, path);
         return self.table_index.?.filter;
@@ -269,6 +284,7 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
 
     var out = Run{
         .id = source.id,
+        .read_identity = source.read_identity,
         .level = source.level,
         .size_bytes = source.size_bytes,
         .compression_stats = source.compression_stats,
@@ -301,47 +317,11 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
 
 pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
     if (source.retainMemory()) |pinned| return pinned;
-    var metadata_owned = true;
-    const smallest_namespace_name = if (source.smallest_namespace_name) |name| try allocator.dupe(u8, name) else null;
-    errdefer if (metadata_owned) if (smallest_namespace_name) |name| allocator.free(name);
-    const smallest_key = try allocator.dupe(u8, source.smallest_key);
-    errdefer if (metadata_owned) allocator.free(smallest_key);
-    const largest_namespace_name = if (source.largest_namespace_name) |name| try allocator.dupe(u8, name) else null;
-    errdefer if (metadata_owned) if (largest_namespace_name) |name| allocator.free(name);
-    const largest_key = try allocator.dupe(u8, source.largest_key);
-    errdefer if (metadata_owned) allocator.free(largest_key);
-
-    var out = Run{
-        .id = source.id,
-        .level = source.level,
-        .size_bytes = source.size_bytes,
-        .compression_stats = source.compression_stats,
-        .path = if (source.path) |path| try allocator.dupe(u8, path) else null,
-        .smallest_namespace_name = smallest_namespace_name,
-        .smallest_key = smallest_key,
-        .largest_namespace_name = largest_namespace_name,
-        .largest_key = largest_key,
-        .entry_count = source.entry_count,
-        .tombstone_count = source.tombstone_count,
-        .oldest_tombstone_unix_ns = source.oldest_tombstone_unix_ns,
-        .visibility_id = source.visibility_id,
-        .gc_requested = source.gc_requested,
-        .bloom_filter = null,
-        .owns_bloom_filter = false,
-        .cached_state_index = null,
-        .cached_index_index = null,
-        .cached_table_index = null,
-        .table_index = null,
-        .state = null,
-    };
-    metadata_owned = false;
-    errdefer out.deinit(allocator);
-
-    if (source.path == null) {
-        const state = source.state orelse return error.RunStateUnavailable;
-        out.state = try state.clone(allocator);
-    }
-    return out;
+    var clone = @import("run_snapshot_clone.zig").Clone.init(source);
+    defer clone.deinit(allocator);
+    _ = try clone.memoryBoundWithAdmission(null);
+    try clone.resumeWithAdmission(allocator, null);
+    return clone.takeWithAdmission(null);
 }
 
 pub fn ensureOpenDirs(root_dir: []const u8) !void {
@@ -796,7 +776,7 @@ pub fn runMeta(run: Run) lsm_manifest.RunMeta {
 
 // Journal identities must survive staged restore's directory rename. Runtime
 // paths remain absolute for I/O; wire paths are relative to the owning root.
-fn manifestRelativePath(root: []const u8, path: []const u8) []const u8 {
+pub fn manifestRelativePath(root: []const u8, path: []const u8) []const u8 {
     const trimmed = std.mem.trimEnd(u8, root, "/\\");
     if (path.len > trimmed.len and std.mem.startsWith(u8, path, trimmed) and (path[trimmed.len] == '/' or path[trimmed.len] == '\\')) return std.mem.trimStart(u8, path[trimmed.len..], "/\\");
     return path;
@@ -838,6 +818,8 @@ pub var publication_test_hook: ?struct { context: *anyopaque, run: *const fn (*a
 /// Benchmark control: identical durable format and planner, serialized fsync.
 pub var publication_test_keep_backend_locked = false;
 
+pub var checkpoint_due_test_hook: ?*const fn (*const ManifestJournal) bool = null;
+
 const LedgerSnapshot = @import("ledger_reclamation.zig").Snapshot;
 
 pub const ManifestJournal = struct {
@@ -865,6 +847,82 @@ pub const ManifestJournal = struct {
         }
     };
     pub const Result = struct { written: u64, total: u64, checkpoint: bool };
+
+    /// Fixed lineage receipt. Current run roots may advance while a pinned
+    /// checkpoint builds; another durable lineage must never be overwritten.
+    pub const CheckpointFence = struct {
+        journal: ManifestJournal,
+        directory: ?*const @import("run_directory.zig").Directory,
+
+        pub fn capture(backend: anytype) @This() {
+            // Borrow only identity fields from obsolete; no ownership transfer.
+            return .{ .journal = backend.manifest_journal, .directory = backend.manifest_directory };
+        }
+        pub fn matches(self: *const @This(), backend: anytype) bool {
+            return !backend.manifest_recovery_required and self.matchesIdentity(backend);
+        }
+        pub fn matchesRecoveryFenced(self: *const @This(), backend: anytype) bool {
+            var expected = self.*;
+            expected.journal.sequence = null;
+            return backend.manifest_recovery_required and expected.matchesIdentity(backend);
+        }
+        pub fn matchesRecoveryWithoutJournalChange(self: *const @This(), backend: anytype) bool {
+            return backend.manifest_recovery_required and self.matchesIdentity(backend);
+        }
+        fn matchesIdentity(self: *const @This(), backend: anytype) bool {
+            const current = &backend.manifest_journal;
+            const prior = &self.journal;
+            return backend.manifest_directory == self.directory and
+                std.meta.eql(current.descriptor, prior.descriptor) and current.sequence == prior.sequence and
+                current.active_segment == prior.active_segment and current.checkpoint_sequence == prior.checkpoint_sequence and
+                current.next_run_id == prior.next_run_id and current.bytes == prior.bytes and current.edit_bytes == prior.edit_bytes and
+                current.obsolete.tree.root == prior.obsolete.tree.root and current.segment_count == prior.segment_count and
+                std.mem.eql(u64, current.segments[0..current.segment_count], prior.segments[0..prior.segment_count]);
+        }
+        pub fn retiredPathCount(self: *const @This()) usize {
+            return self.journal.retiredFileCount();
+        }
+        /// One bounded filename; input ledger owns the strings being checked.
+        pub fn retiredPathAt(self: *const @This(), root: []const u8, index: usize, buffer: []u8) ![]const u8 {
+            const descriptor = self.journal.descriptor orelse return error.InvalidArgument;
+            if (index == 0) return std.fmt.bufPrint(buffer, "{s}/manifest-{d}.checkpoint", .{ root, descriptor.checkpoint });
+            var at: usize = 1;
+            for (self.journal.segments[0..self.journal.segment_count]) |id| {
+                for ([_]manifest_set.Kind{ .journal, .next, .checkpoint }) |kind| {
+                    if (kind == .checkpoint and id == descriptor.checkpoint) continue;
+                    if (at == index) return std.fmt.bufPrint(buffer, "{s}/manifest-{d}.{s}", .{ root, id, @tagName(kind) });
+                    at += 1;
+                }
+            }
+            return error.InvalidArgument;
+        }
+    };
+
+    /// Caller holds the backend mutex and publication lane. Descriptor IO is
+    /// already durable. Matching metadata moves before any fallible callback;
+    /// stale lineage fences recovery and leaves both prepared roots untouched.
+    pub fn installPreparedCheckpoint(self: *@This(), backend: anytype, fence: *const CheckpointFence, descriptor: manifest_set.Descriptor, next_run_id: u64, bytes: u64, directory: *@import("run_directory.zig").Directory, ledger: *ObsoleteLedger) !Result {
+        if (comptime @hasField(@TypeOf(backend.*), "registered_publication")) if (backend.registered_publication.seal != null) return error.ExecutionWaitUnsupported;
+        if (comptime @hasField(@TypeOf(backend.*), "registered_manifest_checkpoint")) if (backend.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
+        if (!fence.matches(backend) or !backend.manifest_publish_in_flight) {
+            backend.manifest_recovery_required = true;
+            self.sequence = null;
+            backend.markManifestDirty();
+            return error.RecoveryRequired;
+        }
+        std.mem.swap(ObsoleteLedger, &self.obsolete, ledger);
+        self.descriptor = descriptor;
+        self.active_segment = descriptor.first_segment;
+        self.segments[0] = descriptor.first_segment;
+        self.segment_count = 1;
+        self.sequence = descriptor.sequence;
+        self.checkpoint_sequence = descriptor.sequence;
+        self.bytes = bytes;
+        self.edit_bytes = 0;
+        self.next_run_id = next_run_id;
+        backend.publishManifestDirectory(directory);
+        return .{ .written = bytes + 36 + manifest_set.header_len, .total = bytes, .checkpoint = true };
+    }
 
     pub fn deinit(self: *@This(), allocator: Allocator) void {
         self.obsolete.deinit(allocator);
@@ -969,6 +1027,7 @@ pub const ManifestJournal = struct {
     }
 
     pub fn checkpointDue(self: *const @This()) bool {
+        if (comptime @import("builtin").is_test) if (checkpoint_due_test_hook) |hook| if (hook(self)) return true;
         const edit_budget = @min(8 * 1024 * 1024, (max_manifest_read_bytes -| (self.bytes -| self.edit_bytes)) / 2);
         return self.sequence == null or self.sequence.? -| self.checkpoint_sequence >= 256 or self.edit_bytes >= edit_budget;
     }
@@ -1018,6 +1077,7 @@ pub const ManifestJournal = struct {
     /// descriptor installation are serialized; walking/encoding/fsyncing the
     /// immutable checkpoint runs without the backend mutex.
     pub fn runCheckpoint(self: *@This(), backend: anytype) !bool {
+        if (comptime @hasField(@TypeOf(backend.*), "registered_publication")) if (backend.registered_publication.seal != null) return error.ExecutionWaitUnsupported;
         if (backend.manifest_publish_in_flight or backend.manifest_checkpoint_build_in_flight or self.sequence == null or self.descriptor == null or backend.manifest_directory == null) return false;
         if (self.segment_count == manifest_set.max_segments) {
             // Repeated failed builders can consume the linked-segment bound.
@@ -1199,9 +1259,141 @@ pub const ManifestJournal = struct {
         return true;
     }
 
+    /// Detached normal owner: rotate under the publication lane, then let
+    /// journals advance while the captured checkpoint streams. Never rewrite
+    /// the rotated journal when publishing its new checkpoint descriptor.
+    pub fn runCheckpointWithExecution(self: *@This(), backend: anytype, owner: *@import("../background_runtime.zig").BackendRuntime) !bool {
+        if (backend.manifest_recovery_required) return error.RecoveryRequired;
+        if (backend.registered_publication.seal != null or backend.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
+        if (backend.manifest_publish_in_flight or backend.manifest_checkpoint_build_in_flight or self.sequence == null or self.descriptor == null or backend.manifest_directory == null) return false;
+        if (self.segment_count == manifest_set.max_segments) {
+            self.sequence = null;
+            backend.markManifestDirty();
+            backend.flush_completion_pending = true;
+            return true;
+        }
+        const Frame = @import("manifest_edit_preparation.zig").Frame;
+        const runtime = @import("runtime.zig");
+        const Backend = @TypeOf(backend.*);
+        const frame = try Frame.create(backend);
+        defer backend.retireManifestPreparation(frame);
+        backend.manifest_checkpoint_build_in_flight = true;
+        defer backend.manifest_checkpoint_build_in_flight = false;
+        backend.retainReaderKind(.other);
+        defer backend.releaseReaderKind(.other);
+        var handoff = try backend.beginManifestTurn();
+        var handoff_held = true;
+        defer if (handoff_held) handoff.deinit();
+        const fence = CheckpointFence.capture(backend);
+        const sequence = self.sequence.?;
+        const old_bytes = self.bytes;
+        const old_edits = self.edit_bytes;
+        const deadline = backend.nowNs() +| backend.options.obsolete_retention_ns;
+        frame.current = try backend.manifest_directory.?.fork(backend.allocator);
+        backend.manifest_checkpoint_directory = frame.current;
+        defer backend.manifest_checkpoint_directory = null;
+        frame.obsolete = try LedgerSnapshot.capture(backend, &self.obsolete);
+        runtime.unlockBackend(Backend, backend, true);
+        const planned = frame.planRetirement(backend, owner, &fence, &frame.obsolete.?.value, null, deadline);
+        _ = runtime.lockBackend(Backend, backend);
+        try planned;
+        if (!fence.matches(backend)) return error.ResourceBudgetExceeded;
+        std.mem.swap(ObsoleteLedger, &frame.obsolete.?.value, &frame.planned_obsolete.?);
+        const id = backend.next_run_id;
+        backend.next_run_id = try std.math.add(u64, id, 1);
+        const next_id = backend.next_run_id;
+        backend.manifest_checkpoint_build_id = id;
+        defer backend.manifest_checkpoint_build_id = null;
+        const previous = self.active_segment;
+        // Conservatively retain attempted output identities even on refusal.
+        // A failed link cannot authorize deleting a possibly live journal.
+        self.segments[self.segment_count] = id;
+        self.segment_count += 1;
+        const rotate_started = backend.writeStatsNowNs();
+        runtime.unlockBackend(Backend, backend, true);
+        const rotated = frame.rotateWithExecution(backend, owner, previous, id, sequence);
+        _ = runtime.lockBackend(Backend, backend);
+        backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(rotate_started);
+        rotated catch |cause| {
+            if (frame.rotation_owner != null and frame.rotation_owner.?.linkMayHavePublished()) {
+                self.sequence = null;
+                backend.markManifestDirty();
+                backend.flush_completion_pending = true;
+            }
+            return cause;
+        };
+        self.active_segment = id;
+        backend.write_stats.manifest_bytes +|= 2 * manifest_set.header_len;
+        handoff.deinit();
+        handoff_held = false;
+        const build_started = backend.writeStatsNowNs();
+        runtime.unlockBackend(Backend, backend, true);
+        const built = frame.prepareCheckpointAtSequence(backend, owner, backend.root_dir.?, id, next_id, sequence, true);
+        _ = runtime.lockBackend(Backend, backend);
+        backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(build_started);
+        try built;
+        const checkpoint_bytes = frame.checkpoint_owner.?.physical.encoder.total;
+        var publication = try backend.beginManifestTurn();
+        defer publication.deinit();
+        if (self.sequence == null or self.descriptor == null or !std.meta.eql(self.descriptor, fence.journal.descriptor) or self.active_segment != id) return false;
+        if (!self.checkpointFits(checkpoint_bytes, old_bytes)) return error.ManifestJournalBacklogExceeded;
+        // Rebase retirement intent on both publication-time ledgers. The
+        // publication lane fences journals; a live-root CAS detects foreground
+        // ledger changes while CPU admission runs without Backend.mu.
+        const final = try Frame.create(backend);
+        defer backend.retireManifestPreparation(final);
+        final.deadline_ns = frame.deadline_ns;
+        final.obsolete = try LedgerSnapshot.capture(backend, &self.obsolete);
+        final.previous_obsolete = try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+        const final_fence = CheckpointFence.capture(backend);
+        runtime.unlockBackend(Backend, backend, true);
+        const rebased = final.planRetirement(backend, owner, &fence, &final.obsolete.?.value, &final.previous_obsolete.?.value, deadline);
+        _ = runtime.lockBackend(Backend, backend);
+        try rebased;
+        if (!final_fence.matches(backend) or backend.obsolete_paths.tree.root != final.previous_obsolete.?.value.tree.root) return error.ResourceBudgetExceeded;
+        std.mem.swap(ObsoleteLedger, &backend.obsolete_paths, &final.planned_previous.?);
+        std.mem.swap(ObsoleteLedger, &final.previous_obsolete.?.value, &final.planned_previous.?);
+        backend.obsolete_manifest_dirty = true;
+        const publish_started = backend.writeStatsNowNs();
+        runtime.unlockBackend(Backend, backend, true);
+        const published = frame.finishCheckpoint(backend, owner);
+        _ = runtime.lockBackend(Backend, backend);
+        backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(publish_started);
+        _ = published catch |cause| {
+            if (frame.checkpoint_owner.?.descriptorMayHavePublished()) {
+                backend.manifest_recovery_required = true;
+                self.sequence = null;
+                backend.markManifestDirty();
+            }
+            return cause;
+        };
+        if (!final_fence.matches(backend)) {
+            backend.manifest_recovery_required = true;
+            self.sequence = null;
+            backend.markManifestDirty();
+            return error.RecoveryRequired;
+        }
+        std.mem.swap(ObsoleteLedger, &self.obsolete, &final.planned_obsolete.?);
+        std.mem.swap(ObsoleteLedger, &final.obsolete.?.value, &final.planned_obsolete.?);
+        self.descriptor = .{ .checkpoint = id, .first_segment = id, .sequence = sequence };
+        self.checkpoint_sequence = sequence;
+        self.next_run_id = @max(self.next_run_id, next_id);
+        self.edit_bytes -= old_edits;
+        self.bytes = checkpoint_bytes + (self.bytes - old_bytes);
+        self.segments[0] = id;
+        self.segment_count = 1;
+        backend.current_manifest_bytes = self.bytes;
+        backend.write_stats.manifest_checkpoints +|= 1;
+        backend.write_stats.manifest_writes +|= 1;
+        backend.write_stats.manifest_bytes +|= checkpoint_bytes + 36;
+        return true;
+    }
+
     /// Caller holds the publication lock. The last durable directory owns SST
     /// pins until its successor is durable, independently of reader lifetimes.
     pub fn persist(self: *@This(), backend: anytype, root_dir: []const u8, runs: []const Run) !Result {
+        if (comptime @hasField(@TypeOf(backend.*), "registered_publication")) if (backend.registered_publication.seal != null) return error.ExecutionWaitUnsupported;
+        if (comptime @hasField(@TypeOf(backend.*), "registered_manifest_checkpoint")) if (backend.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         return self.persistAttempt(backend, root_dir, runs) catch |err| {
             if (err != error.ManifestEditTooLarge) return err;
             // The failed preparation already reset the journal state and
@@ -1211,44 +1403,173 @@ pub const ManifestJournal = struct {
         };
     }
 
-    /// Cold/fenced replacement has the same immutable capture boundary as an
-    /// edit. Never encode all live runs into a temporary frame under the mutex.
-    fn persistCheckpointPinned(self: *@This(), backend: anytype, root: []const u8, current: *const @import("run_directory.zig").Directory) !Result {
+    /// Normal detached callers choose the same checkpoint/edit boundaries as
+    /// legacy publication, but lend execution only after immutable capture.
+    pub fn persistWithExecution(self: *@This(), backend: anytype, root: []const u8, owner: *@import("../background_runtime.zig").BackendRuntime) !Result {
+        if (self.sequence == null or self.descriptor == null or backend.manifest_directory == null)
+            return self.persistCheckpointPinned(backend, root, backend.run_directory.?, owner);
+        return self.persistPreparedEdit(backend, root, owner);
+    }
+
+    /// Incremental edits capture immutable roots before off-lock preparation.
+    /// Detached normal callers pin roots under Backend.mu, then admit only the
+    /// off-lock preparation. IO keeps the existing joined append contract.
+    pub fn persistPreparedEdit(self: *@This(), backend: anytype, root: []const u8, owner: *@import("../background_runtime.zig").BackendRuntime) !Result {
+        const Frame = @import("manifest_edit_preparation.zig").Frame;
+        const runtime = @import("runtime.zig");
+        if (backend.run_directory.?.tree.root == backend.manifest_directory.?.tree.root and
+            backend.obsolete_paths.tree.root == self.obsolete.tree.root and backend.next_run_id == self.next_run_id)
+            return .{ .written = 0, .total = self.bytes, .checkpoint = false };
+        const frame = try Frame.create(backend);
+        std.debug.assert(backend.active_manifest_preparation == null);
+        backend.active_manifest_preparation = frame;
+        defer backend.retireManifestPreparation(frame);
+        try frame.capture(backend);
+        const sequence = try std.math.add(u64, self.sequence.?, 1);
+        const next_id = backend.next_run_id;
+        runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+        const prepared = frame.prepare(backend, owner, root, sequence, next_id);
+        _ = runtime.lockBackend(@TypeOf(backend.*), backend);
+        try prepared;
+        if (backend.manifest_recovery_required) return error.RecoveryRequired;
+        if (frame.counts[0] == 0 and frame.counts[1] == 0 and frame.counts[2] == 0 and frame.counts[3] == 0 and next_id == self.next_run_id) {
+            std.mem.swap(ObsoleteLedger, &self.obsolete, &frame.obsolete.?.value);
+            backend.publishManifestDirectory(frame.current.?);
+            frame.current = null;
+            return .{ .written = 0, .total = self.bytes, .checkpoint = false };
+        }
+        const total = try std.math.add(u64, self.bytes, frame.encoded.len);
+        if (total > max_manifest_read_bytes) return error.ManifestEditTooLarge;
+        const started = backend.writeStatsNowNs();
+        runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+        const controlled_append = backend.storage.?.vtable.try_prepare_append_with_admission != null;
+        const written = blk: {
+            if (comptime @import("builtin").is_test) if (publication_test_hook) |hook| hook.run(hook.context) catch |cause| {
+                frame.append_started = true; // Existing physical-boundary fault fixture.
+                break :blk @as(anyerror!void, cause);
+            };
+            if (controlled_append) break :blk frame.appendWithExecution(backend, owner, root, self.active_segment);
+            _ = writePublicationFiles(backend.allocator, backend.storage.?, root, self.active_segment, false, frame.encoded) catch |cause| break :blk @as(anyerror!void, cause);
+            break :blk @as(anyerror!void, {});
+        };
+        _ = runtime.lockBackend(@TypeOf(backend.*), backend);
+        backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(started);
+        _ = written catch |cause| {
+            if (frame.append_started or !controlled_append) self.sequence = null;
+            // A broken cleanup capability must retain exclusion rather than
+            // release a live journal to another publisher before physical join.
+            if (frame.append_pending != null) backend.manifest_recovery_required = true;
+            return cause;
+        };
+        if (backend.manifest_recovery_required) {
+            self.sequence = null;
+            return error.RecoveryRequired;
+        }
+        self.sequence = sequence;
+        std.mem.swap(ObsoleteLedger, &self.obsolete, &frame.obsolete.?.value);
+        self.bytes = total;
+        self.edit_bytes +|= frame.encoded.len;
+        self.next_run_id = next_id;
+        backend.publishManifestDirectory(frame.current.?);
+        frame.current = null;
+        return .{ .written = frame.encoded.len, .total = total, .checkpoint = false };
+    }
+
+    fn persistCheckpointPinned(self: *@This(), backend: anytype, root: []const u8, current: *const @import("run_directory.zig").Directory, execution_runtime: ?*@import("../background_runtime.zig").BackendRuntime) !Result {
         const allocator = backend.allocator;
         const storage = backend.storage.?;
-        errdefer self.sequence = null;
+        errdefer if (execution_runtime == null) {
+            self.sequence = null;
+        };
+        const Frame = @import("manifest_edit_preparation.zig").Frame;
+        const frame = if (execution_runtime != null) try Frame.create(backend) else null;
+        if (frame) |owned| {
+            std.debug.assert(backend.active_manifest_preparation == null);
+            backend.active_manifest_preparation = owned;
+        }
+        defer if (frame) |owned| backend.retireManifestPreparation(owned);
         var reservation: ?resource_manager_mod.Reservation = null;
         defer {
             backend.syncTrackedInMemoryStateUsageCurrentLocked();
             if (reservation) |*lease| lease.release();
         }
-        const retired_count = self.retiredFileCount();
-        const prepared_paths = try std.math.add(usize, backend.obsolete_paths.spare.items.len, retired_count);
-        if (backend.options.resource_manager) |manager| {
-            const bound = try std.math.add(u64, 64 * 1024 + retired_count * (root.len + 128) * 2, try backend.obsolete_paths.prepareMemoryBound(prepared_paths));
-            reservation = try manager.reserve(.lsm_table_builder_working_set, bound);
-        }
         const directory = try current.fork(allocator);
-        errdefer directory.destroy(allocator);
-        const retired = try allocator.alloc(lsm_manifest.ObsoletePathMeta, retired_count);
-        defer allocator.free(retired);
-        var initialized: usize = 0;
-        var transferred = false;
-        defer if (!transferred) for (retired[0..initialized]) |path| allocator.free(path.path);
-        try self.retiredFiles(allocator, root, backend.nowNs() +| backend.options.obsolete_retention_ns, retired, &initialized);
-        try backend.obsolete_paths.ensureUnusedCapacity(allocator, prepared_paths);
-        for (retired) |path| {
-            if (backend.obsolete_paths.contains(path.path)) {
-                allocator.free(path.path);
-            } else backend.obsolete_paths.appendAssumeCapacity(.{ .path = @constCast(path.path), .delete_after_ns = path.delete_after_ns });
-        }
-        transferred = true;
-        const ledger_owner = try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
-        defer ledger_owner.retire(backend);
+        if (frame) |owned| owned.current = directory;
+        errdefer if (frame == null) directory.destroy(allocator);
+        const ledger_owner = if (frame) |owned| blk: {
+            owned.planning_source = try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+            const fence = CheckpointFence.capture(backend);
+            const deadline = backend.nowNs() +| backend.options.obsolete_retention_ns;
+            const runtime = @import("runtime.zig");
+            runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+            const planned = owned.planRetirement(backend, execution_runtime.?, &fence, &owned.planning_source.?.value, null, deadline);
+            _ = runtime.lockBackend(@TypeOf(backend.*), backend);
+            try planned;
+            if (!fence.matches(backend) or backend.obsolete_paths.tree.root != owned.planning_source.?.value.tree.root) return error.ResourceBudgetExceeded;
+            std.mem.swap(ObsoleteLedger, &backend.obsolete_paths, &owned.planned_obsolete.?);
+            // Register the old live spare-vector ownership before observers run.
+            std.mem.swap(ObsoleteLedger, &owned.planning_source.?.value, &owned.planned_obsolete.?);
+            break :blk try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+        } else blk: {
+            const retired_count = self.retiredFileCount();
+            const prepared_paths = try std.math.add(usize, backend.obsolete_paths.spare.items.len, retired_count);
+            if (backend.options.resource_manager) |manager| {
+                const bound = try std.math.add(u64, 64 * 1024 + retired_count * (root.len + 128) * 2, try backend.obsolete_paths.prepareMemoryBound(prepared_paths));
+                reservation = try manager.reserve(.lsm_table_builder_working_set, bound);
+            }
+            const retired = try allocator.alloc(lsm_manifest.ObsoletePathMeta, retired_count);
+            defer allocator.free(retired);
+            var initialized: usize = 0;
+            var transferred = false;
+            defer if (!transferred) for (retired[0..initialized]) |path| allocator.free(path.path);
+            try self.retiredFiles(allocator, root, backend.nowNs() +| backend.options.obsolete_retention_ns, retired, &initialized);
+            try backend.obsolete_paths.ensureUnusedCapacity(allocator, prepared_paths);
+            for (retired) |path| {
+                if (backend.obsolete_paths.contains(path.path)) {
+                    allocator.free(path.path);
+                } else backend.obsolete_paths.appendAssumeCapacity(.{ .path = @constCast(path.path), .delete_after_ns = path.delete_after_ns });
+            }
+            transferred = true;
+            break :blk try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+        };
+        if (frame) |owned| owned.obsolete = ledger_owner;
+        defer if (frame == null) ledger_owner.retire(backend);
         const ledger = &ledger_owner.value;
         const id = backend.next_run_id;
         backend.next_run_id = try std.math.add(u64, id, 1);
         const next_run_id = backend.next_run_id;
+        if (frame) |owned| {
+            // Installation gets separate fixed headers. The streaming writer
+            // retains its original source through physical retirement.
+            owned.previous = try directory.fork(allocator);
+            owned.previous_obsolete = try LedgerSnapshot.capture(backend, ledger);
+            const runtime = @import("runtime.zig");
+            const fence = CheckpointFence.capture(backend);
+            const descriptor = manifest_set.Descriptor{ .checkpoint = id, .first_segment = id, .sequence = 0 };
+            const started = backend.writeStatsNowNs();
+            runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+            const prepared = owned.prepareCheckpoint(backend, execution_runtime.?, root, id, next_run_id);
+            _ = runtime.lockBackend(@TypeOf(backend.*), backend);
+            try prepared;
+            // No descriptor operation can begin until the captured durable
+            // lineage has been checked again under the publication mutex.
+            if (!fence.matches(backend)) return error.RecoveryRequired;
+            runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+            const completed = owned.finishCheckpoint(backend, execution_runtime.?);
+            _ = runtime.lockBackend(@TypeOf(backend.*), backend);
+            backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(started);
+            const bytes = completed catch |cause| {
+                if (owned.checkpoint_owner.?.descriptorMayHavePublished()) {
+                    backend.manifest_recovery_required = true;
+                    self.sequence = null;
+                    backend.markManifestDirty();
+                }
+                return cause;
+            };
+            const result = try self.installPreparedCheckpoint(backend, &fence, descriptor, next_run_id, bytes, owned.previous.?, &owned.previous_obsolete.?.value);
+            owned.previous = null;
+            return result;
+        }
         const Source = struct {
             cursor: @import("run_directory.zig").Directory.Cursor,
             ledger: ObsoleteLedger.Cursor,
@@ -1274,6 +1595,7 @@ pub const ManifestJournal = struct {
         const runtime = @import("runtime.zig");
         const BackendType = @TypeOf(backend.*);
         const unlocked = @import("builtin").os.tag != .freestanding and !(@import("builtin").is_test and publication_test_keep_backend_locked);
+        const checkpoint_fence = CheckpointFence.capture(backend);
         const started = backend.writeStatsNowNs();
         if (unlocked) runtime.unlockBackend(BackendType, backend, true);
         const descriptor = manifest_set.Descriptor{ .checkpoint = id, .first_segment = id, .sequence = 0 };
@@ -1304,18 +1626,7 @@ pub const ManifestJournal = struct {
             backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(started);
         }
         const bytes = try built;
-        std.mem.swap(ObsoleteLedger, &self.obsolete, ledger);
-        self.descriptor = descriptor;
-        self.active_segment = id;
-        self.segments[0] = id;
-        self.segment_count = 1;
-        self.sequence = 0;
-        self.checkpoint_sequence = 0;
-        self.bytes = bytes;
-        self.edit_bytes = 0;
-        self.next_run_id = next_run_id;
-        backend.publishManifestDirectory(directory);
-        return .{ .written = bytes + 36 + manifest_set.header_len, .total = bytes, .checkpoint = true };
+        return self.installPreparedCheckpoint(backend, &checkpoint_fence, descriptor, next_run_id, bytes, directory, ledger);
     }
 
     fn persistAttempt(self: *@This(), backend: anytype, root_dir: []const u8, runs: []const Run) !Result {
@@ -1324,7 +1635,7 @@ pub const ManifestJournal = struct {
         // Count suffix bytes, not the checkpoint itself: large stores must
         // not checkpoint on every edit merely because their base exceeds 8 MiB.
         const checkpoint = self.sequence == null or self.descriptor == null or current == null or backend.manifest_directory == null;
-        if (checkpoint) if (current) |directory| return self.persistCheckpointPinned(backend, root_dir, directory);
+        if (checkpoint) if (current) |directory| return self.persistCheckpointPinned(backend, root_dir, directory, null);
         if (!checkpoint and current.?.tree.root == backend.manifest_directory.?.tree.root and self.next_run_id == backend.next_run_id and self.obsolete.tree.root == backend.obsolete_paths.tree.root)
             return .{ .written = 0, .total = self.bytes, .checkpoint = false };
         var reservation: ?resource_manager_mod.Reservation = null;
@@ -1595,27 +1906,30 @@ pub fn loadRunTableBorrowedAllocWithStorage(
     allocator: Allocator,
     path: []const u8,
 ) !lsm_table_file.BorrowedDecoded {
-    const raw_table = storage.readFileAlloc(allocator, path, max_run_file_read_bytes) catch |err| {
+    return loadRunTableBorrowedAllocWithStorageAndAdmission(storage, allocator, path, null);
+}
+
+pub fn loadRunTableBorrowedAllocWithStorageAndAdmission(storage: storage_io.Storage, allocator: Allocator, path: []const u8, control: ?@import("../../common/read_admission.zig").Port) !lsm_table_file.BorrowedDecoded {
+    if (control) |budget| try budget.checkpoint();
+    const raw_table = (if (control) |budget| storage.readFileAllocWithAdmission(allocator, path, max_run_file_read_bytes, budget) else storage.readFileAlloc(allocator, path, max_run_file_read_bytes)) catch |err| {
         logReadFileFailure(storage, path, max_run_file_read_bytes, "loadRunTableBorrowedAllocWithStorage", err);
         return err;
     };
     errdefer allocator.free(raw_table);
-    return try lsm_table_file.decodeBorrowedOwnedAlloc(allocator, raw_table);
+    return try lsm_table_file.decodeBorrowedOwnedAllocWithAdmission(allocator, raw_table, control);
 }
 
-pub fn loadRunTableIndexAllocWithStorage(
-    storage: storage_io.Storage,
-    allocator: Allocator,
-    path: []const u8,
-) !lsm_table_file.TableIndex {
-    // A missing or truncated run file usually means a concurrent writer
-    // obsoleted and reclaimed it after this reader loaded the manifest;
-    // propagate the transient error so callers can retry against a fresh
-    // manifest instead of misreporting a format mismatch.
-    const footer = try loadRunFooterWithStorage(storage, allocator, path);
-    const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+pub fn loadRunTableIndexAllocWithStorage(storage: storage_io.Storage, allocator: Allocator, path: []const u8) !lsm_table_file.TableIndex {
+    return loadRunTableIndexAllocWithStorageAndAdmission(storage, allocator, path, null);
+}
+
+pub fn loadRunTableIndexAllocWithStorageAndAdmission(storage: storage_io.Storage, allocator: Allocator, path: []const u8, control: ?@import("../../common/read_admission.zig").Port) !lsm_table_file.TableIndex {
+    if (control) |budget| try budget.checkpoint();
+    const footer = try loadRunFooterWithStorageAndAdmission(storage, allocator, path, control);
+    if (control) |budget| try budget.checkpoint();
+    const metadata_bytes = if (control) |budget| try storage.readFileRangeAllocWithAdmission(allocator, path, footer.metadata_offset, footer.metadata_len, budget) else try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
     defer allocator.free(metadata_bytes);
-    return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
+    return try lsm_table_file.decodeIndexFromFooterAllocWithAdmission(allocator, footer, metadata_bytes, control);
 }
 
 pub fn loadRunSequentialTableIndexAllocWithStorage(
@@ -1634,11 +1948,11 @@ pub fn loadRunFooterWithStorage(
     allocator: Allocator,
     path: []const u8,
 ) !lsm_table_file.Footer {
-    var trailer = try storage.readFileTrailerAlloc(
-        allocator,
-        path,
-        lsm_table_file.footer_len,
-    );
+    return loadRunFooterWithStorageAndAdmission(storage, allocator, path, null);
+}
+
+pub fn loadRunFooterWithStorageAndAdmission(storage: storage_io.Storage, allocator: Allocator, path: []const u8, control: ?@import("../../common/read_admission.zig").Port) !lsm_table_file.Footer {
+    var trailer = if (control) |budget| try storage.readFileTrailerAllocWithAdmission(allocator, path, lsm_table_file.footer_len, budget) else try storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len);
     defer trailer.deinit(allocator);
 
     const file_size = trailer.file_size;

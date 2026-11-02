@@ -1,0 +1,9 @@
+openat(AT_FDCWD, "/tmp/diagnostic-data/extensions", O_RDONLY|O_CLOEXEC|O_DIRECTORY) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/tmp/diagnostic-data/metadata/auth/chatgpt", O_RDONLY|O_CLOEXEC|O_PATH|O_DIRECTORY) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/tmp/diagnostic-data/metadata/auth", O_RDONLY|O_CLOEXEC|O_PATH|O_DIRECTORY) = 13
+close(13)                               = 0
+mkdirat(AT_FDCWD, "/tmp/diagnostic-data/metadata/auth/chatgpt", 0777) = 0
+openat(AT_FDCWD, "/tmp/diagnostic-data/metadata/auth/chatgpt", O_RDONLY|O_CLOEXEC|O_PATH|O_DIRECTORY) = 13
+fchmod(13, 0700)                        = -1 EBADF (Bad file descriptor)
+close(13)                               = 0
+rt_sigaction(SIGIO, {sa_handler=0x75b8408, sa_mask=[], sa_flags=0}, NULL, 8) = 0

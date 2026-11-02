@@ -2703,6 +2703,24 @@ pub const SparseIndex = struct {
         };
     }
 
+    /// Final status preparation runs after writers are fenced. Metadata reads
+    /// still use the original execution; an empty cache is not a raw-I/O path.
+    pub fn statsWithAdmission(self: *SparseIndex, original: @import("../common/read_admission.zig").Port) !Stats {
+        try original.checkpoint();
+        if (self.doc_count == 0 and self.term_count == 0) {
+            var txn = try self.store.beginProbeWithAdmission(.retain, original);
+            defer txn.abort();
+            var values: [2]?[]const u8 = @splat(null);
+            try txn.getManySortedWithAdmission(&.{ metaKey(meta_doc_count), metaKey(meta_term_count) }, &values, original);
+            try original.checkpoint();
+            const docs = if (values[0]) |raw| if (raw.len >= 8) std.mem.readInt(u64, raw[0..8], .little) else 0 else 0;
+            const terms = if (values[1]) |raw| if (raw.len >= 8) std.mem.readInt(u64, raw[0..8], .little) else 0 else 0;
+            self.doc_count = docs;
+            self.term_count = terms;
+        }
+        return .{ .doc_count = self.doc_count, .term_count = self.term_count };
+    }
+
     fn loadPersistedStats(self: *SparseIndex) !Stats {
         var txn = try self.beginReadTxn();
         defer txn.abort();

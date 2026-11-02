@@ -4495,11 +4495,15 @@ test "image embedding broker fuses concurrent callers and transfers owned vector
             };
             const batch = try pipeline.embedImagesReported(images);
             defer shared.free(batch.vectors);
-            for (items, batch.vectors) |item, vector| item.slot.setValue([]f32, vector, switch (batch.execution) {
+            for (items, batch.vectors) |item, vector| item.slot.setOwnedValue([]f32, vector, switch (batch.execution) {
                 .native_batch => .native_batch,
                 .serial => .serial,
                 .fallback => .fallback,
-            });
+            }, shared, struct {
+                fn release(alloc: std.mem.Allocator, values: []f32) void {
+                    alloc.free(values);
+                }
+            }.release);
         }
     };
     const Submit = struct {

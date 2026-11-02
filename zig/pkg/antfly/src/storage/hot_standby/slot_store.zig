@@ -148,7 +148,7 @@ pub const SlotStore = struct {
     pub fn open(alloc: Allocator, path: [*:0]const u8, options: OpenOptions) !SlotStore {
         var store = SlotStore{
             .alloc = alloc,
-            .wal = try wal_mod.WAL.open(path, options.wal_options),
+            .wal = try wal_mod.WAL.openWithAllocator(alloc, path, options.wal_options),
             .update_progress_before_read_hook = options.update_progress_before_read_hook,
         };
         errdefer store.close();
@@ -307,6 +307,21 @@ pub const SlotStore = struct {
 
     pub fn get(self: *const SlotStore, name: []const u8) ?SlotState {
         if (self.findIndex(name)) |idx| return self.slots.items[idx].state;
+        return null;
+    }
+
+    /// Slot identifiers are validated at publication (at most 128 bytes).
+    /// Borrowed state remains under the caller's existing serialization.
+    pub fn getWithAdmission(self: *const SlotStore, name: []const u8, control: @import("antfly_local_sources").common_read_admission.Port) !?SlotState {
+        try control.checkpoint();
+        for (self.slots.items, 0..) |slot, index| {
+            if (index % 64 == 0) try control.checkpoint();
+            if (std.mem.eql(u8, slot.state.name, name)) {
+                try control.checkpoint();
+                return slot.state;
+            }
+        }
+        try control.checkpoint();
         return null;
     }
 

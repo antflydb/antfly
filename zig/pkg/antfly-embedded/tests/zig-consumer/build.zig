@@ -19,10 +19,21 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const dependency = b.dependency("embedded", .{ .target = target, .optimize = optimize });
-    const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("main.zig"), .target = target, .optimize = optimize }) });
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("main.zig"), .target = target, .optimize = optimize }),
+        .zig_lib_dir = dependency.artifact("antfly-lite").zig_lib_dir,
+    });
     tests.root_module.addImport("antfly-embedded", dependency.module("antfly-embedded"));
     tests.root_module.addImport("antfly-inference", dependency.module("antfly-inference"));
     tests.root_module.link_libc = true;
+    const consumer_check = b.addTest(.{
+        .name = "fetched-native-consumer-check",
+        .root_module = tests.root_module,
+        .zig_lib_dir = tests.zig_lib_dir,
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("check", "Analyze fetched native package and executor composition without linking providers")
+        .dependOn(&consumer_check.step);
     b.step("test", "Exercise fetched Apache package").dependOn(&b.addRunArtifact(tests).step);
     const native = b.step("native", "Build fetched C ABI, header and install metadata");
     native.dependOn(&dependency.builder.top_level_steps.get("capi").?.step);

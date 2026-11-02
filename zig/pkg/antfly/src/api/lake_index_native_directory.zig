@@ -29,6 +29,7 @@ pub const Access = struct {
     domain: [32]u8,
     token: Token,
     cached: ?artifacts.CachedRead = null,
+    context: local.serverless_query_lake_read_context.Context = .{},
     navigation: ?*Navigation = null,
     reads: u64 = 512 * 1024 * 1024,
     writes: u64 = 512 * 1024 * 1024,
@@ -43,7 +44,7 @@ pub const Access = struct {
         self.publication = true;
     }
     pub fn backing(self: *Access) tree.Store {
-        self.pages = .{ .domain = self.domain, .attempt = if (self.store.upload_scope) |scope| scope.attempt else @splat(0), .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = self.work orelse &self.writes, .read_cache = if (self.cached != null or self.navigation != null) .{ .ptr = self, .read = readPage } else null };
+        self.pages = .{ .domain = self.domain, .attempt = if (self.store.upload_scope) |scope| scope.attempt else @splat(0), .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = self.work orelse &self.writes, .read_cache = if (self.cached != null or self.navigation != null or self.context.execution != null) .{ .ptr = self, .read = readPage } else null };
         if (self.publication) self.pages.admitPublication();
         var result = self.pages.store();
         if (self.navigation != null) result.decoded_page = .{ .ptr = self, .read = acquirePage };
@@ -61,7 +62,7 @@ pub const Access = struct {
     fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, len: usize, digest: [32]u8, token: Token, remaining: *u64) ![]u8 {
         const self: *Access = @ptrCast(@alignCast(raw));
         try stores.chargeReadBudget(remaining, len);
-        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, len, digest, token, self.cached);
+        return artifacts.readPageRangeFor(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, len, digest, token, self.cached, if (self.cached) |cache| cache.context else self.context);
     }
 };
 pub fn key(ordinal: usize) [8]u8 {

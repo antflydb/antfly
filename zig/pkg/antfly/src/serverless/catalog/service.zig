@@ -171,6 +171,57 @@ pub const CatalogService = struct {
     store: *catalog_store.CatalogStore,
     external_source_plan_resolver: ?publication_plan.ExternalSourcePlanResolver = null,
     facts_read_leases: read_lease.Cache = .{},
+    /// Scoped provider views never become retained lease/cache owners.
+    lease_owner: ?*CatalogService = null,
+
+    pub const Scope = struct {
+        /// At most three provider views overlap: runtime, publisher, and
+        /// status/publication. Include the builder's primitive view packet and
+        /// the joined model invocation's borrowed execution/authority scope.
+        pub const retained_bytes = 3 * @sizeOf(Scope) + @sizeOf(builder_mod.Builder) +
+            @sizeOf(manifest_mod.ManifestStore) + @sizeOf(progress_store_mod.ProgressStore) + @sizeOf(wal_mod.WalStore) +
+            @sizeOf(@import("../model_execution.zig").Scope) +
+            @import("antfly_local_sources").inference_managed_embedder.invocation_http_retained_bytes;
+        catalog: CatalogService = undefined,
+        artifacts: artifacts_mod.ArtifactStore = undefined,
+        manifests: manifest_mod.ManifestStore = undefined,
+        progress: progress_store_mod.ProgressStore = undefined,
+        wal: wal_mod.WalStore = undefined,
+        store: catalog_store.CatalogStore = undefined,
+        builder: builder_mod.Builder = undefined,
+
+        pub fn bind(scope: *Scope, original: *CatalogService, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) *CatalogService {
+            scope.artifacts = original.artifacts.*;
+            scope.manifests = original.manifests.*;
+            scope.progress = original.progress.*;
+            scope.wal = original.wal.*;
+            scope.store = original.store.*;
+            scope.artifacts.write_context = context;
+            scope.manifests.context = context;
+            scope.progress.context = context;
+            scope.wal.context = context;
+            scope.store.context = context;
+            scope.builder = original.builder.*;
+            scope.builder.artifacts = &scope.artifacts;
+            scope.builder.manifests = &scope.manifests;
+            scope.builder.progress = &scope.progress;
+            scope.builder.wal = &scope.wal;
+            // Construct a view explicitly: copying a populated lease cache or
+            // its mutex would split ownership of already retained readers.
+            scope.catalog = .{
+                .alloc = original.alloc,
+                .artifacts = &scope.artifacts,
+                .manifests = &scope.manifests,
+                .progress = &scope.progress,
+                .wal = &scope.wal,
+                .store = &scope.store,
+                .builder = &scope.builder,
+                .external_source_plan_resolver = original.external_source_plan_resolver,
+                .lease_owner = original.lease_owner orelse original,
+            };
+            return &scope.catalog;
+        }
+    };
 
     pub fn init(
         alloc: Allocator,
@@ -383,6 +434,12 @@ pub const CatalogService = struct {
     }
 
     pub fn buildStatusUntil(self: *CatalogService, namespace: []const u8, cancellation: ?maintenance_cancellation.Token) !catalog_types.BuildStatus {
+        var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
+        var scope: Scope = .{};
+        const catalog = if (cancellation != null and cancellation.?.execution != null) scope.bind(self, bridge.readContext()) else self;
+        return catalog.buildStatusForScope(namespace, cancellation);
+    }
+    fn buildStatusForScope(self: *CatalogService, namespace: []const u8, cancellation: ?maintenance_cancellation.Token) !catalog_types.BuildStatus {
         try maintenance_cancellation.check(cancellation);
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
         var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .status, null);
@@ -875,19 +932,25 @@ pub const CatalogService = struct {
             var nonce: [16]u8 = undefined;
             io.random(&nonce);
             const owner = std.fmt.bytesToHex(&nonce, .lower);
-            var held = (try work_lease.acquireHeld(try self.progress.workLeaseProvider(), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse return error.WorkLeaseLost;
+            const provider = try self.progress.workLeaseProvider();
+            var lease_bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = (cancellation orelse maintenance_cancellation.Token{ .io = io }).withContext(provider.context) };
+            var held = (try work_lease.acquireHeld(provider.withContext(lease_bridge.readContext()), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse return error.WorkLeaseLost;
             defer _ = held.release() catch false;
-            return self.buildNamespaceGuardedUntil(namespace, held.guard(), held.cancellation(cancellation orelse .{ .io = io }));
+            return self.buildNamespaceGuardedUntil(namespace, held.guard(), try held.cancellation(cancellation orelse .{ .io = io }));
         }
         var protection = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
-        const protected = protection.token(io);
+        defer protection.deinit();
+        const protected = try protection.token(io);
         var bridge = maintenance_cancellation.GraphBridge{ .maintenance = protected };
         var scoped = self.artifacts.*;
         scoped.upload_scope = .{ .domain = graph_page_store.PageStore.namespaceDomain(namespace), .attempt = try builder_mod.graphPublicationAttempt(publication_guard, namespace, io) };
-        const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
-        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication, .{ .artifacts = &scoped, .cancellation = bridge.token(), .maintenance = protected });
+        if (protected.execution != null) scoped.write_context = bridge.readContext();
+        var metadata_scope: Scope = .{};
+        const catalog = if (protected.execution != null) metadata_scope.bind(self, bridge.readContext()) else self;
+        const policy = catalog.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
+        var plan = try catalog.publicationPlanForNamespaceAlloc(namespace, policy, .publication, .{ .artifacts = &scoped, .cancellation = bridge.token(), .maintenance = protected });
         defer plan.deinit(self.alloc);
-        return try self.builder.publishNamespaceWithMetricAndPlanGuardedUntil(
+        return try catalog.builder.publishNamespaceWithMetricAndPlanGuardedUntil(
             namespace,
             policy.vector_distance_metric,
             plan,
@@ -972,7 +1035,7 @@ pub const CatalogService = struct {
         defer self.freeTables(self.alloc, tables);
         for (tables) |table| {
             if (!std.mem.eql(u8, table.namespace, namespace)) continue;
-            const effective_policy = effectivePolicyForTable(policy, table.indexes_json) catch return error.InvalidTableIndexMetadata;
+            const effective_policy = try effectivePolicyForTable(self.alloc, policy, table.indexes_json);
             var external_binding = try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
             defer if (external_binding) |*binding| binding.deinit(self.alloc);
             const default_indexes = table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}");
@@ -1276,20 +1339,24 @@ pub const CatalogService = struct {
     }
 
     fn effectivePolicyForTable(
+        alloc: Allocator,
         base_policy: catalog_types.NamespacePolicy,
         indexes_json: []const u8,
     ) !catalog_types.NamespacePolicy {
         var effective = base_policy;
-        if (!effective.chunk_embeddings_enabled and try tableRequiresChunkEmbeddings(indexes_json)) {
+        if (!effective.chunk_embeddings_enabled and try tableRequiresChunkEmbeddings(alloc, indexes_json)) {
             effective.chunk_embeddings_enabled = true;
         }
         return effective;
     }
 
-    fn tableRequiresChunkEmbeddings(indexes_json: []const u8) !bool {
+    fn tableRequiresChunkEmbeddings(alloc: Allocator, indexes_json: []const u8) !bool {
         if (indexes_json.len == 0 or std.mem.eql(u8, indexes_json, "{}")) return false;
 
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, indexes_json, .{});
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidTableIndexMetadata,
+        };
         defer parsed.deinit();
         const object = switch (parsed.value) {
             .object => |object| object,
@@ -1326,6 +1393,21 @@ pub const CatalogService = struct {
         return try self.store.setPolicy(namespace, policy);
     }
 };
+
+test "serverless execution catalog index policy uses caller memory and preserves allocation failure" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            const policy = try CatalogService.effectivePolicyForTable(alloc, .{}, "{\"dense\":{\"type\":\"embeddings\",\"chunker\":{}}}");
+            try std.testing.expect(policy.chunk_embeddings_enabled);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    var budget = @import("antfly_local_sources").storage_test_allocator.BoundedAllocator.init(std.testing.allocator, 0);
+    defer std.debug.assert(budget.deinit() == 0);
+    try std.testing.expectError(error.OutOfMemory, Fixture.run(budget.allocator()));
+    try std.testing.expectError(error.InvalidTableIndexMetadata, CatalogService.effectivePolicyForTable(std.testing.allocator, .{}, "["));
+}
 
 /// Status and publication share the same metadata-only external reconciliation.
 /// Managed namespace adjacency aliases never stand in for external projections.
@@ -2428,7 +2510,8 @@ fn enrichmentCompletionAlloc(
     // Pin before resolving the manifest; a concurrent retirement must either
     // observe this reader or reject it. Never turn an unreadable source into
     // "enrichment complete".
-    const pin = try self.facts_read_leases.acquire(self.progress, namespace, head_version);
+    const lease_owner = self.lease_owner orelse self;
+    const pin = try lease_owner.facts_read_leases.acquire(lease_owner.progress, namespace, head_version);
     const ReadCheck = struct {
         pin: read_lease.Lease,
         cancellation: ?maintenance_cancellation.Token,
@@ -3024,8 +3107,17 @@ test "serverless catalog service tracks namespaces and reports build status" {
     defer fs_catalog_store.deinit();
 
     var builder = builder_mod.Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
-    var catalog = CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &fs_catalog_store);
-    defer catalog.deinit();
+    var original_catalog = CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &fs_catalog_store);
+    defer original_catalog.deinit();
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .publication_slots = 1, .max_bytes = 64 * 1024 * 1024, .max_wait_ms = 5000 });
+    defer scheduler.close();
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = @sizeOf(Runnable.Execution) + CatalogService.Scope.retained_bytes }, .background);
+    var scope: CatalogService.Scope = .{};
+    const context = (@import("antfly_local_sources").serverless_query_lake_read_context.Context{ .io = std.testing.io }).withExecution(&execution);
+    const catalog = scope.bind(&original_catalog, context);
 
     try std.testing.expect(try catalog.ensureNamespace("docs", 100));
     try std.testing.expect(!(try catalog.ensureNamespace("docs", 200)));
@@ -3087,6 +3179,23 @@ test "serverless catalog service tracks namespaces and reports build status" {
     try std.testing.expectEqual(published.artifacts.len, after.retained_artifacts);
     try std.testing.expect(!after.compaction_recommended);
     try std.testing.expect(after.enrichment_complete);
+    // Exercise prediction after a published head exists, so its protected WAL
+    // replay and facts-page context are used by the normal status caller.
+    const encoded_c = try api_codec.encodeMutationAlloc(alloc, .{ .kind = api_types.MutationKind.upsert, .doc_id = "doc-c", .body = "payload-c" });
+    defer alloc.free(encoded_c);
+    try std.testing.expectEqual(@as(u64, 3), try catalog.wal.append("docs", 333, encoded_c));
+    var pending = try catalog.buildStatus("docs");
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), pending.latest_wal_lsn);
+    try std.testing.expectEqual(@as(u64, 2), pending.published_wal_end_lsn);
+    try std.testing.expectEqual(@as(u64, 1), pending.pending_records);
+    var incremental = try catalog.buildNamespace("docs");
+    defer incremental.deinit(alloc);
+    try std.testing.expect(incremental.published);
+    var updated = try catalog.manifests.getAlloc("docs", 2);
+    defer updated.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), updated.stats.document_count);
+    try std.testing.expect(wal_store.context == null and manifest_store.context == null and progress_store.context == null);
 }
 
 test "serverless catalog service stores per-namespace policy" {

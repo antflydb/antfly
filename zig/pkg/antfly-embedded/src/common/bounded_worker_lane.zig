@@ -24,9 +24,15 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const GuardedStack = @import("guarded_worker_stack.zig").Stack;
 
 pub const Options = struct {
     worker_count: usize,
+    /// Optional authority for exact guarded pthread mappings. Outlives destroy.
+    worker_stack_allocator: ?Allocator = null,
+    stack_size: usize = std.Thread.SpawnConfig.default_stack_size,
+    /// Includes arena backing retained between jobs; outlives destroy.
+    scratch_allocator: Allocator = std.heap.page_allocator,
     queue_capacity: usize,
     max_scratch_bytes: usize,
     retained_scratch_bytes_per_worker: usize,
@@ -142,6 +148,7 @@ const ScratchBudget = struct {
 
 const BoundedBackingAllocator = struct {
     budget: *ScratchBudget,
+    backing: Allocator = std.heap.page_allocator,
     job_budget: ?*ScratchBudget = null,
     job_charged_bytes: usize = 0,
 
@@ -164,7 +171,7 @@ const BoundedBackingAllocator = struct {
             self.budget.release(len);
             return null;
         };
-        const result = std.heap.page_allocator.rawAlloc(len, alignment, return_address) orelse {
+        const result = self.backing.rawAlloc(len, alignment, return_address) orelse {
             self.budget.release(len);
             if (self.job_budget) |job_budget| job_budget.release(len);
             return null;
@@ -181,7 +188,7 @@ const BoundedBackingAllocator = struct {
             self.budget.release(growth);
             return false;
         };
-        if (!std.heap.page_allocator.rawResize(memory, alignment, new_len, return_address)) {
+        if (!self.backing.rawResize(memory, alignment, new_len, return_address)) {
             if (growth > 0) self.budget.release(growth);
             if (growth > 0) if (self.job_budget) |job_budget| job_budget.release(growth);
             return false;
@@ -199,7 +206,7 @@ const BoundedBackingAllocator = struct {
             self.budget.release(growth);
             return null;
         };
-        const result = std.heap.page_allocator.rawRemap(memory, alignment, new_len, return_address) orelse {
+        const result = self.backing.rawRemap(memory, alignment, new_len, return_address) orelse {
             if (growth > 0) self.budget.release(growth);
             if (growth > 0) if (self.job_budget) |job_budget| job_budget.release(growth);
             return null;
@@ -211,7 +218,7 @@ const BoundedBackingAllocator = struct {
 
     fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
         const self: *BoundedBackingAllocator = @ptrCast(@alignCast(context));
-        std.heap.page_allocator.rawFree(memory, alignment, return_address);
+        self.backing.rawFree(memory, alignment, return_address);
         self.budget.release(memory.len);
     }
 
@@ -234,6 +241,7 @@ const Worker = struct {
     backing: BoundedBackingAllocator,
     arena: std.heap.ArenaAllocator,
     thread: ?std.Thread = null,
+    stack: ?GuardedStack = null,
 
     fn run(self: *Worker) void {
         while (self.executor.take()) |job| {
@@ -302,16 +310,25 @@ pub const Executor = struct {
         errdefer {
             self.closeQueue();
             for (workers[0..initialized_workers]) |*worker| if (worker.thread) |thread| thread.join();
-            for (workers[0..initialized_workers]) |*worker| worker.arena.deinit();
+            for (workers[0..initialized_workers]) |*worker| {
+                worker.arena.deinit();
+                if (worker.stack) |stack| stack.destroy();
+            }
         }
         for (workers) |*worker| {
             worker.executor = self;
-            worker.backing = .{ .budget = &self.scratch_budget };
+            worker.backing = .{ .budget = &self.scratch_budget, .backing = options.scratch_allocator };
             worker.arena = std.heap.ArenaAllocator.init(worker.backing.allocator());
             worker.thread = null;
+            worker.stack = null;
             initialized_workers += 1;
         }
-        for (workers) |*worker| worker.thread = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        for (workers) |*worker| {
+            if (options.worker_stack_allocator) |stack_allocator| {
+                worker.stack = try GuardedStack.create(stack_allocator, options.stack_size);
+                worker.thread = try worker.stack.?.spawn(alloc, Worker.run, .{worker});
+            } else worker.thread = try std.Thread.spawn(.{ .stack_size = options.stack_size }, Worker.run, .{worker});
+        }
         return self;
     }
 
@@ -321,7 +338,10 @@ pub const Executor = struct {
     pub fn destroy(self: *Executor) void {
         self.closeQueue();
         for (self.workers) |worker| if (worker.thread) |thread| thread.join();
-        for (self.workers) |*worker| worker.arena.deinit();
+        for (self.workers) |*worker| {
+            worker.arena.deinit();
+            if (worker.stack) |stack| stack.destroy();
+        }
         std.debug.assert(self.scratch_budget.live_bytes.load(.acquire) == 0);
         const alloc = self.alloc;
         alloc.free(self.queue);

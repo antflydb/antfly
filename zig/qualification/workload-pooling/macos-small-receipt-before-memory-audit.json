@@ -1,0 +1,130 @@
+{
+  "manifest": {
+    "version": 1,
+    "name": "macos-native-idle-small",
+    "http_connections": 32,
+    "pgwire_connections": 32,
+    "samples": 5,
+    "sample_interval_seconds": 0.2,
+    "recovery_seconds": 3,
+    "thresholds": {
+      "idle_rss_growth_bytes": 134217728,
+      "idle_thread_growth": 160,
+      "idle_fd_growth": 80,
+      "control_latency_seconds": 2,
+      "recovery_fd_growth": 8,
+      "recovery_rss_growth_bytes": 134217728
+    }
+  },
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "pid": 47740,
+  "baseline": {
+    "rss_bytes": 164659200,
+    "virtual_bytes": 501321908224,
+    "threads": 20,
+    "fds": 20
+  },
+  "retained_pgwire_clients": 32,
+  "retained_http_clients": 32,
+  "idle_samples": [
+    {
+      "rss_bytes": 316047360,
+      "virtual_bytes": 502537175040,
+      "threads": 83,
+      "fds": 84
+    },
+    {
+      "rss_bytes": 318439424,
+      "virtual_bytes": 502556573696,
+      "threads": 84,
+      "fds": 84
+    },
+    {
+      "rss_bytes": 318439424,
+      "virtual_bytes": 502556573696,
+      "threads": 84,
+      "fds": 84
+    },
+    {
+      "rss_bytes": 318439424,
+      "virtual_bytes": 502556573696,
+      "threads": 84,
+      "fds": 84
+    },
+    {
+      "rss_bytes": 318439424,
+      "virtual_bytes": 502556573696,
+      "threads": 84,
+      "fds": 84
+    }
+  ],
+  "control_latencies_seconds": [
+    0.18998345899999958,
+    0.18986537500000011,
+    0.1899102079999997,
+    0.18944725000000062,
+    0.18952537500000055
+  ],
+  "recovery": {
+    "rss_bytes": 318570496,
+    "virtual_bytes": 502556639232,
+    "threads": 84,
+    "fds": 20
+  },
+  "idle_peak": {
+    "rss_bytes": 318439424,
+    "virtual_bytes": 502556573696,
+    "threads": 84,
+    "fds": 84
+  },
+  "checks": {
+    "idle_rss_growth_bytes": 153780224,
+    "idle_thread_growth": 64,
+    "idle_fd_growth": 64,
+    "control_latency_seconds": 0.18998345899999958,
+    "recovery_fd_growth": 0,
+    "recovery_rss_growth_bytes": 153911296
+  },
+  "failures": [
+    "idle_rss_growth_bytes: 153780224 exceeds 134217728",
+    "recovery_rss_growth_bytes: 153911296 exceeds 134217728"
+  ],
+  "passed": false,
+  "binary_sha256": "65e41e1b4116aa038484968dd217872bb48c083b76e6c7a395f14158b77bbe4c",
+  "configuration": {
+    "pgwire": {
+      "enabled": true,
+      "bind_port": 54779,
+      "max_connections": 32
+    },
+    "admission": {
+      "max_request_memory_bytes": 67108864
+    }
+  },
+  "server_exit_code": 0,
+  "server_log": "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-l9tfatrw/server.log",
+  "command": [
+    "/private/tmp/antfly-default-pooling-install/bin/antfly",
+    "standalone",
+    "--config",
+    "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-l9tfatrw/config.json",
+    "--auth",
+    "true",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "54778",
+    "--health",
+    "false",
+    "--data-dir",
+    "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-l9tfatrw/data",
+    "--models-dir",
+    "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-l9tfatrw/models",
+    "--ml-dir",
+    "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-l9tfatrw/ml",
+    "--storage-engine",
+    "lite",
+    "--storage-path",
+    "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-l9tfatrw/data.aflite"
+  ]
+}

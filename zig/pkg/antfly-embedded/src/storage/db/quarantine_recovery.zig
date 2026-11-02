@@ -29,6 +29,11 @@ pub const Owner = struct {
     lifecycle_mutex: std.atomic.Mutex = .unlocked,
     registration: ?runtime_mod.MaintenanceScheduler.Handle = null,
     stopping: std.atomic.Value(bool) = .init(false),
+    stop_started: bool = false,
+    joined: std.Io.Event = .unset,
+    stop_progress: std.Io.Event = .unset,
+    stop_generation: std.atomic.Value(u64) = .init(0),
+    stop_waiters: std.atomic.Value(u32) = .init(0),
     finished: std.atomic.Value(bool) = .init(false),
     start_address_for_test: usize = 0,
 
@@ -68,19 +73,15 @@ pub const Owner = struct {
         };
     }
 
-    pub fn stop(self: *Owner, runtime: *runtime_mod.BackendRuntime) void {
-        self.lock();
-        self.stopping.store(true, .release);
-        var task = self.registration;
-        self.registration = null;
-        self.lifecycle_mutex.unlock();
-        // The last step rechecks its failure cohort under the lifecycle lock.
-        // Join outside that lock so close cannot deadlock its final handshake.
-        if (task) |*handle| handle.await(runtime.io().?);
-        self.lock();
-        self.lifecycle_mutex.unlock();
+    fn shutdown(self: *Owner) @import("maintenance_stop.zig").Borrowed {
+        return .{ .mutex = &self.lifecycle_mutex, .registration = &self.registration, .stopping = &self.stopping, .finisher = &self.stop_started, .joined = &self.joined, .changed = &self.stop_progress, .generation = &self.stop_generation, .waiters = &self.stop_waiters };
     }
-
+    pub fn stop(self: *Owner, runtime: *runtime_mod.BackendRuntime) void {
+        self.shutdown().stop(runtime.io(), false);
+    }
+    pub fn stopWithAdmission(self: *Owner, runtime: *runtime_mod.BackendRuntime, original: @import("../../common/read_admission.zig").Port) !void {
+        try self.shutdown().stopWithAdmission(runtime.io(), original);
+    }
     fn step(self: *Owner) ?u64 {
         const delay_ms: u64 = 10 * 1000;
         if (self.stopping.load(.acquire)) {
@@ -165,4 +166,83 @@ test "quarantine recovery final handshake retains a newly failed cohort" {
     try std.testing.expect(owner.step() == null);
     try std.testing.expect(owner.finished.load(.acquire));
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "maintenance runtime quarantine recovery concurrent shutdown retains physical callback" {
+    if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    var runtime = try runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    var threads = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+    defer threads.deinit();
+    const io = threads.io();
+    var owner: Owner = .{};
+    defer owner.stop(runtime.ptr());
+    const F = struct {
+        owner: *Owner,
+        runtime: *runtime_mod.BackendRuntime,
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        first_done: std.Io.Event = .unset,
+        second_entered: std.Io.Event = .unset,
+        second_done: std.Io.Event = .unset,
+        unlocked: std.atomic.Value(bool) = .init(false),
+        fn run(ptr: *anyopaque) !usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.set(self.io);
+            self.release.waitUncancelable(self.io);
+            // A physical join must not hold the callback's lifecycle mutex.
+            self.owner.lock();
+            self.owner.lifecycle_mutex.unlock();
+            self.unlocked.store(true, .release);
+            return 0;
+        }
+        fn hasFailures(_: *anyopaque) bool {
+            return true;
+        }
+        fn first(self: *@This()) void {
+            self.owner.stop(self.runtime);
+            self.first_done.set(self.io);
+        }
+        fn second(self: *@This()) void {
+            self.second_entered.set(self.io);
+            self.owner.stop(self.runtime);
+            self.second_done.set(self.io);
+        }
+    };
+    var f: F = .{ .owner = &owner, .runtime = runtime.ptr(), .io = io };
+    owner.startInner(.{ .ptr = &f, .runtime = runtime.ptr(), .has_failures = F.hasFailures, .retry = F.run }, true);
+    defer f.release.set(io);
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } };
+    try f.entered.waitTimeout(io, timeout);
+    var first: ?std.Io.Future(void) = try io.concurrent(F.first, .{&f});
+    defer if (first) |*task| {
+        f.release.set(io);
+        task.await(io);
+    };
+    const deadline = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
+    while (!owner.stopping.load(.acquire) and @import("antfly_platform").time.monotonicNs() < deadline)
+        try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(owner.stopping.load(.acquire));
+    var second: ?std.Io.Future(void) = try io.concurrent(F.second, .{&f});
+    defer if (second) |*task| {
+        f.release.set(io);
+        task.await(io);
+    };
+    try f.second_entered.waitTimeout(io, timeout);
+    try std.testing.expectError(error.Timeout, f.second_done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }));
+    try std.testing.expect(!f.first_done.isSet());
+    try std.testing.expect(!owner.joined.isSet());
+    try std.testing.expectEqual(@as(usize, 1), (try runtime.ptr().maintenanceScheduler()).snapshot().active);
+    f.release.set(io);
+    try f.first_done.waitTimeout(io, timeout);
+    try f.second_done.waitTimeout(io, timeout);
+    first.?.await(io);
+    first = null;
+    second.?.await(io);
+    second = null;
+    try std.testing.expect(owner.joined.isSet());
+    try std.testing.expect(f.unlocked.load(.acquire));
+    try std.testing.expect(owner.registration == null);
+    try std.testing.expectEqual(@as(usize, 0), (try runtime.ptr().maintenanceScheduler()).snapshot().active);
 }

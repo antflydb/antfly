@@ -32,6 +32,8 @@ pub const HttpDriverConfig = struct {
     async_send_retained_bytes_max_per_peer: usize = common_http.default_max_request_bytes + 64 * 1024,
     async_send_worker_count: u32 = 4,
     isolated_worker_executors: bool = false,
+    /// Connections remain per sender; all nested tasks share this owner.
+    isolated_worker_network_io: ?std.Io = null,
     isolated_worker_executor_config: common_http.StdHttpExecutorConfig = .{},
 };
 
@@ -227,7 +229,9 @@ pub const HttpFrameDriver = struct {
         if (self.cfg.isolated_worker_executors) {
             self.isolated_executors = try self.alloc.alloc(common_http.StdHttpExecutor, self.cfg.async_send_worker_count);
             for (self.isolated_executors) |*executor| {
-                executor.initInPlace(self.alloc, self.cfg.isolated_worker_executor_config);
+                if (self.cfg.isolated_worker_network_io) |io| {
+                    executor.initBorrowedInPlace(self.alloc, self.cfg.isolated_worker_executor_config, io);
+                } else executor.initInPlace(self.alloc, self.cfg.isolated_worker_executor_config);
             }
         }
         errdefer self.deinitIsolatedExecutors();
@@ -1097,5 +1101,24 @@ test "http frame driver scheduler workload benchmark" {
             std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
             std.debug.print("HTTP_SCHEDULER_BENCH frames={d} ready_peers={} p50_ms={d:.6}\n", .{ count, ready_peers, @as(f64, @floatFromInt(samples[4])) / 1e6 });
         }
+    }
+}
+
+test "http frame driver shared network clients retain sender connection isolation without native pools" {
+    const Unused = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedRequest;
+        }
+    };
+    var network = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(12) });
+    defer network.deinit();
+    var unused: u8 = 0;
+    var driver: HttpFrameDriver = undefined;
+    try driver.initAsyncInPlace(std.testing.allocator, .{ .async_send_worker_count = 2, .isolated_worker_executors = true, .isolated_worker_network_io = network.io() }, .{ .ptr = &unused, .vtable = &.{ .execute = Unused.execute } }, std.testing.io);
+    defer driver.deinit();
+    try std.testing.expectEqual(@as(usize, 2), driver.isolated_executors.len);
+    for (driver.isolated_executors) |*executor| {
+        try std.testing.expect(executor.io_impl == null and executor.io_vtable == null);
+        try std.testing.expectEqual(network.io().userdata, executor.networkIo().userdata);
     }
 }

@@ -190,6 +190,7 @@ pub const KvManager = struct {
             return id;
         }
         const id = try storage.acquire(self.allocator);
+        errdefer _ = storage.releaseRef(self.allocator, id) catch {};
         try sequence_state.block_table.append(self.allocator, id);
         return id;
     }
@@ -992,4 +993,24 @@ test "poolAvailableBlocks reflects target_max_blocks cap" {
 
     manager.setPoolTargetMaxBlocks(pool_id, null);
     try std.testing.expectEqual(@as(?usize, null), manager.poolAvailableBlocks(pool_id));
+}
+
+test "KvManager denied tail table growth returns the acquired block before retry" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    const config: pool_mod.KvPoolConfig = .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 };
+    var runtime = KvManager.init(allocator);
+    defer runtime.deinit();
+    const pool_id = try runtime.addPool(config);
+    const sequence = try runtime.attachSequence(pool_id);
+    const pool = runtime.getPoolMut(pool_id).?;
+    const id = try pool.acquire(allocator);
+    _ = try pool.releaseRef(allocator, id);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, runtime.reserveTailBlock(sequence));
+    try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(id).?.refcount);
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(id, try runtime.reserveTailBlock(sequence));
+    try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(id).?.refcount);
+    try runtime.releaseSequence(sequence);
 }

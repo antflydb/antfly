@@ -279,6 +279,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         break :blk fallback_io.?.io();
     };
 
+    var http_wait: execution_context.HttpWait = .{ .context = execution.requestContext(io) };
     var fallback_http: ?httpx.Client = null;
     defer if (fallback_http) |*client| client.deinit();
     const http = execution.http_client orelse blk: {
@@ -313,7 +314,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         model,
         capability_task,
         routing_headers,
-        execution.waitContext(),
+        execution.waitContextWithControl(http_wait.control()),
     );
     var attachment_transport: inference_work.AttachmentTransport = .base64_payload;
     if (capability_lease.capabilities) |capabilities| {
@@ -369,6 +370,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         header_count += 1;
     }
     var resp = try http.post(url, .{
+        .socket_control = http_wait.control(),
         .json = if (attachment_transport == .segmented_framed_binary) null else body.metadata_or_json,
         .borrowed_body_segments = if (body.envelope) |envelope| envelope.segments else null,
         .headers = header_storage[0..header_count],

@@ -1,0 +1,35 @@
+{
+  "base_commit": "0077c0ead3",
+  "source_sha256": {
+    "zig/lib/linalg/src/pool.zig": "386de03a8e35986eeb2dd545bb4fcd7ed909711b8ebf42c9986ba57f9f82c397",
+    "zig/lib/linalg/src/mod.zig": "9c0dc39ec71458651c58abab1de790b2e5d2cf8d44fe5243e1fe8858a7e364a5",
+    "zig/pkg/inference/src/backends/native.zig": "e595f2e89e4561c4fdfd9028036a24b6770ad9a945f0300214cc6ff20db95199",
+    "zig/pkg/inference/src/backends/openblas.zig": "b88bc54af8627e95ca6ca82a6b554f4dfbe3e0430a4e811cdf2395b5fe4c9f7a"
+  },
+  "native_checks": {
+    "scoped_matrix_and_dispatch_tests": 4,
+    "native_backend_no_system_blas_tests": 1,
+    "native_backend_with_system_blas_tests": 1,
+    "existing_unscoped_matrix_tests": 8
+  },
+  "linux_checks": {
+    "scoped_matrix_and_dispatch_tests": 4,
+    "native_backend_tests": 1,
+    "existing_unscoped_matrix_tests": 8,
+    "complete_pool_and_cpu_budget_tests": 9
+  },
+  "linux_image": "sha256:fb3236b6cc7411028d62f76eb418110a6c34e246b9437a9d093d58a53a3e2954",
+  "linux_target": "aarch64-linux-gnu",
+  "linux_limits": {
+    "cpus": 2,
+    "memory_bytes": 1073741824,
+    "memory_and_swap_bytes": 1073741824
+  },
+  "scope_contract": "Synchronous CPU scopes remain on one OS thread. Child kernels receive one worker; nested scopes cannot increase their allowance. Process capacity is cached independently. No production invocation currently installs this scope.",
+  "pending": [
+    "SQL/inference grant propagation and installation on actual execution workers",
+    "Inference microbatch/broker scheduling and worker-process CPU budgets",
+    "GPU/ONNX/backend teams outside the native kernel path",
+    "Whole API/production integration and automatic sizing/pressure qualification"
+  ]
+}

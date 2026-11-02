@@ -23,6 +23,8 @@ const backup_codec = support.backup_codec;
 
 const Allocator = std.mem.Allocator;
 
+pub const OperationContext = embedded_db.OperationContext;
+
 pub const OpenOptions = struct {
     db: embedded_db.OpenOptions = .{},
     profile: embedded_db.Profile = .native,
@@ -97,18 +99,28 @@ pub const Api = struct {
     }
 
     pub fn batchJson(self: *Api, alloc: Allocator, body: []const u8) ![]u8 {
+        return self.batchJsonWithContext(alloc, body, .{});
+    }
+
+    pub fn batchJsonWithContext(self: *Api, alloc: Allocator, body: []const u8, context: OperationContext) ![]u8 {
+        try context.ensureActive();
         var owned = try batch_api.parseBatchRequest(alloc, body);
         defer owned.deinit(alloc);
 
-        try self.db.batch(owned.req);
+        try self.db.batchWithContext(owned.req, context);
         return try batch_api.encodeBatchResponse(alloc, owned.result());
     }
 
     pub fn lookupJson(self: *Api, alloc: Allocator, key: []const u8, body: []const u8) ![]u8 {
+        return self.lookupJsonWithContext(alloc, key, body, .{});
+    }
+
+    pub fn lookupJsonWithContext(self: *Api, alloc: Allocator, key: []const u8, body: []const u8, context: OperationContext) ![]u8 {
+        try context.ensureActive();
         var opts = try parseLookupRequest(alloc, body);
         defer opts.deinit(alloc);
 
-        var result = (try self.db.lookup(alloc, key, opts.lookup_opts)) orelse {
+        var result = (try self.db.lookupWithContext(alloc, key, opts.lookup_opts, context)) orelse {
             return try alloc.dupe(u8, "{\"found\":false}");
         };
         defer result.deinit(alloc);
@@ -125,10 +137,15 @@ pub const Api = struct {
     }
 
     pub fn scanJson(self: *Api, alloc: Allocator, body: []const u8) ![]u8 {
+        return self.scanJsonWithContext(alloc, body, .{});
+    }
+
+    pub fn scanJsonWithContext(self: *Api, alloc: Allocator, body: []const u8, context: OperationContext) ![]u8 {
+        try context.ensureActive();
         var req = try parseScanRequest(alloc, body);
         defer req.deinit(alloc);
 
-        var result = try self.db.scan(alloc, req.from, req.to, req.scan_opts);
+        var result = try self.db.scanWithContext(alloc, req.from, req.to, req.scan_opts, context);
         defer result.deinit(alloc);
 
         var out = std.ArrayListUnmanaged(u8).empty;
@@ -159,16 +176,24 @@ pub const Api = struct {
     }
 
     pub fn searchJson(self: *Api, alloc: Allocator, body: []const u8) ![]u8 {
+        return self.searchJsonWithContext(alloc, body, .{});
+    }
+
+    pub fn searchJsonWithContext(self: *Api, alloc: Allocator, body: []const u8, context: OperationContext) ![]u8 {
+        try context.ensureActive();
         try query_api.validateStoragePublicQueryRequest(alloc, body);
-        var owned = try query_api.parsePublicQueryRequest(
+        const declared_deadline = try query_contract.queryExecutionDeadlineNsFromBody(alloc, body);
+        const deadline = if (context.deadline_ns) |outer| if (declared_deadline) |inner| @min(outer, inner) else outer else declared_deadline;
+        var owned = try query_contract.parsePublicQueryRequestWithDeadline(
             alloc,
             self.semantic_resolver,
             self.table_name,
             body,
+            deadline,
         );
         defer owned.deinit(alloc);
 
-        var result = try self.db.search(alloc, owned.req);
+        var result = try self.db.searchWithContext(alloc, owned.req, context);
         defer result.deinit();
 
         var response = try query_api.encodeQueryResponses(

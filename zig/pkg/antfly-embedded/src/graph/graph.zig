@@ -7073,6 +7073,13 @@ pub const GraphIndex = struct {
 
     /// Physical counters are upper bounds until ownership cleanup completes.
     /// Status publication never allocates a node set or scans graph topology.
+    pub fn operationalStatsWithAdmission(self: *GraphIndex, io: std.Io, original: @import("../common/read_admission.zig").Port) !OperationalStats {
+        if (self.borrowed_owner) |owner| return owner.operationalStatsWithAdmission(io, original);
+        try @import("../common/cleanup_wait.zig").lockAtomic(&self.ownership_mutex, io, original);
+        defer self.ownership_mutex.unlock();
+        return .{ .edge_count = self.edge_count, .node_count = self.node_count, .counts_pending = self.ownership_fence != null };
+    }
+
     pub fn operationalStats(self: *GraphIndex) OperationalStats {
         if (self.borrowed_owner) |owner| return owner.operationalStats();
         // Sample after acquiring the fence lock so completion cannot clear

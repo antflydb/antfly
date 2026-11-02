@@ -39,7 +39,7 @@ pub const Store = struct {
     fn get(self: Store, a: A, key_name: []const u8) !?Object {
         try self.context.ensureActive();
         var client = self.client;
-        var response = client.getObject(self.bucket, key_name, .{ .cancellation = catalog.types.contextCancellation(&self.context), .max_response_bytes = 12 * 1024 * 1024 }) catch |err| switch (err) {
+        var response = self.context.objectCall(objectstore.Client.getObject, .{ &client, self.bucket, key_name, objectstore.GetOptions{ .cancellation = catalog.types.providerCancellation(&self.context), .max_response_bytes = 12 * 1024 * 1024 } }, client.allocator) catch |err| switch (err) {
             error.NotFound, error.ObjectNotFound, error.FileNotFound => return null,
             else => return err,
         };

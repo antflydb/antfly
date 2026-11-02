@@ -18,8 +18,11 @@ const std = @import("std");
 pub const sql_max_request_body_bytes: usize = 4 << 20;
 
 /// Transport admission shared by native and linked-kernel registrars. Resolve
-/// before buffering so a SQL request cannot consume the much larger batch cap.
-pub fn publicPostBodyLimit(path: []const u8) ?usize {
+/// before buffering so fixed control bodies and SQL cannot consume batch caps.
+pub fn postBodyLimit(path: []const u8) ?usize {
+    const internal = @import("../internal/routes.zig");
+    if (std.mem.eql(u8, path, internal.remote_attempt_capabilities)) return 32;
+    if (std.mem.eql(u8, path, internal.remote_attempt_status) or std.mem.eql(u8, path, internal.remote_attempt_cancel) or std.mem.eql(u8, path, internal.remote_attempt_fence)) return 2;
     return if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) sql_max_request_body_bytes else null;
 }
 

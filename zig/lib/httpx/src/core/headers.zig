@@ -253,6 +253,7 @@ pub const Headers = struct {
     /// Creates a deep copy of the headers.
     pub fn clone(self: *const Self, allocator: Allocator) !Headers {
         var new_headers = Headers.init(allocator);
+        errdefer new_headers.deinit();
         for (self.entries.items) |entry| {
             try new_headers.append(entry.name, entry.value);
         }
