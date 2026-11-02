@@ -199,3 +199,128 @@ test "read demand preserves correlated bindings across optional pattern constrai
     try expectNames(&.{"score"}, demand.table("docs").?.nodes.fields.?);
     try expectNames(&.{}, demand.table("categories").?.nodes.fields.?);
 }
+
+test "read demand scopes list locals while retaining their outer inputs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "MATCH(d:D) RETURN [d IN [1,2] | d]",
+        "MATCH(d:D) RETURN [d IN [{payload:{rank:7}}] | d.payload.rank]",
+        "MATCH(d:D) RETURN all(d IN [1,2] WHERE d>0)",
+        "MATCH(d:D) RETURN reduce(d=0,x IN [1,2] | d+x)",
+        "MATCH(d:D) RETURN reduce(x=0,d IN [1,2] | x+d)",
+        "MATCH(d:D) RETURN [d IN [1] | [d IN [2] | d]]",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand;
+        try expectNames(&.{}, demand.table("docs").?.nodes.fields.?);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D) RETURN [d IN d.items | d]",
+        "MATCH(d:D) RETURN all(d IN d.items WHERE d>0)",
+        "MATCH(d:D) RETURN reduce(d=d.items,x IN [1] | d)",
+        "MATCH(d:D) RETURN [d IN [1] | d],d.items",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand;
+        try expectNames(&.{"items"}, demand.table("docs").?.nodes.fields.?);
+    }
+}
+
+test "read demand propagates property lineage through WITH and upgrades observers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "MATCH(d:D) WITH d.payload AS p RETURN sum(p.rank)",
+        "MATCH(d:D) WITH d.payload AS p WITH p AS q RETURN sum(q.rank)",
+        "MATCH(d:D) WITH d.payload AS p WITH p.child AS q RETURN sum(q.rank)",
+        "MATCH(d:D) WITH d.payload AS p RETURN p.rank IS NULL",
+        "MATCH(d:D) WITH d.payload AS p WITH * RETURN p.rank",
+    }, 0..) |query, i| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try expectNames(&.{"payload"}, demand.fields.?);
+        const tree = demand.projection[0];
+        try std.testing.expect(tree.mode == .children);
+        const leaf = if (i == 2) tree.children[0].children[0] else tree.children[0];
+        try std.testing.expectEqualStrings("rank", leaf.name);
+        try std.testing.expect(if (i == 3) leaf.mode == .presence else leaf.mode == .value);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D) WITH d.payload AS p RETURN p,p.rank",
+        "MATCH(d:D) WITH DISTINCT d.payload AS p RETURN p.rank",
+        "MATCH(d:D) WITH d.payload AS p,count(*) AS c RETURN p.rank,c",
+        "MATCH(d:D) WITH d.payload AS p RETURN p.rank ORDER BY p",
+        "MATCH(d:D) WITH d.payload AS p RETURN *",
+        "MATCH(d:D) WITH d.payload AS p RETURN 1",
+        "MATCH(d:D) WITH d.payload AS p RETURN size(p)",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try expectNames(&.{"payload"}, demand.fields.?);
+        try std.testing.expectEqual(@as(usize, 0), demand.projection.len);
+    }
+}
+
+test "read demand infers endpoint domains without narrowing correlated optional bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const mapped: root.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{
+        .{ .name = "D", .table = "docs" }, .{ .name = "C", .table = "categories" }, .{ .name = "X", .table = "other" },
+    }, .relationships = &.{
+        .{ .name = "R", .stored_type = "r", .index = "links", .source_label = "D", .target_label = "C" },
+        .{ .name = "S", .stored_type = "s", .index = "links", .source_label = "C", .target_label = "X" },
+    } };
+    for ([_][]const u8{
+        "MATCH(d:D)-[:R]->(c) RETURN c,sum(d.score)",
+        "MATCH(c)<-[:R]-(d:D) RETURN c,sum(d.score)",
+        "MATCH(d:D)-[:R*1..3]->(c) RETURN c,sum(d.score)",
+        "MATCH(d:D)-[:R]->(c)-[:S]->(x:X) RETURN c,sum(d.score)",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, mapped)).demand;
+        try expectNames(&.{"score"}, demand.table("docs").?.nodes.fields.?);
+        try std.testing.expect(demand.table("categories").?.nodes.fields == null);
+        try expectNames(&.{}, demand.table("other").?.nodes.fields.?);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D)-[:R*0..1]->(c) RETURN c",
+        "MATCH(d:D)-[:R]-(c) RETURN c",
+        "MATCH(c:D) OPTIONAL MATCH(d:D)-[:R]->(c) RETURN c",
+        "MATCH(c) OPTIONAL MATCH(d:D)-[:R]->(c) RETURN c",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, mapped)).demand;
+        try std.testing.expect(demand.table("docs").?.nodes.fields == null);
+    }
+}
+
+test "read demand forwards relationship property aliases without widening node fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(a, "MATCH(d:D)-[r:R]->(e:D) WITH r.payload AS p RETURN sum(p.rank)", .{}, &diagnostic);
+    defer compiled.deinit();
+    const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand;
+    try expectNames(&.{}, demand.table("docs").?.nodes.fields.?);
+    try expectNames(&.{"payload"}, demand.relationships.fields.?);
+    const tree = demand.relationships.projection[0];
+    try std.testing.expect(tree.mode == .children);
+    try std.testing.expectEqualStrings("rank", tree.children[0].name);
+}

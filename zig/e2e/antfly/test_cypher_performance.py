@@ -2336,6 +2336,11 @@ def test_authenticated_cypher_nested_and_table_demand(relational, monkeypatch):
                     expected_present,
                 ),
                 ("MATCH(d:D) WITH d AS x RETURN sum(x.payload.rank)", expected_sum),
+                ("MATCH(d:D) WITH d.payload AS p RETURN sum(p.rank)", expected_sum),
+                (
+                    "MATCH(d:D) WITH d.payload AS p WITH p AS q RETURN sum(q.rank)",
+                    expected_sum,
+                ),
             ):
                 result = query(statement, session=session)
                 assert result["rows"] == [[integer(expected)]], result
@@ -2430,18 +2435,22 @@ def test_authenticated_cypher_nested_and_table_demand(relational, monkeypatch):
             },
         )
         for key in ("d4", "d5"):
-            invalid = admin.post(
-                base + f"/graphs/{name}/query",
-                json={
-                    "query": f"MATCH(d:D) WHERE antfly.documentKey(d)='{key}' RETURN d.payload.rank",
-                    "limits": {"memory_bytes": 1 << 20},
-                },
-                timeout=45,
-            )
-            assert (
-                invalid.status_code == 400
-                and invalid.json().get("code") == "CypherTypeMismatch"
-            ), invalid.text
+            for projection in (
+                "RETURN d.payload.rank",
+                "WITH d.payload AS p RETURN p.rank",
+            ):
+                invalid = admin.post(
+                    base + f"/graphs/{name}/query",
+                    json={
+                        "query": f"MATCH(d:D) WHERE antfly.documentKey(d)='{key}' {projection}",
+                        "limits": {"memory_bytes": 1 << 20},
+                    },
+                    timeout=45,
+                )
+                assert (
+                    invalid.status_code == 400
+                    and invalid.json().get("code") == "CypherTypeMismatch"
+                ), invalid.text
         result = query(
             "MATCH(d:D) WHERE antfly.documentKey(d) IN ['d4','d5'] RETURN d.id,d.payload,d.payload IS NULL ORDER BY d.id"
         )
@@ -2460,4 +2469,186 @@ def test_authenticated_cypher_nested_and_table_demand(relational, monkeypatch):
     finally:
         reader.close()
         admin.close()
+        server.stop()
+
+
+def test_authenticated_cypher_lineage_scopes_and_endpoint_domains(monkeypatch):
+    """WITH and local names preserve narrow reads; mappings constrain endpoints."""
+    write_config = conftest._write_remote_content_e2e_config
+
+    def with_graph_work_budget(*args, **kwargs):
+        path = write_config(*args, **kwargs)
+        config = json.loads(path.read_text())
+        config.setdefault("resources", {}).setdefault("query", {}).setdefault(
+            "request_limits", {}
+        )["graph"] = {"max_intermediate_states": 1000000}
+        path.write_text(json.dumps(config))
+        return path
+
+    monkeypatch.setattr(
+        conftest, "_write_remote_content_e2e_config", with_graph_work_budget
+    )
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port(), pgwire=True)
+    session = requests.Session()
+    session.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+    base = server.api_url.rstrip("/")
+    name = "cypher_lineage_" + uuid.uuid4().hex
+
+    def call(path, body=None, method="POST"):
+        response = session.request(method, base + path, json=body, timeout=45)
+        assert response.status_code in (200, 201, 202), (
+            response.status_code,
+            response.text,
+        )
+        return response.json()
+
+    def query(statement, memory=1 << 20):
+        result = call(
+            f"/graphs/{name}/query",
+            {
+                "query": statement,
+                "limits": {
+                    "memory_bytes": memory,
+                    "intermediate_states": 1000000,
+                },
+            },
+        )
+        assert result["stats"]["memory_bytes"] < memory, result
+        print(json.dumps({"lineage_query": statement, "stats": result["stats"]}))
+        return result
+
+    def integer(n):
+        return {"type": "integer", "value": str(n)}
+
+    try:
+        call(
+            f"/tables/{name}",
+            {
+                "num_shards": 1,
+                "indexes": {
+                    "links": {"type": "graph", "edge_types": [{"name": "link"}]},
+                },
+            },
+        )
+        call(f"/tables/{name}_c", {"num_shards": 1})
+        deadline = time.monotonic() + 60
+        while True:
+            index = call(f"/tables/{name}/indexes/links", method="GET")
+            ready = index.get("status", {}).get("milestones", {}).get("complete", {})
+            if ready.get("reached") and not ready.get("blockers"):
+                break
+            assert time.monotonic() < deadline, index
+            time.sleep(0.1)
+        call(
+            f"/tables/{name}/batch",
+            {"inserts": {"d1": {"score": 7}}, "sync_level": "full_index"},
+        )
+        call(
+            f"/tables/{name}_c/batch",
+            {"inserts": {"c1": {"id": "c1"}}, "sync_level": "full_index"},
+        )
+        call(
+            f"/graphs/{name}",
+            {
+                "labels": [
+                    {"name": "D", "table": name},
+                    {"name": "C", "table": name + "_c"},
+                ],
+                "relationships": [
+                    {
+                        "name": "R",
+                        "stored_type": "link",
+                        "index": "links",
+                        "source_label": "D",
+                        "target_label": "C",
+                    }
+                ],
+            },
+        )
+        call(
+            f"/graphs/{name}/query",
+            {
+                "query": "MATCH(d:D),(c:C) CREATE(d)-[:R]->(c) RETURN 1",
+                "write_request_id": uuid.uuid4().hex,
+            },
+        )
+        wide = "x" * (2 << 20)
+        call(
+            f"/tables/{name}/batch",
+            {
+                "inserts": {
+                    "d1": {
+                        "score": 7,
+                        "body": wide,
+                        "payload": {"rank": 7, "body": wide},
+                    }
+                },
+                "sync_level": "full_index",
+            },
+        )
+        for statement in (
+            "MATCH(d:D) WITH d.payload AS p RETURN sum(p.rank)",
+            "MATCH(d:D) WITH d.payload AS p WITH p AS q RETURN sum(q.rank)",
+        ):
+            assert query(statement)["rows"] == [[integer(7)]]
+        for statement in (
+            "MATCH(d:D)-[:R]->(c) RETURN c,sum(d.score)",
+            "MATCH(c)<-[:R]-(d:D) RETURN c,sum(d.score)",
+        ):
+            result = query(statement)
+            assert len(result["rows"]) == 1, result
+            assert result["rows"][0][1] == integer(7), result
+            assert (
+                result["rows"][0][0]["value"]["properties"]["value"]["id"]["value"]
+                == "c1"
+            ), result
+        for local in ("x", "d"):
+            assert query(f"MATCH(d:D) RETURN [{local} IN [1,2] | {local}]")["rows"] == [
+                [
+                    {
+                        "type": "list",
+                        "value": [integer(1), integer(2)],
+                    }
+                ]
+            ]
+        # A full ancestor still upgrades every partial alias observer.
+        result = query("MATCH(d:D) WITH d.payload AS p RETURN p,p.rank", 64 << 20)
+        assert result["rows"][0][0]["value"]["body"]["value"] == wide, result
+        assert result["rows"][0][1] == integer(7), result
+        # Unused document values outside the Cypher integer range must never
+        # be evaluated because a lexical local happens to share their name.
+        call(
+            f"/tables/{name}/batch",
+            {
+                "inserts": {
+                    "d1": {
+                        "payload": {"rank": 9223372036854775808},
+                    }
+                },
+                "sync_level": "full_index",
+            },
+        )
+        for local in ("x", "d"):
+            result = query(
+                f"MATCH(d:D) RETURN [{local} IN [{{payload:{{rank:7}}}}] | {local}.payload.rank]"
+            )
+            assert result["rows"] == [[{"type": "list", "value": [integer(7)]}]], result
+        assert query("MATCH(d:D) RETURN all(d IN [1,2] WHERE d>0)")["rows"] == [
+            [
+                {
+                    "type": "boolean",
+                    "value": True,
+                }
+            ]
+        ]
+        for statement in (
+            "MATCH(d:D) RETURN reduce(d=0,x IN [1,2] | d+x)",
+            "MATCH(d:D) RETURN reduce(x=0,d IN [1,2] | x+d)",
+        ):
+            assert query(statement)["rows"] == [[integer(3)]]
+    finally:
+        session.close()
         server.stop()

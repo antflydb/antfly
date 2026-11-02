@@ -5358,3 +5358,63 @@ and retained-read tests pass 21 cases; the independently compiled retained-read
 fork test also passes. Publication-less primary/index/artifact writes remain
 rejected while bounded allocator service can safely rebase under its writer
 fence.
+
+### Scoped container lineage and relationship endpoint domains
+
+Read demand now follows static property lineage through non-grouping `WITH`
+projections. `WITH d.payload AS p RETURN SUM(p.rank)` selects the same nested
+storage cell as `SUM(d.payload.rank)`, including chained aliases and relationship
+properties. Returning the parent, grouping it, applying `DISTINCT`, ordering by
+its complete value, or passing it to an opaque consumer upgrades that lineage to
+a complete value. Unused forwarding expressions retain their ordinary eager
+validation. These are private read carriers; public JSON and Cypher values do
+not change.
+
+List comprehensions, list predicates, reductions, and private collection filters
+own lexical scopes. Their inputs and reduction initializers resolve in the outer
+scope; local variables mask entity and property aliases only inside their
+bodies. Consequently alpha-renaming a local cannot load an unrelated outer
+entity, spend its memory budget, or raise numeric errors from an unused stored
+property. Scope restoration preserves later uses of the outer alias.
+
+New unlabeled node bindings derive physical table domains from adjacent catalog
+relationship mappings. Direction and type alternatives select endpoint tables;
+undirected traversal unions both ends. Positive variable lengths retain all
+possible terminal mapping tables; zero-hop alternatives also retain the opposite
+node's domain. Adjacent constraints intersect only for new bindings. Existing
+bindings keep their incoming domain across optional-match failure. Only the two
+adjacent edges are examined per node, avoiding quadratic path analysis. Complete
+returned paths still include mapped intermediate node tables.
+
+The authenticated regression fixture stores an unused 2 MiB root string and a
+2 MiB nested sibling. Forwarded-property reductions, inferred relationship
+endpoints, and shadowed comprehension locals must complete under 1 MiB. Separate
+controls return the complete ancestor and preserve scalar-ancestor type errors.
+The document and relational campaigns also exercise property aliases under
+administrator and row-filtered reader credentials.
+
+This update merges `origin/main` at `70fb539fee` as `9e9b31ec1c`, retains main's
+SQL recovery reentrancy guard alongside graph commit proofs, and regenerates the
+Go client's embedded OpenAPI schema from the merged contract. Runtime error
+details retain main's published prefix; graph-only details follow that prefix.
+
+Final CPU Debug measurements for the one-document fixture:
+
+| Query shape | Review memory bytes | Fixed memory bytes | Fixed work |
+| --- | ---: | ---: | ---: |
+| `WITH d.payload AS p RETURN SUM(p.rank)` | 22,995,290 | 83,530 | 24 |
+| Return inferred `c` with `SUM(d.score)` | 46,468,316 | 88,656 | 36 |
+| `[d IN [1,2] \| d]` shadowing outer `d` | 46,465,636 | 43,600 | 35 |
+
+Renamed and shadowed locals now report identical memory and work. Both nested
+local variants return `[7]` when the unused stored rank is outside signed 64-bit
+range. Returning the actual complete 2 MiB ancestor still reports 22,993,810
+bytes and preserves its full value. These are allocation/work measurements,
+without latency claims.
+
+Qualification passes all 552 core tests with optimized code and safety checks,
+14 focused Debug tests, 44 direct runtime-error ABI tests, the runtime transport /
+embedded / projection boundary checks, both final native builds, and all eight
+authenticated performance campaigns on the final Debug binary. Python formatting,
+lint, SDK-generator tests, and whitespace checks pass. Repository cache cleanup
+runs after the build session and preserves recent or active output.

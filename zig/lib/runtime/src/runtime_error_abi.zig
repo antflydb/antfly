@@ -3454,6 +3454,9 @@ test "merged runtime error details preserve the common prefix under ABI two" {
     try std.testing.expectEqual(@as(c_int, 832), @backingInt(Detail.invalid_connection_credentials));
     try std.testing.expectEqual(@as(c_int, 833), @backingInt(Detail.pioneer_credential_missing));
     try std.testing.expectEqual(@as(c_int, 835), @backingInt(Detail.unsupported_pioneer_input));
+    try std.testing.expectEqual(@as(c_int, 836), @backingInt(Detail.standalone_replication_sources_unsupported));
+    try std.testing.expectEqual(@as(c_int, 837), @backingInt(Detail.ha_catalog_replication_sources_unsupported));
+    try std.testing.expectEqual(@as(c_int, 838), @backingInt(Detail.embed_admission_refused));
     try std.testing.expectEqual(@as(c_int, 839), @backingInt(Detail.cypher_aggregate_scope));
 }
 
