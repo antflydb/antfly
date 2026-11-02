@@ -209,14 +209,14 @@ class CatalogAccounting:
             not value_length or not struct.unpack_from("<Q", payload, end)[0]
         ):
             raise ValueError("invalid external document value")
-        return previous, payload[header:end], value_length, bool(flags & 1)
+        return previous, payload[header:end], value_length, bool(flags & 1), header
 
     def documents(self):
         if self.slot[7]:
             for reference in self.references(self.slot[7]):
-                _, key, length, deleted = self.document(reference)
+                _, key, length, deleted, header = self.document(reference)
                 if not deleted:
-                    yield key, length
+                    yield key, length, header
             return
         reference = self.slot[2]
         seen_records, seen_keys = set(), set()
@@ -224,11 +224,11 @@ class CatalogAccounting:
             if reference in seen_records:
                 raise ValueError("document history cycle")
             seen_records.add(reference)
-            reference, key, length, deleted = self.document(reference)
+            reference, key, length, deleted, header = self.document(reference)
             if key not in seen_keys:
                 seen_keys.add(key)
                 if not deleted:
-                    yield key, length
+                    yield key, length, header
 
     def account(self, include_documents: bool = False):
         result = {
@@ -252,6 +252,7 @@ class CatalogAccounting:
                 sizes[str(max(0, length.bit_length() - 1))] += 1
                 digest.update(struct.pack("<QQ", len(key), length))
                 digest.update(key)
+            row["record_header_bytes"] = row["records"] * 16
             row["value_size_log2_histogram"] = dict(
                 sorted(sizes.items(), key=lambda item: int(item[0]))
             )
@@ -259,13 +260,19 @@ class CatalogAccounting:
             result[label] = row
         if include_documents:
             for label in ("documents", "control_documents"):
-                result[label] = {"records": 0, "key_bytes": 0, "value_bytes": 0}
-            for key, length in self.documents():
+                result[label] = {
+                    "records": 0,
+                    "key_bytes": 0,
+                    "value_bytes": 0,
+                    "record_header_bytes": 0,
+                }
+            for key, length, header in self.documents():
                 label = "control_documents" if is_control_record(key) else "documents"
                 row = result[label]
                 row["records"] += 1
                 row["key_bytes"] += len(key)
                 row["value_bytes"] += length
+                row["record_header_bytes"] += header
             categories = (
                 "documents",
                 "control_documents",

@@ -1288,7 +1288,9 @@ their existing retry behavior. SQL retains its committed-pending outcome.
 Native revision-7 background turns separate source-derived replay from immutable
 artifact maintenance. After the replay window and its source-dependent lifecycle
 work, the owner releases its primary snapshot before running at most one text
-merge and one index LSM maintenance step. Immutable inputs retain their own range
+merge and draining LSM maintenance of the captured index inputs. LSM
+continuations finish before their runtime closes, without chasing new primary
+writes; cancellation is checked between maintenance steps. Immutable inputs retain their own range
 leases. Artifact catalog reads first acquire short owner/path admission, validate
 the namespace and logical index identity, refresh the checkpoint, and register a
 read pin before releasing admission. They never traverse an old catalog root

@@ -4518,7 +4518,7 @@ test "capi native artifact maintenance releases primary history before merging" 
         fn capture(ptr: *anyopaque, root: *h.Handle) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.root = root;
-            root.db.core.index_manager.test_before_text_merge_step = .{ .ptr = self, .notify = merge };
+            @import("../storage/db/catalog/index_manager.zig").test_before_text_merge_step = .{ .manager = root.db.core.index_manager, .ptr = self, .notify = merge };
         }
         fn merge(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -4567,6 +4567,7 @@ test "capi native artifact maintenance releases primary history before merging" 
         }
     };
     var probe: Probe = .{};
+    defer @import("../storage/db/catalog/index_manager.zig").test_before_text_merge_step = null;
     owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.capture };
     defer owner.test_after_capture = null;
     for (0..8) |_| {

@@ -34179,10 +34179,21 @@ pub const DB = struct {
                 break :blk try self.core.index_manager.runTextMergeScheduler(1);
             };
             try ensureSnapshotActive(cancellation);
-            // Obsolete-file deadlines can be due even with a zero merge
-            // score. Preserve reclamation priority without an idle drain.
-            const lsm = if (try self.core.index_manager.runLsmObsoleteReclaimDue()) true else try self.core.index_manager.runLsmMaintenanceStep();
-            return merged != 0 or lsm;
+            // Finish maintenance of these fixed captured index inputs before
+            // closing their runtime. Dropping it after one slice discards LSM
+            // continuations. This drain retains no primary history and cannot
+            // chase peer primary writes; changed index inputs refuse admission.
+            while (true) {
+                try ensureSnapshotActive(cancellation);
+                const progressed = if (try self.core.index_manager.runLsmObsoleteReclaimDue()) true else try self.core.index_manager.runLsmMaintenanceStep();
+                if (!progressed) break;
+            }
+            // Reclamation can finish during the backend unlock. Report debt,
+            // not completed work, and clear hints left by that final slice.
+            // Otherwise each fresh runtime's local cleanup schedules another
+            // replay turn even though its durable inputs are already settled.
+            self.core.index_manager.refreshLsmMaintenanceDebtHint();
+            return merged != 0 or self.core.index_manager.lsmMaintenanceScore() != 0;
         }
         if (phase == .shadow) {
             if (self.hasConfiguredResolvers()) {
@@ -34201,6 +34212,9 @@ pub const DB = struct {
             .max_windows_per_index = 1,
         });
         const finalized = try self.finalizeDenseProjectionLifecycleForIdle();
+        // Primary LSM/source maintenance still belongs to the source phase.
+        // Deferring only index work must not strand this lane at idle.
+        if (phase == .replay) _ = try self.runPrimaryLsmMaintenanceStep();
         return finalized or self.core.nextDerivedSequence() > before or self.executor.snapshotStats().workers_with_replay_debt != 0 or
             self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
     }
