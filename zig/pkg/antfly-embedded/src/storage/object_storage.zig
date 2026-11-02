@@ -18,6 +18,8 @@ const objectstore = @import("objectstore");
 
 const Allocator = std.mem.Allocator;
 
+pub const transactional_store = objectstore.transactional_store;
+pub const immutable_log = objectstore.immutable_log;
 pub const ObjectStorage = objectstore.Client;
 pub const ObjectMetadata = objectstore.ObjectMetadata;
 pub const ObjectChecksum = objectstore.ObjectChecksum;

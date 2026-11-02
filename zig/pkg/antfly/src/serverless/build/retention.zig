@@ -1278,9 +1278,9 @@ test "serverless retention pruner retains recent manifests and truncates WAL his
     defer build_first.deinit(alloc);
     var manifest_first = try manifest_store.getAlloc("docs", 1);
     defer manifest_first.deinit(alloc);
-    const first_artifact_a = try alloc.dupe(u8, manifest_first.artifacts[0].artifact_id);
+    const first_artifact_a = try alloc.dupe(u8, manifest_first.artifacts[@import("builder.zig").findArtifactIndex(manifest_first, .mutation_segment).?].artifact_id);
     defer alloc.free(first_artifact_a);
-    const first_artifact_b = try alloc.dupe(u8, manifest_first.artifacts[1].artifact_id);
+    const first_artifact_b = try alloc.dupe(u8, manifest_first.artifacts[@import("builder.zig").findArtifactIndex(manifest_first, .document_segment).?].artifact_id);
     defer alloc.free(first_artifact_b);
 
     const second = [_]@import("../api/types.zig").DocumentMutation{
@@ -1327,7 +1327,9 @@ test "serverless retention pruner retains recent manifests and truncates WAL his
     try std.testing.expectEqual(@as(u64, 3), wal_records[0].lsn);
 
     try std.testing.expectError(error.FileNotFound, artifact_store.getAlloc(first_artifact_a));
-    try std.testing.expectError(error.FileNotFound, artifact_store.getAlloc(first_artifact_b));
+    // Later generations still reference the reused packed body cache.
+    const retained_snapshot = try artifact_store.getAlloc(first_artifact_b);
+    defer alloc.free(retained_snapshot);
 }
 
 test "serverless retention concurrent pruners observe gc watermark conflict" {
