@@ -52,6 +52,7 @@ pub const quant_recipe = @import("quant_recipe.zig");
 pub const quant_kernel_metal_renderer = @import("quant_kernel_metal_renderer.zig");
 pub const model_runtime = @import("model_runtime.zig");
 pub const decode_state_runtime = @import("decode_state_runtime.zig");
+pub const decode_batch = @import("decode_batch.zig");
 pub const live_model_executor = @import("live_model_executor.zig");
 pub const metal_command_planner = if (build_options.enable_metal) @import("metal_command_planner.zig") else struct {};
 pub const metal_executor = if (build_options.enable_metal) @import("metal_executor.zig") else struct {
@@ -165,6 +166,7 @@ test {
     _ = quant_recipe;
     _ = model_runtime;
     _ = decode_state_runtime;
+    _ = decode_batch;
     _ = live_model_executor;
     if (build_options.enable_metal) {
         _ = metal_command_planner;

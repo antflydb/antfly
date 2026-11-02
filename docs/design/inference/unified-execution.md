@@ -126,6 +126,10 @@ preparation API do not by themselves complete these remaining requirements:
 - Resident stage contracts, exact typed transfers and strict readback auditing
   are implemented. Migrating every task to resident stage chaining and moving
   all KV/recurrent execution choices behind runtime owners remains incremental.
+  `graph/decode_batch.zig` now owns uniform, mixed prefill/decode and packed
+  batch metadata assembly, including per-sequence physical KV views, recurrent
+  caches and position ownership. Generation retains compatibility exports and
+  supplies typed state/geometry; batch layout does not depend on a task pipeline.
 - `execution/testing/model_formats.zig` compares deterministic one-layer BERT
   and sliding-window decoder graphs loaded through real ONNX, safetensors and
   GGUF parsers. Deliberately lossy Q8_0 weights use an independently rounded CPU
