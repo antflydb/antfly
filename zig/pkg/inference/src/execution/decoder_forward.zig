@@ -24,6 +24,7 @@ const gpt_arch = @import("../architectures/gpt.zig");
 const graph_mod = @import("../graph/root.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
+const BorrowedDecodeStateRuntime = graph_mod.decode_state_runtime.BorrowedDecodeStateRuntime;
 const NativeDecodeState = @import("../graph/decode_state_runtime.zig").NativeDecodeState;
 const runWithDecoderRuntimeResetBoundary = graph_mod.decoder_step_executor.runWithDecoderRuntimeResetBoundary;
 
@@ -91,6 +92,339 @@ pub const Runtime = struct {
     graph_cache: ?*graph_mod.cache.GraphCache = null,
     io: ?std.Io = null,
     replay_fallbacks: ?*u64 = null,
+
+    pub const MtpMaterializedDeviceActivation = struct {
+        activation: ?ops.CT,
+        next_target_choice: ?u32 = null,
+    };
+
+    pub const MtpMaterializedHostActivation = struct {
+        activation: []f32,
+        next_target_choice: ?u32 = null,
+    };
+
+    pub fn materializeAcceptedTokenKv(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_state: *NativeDecodeState,
+    ) !void {
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        if (decode_state.requiresFullRecompute()) {
+            _ = try decode_runtime.appendGeneratedToken();
+            return;
+        }
+        // Run a forward pass to populate the KV cache for the correction/bonus
+        // token. Paged CUDA writes the KV suffix at decode_context.kv_sequence_len,
+        // so advance first; otherwise the device KV layer stays one token short.
+        _ = try decode_runtime.appendGeneratedToken();
+        errdefer decode_runtime.truncateGeneratedTokens(1) catch {};
+        const decode_context = decode_runtime.makeDecodeContext(total_seq_len, 1);
+        const logits = try self.forwardAllLogits(
+            token_ids[total_seq_len - 1 .. total_seq_len],
+            1,
+            total_seq_len,
+            &decode_context,
+        );
+        self.context.allocator.free(logits);
+    }
+
+    pub fn greedyTargetChoiceFromFinalHiddenDevice(
+        self: *Runtime,
+        final_hidden: ops.CT,
+    ) !?u32 {
+        const lm_w = try self.context.graphWeight("lm_head.weight");
+        defer self.context.cb.free(lm_w);
+        const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
+        const vocab_size: usize = @intCast(self.context.gpt_config.*.vocab_size);
+        const suppress_token_ids = self.context.gpt_config.*.suppressTokenIds();
+        if (suppress_token_ids.len == 0) {
+            if (try self.context.cb.linearNoBiasArgmaxLastRow(
+                final_hidden,
+                lm_w,
+                1,
+                hidden_size,
+                vocab_size,
+            )) |token| {
+                return token;
+            }
+        }
+        if (try self.context.cb.linearNoBiasArgmaxRowsSuppress(
+            final_hidden,
+            lm_w,
+            1,
+            hidden_size,
+            vocab_size,
+            suppress_token_ids,
+            self.context.allocator,
+        )) |choices| {
+            defer self.context.allocator.free(choices);
+            if (choices.len == 0) return error.InvalidModelOutput;
+            return choices[0];
+        }
+        return null;
+    }
+
+    pub fn materializeMtpCanonicalHidden(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: HiddenSource,
+    ) !ForwardHiddenDevice {
+        if (total_seq_len == 0 or token_ids.len < total_seq_len) return error.InvalidTensorShape;
+        if (try self.materializeAcceptedTokenKvActiveHiddenForMtp(token_ids, total_seq_len, decode_context, hidden_source)) |result| return result;
+        return self.forwardTargetHiddenDeviceNoReplay(token_ids[total_seq_len - 1 .. total_seq_len], 1, total_seq_len, decode_context, hidden_source);
+    }
+
+    pub fn materializeAcceptedTokenKvActiveHiddenForMtp(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: HiddenSource,
+    ) !?ForwardHiddenDevice {
+        if (!activeMaterializationEnabled()) return null;
+        if (hidden_source != .final) return null;
+        if (self.context.cb.kind() != .metal) return null;
+        if (!activeMaterializationSupported(self.context.cb.kind(), self.context.gpt_config.*, total_seq_len) and
+            !getenvBool("ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME")) return null;
+        if (total_seq_len == 0 or token_ids.len < total_seq_len) return error.InvalidTensorShape;
+        var result = (try decoder_gated_runtime.forwardGreedyTokenAndFinalHidden(
+            self.context.cb,
+            self.context.allocator,
+            self.context.gpt_config.*,
+            self.context.gpt_config.*.num_hidden_layers,
+            token_ids[total_seq_len - 1],
+            total_seq_len,
+            decode_context,
+        )) orelse return null;
+        errdefer result.deinit(self.context.cb);
+        var greedy_token_id: ?u32 = null;
+        if (result.token_id >= 0 and result.token_id <= std.math.maxInt(u32)) {
+            const raw_token: u32 = @intCast(result.token_id);
+            if (!isSuppressedToken(raw_token, self.context.gpt_config.*.suppressTokenIds())) {
+                greedy_token_id = raw_token;
+            }
+        }
+        return .{
+            .cb = self.context.cb,
+            .hidden = result.final_hidden,
+            .pre_norm_hidden = null,
+            .rows = 1,
+            .greedy_token_id = greedy_token_id,
+        };
+    }
+
+    pub fn materializeAcceptedTokenKvForMtp(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_state: *NativeDecodeState,
+        hidden_source: HiddenSource,
+    ) !?u32 {
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        if (decode_state.requiresFullRecompute()) {
+            _ = try decode_runtime.appendGeneratedToken();
+            return null;
+        }
+        _ = try decode_runtime.appendGeneratedToken();
+        errdefer decode_runtime.truncateGeneratedTokens(1) catch {};
+        const decode_context = decode_runtime.makeDecodeContext(total_seq_len, 1);
+        if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY", false) and
+            activeMaterializationEnabled() and hidden_source == .final and self.context.cb.kind() == .metal and
+            (activeMaterializationSupported(self.context.cb.kind(), self.context.gpt_config.*, total_seq_len) or getenvBool("ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME")))
+        {
+            if (try decoder_gated_runtime.forwardGreedyTokenPreparedOnly(self.context.cb, self.context.allocator, self.context.gpt_config.*, self.context.gpt_config.*.num_hidden_layers, token_ids[total_seq_len - 1], total_seq_len, &decode_context)) |choice| {
+                if (choice < 0 or choice >= self.context.gpt_config.*.vocab_size) return error.InvalidModelOutput;
+                const token: u32 = @intCast(choice);
+                if (isSuppressedToken(token, self.context.gpt_config.*.suppressTokenIds())) return error.InvalidModelOutput;
+                return token;
+            }
+        }
+
+        if (try self.materializeAcceptedTokenKvActiveHiddenForMtp(
+            token_ids,
+            total_seq_len,
+            &decode_context,
+            hidden_source,
+        )) |active_result| {
+            var result = active_result;
+            defer result.deinit();
+            return result.greedy_token_id orelse try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden);
+        }
+        if (hiddenOnlyMaterializationEnabled()) {
+            var result = if (materializationReplayEnabled())
+                try self.forwardTargetHiddenDevice(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                    "gpt.mtp_materialize_choice_hidden",
+                )
+            else
+                try self.forwardTargetHiddenDeviceNoReplay(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                );
+            defer result.deinit();
+            return try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden);
+        }
+        var result = try self.forwardAllLogitsAndHiddenDevice(
+            token_ids[total_seq_len - 1 .. total_seq_len],
+            1,
+            total_seq_len,
+            &decode_context,
+        );
+        defer result.deinit();
+        return try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden);
+    }
+
+    pub fn materializeAcceptedTokenKvAndReturnHidden(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_state: *NativeDecodeState,
+        hidden_source: HiddenSource,
+    ) !MtpMaterializedHostActivation {
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        if (decode_state.requiresFullRecompute()) return error.MissingMaterializedHiddenState;
+        _ = try decode_runtime.appendGeneratedToken();
+        errdefer decode_runtime.truncateGeneratedTokens(1) catch {};
+        const decode_context = decode_runtime.makeDecodeContext(total_seq_len, 1);
+        if (try self.materializeAcceptedTokenKvActiveHiddenForMtp(
+            token_ids,
+            total_seq_len,
+            &decode_context,
+            hidden_source,
+        )) |active_result| {
+            var result = active_result;
+            defer result.deinit();
+            const activation = try self.dupeTargetHiddenRowFromHiddenDevice(&result, 0, hidden_source);
+            errdefer self.context.allocator.free(activation);
+            return .{
+                .activation = activation,
+                .next_target_choice = result.greedy_token_id orelse try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden),
+            };
+        }
+        if (hiddenOnlyMaterializationEnabled()) {
+            var result = if (materializationReplayEnabled())
+                try self.forwardTargetHiddenDevice(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                    "gpt.mtp_materialize_host_hidden",
+                )
+            else
+                try self.forwardTargetHiddenDeviceNoReplay(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                );
+            defer result.deinit();
+            const activation = try self.dupeTargetHiddenRowFromHiddenDevice(&result, 0, hidden_source);
+            errdefer self.context.allocator.free(activation);
+            return .{
+                .activation = activation,
+                .next_target_choice = try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden),
+            };
+        }
+        var result = try self.forwardAllLogitsAndHiddenDevice(
+            token_ids[total_seq_len - 1 .. total_seq_len],
+            1,
+            total_seq_len,
+            &decode_context,
+        );
+        defer result.deinit();
+        const activation = try self.dupeTargetHiddenRowFromDevice(&result, 0, hidden_source);
+        errdefer self.context.allocator.free(activation);
+        return .{
+            .activation = activation,
+            .next_target_choice = try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden),
+        };
+    }
+
+    pub fn materializeAcceptedTokenKvAndCopyHiddenToBackend(
+        self: *Runtime,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_state: *NativeDecodeState,
+        hidden_source: HiddenSource,
+        dst_cb: *const ComputeBackend,
+    ) !MtpMaterializedDeviceActivation {
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        if (decode_state.requiresFullRecompute()) return .{ .activation = null };
+        _ = try decode_runtime.appendGeneratedToken();
+        errdefer decode_runtime.truncateGeneratedTokens(1) catch {};
+        const decode_context = decode_runtime.makeDecodeContext(total_seq_len, 1);
+        if (try self.materializeAcceptedTokenKvActiveHiddenForMtp(
+            token_ids,
+            total_seq_len,
+            &decode_context,
+            hidden_source,
+        )) |active_result| {
+            var result = active_result;
+            defer result.deinit();
+            const activation = try self.copyTargetHiddenRowFromHiddenToBackend(&result, 0, hidden_source, dst_cb);
+            errdefer if (activation) |tensor| dst_cb.free(tensor);
+            return .{
+                .activation = activation,
+                .next_target_choice = result.greedy_token_id orelse try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden),
+            };
+        }
+        if (hiddenOnlyMaterializationEnabled()) {
+            var result = if (materializationReplayEnabled())
+                try self.forwardTargetHiddenDevice(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                    "gpt.mtp_materialize_device_hidden",
+                )
+            else
+                try self.forwardTargetHiddenDeviceNoReplay(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                );
+            defer result.deinit();
+            const activation = try self.copyTargetHiddenRowFromHiddenToBackend(&result, 0, hidden_source, dst_cb);
+            errdefer if (activation) |tensor| dst_cb.free(tensor);
+            return .{
+                .activation = activation,
+                .next_target_choice = try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden),
+            };
+        }
+        var result = try self.forwardAllLogitsAndHiddenDevice(
+            token_ids[total_seq_len - 1 .. total_seq_len],
+            1,
+            total_seq_len,
+            &decode_context,
+        );
+        defer result.deinit();
+        const activation = try self.copyTargetHiddenRowToBackend(&result, 0, hidden_source, dst_cb);
+        errdefer if (activation) |tensor| dst_cb.free(tensor);
+        return .{
+            .activation = activation,
+            .next_target_choice = try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden),
+        };
+    }
+
+    fn forwardAllLogits(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
+        var fallback_count: u64 = 0;
+        return graph_mod.decoder_step_executor.forwardAll(&self.context, self.graph_cache, input_ids, batch, seq_len, decode_context, self.replay_fallbacks orelse &fallback_count);
+    }
 
     pub fn rejectUnsupportedDeepSeekV4GraphMode(self: *const Runtime) !void {
         if (!NativeDecodeState.requiresDeepSeekV4CompressedCache(self.context.gpt_config.*)) return;
@@ -855,4 +1189,42 @@ pub fn compiledSampledDecodeEnabled(cfg: @import("../models/gpt.zig").Config) bo
         "ANTFLY_INFERENCE_METAL_RESIDENT_NUCLEUS",
         compiledSampledDecodeDefaultEligible(cfg),
     );
+}
+
+pub fn hiddenOnlyMaterializationEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_HIDDEN_ONLY_MATERIALIZE", true);
+}
+
+pub fn activeMaterializationEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ACTIVE_MATERIALIZE", true);
+}
+
+pub fn activeMaterializationSupported(
+    kind: ops.BackendKind,
+    config: @import("../models/gpt.zig").Config,
+    total_seq_len: usize,
+) bool {
+    // Without a whole-model generated route, the Metal active frame can hand
+    // a mixed SWA/global model back to generic attention after device-only KV
+    // has been written. Past the local window that fallback cannot reconstruct
+    // the complete KV span. Use the existing hidden-only materialization path,
+    // which owns the full one-token forward, for long-context MTP instead.
+    return !(kind == .metal and
+        config.supportsSplitSwaGlobalKvRing() and
+        total_seq_len > @as(usize, config.sliding_window));
+}
+
+pub fn materializationReplayEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_MATERIALIZE_REPLAY", false);
+}
+
+pub fn isSuppressedToken(token_id: u32, token_ids: []const i32) bool {
+    for (token_ids) |candidate| {
+        if (candidate >= 0 and @as(u32, @intCast(candidate)) == token_id) return true;
+    }
+    return false;
+}
+
+fn getenvBool(comptime name: [*:0]const u8) bool {
+    return platform.env.getenvBool(name);
 }
