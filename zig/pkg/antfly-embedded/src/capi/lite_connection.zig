@@ -118,6 +118,10 @@ pub const PreparedPublication = struct {
     fn current(self: *@This()) !*h.db_mod.DB {
         const root = try self.owner.refresh();
         if (Owner.needsOutcomeReconciliation(root)) return error.EnrichmentWaitCanceled;
+        // Reject stale captured catalogs before recovery can open a replacement
+        // table runtime. In particular, half-published or invalid schema bytes
+        // must fence this task rather than being decoded on its behalf.
+        try (self.catalog orelse return error.EnrichmentSourceChanged).verify(root);
         try @import("sql_commit.zig").recover(root);
         try @import("sql_ddl.zig").recover(root);
         const database = try @import("tables.zig").get(root, self.name);
@@ -161,6 +165,10 @@ pub const PreparedPublication = struct {
         }
         const root = try self.owner.refresh();
         if (Owner.needsOutcomeReconciliation(root)) return error.EnrichmentWaitCanceled;
+        // Reject stale captured catalogs before recovery can open a replacement
+        // table runtime. In particular, half-published or invalid schema bytes
+        // must fence this task rather than being decoded on its behalf.
+        try (self.catalog orelse return error.EnrichmentSourceChanged).verify(root);
         try @import("sql_commit.zig").recover(root);
         try @import("sql_ddl.zig").recover(root);
         if (std.mem.eql(u8, self.name, "default")) {
@@ -712,6 +720,9 @@ pub const Owner = struct {
         /// Namespace rounds reaching replay/idle completion (errors below).
         /// Lets observers distinguish quiescence from a worker that stopped.
         maintenance_rounds: u64 = 0,
+        retirement_work_pages: usize = 128,
+        replay_budget_table_id: u64 = 0,
+        replay_budget: @import("../storage/db/derived/replay_budget.zig").Snapshot = .{},
         attempts: u64 = 0,
         refused: u64 = 0,
         rebased: u64 = 0,
@@ -819,6 +830,18 @@ pub const Owner = struct {
         errdefer h.closeHandle(replacement);
         try self.bindGroupSourceState(replacement);
         if (self.current) |previous| {
+            // A clean memo is meaningful only at its logical metadata cut.
+            // Copy the witness; recover() compares it with the replacement's
+            // current identity before skipping work.
+            if (previous.owned_lite_backend.?.native_docstore.?.file.header.indexed_reclamation and
+                replacement.owned_lite_backend.?.native_docstore.?.file.header.indexed_reclamation)
+                replacement.sql_ddl_recovery_needed = previous.sql_ddl_recovery_needed;
+            replacement.sql_ddl_recovery_generation = previous.sql_ddl_recovery_generation;
+            replacement.sql_ddl_agenda_after = previous.sql_ddl_agenda_after;
+            replacement.sql_ddl_agenda_after_len = previous.sql_ddl_agenda_after_len;
+            replacement.sql_ddl_agenda_scan_generation = previous.sql_ddl_agenda_scan_generation;
+            replacement.sql_ddl_agenda_scan_started = previous.sql_ddl_agenda_scan_started;
+            replacement.sql_ddl_agenda_scan_complete = previous.sql_ddl_agenda_scan_complete;
             if (known_maintenance) |snapshot| {
                 try replacement.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 replacement.sql_commit_recovery_needed = previous.sql_commit_recovery_needed or snapshot.sql_commit_recovery_needed;
@@ -935,7 +958,15 @@ pub const Owner = struct {
     }
 
     fn loadedIndexInputsUnchanged(root: *h.Handle, before: *native.NativeFile, after: *native.NativeFile) !bool {
-        if (before.activeCheckpoint().index_catalog_root_page == after.activeCheckpoint().index_catalog_root_page) return true;
+        if (before.header.indexed_reclamation and after.header.indexed_reclamation) {
+            if (std.mem.eql(u8, &before.activeCheckpoint().logical.indexes, &after.activeCheckpoint().logical.indexes)) return true;
+            // Prefix comparisons dereference the old root. Its page numbers
+            // are meaningful only while that checkpoint remains protected.
+            const retained = for (after.header.checkpoints) |slot| {
+                if (std.meta.eql(before.activeCheckpoint(), slot)) break true;
+            } else false;
+            if (!retained) return false;
+        } else if (before.activeCheckpoint().index_catalog_root_page == after.activeCheckpoint().index_catalog_root_page) return true;
         if (!try databaseIndexInputsUnchanged(&root.db, before, after)) return false;
         var tables = root.embedded_tables.valueIterator();
         while (tables.next()) |table| if (!try databaseIndexInputsUnchanged(&table.*.db, before, after)) return false;
@@ -987,6 +1018,7 @@ pub const Owner = struct {
 
     fn bindGroupSourceState(self: *Owner, root: *h.Handle) !void {
         root.owned_lite_backend.?.native_docstore.?.file.defer_allocator_verification = self.options.profile == .native;
+        self.configureRetirementBudget(root.owned_lite_backend.?.native_docstore.?);
         if (self.maintenance_root_incarnation != root.db.root_incarnation) {
             self.deinitMaintenanceSchedules();
             self.maintenance_schedules = .empty;
@@ -1022,6 +1054,17 @@ pub const Owner = struct {
         self.wake.set(h.handleLockIo());
     }
 
+    /// Scope registration reuse to admission; closing the path lease also
+    /// releases idle anchors before another process can publish.
+    fn withReadRegistrationBatch(self: *Owner, lease: native.PathWriterLock) native.PathWriterLock {
+        var held = lease;
+        if (self.options.reader_coordinator) |coordinator| {
+            std.debug.assert(held.reader_registration_batch == null);
+            held.reader_registration_batch = coordinator.beginRegistrationBatch();
+        }
+        return held;
+    }
+
     /// Caller holds the owner gate. Captures and validated publications need
     /// turns alongside foreground writers, otherwise a continuously occupied
     /// kernel queue prevents index replay from ever acquiring its lease.
@@ -1029,7 +1072,7 @@ pub const Owner = struct {
     fn acquireMaintenancePathLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         if (self.stopping.load(.acquire)) return error.Canceled;
         const io = h.handleLockIo();
-        if (native.lockWriterPathWithIo(alloc, io, self.path)) |held| return held else |err| {
+        if (native.lockWriterPathWithIo(alloc, io, self.path)) |held| return self.withReadRegistrationBatch(held) else |err| {
             if (err != error.WouldBlock and err != error.FileBusy) return err;
             // A full foreground queue can exceed one second while each caller
             // remains inside its normal admission budget. Give publications
@@ -1046,7 +1089,7 @@ pub const Owner = struct {
             };
             errdefer held.close();
             if (self.stopping.load(.acquire)) return error.Canceled;
-            return held;
+            return self.withReadRegistrationBatch(held);
         }
     }
 
@@ -1222,12 +1265,21 @@ pub const Owner = struct {
         stats.rewrite_count = @max(stats.rewrite_count, previous.rewrite_count);
     }
 
+    fn configureRetirementBudget(self: *Owner, store: *NativeStore) void {
+        store.file.retirement_work_pages = self.publication_stats.retirement_work_pages;
+        store.maintenance_policy.options.retirement_work_pages = self.publication_stats.retirement_work_pages;
+    }
+
     fn refreshMaintenanceSnapshot(self: *Owner, foreground: *h.Handle, need_database: bool) !*h.Handle {
         const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
         if (self.maintenance_snapshot) |snapshot| {
             const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
             if ((!need_database or snapshot.db_live) and std.meta.eql(file.header, captured.header) and
-                (try file.file.stat(file.runtime())).inode == (try captured.file.stat(captured.runtime())).inode) return snapshot;
+                (try file.file.stat(file.runtime())).inode == (try captured.file.stat(captured.runtime())).inode)
+            {
+                self.configureRetirementBudget(snapshot.owned_lite_backend.?.native_docstore.?);
+                return snapshot;
+            }
         }
         var options = self.options;
         options.externally_locked = true;
@@ -1257,6 +1309,7 @@ pub const Owner = struct {
         snapshot.lease_snapshot = true;
         snapshot.sql_commit_recovery_needed = foreground.sql_commit_recovery_needed;
         snapshot.sql_ddl_recovery_needed = foreground.sql_ddl_recovery_needed;
+        snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
         const store = snapshot.owned_lite_backend.?.native_docstore.?;
         store.file.reader_coordinator = self.reader_coordinator;
         try store.file.inheritAllocatorVerification(file);
@@ -1274,6 +1327,8 @@ pub const Owner = struct {
             previous_store.artifact_marker_sweep = .{};
             closeMaintenanceSnapshot(old);
         }
+        // Carry scheduling state first, then apply the owner's current bound.
+        self.configureRetirementBudget(store);
         if (comptime h.builtin.is_test) {
             const source = foreground.owned_lite_backend.?.native_docstore.?;
             if (source.test_maintenance_hook != null) {
@@ -1471,6 +1526,16 @@ pub const Owner = struct {
         defer authority_arena.deinit();
         if (self.options.open_mode == .writer and try @import("resolver_authority.zig").hasProjectionDebt(foreground, database, authority_arena.allocator())) self.maintenance_pending = true;
         const group_state = try self.groupSourceState(database);
+        if (foreground_file.ledger) |ledger| {
+            group_state.replay_budget.updatePressure(ledger.data_pending, ledger.free_pages, foreground_file.allocator_work.reuse_blocked_append_pages);
+            // Bound each service publication independently, increasing useful
+            // work when foreground retirement is outpacing the baseline turn.
+            const work_pages: usize = @intCast(@min(512, 128 + ledger.data_pending / 8));
+            self.publication_stats.retirement_work_pages = work_pages;
+            self.configureRetirementBudget(foreground.owned_lite_backend.?.native_docstore.?);
+        }
+        self.publication_stats.replay_budget_table_id = database.core.identity_namespace.table_id;
+        self.publication_stats.replay_budget = group_state.replay_budget.snapshot();
         const schedule_entry = try self.maintenance_schedules.getOrPut(alloc, .{
             .table_id = database.core.identity_namespace.table_id,
             .incarnation = database.root_incarnation,
@@ -1604,6 +1669,7 @@ pub const Owner = struct {
             runtime.dense_result_cache = .{ .ptr = self, .lookup = lookupEmbedding, .remember = rememberEmbedding };
             runtime.generated_publication = .{ .ptr = &publication, .commit = PreparedPublication.commit, .heartbeat = PreparedPublication.heartbeat, .acquire_store = PreparedPublication.acquireStore };
         };
+        database.borrowed_group_source_state = group_state;
         if (run_database) database.async_context.replay_publication = .{ .ptr = &publication, .publish = PreparedPublication.publishReplay };
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
         lease.close();
@@ -1861,7 +1927,7 @@ pub const Owner = struct {
         // its connection-local busy policy when another process wins the
         // writer lease during the detached proof. Background turns stay
         // nonblocking and yield to that writer instead of consuming its budget.
-        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked() else try native.lockWriterPathWithIo(alloc, io, self.path);
+        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked() else self.withReadRegistrationBatch(try native.lockWriterPathWithIo(alloc, io, self.path));
         var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         if (self.current) |current| {
@@ -2029,12 +2095,12 @@ pub const Connection = struct {
                 native.lockWriterPathWithIo(alloc, io, self.path)
             else
                 native.lockReaderPathWithIo(alloc, io, self.path);
-            if (lease) |held| return held else |err| {
+            if (lease) |held| return self.owner.withReadRegistrationBatch(held) else |err| {
                 if (err != error.WouldBlock and err != error.FileBusy) return err;
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
                 if (remaining <= 0) return error.FileBusy;
                 if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
-                if (native.waitPathLockWithIo(alloc, self.owner.path_lock_io.io(), self.path, h.liteOpenModeCanWrite(self.options.open_mode), deadline)) |held| return held else |wait_err| switch (wait_err) {
+                if (native.waitPathLockWithIo(alloc, self.owner.path_lock_io.io(), self.path, h.liteOpenModeCanWrite(self.options.open_mode), deadline)) |held| return self.owner.withReadRegistrationBatch(held) else |wait_err| switch (wait_err) {
                     // Sidecar-free read-only snapshots retain their inode
                     // authority. Resource-limited executors retain bounded
                     // polling rather than making the deadline unbounded.
@@ -4472,4 +4538,387 @@ test "capi native allocator proof issue1431 refreshed readers distinguish curren
     try file.putDocument("after-reader-close", "safe");
     try std.testing.expect((try file.allocatorStats()).?.reused_pages > blocked);
     try std.testing.expect((try file.check()).valid);
+}
+
+test "capi native recovery agenda clean opens avoid unrelated table runtimes" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("recovery-agenda-discovery", 5000, .sql);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const root = fixture.connection.owner.current.?;
+    for (0..8) |_| try @import("sql_ddl.zig").recover(root);
+    try std.testing.expect(!root.sql_ddl_recovery_needed);
+    @import("tables.zig").closeAll(root);
+    root.sql_ddl_recovery_needed = true;
+    root.sql_ddl_agenda_after_len = 0;
+    try @import("sql_ddl.zig").recover(root);
+    try std.testing.expectEqual(@as(u32, 0), root.embedded_tables.count());
+    try std.testing.expect(!root.sql_ddl_recovery_needed);
+    // A native producer bypassing SQL's invalidation still changes the durable
+    // agenda and metadata generation. The cached clean flag cannot hide it.
+    const database = try @import("tables.zig").get(root, "numbers");
+    const schema = (try database.getSchemaJson(root.alloc)).?;
+    defer root.alloc.free(schema);
+    var txn = try database.core.store.beginWriteTxn();
+    errdefer txn.abort();
+    try txn.put(keys.public_schema_json_key, schema);
+    try txn.commit();
+    try std.testing.expect(!root.sql_ddl_recovery_needed);
+    const before = root.sql_ddl_recovery_scans;
+    try @import("sql_ddl.zig").recover(root);
+    try std.testing.expectEqual(before + 1, root.sql_ddl_recovery_scans);
+    try std.testing.expect(!root.sql_ddl_recovery_needed);
+}
+
+test "capi native logical generations adopt foreign lease checkpoints without reopening runtime" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("logical-generation-adoption", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const owner = fixture.connection.owner;
+    const root = owner.current.?;
+    const file = &root.owned_lite_backend.?.native_docstore.?.file;
+    var peer = try native.NativeFile.openWithIo(std.testing.allocator, h.handleLockIo(), fixture.path, .{ .externally_locked = true, .no_sync = true });
+    defer peer.close();
+    try peer.inheritAllocatorVerification(file);
+    peer.allocator_certificate_on_commit = true;
+    for (0..4) |i| {
+        try peer.beginArtifactLeaseTransaction();
+        errdefer peer.abortTransaction();
+        var key_buffer: [64]u8 = undefined;
+        const marker = try std.fmt.bufPrint(&key_buffer, "{s}generation-{d}", .{ native.NativeFile.artifact_lease_key_prefix, i });
+        try peer.putCatalogRecord(marker, "lease");
+        try peer.commitTransaction();
+    }
+    try std.testing.expect(!std.meta.eql(file.header, peer.header));
+    try std.testing.expectEqual(root, try owner.refresh());
+    try std.testing.expectEqualDeep(peer.header, file.header);
+}
+
+test "capi native recovery agenda bounds a turn and acknowledges dropped namespaces" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("recovery-agenda-page", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const root = fixture.connection.owner.current.?;
+    for (0..8) |_| try @import("sql_ddl.zig").recover(root);
+    try std.testing.expect(!root.sql_ddl_recovery_needed);
+    const file = &root.owned_lite_backend.?.native_docstore.?.file;
+    try file.beginTransaction();
+    errdefer file.abortTransaction();
+    for (100..109) |id| {
+        var buffer: [128]u8 = undefined;
+        const marker = try std.fmt.bufPrint(&buffer, "{s}{s}{d}\x00", .{
+            @import("../storage/lite/recovery_agenda.zig").prefix,
+            @import("../storage/lite/recovery_agenda.zig").table_prefix,
+            id,
+        });
+        try file.putCatalogRecord(marker, "");
+    }
+    try file.commitTransaction();
+    try @import("sql_ddl.zig").recover(root);
+    try std.testing.expect(root.sql_ddl_recovery_needed);
+    try std.testing.expect(root.sql_ddl_agenda_after_len != 0);
+    try @import("sql_ddl.zig").recover(root);
+    try std.testing.expect(!root.sql_ddl_recovery_needed);
+    try std.testing.expectEqual(@as(u8, 0), root.sql_ddl_agenda_after_len);
+}
+
+test "capi native logical generations preserve adaptive retirement budgets across snapshot replacement" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("retirement-budget-refresh", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const owner = fixture.connection.owner;
+    const root = owner.current.?;
+    owner.publication_stats.retirement_work_pages = 256;
+    const first = try owner.refreshMaintenanceSnapshot(root, false);
+    try std.testing.expectEqual(@as(usize, 256), first.owned_lite_backend.?.native_docstore.?.maintenance_policy.options.retirement_work_pages);
+    owner.publication_stats.retirement_work_pages = 512;
+    try root.owned_lite_backend.?.native_docstore.?.file.putCatalogRecord("budget-test", "next snapshot");
+    const replacement = try owner.refreshMaintenanceSnapshot(root, false);
+    const store = replacement.owned_lite_backend.?.native_docstore.?;
+    try std.testing.expectEqual(@as(usize, 512), store.file.retirement_work_pages);
+    try std.testing.expectEqual(@as(usize, 512), store.maintenance_policy.options.retirement_work_pages);
+}
+
+test "capi native recovery agenda readonly sweeps become clean across eight and nine namespaces" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const ddl = @import("sql_ddl.zig");
+    for ([_]usize{ 8, 9 }) |count| {
+        var fixture = try AdmissionFollowupFixture.init("readonly-agenda-pages", 5000, .batch);
+        defer fixture.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+        {
+            var lease = try fixture.connection.acquire();
+            defer {
+                lease.close();
+                fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            }
+            const root = fixture.connection.owner.current.?;
+            for (0..count) |i| {
+                var name: [32]u8 = undefined;
+                try @import("tables.zig").create(root, try std.fmt.bufPrint(&name, "namespace-{d}", .{i}), "{}", false);
+            }
+        }
+        const reader = try open(fixture.path, .{ .profile = .native, .open_mode = .query_readonly, .no_sync = true }, false);
+        defer h.closeHandle(reader);
+        const connection = reader.lite_connection.?;
+        var lease: ?native.PathWriterLock = try connection.acquire();
+        var gate_held = true;
+        defer if (gate_held) {
+            connection.detach();
+            if (lease) |*held| held.close();
+            connection.gate.mutex.unlock(h.handleLockIo());
+        };
+        const root = try connection.refresh(&lease, .read_only);
+        for (0..4) |_| try ddl.recover(root);
+        try std.testing.expect(!root.sql_ddl_recovery_needed);
+        const scans = root.sql_ddl_recovery_scans;
+        try std.testing.expect(scans <= 3);
+        for (0..20) |_| try ddl.recover(root);
+        try std.testing.expectEqual(scans, root.sql_ddl_recovery_scans);
+        const metadata = root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().logical.metadata;
+        // A peer's data-only commit replaces the serving wrapper but cannot
+        // erase this clean witness for the same logical metadata generation.
+        connection.detach();
+        lease.?.close();
+        lease = null;
+        connection.gate.mutex.unlock(h.handleLockIo());
+        gate_held = false;
+        {
+            var writer_lease = try fixture.connection.acquire();
+            defer {
+                writer_lease.close();
+                fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            }
+            try fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file.putDocument("foreign-data-only", "{}");
+        }
+        lease = try connection.acquire();
+        gate_held = true;
+        const refreshed = try connection.refresh(&lease, .read_only);
+        try std.testing.expectEqualSlices(u8, &metadata, &refreshed.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().logical.metadata);
+        try std.testing.expect(!refreshed.sql_ddl_recovery_needed);
+        try @import("sql_ddl.zig").recover(refreshed);
+        try std.testing.expectEqual(@as(u64, 0), refreshed.sql_ddl_recovery_scans);
+        // Reprojecting an existing marker for new DDL must invalidate the memo.
+        connection.detach();
+        lease.?.close();
+        lease = null;
+        connection.gate.mutex.unlock(h.handleLockIo());
+        gate_held = false;
+        {
+            var writer_lease = try fixture.connection.acquire();
+            defer {
+                writer_lease.close();
+                fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            }
+            try fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file.putDocument(
+                "\x02db/embedded/tables/2\x00\x00antfly/embedded/sql-ddl",
+                "unfinished",
+            );
+        }
+        lease = try connection.acquire();
+        gate_held = true;
+        const changed = try connection.refresh(&lease, .read_only);
+        try @import("sql_ddl.zig").recover(changed);
+        try std.testing.expect(changed.sql_ddl_recovery_needed);
+        try std.testing.expectError(error.SqlStatementReadUnavailable, @import("tables.zig").get(changed, "namespace-0"));
+    }
+}
+
+test "capi native recovery agenda fences an affected namespace beyond the current page" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("affected-agenda-page", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const root = fixture.connection.owner.current.?;
+        for (0..10) |i| {
+            var name: [32]u8 = undefined;
+            try @import("tables.zig").create(root, try std.fmt.bufPrint(&name, "namespace-{d}", .{i}), "{}", false);
+        }
+        // ID 9 sorts after the eight-entry page (10,11,2,3,4,5,6,7).
+        const affected = try @import("tables.zig").get(root, "namespace-7");
+        var txn = try affected.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put("\x00antfly/embedded/sql-ddl", "unfinished");
+        try txn.commit();
+    }
+    const reader = try open(fixture.path, .{ .profile = .native, .open_mode = .query_readonly, .no_sync = true }, false);
+    defer h.closeHandle(reader);
+    const connection = reader.lite_connection.?;
+    var lease: ?native.PathWriterLock = try connection.acquire();
+    defer {
+        connection.detach();
+        if (lease) |*held| held.close();
+        connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const root = try connection.refresh(&lease, .read_only);
+    for (0..20) |_| {
+        try @import("sql_ddl.zig").recover(root);
+        try std.testing.expectError(error.SqlStatementReadUnavailable, @import("tables.zig").get(root, "namespace-7"));
+    }
+    try std.testing.expect(root.sql_ddl_recovery_needed);
+}
+
+test "capi native recovery agenda root admission cannot bypass an unresolved job" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("root-agenda-admission", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const root = fixture.connection.owner.current.?;
+        for (0..9) |i| {
+            var name: [32]u8 = undefined;
+            try @import("tables.zig").create(root, try std.fmt.bufPrint(&name, "namespace-{d}", .{i}), "{}", false);
+        }
+        try root.owned_lite_backend.?.native_docstore.?.file.putDocument("\x00antfly/embedded/sql-ddl", "unfinished");
+    }
+    const reader = try open(fixture.path, .{ .profile = .native, .open_mode = .query_readonly, .no_sync = true }, false);
+    const id = try api.publishHandle(reader);
+    defer api.antfly_db_close(id);
+    const expected = h.capi.mapError(error.SqlStatementReadUnavailable);
+    for (0..20) |_| {
+        var result: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free(&result);
+        try std.testing.expectEqual(expected, api.antfly_db_stats_json(id, &result));
+        try std.testing.expectEqual(@as(usize, 0), result.len);
+    }
+}
+
+test "capi native recovery agenda interrupted readonly namespace cannot certify a sweep" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("readonly-agenda-interrupted", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    {
+        var writer_lease = try fixture.connection.acquire();
+        defer {
+            writer_lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const root = fixture.connection.owner.current.?;
+        try @import("tables.zig").create(root, "pending", "{}", false);
+        const table = try @import("tables.zig").get(root, "pending");
+        var txn = try table.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put("\x00antfly/embedded/sql-ddl", "unfinished");
+        try txn.commit();
+    }
+    const reader = try open(fixture.path, .{ .profile = .native, .open_mode = .query_readonly, .no_sync = true }, false);
+    defer h.closeHandle(reader);
+    const connection = reader.lite_connection.?;
+    var lease: ?native.PathWriterLock = try connection.acquire();
+    defer {
+        connection.detach();
+        if (lease) |*held| held.close();
+        connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const root = try connection.refresh(&lease, .read_only);
+    try @import("tables.zig").loadCatalog(root);
+    const original = root.alloc;
+    var failing = std.testing.FailingAllocator.init(original, .{ .fail_index = 2 });
+    // The page's key and key-array are captured first, then opening the named
+    // namespace fails. All successful allocations delegate to the same backing
+    // allocator; restore it before any later recovery or handle destruction.
+    root.alloc = failing.allocator();
+    const result = @import("sql_ddl.zig").recover(root);
+    root.alloc = original;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(root.sql_ddl_agenda_after_len != 0);
+    for (0..20) |_| {
+        try @import("sql_ddl.zig").recover(root);
+        try std.testing.expect(root.sql_ddl_recovery_needed);
+        try std.testing.expectError(error.SqlStatementReadUnavailable, @import("tables.zig").get(root, "pending"));
+    }
+}
+
+test "capi native recovery agenda repeated compaction invalidates a clean metadata witness" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("agenda-compaction-lineage", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    {
+        var writer_lease = try fixture.connection.acquire();
+        defer {
+            writer_lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const file = &fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+        var image = try file.prepareVacuum(null);
+        defer image.deinit();
+        try file.publishVacuum(&image);
+    }
+    const reader = try open(fixture.path, .{ .profile = .native, .open_mode = .query_readonly, .no_sync = true }, false);
+    defer h.closeHandle(reader);
+    const connection = reader.lite_connection.?;
+    var lease: ?native.PathWriterLock = try connection.acquire();
+    var gate_held = true;
+    defer if (gate_held) {
+        connection.detach();
+        if (lease) |*held| held.close();
+        connection.gate.mutex.unlock(h.handleLockIo());
+    };
+    const root = try connection.refresh(&lease, .read_only);
+    try @import("sql_ddl.zig").recover(root);
+    try std.testing.expect(!root.sql_ddl_recovery_needed);
+    const clean = root.sql_ddl_recovery_generation;
+    connection.detach();
+    lease.?.close();
+    lease = null;
+    connection.gate.mutex.unlock(h.handleLockIo());
+    gate_held = false;
+    {
+        var writer_lease = try fixture.connection.acquire();
+        defer {
+            writer_lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const file = &fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+        try file.putDocument("\x00antfly/embedded/sql-ddl", "unfinished");
+        var image = try file.prepareVacuum(null);
+        defer image.deinit();
+        try file.publishVacuum(&image);
+    }
+    lease = try connection.acquire();
+    gate_held = true;
+    const refreshed = try connection.refresh(&lease, .read_only);
+    try std.testing.expect(!std.mem.eql(u8, &clean, &refreshed.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().logical.metadata));
+    for (0..20) |_| {
+        try @import("sql_ddl.zig").recover(refreshed);
+        try std.testing.expect(refreshed.sql_ddl_recovery_needed);
+        try std.testing.expectError(error.SqlStatementReadUnavailable, @import("sql_ddl.zig").requireRecovered(refreshed, &refreshed.db, "default"));
+    }
 }

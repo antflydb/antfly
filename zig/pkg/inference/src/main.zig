@@ -44,6 +44,7 @@ const InferenceSettings = struct {
     const WarmModelConfig = struct {
         kind: []const u8,
         name: []const u8,
+        pin: bool = true,
         backend: ?[]const u8 = null,
         cuda_precision: @FieldType(inference.server.WarmModel, "cuda_precision") = null,
         format: ?[]const u8 = null,
@@ -258,6 +259,7 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const Inferen
         out[i] = .{
             .kind = parsePreloadModelKind(value.kind) orelse return error.InvalidArguments,
             .name = value.name,
+            .pin = value.pin,
             .backend = try parseOptionalBackendType(value.backend),
             .cuda_precision = value.cuda_precision,
             .format = value.format,
@@ -1168,4 +1170,12 @@ test "standalone canonical execution settings share lifetime and batching" {
     defer zero.deinit();
     try std.testing.expectEqual(@as(u64, 0), try platform.inference_settings.parseKeepAliveMs(zero.value.inference.keep_alive.?));
     try std.testing.expectError(error.InvalidInferenceConfig, parseRunConfig(std.testing.allocator, "{\"inference\":{\"keep_alive_ms\":5000}}"));
+}
+
+test "run config preserves evictable preload retention" {
+    var parsed = try parseRunConfig(std.testing.allocator, "{\"inference\": {\"preload\": [{\"kind\": \"reader\", \"name\": \"ocr\", \"pin\": false}]}}");
+    defer parsed.deinit();
+    const models = try preloadModelsFromConfig(std.testing.allocator, parsed.value.inference.preload);
+    defer std.testing.allocator.free(models);
+    try std.testing.expect(!models[0].pin);
 }

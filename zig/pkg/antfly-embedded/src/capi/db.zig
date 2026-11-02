@@ -1067,6 +1067,13 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             store.file.read_only = true;
         }
         guard.entry_sequence = root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        if (!pinned) @import("sql_commit.zig").recover(root) catch |err| {
+            guard.entry_error = capi.mapError(err);
+        };
+        if (!pinned and guard.entry_error == null) @import("sql_ddl.zig").recover(root) catch |err| {
+            guard.entry_error = capi.mapError(err);
+        };
+        if (guard.entry_error != null) return guard;
         if (handle.parent_id != null) {
             const database = @import("tables.zig").get(root, handle.selected_table_name orelse "default") catch |err| {
                 guard.entry_error = capi.mapError(err);
@@ -1084,10 +1091,7 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             guard.entry_error = catalogOwnershipError(err);
             return guard;
         };
-        if (!pinned) @import("sql_commit.zig").recover(root) catch |err| {
-            guard.entry_error = capi.mapError(err);
-        };
-        if (!pinned and guard.entry_error == null) @import("sql_ddl.zig").recover(root) catch |err| {
+        if (!pinned and guard.entry_error == null) @import("sql_ddl.zig").requireRecovered(root, guard.handle.database(), guard.handle.selected_table_name orelse "default") catch |err| {
             guard.entry_error = capi.mapError(err);
         };
         return guard;
@@ -1117,6 +1121,10 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             return guard;
         };
         @import("sql_ddl.zig").recover(lock_handle) catch |err| {
+            guard.entry_error = capi.mapError(err);
+            return guard;
+        };
+        @import("sql_ddl.zig").requireRecovered(lock_handle, handle.database(), handle.selected_table_name orelse "default") catch |err| {
             guard.entry_error = capi.mapError(err);
             return guard;
         };
@@ -3547,11 +3555,15 @@ pub const LiteCompactReport = struct {
 };
 
 pub fn prepareLiteCompact(handle: *Handle) !void {
-    try handle.database().*.runUntilIdle();
-    try handle.database().*.forceCompactTextIndexes();
-    try handle.database().*.drainScheduledTextMerges();
-    try handle.database().*.sync(true);
-    try handle.database().*.syncIndexes(true);
+    const root = handle.parent_handle orelse handle;
+    // Compaction is database-wide. Fail on an unavailable namespace rather
+    // than reporting a partially settled artifact as fully compacted.
+    try @import("tables.zig").load(root);
+    try @import("entity_sink.zig").runUntilIdle(root);
+    try @import("../storage/lite/connection.zig").prepareDatabaseCompact(&root.db);
+    var iterator = root.embedded_tables.valueIterator();
+    while (iterator.next()) |table|
+        try @import("../storage/lite/connection.zig").prepareDatabaseCompact(&table.*.db);
 }
 
 pub fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {

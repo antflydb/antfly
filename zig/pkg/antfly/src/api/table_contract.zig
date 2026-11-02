@@ -25,8 +25,34 @@ const enrichment_config_validation = @import("antfly_local_sources").storage_db_
 const public_index_contract = @import("public_index_contract.zig");
 const table_index_config = @import("antfly_local_sources").api_table_index_config;
 
+// `std.fmt.allocPrint` (via `std.Io.Writer.Allocating`) starts from a tiny
+// capacity and grows the buffer as it writes, then shrinks it back down in
+// `toOwnedSlice` by attempting a `remap` and falling back to alloc+copy+free
+// when the remap fails. Under `std.testing.checkAllAllocationFailures`, that
+// final shrink's resize/remap outcome is state the test does not control the
+// same way on every pass, so the exact number of allocator calls this
+// produces is not guaranteed to match across runs, which trips
+// `error.NondeterministicMemoryUsage` even though the function itself is
+// pure. Measure the exact output length first with a throwaway `Discarding`
+// writer, then allocate precisely once and format directly into that buffer
+// with a `Writer.fixed`, so there is never a grow-then-shrink step.
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    var measure_buf: [256]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&measure_buf);
+    discarding.writer.print("{f}", .{std.json.fmt(value, .{})}) catch |err| switch (err) {
+        // Discarding.drain never reports a short write.
+        error.WriteFailed => unreachable,
+    };
+    const len = std.math.cast(usize, discarding.fullCount()) orelse return error.OutOfMemory;
+    const out = try alloc.alloc(u8, len);
+    errdefer alloc.free(out);
+    var fixed_writer = std.Io.Writer.fixed(out);
+    fixed_writer.print("{f}", .{std.json.fmt(value, .{})}) catch |err| switch (err) {
+        // The buffer was sized exactly for this output by the measuring pass above.
+        error.WriteFailed => unreachable,
+    };
+    std.debug.assert(fixed_writer.end == len);
+    return out;
 }
 
 pub const CreateTableRequestErrorDisposition = enum {
@@ -117,37 +143,46 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     // replication_sources). For indexes, parse from the raw body to preserve
     // type-specific fields (external, dimension, edge_types, etc.) that the
     // generated IndexConfig struct doesn't capture.
-    var parsed = metadata_server_openapi.server.parseCreateTableBody(alloc, body) catch {
-        // Normalize validated public indexes before compatibility admission.
-        // Otherwise SDK nulls reach strict coverage/runtime validators first.
-        var fallback = fallback: {
-            if (raw_root.get("indexes")) |indexes_value| {
-                if (indexes_value != .null) {
-                    const normalized_indexes = try normalizeCreateTableIndexesWithDefaults(alloc, indexes_value, !external_source);
-                    defer alloc.free(normalized_indexes);
-                    var indexes = try std.json.parseFromSlice(std.json.Value, alloc, normalized_indexes, .{});
-                    defer indexes.deinit();
-                    // Preserve exact schema literal tokens while replacing only
-                    // the index object. Neither parsed arena owns the other.
-                    var exact = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
-                    defer exact.deinit();
-                    exact.value.object.getPtr("indexes").?.* = indexes.value;
-                    const normalized_body = try stringifyJsonAlloc(alloc, exact.value);
-                    defer alloc.free(normalized_body);
-                    // Only our validated normalizer introduced private durable
-                    // identities; public input was checked before this branch.
-                    break :fallback try tables_api.parseStoredCreateTableRequest(alloc, normalized_body);
+    var parsed = metadata_server_openapi.server.parseCreateTableBody(alloc, body) catch |generated_parse_err| switch (generated_parse_err) {
+        // An injected or genuine allocation failure here is an operational
+        // failure, not malformed client input. Letting it fall through to the
+        // compatibility-fallback branch below sends it down a structurally
+        // different allocation path (normalization, re-parsing, re-stringifying)
+        // with its own failure profile, which made `checkAllAllocationFailures`
+        // nondeterministic for this request. Propagate it immediately instead.
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            // Normalize validated public indexes before compatibility admission.
+            // Otherwise SDK nulls reach strict coverage/runtime validators first.
+            var fallback = fallback: {
+                if (raw_root.get("indexes")) |indexes_value| {
+                    if (indexes_value != .null) {
+                        const normalized_indexes = try normalizeCreateTableIndexesWithDefaults(alloc, indexes_value, !external_source);
+                        defer alloc.free(normalized_indexes);
+                        var indexes = try std.json.parseFromSlice(std.json.Value, alloc, normalized_indexes, .{});
+                        defer indexes.deinit();
+                        // Preserve exact schema literal tokens while replacing only
+                        // the index object. Neither parsed arena owns the other.
+                        var exact = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
+                        defer exact.deinit();
+                        exact.value.object.getPtr("indexes").?.* = indexes.value;
+                        const normalized_body = try stringifyJsonAlloc(alloc, exact.value);
+                        defer alloc.free(normalized_body);
+                        // Only our validated normalizer introduced private durable
+                        // identities; public input was checked before this branch.
+                        break :fallback try tables_api.parseStoredCreateTableRequest(alloc, normalized_body);
+                    }
                 }
-            }
-            break :fallback try tables_api.parseCreateTableRequest(alloc, body);
-        };
-        errdefer fallback.deinit(alloc);
-        try validateCreateTableIndexSemantics(
-            alloc,
-            fallback.indexes_json orelse tables_api.default_indexes_json,
-        );
-        try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, fallback.schema_json orelse "", fallback.indexes_json orelse tables_api.default_indexes_json);
-        return fallback;
+                break :fallback try tables_api.parseCreateTableRequest(alloc, body);
+            };
+            errdefer fallback.deinit(alloc);
+            try validateCreateTableIndexSemantics(
+                alloc,
+                fallback.indexes_json orelse tables_api.default_indexes_json,
+            );
+            try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, fallback.schema_json orelse "", fallback.indexes_json orelse tables_api.default_indexes_json);
+            return fallback;
+        },
     };
     defer parsed.deinit();
 

@@ -405,6 +405,7 @@ pub fn Adapter(comptime native: type) type {
         }
 
         pub fn localCatalog(self: *Self, alloc: std.mem.Allocator, version: u32) !LocalCatalog {
+            if (self.handle) |handle| try @import("sql_ddl.zig").requireCatalogRecovered(handle);
             if (self.handle) |handle| if (handle.owned_lite_backend != null) return self.liteCatalog(alloc, version);
             // Coordinated constraints require the complete dependency catalog;
             // ordinary reads can proceed against healthy referenced tables.
