@@ -17,8 +17,36 @@
 //! task construction. Serving supplies retirement and admission services through
 //! Host, retaining registry/handle/health ownership outside this module.
 const session_loader = @import("session_loader.zig");
+const tokenizer_loader = @import("tokenizer_loader.zig");
 
 pub const Host = struct {
+    /// Standalone owners have no registry or eviction service. Component loads
+    /// retain their session manager's protection policy; resource admission
+    /// remains explicitly unavailable rather than inventing a serving lease.
+    pub fn unmanaged() Host {
+        const Services = struct {
+            const token: u8 = 0;
+            fn retire(_: *anyopaque, _: *Runtime) void {}
+            fn reserve(_: *anyopaque, _: runtime.tier.memory.BackendClass, _: runtime.tier.memory.Limits, _: runtime.tier.memory.AdmissionAmounts) !runtime.tier.memory.AdmissionLease {
+                return error.ResourceTemporarilyUnavailable;
+            }
+            fn unhealthy(_: *anyopaque, _: []const u8, _: backends.BackendType) bool {
+                return false;
+            }
+            fn limits(_: *anyopaque, _: []const u8, _: backends.BackendRuntime, fallback: runtime.tier.memory.Limits) !runtime.tier.memory.Limits {
+                return fallback;
+            }
+            fn reserveLoad(_: *anyopaque, _: []const u8, _: backends.BackendRuntime, _: runtime.tier.memory.Limits, _: @import("load_plan.zig").ModelLoadAdmissionPlan) !session_loader.Reservation {
+                return error.ResourceTemporarilyUnavailable;
+            }
+            fn protect(_: *anyopaque, _: backends.BackendRuntime) !?backends.Session.CloseProtection {
+                return null;
+            }
+            fn attach(_: *anyopaque, _: *backends.Session, _: backends.BackendRuntime, _: runtime.tier.memory.AdmissionAmounts, _: ?*const manifest_mod.ModelManifest) !void {}
+        };
+        const context: *anyopaque = @constCast(&Services.token);
+        return .{ .context = context, .session_loading = .{ .context = context, .admission_enabled = false, .unhealthy_fn = Services.unhealthy, .limits_fn = Services.limits, .reserve_fn = Services.reserveLoad, .protect_close_fn = Services.protect, .attach_admission_fn = Services.attach }, .retire = Services.retire, .reserve = Services.reserve };
+    }
     context: *anyopaque,
     session_loading: session_loader.Host,
     retire: *const fn (*anyopaque, *LoadedModel) void,
@@ -453,6 +481,233 @@ pub fn chunkPlanningSnapshotWithControl(a: std.mem.Allocator, io: std.Io, manife
 const LoadedModel = Runtime;
 
 pub const Runtime = struct {
+    /// Consumes every asset even on failure. Backend/session lifetime is
+    /// established before attaching worker-borrowed shared execution state.
+    pub fn fromOwnedAssets(allocator: std.mem.Allocator, source: Assets, control: ?InferenceExecutionControl) !*Runtime {
+        var assets = source;
+        var assets_owned = true;
+        defer if (assets_owned) assets.deinit(allocator);
+        const man = assets.manifest;
+        const session = assets.session.session;
+        const model_dir = assets.model_dir;
+        const hf_tok = assets.hf_tok;
+        const sp_tok = assets.sp_tok;
+        const resolution_revision = assets.resolution_revision;
+        const resolution_file_revision = assets.resolution_file_revision;
+        const native_kv_asset_generation = assets.native_kv_asset_generation;
+        const tokenizer_type = assets.tokenizer_type;
+        const embedding_signature = assets.embedding_signature;
+        if (man.gliner_architecture == .boundary) {
+            const identity = try session_factory.getGlinerBoundaryIdentity(session);
+            try identity.verifySidecars(try man.boundarySidecarDigests());
+        }
+        if (assets.gliner_span_tokenizer_digest) |digest|
+            try session_factory.sealGlinerDecisionTokenizerDigest(session, digest);
+
+        var whisper_prompt_cache: ?whisper_prompt.PromptCache = if (session_factory.getWhisperConfig(session) != null)
+            try whisper_prompt.PromptCache.init(
+                allocator,
+                model_dir,
+                if (hf_tok) |ht| ht.tokenizer() else sp_tok.?.tokenizer(),
+            )
+        else
+            null;
+        errdefer if (whisper_prompt_cache) |*cache| cache.deinit();
+
+        // Embedding checkpoints can ship their decoder backbone's chat
+        // template, but embedding execution never uses it. Qwen rerankers use
+        // their explicit scoring templates instead of this general chat path.
+        var chat_template_failed = false;
+        const needs_chat_template = man.model_type != .embedder and
+            !man.isQwen3TextReranker() and !man.isQwen3VlReranker();
+        const chat_template_source: ?[]const u8 = if (man.isLightOnOcr3())
+            @import("../readers/lightonocr3.zig").chat_template
+        else
+            man.chat_template;
+        var chat_tmpl: ?*ChatTemplate = if (if (needs_chat_template) chat_template_source else null) |ct_source| blk2: {
+            const ct = allocator.create(ChatTemplate) catch {
+                chat_template_failed = true;
+                break :blk2 null;
+            };
+            ct.* = ChatTemplate.init(
+                allocator,
+                ct_source,
+                man.bos_token,
+                man.eos_token,
+                man.unk_token,
+                man.pad_token,
+            ) catch |err| {
+                // Chat requests will silently degrade to raw prompting from here on, which
+                // looks like a model quality problem rather than a template problem.
+                std.log.err("chat template init failed for {s}: {s}; chat requests will use raw prompts", .{ model_dir, @errorName(err) });
+                allocator.destroy(ct);
+                chat_template_failed = true;
+                break :blk2 null;
+            };
+            break :blk2 ct;
+        } else null;
+        errdefer if (chat_tmpl) |ct| {
+            ct.deinit();
+            allocator.destroy(ct);
+        };
+
+        const tokenizer_resource_lease = assets.tokenizer_resource_lease;
+        // Create loaded model
+        var shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = blk: {
+            if (session_factory.getGptConfig(session)) |cfg| {
+                if (cfg.usesMoe()) {
+                    const cache = try allocator.create(runtime.moe.shared.SharedExpertCache);
+                    cache.* = runtime.moe.shared.SharedExpertCache.init(allocator);
+                    break :blk cache;
+                }
+            }
+            break :blk null;
+        };
+        errdefer if (shared_moe_cache) |cache| {
+            cache.deinit();
+            allocator.destroy(cache);
+        };
+        var shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = if (session_factory.getGptConfig(session)) |_| blk: {
+            const state = try allocator.create(runtime.tier.shared.SharedPrefetchState);
+            errdefer allocator.destroy(state);
+            state.* = runtime.tier.shared.SharedPrefetchState.init(allocator);
+            errdefer state.deinit();
+            break :blk state;
+        } else null;
+        errdefer if (shared_prefetch) |state| {
+            state.deinit();
+            allocator.destroy(state);
+        };
+        var native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = if (session_factory.getGptConfig(session)) |_| blk: {
+            const coordinator = try allocator.create(runtime.scheduler.native_generate.NativeGenerateCoordinator);
+            coordinator.* = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(allocator);
+            break :blk coordinator;
+        } else null;
+        errdefer if (native_generate_coordinator) |coordinator| {
+            coordinator.deinit();
+            allocator.destroy(coordinator);
+        };
+        const florence_reader_config: ?vision_config.RuntimeConfig = if (session_factory.getFlorenceConfig(session)) |florence| blk: {
+            const config_path = man.config_path orelse return error.IncompleteFlorence2Bundle;
+            const preprocessor_path = man.preprocessor_config_path orelse return error.IncompleteFlorence2Bundle;
+            const preprocessor = try vision_config.loadPreprocessorConfigFile(allocator, preprocessor_path);
+            if (preprocessor.image_size != @as(usize, florence.image_size))
+                return error.InvalidPreprocessorConfig;
+            var cb = try session_factory.getComputeBackend(session, allocator);
+            defer cb.deinit();
+            break :blk .{
+                .decoder = try encoder_decoder.loadDecoderConfigFile(allocator, config_path),
+                .preprocessor = preprocessor,
+                .final_logits_bias_zero = try florence_arch.decoderFinalLogitsBiasIsZero(
+                    &cb,
+                    allocator,
+                    florence.vocab_size,
+                ),
+            };
+        } else null;
+        // Hash only after tokenizer/session admission owns the loaded assets.
+        const embedding_snapshot: ?eg2_identity.Snapshot = if (embedding_signature) |before| blk: {
+            const snapshot = try eg2_identity.snapshotCached(allocator, assets.preparation_io orelse std.Options.debug_io, model_dir, man.safetensors_path.?, control orelse .{});
+            if (!std.mem.eql(u8, &before, &snapshot.signature)) return error.ModelArtifactsChanging;
+            break :blk snapshot;
+        } else null;
+        const owned_model_dir = try allocator.dupe(u8, model_dir);
+        var owned_model_dir_owned = true;
+        errdefer if (owned_model_dir_owned) allocator.free(owned_model_dir);
+        const model = try allocator.create(LoadedModel);
+        var model_storage_owned = true;
+        errdefer if (model_storage_owned) allocator.destroy(model);
+        const chunk_planning = try chunkPlanningSnapshotWithControl(allocator, assets.preparation_io orelse std.Options.debug_io, man, resolution_revision, control orelse .{});
+        if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(allocator, assets.preparation_io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
+        if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(allocator, assets.preparation_io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
+        var resolved_session = session;
+        resolved_session.model_contract = @import("../models/session_contract.zig").resolve(session.model_contract, &man, session.backend());
+        model.* = .{
+            .chunk_planning = chunk_planning,
+            .resolution_revision = resolution_revision,
+            .native_kv_asset_generation = native_kv_asset_generation,
+            .native_kv_tokenizer_contract = if (native_kv_asset_generation != null) .{
+                .route = switch (tokenizer_type) {
+                    .huggingface => .huggingface,
+                    .sentencepiece => .sentencepiece,
+                },
+                .preserve_inline_specials = if (sp_tok) |sp| sp.preserve_inline_specials_after_literal_bos else false,
+            } else null,
+            .embedding_identity = if (embedding_snapshot) |snapshot| eg2_identity.forBackend(snapshot.digest, session.backend()) else null,
+            .embedding_validation = if (embedding_snapshot) |snapshot| .{ .value = snapshot } else null,
+            .manifest = man,
+            .hf_tok = hf_tok,
+            .sp_tok = sp_tok,
+            .session = resolved_session,
+            .session_manager = assets.session_manager,
+            .host = assets.host,
+            .model_dir = owned_model_dir,
+            .allocator = allocator,
+            .executor_io = assets.executor_io,
+            .florence_reader_config = florence_reader_config,
+            .chat_tmpl = chat_tmpl,
+            .whisper_prompt_cache = whisper_prompt_cache,
+            .chat_template_failed = chat_template_failed,
+            .shared_moe_cache = shared_moe_cache,
+            .shared_prefetch = shared_prefetch,
+            .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator),
+            .native_generate_coordinator = native_generate_coordinator,
+            .native_generation_graph_cache = graph_mod.cache.GraphCache.init(allocator),
+            .vision_session = null,
+            .audio_session = null,
+            .text_projection = null,
+            .visual_projection = null,
+            .audio_projection = null,
+            .kernel_jit_profile_bundle = assets.kernel_jit_profile_bundle,
+            .tokenizer_resource_lease = tokenizer_resource_lease,
+            .resource_lease = assets.session.resource_lease,
+        };
+        model.session.execution_gate = &model.target_inference_run_lock;
+        if (session_factory.getEmbeddingGemma2Config(model.session) != null) model.session.cohort_scheduler = &model.embedding_cohort_scheduler;
+
+        // One final owner is installed before borrowing shared state. Every
+        // subsequent failure closes the session/worker before freeing it.
+        assets_owned = false;
+        shared_moe_cache = null;
+        shared_prefetch = null;
+        native_generate_coordinator = null;
+        chat_tmpl = null;
+        whisper_prompt_cache = null;
+        owned_model_dir_owned = false;
+        model_storage_owned = false;
+        errdefer {
+            model.deinit();
+            allocator.destroy(model);
+        }
+        if (model.shared_prefetch) |state| try session_factory.attachSharedPrefetchState(model.session, state);
+        return model;
+    }
+
+    pub fn prewarmWithControl(self: *Runtime, control: ?InferenceExecutionControl) !void {
+        if (comptime !@import("build_options").enable_metal) return;
+        const session = self.session;
+        if (@import("../execution/model_candidate.zig").prefersSpecializedSession(session)) {
+            if (session_factory.getGptConfig(session)) |gpt_config| {
+                if (graph_mod.metal_executor.supportsSession(session)) {
+                    _ = graph_mod.metal_executor.prewarmSharedDecoderRuntimeWithControl(self.allocator, session, gpt_config, control) catch |err| {
+                        if (control) |active| try active.check();
+                        switch (err) {
+                            error.Canceled,
+                            error.Cancelled,
+                            error.Timeout,
+                            error.ProcessIsolationRequired,
+                            error.HardCancellationWatchdogNotStarted,
+                            error.InferenceWorkerShuttingDown,
+                            => return err,
+                            else => {},
+                        }
+                        std.log.warn("metal decoder-runtime prewarm failed for {s}: {s}", .{ self.model_dir, @errorName(err) });
+                    };
+                }
+            }
+        }
+    }
+
     runtime_id: RuntimeId = 0,
     residency_mode: RuntimeResidencyMode = .backend_managed,
     chunk_planning: ?ChunkPlanningSnapshot = null,
@@ -828,7 +1083,7 @@ pub const Runtime = struct {
         slot: *?backends.Session,
         lease_slot: *?runtime.tier.memory.AdmissionLease,
     ) void {
-        if (slot.*) |session| session.close();
+        if (slot.*) |session| session.closeRetainingResources(lease_slot);
         slot.* = null;
         if (lease_slot.*) |*lease| lease.release();
         lease_slot.* = null;
@@ -1313,20 +1568,25 @@ pub const Runtime = struct {
         }
         // Cache destruction may enter a driver before Session.close. Protect
         // every retained component first, without borrowing request controls.
-        var close_scopes: [6]backends.Session.CloseScope = @splat(.{});
-        close_scopes[0] = self.session.beginClose();
-        const optional_sessions = [_]?backends.Session{ self.vision_session, self.audio_session, self.text_projection, self.visual_projection, self.audio_projection };
-        for (optional_sessions, 1..) |session, index| {
-            if (session) |component| close_scopes[index] = component.beginClose();
+        const sessions = [_]?backends.Session{ self.session, self.vision_session, self.audio_session, self.text_projection, self.visual_projection, self.audio_projection };
+        const session_leases = [_]*?runtime.tier.memory.AdmissionLease{ &self.resource_lease, &self.vision_resource_lease, &self.audio_resource_lease, &self.text_projection_resource_lease, &self.visual_projection_resource_lease, &self.audio_projection_resource_lease };
+        var close_scopes: [sessions.len]backends.Session.CloseScope = @splat(.{});
+        var aggregate_lifetimes: [sessions.len]?*backends.Session.ModelLifetime = @splat(null);
+        for (sessions, 0..) |session, index| {
+            if (session) |component| {
+                close_scopes[index] = component.beginClose();
+                // Model reservations also cover dependent shared state below.
+                // Quiesce now; keep weights and admission through its cleanup.
+                if (component.model_lifetime) |lifetime| aggregate_lifetimes[index] = lifetime.retain();
+            }
         }
         self.native_generation_graph_cache.deinit();
         self.prompt_prefix_cache.deinit();
-        self.session.close();
-        if (self.vision_session) |vs| vs.close();
-        if (self.audio_session) |as_| as_.close();
-        if (self.text_projection) |tp| tp.close();
-        if (self.visual_projection) |vp| vp.close();
-        if (self.audio_projection) |ap| ap.close();
+        for (sessions, session_leases) |session, lease| {
+            if (session) |component| {
+                if (component.model_lifetime != null) component.closeRetainingResources(lease) else component.close();
+            }
+        }
         if (self.kernel_jit_profile_bundle) |*bundle| bundle.deinit();
         if (self.vision_resource_lease) |*lease| lease.release();
         if (self.audio_resource_lease) |*lease| lease.release();
@@ -1353,6 +1613,7 @@ pub const Runtime = struct {
         // All session/cache/prefetch driver cleanup has returned. End protection
         // before unrelated host tokenizer/template destruction: large vocabularies
         // under Debug allocation tracking can otherwise trigger a false restart.
+        for (aggregate_lifetimes) |lifetime| if (lifetime) |owner| owner.release();
         for (&close_scopes) |*scope| scope.deinit();
         if (self.hf_tok) |ht| ht.deinitSelf();
         if (self.sp_tok) |sp| {
@@ -1411,4 +1672,498 @@ test "loaded runtime cleanup head publication unwinds every allocation failure" 
         }
     };
     try std.testing.checkAllAllocationFailures(a, Case.run, .{directory});
+}
+
+pub fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var paths: std.ArrayList([]const u8) = .empty;
+    inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {
+        if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest, field)) == ?[]const u8) {
+            if (@field(manifest, field)) |path| try paths.append(alloc, path);
+        }
+    }
+    if (manifest.safetensors_index_path) |path| {
+        const raw = try @import("../util/c_file.zig").readFile(alloc, path);
+        const index = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+        if (index == .object) if (index.object.get("weight_map")) |weights| {
+            if (weights != .object) return error.InvalidModelLayout;
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            for (weights.object.values()) |file| {
+                if (file != .string) return error.InvalidModelLayout;
+                const slot = try seen.getOrPut(alloc, file.string);
+                if (!slot.found_existing) try paths.append(alloc, try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path).?, file.string }));
+            }
+        };
+    }
+    var external: std.ArrayList([]const u8) = .empty;
+    for (paths.items) |path| {
+        if (!std.mem.endsWith(u8, path, ".onnx")) continue;
+        var artifacts = try backends.imported_onnx_session.inspectArtifactSet(alloc, path);
+        defer artifacts.deinit();
+        for (artifacts.external_paths) |tensor_path| try external.append(alloc, try alloc.dupe(u8, tensor_path));
+    }
+    try paths.appendSlice(alloc, external.items);
+    return componentDependencySignature(io, paths.items);
+}
+
+const eg2_identity = @import("embedding_gemma2_identity.zig");
+const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
+const florence_arch = @import("../architectures/florence.zig");
+
+pub const Assets = struct {
+    manifest: manifest_mod.ModelManifest,
+    hf_tok: ?*hf_tokenizer.HfTokenizer,
+    sp_tok: ?*sentencepiece.Processor,
+    session: session_loader.ManagedSession,
+    session_manager: *backends.SessionManager,
+    host: Host,
+    model_dir: []const u8,
+    preparation_io: ?std.Io,
+    executor_io: ?std.Io,
+    resolution_revision: [32]u8,
+    resolution_file_revision: [32]u8,
+    native_kv_asset_generation: ?[32]u8,
+    tokenizer_type: manifest_mod.TokenizerType,
+    gliner_span_tokenizer_digest: ?@import("gliner_decide_qualification.zig").Digest = null,
+    embedding_signature: ?[32]u8,
+    tokenizer_resource_lease: ?runtime.tier.memory.AdmissionLease,
+    kernel_jit_profile_bundle: ?kernel_jit_profile_output.LoadedProfileBundle,
+
+    fn deinit(self: *Assets, allocator: std.mem.Allocator) void {
+        self.session.deinit();
+        if (self.hf_tok) |tokenizer| tokenizer.deinitSelf();
+        if (self.sp_tok) |tokenizer| {
+            tokenizer.deinit();
+            allocator.destroy(tokenizer);
+        }
+        if (self.kernel_jit_profile_bundle) |*bundle| bundle.deinit();
+        if (self.tokenizer_resource_lease) |*lease| lease.release();
+        self.manifest.deinit();
+    }
+};
+
+test "loaded runtime owned asset construction unwinds model and shared state at every allocation failure" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try writeRuntimeConstructionFixture(temp.dir);
+    const directory = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..] });
+    defer a.free(directory);
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, path: []const u8) !void {
+            // Backend/artifact construction has independent failure coverage.
+            // Keep its process/IO warmup outside this runtime allocator sweep.
+            const source_allocator = std.testing.allocator;
+            var manifest = try manifest_mod.loadFromDir(source_allocator, path);
+            var manifest_owned = true;
+            defer if (manifest_owned) manifest.deinit();
+            var session = try session_factory.createNativeSession(source_allocator, path);
+            var session_owned = true;
+            defer if (session_owned) session.close();
+            const revision = try resolutionModelRevision(source_allocator, std.testing.io, manifest);
+            var sessions = backends.SessionManager.init(source_allocator);
+            const assets = Assets{
+                .manifest = manifest,
+                .hf_tok = null,
+                .sp_tok = null,
+                .session = .{ .session = session },
+                .session_manager = &sessions,
+                .host = Host.unmanaged(),
+                .model_dir = path,
+                .preparation_io = std.testing.io,
+                .executor_io = std.testing.io,
+                .resolution_revision = revision,
+                .resolution_file_revision = revision,
+                .native_kv_asset_generation = null,
+                .tokenizer_type = .huggingface,
+                .embedding_signature = null,
+                .tokenizer_resource_lease = null,
+                .kernel_jit_profile_bundle = null,
+            };
+            manifest_owned = false;
+            session_owned = false;
+            const model = try Runtime.fromOwnedAssets(allocator, assets, null);
+            defer allocator.destroy(model);
+            defer model.deinit();
+            try std.testing.expect(model.shared_prefetch != null);
+            try std.testing.expect(model.native_generate_coordinator != null);
+            try std.testing.expectEqual(&model.target_inference_run_lock, model.session.execution_gate.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{directory});
+}
+
+pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    var receipt = try managed_receipt.loadValidated(a, io, model_dir);
+    defer if (receipt) |*validated| validated.deinit();
+    if (receipt) |*validated| {
+        const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, validated.artifacts);
+        defer a.free(artifacts);
+        std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
+            fn less(_: void, left: managed_receipt.ValidatedArtifact, right: managed_receipt.ValidatedArtifact) bool {
+                return std.mem.lessThan(u8, left.path, right.path);
+            }
+        }.less);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for (artifacts) |artifact| {
+            const decoded = try ArtifactDigestCache.digest(io, artifact);
+            if (artifact.sha256) |digest| {
+                if (digest.len != 64) return error.InvalidManagedDownload;
+                var expected: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&expected, digest) catch return error.InvalidManagedDownload;
+                if (!std.mem.eql(u8, &expected, &decoded)) return error.ChecksumMismatch;
+            }
+            hash.update(artifact.path);
+            hash.update(&.{0});
+            hash.update(&decoded);
+        }
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+    return resolutionModelRevision(a, io, manifest);
+}
+
+/// The resource domain supplies admission; all model preparation and backend
+/// selection is owned here. Registry publication is a separate operation.
+pub const TokenizerAdmission = struct {
+    context: *anyopaque,
+    reserve_fn: *const fn (*anyopaque, @import("load_plan.zig").ModelLoadAdmissionPlan) anyerror!?runtime.tier.memory.AdmissionLease,
+    fn reserve(self: TokenizerAdmission, plan: @import("load_plan.zig").ModelLoadAdmissionPlan) !?runtime.tier.memory.AdmissionLease {
+        return self.reserve_fn(self.context, plan);
+    }
+};
+pub const PrimaryPreparation = struct {
+    host: Host,
+    component_sessions: *backends.SessionManager,
+    executor_io: ?std.Io,
+    serving_policy: ?@import("compatibility.zig").Policy = null,
+    tokenizer_options: @import("tokenizer_loader.zig").Options = .{},
+    tokenizer_admission: ?TokenizerAdmission = null,
+};
+
+/// A synchronous model load consumes its own runtime snapshot. Borrowed backend
+/// preference/profile slices never escape into the published model owner.
+pub fn loadPrimary(allocator: std.mem.Allocator, model_dir: []const u8, source_sessions: *const backends.SessionManager, preparation: PrimaryPreparation, control: ?InferenceExecutionControl) !*Runtime {
+    var session_snapshot = source_sessions.*;
+    const sm = &session_snapshot;
+
+    if (control) |active| try active.update(.loading_model, 0, 4);
+
+    // Load manifest
+    var man = try manifest_mod.loadFromDir(allocator, model_dir);
+    var man_owned = true;
+    errdefer if (man_owned) man.deinit();
+    if (control) |active| try active.update(.loading_model, 1, 4);
+    var policy_backend_scratch: [7]backends.BackendType = undefined;
+    if (preparation.serving_policy) |policy| {
+        sm.preferred_backends = try @import("backend_compatibility.zig").policyAllowedBackends(
+            allocator,
+            &policy_backend_scratch,
+            model_dir,
+            &man,
+            sm.preferred_backends,
+            policy,
+        );
+    }
+    if (man.hasIncompleteGlinerBundle()) return error.IncompleteGlinerBundle;
+    if (man.hasIncompleteColqwenBundle()) return error.IncompleteColqwenBundle;
+    if (man.hasIncompleteClipclapGgufBundle()) return error.IncompleteClipclapGgufBundle;
+    if (man.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
+    var eg2_backends: [3]backends.BackendType = undefined;
+    if (man.embedding_style == .embedding_gemma2) {
+        var count: usize = 0;
+        for (sm.preferred_backends) |backend| {
+            if (backend != .native and backend != .metal and backend != .cuda) continue;
+            var duplicate = false;
+            for (eg2_backends[0..count]) |existing| if (existing == backend) {
+                duplicate = true;
+            };
+            if (!duplicate) {
+                eg2_backends[count] = backend;
+                count += 1;
+            }
+        }
+        if (count == 0) return error.UnsupportedEmbeddingGemma2Backend;
+        sm.preferred_backends = eg2_backends[0..count];
+    }
+
+    // Record before tokenizer and weight loading. Errors disable only the
+    // optional portable-KV route; ordinary inference remains available.
+    const native_kv_asset_generation: ?[32]u8 = native_generation: {
+        if (!man.usesGgufWeights()) break :native_generation null;
+        var files = NativeKvFiles.init(allocator, model_dir, man) catch break :native_generation null;
+        defer files.deinit();
+        break :native_generation native_kv_identity.fileGeneration(std.Io.Dir.cwd(), sm.io orelse std.Options.debug_io, &files.entries) catch null;
+    };
+    const resolution_file_revision = try resolutionModelRevision(allocator, sm.io orelse std.Options.debug_io, man);
+    const resolution_revision = try modelIdentity(allocator, sm.io orelse std.Options.debug_io, model_dir, man);
+    const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
+        try eg2_identity.signature(allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
+    else
+        null;
+
+    var qualified_profile_bundle: ?kernel_jit_profile_output.LoadedProfileBundle =
+        if (sm.kernel_jit.qualified_profile_path) |path|
+            try kernel_jit_profile_output.loadQualifiedProfileBundleIfPresent(
+                allocator,
+                sm.io orelse std.Options.debug_io,
+                path,
+            )
+        else
+            null;
+    errdefer if (qualified_profile_bundle) |*bundle| bundle.deinit();
+    if (qualified_profile_bundle) |*bundle| {
+        sm.kernel_jit.qualified_profile_path = bundle.kernelJitBundle().primary;
+        if (!sm.kernel_jit.mode.failClosed() and !bundle.hasQualifiedKernels(.primary)) {
+            std.log.warn("kernel JIT profile bundle primary has no qualified winner; using bundled kernels", .{});
+            sm.kernel_jit.qualified_profile_path = null;
+            sm.kernel_jit.mode = .off;
+        }
+    }
+
+    // Load tokenizer
+    var hf_tok: ?*hf_tokenizer.HfTokenizer = null;
+    var sp_tok: ?*sentencepiece.Processor = null;
+    var gliner_span_tokenizer_digest: ?@import("gliner_decide_qualification.zig").Digest = null;
+
+    const tokenizer_type = try tokenizer_loader.select(allocator, model_dir, man);
+    const tokenizer_admission_plan: ?@import("load_plan.zig").ModelLoadAdmissionPlan = if (preparation.host.session_loading.admission_enabled)
+        try @import("load_plan.zig").tokenizerLoadAdmissionPlan(
+            allocator,
+            model_dir,
+            &man,
+            tokenizer_type,
+        )
+    else
+        null;
+    var tokenizer_resource_lease = if (tokenizer_admission_plan) |plan|
+        try (preparation.tokenizer_admission orelse return error.MissingTokenizerAdmissionService).reserve(plan)
+    else
+        null;
+    errdefer if (tokenizer_resource_lease) |*lease| lease.release();
+    // Register these after the lease cleanup so LIFO unwinding frees the
+    // admitted memory before making its capacity visible to another load.
+    errdefer if (hf_tok) |ht| ht.deinitSelf();
+    errdefer if (sp_tok) |sp| {
+        sp.deinit();
+        allocator.destroy(sp);
+    };
+
+    if (control) |active| try active.check();
+    const parsed_tokenizer = try tokenizer_loader.loadSelected(allocator, model_dir, &man, tokenizer_type, .{
+        .cache = preparation.tokenizer_options.cache,
+        .parallel = preparation.tokenizer_options.parallel,
+    });
+    hf_tok = parsed_tokenizer.hf;
+    sp_tok = parsed_tokenizer.sp;
+    gliner_span_tokenizer_digest = parsed_tokenizer.decision_digest;
+    if (control) |active| try active.update(.loading_model, 2, 4);
+    if (tokenizer_resource_lease) |*lease| {
+        try lease.retain(tokenizer_admission_plan.?.resident);
+    }
+
+    // Plan and reserve resources before the backend begins allocating weights.
+    if (control) |active| try active.update(.loading_weights, 0, 1);
+    var loaded_session = try session_loader.loadPreferred(allocator, preparation.host.session_loading, sm.preferred_backends, model_dir, man, sm, control);
+    defer loaded_session.deinit();
+    if (control) |active| try active.update(.loading_model, 3, 4);
+    const assets = Assets{
+        .manifest = man,
+        .hf_tok = hf_tok,
+        .sp_tok = sp_tok,
+        .session = loaded_session.take(),
+        .session_manager = preparation.component_sessions,
+        .host = preparation.host,
+        .model_dir = model_dir,
+        .preparation_io = sm.io,
+        .executor_io = preparation.executor_io,
+        .resolution_revision = resolution_revision,
+        .resolution_file_revision = resolution_file_revision,
+        .native_kv_asset_generation = native_kv_asset_generation,
+        .tokenizer_type = tokenizer_type,
+        .gliner_span_tokenizer_digest = gliner_span_tokenizer_digest,
+        .embedding_signature = embedding_signature,
+        .tokenizer_resource_lease = tokenizer_resource_lease,
+        .kernel_jit_profile_bundle = qualified_profile_bundle,
+    };
+    man_owned = false;
+    hf_tok = null;
+    sp_tok = null;
+    tokenizer_resource_lease = null;
+    qualified_profile_bundle = null;
+    return Runtime.fromOwnedAssets(allocator, assets, control);
+}
+
+fn writeRuntimeConstructionFixture(directory: std.Io.Dir) !void {
+    try directory.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"llama\",\"hidden_size\":4,\"num_hidden_layers\":1,\"num_attention_heads\":1,\"num_key_value_heads\":1,\"intermediate_size\":8,\"vocab_size\":2}" });
+    const header = "{\"model.embed_tokens.weight\":{\"dtype\":\"F32\",\"shape\":[2,4],\"data_offsets\":[0,32]}}";
+    const padded = comptime std.mem.alignForward(usize, header.len, 8);
+    var bytes: [8 + padded + 32]u8 = @splat(' ');
+    std.mem.writeInt(u64, bytes[0..8], padded, .little);
+    @memcpy(bytes[8..][0..header.len], header);
+    const weights = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    @memcpy(bytes[8 + padded ..], std.mem.asBytes(&weights));
+    try directory.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = &bytes });
+    try directory.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"[UNK]\",\"vocab\":{\"[UNK]\":0,\"hello\":1}}}" });
+}
+
+test "primary model preparation loads without a serving registry and preserves its runtime snapshot" {
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try writeRuntimeConstructionFixture(temp.dir);
+    const directory = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..] });
+    defer a.free(directory);
+    var source = backends.SessionManager{ .allocator = a, .preferred_backends = &.{.native} };
+    const original = source;
+    const model = try loadPrimary(a, directory, &source, .{ .host = Host.unmanaged(), .component_sessions = &source, .executor_io = std.testing.io }, null);
+    defer a.destroy(model);
+    defer model.deinit();
+    try std.testing.expectEqual(backends.BackendType.native, model.session.backend());
+    try std.testing.expectEqual(&model.target_inference_run_lock, model.session.execution_gate.?);
+    try std.testing.expect(model.hf_tok != null);
+    const ids = try model.hf_tok.?.tokenizer().encode(a, "hello");
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{1}, ids);
+    try std.testing.expectEqualDeep(original, source);
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, loadPrimary(a, "/missing-cancelled-model", &source, .{ .host = Host.unmanaged(), .component_sessions = &source, .executor_io = std.testing.io }, .{ .check_fn = Cancel.check }));
+}
+
+pub const ChunkPlanningAssets = struct {
+    model_dir: []const u8,
+    identity_signature: ?[32]u8 = null,
+    allocator: std.mem.Allocator,
+    manifest: manifest_mod.ModelManifest,
+    hf_tok: ?*hf_tokenizer.HfTokenizer = null,
+    sp_tok: ?*sentencepiece.Processor = null,
+    lease: ?runtime.tier.memory.AdmissionLease = null,
+    revision: [32]u8,
+    identity: [64]u8,
+    planning: ChunkPlanningSnapshot,
+    io: std.Io,
+    pub fn tokenizer(self: *@This()) tokenizer_mod.Tokenizer {
+        if (self.hf_tok) |tok| return tok.tokenizer();
+        return self.sp_tok.?.tokenizer();
+    }
+    pub fn verify(self: *@This()) !void {
+        if (self.identity_signature) |expected| {
+            const actual = try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, self.io, self.model_dir, self.manifest.safetensors_path.?);
+            if (!std.mem.eql(u8, &actual, &expected)) return error.ModelArtifactsChanging;
+        }
+        var paths: [9][]const u8 = undefined;
+        const signature = try componentDependencySignature(self.io, chunkPlanningPaths(self.manifest, &paths));
+        if (!std.mem.eql(u8, &signature, &self.planning.signature)) return error.ModelArtifactsChanging;
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.hf_tok) |tok| tok.deinitSelf();
+        if (self.sp_tok) |tok| {
+            tok.deinit();
+            self.allocator.destroy(tok);
+        }
+        self.manifest.deinit();
+        if (self.lease) |*lease| lease.release();
+    }
+};
+
+pub fn embeddingPlanningBackend(manager: backends.SessionManager) backends.BackendType {
+    if (manager.required_backend) |backend| return backend;
+    for (manager.preferred_backends) |backend| {
+        if (!backend.available()) continue;
+        if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
+        if (backend == .cuda or backend == .metal or backend == .native) return backend;
+    }
+    return .native;
+}
+
+/// A metadata-only planning snapshot uses the same tokenizer resource service
+/// as a full model load. No backend or driver is constructed here.
+pub const PlanningPreparation = struct {
+    backend_snapshot: backends.SessionManager,
+    identity_io: ?std.Io,
+    tokenizer_options: @import("tokenizer_loader.zig").Options = .{},
+    tokenizer_admission: ?TokenizerAdmission = null,
+    admission_enabled: bool = false,
+};
+pub fn loadPlanningAssets(allocator: std.mem.Allocator, model_dir: []const u8, io: std.Io, preparation: PlanningPreparation, control: InferenceExecutionControl) !ChunkPlanningAssets {
+    try control.check();
+    var man = try manifest_mod.loadFromDir(allocator, model_dir);
+    errdefer man.deinit();
+    const revision = try modelIdentity(allocator, preparation.identity_io orelse return error.MissingIoRuntime, model_dir, man);
+    const planning = try chunkPlanningSnapshotWithControl(allocator, io, man, revision, control);
+    const kind = try tokenizer_loader.select(allocator, model_dir, man);
+    const plan = try @import("load_plan.zig").tokenizerLoadAdmissionPlan(allocator, model_dir, &man, kind);
+    var lease = if (preparation.tokenizer_admission) |service| try service.reserve(plan) else if (preparation.admission_enabled) return error.MissingTokenizerAdmissionService else null;
+    errdefer if (lease) |*active| active.release();
+    var hf: ?*hf_tokenizer.HfTokenizer = null;
+    var sp: ?*sentencepiece.Processor = null;
+    errdefer if (hf) |tok| tok.deinitSelf();
+    errdefer if (sp) |tok| {
+        tok.deinit();
+        allocator.destroy(tok);
+    };
+    const parsed_tokenizer = try tokenizer_loader.loadSelected(allocator, model_dir, &man, kind, .{
+        .cache = preparation.tokenizer_options.cache,
+        .parallel = preparation.tokenizer_options.parallel,
+    });
+    hf = parsed_tokenizer.hf;
+    sp = parsed_tokenizer.sp;
+    const identity = if (man.embedding_style == .embedding_gemma2)
+        @import("../models/embedding_gemma2_identity.zig").forBackend(
+            (try @import("../models/embedding_gemma2_identity.zig").snapshotCached(allocator, io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights, control)).digest,
+            embeddingPlanningBackend(preparation.backend_snapshot),
+        )
+    else
+        std.fmt.bytesToHex(revision, .lower);
+    if (lease) |*active| try active.retain(plan.resident);
+    try control.check();
+    return .{ .model_dir = model_dir, .identity_signature = if (man.embedding_style == .embedding_gemma2) try @import("../models/embedding_gemma2_identity.zig").signature(allocator, io, model_dir, man.safetensors_path.?) else null, .allocator = allocator, .manifest = man, .hf_tok = hf, .sp_tok = sp, .lease = lease, .revision = revision, .identity = identity, .planning = planning, .io = io };
+}
+
+test "metadata planning owns tokenizer and identity without constructing the requested backend" {
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try writeRuntimeConstructionFixture(temp.dir);
+    const directory = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..] });
+    defer a.free(directory);
+    // This backend policy rejects actual GPU construction without supervision,
+    // including on a CPU-only build. Metadata planning needs neither a driver
+    // nor a numerical backend and must still remain usable.
+    const preparation = PlanningPreparation{
+        .backend_snapshot = .{ .allocator = a, .preferred_backends = &.{.cuda}, .required_backend = .cuda, .process_termination_available = false },
+        .identity_io = std.testing.io,
+    };
+    var assets = try loadPlanningAssets(a, directory, std.testing.io, preparation, .{});
+    defer assets.deinit();
+    const ids = try assets.tokenizer().encode(a, "hello");
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{1}, ids);
+    try assets.verify();
+    const Deny = struct {
+        calls: usize = 0,
+        fn reserve(raw: *anyopaque, _: @import("load_plan.zig").ModelLoadAdmissionPlan) !?runtime.tier.memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.ResourceTemporarilyUnavailable;
+        }
+        fn cancel(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var denied = preparation;
+    var probe = Deny{};
+    denied.admission_enabled = true;
+    denied.tokenizer_admission = .{ .context = &probe, .reserve_fn = Deny.reserve };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, loadPlanningAssets(a, directory, std.testing.io, denied, .{}));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectError(error.Cancelled, loadPlanningAssets(a, "/missing-cancelled-model", std.testing.io, preparation, .{ .check_fn = Deny.cancel }));
 }

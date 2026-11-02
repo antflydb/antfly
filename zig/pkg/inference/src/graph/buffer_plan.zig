@@ -174,6 +174,14 @@ pub const BufferPlan = struct {
         return id;
     }
 
+    /// Explicit byte-addressed host control workspace, even in a device-only
+    /// partition. It shares the plan's allocation identity and frame lifetime.
+    pub fn addHostWorkspace(self: *BufferPlan, bytes: usize) !AllocationId {
+        const id = try self.addWorkspace(.native, bytes, 1);
+        self.allocations[id].storage = .host_dense;
+        return id;
+    }
+
     /// A stable mutable input bank for captured submission. External inputs
     /// remain external logical slots; this allocation records the explicit
     /// device copy which binds their current values to the captured addresses.
@@ -477,18 +485,20 @@ pub fn build(
         };
     }
 
-    // A metadata view keeps its source allocation live through every view
-    // consumer and published output. Propagate before assigning/reusing IDs;
-    // retaining a tensor wrapper alone cannot prevent an overlapping write.
-    var view_index = slots.len;
-    while (view_index != 0) {
-        view_index -= 1;
-        const view = slots[view_index];
-        if (view.kind != .view) continue;
-        const source = view.source_slot orelse continue;
-        if (source >= view_index) return error.InvalidViewSource;
-        slots[source].last_use = @max(slots[source].last_use, view.last_use);
+    // The selected descriptors supply alias facts; the shared authority
+    // extends backing lifetimes before allocation reuse is considered.
+    const alias_sources = try allocator.alloc(NodeId, slots.len);
+    defer allocator.free(alias_sources);
+    @memset(alias_sources, null_node);
+    for (slots, 0..) |slot, index| {
+        if (slot.kind != .view) continue;
+        const source = slot.source_slot orelse continue;
+        if (source >= index) return error.InvalidViewSource;
+        alias_sources[index] = source;
     }
+    const backing_last_use = try ml.graph.passes.memory.computeAliasLastUse(allocator, last_use, alias_sources, .{ .propagation = .sources });
+    defer allocator.free(backing_last_use);
+    for (slots, backing_last_use) |*slot, end| slot.last_use = end;
 
     var allocations = std.ArrayListUnmanaged(PhysicalAllocation).empty;
     errdefer allocations.deinit(allocator);

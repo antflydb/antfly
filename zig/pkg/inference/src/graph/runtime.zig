@@ -180,9 +180,9 @@ pub const Runtime = struct {
         options: interpreter.ExecuteOptions,
     ) !Result {
         const transfer_audit = @import("../execution/transfer_audit.zig");
-        var audit = transfer_audit.Audit{ .forbid_device_host_access = options.activation_readbacks == .forbidden };
-        const auditing = options.collect_partition_stats or audit.forbid_device_host_access;
-        if (audit.forbid_device_host_access) try transfer_audit.validateBackend(self.default_backend.kind());
+        var audit = transfer_audit.Audit{ .forbid_activation_readbacks = options.activation_readbacks == .forbidden };
+        const auditing = options.collect_partition_stats or audit.forbid_activation_readbacks;
+        if (audit.forbid_activation_readbacks) try transfer_audit.validateBackend(self.default_backend.kind());
         if (auditing) try transfer_audit.begin(&audit);
         defer if (auditing) transfer_audit.end();
         var result = try self.executeImpl(allocator, graph, options);
@@ -220,6 +220,7 @@ pub const Runtime = struct {
             if (!capturing.*) return err;
             frame.?.abortReplayCapture(err);
             capturing.* = false;
+            if (frame.?.storage_admission_failed) return err;
             break :recover try multi_executor.executeMultiDevice(allocator, graph, plan, mesh, options);
         };
         if (!capturing.*) return result;
@@ -255,7 +256,7 @@ pub const Runtime = struct {
             .partitioned, .compiled_preferred, .compiled_required => {
                 const plan = self.plan orelse return error.MissingGraphRuntimePlan;
                 const mesh = self.mesh orelse return error.MissingGraphRuntimeMesh;
-                const frame = if (self.physical_pool) |pool| try pool.acquire() else null;
+                const frame = if (self.physical_pool) |pool| try pool.acquireWithAdmission(options.storage_admission) else null;
                 var frame_finished = false;
                 defer if (frame) |active| {
                     if (!frame_finished) {

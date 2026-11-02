@@ -25,6 +25,7 @@
 //   - config.json (model_type: whisper)
 //   - preprocessor_config.json (mel spectrogram params)
 
+const stage_runtime = @import("../execution/encoder_decoder_runtime.zig");
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -287,20 +288,13 @@ pub const TranscriptionPipeline = struct {
         const mel_shape = [_]i64{ 1, @intCast(n_mels), @intCast(n_frames) };
         var mel_tensor = try backends.Tensor.initFloat32(allocator, "input_features", &mel_shape, mel);
         defer mel_tensor.deinit();
-        const encoder_outputs = if (self.batch_dispatch) |dispatch|
-            try dispatch.run(allocator, self.encoder, &encoder_permit, null, &.{mel_tensor}, self.execution_control)
-        else
-            try encoder_permit.runWithControl(&.{mel_tensor}, allocator, self.execution_control);
-        defer {
-            for (encoder_outputs) |*t| {
-                var mt = t.*;
-                mt.deinit();
-            }
-            allocator.free(encoder_outputs);
-        }
-        if (encoder_outputs.len == 0) return error.NoEncoderOutput;
+        var encoder_outputs = try stage_runtime.encodeWithPermit(allocator, self.encoder, self.decoder, &.{mel_tensor}, self.batch_dispatch, self.execution_control, &encoder_permit);
+        defer encoder_outputs.deinit(allocator);
         timing.encoder_ns = platform.time.monotonicNs() -| encoder_started;
-        const enc_seq_len: usize = if (encoder_outputs[0].shape.len >= 2) @intCast(encoder_outputs[0].shape[1]) else 1;
+        const enc_seq_len: usize = switch (encoder_outputs) {
+            .host => |outputs| if (outputs.len == 0) return error.NoEncoderOutput else if (outputs[0].shape.len >= 2) @intCast(outputs[0].shape[1]) else 1,
+            .resident => |value| @intCast(value.shape[1]),
+        };
         const enc_mask = try allocator.alloc(i64, enc_seq_len);
         defer allocator.free(enc_mask);
         @memset(enc_mask, 1);
@@ -312,7 +306,7 @@ pub const TranscriptionPipeline = struct {
         defer if (chosen) |*attempt| attempt.deinit(allocator);
         for (temperatures, 0..) |temperature, attempt_index| {
             if (attempt_index > 0 and !self.config.temperature_fallback) break;
-            var attempt = try self.decodeAttempt(encoder_outputs[0], enc_seq_len, enc_mask, prompt_prefix, temperature, attempt_index, &timing);
+            var attempt = try self.decodeAttempt(&encoder_outputs, enc_seq_len, enc_mask, prompt_prefix, temperature, attempt_index, &timing);
             errdefer attempt.deinit(allocator);
             const needs_fallback = attempt.compression_ratio > self.config.compression_ratio_threshold or
                 attempt.avg_logprob < self.config.logprob_threshold;
@@ -414,7 +408,7 @@ pub const TranscriptionPipeline = struct {
 
     fn decodeAttempt(
         self: *TranscriptionPipeline,
-        encoder_output: backends.Tensor,
+        encoder_output: *const stage_runtime.EncoderOutputs,
         enc_seq_len: usize,
         enc_mask: []const i64,
         prompt_prefix: []const i32,
@@ -460,19 +454,23 @@ pub const TranscriptionPipeline = struct {
         var logprob_sum: f64 = 0;
         var no_speech_prob: f32 = 0;
 
+        const host_encoder: ?backends.Tensor = switch (encoder_output.*) {
+            .host => |outputs| if (outputs.len != 0) outputs[0] else return error.NoEncoderOutput,
+            .resident => null,
+        };
         // Native Whisper sessions decode through the KV cache; ONNX merged
         // bundles keep their own incremental state; anything else re-runs
         // the full prefix per step.
-        var native_decoder: ?session_factory.WhisperNativeDecoder = try session_factory.whisperNativeDecoder(
+        var native_decoder: ?session_factory.WhisperNativeDecoder = if (host_encoder) |host| try session_factory.whisperNativeDecoder(
             self.decoder,
             allocator,
             self.execution_control,
-            encoder_output.asFloat32(),
+            host.asFloat32(),
             enc_seq_len,
-        );
+        ) else null;
         defer if (native_decoder) |*decoder| decoder.deinit();
         timing.kv_cached = native_decoder != null;
-        var incremental = if (native_decoder != null) null else @import("seq2seq_decode.zig").State.init(allocator, self.decoder, encoder_output, enc_mask, self.config.vocab_size);
+        var incremental = if (native_decoder == null and host_encoder != null) @import("seq2seq_decode.zig").State.init(allocator, self.decoder, host_encoder.?, enc_mask, self.config.vocab_size) else null;
         defer if (incremental) |*state| state.deinit();
         // Suppression list handed to the device token-choice kernel.
         var suppress_scratch = std.ArrayListUnmanaged(i32).empty;
@@ -554,12 +552,15 @@ pub const TranscriptionPipeline = struct {
                     native_logits = try decoder.step(pending);
                     last_logits = native_logits.?;
                 }
+            } else if (host_encoder == null) {
+                native_logits = try stage_runtime.finalVocabularyRow(allocator, self.decoder, encoder_output, dec_ids[0..dec_len], enc_mask, self.config.vocab_size, self.execution_control);
+                last_logits = native_logits.?;
             } else {
                 const dec_seq: i64 = @intCast(dec_len);
                 const dec_shape = [_]i64{ 1, dec_seq };
                 var dec_tensor = try backends.Tensor.initInt64(allocator, "input_ids", &dec_shape, dec_ids[0..dec_len]);
                 defer dec_tensor.deinit();
-                const enc_hidden = encoder_output.borrowedView("encoder_hidden_states");
+                const enc_hidden = host_encoder.?.borrowedView("encoder_hidden_states");
                 dec_outputs = if (incremental) |*state| try state.stepOutputs(dec_ids[0..dec_len], self.batch_dispatch, self.execution_control) else if (self.batch_dispatch) |dispatch| try dispatch.run(allocator, self.decoder, null, null, &.{ dec_tensor, enc_hidden }, self.execution_control) else try self.decoder.runWithControl(
                     &.{ dec_tensor, enc_hidden },
                     allocator,

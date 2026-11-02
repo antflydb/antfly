@@ -52,7 +52,7 @@ pub const ManagedSession = struct {
     owns_session: bool = true,
 
     pub fn deinit(self: *ManagedSession) void {
-        if (self.owns_session) self.session.close();
+        if (self.owns_session) self.session.closeRetainingResources(&self.resource_lease);
         if (self.resource_lease) |*lease| lease.release();
         self.resource_lease = null;
         self.owns_session = false;

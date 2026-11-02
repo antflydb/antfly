@@ -102,12 +102,7 @@ pub const RewritingPipeline = struct {
 
             fn execute(self_job: *@This()) !void {
                 const alloc = std.heap.smp_allocator;
-                const outputs = try self_job.pipeline.encodeMasked(alloc, self_job.ids, self_job.mask);
-                defer {
-                    for (outputs) |*output| output.deinit();
-                    alloc.free(outputs);
-                }
-                self_job.output = try self_job.pipeline.greedyDecode(alloc, outputs, self_job.mask, self_job.ids.len);
+                self_job.output = try self_job.pipeline.generateMasked(alloc, self_job.ids, self_job.mask);
             }
             fn run(self_job: *@This()) std.Io.Cancelable!void {
                 self_job.execute() catch |err| {
@@ -192,20 +187,10 @@ pub const RewritingPipeline = struct {
             input_ids[i] = @intCast(token_ids_i32[i]);
         }
 
-        // 2. Run encoder
-        const encoder_outputs = try self.enc_dec.encode(allocator, input_ids, seq_len);
-        defer {
-            for (encoder_outputs) |*o| o.deinit();
-            allocator.free(encoder_outputs);
-        }
-
-        // 3. Build encoder attention mask (all 1s for real tokens)
         const enc_mask = try allocator.alloc(i64, seq_len);
         defer allocator.free(enc_mask);
         @memset(enc_mask, 1);
-
-        // 4. Greedy decode
-        var gen_result = try self.enc_dec.greedyDecode(allocator, encoder_outputs, enc_mask, seq_len);
+        var gen_result = try self.enc_dec.generateMasked(allocator, input_ids, enc_mask);
         defer gen_result.deinit();
 
         // 5. Decode output token IDs to text

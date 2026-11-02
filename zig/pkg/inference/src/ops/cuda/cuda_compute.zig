@@ -11970,7 +11970,14 @@ fn tryCublasLtF32Linear(
     // Its wide projections benefit from cuBLASLt below the general 128-row gate.
     if ((!self.strict_f32_weights and rows < 128) or in_dim < 64 or out_dim < 64) return false;
     const blas = &(self.cublaslt orelse return false);
-    blas.matmulF32WeightF32Out(&self.ctx, dst, input, weight, rows, in_dim, out_dim) catch return false;
+    blas.matmulF32WeightF32Out(&self.ctx, dst, input, weight, rows, in_dim, out_dim) catch |err| {
+        // A prepared physical capture must preserve its warmed vendor route.
+        // Cache eviction/misses decline recording before submission, rather
+        // than silently capturing a different SIMT schedule. Ordinary direct
+        // calls retain their existing fallback behavior.
+        if (self.physical_execution_storage != null and self.debug_cuda_graph_capture_active) return err;
+        return false;
+    };
     return true;
 }
 
@@ -32042,27 +32049,18 @@ fn physicalReplayTensorSupportedOp(ctx: *anyopaque, value: CT) bool {
 
 fn physicalReplayKernelSupportedOp(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     const compute: *CudaCompute = @ptrCast(@alignCast(ctx));
-    var rows: usize = 0;
-    var in_dim: usize = 0;
-    var out_dim: usize = 0;
-    switch (descriptor.operation) {
-        .linear => |projection| {
-            rows = projection.rows;
-            in_dim = projection.in_dim;
-            out_dim = projection.out_dim;
-        },
-        .dot => |dot| {
-            if (descriptor.input_shapes[0].rank() != 2) return true;
-            if (compute.training_blas != null) return false;
-            rows = dot.m;
-            in_dim = dot.k;
-            out_dim = dot.n;
-        },
-        .transpose, .broadcast, .unary, .binary, .norm, .softmax, .rope, .reduction, .concat, .slice, .gather => return true,
-    }
-    const vendor = cudaCublasLtEnabled() and compute.ctx.info.compute_major >= 8 and compute.cublaslt != null and
-        (compute.strict_f32_weights or rows >= 128) and in_dim >= 64 and out_dim >= 64;
-    return !vendor;
+    return switch (descriptor.operation) {
+        .dot => descriptor.input_shapes[0].rank() != 2 or compute.training_blas == null,
+        // Strict-F32 cuBLASLt linear dispatch uses the bounded warmed plan
+        // cache and an explicit zero-workspace invocation. Bias is the same
+        // GEMM plus the existing add-bias kernel. Reduced/packed weights still
+        // fail physicalReplayTensorSupportedOp: their staging is not assigned.
+        .linear => true,
+        // Index validity is checked against current metadata on every call.
+        // A capture cannot freeze that check without an immutable proof.
+        .gather => false,
+        .transpose, .broadcast, .unary, .binary, .norm, .softmax, .rope, .reduction, .concat, .slice => true,
+    };
 }
 
 fn createPhysicalReplayOp(ctx: *anyopaque) anyerror!?ops.physical_storage.Replay {
@@ -32132,9 +32130,36 @@ fn assignedKernelAuxiliariesOp(ctx: *anyopaque, descriptor: *const ops.kernel_de
 }
 
 fn assignedKernelWorkspaceOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) anyerror!ops.kernel_descriptor.WorkspaceRequirement {
+    if (descriptor.operation == .gather) {
+        if (descriptor.input_count != 2) return error.InvalidShape;
+        const shape = descriptor.input_shapes[1];
+        const width: usize = if (shape.dtype == .i64) 8 else if (shape.dtype == .i32 or shape.dtype == .f32) 4 else return error.UnsupportedTensorType;
+        return .{ .host_byte_size = try std.math.mul(usize, @intCast(shape.numElements() orelse return error.InvalidShape), width) };
+    }
     if (descriptor.operation == .dot and descriptor.input_shapes[0].rank() == 2 and descriptor.operation.dot.lhs_contract_last and !descriptor.operation.dot.rhs_contract_last)
         return .{ .byte_size = @as(usize, @intCast(descriptor.input_shapes[1].numElements().?)) * @sizeOf(f32) };
     return .{};
+}
+
+/// Validate only the current index/control payload; never download the table
+/// or activation. Scratch is assigned by the executable, with no warm heap
+/// allocation. An invalid index fails before the gather launch, as on CPU.
+fn validateAssignedGatherIndices(self: *CudaCompute, indices: *const CudaTensor, extent: usize, scratch: []u8) !void {
+    const audit = @import("../../execution/transfer_audit.zig");
+    try audit.checkIndexMetadataAccess();
+    if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
+    if (self.debug_cuda_graph_capture_active) {
+        self.debug_cuda_graph_capture_disabled = true;
+        return error.CudaGraphCaptureUnsafeHostCopy;
+    }
+    const bytes = try std.math.mul(usize, indices.elem_count, indices.dtype.byteSize());
+    if (scratch.len < bytes or indices.buffer.len < bytes) return error.MissingAssignedHostWorkspace;
+    try indices.buffer.copyIndexMetadataToHost(&self.ctx, scratch[0..bytes]);
+    self.stats.d2h_bytes += bytes;
+    try synchronizeAndDrainDeferredDeviceFrees(self);
+    self.stats.download_syncs += 1;
+    try audit.indexMetadataHostAccess(bytes);
+    try (try @import("../index_metadata.zig").Reader.init(indices.dtype, scratch[0..bytes])).validate(extent);
 }
 
 fn assignedProjectionWeightSupported(weight: *const CudaTensor, bias: bool) bool {
@@ -32153,6 +32178,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const descriptor = request.descriptor;
     if (request.inputs.len != descriptor.input_count) return error.InvalidShape;
+    if (descriptor.operation == .gather and descriptor.input_count != 2) return error.InvalidShape;
     for (request.inputs, 0..) |input, i| {
         const tensor = tensorFromCt(input);
         if (tensor.elem_count != descriptor.input_shapes[i].numElements().?) return false;
@@ -32192,9 +32218,10 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .rope) {
         for (request.inputs) |input| {
             const source = tensorFromCt(input);
-            if (kernel_geometry.byteRangesOverlap(source.buffer.ptr, source.elem_count * @sizeOf(f32), output.buffer.ptr, output.elem_count * @sizeOf(f32))) return error.InvalidAssignedAlias;
+            if (kernel_geometry.byteRangesOverlap(source.buffer.ptr, try checkedMul(source.elem_count, source.dtype.byteSize()), output.buffer.ptr, try checkedMul(output.elem_count, output.dtype.byteSize()))) return error.InvalidAssignedAlias;
         }
     }
+    if (descriptor.operation == .gather) try validateAssignedGatherIndices(self, tensorFromCt(request.inputs[1]), descriptor.operation.gather.geometry.extent, request.host_workspace);
     for (request.inputs) |input| try retainPhysicalCaptureTensor(self, input);
     try retainPhysicalCaptureTensor(self, output_ct);
     if (request.workspace) |workspace| try retainPhysicalCaptureTensor(self, workspace);
@@ -33076,7 +33103,7 @@ test "CUDA resident weight uploads release partial host allocations and device b
     try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, -4 }, source.asFloat32());
 }
 
-test "CUDA typed gather descriptors execute into assigned storage without host access" {
+test "CUDA typed gather descriptors validate counted metadata without activation readback" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
     var compute = try CudaCompute.init(a);
@@ -33107,7 +33134,10 @@ test "CUDA typed gather descriptors execute into assigned storage without host a
         var descriptor = K.lower(&graph, y).?;
         const output = try @import("../testing/assigned_kernel_conformance.zig").physicalTensor(&cb, &.{ -99, -99, -99, -99, -99, -99 }, &.{ 3, 2 });
         defer cb.free(output);
-        var request = K.Invocation{ .descriptor = &descriptor, .inputs = &.{ input, indices } };
+        const requirements = try assignedKernelWorkspaceOp(&compute, &descriptor);
+        const host_workspace = try a.alloc(u8, requirements.host_byte_size);
+        defer a.free(host_workspace);
+        var request = K.Invocation{ .descriptor = &descriptor, .inputs = &.{ input, indices }, .host_workspace = host_workspace };
         const audit_mod = @import("../../execution/transfer_audit.zig");
         var audit = audit_mod.Audit{ .forbid_device_host_access = true };
         try audit_mod.begin(&audit);
@@ -33118,6 +33148,12 @@ test "CUDA typed gather descriptors execute into assigned storage without host a
         defer a.free(untouched);
         try std.testing.expectEqualSlices(f32, &.{ -99, -99, -99, -99, -99, -99 }, untouched);
         request.output = output;
+        try audit_mod.begin(&audit);
+        const all_read_rejected = runAssignedKernelOp(&compute, request);
+        audit_mod.end();
+        try std.testing.expectError(error.DeviceReadbackForbidden, all_read_rejected);
+        try std.testing.expectEqual(@as(u64, 0), audit.download_bytes);
+        audit = .{ .forbid_activation_readbacks = true };
         for (0..3) |_| {
             try audit_mod.begin(&audit);
             const executed = runAssignedKernelOp(&compute, request);
@@ -33127,9 +33163,25 @@ test "CUDA typed gather descriptors execute into assigned storage without host a
             defer a.free(actual);
             try std.testing.expectEqualSlices(f32, &.{ 5, 6, 1, 2, 1, 2 }, actual);
         }
+        try std.testing.expectEqual(@as(u64, 3), audit.index_metadata_host_accesses);
+        try std.testing.expectEqual(@as(u64, 3 * @sizeOf(@TypeOf(selected))), audit.index_metadata_host_access_bytes);
+        try std.testing.expectEqual(audit.index_metadata_host_access_bytes, audit.download_bytes);
+        try std.testing.expectEqual(audit.index_metadata_host_access_bytes, audit.host_access_bytes);
         var aliased = request;
         aliased.output = input;
         try std.testing.expectError(error.InvalidAssignedAlias, runAssignedKernelOp(&compute, aliased));
+        if (dtype == .i64) {
+            // The final i64 lies past the mistaken 3*sizeof(f32) span.
+            // An empty metadata workspace makes a missed alias fail before
+            // any device copy/launch, keeping the regression safe either way.
+            const target = tensorFromCt(output);
+            const original_buffer = target.buffer;
+            defer target.buffer = original_buffer;
+            target.buffer.ptr = tensorFromCt(indices).buffer.ptr + 16;
+            var partial_overlap = request;
+            partial_overlap.host_workspace = &.{};
+            try std.testing.expectError(error.InvalidAssignedAlias, runAssignedKernelOp(&compute, partial_overlap));
+        }
         descriptor.input_shapes[1].dtype = if (dtype == .i32) .i64 else .i32;
         try std.testing.expect(!try runAssignedKernelOp(&compute, request));
         const retained = try cb.toFloat32(input, a);
@@ -37827,4 +37879,27 @@ test "LightOn BF16 vision capability includes the portable artifact driver contr
     compute.ctx.info.compute_major = 8;
     compute.cublaslt = null;
     try std.testing.expect(!CudaCompute.lightOnBf16VisionEnabled(&cb));
+}
+
+test "CUDA assigned gather index precondition preserves integers above F32 precision" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = @import("../../backends/compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var tensor = try tensor_mod.Tensor.initInt64(a, "index", &.{1}, &.{16_777_217});
+    defer tensor.deinit();
+    const value = try context.importHostTensor(a, &tensor);
+    defer cb.free(value);
+    var scratch: [8]u8 = undefined;
+    try std.testing.expectError(error.IndexOutOfBounds, validateAssignedGatherIndices(context.cuda, tensorFromCt(value), 16_777_217, &scratch));
+    try validateAssignedGatherIndices(context.cuda, tensorFromCt(value), 16_777_218, &scratch);
+    context.cuda.debug_cuda_graph_capture_active = true;
+    defer context.cuda.debug_cuda_graph_capture_active = false;
+    context.cuda.debug_cuda_graph_capture_disabled = false;
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, validateAssignedGatherIndices(context.cuda, tensorFromCt(value), 16_777_218, &scratch));
+    try std.testing.expect(context.cuda.debug_cuda_graph_capture_disabled);
 }

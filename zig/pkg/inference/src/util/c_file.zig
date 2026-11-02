@@ -896,3 +896,13 @@ test "prefetchFile reads every byte with bounded workers" {
         }
     }
 }
+
+pub fn writeF32LeFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, values: []const f32) !void {
+    const byte_count = std.math.mul(usize, values.len, @sizeOf(f32)) catch return error.RequestTooLarge;
+    const bytes = try allocator.alloc(u8, byte_count);
+    defer allocator.free(bytes);
+    for (values, 0..) |value, i| {
+        std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(value), .little);
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+}

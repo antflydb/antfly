@@ -33,6 +33,7 @@ pub const Executable = struct {
 
     pub fn run(self: *Executable, allocator: std.mem.Allocator, options: interpreter.ExecuteOptions) !runtime_module.Result {
         const before = self.diagnostics.begin(self.runtime.default_backend);
+        defer @import("diagnostics.zig").Diagnostics.end(before);
         var prepared_options = options;
         prepared_options.cached_analysis = self.analysis;
         prepared_options.mutable_parameters = self.mutable_parameters;
@@ -523,9 +524,12 @@ test "prepared physical transfer protocol binds download and upload storage with
     defer graph.deinit();
     var b = ml.graph.Builder.init(&graph);
     const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
-    const indices = try b.parameter("indices", ml.graph.Shape.init(.i32, &.{2}));
+    const indices = try b.parameter("indices", ml.graph.Shape.init(.i32, &.{ 2, 2 }));
     const gathered = try b.gather(x, indices, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
     graph.nodeMut(gathered).op.gather.axis = 1;
+    // GatherElements deliberately remains a CPU boundary. Ordinary Gather is
+    // now a CUDA kernel and cannot exercise the transfer protocol here.
+    graph.nodeMut(gathered).op.gather.elements = true;
     const out = try b.relu(gathered);
     try graph.markOutput(out);
     var program = try ModelProgram.init(a, &graph, &.{ .{ .name = "x", .kind = .input, .node_id = x }, .{ .name = "indices", .kind = .input, .node_id = indices }, .{ .name = "out", .kind = .output, .node_id = out } });
@@ -534,7 +538,7 @@ test "prepared physical transfer protocol binds download and upload storage with
     defer executable.deinit();
     const input = try cb.fromFloat32Shape(&.{ -1, 2, -3, 4, -5, 6 }, &.{ 2, 3 });
     defer cb.free(input);
-    const index_values = (try cb.fromInt32Shape(&.{ 1, 0 }, &.{2})).?;
+    const index_values = (try cb.fromInt32Shape(&.{ 1, 0, 1, 0 }, &.{ 2, 2 })).?;
     defer cb.free(index_values);
     const bindings = [_]interpreter.RuntimeInput{ .{ .node_id = program.id_map[x], .value = input }, .{ .node_id = program.id_map[indices], .value = index_values } };
     for (0..3) |iteration| {
@@ -1149,4 +1153,492 @@ test "prepared grouped projections retain resident assigned outputs across reuse
         defer a.free(retained);
         for (expected, retained) |wanted, value| try std.testing.expectApproxEqAbs(wanted, value, 1e-6);
     }
+}
+
+test "prepared CUDA gather uses assigned control scratch and validates current exact indices" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const ml = @import("ml");
+    const tensor_mod = @import("../backends/tensor.zig");
+    const Context = @import("../backends/compute_context.zig").BackendContext;
+    const a = std.testing.allocator;
+    var context = Context.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var cpu = try Context.init(a, .native, null);
+    defer cpu.deinit(a);
+    const reference_backend = cpu.computeBackend();
+    var table = try tensor_mod.Tensor.initFloat32(a, "table", &.{ 4, 2 }, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer table.deinit();
+    const device_table = try context.importHostTensor(a, &table);
+    defer cb.free(device_table);
+    const host_table = try cpu.importHostTensor(a, &table);
+    defer reference_backend.free(host_table);
+    inline for (.{ tensor_mod.DType.f32, tensor_mod.DType.i32, tensor_mod.DType.i64 }) |dtype| {
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var builder = ml.graph.Builder.init(&graph);
+        const values_node = try builder.parameter("table", ml.graph.Shape.init(.f32, &.{ 4, 2 }));
+        const index_node = try builder.parameter("indices", ml.graph.Shape.init(@field(ops.GraphDType, @tagName(dtype)), &.{3}));
+        const gathered = try builder.gather(values_node, index_node, ml.graph.Shape.init(.f32, &.{ 3, 2 }));
+        try graph.markOutput(gathered);
+        var program = try ModelProgram.init(a, &graph, &.{ .{ .name = "table", .node_id = values_node, .kind = .weight }, .{ .name = "indices", .node_id = index_node, .kind = .input }, .{ .name = "output", .node_id = gathered, .kind = .output } });
+        defer program.deinit();
+        var indices = switch (dtype) {
+            .f32 => try tensor_mod.Tensor.initFloat32(a, "indices", &.{3}, &.{ 2.9, -1.9, 0.9 }),
+            .i32 => try tensor_mod.Tensor.initInt32(a, "indices", &.{3}, &.{ 2, -1, 0 }),
+            .i64 => try tensor_mod.Tensor.initInt64(a, "indices", &.{3}, &.{ 2, -1, 0 }),
+            else => unreachable,
+        };
+        defer indices.deinit();
+        const device_indices = try context.importHostTensor(a, &indices);
+        defer cb.free(device_indices);
+        const host_indices = try cpu.importHostTensor(a, &indices);
+        defer reference_backend.free(host_indices);
+        const reference = try reference_backend.primGather(host_table, host_indices, 0, &.{ 4, 2 });
+        defer reference_backend.free(reference);
+        const expected = try reference_backend.toFloat32(reference, a);
+        defer a.free(expected);
+        try std.testing.expectEqualSlices(f32, &.{ 5, 6, 7, 8, 1, 2 }, expected);
+        var raw_inputs = [_]interpreter.RuntimeInput{ .{ .node_id = values_node, .value = device_table }, .{ .node_id = index_node, .value = device_indices } };
+        const inputs = try program.remapInputs(&raw_inputs);
+        var executable = try prepare(a, &program, &cb, .compiled_preferred);
+        defer executable.deinit();
+        const options = interpreter.ExecuteOptions{ .runtime_inputs = inputs, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden };
+        for (0..3) |iteration| {
+            var result = try executable.run(a, options);
+            defer result.deinit(&executable.runtime);
+            try std.testing.expectEqual(@as(u64, 1), result.stats.assigned_kernel_dispatches);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.interpreter_fallbacks);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.actual_upload_calls);
+            try std.testing.expectEqual(@as(u64, 1), result.stats.actual_download_calls);
+            try std.testing.expectEqual(@as(u64, indices.data.len), result.stats.actual_download_bytes);
+            try std.testing.expectEqual(result.stats.device_host_access_bytes, result.stats.index_metadata_host_access_bytes);
+            try std.testing.expectEqual(@as(u64, indices.data.len), result.stats.index_metadata_host_access_bytes);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.physical_graph_captures);
+            const usage = result.stats.planned_storage.?;
+            try std.testing.expectEqual(@as(?u64, indices.data.len), usage.host_workspace.backing_live_bytes);
+            if (iteration > 0) {
+                try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
+                try std.testing.expect(result.stats.physical_storage_reuses > 0);
+            }
+            const actual = try result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], a);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(f32, expected, actual);
+        }
+        var held = try executable.run(a, options);
+        defer held.deinit(&executable.runtime);
+        // Mutate the exact same device address. No cached host summary may
+        // authorize these different indices or stale capture preconditions.
+        var changed = switch (dtype) {
+            .f32 => try tensor_mod.Tensor.initFloat32(a, "indices", &.{3}, &.{ 0, 1, 2 }),
+            .i32 => try tensor_mod.Tensor.initInt32(a, "indices", &.{3}, &.{ 0, 1, 2 }),
+            .i64 => try tensor_mod.Tensor.initInt64(a, "indices", &.{3}, &.{ 0, 1, 2 }),
+            else => unreachable,
+        };
+        defer changed.deinit();
+        const raw: *@import("../ops/cuda/cuda_compute.zig").CudaTensor = @ptrCast(@alignCast(device_indices));
+        try raw.buffer.copyFromHost(&context.cuda.ctx, changed.data);
+        var next = try executable.run(a, options);
+        defer next.deinit(&executable.runtime);
+        const actual_next = try next.backendFor(&executable.runtime, 0).toFloat32(next.outputs[0], a);
+        defer a.free(actual_next);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, actual_next);
+        const retained = try held.backendFor(&executable.runtime, 0).toFloat32(held.outputs[0], a);
+        defer a.free(retained);
+        try std.testing.expectEqualSlices(f32, expected, retained);
+        switch (dtype) {
+            .f32 => std.mem.bytesAsSlice(f32, changed.data)[0] = 4,
+            .i32 => std.mem.bytesAsSlice(i32, changed.data)[0] = 4,
+            .i64 => std.mem.bytesAsSlice(i64, changed.data)[0] = 4,
+            else => unreachable,
+        }
+        try raw.buffer.copyFromHost(&context.cuda.ctx, changed.data);
+        try std.testing.expectError(error.IndexOutOfBounds, executable.run(a, options));
+        if (comptime dtype == .f32) {
+            std.mem.bytesAsSlice(f32, changed.data)[0] = std.math.nan(f32);
+            try raw.buffer.copyFromHost(&context.cuda.ctx, changed.data);
+            try std.testing.expectError(error.InvalidIndex, executable.run(a, options));
+        }
+        var all_reads = @import("transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+        try @import("transfer_audit.zig").begin(&all_reads);
+        const forbidden = executable.run(a, options);
+        @import("transfer_audit.zig").end();
+        try std.testing.expectError(error.DeviceReadbackForbidden, forbidden);
+        try std.testing.expectEqual(@as(u64, 0), all_reads.download_calls);
+    }
+}
+
+fn qualifyCudaVendorReplay(with_bias: bool, evict_before_capture: bool) !void {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    if (!@import("antfly_platform").env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CUBLASLT", true)) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer context.deinit(a);
+    const compute = context.cuda;
+    if (compute.ctx.info.compute_major < 8 or compute.cublaslt == null) return error.SkipZigTest;
+    const blas = &compute.cublaslt.?;
+    const cb = context.computeBackend();
+    const rows = 128;
+    const width = 64;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, width }));
+    const weight_node = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{ width, width }));
+    const bias_node = if (with_bias) try builder.parameter("bias", ml.graph.Shape.init(.f32, &.{width})) else ml.graph.null_node;
+    var output = if (with_bias)
+        try builder.linear(x, weight_node, bias_node, rows, width, width)
+    else
+        try builder.linearNoBias(x, weight_node, rows, width, width);
+    // Retain enough real work to make replay profitable under the ordinary
+    // launch/copy cost policy. No qualification-only cost override is used.
+    for (0..16) |_| output = try builder.add(output, x);
+    try graph.markOutput(output);
+    const bindings = [_]@import("program.zig").Binding{
+        .{ .name = "x", .kind = .input, .node_id = x },
+        .{ .name = "weight", .kind = .weight, .node_id = weight_node },
+        .{ .name = "bias", .kind = .weight, .node_id = bias_node },
+        .{ .name = "output", .kind = .output, .node_id = output },
+    };
+    var program = try ModelProgram.init(a, &graph, if (with_bias) &bindings else &.{ bindings[0], bindings[1], bindings[3] });
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    var executable_owned = true;
+    defer if (executable_owned) executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    try std.testing.expect(pool.replay_backend != null);
+    var identity: [width * width]f32 = @splat(0);
+    for (0..width) |index| identity[index * width + index] = 1;
+    const weight = try cb.fromFloat32Shape(&identity, &.{ width, width });
+    defer cb.free(weight);
+    const ones: [width]f32 = @splat(1);
+    const bias = if (with_bias) try cb.fromFloat32Shape(&ones, &.{width}) else null;
+    defer if (bias) |value| cb.free(value);
+    var held: ?runtime_module.Result = null;
+    defer if (held) |*result| result.deinit(&executable.runtime);
+    var held_first: f32 = 0;
+    for (0..4) |iteration| {
+        var values: [rows * width]f32 = undefined;
+        for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8 + @as(i32, @intCast(iteration)))) / 8;
+        const input = try cb.fromFloat32Shape(&values, &.{ rows, width });
+        defer cb.free(input);
+        var inputs = [_]interpreter.RuntimeInput{
+            .{ .node_id = x, .value = input },
+            .{ .node_id = weight_node, .value = weight },
+            .{ .node_id = bias_node, .value = bias orelse weight },
+        };
+        var result = try executable.run(a, .{
+            .runtime_inputs = try program.remapInputs(if (with_bias) &inputs else inputs[0..2]),
+            .output_placement = .producer,
+            .activation_readbacks = .forbidden,
+            .collect_partition_stats = true,
+        });
+        var result_owned = true;
+        defer if (result_owned) result.deinit(&executable.runtime);
+        const actual = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, values) |found, original| try std.testing.expectEqual(original * 17 + @as(f32, if (with_bias) 1 else 0), found);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.device_host_accesses);
+        if (iteration == 0) {
+            // Prove that the real warm invocation used cuBLASLt, with no
+            // scratch borrowed from the backend's growable vendor arena.
+            try std.testing.expect(blas.tensor_core_plans.count() > 0);
+            try std.testing.expectEqual(@as(usize, 0), compute.cublaslt_workspace_scratch.buffer.len);
+            if (evict_before_capture) try std.testing.expect(try blas.reserveTensorCorePlanSlots(&compute.ctx, blas.plan_cache_capacity));
+        }
+        if (iteration == 1) {
+            if (evict_before_capture) {
+                try std.testing.expectEqual(@as(u64, 1), result.stats.physical_capture_failures);
+                try std.testing.expectEqualStrings("CublasLtUnsupported", result.stats.physical_replay_error.?);
+                try std.testing.expectEqual(@as(u64, 0), result.stats.physical_graph_captures);
+                // Ordinary execution rebuilt the same strict-F32 vendor plan.
+                try std.testing.expect(blas.tensor_core_plans.count() > 0);
+            } else {
+                try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_captures);
+                try std.testing.expect(blas.plan_cache_hits > 0);
+            }
+        }
+        if (iteration == 2 and !evict_before_capture) {
+            try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_replays);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
+            held_first = actual[0];
+            held = result;
+            result_owned = false;
+        }
+    }
+    // Published values retain their storage after graph/plan retirement.
+    executable.deinit();
+    executable_owned = false;
+    if (held) |*result| {
+        const preserved = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(preserved);
+        try std.testing.expectEqual(held_first, preserved[0]);
+    }
+}
+
+test "prepared physical CUDA strict F32 vendor GEMMs capture without hidden workspace" {
+    try qualifyCudaVendorReplay(false, false);
+    try qualifyCudaVendorReplay(true, false);
+}
+
+test "prepared physical CUDA vendor cache invalidation aborts recording before schedule fallback" {
+    try qualifyCudaVendorReplay(false, true);
+    try qualifyCudaVendorReplay(true, true);
+}
+
+test "prepared physical Metal output banks pin metadata aliases across reuse and retirement" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 4, 4 }));
+    const negated = try builder.neg(x);
+    const output = try builder.reshape(negated, ml.graph.Shape.init(.f32, &.{ 2, 8 }));
+    try graph.markOutput(output);
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    var executable_owned = true;
+    defer if (executable_owned) executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    pool.max_frames = 2;
+    const ledger = pool.accounting.?;
+    ledger.retain();
+    defer ledger.release();
+    var alias: ?ops.CT = null;
+    defer if (alias) |value| cb.free(value);
+    var expected: [16]f32 = undefined;
+    for (0..4) |iteration| {
+        var values: [16]f32 = undefined;
+        for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index + iteration * 16)) / 4;
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&values, &.{ 4, 4 }));
+        defer cb.free(input);
+        var inputs = [_]interpreter.RuntimeInput{.{ .node_id = x, .value = input, .source_backend = &cb }};
+        var result = try executable.run(a, .{
+            .runtime_inputs = try program.remapInputs(&inputs),
+            .output_placement = .producer,
+            .collect_partition_stats = true,
+            .activation_readbacks = .forbidden,
+        });
+        defer result.deinit(&executable.runtime);
+        try std.testing.expectEqual(@as(u64, 1), result.stats.assigned_kernel_dispatches);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.graph_output_owned_copies);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.actual_download_bytes);
+        if (iteration > 1) try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
+        const actual = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, values) |found, original| try std.testing.expectEqual(-original, found);
+        if (iteration == 0) {
+            @memcpy(&expected, actual);
+            alias = (try cb.cloneTensorShape(result.outputs[0], &.{ 1, 16 })) orelse return error.MissingRetainedView;
+        } else {
+            const retained = try cb.toFloat32(alias.?, a);
+            defer a.free(retained);
+            try std.testing.expectEqualSlices(f32, &expected, retained);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), pool.frames.items.len);
+    executable.deinit();
+    executable_owned = false;
+    // Only the published backing span survives, without the model/executable
+    // retaining the unrelated warm frame or a host mirror.
+    try std.testing.expectEqual(@as(u64, 64), ledger.snapshot().activation.requested_live_bytes);
+    const retained = try cb.toFloat32(alias.?, a);
+    defer a.free(retained);
+    try std.testing.expectEqualSlices(f32, &expected, retained);
+    cb.free(alias.?);
+    alias = null;
+    try std.testing.expectEqual(@as(u64, 0), ledger.snapshot().activation.requested_live_bytes);
+}
+
+test "prepared physical Metal preserves deferred multiply-add command fusion" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{ 4, 4 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const negated = try b.neg(x);
+    const half = try b.scalarConst(.f32, 0.5);
+    const scaled = try b.mul(negated, half);
+    const sum = try b.add(scaled, y);
+    try graph.markOutput(sum);
+    var program = try ModelProgram.init(a, &graph, &.{
+        .{ .name = "x", .node_id = x, .kind = .input },
+        .{ .name = "y", .node_id = y, .kind = .input },
+    });
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    _ = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    for (0..3) |iteration| {
+        var host: [16]f32 = undefined;
+        for (&host, 0..) |*value, index| value.* = @floatFromInt(index + iteration);
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&host, &.{ 4, 4 }));
+        defer cb.free(input);
+        var inputs = [_]interpreter.RuntimeInput{
+            .{ .node_id = x, .value = input, .source_backend = &cb },
+            .{ .node_id = y, .value = input, .source_backend = &cb },
+        };
+        var result = try executable.run(a, .{
+            .runtime_inputs = try program.remapInputs(&inputs),
+            .output_placement = .producer,
+            .collect_partition_stats = true,
+            .activation_readbacks = .forbidden,
+        });
+        defer result.deinit(&executable.runtime);
+        const actual = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, host) |found, original| try std.testing.expectEqual(original * 0.5, found);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.actual_download_bytes);
+    }
+}
+
+test "prepared physical Metal declines banks in caller-owned unsubmitted frames" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const metal = @import("../backends/metal_runtime.zig");
+    if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 4, 4 }));
+    try graph.markOutput(try b.neg(x));
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const host = [_]f32{ -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7 };
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&host, &.{ 4, 4 }));
+    defer cb.free(input);
+    for (0..2) |_| {
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        defer cb.decoderRuntimeCancelFrame() catch {};
+        var inputs = [_]interpreter.RuntimeInput{.{ .node_id = x, .value = input, .source_backend = &cb }};
+        var result = try executable.run(a, .{
+            .runtime_inputs = try program.remapInputs(&inputs),
+            .output_placement = .producer,
+            .collect_partition_stats = true,
+        });
+        defer result.deinit(&executable.runtime);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
+        // The bank remains completely unallocated even if the caller defers
+        // submission across more than one invocation.
+        for (pool.frames.items) |frame| for (frame.storages) |allocation| try std.testing.expect(allocation == null);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        const actual = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, host) |found, original| try std.testing.expectEqual(-original, found);
+    }
+}
+
+test "prepared physical Metal lease construction and retained views unwind every allocation failure" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, -2, 3, -4 }, &.{ 2, 2 }));
+    defer cb.free(input);
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, backend: ops.ComputeBackend, source: ops.CT) !void {
+            const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(backend.ptr));
+            const previous = compute.allocator;
+            compute.allocator = allocator;
+            defer compute.allocator = previous;
+            const ledger = try @import("storage_accounting.zig").Ledger.create(allocator);
+            defer ledger.release();
+            const lease = (try ops.physical_storage.Lease.createTracked(allocator, backend, 16, ledger, .activation)).?;
+            var owner = true;
+            defer if (owner) lease.release();
+            const functions = backend.vtable.kernels.?;
+            const output = (try functions.physicalTensorView.?(backend.ptr, .{ .storage = lease, .shape = &.{ 2, 2 } })).?;
+            var output_owned = true;
+            defer if (output_owned) backend.free(output);
+            var descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .unary = .negate }, .input_count = 1, .input_shapes = undefined, .output_shape = @import("ml").graph.Shape.init(.f32, &.{ 2, 2 }) };
+            descriptor.input_shapes[0] = descriptor.output_shape;
+            try std.testing.expect(try functions.runAssignedKernel.?(backend.ptr, .{ .descriptor = &descriptor, .inputs = &.{source}, .output = output }));
+            const retained = (try backend.cloneTensorShape(output, &.{4})).?;
+            defer backend.free(retained);
+            backend.free(output);
+            output_owned = false;
+            lease.release();
+            owner = false;
+            try std.testing.expectEqual(@as(u64, 16), ledger.snapshot().activation.requested_live_bytes);
+            var values: [4]f32 = undefined;
+            try std.testing.expect(try backend.readFloat32Into(retained, &values));
+            try std.testing.expectEqualSlices(f32, &.{ -1, 2, -3, 4 }, &values);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{ cb, input });
+}
+test "prepared physical Metal executor allocation failures cancel owned frames before bank reuse" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const metal = @import("../backends/metal_runtime.zig");
+    if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 4, 4 }));
+    const neg = try b.neg(x);
+    const sum = try b.add(neg, x);
+    try graph.markOutput(neg);
+    try graph.markOutput(sum);
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7 }, &.{ 4, 4 }));
+    defer cb.free(input);
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, prepared: *Executable, semantic: *const ModelProgram, backend: *const ops.ComputeBackend, input_node: ml.graph.NodeId, input_value: ops.CT) !void {
+            var inputs = [_]interpreter.RuntimeInput{.{ .node_id = input_node, .value = input_value, .source_backend = backend }};
+            defer {
+                std.debug.assert(!backend.decoderRuntimeHasActiveFrame());
+                if (prepared.runtime.physical_pool) |pool| for (pool.frames.items) |frame| std.debug.assert(!frame.in_use);
+            }
+            var result = try prepared.run(allocator, .{
+                .runtime_inputs = try semantic.remapInputs(&inputs),
+                .output_placement = .producer,
+                .collect_partition_stats = true,
+                .activation_readbacks = .forbidden,
+            });
+            defer result.deinit(&prepared.runtime);
+            const zero = try backend.toFloat32(result.outputs[1], allocator);
+            defer allocator.free(zero);
+            for (zero) |value| try std.testing.expectEqual(@as(f32, 0), value);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{ &executable, &program, &cb, x, input });
 }

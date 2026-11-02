@@ -19,6 +19,8 @@ const std = @import("std");
 const ops = @import("../ops/ops.zig");
 pub const ExecutionStats = @import("stats.zig").ExecutionStats;
 pub const Specializations = @import("specialization_cache.zig").Stats;
+const observation = @import("runtime_observation.zig");
+pub const Start = struct { runtime: ops.RuntimeTelemetry, scope: observation.Scope };
 pub const Snapshot = struct { specializations: ?Specializations = null, execution: ExecutionStats = .{}, provider: ops.NativeQuantTimingStats = .{}, runtime: ops.RuntimeTelemetry = .{} };
 pub const Diagnostics = struct {
     enabled: std.atomic.Value(bool) = .init(false),
@@ -54,13 +56,73 @@ pub const Diagnostics = struct {
             last.specializations = stats;
         };
     }
-    pub fn begin(self: *const Diagnostics, backend: *const ops.ComputeBackend) ?ops.RuntimeTelemetry {
+    pub fn begin(self: *const Diagnostics, backend: *const ops.ComputeBackend) ?Start {
         if (!self.isEnabled()) return null;
-        return backend.debugTimingSnapshot().runtime;
+        return .{ .scope = observation.Scope.init(), .runtime = backend.debugTimingSnapshot().runtime };
     }
-    pub fn record(self: *Diagnostics, stats: ExecutionStats, backend: *const ops.ComputeBackend, before: ?ops.RuntimeTelemetry) void {
+    /// Every caller defers this immediately after begin, including error exits.
+    pub fn end(before: ?Start) void {
+        if (before) |value| {
+            var scope = value.scope;
+            scope.deinit();
+        }
+    }
+    pub fn record(self: *Diagnostics, stats: ExecutionStats, backend: *const ops.ComputeBackend, before: ?Start) void {
         if (!self.isEnabled()) return;
         const after = backend.debugTimingSnapshot();
-        self.publish(.{ .execution = stats, .provider = after.provider, .runtime = if (before) |start| after.runtime.since(start) else .{} });
+        var runtime = if (before) |start| after.runtime.since(start.runtime) else ops.RuntimeTelemetry{};
+        if (before) |start| runtime.submission = start.scope.snapshot();
+        self.publish(.{ .execution = stats, .provider = after.provider, .runtime = runtime });
     }
 };
+
+test "native execution observations include nested work and unwind every failed invocation" {
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const contexts = @import("../backends/compute_context.zig");
+    const programs = @import("program.zig");
+    const executables = @import("executable.zig");
+    var context = try contexts.BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try builder.relu(input));
+    var program = try programs.ModelProgram.init(a, &graph, &.{});
+    defer program.deinit();
+    var executable = try executables.prepare(a, &program, &backend, .compiled_preferred);
+    defer executable.deinit();
+    executable.diagnostics.configure(true);
+    const value = try backend.fromFloat32Shape(&.{ -1, 2, -3, 4 }, &.{4});
+    defer backend.free(value);
+    const inputs = [_]@import("../graph/interpreter.zig").RuntimeInput{.{ .node_id = program.id_map[input], .value = value }};
+    var outer = observation.Scope.init();
+    defer outer.deinit();
+    for (0..2) |_| {
+        var result = try executable.run(a, .{ .runtime_inputs = &inputs, .collect_partition_stats = true });
+        defer result.deinit(&executable.runtime);
+        const measured = executable.diagnostics.snapshot().?;
+        try std.testing.expect(measured.runtime.submission != null);
+        try std.testing.expectEqual(result.stats.assigned_kernel_dispatches, measured.runtime.submission.?.native_assigned_dispatches);
+        try std.testing.expect(measured.runtime.submission.?.native_assigned_dispatches > 0);
+        const values = try backend.toFloat32(result.outputs[0], a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &.{ 0, 2, 0, 4 }, values);
+    }
+    try std.testing.expectEqual(@as(u64, 2), outer.snapshot().native_assigned_dispatches);
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, prepared: *executables.Executable, bindings: []const @import("../graph/interpreter.zig").RuntimeInput) !void {
+            var result = try prepared.run(allocator, .{ .runtime_inputs = bindings, .collect_partition_stats = true });
+            defer result.deinit(&prepared.runtime);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{ &executable, @as([]const @import("../graph/interpreter.zig").RuntimeInput, &inputs) });
+    // Child failures must not turn off the still-live outer scope.
+    const before = outer.snapshot().native_assigned_dispatches;
+    executable.diagnostics.configure(false);
+    var result = try executable.run(a, .{ .runtime_inputs = &inputs });
+    defer result.deinit(&executable.runtime);
+    try std.testing.expectEqual(before + 1, outer.snapshot().native_assigned_dispatches);
+}

@@ -17,6 +17,7 @@
 //! plan owns one reference; outstanding values pin storage across plan eviction.
 const std = @import("std");
 const ops = @import("ops.zig");
+const admission = @import("../execution/storage_admission.zig");
 const accounting = @import("../execution/storage_accounting.zig");
 
 pub const Lease = struct {
@@ -24,6 +25,7 @@ pub const Lease = struct {
     backend: ops.ComputeBackend,
     tensor: ops.CT,
     byte_size: usize,
+    admission: ?*admission.Reservation = null,
     ledger: ?*accounting.Ledger = null,
     accounting_class: accounting.Class = .activation,
     backing_byte_size: ?usize = null,
@@ -33,19 +35,59 @@ pub const Lease = struct {
         return createTracked(allocator, backend, byte_size, null, .activation);
     }
     pub fn createTracked(allocator: std.mem.Allocator, backend: ops.ComputeBackend, byte_size: usize, ledger: ?*accounting.Ledger, class: accounting.Class) !?*Lease {
+        return createAdmitted(allocator, backend, byte_size, ledger, class, null);
+    }
+    pub fn createAdmitted(allocator: std.mem.Allocator, backend: ops.ComputeBackend, byte_size: usize, ledger: ?*accounting.Ledger, class: accounting.Class, capability: ?admission.Capability) !?*Lease {
         if (byte_size == 0 or byte_size % @sizeOf(f32) != 0 or byte_size / @sizeOf(f32) > std.math.maxInt(i32)) return null;
+        // Ownership metadata precedes partitioning a request's quota. Once
+        // partitioned, an allocation failure aborts this invocation.
         const self = try allocator.create(Lease);
         errdefer allocator.destroy(self);
+        const reservation = if (capability) |cap| try reserve(allocator, backend, byte_size, class, cap) else null;
+        errdefer if (reservation) |value| {
+            value.release();
+            allocator.destroy(value);
+        };
+
         const allocate_storage = if (backend.vtable.kernels) |functions| functions.allocatePhysicalStorage else null;
         const tensor = (if (allocate_storage) |allocate| try allocate(backend.ptr, byte_size) else try backend.allocUninitF32Shape(&.{@intCast(byte_size / @sizeOf(f32))})) orelse {
+            if (capability != null) return error.PhysicalStorageAllocationDeclined;
             allocator.destroy(self);
             return null;
         };
         const measure = if (backend.vtable.kernels) |functions| functions.physicalStorageBytes else null;
         const backing_bytes = if (measure) |bytes| bytes(backend.ptr, tensor) else null;
-        self.* = .{ .allocator = allocator, .backend = backend, .tensor = tensor, .byte_size = byte_size, .ledger = ledger, .accounting_class = class, .backing_byte_size = backing_bytes };
+        if (reservation) |value| {
+            const actual = backing_bytes orelse byte_size;
+            if (actual > value.reservedBytes()) {
+                backend.free(tensor);
+                return error.PhysicalStorageExceededReservation;
+            }
+            value.retainBytes(actual);
+        }
+        self.* = .{ .admission = reservation, .allocator = allocator, .backend = backend, .tensor = tensor, .byte_size = byte_size, .ledger = ledger, .accounting_class = class, .backing_byte_size = backing_bytes };
         if (ledger) |owner| owner.allocated(class, byte_size, backing_bytes);
         return self;
+    }
+    fn reserve(allocator: std.mem.Allocator, backend: ops.ComputeBackend, bytes: usize, class: accounting.Class, capability: admission.Capability) !*admission.Reservation {
+        const owner = try allocator.create(admission.Reservation);
+        errdefer allocator.destroy(owner);
+        const functions = backend.vtable.kernels;
+        const bound = if (functions) |f| (if (f.physicalStorageReservationBytes) |query| try query(backend.ptr, bytes) else bytes) else bytes;
+        if (bound < bytes) return error.InvalidPhysicalStorageReservation;
+        owner.* = try capability.reserve(allocator, backend.kind(), class, bound);
+        return owner;
+    }
+    pub fn ensureAdmission(self: *Lease, capability: admission.Capability) !void {
+        if (self.admission) |existing| {
+            if (!existing.identity.eql(capability.identity)) return error.PhysicalStorageAdmissionMismatch;
+            return;
+        }
+        const bytes = self.backing_byte_size orelse self.byte_size;
+        const owner = try self.allocator.create(admission.Reservation);
+        errdefer self.allocator.destroy(owner);
+        owner.* = try capability.reserve(self.allocator, self.backend.kind(), self.accounting_class, bytes);
+        self.admission = owner;
     }
     pub fn retain(self: *Lease) void {
         const before = self.references.fetchAdd(1, .monotonic);
@@ -59,12 +101,18 @@ pub const Lease = struct {
         std.debug.assert(before > 0);
         if (before != 1) return;
         self.backend.free(self.tensor);
+        const reservation = self.admission;
+        const allocator = self.allocator;
         const ledger = self.ledger;
         const class = self.accounting_class;
         const requested = self.byte_size;
         const backing = self.backing_byte_size;
         self.allocator.destroy(self);
         if (ledger) |owner| owner.freed(class, requested, backing);
+        if (reservation) |owner| {
+            owner.release();
+            allocator.destroy(owner);
+        }
     }
 };
 
@@ -494,4 +542,80 @@ test "physical CUDA storage accounting measures its actual backing span" {
     try std.testing.expectEqual(@as(?u64, 0), done.total.backing_live_bytes);
     try std.testing.expectEqual(@as(u64, 1), done.total.leases_created);
     try std.testing.expectEqual(@as(u64, 1), done.total.leases_released);
+}
+
+test "physical Metal allocation admission bound covers SDK span without audio buckets" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const functions = cb.vtable.kernels.?;
+    for ([_]usize{ 4, 8, 12, 16, 252, 256, 260, 4092, 4096, 4100, 16384 }) |bytes| {
+        const upper = try functions.physicalStorageReservationBytes.?(cb.ptr, bytes);
+        try std.testing.expect(upper >= bytes);
+        const tensor = (try functions.allocatePhysicalStorage.?(cb.ptr, bytes)).?;
+        defer cb.free(tensor);
+        const actual = functions.physicalStorageBytes.?(cb.ptr, tensor) orelse return error.MissingPhysicalBackingMeasurement;
+        try std.testing.expect(actual <= upper);
+        if (bytes <= 16) try std.testing.expect(upper < 16384);
+    }
+}
+
+test "physical storage admission outlives its request and plan while retained views exist" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const memory = @import("../runtime/tier/memory.zig");
+    const Owner = struct {
+        controller: memory.AdmissionController = .{},
+        run: memory.AdmissionLease,
+        credit: memory.AdmissionAmounts = .{ .host_scratch_bytes = 64 },
+        refs: usize = 1,
+        fn retain(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: @import("../graph/backend_contracts.zig").BackendKind, class: accounting.Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return admission.fromRunLease(allocator, &self.run, .{
+                .controller = &self.controller,
+                .backend_class = .cpu,
+                .limits = .{ .host_limit_bytes = 64, .combined_limit_bytes = 64 },
+                .check_live_memory = false,
+                .credit = &self.credit,
+                .lifetime = .{ .context = self, .retain = retain, .release = release },
+            }, kind, class, bytes);
+        }
+    };
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var owner = Owner{ .run = undefined };
+    defer owner.controller.deinit();
+    owner.run = try owner.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 64, .combined_limit_bytes = 64 }, .{ .host_scratch_bytes = 64 }, false);
+    defer owner.run.release();
+    const cap = admission.Capability{ .identity = .{ .controller = &owner.controller, .backend_class = .cpu }, .context = &owner, .reserve_fn = Owner.reserve };
+    const storage = (try Lease.createAdmitted(a, cb, 64, null, .activation, cap)).?;
+    var storage_owned = true;
+    defer if (storage_owned) storage.release();
+    try std.testing.expectEqual(@as(usize, 2), owner.refs);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, owner.run.amounts);
+    const view = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = storage, .shape = &.{ 4, 4 } })).?;
+    var view_owned = true;
+    defer if (view_owned) cb.free(view);
+    owner.run.release();
+    storage.release();
+    storage_owned = false;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 64 }, owner.controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 2), owner.refs);
+    cb.free(view);
+    view_owned = false;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, owner.controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 1), owner.refs);
 }

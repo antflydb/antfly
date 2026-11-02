@@ -27,6 +27,8 @@ pub const VTable = struct {
     physicalExecutionScope: ?*const fn (ctx: *anyopaque, storages: ?[]const ?*physical_storage.Lease) anyerror!void = null,
     allocatePhysicalStorage: ?*const fn (ctx: *anyopaque, byte_size: usize) anyerror!?CT = null,
     /// Backing buffer span, including allocator reuse/rounding. Null is unknown.
+    /// Metadata-only preflight upper bound for the owned SDK allocation span.
+    physicalStorageReservationBytes: ?*const fn (ctx: *anyopaque, byte_size: usize) anyerror!usize = null,
     physicalStorageBytes: ?*const fn (ctx: *anyopaque, tensor: CT) ?usize = null,
     physicalTensorView: ?*const fn (ctx: *anyopaque, request: physical_storage.View) anyerror!?CT = null,
     copyPhysicalInput: ?*const fn (ctx: *anyopaque, destination: CT, source: CT) anyerror!void = null,

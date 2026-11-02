@@ -180,8 +180,10 @@ pub const ExecuteOptions = struct {
     /// Input/state values can change each invocation even at a stable address.
     mutable_parameters: ?[]const bool = null,
     output_placement: OutputPlacement = .default_backend,
-    /// Enforce actual device/host access at transfer boundaries. Final output
-    /// materialization happens after submission and outside this scope.
+    /// Forbid activation readbacks at actual transfer boundaries. Exact index
+    /// metadata processing is separately counted; an outer transfer Audit can
+    /// forbid every host access. Final output materialization is outside this
+    /// submission scope.
     activation_readbacks: enum { allowed, forbidden } = .allowed,
     /// Request lifetime checked before graph setup and at every reachable node.
     /// A backend operation that is already executing still owns its buffers and
@@ -245,6 +247,7 @@ pub const ExecuteOptions = struct {
     /// External/debug plans retain validation unless their owner proves this.
     cached_buffer_plan_validated: bool = false,
     physical_frame: ?*@import("../execution/physical_buffers.zig").Frame = null,
+    storage_admission: ?@import("../execution/storage_admission.zig").Capability = null,
 
     /// Skip Metal graph-fusion probes for graphs whose hot path is already
     /// covered by backend primitive/runtime commands.
@@ -612,15 +615,12 @@ fn computeDonationLastUse(
     reachable: []const bool,
     last_use: []const u32,
 ) ![]u32 {
-    const count = graph.nodeCount();
-    const roots = try allocator.alloc(NodeId, count);
-    defer allocator.free(roots);
-    for (roots, 0..) |*root, i| root.* = @intCast(i);
-
-    for (0..count) |i| {
-        if (!reachable[i]) continue;
-        const node_id: NodeId = @intCast(i);
-        const node = graph.node(node_id);
+    const sources = try allocator.alloc(NodeId, graph.nodeCount());
+    defer allocator.free(sources);
+    @memset(sources, null_node);
+    for (sources, 0..) |*source, index| {
+        if (!reachable[index]) continue;
+        const node = graph.node(@intCast(index));
         const aliases_input = switch (node.op) {
             .reshape,
             .transpose,
@@ -632,23 +632,9 @@ fn computeDonationLastUse(
             => true,
             else => false,
         };
-        if (!aliases_input or node.num_inputs == 0) continue;
-        const input_id = node.inputs[0];
-        if (input_id == null_node or input_id >= count) continue;
-        roots[i] = roots[@intCast(input_id)];
+        if (aliases_input and node.num_inputs != 0) source.* = node.inputs[0];
     }
-
-    const donation_last_use = try allocator.dupe(u32, last_use);
-    for (0..count) |i| {
-        if (!reachable[i]) continue;
-        const root_idx: usize = @intCast(roots[i]);
-        donation_last_use[root_idx] = @max(donation_last_use[root_idx], last_use[i]);
-    }
-    for (0..count) |i| {
-        if (!reachable[i]) continue;
-        donation_last_use[i] = donation_last_use[@intCast(roots[i])];
-    }
-    return donation_last_use;
+    return ml.graph.passes.memory.computeAliasLastUse(allocator, last_use, sources, .{ .reachable = reachable });
 }
 
 fn computeGatherAddBiasPreserveSet(allocator: std.mem.Allocator, graph: *const Graph, reachable: []const bool) ![]bool {
@@ -708,12 +694,12 @@ pub fn execute(
         }
     };
     const transfer_audit = @import("../execution/transfer_audit.zig");
-    var audit = transfer_audit.Audit{ .forbid_device_host_access = options.activation_readbacks == .forbidden };
-    if (audit.forbid_device_host_access) {
+    var audit = transfer_audit.Audit{ .forbid_activation_readbacks = options.activation_readbacks == .forbidden };
+    if (audit.forbid_activation_readbacks) {
         try transfer_audit.validateBackend(cb.kind());
         try transfer_audit.begin(&audit);
     }
-    defer if (audit.forbid_device_host_access) transfer_audit.end();
+    defer if (audit.forbid_activation_readbacks) transfer_audit.end();
     const trace_nodes = graphExecTraceEnabled();
     const profile_ops = graphOpProfileEnabled();
     const finite_trace = graphFiniteTraceEnabled();

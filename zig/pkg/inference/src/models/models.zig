@@ -42,6 +42,9 @@ pub const gliner_boundary_artifact = @import("gliner_boundary_artifact.zig");
 pub const gliner_boundary_bundle = @import("gliner_boundary_bundle.zig");
 
 test {
+    _ = managed_tokenizer;
+    _ = component_loader;
+    _ = composite_runtime;
     _ = safetensors;
     _ = weight_source;
     _ = tensor_access;
@@ -66,3 +69,7 @@ test {
 
 /// Published loaded generation, with explicit serving lifecycle services.
 pub const loaded_runtime = @import("loaded_runtime.zig");
+
+pub const managed_tokenizer = @import("managed_tokenizer.zig");
+pub const component_loader = @import("component_loader.zig");
+pub const composite_runtime = @import("composite_runtime.zig");

@@ -361,6 +361,9 @@ pub const LoadedMultiStageReader = struct {
     }
 
     pub fn deinit(self: *LoadedMultiStageReader) void {
+        // Pipelines own session close; this parallel list owns admission.
+        // Transfer only the retained leases before either owner is retired.
+        for (self.managed_sessions.items) |*managed| managed.session.retainResources(&managed.resource_lease);
         self.pipeline.deinit();
         for (self.managed_sessions.items) |*managed| managed.deinit();
         self.managed_sessions.deinit(self.allocator);

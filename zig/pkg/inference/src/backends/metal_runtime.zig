@@ -49668,6 +49668,7 @@ pub extern fn antfly_metal_audio_storage_admission(runtime: ?*RawMetalDecodeRunt
 
 pub extern fn antfly_metal_audio_pad(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, params: *const @import("../ops/ops.zig").AudioPadParams) c_int;
 
+pub extern fn antfly_metal_physical_allocation_bytes(runtime: ?*RawMetalDecodeRuntime, bytes: usize) usize;
 pub extern fn antfly_metal_audio_allocation_bytes(runtime: ?*RawMetalDecodeRuntime, bytes: usize, shared: c_int) usize;
 pub extern fn antfly_metal_audio_buffer_bytes(buffer: ?*anyopaque) usize;
 pub extern fn antfly_metal_norm_residual_weight(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, residual: ?*anyopaque, residual_offset: usize, rows: usize, dim: usize, eps: f32, norm_scale: f32, output_scale: f32, out: ?*anyopaque, out_offset: usize) c_int;

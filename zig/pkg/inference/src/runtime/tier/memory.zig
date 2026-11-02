@@ -762,6 +762,89 @@ fn emptyAdmissionAmountsByBackend() [backend_class_count]AdmissionAmounts {
     return .{ .{}, .{} };
 }
 
+/// A partitioned lease retains the exact external budget which issued its
+/// opaque token. Logical members shrink that one reservation; the last member
+/// releases it exactly once. Provider and controller lifetimes are distinct:
+/// retaining the provider does not authorize an escaped controller pointer.
+const SharedExternalAdmission = struct {
+    allocator: std.mem.Allocator,
+    controller: *AdmissionController,
+    budget: AdmissionResourceBudget,
+    token: usize,
+    amounts: AdmissionAmounts,
+    references: usize = 1,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn create(allocator: std.mem.Allocator, controller: *AdmissionController, token: usize, amounts: AdmissionAmounts) !*@This() {
+        const owner = try allocator.create(@This());
+        errdefer allocator.destroy(owner);
+        // A nonempty original reservation prevents reconfiguration between
+        // this snapshot and registration of the shared-token exclusion.
+        spinLockAdmission(&controller.mutex);
+        const budget = controller.resource_budget orelse {
+            controller.mutex.unlock();
+            return error.InvalidAdmissionLeasePartition;
+        };
+        controller.mutex.unlock();
+        if (!budget.retainContext()) return error.ResourceOwnerShuttingDown;
+        errdefer budget.releaseContext();
+        spinLockAdmission(&controller.mutex);
+        const count = std.math.add(usize, controller.shared_external_owners, 1) catch {
+            controller.mutex.unlock();
+            return error.ResourceLimitExceeded;
+        };
+        controller.shared_external_owners = count;
+        controller.mutex.unlock();
+        owner.* = .{ .allocator = allocator, .controller = controller, .budget = budget, .token = token, .amounts = amounts };
+        return owner;
+    }
+
+    fn addReference(self: *@This()) !void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        self.references = std.math.add(usize, self.references, 1) catch return error.ResourceLimitExceeded;
+    }
+
+    /// Failure is atomic for both the member and the aggregate reservation.
+    fn reduce(self: *@This(), released: AdmissionAmounts) !void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        const remaining = subtractAdmissionAmounts(self.amounts, released) orelse return error.InvalidAdmissionLeaseReduction;
+        try self.budget.retain(self.budget.context, self.token, remaining);
+        self.amounts = remaining;
+    }
+
+    fn releaseMember(self: *@This(), amounts: AdmissionAmounts) void {
+        spinLockAdmission(&self.mutex);
+        std.debug.assert(self.references > 0);
+        const remaining = subtractAdmissionAmounts(self.amounts, amounts) orelse @panic("partitioned admission released unowned amounts");
+        self.references -= 1;
+        if (self.references != 0) {
+            // Release is infallible. A provider refusing a shrink keeps its
+            // larger external reservation until a later shrink/final release;
+            // it can never authorize more memory than the remaining token.
+            self.budget.retain(self.budget.context, self.token, remaining) catch {};
+            self.amounts = remaining;
+            self.mutex.unlock();
+            return;
+        }
+        std.debug.assert(std.meta.eql(remaining, AdmissionAmounts{}));
+        const controller = self.controller;
+        const budget = self.budget;
+        // Keep exclusion active through the producer's release callback, even
+        // when zero-byte members outlive all actual storage.
+        budget.release(budget.context, self.token);
+        spinLockAdmission(&controller.mutex);
+        std.debug.assert(controller.shared_external_owners > 0);
+        controller.shared_external_owners -= 1;
+        controller.mutex.unlock();
+        self.mutex.unlock();
+        const allocator = self.allocator;
+        allocator.destroy(self);
+        budget.releaseContext();
+    }
+};
+
 pub const AdmissionLease = struct {
     controller: ?*AdmissionController,
     amounts: AdmissionAmounts,
@@ -770,6 +853,7 @@ pub const AdmissionLease = struct {
     /// Opaque exactly-once ownership token returned by the external process
     /// manager. Byte totals are never reconstructed for release.
     external_lease: ?usize = null,
+    shared_external: ?*SharedExternalAdmission = null,
     /// Bytes committed against the current live-memory pressure epoch. This is
     /// deliberately separate from policy accounting: the kernel/cgroup probe
     /// reflects physical pressure, while AdmissionAmounts tracks ownership.
@@ -779,6 +863,53 @@ pub const AdmissionLease = struct {
     /// receive credit for memory they may already have observed as free.
     live_settled_bytes: usize = 0,
     live_settled_epoch: u64 = 0,
+
+    /// Transfer an owned subset without acquiring another reservation or
+    /// publishing a release/reacquire gap. The caller owns both results and
+    /// keeps the controller alive until both retire. An external process token
+    /// is shared through one retained producer, never copied or reconstructed.
+    /// The first external split allocates one owner; unsplit leases do not.
+    pub fn partition(self: *AdmissionLease, allocator: std.mem.Allocator, amounts: AdmissionAmounts) !AdmissionLease {
+        const controller = self.controller orelse return error.AdmissionLeaseReleased;
+        const backend = self.retain_backend_class orelse return error.InvalidAdmissionLeasePartition;
+        if (std.meta.eql(amounts, AdmissionAmounts{})) return error.InvalidAdmissionLeasePartition;
+        const remaining = subtractAdmissionAmounts(self.amounts, amounts) orelse return error.InvalidAdmissionLeasePartition;
+        const index = backendClassIndex(backend);
+        const domain_remaining = subtractAdmissionAmounts(self.amounts_by_backend[index], amounts) orelse return error.InvalidAdmissionLeasePartition;
+        if (!std.meta.eql(self.amounts_by_backend[index], self.amounts)) return error.InvalidAdmissionLeasePartition;
+        const live_bytes = liveHostBytes(amounts) catch return error.InvalidAdmissionLeasePartition;
+        const pending = @min(self.live_reserved_bytes, live_bytes);
+        const settled = @min(self.live_settled_bytes, live_bytes - pending);
+        // Every fallible operation precedes ownership mutation. Allocation or
+        // capability failure leaves the original exactly-once token untouched.
+        var shared = self.shared_external;
+        if (shared) |owner| {
+            try owner.addReference();
+        } else if (self.external_lease) |token| {
+            shared = try SharedExternalAdmission.create(allocator, controller, token, self.amounts);
+            // create owns the original member; the child is the second.
+            shared.?.references = 2;
+        }
+        var domains = emptyAdmissionAmountsByBackend();
+        domains[index] = amounts;
+        const child = AdmissionLease{
+            .controller = controller,
+            .amounts = amounts,
+            .amounts_by_backend = domains,
+            .retain_backend_class = backend,
+            .live_reserved_bytes = pending,
+            .live_settled_bytes = settled,
+            .live_settled_epoch = self.live_settled_epoch,
+            .shared_external = shared,
+        };
+        self.amounts = remaining;
+        self.amounts_by_backend[index] = domain_remaining;
+        self.live_reserved_bytes -= pending;
+        self.live_settled_bytes -= settled;
+        self.external_lease = null;
+        self.shared_external = shared;
+        return child;
+    }
 
     /// Reduce a peak reservation to the bytes that remain resident after a
     /// construction/import phase. This never acquires new capacity, so the
@@ -791,7 +922,10 @@ pub const AdmissionLease = struct {
             return error.InvalidAdmissionLeaseReduction;
         const retained_live_bytes = liveHostBytes(retained) catch
             return error.InvalidAdmissionLeaseReduction;
-        try controller.retainExternalLease(self.external_lease, retained);
+        if (self.shared_external) |owner|
+            try owner.reduce(released)
+        else
+            try controller.retainExternalLease(self.external_lease, retained);
         controller.releaseSingle(backend_class, released);
         if (self.live_reserved_bytes != 0) {
             self.live_settled_epoch = controller.settleLiveReservation(self.live_reserved_bytes, retained_live_bytes);
@@ -809,12 +943,16 @@ pub const AdmissionLease = struct {
         const controller = self.controller orelse return;
         controller.releaseLiveReservation(self.live_reserved_bytes);
         controller.releaseSettledResidency(self.live_settled_epoch, self.live_settled_bytes);
-        controller.release(self.amounts_by_backend, self.amounts, self.external_lease);
+        if (self.shared_external) |owner| {
+            owner.releaseMember(self.amounts);
+            controller.releaseLocal(self.amounts_by_backend, self.amounts);
+        } else controller.release(self.amounts_by_backend, self.amounts, self.external_lease);
         self.controller = null;
         self.amounts = .{};
         self.amounts_by_backend = emptyAdmissionAmountsByBackend();
         self.retain_backend_class = null;
         self.external_lease = null;
+        self.shared_external = null;
         self.live_reserved_bytes = 0;
         self.live_settled_bytes = 0;
         self.live_settled_epoch = 0;
@@ -847,6 +985,9 @@ pub const AdmissionController = struct {
     process_memory_limit_bytes: usize = 0,
     process_memory_limit_provenance: ProcessMemoryLimitProvenance = .automatic,
     resource_budget: ?AdmissionResourceBudget = null,
+    // A zero-byte member may still own an opaque partitioned token. Keep its
+    // producer installed until the final exactly-once release callback.
+    shared_external_owners: usize = 0,
     /// Opt-in fault injection for live server regression tests. Production
     /// callers leave this at zero, so normal admission behavior is unchanged.
     forced_run_denials_for_testing: std.atomic.Value(usize) = .init(0),
@@ -939,7 +1080,7 @@ pub const AdmissionController = struct {
         }
         errdefer if (resource_budget) |budget| budget.releaseContext();
         spinLockAdmission(&self.mutex);
-        if (!std.meta.eql(self.admitted, AdmissionAmounts{})) {
+        if (!std.meta.eql(self.admitted, AdmissionAmounts{}) or self.shared_external_owners != 0) {
             self.mutex.unlock();
             return error.ResourceBudgetInUse;
         }
@@ -4680,4 +4821,207 @@ test "LightOnOCR3 physical CUDA clamping preserves host scratch and KV within co
     var explicit = requested;
     explicit.scratch_limit_bytes = mib(32);
     try std.testing.expectEqual(mib(32), clampDiscreteDeviceLimits(explicit, gib(24), gib(2)).scratch_limit_bytes);
+}
+
+const PartitionBudgetRecorder = struct {
+    current: AdmissionAmounts = .{},
+    references: usize = 1,
+    reserves: usize = 0,
+    releases: usize = 0,
+    reject_context: bool = false,
+    reject_retain: bool = false,
+    controller: ?*AdmissionController = null,
+    reconfiguration_blocked: bool = false,
+
+    fn capability(self: *@This()) AdmissionResourceBudget {
+        return .{ .context = self, .retain_context = retainContext, .release_context = releaseContext, .try_reserve = reserve, .retain = retain, .release = release };
+    }
+    fn retainContext(raw: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.reject_context) return false;
+        self.references += 1;
+        return true;
+    }
+    fn releaseContext(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.references > 1);
+        self.references -= 1;
+    }
+    fn reserve(raw: *anyopaque, amounts: AdmissionAmounts) AdmissionResourceError!usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.reserves != 0) return error.ResourceLimitExceeded;
+        self.reserves += 1;
+        self.current = amounts;
+        return 0x1166;
+    }
+    fn retain(raw: *anyopaque, token: usize, amounts: AdmissionAmounts) AdmissionResourceError!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (token != 0x1166) return error.ResourceLimitExceeded;
+        if (self.reject_retain) return error.ResourceTemporarilyUnavailable;
+        _ = subtractAdmissionAmounts(self.current, amounts) orelse return error.ResourceLimitExceeded;
+        self.current = amounts;
+    }
+    fn release(raw: *anyopaque, token: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(token == 0x1166);
+        self.releases += 1;
+        std.debug.assert(self.releases == 1);
+        if (self.controller) |controller| {
+            controller.configureResourceBudget(null) catch |err| {
+                self.reconfiguration_blocked = err == error.ResourceBudgetInUse;
+            };
+        }
+        self.current = .{};
+    }
+};
+
+test "admission partition transfers ownership without another reservation or capacity gap" {
+    const a = std.testing.allocator;
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    var source = try controller.tryAcquire(.gpu, .{ .combined_limit_bytes = 96 }, .{ .host_scratch_bytes = 32, .backend_scratch_bytes = 64 }, false);
+    defer source.release();
+    const original = controller.snapshot();
+    var child = try source.partition(a, .{ .host_scratch_bytes = 16, .backend_scratch_bytes = 32 });
+    defer child.release();
+    try std.testing.expectEqualDeep(original, controller.snapshot());
+    try std.testing.expectEqualDeep(AdmissionAmounts{ .host_scratch_bytes = 16, .backend_scratch_bytes = 32 }, source.amounts);
+    try std.testing.expectError(error.InvalidAdmissionLeasePartition, source.partition(a, .{ .backend_scratch_bytes = 33 }));
+    try std.testing.expectError(error.InvalidAdmissionLeasePartition, source.partition(a, .{}));
+    try child.retain(.{ .backend_scratch_bytes = 24 });
+    source.release();
+    try std.testing.expectEqualDeep(AdmissionAmounts{ .backend_scratch_bytes = 24 }, controller.snapshot());
+    child.release();
+    try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+}
+
+test "admission partition retains one exact external token through nested splits and zero-byte members" {
+    const a = std.testing.allocator;
+    var recorder = PartitionBudgetRecorder{};
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    recorder.controller = &controller;
+    try controller.configureResourceBudget(recorder.capability());
+    var source = try controller.tryAcquire(.gpu, .{}, .{ .host_scratch_bytes = 128, .backend_scratch_bytes = 256 }, false);
+    defer source.release();
+    var child = try source.partition(a, .{ .host_scratch_bytes = 16, .backend_scratch_bytes = 64 });
+    defer child.release();
+    var nested = try child.partition(a, .{ .host_scratch_bytes = 8, .backend_scratch_bytes = 32 });
+    defer nested.release();
+    try std.testing.expectEqual(@as(usize, 1), recorder.reserves);
+    try std.testing.expectEqual(@as(usize, 3), recorder.references);
+    try std.testing.expectEqualDeep(AdmissionAmounts{ .host_scratch_bytes = 128, .backend_scratch_bytes = 256 }, controller.snapshot());
+    try std.testing.expectEqualDeep(controller.snapshot(), recorder.current);
+    try source.retain(.{ .host_scratch_bytes = 32, .backend_scratch_bytes = 128 });
+    const before = controller.snapshot();
+    recorder.reject_retain = true;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, nested.retain(.{ .backend_scratch_bytes = 16 }));
+    try std.testing.expectEqualDeep(AdmissionAmounts{ .host_scratch_bytes = 8, .backend_scratch_bytes = 32 }, nested.amounts);
+    try std.testing.expectEqualDeep(before, controller.snapshot());
+    try std.testing.expectEqualDeep(before, recorder.current);
+    recorder.reject_retain = false;
+    source.release();
+    try std.testing.expectEqualDeep(AdmissionAmounts{ .host_scratch_bytes = 16, .backend_scratch_bytes = 64 }, controller.snapshot());
+    try child.retain(.{});
+    try nested.retain(.{});
+    try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+    try std.testing.expectEqualDeep(AdmissionAmounts{}, recorder.current);
+    try std.testing.expectEqual(@as(usize, 0), recorder.releases);
+    try std.testing.expectError(error.ResourceBudgetInUse, controller.configureResourceBudget(null));
+    child.release();
+    try std.testing.expectEqual(@as(usize, 0), recorder.releases);
+    nested.release();
+    try std.testing.expectEqual(@as(usize, 1), recorder.releases);
+    try std.testing.expect(recorder.reconfiguration_blocked);
+    try controller.configureResourceBudget(null);
+    try std.testing.expectEqual(@as(usize, 1), recorder.references);
+}
+
+test "admission partition allocation and producer lifetime failures leave the original token intact" {
+    const a = std.testing.allocator;
+    var recorder = PartitionBudgetRecorder{};
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    try controller.configureResourceBudget(recorder.capability());
+    var source = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 128 }, false);
+    defer source.release();
+    const original = source;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, source.partition(failing.allocator(), .{ .host_scratch_bytes = 64 }));
+    try std.testing.expectEqualDeep(original, source);
+    recorder.reject_context = true;
+    try std.testing.expectError(error.ResourceOwnerShuttingDown, source.partition(a, .{ .host_scratch_bytes = 64 }));
+    try std.testing.expectEqualDeep(original, source);
+    try std.testing.expectEqual(@as(usize, 2), recorder.references);
+    recorder.reject_context = false;
+    var child = try source.partition(a, .{ .host_scratch_bytes = 64 });
+    defer child.release();
+    recorder.reject_retain = true;
+    // An infallible child release conservatively keeps the old external peak
+    // when its provider refuses a shrink; final release still consumes it once.
+    child.release();
+    try std.testing.expectEqual(@as(usize, 128), recorder.current.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 64), controller.snapshot().host_scratch_bytes);
+    source.release();
+    try std.testing.expectEqual(@as(usize, 1), recorder.releases);
+    try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+}
+
+test "admission partition splits pending and settled live-memory ownership exactly" {
+    const a = std.testing.allocator;
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    var source = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 128 }, false);
+    defer source.release();
+    // Deterministic sampled epoch; no platform/cgroup probe participates.
+    controller.live_capacity_bytes = 1024;
+    controller.live_pending_bytes = 128;
+    controller.live_epoch = 17;
+    source.live_reserved_bytes = 128;
+    var child = try source.partition(a, .{ .host_scratch_bytes = 32 });
+    defer child.release();
+    try std.testing.expectEqual(@as(usize, 96), source.live_reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 32), child.live_reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 128), controller.live_pending_bytes);
+    try source.retain(.{ .host_scratch_bytes = 64 });
+    try std.testing.expectEqual(@as(usize, 32), controller.live_pending_bytes);
+    try std.testing.expectEqual(@as(usize, 64), source.live_settled_bytes);
+    var resident = try source.partition(a, .{ .host_scratch_bytes = 16 });
+    defer resident.release();
+    try std.testing.expectEqual(@as(usize, 16), resident.live_settled_bytes);
+    try std.testing.expectEqual(@as(u64, 17), resident.live_settled_epoch);
+    try std.testing.expectEqual(@as(usize, 48), source.live_settled_bytes);
+    const capacity = controller.live_capacity_bytes;
+    resident.release();
+    try std.testing.expectEqual(capacity + 16, controller.live_capacity_bytes);
+    source.release();
+    child.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.live_capacity_bytes);
+    try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+}
+
+test "admission partition external promotion unwinds every allocation failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var recorder = PartitionBudgetRecorder{};
+            var controller = AdmissionController{};
+            defer {
+                controller.deinit();
+                std.debug.assert(recorder.references == 1 and recorder.releases == 1);
+            }
+            try controller.configureResourceBudget(recorder.capability());
+            var source = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 128 }, false);
+            defer source.release();
+            var child = try source.partition(a, .{ .host_scratch_bytes = 64 });
+            defer child.release();
+            var nested = try child.partition(a, .{ .host_scratch_bytes = 32 });
+            defer nested.release();
+            try source.retain(.{ .host_scratch_bytes = 32 });
+            try child.retain(.{ .host_scratch_bytes = 16 });
+            try std.testing.expectEqual(@as(usize, 1), recorder.reserves);
+            try std.testing.expectEqual(@as(usize, 80), controller.snapshot().host_scratch_bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

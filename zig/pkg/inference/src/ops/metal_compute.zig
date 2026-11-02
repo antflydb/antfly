@@ -2942,6 +2942,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const metal_tensor = if (buf.metal_tensor) |*mt| mt else return null;
         if (!metal_tensor.isDevice()) return null;
         if (metal_tensor.deviceByteLen() == 0) return null;
+        // A published physical view pins its allocation and every retained
+        // metadata alias. The shared frame cannot overwrite or retire it.
+        if (metal_tensor.hasPhysicalLease()) return null;
         if (metal_tensor.isOwnedDeviceBuffer()) return null;
         var copied = try metal_tensor.copiedView(0, metal_tensor.deviceByteLen(), metal_tensor.shape());
         const owned_ct = self.ctFromOwnedMetalTensor(copied) catch |err| {
@@ -9528,6 +9531,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return result;
     }
 
+    fn physicalStorageReservationBytesOp(ctx: *anyopaque, byte_size: usize) anyerror!usize {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        const bound = metal_runtime.antfly_metal_physical_allocation_bytes(runtime, byte_size);
+        if (bound < byte_size) return error.InvalidPhysicalStorageReservation;
+        return bound;
+    }
+
+    fn physicalStorageBytesOp(_: *anyopaque, tensor: CT) ?usize {
+        const buffer = toBuf(tensor);
+        if (buffer.metal_tensor) |*metal_tensor| return metal_tensor.allocatedDeviceBytes();
+        return null;
+    }
+
     fn allocatePhysicalStorageOp(ctx: *anyopaque, byte_size: usize) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
@@ -9535,9 +9552,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // Published storage must bypass frame/arena reuse even when the
         // snapshot is encoded inside an active planned decoder frame.
         const shape = [_]i32{@intCast(byte_size / @sizeOf(f32))};
-        var tensor = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), byte_size, .private, &shape);
+        var tensor = try MetalTensor.deviceAllocateFreshWithAllocator(self.allocator, @ptrCast(runtime), byte_size, .private, &shape);
         errdefer tensor.deinit();
         return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.dtype != .f32) return null;
+        if (request.storage.backend.ptr != ctx or request.storage.backend.kind() != .metal) return error.InvalidPhysicalStorageBackend;
+        const storage = toBuf(request.storage.tensor);
+        if (bufHasAnyQuantizedStorage(storage) or hasHostView(storage)) return null;
+        const source = if (storage.metal_tensor) |*tensor| tensor else return null;
+        var view = try MetalTensor.deviceLeasedView(self.allocator, source, request.storage, request.shape);
+        errdefer view.deinit();
+        return self.ctFromOwnedMetalTensor(view);
     }
 
     /// Bind shared semantics to the existing Metal command/arena schedules.
@@ -34387,7 +34416,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.populateMemoryDebugStats(&provider_stats);
         const memory = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
         return .{
-            .runtime = .{ .counters = .{ .frame_submissions = memory.frame_submit_count }, .memory = .{ .scope = .backend_runtime_buffers, .live_bytes = memory.total_bytes } },
+            .runtime = .{
+                .counters = .{ .frame_submissions = memory.frame_submit_count },
+                .memory = .{ .scope = .backend_runtime_buffers, .live_bytes = memory.total_bytes },
+                .process = @import("../backends/metal_telemetry.zig").runtimeProcessSnapshot(),
+            },
             .native_quant_null = false,
             .provider = provider_stats,
             .quant = .{},
@@ -36467,7 +36500,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         break :blk vt;
     };
 
-    const kernel_backend_impl = ops.KernelBackend{ .readFloat32Into = readFloat32IntoOp, .allocatePhysicalStorage = allocatePhysicalStorageOp, .runAssignedKernel = runAssignedKernelOp };
+    const kernel_backend_impl = ops.KernelBackend{ .physicalStorageReservationBytes = physicalStorageReservationBytesOp, .physicalStorageBytes = physicalStorageBytesOp, .readFloat32Into = readFloat32IntoOp, .allocatePhysicalStorage = allocatePhysicalStorageOp, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp };
 
     const vtable_impl = blk: {
         var vt = native_compute_mod.vtable_impl;
@@ -50250,4 +50283,44 @@ test "Metal pooling and bare RMS metadata adoption failures release device outpu
             try std.testing.expectEqual(live_before, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
         }
     }
+}
+
+test "Metal uniform observation counts real dispatch submission waits and rounded backing" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const raw = compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    const values = [_]f32{ -1, 2, -3, 4 };
+    var device = try MetalTensor.deviceAllocateFresh(@ptrCast(raw), @sizeOf(@TypeOf(values)), .private, &.{ 1, 4 });
+    var device_owned = true;
+    defer if (device_owned) device.deinit();
+    try device.uploadBytes(std.mem.asBytes(&values));
+    const actual_backing = device.allocatedDeviceBytes().?;
+    try std.testing.expect(actual_backing >= @sizeOf(@TypeOf(values)));
+    const input = try compute.ctFromOwnedMetalTensor(device);
+    device_owned = false;
+    defer backend.free(input);
+    try std.testing.expectEqual(@as(?usize, actual_backing), backend.vtable.kernels.?.physicalStorageBytes.?(backend.ptr, input));
+    var scope = @import("../execution/runtime_observation.zig").Scope.init();
+    defer scope.deinit();
+    const before = backend.debugTimingSnapshot().runtime;
+    const output = try backend.relu(input);
+    defer backend.free(output);
+    const host = try backend.toFloat32(output, a);
+    defer a.free(host);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 2, 0, 4 }, host);
+    const measured = scope.snapshot();
+    try std.testing.expect(measured.metal_encoded_dispatches.? > 0);
+    try std.testing.expect(measured.metal_command_submissions.? > 0);
+    try std.testing.expect(measured.metal_command_waits.? > 0);
+    const interval = backend.debugTimingSnapshot().runtime.since(before);
+    try std.testing.expect(interval.process != null);
+    try std.testing.expect(interval.process.?.counters.physical_allocations > 0);
+    try std.testing.expect(interval.process.?.owned_live_bytes >= actual_backing);
+    try std.testing.expect(interval.process.?.owned_lifetime_peak_bytes >= interval.process.?.owned_live_bytes);
 }

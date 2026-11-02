@@ -863,3 +863,107 @@ test "tokenizer source compatibility uses resolved architecture and rejects non-
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     try std.testing.expect(shouldEnableGemmaSentencePieceCompat(resolved, root, failing.allocator()));
 }
+
+/// Construction follows model metadata; serving admits the selected parse peak
+/// before calling this owner and adopts the result with its retained lease.
+pub const Options = struct {
+    cache: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
+    parallel: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
+};
+pub const Loaded = struct {
+    hf: ?*hf_tokenizer.HfTokenizer = null,
+    sp: ?*sentencepiece.Processor = null,
+    decision_digest: ?@import("gliner_decide_qualification.zig").Digest = null,
+
+    pub fn deinit(self: *Loaded, allocator: std.mem.Allocator) void {
+        if (self.hf) |tokenizer| tokenizer.deinitSelf();
+        if (self.sp) |tokenizer| {
+            tokenizer.deinit();
+            allocator.destroy(tokenizer);
+        }
+        self.* = .{};
+    }
+};
+pub fn select(allocator: std.mem.Allocator, model_dir: []const u8, manifest: manifest_mod.ModelManifest) !manifest_mod.TokenizerType {
+    if (shouldPreferSentencePieceOverride(manifest, model_dir, allocator)) return .sentencepiece;
+    return manifest.tokenizer_type orelse error.NoTokenizerFound;
+}
+pub fn loadSelected(allocator: std.mem.Allocator, model_dir: []const u8, manifest: *const manifest_mod.ModelManifest, kind: manifest_mod.TokenizerType, options: Options) !Loaded {
+    const man = manifest.*;
+    var result = Loaded{};
+    errdefer result.deinit(allocator);
+    switch (kind) {
+        .huggingface => {
+            result.hf = if (man.gliner_architecture == .boundary) blk: {
+                const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
+                const bytes = try c_file.readFileMax(allocator, path, 32 * 1024 * 1024);
+                defer allocator.free(bytes);
+                // Parse the same bytes that pass the receipt check. A
+                // separate pathname check leaves a replacement window.
+                try man.verifyBoundarySidecar("tokenizer.json", bytes);
+                break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(allocator, bytes, .{ .strict_unigram_normalizer = true });
+            } else if (man.gliner_architecture == .span and man.gliner_span_declared) blk: {
+                const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
+                const bytes = try c_file.readFileMax(allocator, path, 32 * 1024 * 1024);
+                defer allocator.free(bytes);
+                const digest = @import("gliner_decide_qualification.zig").Digest.of(bytes);
+                if (man.gliner_span_tokenizer_digest) |expected| {
+                    if (digest.size_bytes != expected.size_bytes or !std.mem.eql(u8, &digest.sha256, &expected.sha256))
+                        return error.GlinerDecisionArtifactMismatch;
+                } else return error.MissingGlinerDecisionIdentity;
+                const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, bytes);
+                result.decision_digest = digest;
+                break :blk tokenizer;
+            } else try loadHuggingFaceTokenizerFromManifest(allocator, &man);
+            try result.hf.?.configureBpeCache(options.cache);
+            try result.hf.?.configureParallelBpe(
+                options.parallel,
+            );
+        },
+        .sentencepiece => {
+            const sp = try loadSentencePieceTokenizerFromDirOrGguf(allocator, model_dir, man.gguf_path);
+            errdefer {
+                sp.deinit();
+                allocator.destroy(sp);
+            }
+            if (shouldEnableGemmaSentencePieceCompat(man, model_dir, allocator)) {
+                sp.setPreserveInlineSpecialsAfterLiteralBos(true);
+            }
+            try loadSentencePieceAddedTokens(model_dir, allocator, sp);
+            result.sp = sp;
+        },
+    }
+    return result;
+}
+
+test "selected tokenizer construction owns parse failures and verifies the exact decision bytes" {
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const bytes = "{\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"[UNK]\",\"vocab\":{\"[UNK]\":0,\"hello\":1}}}";
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data = bytes });
+    const directory = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..] });
+    defer a.free(directory);
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .tokenizer_type = .huggingface, .tokenizer_json_path = path };
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, root: []const u8, source: manifest_mod.ModelManifest) !void {
+            var loaded = try loadSelected(allocator, root, &source, .huggingface, .{});
+            defer loaded.deinit(allocator);
+            const ids = try loaded.hf.?.tokenizer().encode(allocator, "hello");
+            defer allocator.free(ids);
+            try std.testing.expectEqualSlices(i32, &.{1}, ids);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{ directory, manifest });
+    var decision = manifest;
+    decision.gliner_architecture = .span;
+    decision.gliner_span_declared = true;
+    decision.gliner_span_tokenizer_digest = @import("gliner_decide_qualification.zig").Digest.of(bytes);
+    var loaded = try loadSelected(a, directory, &decision, .huggingface, .{});
+    defer loaded.deinit(a);
+    try std.testing.expectEqualDeep(decision.gliner_span_tokenizer_digest, loaded.decision_digest);
+    decision.gliner_span_tokenizer_digest.?.sha256[0] ^= 1;
+    try std.testing.expectError(error.GlinerDecisionArtifactMismatch, loadSelected(a, directory, &decision, .huggingface, .{}));
+}

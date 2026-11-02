@@ -1737,6 +1737,10 @@ pub const MetalPartitionExecutor = struct {
             .last_use = last_use,
             .pair_second = if (exec_ctx.pair_second) |pair| pair.* else null,
         };
+        // The explicit command branch below owns Metal bank eligibility and
+        // its frame completion proof. Interpreter fallbacks retain their
+        // ordinary allocation path, including inside caller-owned frames.
+        exec_state.options.physical_frame = null;
 
         // Per-step disentangled-attention padding-mask cache (computed once,
         // reused across all attention calls this step — see AttnMaskCache).
@@ -2065,8 +2069,31 @@ pub const MetalPartitionExecutor = struct {
                     if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     const command_path_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
+                    // Keep tuned regions and graph fusions ahead of generic
+                    // descriptor dispatch. Once that choice reaches this
+                    // assigned branch, bind the common plan's output directly
+                    // instead of allocating another device-specific hint.
+                    const physical_output: ?CT = physical: {
+                        // An owned frame is drained (or cancelled on error)
+                        // before this invocation releases its storage bank.
+                        // A caller-owned frame can remain unsubmitted beyond
+                        // that lifetime; keep its existing allocation path.
+                        if (!frame_active) break :physical null;
+                        if (metalPartitionRuntimeCommandsDisabled()) break :physical null;
+                        if (runtime_region_plan.descriptorAt(node_pos) == null) break :physical null;
+                        const frame = options.physical_frame orelse break :physical null;
+                        // Metal may intentionally leave a producer absent so
+                        // the command path below can fold it into its consumer
+                        // (broadcasts, scales and transposes, for example).
+                        // A frozen descriptor is usable only once all of its
+                        // ordinary operands have actually been materialized.
+                        for (graph.node(node_id).getInputs()) |input| {
+                            if (valueFor(values, input) == null) break :physical null;
+                        }
+                        break :physical try frame.execute(cb, values, node_id, try interpreter.ropePositionOverride(exec_state.options.attention));
+                    };
                     var output_hint_source: ?OutputHintSource = null;
-                    const output_hint: ?CT = blk: {
+                    const output_hint: ?CT = if (physical_output != null) null else blk: {
                         if (chunk_local_outputs) {
                             if (currentFrameChunkBoundaryPos(node_ids.len, node_pos, chunk_ops, chunk_executed)) |chunk_boundary_pos| {
                                 if (chunk_local_pool.outputHintForNode(cb, graph, buffer_plan, values, node_ids, node_pos, chunk_boundary_pos, node_id)) |hint| {
@@ -2109,6 +2136,9 @@ pub const MetalPartitionExecutor = struct {
                         break :blk null;
                     };
                     const command_output_opt = command: {
+                        // Frame statistics account this dispatch once at the
+                        // shared runtime boundary, including actual backing.
+                        if (physical_output) |output| break :command output;
                         if (metalPartitionRuntimeCommandsDisabled()) break :command null;
                         errdefer if (output_hint) |hint| cb.free(hint);
                         if (runtime_region_plan.descriptorAt(node_pos)) |descriptor| {

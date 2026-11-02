@@ -38,6 +38,10 @@ pub const ResidentInput = struct {
     shape: []const i64 = &.{},
 };
 
+/// Borrowed stage inputs ordered by the destination session signature.
+/// Host values are explicit uploads; resident values retain producer ownership.
+pub const StageInput = union(enum) { host: Tensor, resident: ResidentInput };
+
 pub const ResidentTextPooling = enum { mean, cls, max, last };
 
 pub const ResidentTextEmbeddingRequest = struct {
@@ -52,6 +56,7 @@ pub const ResidentOutputs = struct {
     backend_owner: ?*anyopaque = null,
     deinit_backend_owner: ?*const fn (owner: *anyopaque, allocator: std.mem.Allocator) void = null,
     resource_lease: ?memory.AdmissionLease = null,
+    model_retention: ?*Session.ModelLifetime = null,
 
     pub fn deinit(self: *ResidentOutputs) void {
         for (self.outputs, 0..) |output, idx| {
@@ -73,6 +78,8 @@ pub const ResidentOutputs = struct {
         self.backend_owner = null;
         self.deinit_backend_owner = null;
         self.resource_lease = null;
+        if (self.model_retention) |lifetime| lifetime.release();
+        self.model_retention = null;
     }
 };
 
@@ -547,6 +554,7 @@ fn residentShapeDimension(inputs: []const ResidentInput, axis: usize) usize {
 const OutputAdmission = struct {
     allocator: std.mem.Allocator,
     lease: memory.AdmissionLease,
+    resource_pin: ?Session.ModelLifetime.ResourcePin = null,
     remaining: std.atomic.Value(usize),
     entries: []Entry,
     credits: OutputCredits,
@@ -565,7 +573,9 @@ const OutputAdmission = struct {
         self.lease.release();
         self.credits.deinit(self.allocator);
         self.allocator.free(self.entries);
+        const resource_pin = self.resource_pin;
         self.allocator.destroy(self);
+        if (resource_pin) |pin| pin.release();
     }
 };
 
@@ -687,6 +697,71 @@ pub const ResidentPreparation = struct {
 
 /// Loaded model execution handle. Copies preserve the resolved model contract.
 pub const Session = struct {
+    pub const ModelLifetime = struct {
+        pub const ResourcePin = struct {
+            ptr: *anyopaque,
+            release_fn: *const fn (*anyopaque) void,
+            retain_fn: ?*const fn (*anyopaque) void = null,
+            pub fn retain(self: ResourcePin) ?ResourcePin {
+                const retain_fn = self.retain_fn orelse return null;
+                retain_fn(self.ptr);
+                return self;
+            }
+            pub fn release(self: ResourcePin) void {
+                self.release_fn(self.ptr);
+            }
+        };
+        references: std.atomic.Value(usize) = .init(1),
+        owner: *anyopaque,
+        destroy_fn: *const fn (*anyopaque) void,
+        quiesce_fn: ?*const fn (*anyopaque) void = null,
+        allocator: ?std.mem.Allocator = null,
+        model_lease: ?memory.AdmissionLease = null,
+        resource_pin: ?ResourcePin = null,
+        close_protection: ?CloseProtection = null,
+
+        pub fn retain(self: *ModelLifetime) *ModelLifetime {
+            const old = self.references.fetchAdd(1, .monotonic);
+            std.debug.assert(old > 0 and old < std.math.maxInt(usize));
+            return self;
+        }
+        pub fn release(self: *ModelLifetime) void {
+            const old = self.references.fetchSub(1, .acq_rel);
+            std.debug.assert(old > 0);
+            if (old != 1) return;
+            // Embedded lifetimes disappear in destroy_fn; move every cleanup value
+            // out before destroying the owner. Provider and weight retirement must
+            // precede the model admission lease and the controller-domain pin.
+            const owner = self.owner;
+            const destroy = self.destroy_fn;
+            const allocator = self.allocator;
+            var model_lease = self.model_lease;
+            const pin = self.resource_pin;
+            const protection = self.close_protection;
+            var scope = if (protection) |p| p.begin() else CloseScope{};
+            destroy(owner);
+            if (model_lease) |*lease| lease.release();
+            scope.deinit();
+            if (protection) |p| p.release();
+            if (allocator) |a| a.destroy(self);
+            if (pin) |p| p.release();
+        }
+        fn close(self: *ModelLifetime, protection: ?CloseProtection, lease: *?memory.AdmissionLease) void {
+            std.debug.assert(self.close_protection == null);
+            if (lease.* != null) {
+                std.debug.assert(self.model_lease == null);
+                self.model_lease = lease.*;
+                lease.* = null;
+            }
+            self.close_protection = protection;
+            var scope = if (protection) |p| p.begin() else CloseScope{};
+            defer scope.deinit();
+            if (self.quiesce_fn) |quiesce| quiesce(self.owner);
+            self.release();
+        }
+    };
+
+    model_lifetime: ?*ModelLifetime = null,
     model_contract: ModelContract = .{},
     compute_backend_provider: ?ComputeBackendProvider = null,
     resident_preparation: ?ResidentPreparation = null,
@@ -742,6 +817,7 @@ pub const Session = struct {
     }
 
     pub const VTable = struct {
+        quiesce: ?*const fn (*anyopaque) void = null,
         configureExecutionDiagnostics: ?*const fn (ptr: *anyopaque, enabled: bool) void = null,
         executionDiagnostics: ?*const fn (ptr: *anyopaque) ?@import("../execution/diagnostics.zig").Snapshot = null,
         hasLayaDecisions: ?*const fn (ptr: *anyopaque) bool = null,
@@ -786,7 +862,7 @@ pub const Session = struct {
         errdefer if (resource_lease) |*lease| lease.release();
         const outputs = try self.vtable.run(self.ptr, inputs, allocator);
         errdefer deinitTensorSlice(outputs, allocator);
-        return attachOutputAdmission(outputs, allocator, &resource_lease);
+        return attachOutputAdmission(outputs, allocator, &resource_lease, self.resourcePin());
     }
 
     pub fn runWithControl(
@@ -812,7 +888,7 @@ pub const Session = struct {
         const outputs = try self.vtable.runWithControl(self.ptr, inputs, allocator, active);
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
-        return attachOutputAdmission(outputs, allocator, &resource_lease);
+        return attachOutputAdmission(outputs, allocator, &resource_lease, self.resourcePin());
     }
 
     /// Optional typed-decision route. Only an unsupported/disabled capability
@@ -835,7 +911,7 @@ pub const Session = struct {
         };
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
-        return try attachOutputAdmission(outputs, allocator, &lease);
+        return try attachOutputAdmission(outputs, allocator, &lease, self.resourcePin());
     }
 
     /// Borrows outputs and the lease until success. On error the caller still
@@ -844,6 +920,7 @@ pub const Session = struct {
         outputs: []Tensor,
         allocator: std.mem.Allocator,
         resource_lease: *?memory.AdmissionLease,
+        resource_pin: ?ModelLifetime.ResourcePin,
     ) ![]Tensor {
         if (resource_lease.* == null) return outputs;
         if (outputs.len == 0) {
@@ -880,6 +957,7 @@ pub const Session = struct {
         output_admission.* = .{
             .allocator = allocator,
             .lease = resource_lease.*.?,
+            .resource_pin = if (resource_pin) |pin| pin.retain() else null,
             .remaining = std.atomic.Value(usize).init(outputs.len),
             .entries = entries,
             .credits = credits,
@@ -902,14 +980,14 @@ pub const Session = struct {
     /// Reserve the full request peak before preprocessing allocates input
     /// buffers. The permit owns that lease and executes without double-counting.
     pub fn admit(self: Session, request: RunRequest) !RunPermit {
-        return .{
+        return self.retainPermit(.{
             .session = self,
             .request = request,
             .lease = if (self.run_admission) |admission|
                 try admission.acquireRequest(request, self.outputInfo())
             else
                 null,
-        };
+        });
     }
 
     /// Acquire only a later phase's additional peak while the original lease
@@ -932,7 +1010,7 @@ pub const Session = struct {
     pub fn admitSupplementPairWithPressure(self: Session, base: *const RunPermit, other: ?*const RunPermit, target: memory.AdmissionAmounts, pressure: *?memory.AdmissionPressure) !RunPermit {
         pressure.* = null;
         if (base.session.ptr != self.ptr or base.session.vtable != self.vtable or base.execution_yielded) return error.InvalidAdmissionLeaseReduction;
-        const admission = self.run_admission orelse return .{ .session = self, .lease = null };
+        const admission = self.run_admission orelse return self.retainPermit(.{ .session = self, .lease = null });
         const lease = base.lease orelse return error.InvalidAdmissionLeaseReduction;
         if (lease.controller != admission.controller or lease.retain_backend_class != admission.backend_class) return error.InvalidAdmissionLeaseReduction;
         var owned = lease.amounts;
@@ -945,23 +1023,23 @@ pub const Session = struct {
         }
         var extra = memory.AdmissionAmounts{};
         inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| @field(extra, name) = @field(target, name) -| @field(owned, name);
-        if (std.meta.eql(extra, memory.AdmissionAmounts{})) return .{ .session = self, .lease = null };
+        if (std.meta.eql(extra, memory.AdmissionAmounts{})) return self.retainPermit(.{ .session = self, .lease = null });
         if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
-        return .{ .session = self, .lease = try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, extra, admission.check_live_memory, pressure) };
+        return self.retainPermit(.{ .session = self, .lease = try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, extra, admission.check_live_memory, pressure) });
     }
 
     /// Preserve the exact denial constraint for bounded batch planning. A
     /// failed reservation publishes no lease; a fit probe is never a permit.
     pub fn admitWithPressure(self: Session, request: RunRequest, pressure: *?memory.AdmissionPressure) !RunPermit {
         pressure.* = null;
-        return .{
+        return self.retainPermit(.{
             .session = self,
             .request = request,
             .lease = if (self.run_admission) |admission| blk: {
                 if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
                 break :blk try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, try admission.estimateRequest(request, self.outputInfo()), admission.check_live_memory, pressure);
             } else null,
-        };
+        });
     }
 
     pub fn planRun(self: Session, inputs: []const Tensor, batch_override: ?usize) !RunRequest {
@@ -1066,7 +1144,7 @@ pub const Session = struct {
             initialized += 1;
         }
         if (control) |active| try active.check();
-        _ = try attachOutputAdmission(copies, allocator, &lease);
+        _ = try attachOutputAdmission(copies, allocator, &lease, self.resourcePin());
         for (copies, indices) |copy, index| {
             tensors[index].deinit();
             tensors[index] = copy;
@@ -1098,33 +1176,82 @@ pub const Session = struct {
     /// model run, enabling callers to reclaim relevant optional caches safely.
     pub fn admitHostPreprocessWithPressure(self: Session, host_scratch_bytes: usize, pressure: *?memory.AdmissionPressure) !RunPermit {
         pressure.* = null;
-        return .{
+        return self.retainPermit(.{
             .session = self,
             .lease = if (self.run_admission) |admission| blk: {
                 if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
                 break :blk try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, .{ .host_scratch_bytes = host_scratch_bytes }, admission.check_live_memory, pressure);
             } else null,
-        };
+        });
     }
 
     /// Owned media cache allocations can outlive a single execution permit.
     /// Charge them independently until eviction, including full device buffers
     /// retained by views rather than only their logical tensor payload.
     pub fn admitRetainedMedia(self: Session, host_bytes: usize, device_bytes: usize) !RunPermit {
-        return .{ .session = self, .lease = if (self.run_admission) |admission|
+        return self.retainPermit(.{ .session = self, .lease = if (self.run_admission) |admission|
             try admission.acquireAmounts(.{ .host_scratch_bytes = host_bytes, .backend_scratch_bytes = device_bytes })
         else
-            null };
+            null });
     }
 
     pub fn admitResidentInputs(self: Session, inputs: []const ResidentInput) !RunPermit {
-        return .{
+        return self.retainPermit(.{
             .session = self,
             .lease = if (self.run_admission) |admission|
                 try admission.acquireResidentInputs(inputs, self.outputInfo())
             else
                 null,
+        });
+    }
+
+    /// Capability preflight is metadata-only and precedes admission or uploads.
+    /// A source from another device context is never normalized through the host.
+    pub fn supportsStageInputs(self: Session, inputs: []const StageInput) bool {
+        const shared = self.shared_compute_context orelse return false;
+        if (self.vtable.runResidentInputs == null or inputs.len != self.inputInfo().len) return false;
+        const stage_backend = shared.stableBackend();
+        for (inputs, self.inputInfo()) |input, info| switch (input) {
+            .host => |host| if (!std.mem.eql(u8, host.name, info.name) or host.dtype != info.dtype) return false,
+            .resident => |value| {
+                if (value.backend.ptr == stage_backend.ptr and value.backend.vtable == stage_backend.vtable) continue;
+                if (value.backend.kind() == .native and stage_backend.kind() == .native) continue;
+                return false;
+            },
         };
+        return true;
+    }
+
+    /// A mixed stage has one admission boundary. Resident activations stay with
+    /// their producer; only host controls are imported into the selected context.
+    pub fn runStageInputsWithControl(self: Session, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
+        if (!self.supportsStageInputs(inputs)) return null;
+        if (control != null and self.vtable.runResidentInputsWithControl == null) return null;
+        if (control) |active| try active.check();
+        var protection = if (control) |active| try active.enterUninterruptible(self.interruption()) else null;
+        defer if (protection) |*scope| scope.deinit();
+        var metadata = std.heap.ArenaAllocator.init(allocator);
+        defer metadata.deinit();
+        const info = try metadata.allocator().alloc(TensorInfo, inputs.len);
+        for (inputs, self.inputInfo(), info) |input, declared, *actual| {
+            actual.* = switch (input) {
+                .host => |host| .{ .name = host.name, .dtype = host.dtype, .shape = host.shape },
+                .resident => |value| .{
+                    .name = declared.name,
+                    .dtype = declared.dtype,
+                    .shape = try value.backend.tensorShape(value.value, metadata.allocator()),
+                },
+            };
+        }
+        const batch = if (info.len > 0) positiveDimension(info[0].shape, 0) else 1;
+        var permit = try self.admit(try self.planShapes(info, batch));
+        defer permit.deinit();
+        var outputs = (try permit.runStageInputsWithinBoundary(inputs, allocator, control)) orelse return null;
+        std.debug.assert(outputs.resource_lease == null);
+        outputs.resource_lease = permit.lease;
+        permit.lease = null;
+        self.pinResident(&outputs);
+        return outputs;
     }
 
     pub fn inputInfo(self: Session) []const TensorInfo {
@@ -1179,11 +1306,61 @@ pub const Session = struct {
         return if (self.close_protection) |protection| protection.begin() else .{};
     }
 
-    pub fn close(self: Session) void {
+    pub fn attachResourcePin(self: *Session, allocator: std.mem.Allocator, pin: ModelLifetime.ResourcePin) !void {
+        if (self.model_lifetime == null) {
+            const lifetime = try allocator.create(ModelLifetime);
+            lifetime.* = .{ .owner = self.ptr, .destroy_fn = self.vtable.close, .quiesce_fn = self.vtable.quiesce, .allocator = allocator };
+            self.model_lifetime = lifetime;
+        }
+        const lifetime = self.model_lifetime.?;
+        if (lifetime.resource_pin != null) return error.ResourcePinAlreadyAttached;
+        lifetime.resource_pin = pin;
+    }
+
+    fn retainPermit(self: Session, permit: RunPermit) RunPermit {
+        var owned = permit;
+        if (owned.lease != null) if (self.resourcePin()) |pin| {
+            owned.resource_pin = pin.retain();
+        };
+        return owned;
+    }
+
+    fn resourcePin(self: Session) ?ModelLifetime.ResourcePin {
+        return if (self.model_lifetime) |lifetime| lifetime.resource_pin else null;
+    }
+
+    pub fn pinResident(self: Session, outputs: *ResidentOutputs) void {
+        if (outputs.model_retention == null) {
+            if (self.model_lifetime) |lifetime| outputs.model_retention = lifetime.retain();
+        }
+    }
+
+    pub fn closeRetainingResources(self: Session, lease: *?memory.AdmissionLease) void {
+        if (self.model_lifetime) |lifetime| {
+            lifetime.close(self.close_protection, lease);
+            return;
+        }
         var scope = self.beginClose();
         defer scope.deinit();
         defer if (self.close_protection) |protection| protection.release();
         self.vtable.close(self.ptr);
+        if (lease.*) |*owned| owned.release();
+        lease.* = null;
+    }
+
+    pub fn close(self: Session) void {
+        var lease: ?memory.AdmissionLease = null;
+        self.closeRetainingResources(&lease);
+    }
+
+    /// Transfer the separately owned model reservation before an aggregate owner
+    /// closes its raw sessions. Legacy sessions leave the lease with their caller.
+    pub fn retainResources(self: Session, lease: *?memory.AdmissionLease) void {
+        const lifetime = self.model_lifetime orelse return;
+        if (lease.* == null) return;
+        std.debug.assert(lifetime.model_lease == null);
+        lifetime.model_lease = lease.*;
+        lease.* = null;
     }
 
     pub fn runResident(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
@@ -1199,6 +1376,7 @@ pub const Session = struct {
             };
             std.debug.assert(outputs.resource_lease == null);
             outputs.resource_lease = resource_lease;
+            self.pinResident(&outputs);
             return outputs;
         }
         return null;
@@ -1217,6 +1395,7 @@ pub const Session = struct {
             };
             std.debug.assert(outputs.resource_lease == null);
             outputs.resource_lease = resource_lease;
+            self.pinResident(&outputs);
             return outputs;
         }
         return null;
@@ -1224,12 +1403,15 @@ pub const Session = struct {
 
     pub fn runResidentTextEmbedding(self: Session, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator) !?ResidentOutputs {
         const run_resident = self.vtable.runResidentTextEmbedding orelse return null;
-        return run_resident(self.ptr, inputs, request, allocator);
+        var outputs = (try run_resident(self.ptr, inputs, request, allocator)) orelse return null;
+        self.pinResident(&outputs);
+        return outputs;
     }
 };
 
 pub const RunPermit = struct {
     session: Session,
+    resource_pin: ?Session.ModelLifetime.ResourcePin = null,
     lease: ?memory.AdmissionLease,
     request: ?RunRequest = null,
     execution_yielded: bool = false,
@@ -1297,7 +1479,7 @@ pub const RunPermit = struct {
             defer execution.deinit();
             const outputs = try execution.runWithControl(inputs, allocator, control);
             errdefer deinitTensorSlice(outputs, allocator);
-            return Session.attachOutputAdmission(outputs, allocator, &execution.lease);
+            return Session.attachOutputAdmission(outputs, allocator, &execution.lease, self.session.resourcePin());
         }
         const active = control orelse return self.run(inputs, allocator);
         try active.check();
@@ -1329,7 +1511,7 @@ pub const RunPermit = struct {
             defer execution.deinit();
             const outputs = (try execution.runLayaDecisionsWithControl(inputs, allocator, control)) orelse return null;
             errdefer deinitTensorSlice(outputs, allocator);
-            return try Session.attachOutputAdmission(outputs, allocator, &execution.lease);
+            return try Session.attachOutputAdmission(outputs, allocator, &execution.lease, self.session.resourcePin());
         }
         const active = control orelse InferenceExecutionControl{};
         try active.check();
@@ -1346,9 +1528,12 @@ pub const RunPermit = struct {
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) !?ResidentOutputs {
+        try self.resolveGeometry(inputs);
         if (self.execution_yielded) return self.runResidentWithControl(inputs, allocator, null);
         const run_resident = self.session.vtable.runResident orelse return null;
-        return run_resident(self.session.ptr, inputs, allocator);
+        var outputs = (try run_resident(self.session.ptr, inputs, allocator)) orelse return null;
+        self.session.pinResident(&outputs);
+        return outputs;
     }
 
     pub fn runResidentWithControl(
@@ -1357,6 +1542,7 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        try self.resolveGeometry(inputs);
         if (self.execution_yielded) {
             var execution = try self.acquireExecution();
             defer execution.deinit();
@@ -1364,6 +1550,7 @@ pub const RunPermit = struct {
             std.debug.assert(outputs.resource_lease == null);
             outputs.resource_lease = execution.lease;
             execution.lease = null;
+            self.session.pinResident(&outputs);
             return outputs;
         }
         const active = control orelse return self.runResident(inputs, allocator);
@@ -1376,6 +1563,60 @@ pub const RunPermit = struct {
             return null;
         errdefer outputs.deinit();
         try active.check();
+        self.session.pinResident(&outputs);
+        return outputs;
+    }
+
+    /// The permit and hard-cancellation scope cover imports as well as execution.
+    /// All input owners remain borrowed until the backend has consumed them.
+    pub fn runStageInputsWithControl(self: *RunPermit, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
+        if (!self.session.supportsStageInputs(inputs)) return null;
+        if (control != null and self.session.vtable.runResidentInputsWithControl == null) return null;
+        if (self.execution_yielded) {
+            var execution = try self.acquireExecution();
+            defer execution.deinit();
+            var outputs = (try execution.runStageInputsWithControl(inputs, allocator, control)) orelse return null;
+            std.debug.assert(outputs.resource_lease == null);
+            outputs.resource_lease = execution.lease;
+            execution.lease = null;
+            self.session.pinResident(&outputs);
+            return outputs;
+        }
+        if (control) |active| try active.check();
+        var protection = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
+        defer if (protection) |*scope| scope.deinit();
+        return self.runStageInputsWithinBoundary(inputs, allocator, control);
+    }
+
+    fn runStageInputsWithinBoundary(self: *RunPermit, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
+        const shared = self.session.shared_compute_context.?;
+        const backend = shared.stableBackend();
+        const resident = try allocator.alloc(ResidentInput, inputs.len);
+        defer allocator.free(resident);
+        var initialized: usize = 0;
+        defer for (inputs[0..initialized], resident[0..initialized]) |input, value| {
+            if (input == .host) backend.free(value.value);
+        };
+        for (inputs, resident) |input, *value| {
+            if (control) |active| try active.check();
+            value.* = switch (input) {
+                .host => |host| .{
+                    .value = try shared.importHostTensor(allocator, &host),
+                    .backend = backend,
+                    .shape = host.shape,
+                    .estimated_bytes = host.data.len,
+                },
+                .resident => |existing| existing,
+            };
+            initialized += 1;
+        }
+        var outputs = (if (control) |active|
+            try self.session.vtable.runResidentInputsWithControl.?(self.session.ptr, resident, allocator, active)
+        else
+            try self.session.vtable.runResidentInputs.?(self.session.ptr, resident, allocator)) orelse return null;
+        errdefer outputs.deinit();
+        if (control) |active| try active.check();
+        self.session.pinResident(&outputs);
         return outputs;
     }
 
@@ -1387,7 +1628,9 @@ pub const RunPermit = struct {
         if (self.execution_yielded) return self.runResidentInputsWithControl(inputs, allocator, null);
         const run_resident_inputs = self.session.vtable.runResidentInputs orelse
             return null;
-        return run_resident_inputs(self.session.ptr, inputs, allocator);
+        var outputs = (try run_resident_inputs(self.session.ptr, inputs, allocator)) orelse return null;
+        self.session.pinResident(&outputs);
+        return outputs;
     }
 
     pub fn runResidentInputsWithControl(
@@ -1403,6 +1646,7 @@ pub const RunPermit = struct {
             std.debug.assert(outputs.resource_lease == null);
             outputs.resource_lease = execution.lease;
             execution.lease = null;
+            self.session.pinResident(&outputs);
             return outputs;
         }
         const active = control orelse return self.runResidentInputs(inputs, allocator);
@@ -1413,6 +1657,7 @@ pub const RunPermit = struct {
         var outputs = (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null;
         errdefer outputs.deinit();
         try active.check();
+        self.session.pinResident(&outputs);
         return outputs;
     }
 
@@ -1424,7 +1669,9 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         if (self.execution_yielded) return self.runResidentTextEmbeddingWithControl(inputs, request, allocator, null);
         const run_resident = self.session.vtable.runResidentTextEmbedding orelse return null;
-        return run_resident(self.session.ptr, inputs, request, allocator);
+        var outputs = (try run_resident(self.session.ptr, inputs, request, allocator)) orelse return null;
+        self.session.pinResident(&outputs);
+        return outputs;
     }
 
     /// Reduce an execution peak after preprocessing/vision has completed.
@@ -1483,6 +1730,7 @@ pub const RunPermit = struct {
             std.debug.assert(outputs.resource_lease == null);
             outputs.resource_lease = execution.lease;
             execution.lease = null;
+            self.session.pinResident(&outputs);
             return outputs;
         }
         const active = control orelse return self.runResidentTextEmbedding(inputs, request, allocator);
@@ -1495,12 +1743,15 @@ pub const RunPermit = struct {
             return null;
         errdefer outputs.deinit();
         try active.check();
+        self.session.pinResident(&outputs);
         return outputs;
     }
 
     pub fn deinit(self: *RunPermit) void {
         if (self.lease) |*lease| lease.release();
         self.lease = null;
+        if (self.resource_pin) |pin| pin.release();
+        self.resource_pin = null;
     }
 };
 
@@ -2128,7 +2379,7 @@ test "session output admission releases obsolete outputs independently" {
     const retained = try retainedOutputAmounts(&outputs, false);
     var permit = try session.admitHostPreprocess(retained.host_scratch_bytes);
     defer permit.deinit();
-    _ = try Session.attachOutputAdmission(&outputs, alloc, &permit.lease);
+    _ = try Session.attachOutputAdmission(&outputs, alloc, &permit.lease, null);
     outputs[0].deinit();
     try std.testing.expectEqual(retained.host_scratch_bytes / 2, controller.snapshot().host_scratch_bytes);
     try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, outputs[1].asFloat32());
@@ -2295,4 +2546,99 @@ test "resident preparation retains model owner and published policy through wrap
     unsupported.resident_preparation = null;
     try unsupported.prepareResident(.{});
     try std.testing.expectEqual(@as(usize, 2), probe.calls);
+}
+
+test "resident model retention quiesces immediately and destroys compute before weights and resource domain" {
+    const Probe = struct {
+        phase: usize = 0,
+        invalid_order: bool = false,
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn step(self: *@This(), expected: usize) void {
+            if (self.phase != expected) self.invalid_order = true;
+            self.phase += 1;
+        }
+        fn quiesce(raw: *anyopaque) void {
+            from(raw).step(0);
+        }
+        fn computeClose(raw: *anyopaque, _: std.mem.Allocator) void {
+            from(raw).step(1);
+        }
+        fn close(raw: *anyopaque) void {
+            from(raw).step(2);
+        }
+        fn pinRelease(raw: *anyopaque) void {
+            from(raw).step(3);
+        }
+        fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) ![]Tensor {
+            return error.NotUsed;
+        }
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) BackendType {
+            return .native;
+        }
+        fn resident(raw: *anyopaque, _: []const Tensor, a: std.mem.Allocator) !?ResidentOutputs {
+            return .{ .outputs = try a.alloc(ops.CT, 0), .backend = undefined, .allocator = a, .backend_owner = raw, .deinit_backend_owner = computeClose };
+        }
+        const vtable = Session.VTable{ .run = run, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close, .runResident = resident, .quiesce = quiesce };
+    };
+    var probe = Probe{};
+    var lifetime = Session.ModelLifetime{ .owner = &probe, .destroy_fn = Probe.close, .quiesce_fn = Probe.quiesce };
+    var session = Session{ .ptr = &probe, .vtable = &Probe.vtable, .model_lifetime = &lifetime };
+    const pin = Session.ModelLifetime.ResourcePin{ .ptr = &probe, .release_fn = Probe.pinRelease };
+    try session.attachResourcePin(std.testing.allocator, pin);
+    try std.testing.expectError(error.ResourcePinAlreadyAttached, session.attachResourcePin(std.testing.allocator, pin));
+    var output = (try session.runResident(&.{}, std.testing.allocator)).?;
+    try std.testing.expectEqual(@as(usize, 2), lifetime.references.load(.monotonic));
+    session.close();
+    try std.testing.expectEqual(@as(usize, 1), probe.phase);
+    try std.testing.expectEqual(@as(usize, 1), lifetime.references.load(.monotonic));
+    output.deinit();
+    try std.testing.expectEqual(@as(usize, 4), probe.phase);
+    try std.testing.expect(!probe.invalid_order);
+}
+
+test "cold model retention adoption is failure atomic" {
+    const Case = struct {
+        closed: bool = false,
+        pinned: bool = false,
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn close(raw: *anyopaque) void {
+            from(raw).closed = true;
+        }
+        fn release(raw: *anyopaque) void {
+            from(raw).pinned = false;
+        }
+        fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) ![]Tensor {
+            return error.NotUsed;
+        }
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) BackendType {
+            return .native;
+        }
+        const vtable = Session.VTable{ .run = run, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+        fn check(a: std.mem.Allocator) !void {
+            var probe = @This(){};
+            var session = Session{ .ptr = &probe, .vtable = &vtable };
+            var opened = true;
+            defer if (opened) session.close();
+            const pin = Session.ModelLifetime.ResourcePin{ .ptr = &probe, .release_fn = release };
+            try session.attachResourcePin(a, pin);
+            probe.pinned = true;
+            const retained = session.model_lifetime.?.retain();
+            session.close();
+            opened = false;
+            try std.testing.expect(!probe.closed and probe.pinned);
+            retained.release();
+            try std.testing.expect(probe.closed and !probe.pinned);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
 }

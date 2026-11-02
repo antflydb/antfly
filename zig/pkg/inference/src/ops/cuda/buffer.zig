@@ -140,9 +140,20 @@ pub const DeviceBuffer = struct {
     }
 
     pub fn copyToHost(self: DeviceBuffer, ctx: *context_mod.CudaContext, bytes: []u8) (driver_mod.Error || error{DeviceReadbackForbidden})!void {
+        return self.copyToHostWithKind(ctx, bytes, .activation);
+    }
+
+    pub fn copyIndexMetadataToHost(self: DeviceBuffer, ctx: *context_mod.CudaContext, bytes: []u8) (driver_mod.Error || error{DeviceReadbackForbidden})!void {
+        return self.copyToHostWithKind(ctx, bytes, .index_metadata);
+    }
+
+    fn copyToHostWithKind(self: DeviceBuffer, ctx: *context_mod.CudaContext, bytes: []u8, kind: enum { activation, index_metadata }) (driver_mod.Error || error{DeviceReadbackForbidden})!void {
         if (bytes.len > self.len) return error.InvalidCudaState;
         if (bytes.len == 0) return;
-        try transfer_audit.checkDeviceHostAccess();
+        switch (kind) {
+            .activation => try transfer_audit.checkDeviceHostAccess(),
+            .index_metadata => try transfer_audit.checkIndexMetadataAccess(),
+        }
         try ctx.makeCurrent();
         const result = ctx.driver.fns.cuMemcpyDtoHAsync(bytes.ptr, self.ptr, bytes.len, ctx.stream);
         if (result != driver_mod.CUDA_SUCCESS) {

@@ -44,11 +44,64 @@ pub const Memory = struct {
     /// Lifetime high-water gauge; not an invocation's peak allocation.
     lifetime_peak_bytes: ?u64 = null,
 };
+/// Worker-process observations include other contexts and threads. These are
+/// distinct from the invocation's submitting-thread counters and program leases.
+pub const ProcessCounters = struct {
+    upload_calls: u64 = 0,
+    upload_bytes: u64 = 0,
+    download_calls: u64 = 0,
+    download_bytes: u64 = 0,
+    copy_calls: u64 = 0,
+    copy_bytes: u64 = 0,
+    completed_commands: u64 = 0,
+    failed_commands: u64 = 0,
+    physical_allocations: u64 = 0,
+    physical_frees: u64 = 0,
+    allocated_bytes: u64 = 0,
+    freed_bytes: u64 = 0,
+    initialized_bytes: u64 = 0,
+    initialization_calls: u64 = 0,
+
+    pub fn since(self: ProcessCounters, before: ProcessCounters) ProcessCounters {
+        var result: ProcessCounters = .{};
+        inline for (@typeInfo(ProcessCounters).@"struct".field_names) |field|
+            @field(result, field) = @field(self, field) -| @field(before, field);
+        return result;
+    }
+};
+pub const Process = struct {
+    /// Tracked MTLBuffer allocatedSize, including command-retained temporaries.
+    /// Alias bytes use logical mapped length and are never added to owned bytes.
+    memory_scope: enum { tracked_metal_buffers_worker_process } = .tracked_metal_buffers_worker_process,
+    counters: ProcessCounters = .{},
+    owned_live_bytes: u64 = 0,
+    owned_lifetime_peak_bytes: u64 = 0,
+    private_live_bytes: u64 = 0,
+    private_lifetime_peak_bytes: u64 = 0,
+    host_visible_live_bytes: u64 = 0,
+    host_visible_lifetime_peak_bytes: u64 = 0,
+    alias_live_bytes: u64 = 0,
+    alias_lifetime_peak_bytes: u64 = 0,
+
+    pub fn since(self: Process, before: Process) Process {
+        var result = self;
+        result.counters = self.counters.since(before.counters);
+        return result;
+    }
+};
 pub const Snapshot = struct {
     counters: Counters = .{},
     memory: Memory = .{},
+    /// Invocation interval on its submitting thread, including CPU fallbacks.
+    submission: ?@import("runtime_observation.zig").Counters = null,
+    /// Process-wide interval/gauges, never per-request ownership or residency.
+    process: ?Process = null,
     pub fn since(self: Snapshot, before: Snapshot) Snapshot {
-        return .{ .counters = self.counters.since(before.counters), .memory = self.memory };
+        return .{
+            .counters = self.counters.since(before.counters),
+            .memory = self.memory,
+            .process = if (self.process) |after| if (before.process) |start| after.since(start) else after else null,
+        };
     }
 };
 

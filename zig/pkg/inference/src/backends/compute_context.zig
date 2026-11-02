@@ -235,7 +235,7 @@ pub const BackendContext = union(enum) {
                 return (try cb.fromConstantBytes(std.mem.sliceAsBytes(values), .f32, shape)) orelse error.UnsupportedTensorType;
             },
             .native => |*ctx| if (comptime build_options.enable_native)
-                ctx.compute.importDenseTensor("", dtype, shape, values)
+                ctx.compute.importOwnedDenseTensor("", dtype, shape, .{ .values = values, .allocator = allocator })
             else
                 unreachable,
             .metal_hosted => |*ctx| {

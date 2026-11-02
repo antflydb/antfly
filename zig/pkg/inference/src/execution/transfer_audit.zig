@@ -23,7 +23,12 @@ pub const Audit = struct {
     host_accesses: u64 = 0,
     upload_calls: u64 = 0,
     download_calls: u64 = 0,
+    /// An explicit all-read prohibition remains stronger than the execution
+    /// option that permits documented index/control metadata processing.
     forbid_device_host_access: bool = false,
+    forbid_activation_readbacks: bool = false,
+    index_metadata_host_accesses: u64 = 0,
+    index_metadata_host_access_bytes: u64 = 0,
     parent: ?*Audit = null,
 
     pub fn recordStats(self: *const Audit, stats: *@import("stats.zig").ExecutionStats) void {
@@ -33,6 +38,8 @@ pub const Audit = struct {
         stats.actual_download_bytes = self.download_bytes;
         stats.device_host_accesses = self.host_accesses;
         stats.device_host_access_bytes = self.host_access_bytes;
+        stats.index_metadata_host_accesses = self.index_metadata_host_accesses;
+        stats.index_metadata_host_access_bytes = self.index_metadata_host_access_bytes;
     }
 };
 
@@ -57,8 +64,24 @@ pub fn end() void {
 }
 pub fn checkDeviceHostAccess() error{DeviceReadbackForbidden}!void {
     var ancestor = current;
+    while (ancestor) |audit| : (ancestor = audit.parent) if (audit.forbid_device_host_access or audit.forbid_activation_readbacks) return error.DeviceReadbackForbidden;
+}
+pub fn checkIndexMetadataAccess() error{DeviceReadbackForbidden}!void {
+    var ancestor = current;
     while (ancestor) |audit| : (ancestor = audit.parent) if (audit.forbid_device_host_access) return error.DeviceReadbackForbidden;
 }
+
+pub fn indexMetadataHostAccess(bytes: usize) !void {
+    try checkIndexMetadataAccess();
+    var ancestor = current;
+    while (ancestor) |audit| : (ancestor = audit.parent) {
+        audit.host_accesses += 1;
+        audit.host_access_bytes += bytes;
+        audit.index_metadata_host_accesses += 1;
+        audit.index_metadata_host_access_bytes += bytes;
+    }
+}
+
 pub fn hostAccess(bytes: usize) !void {
     try checkDeviceHostAccess();
     var ancestor = current;
@@ -97,4 +120,24 @@ test "transfer audit nests counters and cannot weaken an outer strict scope" {
     try std.testing.expectEqual(@as(u64, 32), inner.upload_bytes);
     try std.testing.expectError(error.DeviceReadbackForbidden, hostAccess(16));
     try std.testing.expectEqual(@as(u64, 0), outer.host_accesses);
+}
+
+test "activation residency permits counted index metadata without weakening all-read prohibition" {
+    const std = @import("std");
+    var outer = Audit{ .forbid_activation_readbacks = true };
+    try begin(&outer);
+    defer end();
+    var inner = Audit{};
+    try begin(&inner);
+    try indexMetadataHostAccess(24);
+    try std.testing.expectError(error.DeviceReadbackForbidden, hostAccess(16));
+    end();
+    try std.testing.expectEqual(@as(u64, 1), outer.host_accesses);
+    try std.testing.expectEqual(@as(u64, 24), outer.index_metadata_host_access_bytes);
+    try std.testing.expectEqual(outer.index_metadata_host_access_bytes, inner.index_metadata_host_access_bytes);
+    var strict = Audit{ .forbid_device_host_access = true };
+    try begin(&strict);
+    defer end();
+    try std.testing.expectError(error.DeviceReadbackForbidden, indexMetadataHostAccess(8));
+    try std.testing.expectEqual(@as(u64, 0), strict.index_metadata_host_accesses);
 }

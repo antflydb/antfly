@@ -262,9 +262,9 @@ pub fn executeMultiDevice(
     options: ExecuteOptions,
 ) !MultiExecutionResult {
     const transfer_audit = @import("../execution/transfer_audit.zig");
-    var audit = transfer_audit.Audit{ .forbid_device_host_access = options.activation_readbacks == .forbidden };
-    const auditing = options.collect_partition_stats or audit.forbid_device_host_access;
-    if (audit.forbid_device_host_access) for (mesh.devices) |device| {
+    var audit = transfer_audit.Audit{ .forbid_activation_readbacks = options.activation_readbacks == .forbidden };
+    const auditing = options.collect_partition_stats or audit.forbid_activation_readbacks;
+    if (audit.forbid_activation_readbacks) for (mesh.devices) |device| {
         try transfer_audit.validateBackend(device.kind);
     };
     if (auditing) try transfer_audit.begin(&audit);
@@ -563,7 +563,9 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
     // Collect outputs.
     const num_outputs = graph.outputs.items.len;
     const outputs = try allocator.alloc(CT, num_outputs);
+    errdefer allocator.free(outputs);
     const output_devices = try allocator.alloc(DeviceId, num_outputs);
+    errdefer allocator.free(output_devices);
 
     for (graph.outputs.items, 0..) |out_id, idx| {
         const ct = values[@intCast(out_id)] orelse return error.MissingValue;
@@ -583,6 +585,9 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
             const one = try out_entry.backend.fromFloat32(&one_data);
             defer out_entry.backend.free(one);
             outputs[idx] = try out_entry.backend.multiply(ct, one);
+            // The value table is the sole rollback owner until publication.
+            // The replaced runtime handle remains borrowed from the caller.
+            values[@intCast(out_id)] = outputs[idx];
         } else {
             outputs[idx] = ct;
         }
@@ -598,7 +603,7 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
     // exclusively owned device buffers before returning (see
     // copyPartitionGraphOutputsToOwnedStorage), and non-Metal partitions
     // materialize boundary outputs into owned tensors.
-    var freed_values = std.AutoHashMapUnmanaged(CT, void).empty;
+    var freed_values = std.AutoHashMapUnmanaged(CT, DeviceId).empty;
     defer freed_values.deinit(allocator);
     for (0..count) |i| {
         if (values[i] == null) continue;
@@ -620,11 +625,13 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
         if (aliases_output) continue;
         if (rt_map.contains(@intCast(i)) and !donated.contains(@intCast(i)) and !owned_runtime_transfers.contains(@intCast(i))) continue;
         if (freed_values.contains(values[i].?)) continue;
-        try freed_values.put(allocator, values[i].?, {});
-        const dev = value_device[i];
-        if (mesh.device(dev)) |entry| {
-            entry.backend.free(values[i].?);
-        }
+        try freed_values.put(allocator, values[i].?, value_device[i]);
+    }
+    // Finish every fallible bookkeeping allocation before retiring any value.
+    // On error the value-table rollback still sees all original owners.
+    var retired = freed_values.iterator();
+    while (retired.next()) |entry| {
+        if (mesh.device(entry.value_ptr.*)) |device| device.backend.free(entry.key_ptr.*);
     }
 
     if (collect_stats) executor_stats.record(exec_stats);

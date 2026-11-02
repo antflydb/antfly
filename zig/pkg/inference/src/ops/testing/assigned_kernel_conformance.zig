@@ -80,7 +80,9 @@ pub fn runWithFactory(backend: *ops.ComputeBackend, comptime supports_layouts: b
                 @memset(zeros, 0);
                 workspace = try makeTensor(cb, zeros, &.{@intCast(zeros.len)});
             }
-            var request = K.Invocation{ .descriptor = &descriptor, .inputs = inputs[0..count], .workspace = workspace };
+            const host_workspace = try a.alloc(u8, requirements.host_byte_size);
+            defer a.free(host_workspace);
+            var request = K.Invocation{ .descriptor = &descriptor, .inputs = inputs[0..count], .workspace = workspace, .host_workspace = host_workspace };
             const audit_mod = @import("../../execution/transfer_audit.zig");
             if ((descriptor.operation == .rope or (supports_layouts and descriptor.operation == .gather)) and data[0].len == expected.len) {
                 var alias = request;
@@ -104,8 +106,22 @@ pub fn runWithFactory(backend: *ops.ComputeBackend, comptime supports_layouts: b
                 declined.auxiliaries = &.{.{ .role = .mean, .tensor = inputs[0] }};
                 try std.testing.expect(!try dispatch(cb.ptr, declined));
             }
+            const checked_indices = cb.kind() == .cuda and descriptor.operation == .gather;
+            if (checked_indices) {
+                var strict_request = request;
+                strict_request.output = output;
+                var all_reads = audit_mod.Audit{ .forbid_device_host_access = true };
+                try audit_mod.begin(&all_reads);
+                const rejected = dispatch(cb.ptr, strict_request);
+                audit_mod.end();
+                try std.testing.expectError(error.DeviceReadbackForbidden, rejected);
+                try std.testing.expectEqual(@as(u64, 0), all_reads.download_bytes);
+            }
             for (0..3) |_| {
-                var audit = audit_mod.Audit{ .forbid_device_host_access = true };
+                // Index preconditions are documented control metadata. Every
+                // activation stays resident; the stronger all-read ban above
+                // still rejects the kernel before any driver submission.
+                var audit = audit_mod.Audit{ .forbid_device_host_access = !checked_indices, .forbid_activation_readbacks = true };
                 try audit_mod.begin(&audit);
                 const admitted = dispatch(cb.ptr, request);
                 audit_mod.end();
@@ -121,6 +137,12 @@ pub fn runWithFactory(backend: *ops.ComputeBackend, comptime supports_layouts: b
                 const executed = dispatch(cb.ptr, request);
                 audit_mod.end();
                 try std.testing.expect(try executed);
+                if (checked_indices) {
+                    try std.testing.expect(audit.index_metadata_host_accesses > 0);
+                    try std.testing.expectEqual(audit.index_metadata_host_accesses * host_workspace.len, audit.index_metadata_host_access_bytes);
+                    try std.testing.expectEqual(audit.index_metadata_host_access_bytes, audit.download_bytes);
+                    try std.testing.expectEqual(audit.index_metadata_host_access_bytes, audit.host_access_bytes);
+                }
                 const actual = try cb.toFloat32(output, a);
                 defer a.free(actual);
                 try std.testing.expectEqual(expected.len, actual.len);

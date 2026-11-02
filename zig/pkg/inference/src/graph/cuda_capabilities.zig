@@ -47,6 +47,7 @@ pub fn supports(op: ml.graph.OpCode) bool {
         .broadcast_in_dim,
         .dot_general,
         .slice,
+        .gather,
         .concat_prim,
         .fused_layer_norm,
         .fused_rms_norm,
@@ -105,6 +106,19 @@ pub fn decide(query: partition.CapabilityQuery) partition.CapabilityDecision {
     switch (query.op) {
         .parameter, .constant => return partition.CapabilityDecision.accept(),
         else => {},
+    }
+    if (query.op == .gather) {
+        if (node.num_inputs != 2 or node.output_shape.dtype != .f32) return reject(.unsupported_op);
+        for (node.getInputs(), 0..) |id, index| {
+            if (id == ml.graph.null_node) return reject(.unsupported_op);
+            const shape = query.graph.node(id).output_shape;
+            if (!concrete(shape)) return reject(.unsupported_op);
+            if (index == 0 and shape.dtype != .f32) return reject(.unsupported_op);
+            if (index == 1 and shape.dtype != .f32 and shape.dtype != .i32 and shape.dtype != .i64) return reject(.unsupported_op);
+            if (!dense(query, id)) return reject(.wrong_storage);
+        }
+        if (@import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) == null) return reject(.unsupported_op);
+        return partition.CapabilityDecision.accept();
     }
     // These general kernels consume physical f32. Integer arithmetic and
     // packed/strided operands must go to a separately qualified implementation.

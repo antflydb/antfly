@@ -885,6 +885,7 @@ fn runWithOutputs(
         } else return runWithOutputs(specialized, host_inputs, resident_inputs, allocator, control, false);
     }
     const diagnostics_before = self.executable.diagnostics.begin(&self.cb);
+    defer @import("../execution/diagnostics.zig").Diagnostics.end(diagnostics_before);
     const input_len = if (host_inputs) |inputs| inputs.len else if (resident_inputs) |inputs| inputs.len else 0;
     if (input_len != self.input_info.len) return error.InputArityMismatch;
 
@@ -944,6 +945,7 @@ fn runWithOutputs(
         }
         return outputs;
     }
+    self.executable.diagnostics.record(exec_result.stats, &self.cb, diagnostics_before);
     const outputs = exec_result.outputs;
     exec_result.outputs = &.{};
     for (dynamic_inputs[0..imported_count]) |ri| {
@@ -3221,4 +3223,104 @@ test "imported ONNX CUDA assigned graph captures and replays with changing publi
         try std.testing.expect(pool.frames.items[0].storages[allocation].? == pool.frames.items[1].storages[allocation].?);
         try std.testing.expect(pool.shared_constants[binding.constant_index.?].lease.? == pool.frames.items[0].storages[allocation].?);
     };
+}
+
+test "mixed resident stages import host controls without reading resident activations" {
+    const a = std.testing.allocator;
+    const stage = @import("session.zig");
+    const audit_mod = @import("../execution/transfer_audit.zig");
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ 1, 4 }));
+    const y = try builder.parameter("y", Shape.init(.f32, &.{ 1, 4 }));
+    try graph.markOutput(try builder.add(x, y));
+    try graph.markOutput(x);
+    const bytes = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "stage.onnx", .data = bytes });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "stage.onnx" });
+    defer a.free(path);
+    var host = try Tensor.initFloat32(a, "y", &.{ 1, 4 }, &.{ 10, 20, 30, 40 });
+    defer host.deinit();
+    for ([_]BackendType{ .native, .metal, .cuda }) |kind| {
+        if (kind == .metal) {
+            if (comptime !build_options.enable_metal) continue;
+            if (!@import("metal_runtime.zig").metalDeviceAvailable()) continue;
+        }
+        if (kind == .cuda and comptime !build_options.enable_cuda) continue;
+        var session = createSessionWithOptions(a, path, kind, .{ .graph_runtime_strategy = .compiled_preferred }) catch |err| switch (err) {
+            error.CudaUnavailable, error.NoCudaDevices => continue,
+            else => return err,
+        };
+        var session_open = true;
+        defer if (session_open) session.close();
+        const common = sharedBackendContext(session).?;
+        const stage_backend = common.stableBackend();
+        const source = try stage_backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+        // Keep the source context alive independently of the destination session.
+        _ = common.retain();
+        defer common.release();
+        defer stage_backend.free(source);
+        const inputs = [_]stage.StageInput{
+            .{ .resident = .{ .value = source, .backend = stage_backend, .shape = &.{ 1, 4 }, .estimated_bytes = 16 } },
+            .{ .host = host },
+        };
+        try std.testing.expect(session.supportsStageInputs(&inputs));
+        try std.testing.expect(session.configureExecutionDiagnostics(true));
+        if (kind != .native) {
+            var denied_audit = audit_mod.Audit{};
+            try audit_mod.begin(&denied_audit);
+            defer audit_mod.end();
+            // A controlled uninterruptible call cannot import even host inputs
+            // until the caller supplies its explicit execution policy.
+            try std.testing.expectError(error.ProcessIsolationRequired, session.runStageInputsWithControl(&inputs, a, .{}));
+            try std.testing.expectEqual(@as(u64, 0), denied_audit.upload_calls);
+            try std.testing.expectEqual(@as(u64, 0), executionStats(session).?.executions);
+        }
+        var outputs = blk: {
+            var audit = audit_mod.Audit{ .forbid_activation_readbacks = true };
+            try audit_mod.begin(&audit);
+            defer audit_mod.end();
+            const result = (try session.runStageInputsWithControl(&inputs, a, .{ .native_call_policy = .in_process })).?;
+            errdefer {
+                var owned = result;
+                owned.deinit();
+            }
+            try std.testing.expectEqual(@as(u64, 0), audit.download_bytes);
+            try std.testing.expectEqual(@as(u64, 0), audit.host_access_bytes);
+            break :blk result;
+        };
+        defer outputs.deinit();
+        const measured = session.executionDiagnostics() orelse return error.MissingResidentDiagnostics;
+        try std.testing.expect(measured.execution.assigned_kernel_dispatches > 0);
+        const alias_values = try outputs.backend.toFloat32(outputs.outputs[1], a);
+        defer a.free(alias_values);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, alias_values);
+        const values = try outputs.backend.toFloat32(outputs.outputs[0], a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 44 }, values);
+        if (kind == .native) {
+            const Case = struct {
+                fn run(allocator: std.mem.Allocator, target: Session, values_in: []const stage.StageInput) !void {
+                    var result = (try target.runStageInputsWithControl(values_in, allocator, .{})).?;
+                    defer result.deinit();
+                    const row = try result.backend.toFloat32(result.outputs[0], allocator);
+                    defer allocator.free(row);
+                    try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 44 }, row);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(a, Case.run, .{ session, @as([]const stage.StageInput, &inputs) });
+        }
+        session.close();
+        session_open = false;
+        const held = try outputs.backend.toFloat32(outputs.outputs[0], a);
+        defer a.free(held);
+        try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 44 }, held);
+        const unchanged = try stage_backend.toFloat32(source, a);
+        defer a.free(unchanged);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, unchanged);
+    }
 }

@@ -38,3 +38,12 @@ pub const submission = @import("submission.zig");
 
 pub const reader_pool = @import("reader_pool.zig");
 pub const storage_accounting = @import("storage_accounting.zig");
+
+pub const architecture_session = @import("architecture_session.zig");
+
+pub const decoder_routes = @import("decoder_routes.zig");
+
+pub const encoder_decoder_runtime = @import("encoder_decoder_runtime.zig");
+pub const seq2seq_runtime = @import("seq2seq_runtime.zig");
+
+pub const decoder_checkpoint = @import("decoder_checkpoint.zig");

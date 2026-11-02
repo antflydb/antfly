@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Physical-plan storage shared by native and CUDA assigned-output kernels.
+//! Physical-plan storage shared by native, Metal and CUDA assigned-output kernels.
 //! Frames are reusable only after their values have released every lease, and
 //! device submission dependencies are established before an address is reused.
 const std = @import("std");
@@ -28,6 +28,7 @@ const NodeId = ml.graph.NodeId;
 const CT = ops.CT;
 const interpreter = @import("../graph/interpreter.zig");
 const Binding = @import("program.zig").Binding;
+const admission = @import("storage_admission.zig");
 const ReplayDecision = @import("stats.zig").PhysicalReplayDecision;
 
 pub const Stats = struct {
@@ -56,6 +57,7 @@ pub const KernelPlan = struct {
     backend_index: usize,
     output_allocation: buffers.AllocationId,
     workspace_bytes: usize,
+    host_workspace_bytes: usize = 0,
     auxiliaries: [kernels.max_auxiliaries]?AuxiliaryPlan = @splat(null),
 };
 
@@ -75,6 +77,7 @@ pub const Pool = struct {
     transfers: []?TransferPlan,
     backends: []ops.ComputeBackend,
     workspace_allocations: []buffers.AllocationId,
+    host_workspace_allocation: buffers.AllocationId = buffers.invalid_allocation,
     frames: std.ArrayListUnmanaged(*Frame) = .empty,
     mutex: std.atomic.Mutex = .unlocked,
     max_frames: usize = 4,
@@ -95,9 +98,10 @@ pub const Pool = struct {
         defer allocator.free(scratch_requirements);
         @memset(scratch_requirements, .{});
         var count: usize = 0;
+        var host_workspace_bytes: usize = 0;
         for (prepared, 0..) |*entry, id| {
             const slot = plan.slotForNode(@intCast(id)) orelse continue;
-            if (slot.kind != .allocation or slot.allocation == buffers.invalid_allocation or (slot.backend != .native and slot.backend != .cuda)) continue;
+            if (slot.kind != .allocation or slot.allocation == buffers.invalid_allocation or (slot.backend != .native and slot.backend != .cuda and slot.backend != .metal)) continue;
             const descriptor = kernels.lower(graph, @intCast(id)) orelse continue;
             for (backends, 0..) |backend, backend_index| {
                 if (backend.kind() != slot.backend) continue;
@@ -107,9 +111,10 @@ pub const Pool = struct {
                 if (workspace.byte_size % @sizeOf(f32) != 0) return error.InvalidWorkspaceSize;
                 scratch_requirements[backend_index].byte_size = @max(scratch_requirements[backend_index].byte_size, workspace.byte_size);
                 scratch_requirements[backend_index].alignment = @max(scratch_requirements[backend_index].alignment, workspace.alignment);
+                host_workspace_bytes = @max(host_workspace_bytes, workspace.host_byte_size);
                 var inputs: [3]NodeId = @splat(ml.graph.null_node);
                 @memcpy(inputs[0..descriptor.input_count], graph.node(@intCast(id)).getInputs());
-                entry.* = .{ .descriptor = descriptor, .operator_plan = if (id < operator_plans.len) operator_plans[id] else null, .inputs = inputs, .backend_index = backend_index, .output_allocation = slot.allocation, .workspace_bytes = workspace.byte_size };
+                entry.* = .{ .descriptor = descriptor, .operator_plan = if (id < operator_plans.len) operator_plans[id] else null, .inputs = inputs, .backend_index = backend_index, .output_allocation = slot.allocation, .workspace_bytes = workspace.byte_size, .host_workspace_bytes = workspace.host_byte_size };
                 count += 1;
                 break;
             }
@@ -176,10 +181,11 @@ pub const Pool = struct {
         for (owned_backends, scratch_requirements, 0..) |backend, requirement, index| {
             if (requirement.byte_size != 0) workspace_ids[index] = try plan.addWorkspace(backend.kind(), requirement.byte_size, requirement.alignment);
         }
+        const host_workspace_allocation = if (host_workspace_bytes != 0) try plan.addHostWorkspace(host_workspace_bytes) else buffers.invalid_allocation;
         const ledger = try accounting.Ledger.create(allocator);
         errdefer ledger.release();
         const self = try allocator.create(Pool);
-        self.* = .{ .allocator = allocator, .accounting = ledger, .plan = plan.*, .kernels = prepared, .transfers = transfers, .backends = owned_backends, .workspace_allocations = workspace_ids };
+        self.* = .{ .allocator = allocator, .accounting = ledger, .host_workspace_allocation = host_workspace_allocation, .plan = plan.*, .kernels = prepared, .transfers = transfers, .backends = owned_backends, .workspace_allocations = workspace_ids };
         return self;
     }
 
@@ -352,6 +358,9 @@ pub const Pool = struct {
     /// Busy published outputs pin their frame. Bound retained storage; callers
     /// may use the observable compatibility fallback when all frames are pinned.
     pub fn acquire(self: *Pool) !?*Frame {
+        return self.acquireWithAdmission(null);
+    }
+    pub fn acquireWithAdmission(self: *Pool, capability: ?admission.Capability) !?*Frame {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         for (self.frames.items) |frame| {
@@ -371,11 +380,16 @@ pub const Pool = struct {
                 return err;
             };
             frame.in_use = true;
+            errdefer frame.in_use = false;
+            frame.storage_admission = capability;
+            errdefer frame.storage_admission = null;
+            frame.storage_admission_failed = false;
+            if (capability) |cap| try frame.adoptAdmission(cap);
             frame.stats = .{ .replay_decision = self.replay_decision };
             return frame;
         }
         if (self.frames.items.len >= self.max_frames) return null;
-        const frame = try Frame.create(self);
+        const frame = try Frame.createWithAdmission(self, capability);
         errdefer frame.deinit();
         try self.frames.append(self.allocator, frame);
         return frame;
@@ -384,8 +398,13 @@ pub const Pool = struct {
 
 pub const Frame = struct {
     pool: *Pool,
+    storage_admission: ?admission.Capability = null,
+    storage_admission_failed: bool = false,
+    host_workspace_admission: ?*admission.Reservation = null,
     storages: []?*storage.Lease,
     completions: []?storage.Completion,
+    host_workspace: []u8 = &.{},
+    host_workspace_fresh: bool = true,
     collect_storage_stats: bool = false,
     in_use: bool = true,
     retired: bool = false,
@@ -402,6 +421,9 @@ pub const Frame = struct {
     bound_input_count: usize = 0,
 
     fn create(pool: *Pool) !*Frame {
+        return createWithAdmission(pool, null);
+    }
+    fn createWithAdmission(pool: *Pool, capability: ?admission.Capability) !*Frame {
         const leases = try pool.allocator.alloc(?*storage.Lease, pool.plan.allocations.len);
         errdefer pool.allocator.free(leases);
         @memset(leases, null);
@@ -416,9 +438,41 @@ pub const Frame = struct {
         const capture_pins = try pool.allocator.alloc(bool, if (pool.replay_backend != null) leases.len else 0);
         errdefer pool.allocator.free(capture_pins);
         @memset(capture_pins, false);
+        const host_bytes: usize = if (pool.host_workspace_allocation == buffers.invalid_allocation) 0 else @intCast(pool.plan.allocations[pool.host_workspace_allocation].byte_size);
+        const host_admission = if (capability) |cap| try reserveHost(pool, cap, host_bytes) else null;
+        errdefer if (host_admission) |value| {
+            value.release();
+            pool.allocator.destroy(value);
+        };
+        const host_workspace = try pool.allocator.alloc(u8, host_bytes);
+        errdefer pool.allocator.free(host_workspace);
         const self = try pool.allocator.create(Frame);
-        self.* = .{ .capture_pins = capture_pins, .pool = pool, .storages = leases, .completions = completions, .bound_inputs = bound_inputs, .binding_states = binding_states, .stats = .{ .replay_decision = pool.replay_decision } };
+        self.* = .{ .storage_admission = capability, .host_workspace_admission = host_admission, .host_workspace = host_workspace, .capture_pins = capture_pins, .pool = pool, .storages = leases, .completions = completions, .bound_inputs = bound_inputs, .binding_states = binding_states, .stats = .{ .replay_decision = pool.replay_decision } };
+        if (host_bytes != 0) {
+            if (pool.accounting) |ledger| ledger.allocated(.host_workspace, host_bytes, host_bytes);
+            self.stats.allocations += 1;
+            self.stats.allocated_bytes += host_bytes;
+        }
         return self;
+    }
+    fn reserveHost(pool: *Pool, capability: admission.Capability, bytes: usize) !?*admission.Reservation {
+        if (bytes == 0) return null;
+        const owner = try pool.allocator.create(admission.Reservation);
+        errdefer pool.allocator.destroy(owner);
+        owner.* = try capability.reserve(pool.allocator, .native, .host_workspace, bytes);
+        return owner;
+    }
+    fn adoptAdmission(self: *Frame, capability: admission.Capability) !void {
+        if (self.host_workspace_admission) |existing| {
+            if (!existing.identity.eql(capability.identity)) return error.PhysicalStorageAdmissionMismatch;
+        } else self.host_workspace_admission = try reserveHost(self.pool, capability, self.host_workspace.len);
+        for (self.storages) |maybe| if (maybe) |lease| try lease.ensureAdmission(capability);
+    }
+    fn allocateStorage(self: *Frame, cb: ops.ComputeBackend, bytes: usize, class: accounting.Class) !?*storage.Lease {
+        return storage.Lease.createAdmitted(self.pool.allocator, cb, bytes, self.pool.accounting, class, self.storage_admission) catch |err| {
+            if (self.storage_admission != null) self.storage_admission_failed = true;
+            return err;
+        };
     }
     fn deinit(self: *Frame) void {
         // Eviction is a cold boundary. Complete submissions before retiring
@@ -434,6 +488,13 @@ pub const Frame = struct {
             // Literal addresses are borrowed from the program-level owner.
             if (self.pool.plan.allocations[id].kind != .constant_binding) value.release();
         };
+        const host_bytes = self.host_workspace.len;
+        self.pool.allocator.free(self.host_workspace);
+        if (self.host_workspace_admission) |value| {
+            value.release();
+            self.pool.allocator.destroy(value);
+        }
+        if (host_bytes != 0) if (self.pool.accounting) |ledger| ledger.freed(.host_workspace, host_bytes, host_bytes);
         self.pool.allocator.free(self.completions);
         self.pool.allocator.free(self.storages);
         self.pool.allocator.destroy(self);
@@ -459,6 +520,7 @@ pub const Frame = struct {
         @import("antfly_platform").sync.lockYielding(&self.pool.mutex);
         defer self.pool.mutex.unlock();
         defer self.in_use = false;
+        defer self.storage_admission = null;
         defer self.endScope();
         for (self.completions) |completion| if (completion) |value| value.record() catch |err| {
             // An uncertain completion must never authorize address reuse.
@@ -614,6 +676,7 @@ pub const Frame = struct {
     fn valueForLiteral(self: *Frame, cb: *const ops.ComputeBackend, backend_index: usize, binding: ReplayInput) !CT {
         const id = binding.allocation.?;
         if (self.storages[id] != null) {
+            if (self.storage_admission) |cap| try self.storages[id].?.ensureAdmission(cap);
             self.stats.reused_allocations += 1;
             return self.pool.shared_constants[binding.constant_index.?].value.?;
         }
@@ -627,7 +690,7 @@ pub const Frame = struct {
         const owner = &self.pool.shared_constants[binding.constant_index.?];
         if (owner.lease == null) {
             const bytes: usize = @intCast(self.pool.plan.allocations[id].byte_size);
-            const lease = (try storage.Lease.createTracked(self.pool.allocator, cb.*, bytes, self.pool.accounting, .constant)) orelse return error.InvalidShape;
+            const lease = (try self.allocateStorage(cb.*, bytes, .constant)) orelse return error.InvalidShape;
             errdefer lease.release();
             const view = try self.viewForShape(cb, lease, binding.shape);
             errdefer cb.free(view);
@@ -643,6 +706,7 @@ pub const Frame = struct {
         // Frames borrow this immutable address. Pool retirement destroys all
         // captures before releasing its sole allocation owner.
         self.storages[id] = owner.lease;
+        if (self.storage_admission) |cap| try owner.lease.?.ensureAdmission(cap);
         return owner.value.?;
     }
 
@@ -652,7 +716,7 @@ pub const Frame = struct {
                 if (cb.vtable.kernels.?.createPhysicalCompletion) |make_completion| self.completions[backend_index] = try make_completion(cb.ptr);
             }
             const bytes: usize = @intCast(self.pool.plan.allocations[allocation_id].byte_size);
-            self.storages[allocation_id] = (try storage.Lease.createTracked(self.pool.allocator, cb.*, bytes, self.pool.accounting, if (self.pool.plan.allocations[allocation_id].kind == .workspace) .workspace else .activation)) orelse return null;
+            self.storages[allocation_id] = (try self.allocateStorage(cb.*, bytes, if (self.pool.plan.allocations[allocation_id].kind == .workspace) .workspace else .activation)) orelse return null;
             self.stats.allocations += 1;
             self.stats.allocated_bytes += bytes;
         } else self.stats.reused_allocations += 1;
@@ -721,6 +785,12 @@ pub const Frame = struct {
         errdefer cb.free(output);
         var bound = request;
         bound.output = output;
+        if (kernel.host_workspace_bytes != 0) {
+            if (kernel.host_workspace_bytes > self.host_workspace.len) return error.MissingAssignedHostWorkspace;
+            bound.host_workspace = self.host_workspace[0..kernel.host_workspace_bytes];
+            if (!self.host_workspace_fresh) self.stats.reused_allocations += 1;
+            self.host_workspace_fresh = false;
+        }
         if (kernel.workspace_bytes != 0) {
             const scratch = (try self.storageFor(cb, index, self.pool.workspace_allocations[index])) orelse {
                 cb.free(output);
@@ -750,13 +820,20 @@ test "prepared physical frame metadata allocation failures release every owner" 
     if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
     const Case = struct {
         fn run(allocator: std.mem.Allocator) !void {
-            const allocations = [_]buffers.PhysicalAllocation{.{ .id = 0, .kind = .tensor, .backend = .native, .storage = .host_f32, .byte_size = 16, .first_use = 0, .last_use = 1, .reusable = true }};
+            const allocations = [_]buffers.PhysicalAllocation{
+                .{ .id = 0, .kind = .tensor, .backend = .native, .storage = .host_f32, .byte_size = 16, .first_use = 0, .last_use = 1, .reusable = true },
+                .{ .id = 1, .kind = .workspace, .backend = .native, .storage = .host_dense, .byte_size = 24, .first_use = 0, .last_use = 1, .reusable = true },
+            };
+            const ledger = try accounting.Ledger.create(allocator);
+            defer ledger.release();
             const inputs = [_]ReplayInput{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}) }};
             // Metadata construction never calls this borrowed backend: leases,
             // submissions and immutable handles are all initially empty.
             const backends = [_]ops.ComputeBackend{.{ .ptr = @ptrFromInt(8), .vtable = &@import("../ops/native_compute.zig").vtable_impl }};
             var pool = Pool{
                 .allocator = allocator,
+                .accounting = ledger,
+                .host_workspace_allocation = 1,
                 .plan = .{ .allocator = allocator, .slots = &.{}, .node_slots = &.{}, .node_positions = &.{}, .allocations = @constCast(&allocations), .transfers = &.{}, .transfer_index = .empty },
                 .kernels = &.{},
                 .transfers = &.{},
@@ -767,6 +844,10 @@ test "prepared physical frame metadata allocation failures release every owner" 
             };
             const frame = try Frame.create(&pool);
             frame.deinit();
+            const usage = ledger.snapshot();
+            try std.testing.expectEqual(@as(?u64, 0), usage.host_workspace.backing_live_bytes);
+            try std.testing.expectEqual(@as(?u64, 24), usage.host_workspace.backing_peak_bytes);
+            try std.testing.expectEqual(@as(u64, 1), usage.host_workspace.leases_released);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});

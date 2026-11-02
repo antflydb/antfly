@@ -154,6 +154,45 @@ static __attribute__((always_inline)) inline void termite_metal_bind_five_buffer
     [encoder setBytes:params length:params_size atIndex:5];
 }
 
+
+// Optional observation on the submitting thread. No swizzling, allocations or
+// atomic traffic: diagnostics opens a nested scope and normal execution takes
+// only the predictable inactive branch. Vendor encodes remain opaque and are
+// not misreported as one GPU kernel.
+static _Thread_local size_t antfly_metal_observation_depth;
+static _Thread_local uint64_t antfly_metal_observation_counters[4];
+void termite_metal_observation_begin(void) { antfly_metal_observation_depth += 1; }
+void termite_metal_observation_end(void) {
+    if (antfly_metal_observation_depth != 0) antfly_metal_observation_depth -= 1;
+}
+void termite_metal_observation_snapshot(uint64_t *values) {
+    if (values != NULL) memcpy(values, antfly_metal_observation_counters, sizeof(antfly_metal_observation_counters));
+}
+static __attribute__((always_inline)) inline void antfly_metal_observe(size_t index) {
+    if (__builtin_expect(antfly_metal_observation_depth != 0, 0))
+        antfly_metal_observation_counters[index] += 1;
+}
+static __attribute__((always_inline)) inline void antfly_metal_dispatch_threads(id<MTLComputeCommandEncoder> encoder, MTLSize grid, MTLSize threads) {
+    antfly_metal_observe(0);
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+}
+static __attribute__((always_inline)) inline void antfly_metal_dispatch_threadgroups(id<MTLComputeCommandEncoder> encoder, MTLSize groups, MTLSize threads) {
+    antfly_metal_observe(0);
+    [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+}
+static __attribute__((always_inline)) inline void antfly_metal_wait(id<MTLCommandBuffer> command) {
+    antfly_metal_observe(1);
+    [command waitUntilCompleted];
+}
+static __attribute__((always_inline)) inline void antfly_metal_commit(id<MTLCommandBuffer> command) {
+    antfly_metal_observe(2);
+    [command commit];
+}
+static __attribute__((always_inline)) inline void antfly_metal_encode_matrix(MPSMatrixMultiplication *operation, id<MTLCommandBuffer> command, MPSMatrix *left, MPSMatrix *right, MPSMatrix *result) {
+    antfly_metal_observe(3);
+    [operation encodeToCommandBuffer:command leftMatrix:left rightMatrix:right resultMatrix:result];
+}
+
 // Worker-process diagnostics: explicit logical copies, not bus traffic.
 // Independent atomic reads may straddle concurrent operations; never reset.
 enum { TERMITE_METAL_UPLOAD_BYTES, TERMITE_METAL_UPLOAD_CALLS,
@@ -3146,27 +3185,27 @@ static int termite_metal_decode_runtime_encode_sample_nucleus_from_logits_buffer
     termite_metal_bind_two_buffers(encoder, logits_buffer, 0, runtime->sample_topk_values_buffer, 0, &params, sizeof(params));
     [encoder setBytes:&empty_penalty length:sizeof(empty_penalty) atIndex:3];
     [encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(block_count, 1, 1), MTLSizeMake(256, 1, 1));
     [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     [encoder setComputePipelineState:runtime->sample_nucleus_max_reduce_pipeline];
     termite_metal_bind_two_buffers(encoder, runtime->sample_topk_values_buffer, 0, runtime->sample_topk_ids_buffer, 0, &block_count_u32, sizeof(block_count_u32));
     [encoder setBytes:&params length:sizeof(params) atIndex:3];
     [encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     [encoder setComputePipelineState:runtime->sample_nucleus_probs_partials_pipeline];
     termite_metal_bind_four_buffers(encoder, logits_buffer, 0, runtime->scratch_buffer, 0, runtime->sample_topk_values_buffer, 0, runtime->sample_topk_ids_buffer, 0, &params, sizeof(params));
     [encoder setBytes:&empty_penalty length:sizeof(empty_penalty) atIndex:5];
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(block_count, 1, 1), MTLSizeMake(256, 1, 1));
     [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     [encoder setComputePipelineState:runtime->sample_nucleus_sum_reduce_pipeline];
     termite_metal_bind_two_buffers(encoder, runtime->sample_topk_values_buffer, 0, runtime->sample_topk_ids_buffer, 0, &top_p, sizeof(top_p));
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     if (parallel_radix && runtime->sample_nucleus_parallel_radix_reported == 0u) {
@@ -3180,16 +3219,15 @@ static int termite_metal_decode_runtime_encode_sample_nucleus_from_logits_buffer
         [encoder setBytes:&empty_penalty length:sizeof(empty_penalty) atIndex:5];
         if (parallel_radix) {
             [encoder setThreadgroupMemoryLength:8u * 16u * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(block_count, 1, 1), MTLSizeMake(256, 1, 1));
         } else {
-            [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(16, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(block_count, 1, 1), MTLSizeMake(16, 1, 1));
         }
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [encoder setComputePipelineState:runtime->sample_nucleus_radix_select_pipeline];
         termite_metal_bind_two_buffers_only(encoder, runtime->sample_topk_values_buffer, 0, runtime->sample_topk_ids_buffer, 0);
         [encoder setThreadgroupMemoryLength:16u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(parallel_radix ? 16u : 1u, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(parallel_radix ? 16u : 1u, 1, 1));
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
 
@@ -3197,7 +3235,7 @@ static int termite_metal_decode_runtime_encode_sample_nucleus_from_logits_buffer
     termite_metal_bind_four_buffers(encoder, runtime->scratch_buffer, 0, runtime->sample_topk_values_buffer, 0, runtime->sample_topk_ids_buffer, partial_ids_offset, runtime->sample_topk_ids_buffer, 0, &params, sizeof(params));
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
     [encoder setThreadgroupMemoryLength:256u * sizeof(uint32_t) atIndex:1];
-    [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(block_count, 1, 1), MTLSizeMake(256, 1, 1));
     [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
     const int reduce_rc = termite_metal_encode_argmax_reduce_on_encoder(
         runtime,
@@ -3246,6 +3284,11 @@ static bool termite_metal_decode_runtime_active_frame_empty(termite_metal_decode
 static void termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(termite_metal_decode_runtime *runtime);
 
 void *termite_metal_buffer_alloc(termite_metal_decode_runtime *runtime, size_t length, int storage_mode);
+size_t termite_metal_buffer_allocated_bytes(void *handle) {
+    if (handle == NULL) return 0;
+    return (size_t)((__bridge id<MTLBuffer>)handle).allocatedSize;
+}
+
 void termite_metal_buffer_release(void *handle);
 void termite_metal_decode_runtime_release_buffer(termite_metal_decode_runtime *runtime, void *handle);
 void *termite_metal_buffer_contents(void *handle);
@@ -4933,11 +4976,10 @@ int termite_metal_run_generated_quant_kernel_check(
                 [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:4];
                 [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:5];
             }
-            [encoder dispatchThreadgroups:MTLSizeMake(grid_cols, (NSUInteger)rows, 1)
-                    threadsPerThreadgroup:MTLSizeMake(threads_per_threadgroup_size, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(grid_cols, (NSUInteger)rows, 1), MTLSizeMake(threads_per_threadgroup_size, 1, 1));
             [encoder endEncoding];
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (command_buffer.status == MTLCommandBufferStatusError) {
                 fprintf(stderr, "generated Metal command failed for %s: %s\n", kernel_name, command_buffer.error.localizedDescription.UTF8String ?: "unknown");
                 return -14;
@@ -5025,11 +5067,10 @@ int termite_metal_run_generated_microkernel_check(
             termite_metal_bind_three_buffers(encoder, input_buffer, 0, weight_buffer, 0, output_buffer, 0, &rows_i, sizeof(rows_i));
             [encoder setBytes:&hidden_size_i length:sizeof(hidden_size_i) atIndex:4];
             [encoder setBytes:&eps_f length:sizeof(eps_f) atIndex:5];
-            [encoder dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(threads_per_threadgroup_size, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((NSUInteger)rows, 1, 1), MTLSizeMake(threads_per_threadgroup_size, 1, 1));
             [encoder endEncoding];
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (command_buffer.status == MTLCommandBufferStatusError) {
                 fprintf(stderr, "generated Metal microkernel command failed for %s: %s\n", kernel_name, command_buffer.error.localizedDescription.UTF8String ?: "unknown");
                 return -14;
@@ -5258,8 +5299,7 @@ static int termite_metal_encode_jit_quant_route_fixture(
         termite_metal_bind_three_buffers(encoder, fixture->input_buffer, 0, fixture->weight_buffer, 0, output_buffer, 0, &fixture->rows, sizeof(fixture->rows));
         [encoder setBytes:&fixture->in_dim length:sizeof(fixture->in_dim) atIndex:4];
         [encoder setBytes:&fixture->out_dim length:sizeof(fixture->out_dim) atIndex:5];
-        [encoder dispatchThreadgroups:MTLSizeMake(fixture->candidate_grid_cols, fixture->candidate_grid_rows, 1)
-                threadsPerThreadgroup:MTLSizeMake(fixture->candidate_threads, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(fixture->candidate_grid_cols, fixture->candidate_grid_rows, 1), MTLSizeMake(fixture->candidate_threads, 1, 1));
         return 0;
     }
     if (implementation != TERMITE_METAL_JIT_QUALIFICATION_BASELINE) return failure_code;
@@ -5281,8 +5321,7 @@ static int termite_metal_encode_jit_quant_route_fixture(
     }
     [encoder setComputePipelineState:fixture->baseline];
     termite_metal_bind_three_buffers(encoder, fixture->input_buffer, 0, fixture->weight_buffer, 0, output_buffer, 0, &fixture->params, sizeof(fixture->params));
-    [encoder dispatchThreads:MTLSizeMake(fixture->baseline_total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(fixture->baseline_threads, 1, 1)];
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(fixture->baseline_total, 1, 1), MTLSizeMake(fixture->baseline_threads, 1, 1));
     return 0;
 }
 
@@ -5306,8 +5345,8 @@ static int termite_metal_run_jit_quant_route_fixture_dispatch(
     );
     [encoder endEncoding];
     if (encode_rc != 0) return encode_rc;
-    [command_buffer commit];
-    [command_buffer waitUntilCompleted];
+    antfly_metal_commit(command_buffer);
+    antfly_metal_wait(command_buffer);
     if (command_buffer.status != MTLCommandBufferStatusCompleted) return -13;
     const uint64_t sample = termite_metal_command_buffer_gpu_elapsed_nanos(command_buffer);
     if (sample == 0) return -14;
@@ -5427,8 +5466,8 @@ int termite_metal_run_jit_quant_route_check(
             [encoder endEncoding];
             if (encode_rc != 0) return encode_rc;
             const uint64_t wall_started = termite_metal_clock_monotonic_nanos();
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             const uint64_t wall_finished = termite_metal_clock_monotonic_nanos();
             if (command_buffer.status != MTLCommandBufferStatusCompleted) return -13;
             if (iter >= warmup_iters) {
@@ -5946,11 +5985,10 @@ int termite_metal_run_generated_attention_check(
             [encoder setBuffer:output_buffer offset:0 atIndex:5];
             [encoder setBytes:&params length:sizeof(params) atIndex:6];
             [encoder setThreadgroupMemoryLength:threadgroup_memory atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake((NSUInteger)q_len, (NSUInteger)num_heads, 1)
-                    threadsPerThreadgroup:MTLSizeMake(threads_size, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((NSUInteger)q_len, (NSUInteger)num_heads, 1), MTLSizeMake(threads_size, 1, 1));
             [encoder endEncoding];
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (command_buffer.status == MTLCommandBufferStatusError) {
                 fprintf(stderr, "generated Metal attention command failed for %s: %s\n", kernel_name, command_buffer.error.localizedDescription.UTF8String ?: "unknown");
                 return -14;
@@ -6105,11 +6143,10 @@ int termite_metal_run_generated_flash_prefill_check(
             [encoder setBuffer:output_buffer offset:0 atIndex:5];
             [encoder setBytes:&params length:sizeof(params) atIndex:6];
             [encoder setThreadgroupMemoryLength:threadgroup_memory atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(((NSUInteger)q_len + 7u) / 8u, (NSUInteger)num_heads, 1)
-                    threadsPerThreadgroup:MTLSizeMake(threads_per_threadgroup, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(((NSUInteger)q_len + 7u) / 8u, (NSUInteger)num_heads, 1), MTLSizeMake(threads_per_threadgroup, 1, 1));
             [encoder endEncoding];
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (command_buffer.status == MTLCommandBufferStatusError) {
                 fprintf(stderr, "generated Metal flash-prefill command failed for %s: %s\n", kernel_name, command_buffer.error.localizedDescription.UTF8String ?: "unknown");
                 return -14;
@@ -19901,8 +19938,8 @@ static void termite_metal_log_command_buffer_failure(id<MTLCommandBuffer> comman
 static int termite_metal_commit_and_wait(id<MTLCommandBuffer> command_buffer, const char *context, int failure_code) {
     (void)context;
     if (command_buffer == nil) return failure_code;
-    [command_buffer commit];
-    [command_buffer waitUntilCompleted];
+    antfly_metal_commit(command_buffer);
+    antfly_metal_wait(command_buffer);
     if (command_buffer.status == MTLCommandBufferStatusCompleted) return 0;
     termite_metal_log_command_buffer_failure(command_buffer, context);
     return failure_code;
@@ -19938,8 +19975,8 @@ static bool termite_metal_direct_deberta_ffn_enabled(void) {
 
 static int termite_metal_decode_runtime_finish_command_buffer(id<MTLCommandBuffer> command_buffer, bool frame_owned, int failure_code) {
     if (!frame_owned) return 0;
-    [command_buffer commit];
-    [command_buffer waitUntilCompleted];
+    antfly_metal_commit(command_buffer);
+    antfly_metal_wait(command_buffer);
     if (command_buffer.status == MTLCommandBufferStatusCompleted) return 0;
     termite_metal_log_command_buffer_failure(command_buffer, __func__);
     return failure_code;
@@ -21403,7 +21440,7 @@ static int termite_metal_encode_quant_matmul_q4_k_pair_activation_mul_on_encoder
     } else {
         runtime->q4_k_pair_activation_reduce += 1;
     }
-    [encoder dispatchThreadgroups:MTLSizeMake(use_f16_output ? ((descriptor->out_dim + 3u) / 4u) : ((descriptor->out_dim + 1u) / 2u), 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(use_f16_output ? ((descriptor->out_dim + 3u) / 4u) : ((descriptor->out_dim + 1u) / 2u), 1, 1), MTLSizeMake(128, 1, 1));
     return 0;
 }
 
@@ -21506,12 +21543,12 @@ static int termite_metal_encode_quant_matmul_q4_0_pair_activation_mul_on_encoder
             if (pair_mm.tail) runtime->q4_0_pair_activation_mm_m32_n32_tail_dispatches += 1;
             else runtime->q4_0_pair_activation_mm_m32_n32_aligned_dispatches += 1;
         }
-        [encoder dispatchThreadgroups:MTLSizeMake(
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(
             descriptor->out_dim / pair_mm.output_tile,
             (descriptor->rows + 31u) / 32u,
-            1) threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+            1), MTLSizeMake(128u, 1u, 1u));
     } else if (use_small_batch) {
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 15u) / 16u, (descriptor->rows + small_batch_rows_per_tg - 1u) / small_batch_rows_per_tg, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 15u) / 16u, (descriptor->rows + small_batch_rows_per_tg - 1u) / small_batch_rows_per_tg, 1), MTLSizeMake(128, 1, 1));
     } else if (pair_mmv.pipeline != nil) {
         if (pair_mmv.fell_back) runtime->q4_0_pair_activation_mmv_variant_fallbacks += 1;
         switch (pair_mmv.variant) {
@@ -21527,12 +21564,12 @@ static int termite_metal_encode_quant_matmul_q4_0_pair_activation_mul_on_encoder
                 break;
         }
         const NSUInteger outputs_per_threadgroup = pair_mmv.nr0 * pair_mmv.nsg;
-        [encoder dispatchThreadgroups:MTLSizeMake(
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(
             (descriptor->out_dim + outputs_per_threadgroup - 1u) / outputs_per_threadgroup,
             descriptor->rows,
-            1u) threadsPerThreadgroup:MTLSizeMake(32u * pair_mmv.nsg, 1u, 1u)];
+            1u), MTLSizeMake(32u * pair_mmv.nsg, 1u, 1u));
     } else {
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 15u) / 16u, descriptor->rows, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 15u) / 16u, descriptor->rows, 1), MTLSizeMake(128, 1, 1));
     }
     runtime->q4_0_pair_activation_reduce_encode_nanos += termite_metal_clock_monotonic_nanos() - encode_started;
     return 0;
@@ -21590,7 +21627,7 @@ static int termite_metal_encode_quant_matmul_q4_0_pair_activation_rms_scale_1x_o
     [encoder setBuffer:descriptor->inv_scale_buffer offset:descriptor->inv_scale_offset atIndex:7];
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
     runtime->q4_0_pair_activation_rms_scale_reduce_f16_output += 1;
-    [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 3u) / 4u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 3u) / 4u, 1, 1), MTLSizeMake(128, 1, 1));
     runtime->q4_0_pair_activation_reduce_encode_nanos += termite_metal_clock_monotonic_nanos() - encode_started;
     return 0;
 }
@@ -21635,7 +21672,7 @@ static int termite_metal_encode_quant_matmul_q4_k_activation_rhs_mul_on_encoder(
     [encoder setBytes:&activation_params length:sizeof(activation_params) atIndex:5];
     [encoder setThreadgroupMemoryLength:64u * sizeof(float) atIndex:0];
     runtime->q4_k_activation_rhs_reduce += 1;
-    [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 1u) / 2u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 1u) / 2u, 1, 1), MTLSizeMake(128, 1, 1));
     return 0;
 }
 
@@ -21691,7 +21728,7 @@ static int termite_metal_encode_quant_matmul_q4_0_activation_rhs_mul_on_encoder(
     [encoder setThreadgroupMemoryLength:0u atIndex:0];
     runtime->q4_0_activation_rhs_reduce += 1;
     if (use_f16_output) runtime->q4_0_activation_rhs_reduce_f16_output += 1;
-    [encoder dispatchThreadgroups:MTLSizeMake(use_f16_output ? ((descriptor->out_dim + 15u) / 16u) : ((descriptor->out_dim + 63u) / 64u), 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(use_f16_output ? ((descriptor->out_dim + 15u) / 16u) : ((descriptor->out_dim + 63u) / 64u), 1, 1), MTLSizeMake(128, 1, 1));
     runtime->q4_0_activation_rhs_reduce_encode_nanos += termite_metal_clock_monotonic_nanos() - encode_started;
     return 0;
 }
@@ -21747,11 +21784,11 @@ static int termite_metal_encode_quant_matmul_generic_pair_on_encoder(
 
         [encoder setBuffer:descriptor->weight_buffer offset:descriptor->weight_offset atIndex:1];
         [encoder setBuffer:descriptor->output_buffer offset:descriptor->output_offset atIndex:2];
-        [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads];
+        antfly_metal_dispatch_threadgroups(encoder, threadgroups, threads);
 
         [encoder setBuffer:descriptor->second_weight_buffer offset:descriptor->second_weight_offset atIndex:1];
         [encoder setBuffer:descriptor->second_output_buffer offset:descriptor->second_output_offset atIndex:2];
-        [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads];
+        antfly_metal_dispatch_threadgroups(encoder, threadgroups, threads);
 
         runtime->antfly_q4_k_small_batch_dispatches += 2;
         runtime->florence_q4_k_mm_matrix_dispatches += 2;
@@ -21818,17 +21855,17 @@ static int termite_metal_encode_quant_matmul_generic_pair_on_encoder(
             runtime->q4_k_pair_reduce += 1;
         }
         [encoder setThreadgroupMemoryLength:reduce_shmem_floats * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:reduce_threadgroups threadsPerThreadgroup:reduce_threads];
+        antfly_metal_dispatch_threadgroups(encoder, reduce_threadgroups, reduce_threads);
         if (q4_0_reduce_timing) runtime->q4_0_pair_reduce_encode_nanos += termite_metal_clock_monotonic_nanos() - encode_started;
     } else if (two_dimensional_grid) {
         if (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q4_0) runtime->q4_0_pair += 1;
         NSUInteger thread_width = pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0) thread_width = 32;
         if (thread_width > descriptor->out_dim && descriptor->out_dim > 0) thread_width = descriptor->out_dim;
-        [encoder dispatchThreads:MTLSizeMake(descriptor->out_dim, descriptor->rows, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(descriptor->out_dim, descriptor->rows, 1), MTLSizeMake(thread_width, 1, 1));
     } else {
         const size_t total = descriptor->rows * descriptor->out_dim;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, total), 1, 1));
     }
     return 0;
 }
@@ -22544,7 +22581,7 @@ static int termite_metal_encode_quant_matmul_none_on_encoder_family(
         termite_metal_bind_three_buffers(encoder, descriptor->input_buffer, descriptor->input_offset, descriptor->weight_buffer, descriptor->weight_offset, descriptor->output_buffer, descriptor->output_offset, &rows_i, sizeof(rows_i));
         [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:4];
         [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:5];
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, descriptor->rows, 1) threadsPerThreadgroup:MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, descriptor->rows, 1), MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1));
         termite_metal_workload_profile_record_quant_matmul(
             runtime,
             descriptor,
@@ -22584,20 +22621,20 @@ static int termite_metal_encode_quant_matmul_none_on_encoder_family(
             [encoder setComputePipelineState:bulk_pipeline];
             termite_metal_bind_three_buffers(encoder, descriptor->input_buffer, descriptor->input_offset, descriptor->weight_buffer, 0u, descriptor->output_buffer, descriptor->output_offset, &params, sizeof(params));
             [encoder setThreadgroupMemoryLength:rows64 ? 8192u : 6144u atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(
                 descriptor->out_dim / 64u,
                 bulk_rows / tile_rows,
-                1u) threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+                1u), MTLSizeMake(threads, 1u, 1u));
         }
         if (tail_rows != 0u) {
             params.rows = (uint32_t)tail_rows;
             [encoder setComputePipelineState:tail_pipeline];
             termite_metal_bind_three_buffers(encoder, descriptor->input_buffer, tail_input_offset, descriptor->weight_buffer, 0u, descriptor->output_buffer, tail_output_offset, &params, sizeof(params));
             [encoder setThreadgroupMemoryLength:rows64 ? 16384u : 8192u atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(
                 descriptor->out_dim / 64u,
                 1u,
-                1u) threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+                1u), MTLSizeMake(threads, 1u, 1u));
         }
         termite_metal_workload_profile_record_quant_matmul(
             runtime,
@@ -22627,17 +22664,17 @@ static int termite_metal_encode_quant_matmul_none_on_encoder_family(
     termite_metal_bind_three_buffers(encoder, descriptor->input_buffer, descriptor->input_offset, descriptor->weight_buffer, q8_0_format ? 0u : descriptor->weight_offset, descriptor->output_buffer, descriptor->output_offset, &params, sizeof(params));
     if (use_mm_sg) {
         [encoder setThreadgroupMemoryLength:8192u atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 63u) / 64u, (descriptor->rows + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 63u) / 64u, (descriptor->rows + 31u) / 32u, 1), MTLSizeMake(128, 1, 1));
     } else if (use_mm || use_mm_f16_input) {
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 31u) / 32u, (descriptor->rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 31u) / 32u, (descriptor->rows + 7u) / 8u, 1), MTLSizeMake(128, 1, 1));
     } else if (use_mmv || use_mmv_f16_input) {
         [encoder setThreadgroupMemoryLength:64u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 1u) / 2u, descriptor->rows, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 1u) / 2u, descriptor->rows, 1), MTLSizeMake(128, 1, 1));
     } else if (use_small_batch) {
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 15u) / 16u, (descriptor->rows + small_batch_rows_per_tg - 1u) / small_batch_rows_per_tg, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 15u) / 16u, (descriptor->rows + small_batch_rows_per_tg - 1u) / small_batch_rows_per_tg, 1), MTLSizeMake(128, 1, 1));
     } else {
         const size_t total = descriptor->rows * descriptor->out_dim;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, total), 1, 1));
     }
     termite_metal_workload_profile_record_quant_matmul(
         runtime,
@@ -22768,7 +22805,7 @@ static int termite_metal_encode_quant_matmul_pair_activation_mul_on_encoder(
         [encoder setComputePipelineState:runtime->q8_0_mm_sg_pipeline];
         termite_metal_bind_three_buffers(encoder, descriptor->input_buffer, descriptor->input_offset, descriptor->weight_buffer, 0, gate_output_buffer, 0, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:8192u atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 63u) / 64u, (descriptor->rows + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 63u) / 64u, (descriptor->rows + 31u) / 32u, 1), MTLSizeMake(128, 1, 1));
 
         [encoder setComputePipelineState:runtime->q8_0_mm_sg_pipeline];
         [encoder setBuffer:descriptor->input_buffer offset:descriptor->input_offset atIndex:0];
@@ -22777,13 +22814,12 @@ static int termite_metal_encode_quant_matmul_pair_activation_mul_on_encoder(
         [encoder setBuffer:up_output_buffer offset:0 atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         [encoder setThreadgroupMemoryLength:8192u atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 63u) / 64u, (descriptor->rows + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 63u) / 64u, (descriptor->rows + 31u) / 32u, 1), MTLSizeMake(128, 1, 1));
 
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [encoder setComputePipelineState:runtime->activation_multiply_pipeline];
         termite_metal_bind_three_buffers(encoder, gate_output_buffer, 0, up_output_buffer, 0, descriptor->output_buffer, descriptor->output_offset, &activation_params, sizeof(activation_params));
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_multiply_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_multiply_pipeline, total), 1, 1));
         return 0;
     }
 
@@ -22861,16 +22897,16 @@ static int termite_metal_encode_quant_matmul_pair_activation_mul_on_encoder(
     [encoder setBytes:&activation_params length:sizeof(activation_params) atIndex:5];
     if (use_pair_sg_v2) {
         [encoder setThreadgroupMemoryLength:16384u atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(descriptor->out_dim / 64u, (descriptor->rows + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(descriptor->out_dim / 64u, (descriptor->rows + 31u) / 32u, 1), MTLSizeMake(128, 1, 1));
     } else if (use_mm || use_mm_f16_output) {
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 31u) / 32u, (descriptor->rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 31u) / 32u, (descriptor->rows + 7u) / 8u, 1), MTLSizeMake(128, 1, 1));
     } else if (use_mmv) {
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 15u) / 16u, descriptor->rows, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 15u) / 16u, descriptor->rows, 1), MTLSizeMake(128, 1, 1));
     } else if (use_small_batch) {
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 15u) / 16u, (descriptor->rows + small_batch_rows_per_tg - 1u) / small_batch_rows_per_tg, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 15u) / 16u, (descriptor->rows + small_batch_rows_per_tg - 1u) / small_batch_rows_per_tg, 1), MTLSizeMake(128, 1, 1));
     } else {
         [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 3u) / 4u, descriptor->rows, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 3u) / 4u, descriptor->rows, 1), MTLSizeMake(128, 1, 1));
     }
     return 0;
 }
@@ -22954,7 +22990,7 @@ static int termite_metal_encode_quant_matmul_pair_activation_rms_scale_1x_on_enc
     [encoder setBytes:&activation_params length:sizeof(activation_params) atIndex:5];
     [encoder setBuffer:runtime->rms_norm_weight_buffers[descriptor->norm_slot] offset:0 atIndex:6];
     [encoder setBuffer:descriptor->inv_scale_buffer offset:descriptor->inv_scale_offset atIndex:7];
-    [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 15u) / 16u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 15u) / 16u, 1, 1), MTLSizeMake(128, 1, 1));
     return 0;
 }
 
@@ -23016,11 +23052,11 @@ static int termite_metal_encode_quant_matmul_activation_rhs_mul_on_encoder(
     termite_metal_bind_four_buffers(encoder, descriptor->input_buffer, descriptor->input_offset, descriptor->weight_buffer, 0, descriptor->rhs_buffer, descriptor->rhs_offset, descriptor->output_buffer, descriptor->output_offset, &params, sizeof(params));
     [encoder setBytes:&activation_params length:sizeof(activation_params) atIndex:5];
     if (use_mmv) {
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 15u) / 16u, descriptor->rows, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 15u) / 16u, descriptor->rows, 1), MTLSizeMake(128, 1, 1));
         return 0;
     }
     [encoder setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 3u) / 4u, descriptor->rows, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 3u) / 4u, descriptor->rows, 1), MTLSizeMake(128, 1, 1));
     return 0;
 }
 
@@ -23127,13 +23163,13 @@ static int termite_metal_encode_quant_matmul_pair_on_encoder(
     [encoder setComputePipelineState:pipeline];
     termite_metal_bind_five_buffers(encoder, descriptor->input_buffer, descriptor->input_offset, descriptor->weight_buffer, 0, descriptor->second_weight_buffer, 0, descriptor->output_buffer, descriptor->output_offset, descriptor->second_output_buffer, descriptor->second_output_offset, &params, sizeof(params));
     if (use_small_batch) {
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 15u) / 16u, (descriptor->rows + small_batch_rows_per_tg - 1u) / small_batch_rows_per_tg, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 15u) / 16u, (descriptor->rows + small_batch_rows_per_tg - 1u) / small_batch_rows_per_tg, 1), MTLSizeMake(128, 1, 1));
     } else if (use_mmv) {
         [encoder setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 1u) / 2u, descriptor->rows, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 1u) / 2u, descriptor->rows, 1), MTLSizeMake(128, 1, 1));
     } else {
         const size_t total = descriptor->rows * descriptor->out_dim;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, total), 1, 1));
     }
     return 0;
 }
@@ -23220,19 +23256,19 @@ static int termite_metal_encode_quant_matmul_qkv_on_encoder(
             [encoder setComputePipelineState:runtime->q8_0_kv_pair_mm_sg_pipeline];
             termite_metal_bind_five_buffers(encoder, descriptor->input_buffer, descriptor->input_offset, descriptor->second_weight_buffer, 0u, descriptor->third_weight_buffer, 0u, descriptor->second_output_buffer, descriptor->second_output_offset, descriptor->third_output_buffer, descriptor->third_output_offset, &pair_params, sizeof(pair_params));
             [encoder setThreadgroupMemoryLength:6144u atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(
                 descriptor->second_out_dim / 64u,
                 bulk_rows / 32u,
-                1u) threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+                1u), MTLSizeMake(128u, 1u, 1u));
             if (tail_rows != 0u) {
                 pair_params.rows = (uint32_t)tail_rows;
                 [encoder setComputePipelineState:runtime->q8_0_kv_pair_mm_sg_tail_pipeline];
                 termite_metal_bind_five_buffers(encoder, descriptor->input_buffer, tail_input_offset, descriptor->second_weight_buffer, 0u, descriptor->third_weight_buffer, 0u, descriptor->second_output_buffer, tail_k_output_offset, descriptor->third_output_buffer, tail_v_output_offset, &pair_params, sizeof(pair_params));
                 [encoder setThreadgroupMemoryLength:8192u atIndex:0];
-                [encoder dispatchThreadgroups:MTLSizeMake(
+                antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(
                     descriptor->second_out_dim / 64u,
                     1u,
-                    1u) threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+                    1u), MTLSizeMake(128u, 1u, 1u));
             }
             termite_metal_record_q8_0_linear_dispatch(
                 runtime,
@@ -23294,7 +23330,7 @@ static int termite_metal_encode_quant_matmul_qkv_on_encoder(
     [encoder setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
     const size_t q_groups = (descriptor->out_dim + 1u) / 2u;
     const size_t kv_groups = (descriptor->second_out_dim + 1u) / 2u;
-    [encoder dispatchThreadgroups:MTLSizeMake(q_groups + kv_groups, descriptor->rows, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(q_groups + kv_groups, descriptor->rows, 1), MTLSizeMake(128, 1, 1));
     return 0;
 }
 
@@ -23425,8 +23461,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:4];
         [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:5];
         [encoder setThreadgroupMemoryLength:16384u atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + 63u) / 64u, (descriptor->rows + 63u) / 64u, 1)
-                   threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + 63u) / 64u, (descriptor->rows + 63u) / 64u, 1), MTLSizeMake(256u, 1, 1));
         runtime->antfly_q4_k_small_batch_dispatches += 1;
         runtime->florence_q4_k_mm_matrix_dispatches += 1;
         return 0;
@@ -23510,7 +23545,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         termite_metal_bind_three_buffers(encoder, descriptor->input_buffer, descriptor->input_offset, descriptor->weight_buffer, descriptor->weight_offset, descriptor->output_buffer, descriptor->output_offset, &rows_i, sizeof(rows_i));
         [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:4];
         [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:5];
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, (descriptor->rows - 1u) / rows_per_threadgroup + 1u, 1) threadsPerThreadgroup:MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, (descriptor->rows - 1u) / rows_per_threadgroup + 1u, 1), MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1));
         termite_metal_workload_profile_record_quant_matmul(
             runtime,
             descriptor,
@@ -24214,7 +24249,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         termite_metal_bind_three_buffers(encoder, descriptor->input_buffer, descriptor->input_offset, descriptor->weight_buffer, descriptor->weight_offset, descriptor->output_buffer, descriptor->output_offset, &rows_i, sizeof(rows_i));
         [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:4];
         [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:5];
-        [encoder dispatchThreadgroups:MTLSizeMake((descriptor->out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, (descriptor->rows - 1u) / rows_per_threadgroup + 1u, 1) threadsPerThreadgroup:MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((descriptor->out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, (descriptor->rows - 1u) / rows_per_threadgroup + 1u, 1), MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1));
         termite_metal_workload_profile_record_quant_matmul(
             runtime,
             descriptor,
@@ -24272,11 +24307,11 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             }
         }
         [encoder setThreadgroupMemoryLength:reduce_shmem_floats * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:reduce_threadgroups threadsPerThreadgroup:reduce_threads];
+        antfly_metal_dispatch_threadgroups(encoder, reduce_threadgroups, reduce_threads);
         if (q4_0_reduce_timing) runtime->q4_0_linear_reduce_encode_nanos += termite_metal_clock_monotonic_nanos() - encode_started;
     } else {
         const size_t total = descriptor->rows * descriptor->out_dim;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, total), 1, 1));
     }
     termite_metal_workload_profile_record_quant_matmul(
         runtime,
@@ -24432,8 +24467,8 @@ int termite_metal_calibrate_quant_signature(
             [encoder endEncoding];
             if (result != 0) break;
             const uint64_t wall_started = termite_metal_clock_monotonic_nanos();
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             const uint64_t wall_finished = termite_metal_clock_monotonic_nanos();
             if (command_buffer.status != MTLCommandBufferStatusCompleted) {
                 result = -13;
@@ -24680,7 +24715,7 @@ static int termite_metal_encode_q8_0_linear_rms_scale_1x(
     [encoder setBuffer:runtime->rms_norm_weight_buffers[norm_slot] offset:0 atIndex:4];
     [encoder setBuffer:inv_scale_buffer offset:inv_scale_offset atIndex:5];
     [encoder setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 3u) / 4u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 3u) / 4u, 1, 1), MTLSizeMake(128, 1, 1));
     [encoder endEncoding];
     return 0;
 }
@@ -25577,7 +25612,7 @@ static int termite_metal_encode_q8_0_linear_rms_scale_1x_with_offset(
     [encoder setBuffer:runtime->rms_norm_weight_buffers[norm_slot] offset:0 atIndex:4];
     [encoder setBuffer:inv_scale_buffer offset:inv_scale_offset atIndex:5];
     [encoder setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 3u) / 4u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 3u) / 4u, 1, 1), MTLSizeMake(128, 1, 1));
     [encoder endEncoding];
     return 0;
 }
@@ -25645,7 +25680,7 @@ static int termite_metal_encode_rms_norm_add_on_encoder(
     [encoder setComputePipelineState:runtime->rms_norm_add_pipeline];
     termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, runtime->rms_norm_weight_buffers[norm_slot], 0, residual_buffer, residual_offset, output_buffer, output_offset, &params, sizeof(params));
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     return 0;
 }
 
@@ -25692,7 +25727,7 @@ static int termite_metal_encode_rms_norm_add_sumsq_on_encoder(
     [encoder setComputePipelineState:runtime->rms_norm_add_sumsq_pipeline];
     termite_metal_bind_five_buffers(encoder, input_buffer, input_offset, runtime->rms_norm_weight_buffers[norm_slot], 0, residual_buffer, residual_offset, output_buffer, output_offset, sumsq_buffer, sumsq_offset, &params, sizeof(params));
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     runtime->rms_norm_add_sumsq += 1;
     return 0;
 }
@@ -25743,7 +25778,7 @@ static int termite_metal_encode_rms_norm_add_scale_sumsq_on_encoder(
     [encoder setComputePipelineState:runtime->rms_norm_add_scale_sumsq_pipeline];
     termite_metal_bind_five_buffers(encoder, input_buffer, input_offset, runtime->rms_norm_weight_buffers[norm_slot], 0, residual_buffer, residual_offset, output_buffer, output_offset, sumsq_buffer, sumsq_offset, &params, sizeof(params));
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     runtime->rms_norm_add_sumsq += 1;
     return 0;
 }
@@ -25787,7 +25822,7 @@ static int termite_metal_encode_rms_norm_add_f16_input_on_encoder(
     [encoder setComputePipelineState:runtime->rms_norm_add_f16_input_pipeline];
     termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, runtime->rms_norm_weight_buffers[norm_slot], 0, residual_buffer, residual_offset, output_buffer, output_offset, &params, sizeof(params));
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     return 0;
 }
 
@@ -25864,10 +25899,10 @@ static int termite_metal_encode_attention_f32_on_encoder(
     [encoder setBytes:&params length:sizeof(params) atIndex:6];
     if (use_prefill_tiled) {
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((kv_tokens + 256u) * sizeof(float)) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(q_len, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(q_len, num_heads, 1), MTLSizeMake(256, 1, 1));
     } else {
         const size_t total_rows = q_len * num_heads;
-        [encoder dispatchThreads:MTLSizeMake(total_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->attention_f32_pipeline, total_rows), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->attention_f32_pipeline, total_rows), 1, 1));
     }
     return 0;
 }
@@ -26124,8 +26159,7 @@ static void termite_metal_lightonocr3_dispatch_prefill_attention(
     const bool direct = termite_metal_lightonocr3_prefill_attention_pipeline(runtime, p->q_len, p->page_size) ==
         runtime->lightonocr3_prefill_attention_direct_pipeline;
     if (direct) runtime->lightonocr3_prefill_attention_direct_dispatches++;
-    [encoder dispatchThreadgroups:MTLSizeMake((p->q_len + tile - 1u) / tile, p->num_heads, 1)
-        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((p->q_len + tile - 1u) / tile, p->num_heads, 1), MTLSizeMake(128, 1, 1));
     if (p->q_len < 128 && direct) runtime->lightonocr3_short_direct_attention_dispatches++;
     if (runtime->lightonocr3_prefill_attention_mpp_dispatches++ == 0 &&
         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_ATTENTION_MPP")))
@@ -26336,13 +26370,11 @@ static int termite_metal_lighton_attention_encode_batch_kernel(
   [encoder setThreadgroupMemoryLength:
                TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES(256)
                               atIndex:0];
-  [encoder dispatchThreadgroups:MTLSizeMake(batch->count, kv_heads, max_splits)
-          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch->count, kv_heads, max_splits), MTLSizeMake(256, 1, 1));
   [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
   [encoder
       setComputePipelineState:runtime->lightonocr3_gqa_batch_reduce_pipeline];
-  [encoder dispatchThreadgroups:MTLSizeMake(batch->count, heads, 1)
-          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch->count, heads, 1), MTLSizeMake(256, 1, 1));
   [encoder endEncoding];
   for (size_t i = 0; i < batch->count; i++)
     batch->rows[i].owner->lightonocr3_gqa_split_calls += 1;
@@ -26399,10 +26431,9 @@ int termite_metal_decode_runtime_lighton_attention_batch_end(
                  TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES(
                      r->params.head_dim)
                                 atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, r->params.num_kv_heads,
-                                              r->launch.params.split_count)
-            threadsPerThreadgroup:MTLSizeMake(r->launch.schedule.stage_threads,
-                                              1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, r->params.num_kv_heads,
+                                              r->launch.params.split_count), MTLSizeMake(r->launch.schedule.stage_threads,
+                                              1, 1));
   }
   [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
   for (size_t i = 0; i < batch->count; ++i) {
@@ -26415,9 +26446,8 @@ int termite_metal_decode_runtime_lighton_attention_batch_end(
     [encoder setBytes:&r->launch.params
                length:sizeof(r->launch.params)
               atIndex:3];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, r->params.num_heads, 1)
-            threadsPerThreadgroup:MTLSizeMake(r->launch.schedule.reduce_threads,
-                                              1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, r->params.num_heads, 1), MTLSizeMake(r->launch.schedule.reduce_threads,
+                                              1, 1));
     r->owner->lightonocr3_gqa_split_calls += 1;
   }
   [encoder endEncoding];
@@ -26867,8 +26897,7 @@ static int termite_metal_encode_decode_gqa_split_dispatch(
     [encoder setBytes:params length:sizeof(*params) atIndex:6];
     [encoder setBytes:&launch->params length:sizeof(launch->params) atIndex:7];
     [encoder setThreadgroupMemoryLength:TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES(params->head_dim) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(params->q_len, params->num_kv_heads, launch->params.split_count)
-        threadsPerThreadgroup:MTLSizeMake(launch->schedule.stage_threads, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(params->q_len, params->num_kv_heads, launch->params.split_count), MTLSizeMake(launch->schedule.stage_threads, 1, 1));
 
     const bool needs_explicit_split_barrier = scratch_runtime->active_planned_compute_encoder != encoder ||
         !termite_metal_planned_compute_barriers_enabled(scratch_runtime);
@@ -26896,8 +26925,7 @@ static int termite_metal_encode_decode_gqa_split_dispatch(
     [encoder setComputePipelineState:launch->lightonocr3 ? runtime->lightonocr3_gqa_split_reduce_pipeline : runtime->attention_decode_gqa_split_reduce_pipeline];
     termite_metal_bind_two_buffers(encoder, scratch_buffer, 0, output_buffer, output_offset, params, sizeof(*params));
     [encoder setBytes:&launch->params length:sizeof(launch->params) atIndex:3];
-    [encoder dispatchThreadgroups:MTLSizeMake(params->q_len, params->num_heads, 1)
-        threadsPerThreadgroup:MTLSizeMake(launch->schedule.reduce_threads, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(params->q_len, params->num_heads, 1), MTLSizeMake(launch->schedule.reduce_threads, 1, 1));
 
     if (launch->lightonocr3) runtime->lightonocr3_gqa_split_calls += 1;
     else {
@@ -27219,7 +27247,7 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
         runtime->generated_attention_flash_prefill_hd512_calls += 1;
         termite_metal_record_prefill_kv_route(runtime, use_prefill_direct_kv);
         [encoder setThreadgroupMemoryLength:TERMITE_METAL_GENERATED_FLASH_HD512_MEMORY_BYTES atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((q_len + 7u) / 8u, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_HD512_THREADS, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((q_len + 7u) / 8u, num_heads, 1), MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_HD512_THREADS, 1, 1));
     } else if (use_prefill_sg) {
         if (generated_prefill_sg) runtime->generated_attention_flash_prefill_calls += 1;
         termite_metal_record_prefill_kv_route(runtime, use_prefill_direct_kv);
@@ -27227,15 +27255,15 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
             ? TERMITE_METAL_GENERATED_FLASH_MEMORY_BYTES(head_dim)
             : TERMITE_METAL_HANDWRITTEN_FLASH_MEMORY_BYTES(head_dim);
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(prefill_sg_memory_bytes) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((q_len + 7u) / 8u, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_THREADS, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((q_len + 7u) / 8u, num_heads, 1), MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_THREADS, 1, 1));
     } else if (use_decode_1x) {
         runtime->paged_attention_1x_calls += 1;
         if (runtime->attention_1x_generated_pipeline != nil) runtime->generated_attention_decode_1x_calls += 1;
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((kv_tokens * 2u + TERMITE_METAL_GENERATED_DECODE_THREADS) * sizeof(float)) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(q_len, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_GENERATED_DECODE_THREADS, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(q_len, num_heads, 1), MTLSizeMake(TERMITE_METAL_GENERATED_DECODE_THREADS, 1, 1));
     } else {
         const size_t total = q_len * num_heads;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->attention_paged_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->attention_paged_pipeline, total), 1, 1));
     }
     (void)block_table_buffer;
     (void)sinks_buffer;
@@ -27370,7 +27398,7 @@ static int termite_metal_encode_q4_0_linear_rms_add_rows(
         if (use_sumsq) [encoder setBuffer:sumsq offset:0 atIndex:4];
         [encoder setBytes:&params length:sizeof(params) atIndex:use_sumsq ? 5 : 4];
         [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256, 1, 1));
         if (use_sumsq) runtime->rms_norm_add_sumsq += 1;
     }
     const int end_status = termite_metal_decode_runtime_end_planned_compute_scope(runtime);
@@ -27875,7 +27903,7 @@ static int termite_metal_encode_rms_norm_add_scale_on_encoder(
     [encoder setComputePipelineState:runtime->rms_norm_add_scale_pipeline];
     termite_metal_bind_five_buffers_only(encoder, input_buffer, input_offset, runtime->rms_norm_weight_buffers[norm_slot], 0, residual_buffer, residual_offset, output_buffer, output_offset, params_buffer, 0);
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     return 0;
 }
 
@@ -29323,7 +29351,7 @@ static int termite_metal_encode_rms_norm_add_scale_for(
         [encoder setComputePipelineState:runtime->rms_norm_add_scale_simd4_pipeline];
         termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, runtime->rms_norm_weight_buffers[norm_slot], 0, residual_buffer, residual_offset, output_buffer, output_offset, &row_params, sizeof(row_params));
         [encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(threads, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return 0;
     }
@@ -29333,7 +29361,7 @@ static int termite_metal_encode_rms_norm_add_scale_for(
     [encoder setComputePipelineState:runtime->rms_norm_add_scale_pipeline];
     termite_metal_bind_five_buffers_only(encoder, input_buffer, input_offset, runtime->rms_norm_weight_buffers[norm_slot], 0, residual_buffer, residual_offset, output_buffer, output_offset, params_buffer, 0);
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     if (!planned_encoder) [encoder endEncoding];
     return 0;
 }
@@ -29395,7 +29423,7 @@ static int termite_metal_encode_rms_norm_add_scale_rows_for(
         [encoder setComputePipelineState:runtime->rms_norm_add_scale_simd4_pipeline];
         termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, runtime->rms_norm_weight_buffers[norm_slot], 0, residual_buffer, residual_offset, output_buffer, output_offset, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(threads, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return 0;
     }
@@ -29405,7 +29433,7 @@ static int termite_metal_encode_rms_norm_add_scale_rows_for(
     [encoder setComputePipelineState:runtime->rms_norm_add_scale_rows_pipeline];
     termite_metal_bind_five_buffers_only(encoder, input_buffer, input_offset, runtime->rms_norm_weight_buffers[norm_slot], 0, residual_buffer, residual_offset, output_buffer, output_offset, params_buffer, 0);
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256, 1, 1));
     if (!planned_encoder) [encoder endEncoding];
     return 0;
 }
@@ -29724,31 +29752,31 @@ static void termite_metal_dispatch_rms_norm_rows(
     if (prefill_threads != 0) {
         [encoder setComputePipelineState:runtime->rms_norm_rows_simd4_reduce_pipeline];
         [encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(prefill_threads, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(prefill_threads, 1, 1));
         return;
     }
     const uint32_t embedding_threads = termite_metal_decode_runtime_embeddinggemma2_rms_norm_threads(runtime, rows, hidden_size);
     if (embedding_threads != 0u) {
         [encoder setComputePipelineState:runtime->rms_norm_rows_simd4_reduce_pipeline];
         [encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(embedding_threads, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(embedding_threads, 1, 1));
         return;
     }
     if (termite_metal_a4b_simd4_rms_norm_rows_preferred(runtime, rows, hidden_size)) {
         const NSUInteger threads = hidden_size <= 512u ? 128u : 256u;
         [encoder setComputePipelineState:runtime->rms_norm_rows_simd4_reduce_pipeline];
         [encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(threads, 1, 1));
         return;
     }
     if (termite_metal_rms_norm_rows_reduce_preferred(runtime, rows, hidden_size)) {
         [encoder setComputePipelineState:runtime->rms_norm_rows_reduce_pipeline];
         [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256, 1, 1));
         return;
     }
     [encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
-    [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1));
 }
 
 static int termite_metal_encode_rms_norm_rows(
@@ -29858,7 +29886,7 @@ static int termite_metal_encode_rms_norm_generated(
     termite_metal_bind_three_buffers(encoder, input_buffer, input_offset, weight_buffer, weight_offset, output_buffer, output_offset, &rows_i, sizeof(rows_i));
     [encoder setBytes:&hidden_size_i length:sizeof(hidden_size_i) atIndex:4];
     [encoder setBytes:&eps_f length:sizeof(eps_f) atIndex:5];
-    [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(reduction_threads, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(reduction_threads, 1, 1));
     runtime->generated_rms_norm_calls += 1;
     if (!planned_encoder) [encoder endEncoding];
     return 0;
@@ -29924,7 +29952,7 @@ static int termite_metal_encode_add_for(
     }
     [encoder setComputePipelineState:runtime->add_pipeline];
     termite_metal_bind_three_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, &params, sizeof(params));
-    [encoder dispatchThreads:MTLSizeMake(elems, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, elems), 1, 1)];
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(elems, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, elems), 1, 1));
     if (!planned_encoder) [encoder endEncoding];
     return 0;
 }
@@ -29969,7 +29997,7 @@ static int termite_metal_encode_rms_norm_reduce(
     [encoder setComputePipelineState:runtime->rms_norm_reduce_pipeline];
     termite_metal_bind_three_buffers(encoder, input_buffer, input_offset, runtime->rms_norm_weight_buffers[norm_slot], 0, output_buffer, output_offset, &params, sizeof(params));
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     if (!planned_encoder) [encoder endEncoding];
     return 0;
 }
@@ -30027,7 +30055,7 @@ static int termite_metal_encode_rms_inv_scale_1x_on_encoder(
     [encoder setComputePipelineState:runtime->rms_inv_scale_pipeline];
     termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     return 0;
 }
 
@@ -31880,7 +31908,7 @@ int termite_metal_decode_runtime_embed_absolute_position(
         if (thread_width == 0) thread_width = 64;
         if (thread_width > hidden_size && hidden_size > 0) thread_width = hidden_size;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         [encoder endEncoding];
         const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
         if (finish_rc != 0) return finish_rc;
@@ -32322,7 +32350,7 @@ int termite_metal_decode_runtime_embedding_lookup_prepared(
         if (thread_width == 0) thread_width = 64;
         if (thread_width > total_values && total_values > 0) thread_width = total_values;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         [encoder endEncoding];
         const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
         if (finish_rc != 0) return finish_rc;
@@ -32383,11 +32411,11 @@ int termite_metal_decode_runtime_embedding_lookup_prepared_device(
         if (thread_width == 0) thread_width = 64;
         if (thread_width > total_values && total_values > 0) thread_width = total_values;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         if (!planned_encoder) [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -10;
         }
         return 0;
@@ -32496,11 +32524,11 @@ int termite_metal_decode_runtime_deberta_embeddings_f32_device(
         [encoder setComputePipelineState:runtime->deberta_embeddings_f32_pipeline];
         termite_metal_bind_six_buffers_only(encoder, weight_buffer, weight_offset, gamma_buffer, gamma_offset, beta_buffer, beta_offset, ids_slice.buffer, ids_slice.offset, mask_slice.buffer, mask_slice.offset, output_buffer, output_offset);
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
-        [encoder dispatchThreadgroups:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(256, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -12;
         }
         return 0;
@@ -32586,11 +32614,11 @@ int termite_metal_decode_runtime_deberta_embeddings_f32(
         [encoder setComputePipelineState:runtime->deberta_embeddings_f32_pipeline];
         termite_metal_bind_six_buffers_only(encoder, weight_buffer, weight_offset, gamma_buffer, 0, beta_buffer, 0, ids_slice.buffer, ids_slice.offset, mask_slice.buffer, mask_slice.offset, output_buffer, output_offset);
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
-        [encoder dispatchThreadgroups:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(256, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -14;
         }
         return 0;
@@ -32647,11 +32675,11 @@ int termite_metal_decode_runtime_embedding_lookup_bf16_prepared_device(
         if (thread_width == 0) thread_width = 64;
         if (thread_width > total_values && total_values > 0) thread_width = total_values;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         if (!planned_encoder) [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -10;
         }
         return 0;
@@ -32708,11 +32736,11 @@ int termite_metal_decode_runtime_embedding_lookup_f16_prepared_device(
         if (thread_width == 0) thread_width = 64;
         if (thread_width > total_values && total_values > 0) thread_width = total_values;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         if (!planned_encoder) [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -10;
         }
         return 0;
@@ -32801,11 +32829,11 @@ int termite_metal_decode_runtime_embedding_lookup_bf16_staged_rows_device(
         if (thread_width == 0) thread_width = 64;
         if (thread_width > total_values && total_values > 0) thread_width = total_values;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         if (!planned_encoder) [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -18;
         }
         return 0;
@@ -32859,7 +32887,7 @@ int termite_metal_decode_runtime_quant_embedding_lookup_prepared_device_token(
         }
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_three_buffers(encoder, runtime->generic_embedding_table_buffer, runtime->generic_embedding_buffer_offset, runtime->token_buffer, 0, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return 0;
     }
@@ -32919,11 +32947,11 @@ int termite_metal_decode_runtime_quant_embedding_lookup_prepared_device(
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_three_buffers(encoder, runtime->generic_embedding_table_buffer, runtime->generic_embedding_buffer_offset, ids_slice.buffer, ids_slice.offset, output_buffer, output_offset, &params, sizeof(params));
         const size_t total_values = total * dim;
-        [encoder dispatchThreads:MTLSizeMake(total_values, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, total_values), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_values, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, total_values), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -11;
         }
         return 0;
@@ -33056,11 +33084,11 @@ int termite_metal_decode_runtime_quant_get_rows_linear_slot_device(
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_three_buffers(encoder, view.weight_buffer, view.weight_offset, ids_slice.buffer, ids_slice.offset, output_buffer, output_offset, &params, sizeof(params));
         const size_t total_values = total * dim;
-        [encoder dispatchThreads:MTLSizeMake(total_values, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, total_values), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_values, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, total_values), 1, 1));
         [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -11;
         }
         return 0;
@@ -33139,11 +33167,11 @@ int termite_metal_decode_runtime_quant_copy_linear_slot_to_f32_device(
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_two_buffers(encoder, view.weight_buffer, view.weight_offset, output_buffer, output_offset, &params, sizeof(params));
         const size_t total_values = rows * dim;
-        [encoder dispatchThreads:MTLSizeMake(total_values, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, total_values), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_values, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, total_values), 1, 1));
         [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -11;
         }
         return 0;
@@ -33223,11 +33251,11 @@ int termite_metal_decode_runtime_quant_copy_f32_to_linear_slot_device(
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, view.weight_buffer, view.weight_offset, &params, sizeof(params));
         const size_t row_blocks = dim / 32u;
         const size_t total_blocks = rows * row_blocks;
-        [encoder dispatchThreads:MTLSizeMake(total_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, total_blocks), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_blocks, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, total_blocks), 1, 1));
         [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -11;
         }
         return 0;
@@ -33285,11 +33313,11 @@ int termite_metal_decode_runtime_quant_set_rows_linear_slot_device(
         termite_metal_bind_three_buffers(encoder, input_buffer, input_offset, ids_slice.buffer, ids_slice.offset, view.weight_buffer, view.weight_offset, &params, sizeof(params));
         const size_t row_blocks = dim / 32u;
         const size_t total_blocks = total * row_blocks;
-        [encoder dispatchThreads:MTLSizeMake(total_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, total_blocks), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_blocks, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, total_blocks), 1, 1));
         [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -11;
         }
         return 0;
@@ -33359,7 +33387,7 @@ int termite_metal_decode_runtime_apply_rope(
         if (thread_width == 0) thread_width = 64;
         if (thread_width > total_values && total_values > 0) thread_width = total_values;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         [encoder endEncoding];
         const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
         if (finish_rc != 0) return finish_rc;
@@ -33436,7 +33464,7 @@ int termite_metal_decode_runtime_apply_rope_device(
         if (thread_width == 0) thread_width = 64;
         if (thread_width > total_values && total_values > 0) thread_width = total_values;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -33622,8 +33650,7 @@ static int termite_metal_lightonocr3_encode_recurrent_parallel_narrow(termite_me
     [encoder setBytes:table length:rows * sizeof(table[0]) atIndex:0];
     [encoder useResources:resources count:rows * 15 usage:MTLResourceUsageRead];
     [encoder useResources:writes count:write_count usage:MTLResourceUsageWrite];
-    [encoder dispatchThreadgroups:MTLSizeMake(params[2], rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(params[2], rows, 1), MTLSizeMake(512, 1, 1));
     termite_metal_end_scoped_compute_encoder(encoder, owned);
     runtime->lightonocr3_recurrent_parallel_dispatches++;
     if ((runtime->lightonocr3_recurrent_parallel_traced_rows & (UINT64_C(1) << (rows - 1))) == 0 &&
@@ -33754,8 +33781,7 @@ static int termite_metal_lightonocr3_encode_recurrent_parallel(termite_metal_dec
     else [encoder setBytes:table length:rows * sizeof(table[0]) atIndex:0];
     [encoder useResources:resources count:rows * 15 usage:MTLResourceUsageRead];
     [encoder useResources:writes count:write_count usage:MTLResourceUsageWrite];
-    [encoder dispatchThreadgroups:MTLSizeMake(params[2], rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(params[2], rows, 1), MTLSizeMake(512, 1, 1));
     termite_metal_end_scoped_compute_encoder(encoder, owned);
     runtime->lightonocr3_recurrent_parallel_dispatches++;
     runtime->lightonocr3_wide_recurrent_dispatches++;
@@ -33790,7 +33816,7 @@ int termite_metal_decode_runtime_qwen35_core_batch_end(termite_metal_decode_runt
                 for (size_t i = 0; i < 15; i++) [encoder setBuffer:(__bridge id<MTLBuffer>)runtime->qwen35_core_batch_handles[row][i]
                     offset:runtime->qwen35_core_batch_offsets[row][i] atIndex:i];
                 [encoder setBytes:params length:6 * sizeof(uint32_t) atIndex:15];
-                [encoder dispatchThreadgroups:MTLSizeMake(params[2], 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(params[2], 1, 1), MTLSizeMake(128, 1, 1));
             }
             [encoder endEncoding];
             termite_metal_decode_runtime_qwen35_core_batch_abort(runtime);
@@ -33817,7 +33843,7 @@ int termite_metal_decode_runtime_qwen35_core_batch_end(termite_metal_decode_runt
                     offset:runtime->qwen35_core_batch_offsets[row][i] atIndex:i];
                 [encoder setBytes:params length:6 * sizeof(uint32_t) atIndex:15];
                 const size_t width = stage == 3 ? 64 : (parallel_norm && (stage == 2 || stage == 4) ? 32 : termite_metal_thread_width(pipelines[stage], grids[stage]));
-                [encoder dispatchThreads:MTLSizeMake(grids[stage], 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+                antfly_metal_dispatch_threads(encoder, MTLSizeMake(grids[stage], 1, 1), MTLSizeMake(width, 1, 1));
             }
             [encoder endEncoding];
         }
@@ -33928,7 +33954,7 @@ int termite_metal_decode_runtime_qwen35_core_device(
             [encoder setComputePipelineState:runtime->qwen35_fused_decode_pipeline];
             for (size_t i = 0; i < 15; i++) [encoder setBuffer:buffers[i] offset:offsets[i] atIndex:i];
             [encoder setBytes:&params length:sizeof(params) atIndex:15];
-            [encoder dispatchThreadgroups:MTLSizeMake(value_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(value_heads, 1, 1), MTLSizeMake(128, 1, 1));
             [encoder endEncoding];
             return termite_metal_decode_runtime_finish_command_buffer(cb, frame_owned, -9);
         }
@@ -33985,7 +34011,7 @@ int termite_metal_decode_runtime_qwen35_core_device(
             }
             size_t width=stage==3?(seq==1?64:128):(parallel_norm && (stage==2 || stage==4) ? 32 : termite_metal_thread_width(pipelines[stage],grids[stage]));
             if (stage == 3 && pipelines[stage] == runtime->qwen35_recurrent_columns4_pipeline) width = 32;
-            [encoder dispatchThreads:MTLSizeMake(grids[stage],1,1) threadsPerThreadgroup:MTLSizeMake(width,1,1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(grids[stage],1,1), MTLSizeMake(width,1,1));
             if (shared_encoder && stage < 4) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             if (!shared_encoder) [encoder endEncoding];
         }
@@ -34064,8 +34090,7 @@ int termite_metal_decode_runtime_apply_mrope_device(
         [encoder setComputePipelineState:runtime->mrope_pipeline];
         termite_metal_bind_three_buffers(encoder, input_buffer, input_offset, positions_slice.buffer, positions_slice.offset, output_buffer, output_offset, &params, sizeof(params));
         const size_t total_values = total_chunks * head_dim;
-        [encoder dispatchThreads:MTLSizeMake(total_values, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->mrope_pipeline, total_values), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_values, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->mrope_pipeline, total_values), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
     }
@@ -34087,7 +34112,7 @@ int termite_metal_decode_runtime_packed_gelu(termite_metal_decode_runtime *runti
         if (!encoder) return -5;
         uint32_t dims[2] = { rows, width };
         [encoder setComputePipelineState:runtime->packed_gelu_pipeline]; termite_metal_bind_two_buffers(encoder, x, input_offset, y, output_offset, dims, sizeof(dims));
-        [encoder dispatchThreads:MTLSizeMake((size_t)rows * width, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->packed_gelu_pipeline, (size_t)rows * width), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake((size_t)rows * width, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->packed_gelu_pipeline, (size_t)rows * width), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(cb, owned, -6);
     }
@@ -34120,7 +34145,7 @@ int termite_metal_decode_runtime_embedding_head_prepare(termite_metal_decode_run
         [encoder setComputePipelineState:runtime->embedding_head_prepare_pipeline];
         termite_metal_bind_four_buffers(encoder, x, input_offset, w, weight_offset, g, gather_offset, y, output_offset, p, sizeof(*p));
         [encoder setBuffer:table offset:p->cached_rotary ? rotary_offset : input_offset atIndex:5];
-        [encoder dispatchThreadgroups:MTLSizeMake((size_t)p->rows * p->heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((size_t)p->rows * p->heads, 1, 1), MTLSizeMake(32, 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(cb, owned, -7);
     }
@@ -34162,7 +34187,7 @@ int termite_metal_decode_runtime_vision_norm_rope(termite_metal_decode_runtime *
         [encoder setComputePipelineState:runtime->vision_norm_rope_pipeline];
         termite_metal_bind_three_buffers(encoder, x, input_offset, w, weight_offset, y, output_offset, p, sizeof(*p));
         [encoder setBuffer:table offset:p->cached_rotary ? rotary_offset : input_offset atIndex:4];
-        [encoder dispatchThreadgroups:MTLSizeMake(count / p->head_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(count / p->head_dim, 1, 1), MTLSizeMake(32, 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(cb, owned, -8);
     }
@@ -34225,8 +34250,7 @@ int termite_metal_decode_runtime_apply_vision_rope_device(
         [encoder setComputePipelineState:runtime->mrope_pipeline];
         termite_metal_bind_three_buffers(encoder, input_buffer, input_offset, positions_slice.buffer, positions_slice.offset, output_buffer, output_offset, &params, sizeof(params));
         const size_t total_values = total_chunks * head_dim;
-        [encoder dispatchThreads:MTLSizeMake(total_values, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->mrope_pipeline, total_values), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_values, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->mrope_pipeline, total_values), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
     }
@@ -34314,7 +34338,7 @@ int termite_metal_decode_runtime_apply_rope_pair_scratch_device(
         if (thread_width > total_values) thread_width = total_values;
         const MTLSize grid_size = MTLSizeMake(total_values, 1, 1);
         const MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
 
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
 
@@ -34536,14 +34560,14 @@ int termite_metal_decode_runtime_apply_attention_f32(
         const size_t total_rows = q_len * num_heads;
         if (use_prefill_tiled) {
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((kv_len + 256u) * sizeof(float)) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(q_len, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(q_len, num_heads, 1), MTLSizeMake(256, 1, 1));
         } else {
             MTLSize grid_size = MTLSizeMake(total_rows, 1, 1);
             NSUInteger thread_width = runtime->attention_f32_pipeline.maxTotalThreadsPerThreadgroup;
             if (thread_width == 0) thread_width = 64;
             if (thread_width > total_rows && total_rows > 0) thread_width = total_rows;
             MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-            [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+            antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         }
         [encoder endEncoding];
         int rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
@@ -34706,9 +34730,9 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
                 const size_t convert_width = termite_metal_thread_width(runtime->encode_f16_convert_pipeline, convert_items);
                 [encoder setComputePipelineState:runtime->encode_f16_convert_pipeline];
                 termite_metal_bind_two_buffers(encoder, k_buffer, k_offset, runtime->dense_sg_f16_k_buffer, 0, &convert_params, sizeof(convert_params));
-                [encoder dispatchThreads:MTLSizeMake(convert_items, 1, 1) threadsPerThreadgroup:MTLSizeMake(convert_width, 1, 1)];
+                antfly_metal_dispatch_threads(encoder, MTLSizeMake(convert_items, 1, 1), MTLSizeMake(convert_width, 1, 1));
                 termite_metal_bind_two_buffers_only(encoder, v_buffer, v_offset, runtime->dense_sg_f16_v_buffer, 0);
-                [encoder dispatchThreads:MTLSizeMake(convert_items, 1, 1) threadsPerThreadgroup:MTLSizeMake(convert_width, 1, 1)];
+                antfly_metal_dispatch_threads(encoder, MTLSizeMake(convert_items, 1, 1), MTLSizeMake(convert_width, 1, 1));
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
             const BOOL use_gqa2 = (use_f16kv &&
@@ -34735,15 +34759,15 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
             const size_t query_tile = use_q16 ? 16u : 8u;
             if (use_gqa2) {
                 [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((32u + 32u) * head_dim * 2u + 8192u) atIndex:0];
-                [encoder dispatchThreadgroups:MTLSizeMake((q_len + 15u) / 16u, num_kv_heads, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((q_len + 15u) / 16u, num_kv_heads, 1), MTLSizeMake(256, 1, 1));
             } else {
                 [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((query_tile + 32u) * head_dim * 2u + 4096u) atIndex:0];
-                [encoder dispatchThreadgroups:MTLSizeMake((q_len + query_tile - 1u) / query_tile, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((q_len + query_tile - 1u) / query_tile, num_heads, 1), MTLSizeMake(128, 1, 1));
             }
             termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
             if (frame_owned) {
-                [command_buffer commit];
-                [command_buffer waitUntilCompleted];
+                antfly_metal_commit(command_buffer);
+                antfly_metal_wait(command_buffer);
                 return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -13;
             }
             return 0;
@@ -34766,19 +34790,19 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
         const size_t total_rows = q_len * num_heads;
         if (use_prefill_tiled) {
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((kv_len + 256u) * sizeof(float)) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(q_len, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(q_len, num_heads, 1), MTLSizeMake(256, 1, 1));
         } else {
             MTLSize grid_size = MTLSizeMake(total_rows, 1, 1);
             NSUInteger thread_width = runtime->attention_f32_pipeline.maxTotalThreadsPerThreadgroup;
             if (thread_width == 0) thread_width = 64;
             if (thread_width > total_rows && total_rows > 0) thread_width = total_rows;
             MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-            [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+            antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -13;
         }
         return 0;
@@ -34915,21 +34939,19 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
                 termite_metal_bind_four_buffers(encoder, q_buffer, q_offset + qi * row_bytes, k_buffer, k_offset, v_buffer, v_offset, runtime->attention_split_partials_buffer, part_offset, &qparams, sizeof(qparams));
                 [encoder setBytes:&chunk32 length:sizeof(chunk32) atIndex:5];
                 [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((split_chunk + 8u + 64u) * sizeof(float)) atIndex:0];
-                [encoder dispatchThreadgroups:MTLSizeMake(num_heads, split_count, 1)
-                        threadsPerThreadgroup:MTLSizeMake(128u, 1, 1)];
+                antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, split_count, 1), MTLSizeMake(128u, 1, 1));
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 [encoder setComputePipelineState:runtime->attention_f32_decode_1x_hd64_split_reduce_pipeline];
                 termite_metal_bind_two_buffers(encoder, runtime->attention_split_partials_buffer, part_offset, output_buffer, output_offset + qi * row_bytes, &qparams, sizeof(qparams));
                 [encoder setBytes:&splits32 length:sizeof(splits32) atIndex:3];
-                [encoder dispatchThreadgroups:MTLSizeMake(num_heads, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(64u, 1, 1)];
+                antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, 1, 1), MTLSizeMake(64u, 1, 1));
                 if (qi + 1u < q_len) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
             runtime->florence_attention_1x_dispatches += 1;
             if (!planned_encoder) [encoder endEncoding];
             if (frame_owned) {
-                [command_buffer commit];
-                [command_buffer waitUntilCompleted];
+                antfly_metal_commit(command_buffer);
+                antfly_metal_wait(command_buffer);
                 return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -10;
             }
             return 0;
@@ -34942,18 +34964,16 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
             termite_metal_bind_four_buffers(encoder, q_buffer, q_offset, k_buffer, k_offset, v_buffer, v_offset, runtime->attention_split_partials_buffer, 0, &params, sizeof(params));
             [encoder setBytes:&chunk32 length:sizeof(chunk32) atIndex:5];
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((split_chunk + 8u + 64u) * sizeof(float)) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(num_heads, split_count, batch)
-                    threadsPerThreadgroup:MTLSizeMake(128u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, split_count, batch), MTLSizeMake(128u, 1, 1));
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [encoder setComputePipelineState:runtime->attention_f32_decode_1x_hd64_split_reduce_pipeline];
             termite_metal_bind_two_buffers(encoder, runtime->attention_split_partials_buffer, 0, output_buffer, output_offset, &params, sizeof(params));
             [encoder setBytes:&splits32 length:sizeof(splits32) atIndex:3];
-            [encoder dispatchThreadgroups:MTLSizeMake(num_heads, batch, 1)
-                    threadsPerThreadgroup:MTLSizeMake(64u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, batch, 1), MTLSizeMake(64u, 1, 1));
             if (!planned_encoder) [encoder endEncoding];
             if (frame_owned) {
-                [command_buffer commit];
-                [command_buffer waitUntilCompleted];
+                antfly_metal_commit(command_buffer);
+                antfly_metal_wait(command_buffer);
                 return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -10;
             }
             return 0;
@@ -34967,8 +34987,7 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
         if (use_decode_1x_hd64) {
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((kv_len + 4u) * sizeof(float)) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(num_heads, batch, 1)
-                    threadsPerThreadgroup:MTLSizeMake(64u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, batch, 1), MTLSizeMake(64u, 1, 1));
         } else {
             const size_t total_rows = q_rows;
             MTLSize grid_size = MTLSizeMake(total_rows, 1, 1);
@@ -34976,12 +34995,12 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
             if (thread_width == 0) thread_width = 64;
             if (thread_width > total_rows && total_rows > 0) thread_width = total_rows;
             MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-            [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+            antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         }
         if (!planned_encoder) [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -10;
         }
         return 0;
@@ -35048,8 +35067,7 @@ int termite_metal_decode_runtime_florence_window_pack_f32_device(
         if (encoder == nil) return -14;
         [encoder setComputePipelineState:runtime->florence_window_pack_f32_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(output_elems, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->florence_window_pack_f32_pipeline, output_elems), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(output_elems, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->florence_window_pack_f32_pipeline, output_elems), 1, 1));
         [encoder endEncoding];
         const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -15);
         if (finish_rc == 0) {
@@ -35124,8 +35142,7 @@ int termite_metal_decode_runtime_florence_window_unpack_f32_device(
         if (encoder == nil) return -14;
         [encoder setComputePipelineState:runtime->florence_window_unpack_f32_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(output_elems, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->florence_window_unpack_f32_pipeline, output_elems), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(output_elems, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->florence_window_unpack_f32_pipeline, output_elems), 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -15);
     }
@@ -35192,10 +35209,9 @@ int termite_metal_decode_runtime_florence_channel_attention_f32_device(
         [scores_encoder setComputePipelineState:score_pipeline];
         termite_metal_bind_two_buffers(scores_encoder, qkv_buffer, qkv_offset, scores_buffer, 0, &params, sizeof(params));
         if (parallel_scores) {
-            [scores_encoder dispatchThreadgroups:MTLSizeMake(score_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            antfly_metal_dispatch_threadgroups(scores_encoder, MTLSizeMake(score_rows, 1, 1), MTLSizeMake(256, 1, 1));
         } else {
-            [scores_encoder dispatchThreads:MTLSizeMake(score_elems, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(score_pipeline, score_elems), 1, 1)];
+            antfly_metal_dispatch_threads(scores_encoder, MTLSizeMake(score_elems, 1, 1), MTLSizeMake(termite_metal_thread_width(score_pipeline, score_elems), 1, 1));
         }
         [scores_encoder endEncoding];
 
@@ -35204,8 +35220,7 @@ int termite_metal_decode_runtime_florence_channel_attention_f32_device(
         [softmax_encoder setComputePipelineState:runtime->florence_channel_softmax_f32_pipeline];
         [softmax_encoder setBuffer:scores_buffer offset:0 atIndex:0];
         [softmax_encoder setBytes:&params length:sizeof(params) atIndex:1];
-        [softmax_encoder dispatchThreads:MTLSizeMake(score_rows, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->florence_channel_softmax_f32_pipeline, score_rows), 1, 1)];
+        antfly_metal_dispatch_threads(softmax_encoder, MTLSizeMake(score_rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->florence_channel_softmax_f32_pipeline, score_rows), 1, 1));
         [softmax_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> apply_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
@@ -35215,8 +35230,7 @@ int termite_metal_decode_runtime_florence_channel_attention_f32_device(
         [apply_encoder setBuffer:scores_buffer offset:0 atIndex:1];
         [apply_encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [apply_encoder setBytes:&params length:sizeof(params) atIndex:3];
-        [apply_encoder dispatchThreads:MTLSizeMake(output_elems, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->florence_channel_apply_f32_pipeline, output_elems), 1, 1)];
+        antfly_metal_dispatch_threads(apply_encoder, MTLSizeMake(output_elems, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->florence_channel_apply_f32_pipeline, output_elems), 1, 1));
         [apply_encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
     }
@@ -35261,11 +35275,11 @@ int termite_metal_decode_runtime_compressed_attention_store_local_device(
         [encoder setComputePipelineState:runtime->compressed_attention_store_local_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, local_buffer, local_offset, &params, sizeof(params));
         const size_t total = query_rows * head_dim;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->compressed_attention_store_local_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->compressed_attention_store_local_pipeline, total), 1, 1));
         [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -7;
         }
         return 0;
@@ -35367,15 +35381,15 @@ int termite_metal_decode_runtime_compressed_attention_update_component_device(
         const size_t store_total = MAX(projected_bytes / sizeof(float), gate_bytes / sizeof(float));
         [encoder setComputePipelineState:runtime->compressed_attention_store_component_pipeline];
         termite_metal_bind_four_buffers(encoder, projected_buffer, projected_offset, gate_buffer, gate_offset, projected_cache_buffer, projected_cache_offset, gate_cache_buffer, gate_cache_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(store_total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->compressed_attention_store_component_pipeline, store_total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(store_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->compressed_attention_store_component_pipeline, store_total), 1, 1));
         [encoder setComputePipelineState:runtime->compressed_attention_update_component_pipeline];
         termite_metal_bind_six_buffers_only(encoder, bias_buffer, bias_offset, norm_buffer, norm_offset, projected_cache_buffer, projected_cache_offset, gate_cache_buffer, gate_cache_offset, compressed_buffer, compressed_offset, positions_buffer, positions_offset);
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
-        [encoder dispatchThreads:MTLSizeMake(row_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->compressed_attention_update_component_pipeline, row_count), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(row_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->compressed_attention_update_component_pipeline, row_count), 1, 1));
         [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -8;
         }
         return 0;
@@ -35505,17 +35519,17 @@ int termite_metal_decode_runtime_compressed_attention_hybrid_attention_device(
             [encoder setComputePipelineState:runtime->compressed_attention_select_compressed_pipeline];
             termite_metal_bind_six_buffers_only(encoder, index_buffer, index_offset, index_positions_buffer, index_positions_offset, index_query_buffer, index_query_offset, index_head_weights_buffer, index_head_weights_offset, selected_indices_buffer, selected_indices_offset, selected_scores_buffer, selected_scores_offset);
             [encoder setBytes:&params length:sizeof(params) atIndex:6];
-            [encoder dispatchThreads:MTLSizeMake(query_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->compressed_attention_select_compressed_pipeline, query_rows), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(query_rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->compressed_attention_select_compressed_pipeline, query_rows), 1, 1));
         }
         [encoder setComputePipelineState:runtime->compressed_attention_hybrid_attention_pipeline];
         termite_metal_bind_seven_buffers_only(encoder, q_buffer, q_offset, local_buffer, local_offset, compressed_buffer, compressed_offset, positions_buffer, positions_offset, selected_indices_buffer, selected_indices_offset, sinks_buffer, sinks_offset, output_buffer, output_offset);
         [encoder setBytes:&params length:sizeof(params) atIndex:7];
         const size_t total = query_rows * num_heads;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->compressed_attention_hybrid_attention_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->compressed_attention_hybrid_attention_pipeline, total), 1, 1));
         [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -9;
         }
         return 0;
@@ -35637,7 +35651,7 @@ int termite_metal_decode_runtime_apply_layer_norm(
         }
         [encoder setComputePipelineState:runtime->layer_norm_pipeline];
         termite_metal_bind_four_buffers(encoder, input_buffer, 0, runtime->layer_norm_weight_buffers[slot], 0, runtime->layer_norm_bias_buffers[slot], 0, output_buffer, 0, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
         [encoder endEncoding];
         // The host-I/O command buffer drains prior frames and always waits,
         // including when the caller entered with a planned compute scope.
@@ -36177,14 +36191,14 @@ static int termite_metal_encode_argmax_reduce_on_encoder(
     if (use_a4b_tg) {
         [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
         [encoder setThreadgroupMemoryLength:256u * sizeof(uint32_t) atIndex:1];
-        [encoder dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1u, 1u, 1u), MTLSizeMake(256u, 1u, 1u));
         if (runtime->a4b_argmax_tg_reported == 0u) {
             fprintf(stderr,
                 "metal_a4b_argmax_tg: enabled=1 partials=256 threads=256 rollback=TERMITE_METAL_DISABLE_A4B_ARGMAX_TG\n");
             runtime->a4b_argmax_tg_reported = 1u;
         }
     } else {
-        [encoder dispatchThreads:MTLSizeMake(1u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(1u, 1u, 1u)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(1u, 1u, 1u), MTLSizeMake(1u, 1u, 1u));
     }
     return 0;
 }
@@ -36241,7 +36255,7 @@ static int termite_metal_encode_argmax_logits_on_encoder_at(
         }
         [encoder setComputePipelineState:runtime->argmax_logits_pipeline];
         termite_metal_bind_two_buffers(encoder, logits_buffer, logits_offset, runtime->token_buffer, token_offset, &out_dim_u32, sizeof(out_dim_u32));
-        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         return 0;
     }
 
@@ -36264,7 +36278,7 @@ static int termite_metal_encode_argmax_logits_on_encoder_at(
     termite_metal_bind_three_buffers(encoder, logits_buffer, logits_offset, runtime->sample_topk_values_buffer, partials_offset, runtime->sample_topk_ids_buffer, partials_offset, &out_dim_u32, sizeof(out_dim_u32));
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
     [encoder setThreadgroupMemoryLength:256u * sizeof(uint32_t) atIndex:1];
-    [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(block_count, 1, 1), MTLSizeMake(256, 1, 1));
 
     if (runtime->active_planned_compute_encoder == encoder) {
         termite_metal_planned_encoder_range reduce_accesses[3];
@@ -36369,7 +36383,7 @@ static int termite_metal_encode_argmax_logits_suppress_on_encoder_at(
     termite_metal_bind_four_buffers(encoder, logits_buffer, logits_offset, suppress_buffer, 0, runtime->sample_topk_values_buffer, partials_offset, runtime->sample_topk_ids_buffer, partials_offset, &params, sizeof(params));
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
     [encoder setThreadgroupMemoryLength:256u * sizeof(uint32_t) atIndex:1];
-    [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(block_count, 1, 1), MTLSizeMake(256, 1, 1));
 
     if (runtime->active_planned_compute_encoder == encoder) {
         termite_metal_planned_encoder_range reduce_accesses[3];
@@ -36492,7 +36506,7 @@ static int termite_metal_encode_lm_head_q4_q6_refined_argmax_on_encoder(
     [encoder setBytes:&suppress_params length:sizeof(suppress_params) atIndex:4];
     [encoder setThreadgroupMemoryLength:top_k * threads * sizeof(float) atIndex:0];
     [encoder setThreadgroupMemoryLength:top_k * threads * sizeof(uint32_t) atIndex:1];
-    [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(block_count, 1, 1), MTLSizeMake(threads, 1, 1));
 
     termite_metal_planned_encoder_range reduce_accesses[3];
     if (termite_metal_planned_range_make(runtime->sample_topk_values_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[0], failure_code) != 0 ||
@@ -36502,7 +36516,7 @@ static int termite_metal_encode_lm_head_q4_q6_refined_argmax_on_encoder(
     const uint32_t candidate_count_u32 = (uint32_t)candidate_count;
     [encoder setComputePipelineState:runtime->lm_head_top8_reduce_pipeline];
     termite_metal_bind_two_buffers(encoder, runtime->sample_topk_values_buffer, 0, runtime->sample_topk_ids_buffer, 0, &candidate_count_u32, sizeof(candidate_count_u32));
-    [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
 
     const size_t refine_row_blocks = refine_view->in_dim / refine_view->values_per_block;
     if (refine_view->out_dim > SIZE_MAX / refine_row_blocks ||
@@ -36526,7 +36540,7 @@ static int termite_metal_encode_lm_head_q4_q6_refined_argmax_on_encoder(
     [encoder setComputePipelineState:runtime->lm_head_q6_k_rescore_top8_pipeline];
     termite_metal_bind_four_buffers(encoder, hidden_buffer, hidden_offset, refine_view->weight_buffer, 0, runtime->sample_topk_ids_buffer, 0, runtime->token_buffer, 0, &linear_params, sizeof(linear_params));
     [encoder setThreadgroupMemoryLength:top_k * sizeof(float) atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(top_k * 32u, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(top_k * 32u, 1, 1));
     runtime->lm_head_q4_q6_refine_dispatches += 1;
     return 0;
 }
@@ -36596,7 +36610,7 @@ static int termite_metal_encode_lighton_batch_argmax(
     [encoder setBytes:params length:sizeof(params) atIndex:4];
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
     [encoder setThreadgroupMemoryLength:256u * sizeof(uint32_t) atIndex:1];
-    [encoder dispatchThreadgroups:MTLSizeMake(blocks, rows, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(blocks, rows, 1), MTLSizeMake(256, 1, 1));
     if (runtime->active_planned_compute_encoder == encoder) {
         termite_metal_planned_encoder_range reduce_accesses[3];
         if (termite_metal_planned_range_make(runtime->sample_topk_values_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[0], failure_code) != 0 ||
@@ -36612,7 +36626,7 @@ static int termite_metal_encode_lighton_batch_argmax(
     [encoder setBuffer:runtime->sample_topk_ids_buffer offset:0 atIndex:1];
     [encoder setBuffer:runtime->token_buffer offset:0 atIndex:2];
     [encoder setBytes:&block_count length:sizeof(block_count) atIndex:3];
-    [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(rows, (size_t)32), 1, 1)];
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(MIN(rows, (size_t)32), 1, 1));
     runtime->lighton_batch_argmax_calls = termite_metal_u64_saturating_add(runtime->lighton_batch_argmax_calls, 1);
     runtime->lighton_batch_argmax_rows = termite_metal_u64_saturating_add(runtime->lighton_batch_argmax_rows, rows);
     return 0;
@@ -36730,8 +36744,8 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
                 int flush_rc = termite_metal_decode_runtime_flush_active_frame(runtime);
                 if (flush_rc != 0) return -14;
             } else {
-                [command_buffer commit];
-                [command_buffer waitUntilCompleted];
+                antfly_metal_commit(command_buffer);
+                antfly_metal_wait(command_buffer);
                 if (command_buffer.status != MTLCommandBufferStatusCompleted) return -15;
             }
         }
@@ -36780,8 +36794,7 @@ static int termite_metal_decode_runtime_copy_grown_buffer(
         const uint32_t count = (uint32_t)old_capacity;
         [encoder setComputePipelineState:runtime->copy_bytes_pipeline];
         termite_metal_bind_two_buffers(encoder, old_buffer, 0, new_buffer, 0, &count, sizeof(count));
-        [encoder dispatchThreads:MTLSizeMake(old_capacity, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->copy_bytes_pipeline, old_capacity), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(old_capacity, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->copy_bytes_pipeline, old_capacity), 1, 1));
         return 0;
     }
     bool frame_owned = false;
@@ -36887,7 +36900,7 @@ int termite_metal_decode_runtime_apply_rms_norm(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:runtime->rms_norm_pipeline];
         termite_metal_bind_three_buffers(encoder, input_buffer, 0, runtime->rms_norm_weight_buffers[slot], 0, output_buffer, 0, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         [encoder endEncoding];
         const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
         if (finish_rc != 0) return finish_rc;
@@ -36937,8 +36950,8 @@ int termite_metal_decode_runtime_apply_rms_norm_device(
                 eps,
                 -11) != 0) return -11;
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -12;
     }
 }
@@ -36983,8 +36996,8 @@ int termite_metal_decode_runtime_apply_rms_norm_scratch_device(
                 eps,
                 -10) != 0) return -10;
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (command_buffer.status != MTLCommandBufferStatusCompleted) return -11;
         }
         *output_handle = (__bridge void *)output_buffer;
@@ -37015,7 +37028,7 @@ static void termite_metal_dispatch_lightonocr3_norm_or_rows(
     if (cached != nil) {
         [encoder setComputePipelineState:cached];
         [encoder setThreadgroupMemoryLength:4u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(128, 1, 1));
     } else {
         termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows, hidden_size);
     }
@@ -37077,8 +37090,8 @@ int termite_metal_decode_runtime_apply_rms_norm_rows_device(
         termite_metal_dispatch_lightonocr3_norm_or_rows(runtime, encoder, rows, hidden_size, input_offset, 0, output_offset);
         if (!planned_encoder) [encoder endEncoding];
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -11;
     }
 }
@@ -37135,8 +37148,8 @@ int termite_metal_decode_runtime_apply_rms_norm_weight_device(
         termite_metal_dispatch_lightonocr3_norm_or_rows(runtime, encoder, rows, hidden_size, input_offset, weight_offset, output_offset);
         if (!planned_encoder) [encoder endEncoding];
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -9;
     }
 }
@@ -37215,11 +37228,11 @@ int termite_metal_decode_runtime_apply_rms_norm_triple_weight_device(
         [encoder setBytes:&params length:sizeof(params) atIndex:7];
         [encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
         const NSUInteger threads = hidden_size <= 512u ? 128u : 256u;
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(threads, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -8;
     }
 }
@@ -37299,11 +37312,11 @@ int termite_metal_decode_runtime_apply_parallel_ffn_post_residual_weight_device(
         [encoder setBytes:&params length:sizeof(params) atIndex:7];
         [encoder setThreadgroupMemoryLength:64u * sizeof(float) atIndex:0];
         const NSUInteger threads = hidden_size <= 512u ? 128u : 256u;
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(threads, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -8;
     }
 }
@@ -37361,8 +37374,8 @@ int termite_metal_decode_runtime_apply_rms_norm_weight_scratch_device(
         termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows, hidden_size);
         if (!planned_encoder) [encoder endEncoding];
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (command_buffer.status != MTLCommandBufferStatusCompleted) return -9;
         }
         *output_handle = (__bridge void *)output_buffer;
@@ -37440,10 +37453,10 @@ static int termite_metal_encode_head_rms_rope_on_encoder(
     [encoder setComputePipelineState:use_head_norm_sg ? runtime->head_rms_rope_hd128_sg_pipeline : runtime->head_rms_rope_pipeline];
     termite_metal_bind_three_buffers(encoder, input_buffer, input_offset, runtime->rms_norm_weight_buffers[norm_slot], 0, output_buffer, output_offset, &params, sizeof(params));
     if (use_head_norm_sg) {
-        [encoder dispatchThreadgroups:MTLSizeMake((total_heads + 3u) / 4u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((total_heads + 3u) / 4u, 1, 1), MTLSizeMake(128, 1, 1));
     } else {
         [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(total_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(total_heads, 1, 1), MTLSizeMake(256, 1, 1));
     }
     return 0;
 }
@@ -37489,14 +37502,14 @@ int termite_metal_decode_runtime_apply_layer_norm_device(
         termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, runtime->layer_norm_weight_buffers[slot], 0, runtime->layer_norm_bias_buffers[slot], 0, output_buffer, output_offset, &params, sizeof(params));
         if (use_rows_pipeline) {
             [encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
         } else {
-            [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
         }
         if (!planned_encoder) [encoder endEncoding];
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -12;
     }
 }
@@ -37569,9 +37582,9 @@ int termite_metal_decode_runtime_apply_add_layer_norm_sum_device(
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
         if (use_rows_pipeline) {
             [encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
         } else {
-            [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
@@ -37639,14 +37652,14 @@ int termite_metal_decode_runtime_apply_add_layer_norm_device(
         termite_metal_bind_five_buffers(encoder, a_buffer, a_offset, b_buffer, b_offset, runtime->layer_norm_weight_buffers[slot], 0, runtime->layer_norm_bias_buffers[slot], 0, output_buffer, output_offset, &params, sizeof(params));
         if (use_rows_pipeline) {
             [encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
         } else {
-            [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -12;
     }
 }
@@ -37824,7 +37837,7 @@ int termite_metal_decode_runtime_apply_linear_rows_device(
             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 3, -4) != 0) return -4;
         termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
         mm.batchStart = 0; mm.batchSize = 1;
-        [mm encodeToCommandBuffer:cb leftMatrix:l rightMatrix:r resultMatrix:o];
+        antfly_metal_encode_matrix(mm, cb, l, r, o);
         if (!owned) {
             runtime->mps_dense_linear_active_frame_calls += 1;
             runtime->active_frame_mps_dense_linear_count += 1;
@@ -38551,8 +38564,7 @@ static int termite_metal_try_f16_encoder_mpp(termite_metal_decode_runtime *runti
     [enc setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
     [enc setBuffer:output offset:output_offset atIndex:3];
     [enc setBytes:&params length:sizeof(params) atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(out_dim / 64, (rows + 31) / 32, 1)
-        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(enc, MTLSizeMake(out_dim / 64, (rows + 31) / 32, 1), MTLSizeMake(128, 1, 1));
     [enc endEncoding];
     termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in_dim, out_dim,
                                                     "f16_encoder_mpp", !owned, false, false, false, false);
@@ -38637,7 +38649,7 @@ static int termite_metal_try_lightonocr3_wide_mpp(termite_metal_decode_runtime *
     [encoder setBuffer:r->linear_bias_buffers[slot] offset:0 atIndex:2];
     [encoder setBuffer:output offset:output_offset atIndex:3];
     [encoder setBytes:&params length:sizeof(params) atIndex:4];
-    [encoder dispatchThreadgroups:MTLSizeMake(out / columns, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out / columns, 1, 1), MTLSizeMake(threads, 1, 1));
     if (!planned) [encoder endEncoding];
     termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in, out,
         head ? "lightonocr3_wide_mpp_head" : "lightonocr3_wide_mpp_projection", !owned, planned, false, false, false);
@@ -38781,8 +38793,7 @@ static int termite_metal_try_lightonocr3_local_projection(termite_metal_decode_r
     [e setBytes:&params length:sizeof(params) atIndex:4];
     if (memory)
         [e setThreadgroupMemoryLength:memory atIndex:0];
-    [e dispatchThreadgroups:MTLSizeMake(out / columns, row_groups, 1)
-        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    antfly_metal_dispatch_threadgroups(e, MTLSizeMake(out / columns, row_groups, 1), MTLSizeMake(threads, 1, 1));
     if (!planned)
         [e endEncoding];
     termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in, out,
@@ -38892,8 +38903,7 @@ static int termite_metal_try_lightonocr3_down_split(termite_metal_decode_runtime
     [enc setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
     [enc setBuffer:scratch offset:0 atIndex:2];
     [enc setBytes:&params length:sizeof(params) atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(out_dim / (narrow ? 32 : 64), splits, 1)
-        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    antfly_metal_dispatch_threadgroups(enc, MTLSizeMake(out_dim / (narrow ? 32 : 64), splits, 1), MTLSizeMake(32, 1, 1));
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     [enc setComputePipelineState:reduce];
     [enc setBuffer:scratch offset:0 atIndex:0];
@@ -38901,8 +38911,7 @@ static int termite_metal_try_lightonocr3_down_split(termite_metal_decode_runtime
     [enc setBuffer:output offset:output_offset atIndex:2];
     [enc setBytes:&params length:sizeof(params) atIndex:3];
     const size_t count = rows * out_dim;
-    [enc dispatchThreads:MTLSizeMake(count, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(reduce, count), 1, 1)];
+    antfly_metal_dispatch_threads(enc, MTLSizeMake(count, 1, 1), MTLSizeMake(termite_metal_thread_width(reduce, count), 1, 1));
     termite_metal_end_scoped_compute_encoder(enc, encoder_owned);
     termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in_dim, out_dim,
                                                     splits == 16 ? "lightonocr3_down_split16"
@@ -38996,8 +39005,7 @@ static int termite_metal_try_lightonocr3_prefill_gate(termite_metal_decode_runti
     [enc setBuffer:output offset:output_offset atIndex:3];
     [enc setBytes:&p length:sizeof(p) atIndex:4];
     [enc setThreadgroupMemoryLength:scratch atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake((out + columns - 1) / columns, (rows + 7) / 8, 1)
-        threadsPerThreadgroup:MTLSizeMake(splits * 32, 1, 1)];
+    antfly_metal_dispatch_threadgroups(enc, MTLSizeMake((out + columns - 1) / columns, (rows + 7) / 8, 1), MTLSizeMake(splits * 32, 1, 1));
     if (!encoder_owned) [enc setThreadgroupMemoryLength:0 atIndex:0];
     termite_metal_end_scoped_compute_encoder(enc, encoder_owned);
     termite_metal_maybe_trace_dense_linear_dispatch("linear_multi_row_device", slot, rows, in, out,
@@ -39177,10 +39185,9 @@ static int termite_metal_try_lightonocr3_mpp(termite_metal_decode_runtime *runti
         [enc setBuffer:input offset:input_offset atIndex:0];
         [enc setBuffer:packed offset:0 atIndex:1];
         [enc setBytes:&count length:4 atIndex:2];
-        [enc dispatchThreads:MTLSizeMake(count, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(
+        antfly_metal_dispatch_threads(enc, MTLSizeMake(count, 1, 1), MTLSizeMake(
                                       termite_metal_thread_width(runtime->lightonocr3_pack_bf16_pipeline, count), 1,
-                                      1)];
+                                      1));
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
     termite_metal_linear_params params = {(uint32_t)rows, (uint32_t)in_dim, (uint32_t)out_dim, 0};
@@ -39191,8 +39198,7 @@ static int termite_metal_try_lightonocr3_mpp(termite_metal_decode_runtime *runti
     [enc setBuffer:output offset:output_offset atIndex:3];
     [enc setBytes:&params length:sizeof(params) atIndex:4];
     size_t tm = (small_tile || segment4) ? 8 : (n32 ? 64 : 32), tn = segment4 ? 8 : small_tile ? (four_row_mpp ? 16 : 32) : (n32 ? 32 : 64);
-    [enc dispatchThreadgroups:MTLSizeMake((out_dim + tn - 1) / tn, (rows + tm - 1) / tm, 1)
-        threadsPerThreadgroup:MTLSizeMake((small_tile || segment4) ? 32 : 128, 1, 1)];
+    antfly_metal_dispatch_threadgroups(enc, MTLSizeMake((out_dim + tn - 1) / tn, (rows + tm - 1) / tm, 1), MTLSizeMake((small_tile || segment4) ? 32 : 128, 1, 1));
     if (!planned) [enc endEncoding];
     if (reuse_packed) {
         // Transfer a new +1 into the existing in-frame allocator. Its prior
@@ -39265,16 +39271,15 @@ int termite_metal_decode_runtime_apply_linear(
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_four_buffers(encoder, input_buffer, 0, runtime->linear_weight_buffers[slot], 0, runtime->linear_bias_buffers[slot], 0, output_buffer, 0, &params, sizeof(params));
         if (lighton_pipeline != nil) {
-            [encoder dispatchThreadgroups:MTLSizeMake((out_dim + lighton_rows - 1) / lighton_rows, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + lighton_rows - 1) / lighton_rows, 1, 1), MTLSizeMake(32, 1, 1));
         } else if (use_reduce) {
-            [encoder dispatchThreads:MTLSizeMake(out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
             id<MTLComputePipelineState> scalar_pipeline = use_f16 ? runtime->linear_f16_pipeline : (use_bf16 ? runtime->linear_bf16_pipeline : runtime->linear_pipeline);
             NSUInteger thread_width = scalar_pipeline.maxTotalThreadsPerThreadgroup;
             if (thread_width == 0) thread_width = 64;
             if (thread_width > out_dim && out_dim > 0) thread_width = out_dim;
-            [encoder dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(out_dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
         }
         [encoder endEncoding];
         const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
@@ -39528,8 +39533,7 @@ static int termite_metal_try_lightonocr3_gate_split(termite_metal_decode_runtime
     [encoder setBuffer:runtime->linear_bias_buffers[up_slot] offset:0 atIndex:4];
     [encoder setBuffer:scratch offset:0 atIndex:5];
     [encoder setBytes:&params length:sizeof(params) atIndex:6];
-    [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 16, 4, 1)
-            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim / 16, 4, 1), MTLSizeMake(32, 1, 1));
     [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
     [encoder setComputePipelineState:reduce];
     [encoder setBuffer:scratch offset:0 atIndex:0];
@@ -39537,7 +39541,7 @@ static int termite_metal_try_lightonocr3_gate_split(termite_metal_decode_runtime
     [encoder setBuffer:runtime->linear_bias_buffers[up_slot] offset:0 atIndex:2];
     [encoder setBuffer:output offset:output_offset atIndex:3];
     [encoder setBytes:&params length:sizeof(params) atIndex:4];
-    [encoder dispatchThreads:MTLSizeMake(rows * out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows * out_dim, 1, 1), MTLSizeMake(128, 1, 1));
     [encoder endEncoding];
     termite_metal_maybe_trace_dense_linear_dispatch("bf16_gate_up_device", gate_slot, rows, in_dim, out_dim,
                                                     "lightonocr3_gate_up_split", true, false, false, true,
@@ -39707,8 +39711,7 @@ int antfly_metal_lighton_prefill_ffn_apply(termite_metal_decode_runtime *r,
         [encoder setBuffer:buffers[0] offset:offsets[0] atIndex:0];
         [encoder setBuffer:buffers[1] offset:offsets[1] atIndex:1];
         [encoder setBytes:&count length:sizeof(count) atIndex:2];
-        [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(r->lightonocr3_pack_bf16_pipeline, count), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(count, 1, 1), MTLSizeMake(termite_metal_thread_width(r->lightonocr3_pack_bf16_pipeline, count), 1, 1));
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         const size_t variant = rows <= 512 ? 1 : 0, m = variant ? 64 : 32, n = variant ? 32 : 64;
         termite_metal_linear_params params = {(uint32_t)rows, (uint32_t)hidden, (uint32_t)intermediate, 0};
@@ -39718,8 +39721,7 @@ int antfly_metal_lighton_prefill_ffn_apply(termite_metal_decode_runtime *r,
         [encoder setBuffer:buffers[7] offset:0 atIndex:3]; [encoder setBuffer:buffers[8] offset:0 atIndex:4];
         [encoder setBuffer:buffers[2] offset:offsets[2] atIndex:5];
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
-        [encoder dispatchThreadgroups:MTLSizeMake((intermediate+n-1)/n, (rows+m-1)/m, 1)
-            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((intermediate+n-1)/n, (rows+m-1)/m, 1), MTLSizeMake(128, 1, 1));
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         params.in_dim = (uint32_t)intermediate; params.out_dim = (uint32_t)hidden;
         [encoder setComputePipelineState:r->lightonocr3_mpp_bf16_pipeline];
@@ -39727,8 +39729,7 @@ int antfly_metal_lighton_prefill_ffn_apply(termite_metal_decode_runtime *r,
         [encoder setBuffer:buffers[6] offset:0 atIndex:1]; [encoder setBuffer:buffers[9] offset:0 atIndex:2];
         [encoder setBuffer:buffers[3] offset:offsets[3] atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
-        [encoder dispatchThreadgroups:MTLSizeMake((hidden+63)/64, (rows+31)/32, 1)
-            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((hidden+63)/64, (rows+31)/32, 1), MTLSizeMake(128, 1, 1));
         if (!planned) [encoder endEncoding];
         r->lighton_prefill_ffn_calls += 1;
         return 0;
@@ -39788,11 +39789,10 @@ int termite_metal_decode_runtime_apply_bf16_gate_up_device(
         if(local_tg){
             const size_t columns=small==runtime->lightonocr3_local_gate_tg16?16:32;
             [encoder setThreadgroupMemoryLength:2*4*8*columns*sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(out_dim/columns,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
-        } else if(local_vec)[encoder dispatchThreadgroups:MTLSizeMake(out_dim/16,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim/columns,1,1), MTLSizeMake(128,1,1));
+        } else if(local_vec)antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim/16,1,1), MTLSizeMake(128,1,1));
         else if (small == runtime->lightonocr3_gate_up_wide64_pipeline && small != nil) {
-            [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 32, (rows + 63u) / 64u, 1)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim / 32, (rows + 63u) / 64u, 1), MTLSizeMake(128, 1, 1));
             runtime->lightonocr3_wide_gate_up_calls =
                 termite_metal_u64_saturating_add(runtime->lightonocr3_wide_gate_up_calls, 1);
             if (rows == 64 && in_dim == 2560 && out_dim == 9216)
@@ -39800,16 +39800,14 @@ int termite_metal_decode_runtime_apply_bf16_gate_up_device(
                     termite_metal_u64_saturating_add(runtime->lightonocr3_full64_gate_up_calls, 1);
         }
         else if (small == runtime->lightonocr3_gate_up_wide32_pipeline && small != nil) {
-            [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 16, (rows + 31u) / 32u, 1)
-                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim / 16, (rows + 31u) / 32u, 1), MTLSizeMake(64, 1, 1));
             runtime->lightonocr3_wide_gate_up_calls =
                 termite_metal_u64_saturating_add(runtime->lightonocr3_wide_gate_up_calls, 1);
         }
-        else if (small == runtime->lightonocr3_gate_up_wide16_pipeline && small != nil) [encoder dispatchThreadgroups:MTLSizeMake(out_dim / 16, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        else if (small != nil) [encoder dispatchThreadgroups:MTLSizeMake(out_dim / (small == runtime->lightonocr3_gate_up_small16_pipeline ? 16 : 32), (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        else if(rows==1)[encoder dispatchThreadgroups:MTLSizeMake(out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
-        else [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 63u) / 64u, 1u)
-                threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+        else if (small == runtime->lightonocr3_gate_up_wide16_pipeline && small != nil) antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim / 16, 1, 1), MTLSizeMake(32, 1, 1));
+        else if (small != nil) antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim / (small == runtime->lightonocr3_gate_up_small16_pipeline ? 16 : 32), (rows + 7u) / 8u, 1), MTLSizeMake(32, 1, 1));
+        else if(rows==1)antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim,1,1), MTLSizeMake(32,1,1));
+        else antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 31u) / 32u, (rows + 63u) / 64u, 1u), MTLSizeMake(256u, 1u, 1u));
         termite_metal_maybe_trace_dense_linear_dispatch("bf16_gate_up_device", gate_slot, rows, in_dim, out_dim,
             local_tg ? "lightonocr3_gate_up_local_tg" : local_vec ? "lightonocr3_gate_up_local_vector" : small != nil && small == runtime->lightonocr3_gate_up_wide64_pipeline ? "lightonocr3_wide64_gate_up_mpp" : small != nil && small == runtime->lightonocr3_gate_up_wide32_pipeline ? "lightonocr3_wide_gate_up_mpp" : small != nil ? "lightonocr3_batch_gate_up" : pipeline == runtime->bf16_gate_up_mm_vec4_pipeline ? "bf16_gate_up_mm_m64_n32_vec4" : "bf16_gate_up_mm_m64_n32",
             !frame_owned, planned_encoder, false, true, false);
@@ -39886,25 +39884,25 @@ int termite_metal_decode_runtime_apply_linear_multi_row(
 	        [encoder setComputePipelineState:pipeline];
         termite_metal_bind_four_buffers(encoder, input_buffer, 0, runtime->linear_weight_buffers[slot], 0, runtime->linear_bias_buffers[slot], 0, output_buffer, 0, &params, sizeof(params));
         if (use_bf16_mm) {
-            [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 31u) / 32u, (rows + 63u) / 64u, 1), MTLSizeMake(256u, 1u, 1u));
         } else if (use_bf16_tiled32_m16 || use_tiled32_m16) {
-            [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 31u) / 32u, (rows + 15u) / 16u, 1), MTLSizeMake(8u, 16u, 1));
         } else if (use_tiled32) {
-            [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 31u) / 32u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
         } else if (use_tiled) {
-            [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 15u) / 16u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 15u) / 16u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
         } else if (use_shared_row_reduce) {
             [encoder setThreadgroupMemoryLength:rows * 32u * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim, 1, 1), MTLSizeMake(32u, 1, 1));
         } else if (use_reduce) {
             [encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(out_dim, rows, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim, rows, 1), MTLSizeMake(32u, 1, 1));
         } else {
             const size_t total = rows * out_dim;
             NSUInteger thread_width = pipeline.maxTotalThreadsPerThreadgroup;
             if (thread_width == 0) thread_width = 64;
             if (thread_width > total && total > 0) thread_width = total;
-            [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(thread_width, 1, 1));
         }
         [encoder endEncoding];
         const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
@@ -40045,7 +40043,7 @@ static int termite_metal_decode_runtime_encode_linear_multi_row_device(
 	                // encoder before handing it the same command buffer;
 	                // otherwise AGX aborts instead of returning an error.
 	                termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
-	                [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
+	                antfly_metal_encode_matrix(mm, command_buffer, left, right, result);
 	                termite_metal_maybe_trace_dense_linear_dispatch(
 	                    "linear_multi_row_device",
 	                    slot,
@@ -40066,7 +40064,7 @@ static int termite_metal_decode_runtime_encode_linear_multi_row_device(
                     [bias_encoder setComputePipelineState:runtime->linear_bias_pipeline];
                     termite_metal_bind_two_buffers(bias_encoder, output_buffer, output_offset, runtime->linear_bias_buffers[slot], 0, &params, sizeof(params));
                     const size_t total = rows * out_dim;
-                    [bias_encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_bias_pipeline, total), 1, 1)];
+                    antfly_metal_dispatch_threads(bias_encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_bias_pipeline, total), 1, 1));
                     [bias_encoder endEncoding];
                 }
 
@@ -40155,27 +40153,27 @@ static int termite_metal_decode_runtime_encode_linear_multi_row_device(
 	        [encoder setComputePipelineState:pipeline];
         termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, runtime->linear_weight_buffers[slot], 0, runtime->linear_bias_buffers[slot], 0, output_buffer, output_offset, &params, sizeof(params));
         if (lighton_batch != nil) {
-            [encoder dispatchThreadgroups:MTLSizeMake(out_dim / lighton_columns, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim / lighton_columns, 1, 1), MTLSizeMake(32u, 1, 1));
         } else if (use_bf16_mm) {
-            [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 31u) / 32u, (rows + 63u) / 64u, 1), MTLSizeMake(256u, 1u, 1u));
         } else if (use_bf16_tiled32_m16 || use_tiled32_m16) {
-            [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 31u) / 32u, (rows + 15u) / 16u, 1), MTLSizeMake(8u, 16u, 1));
         } else if (use_tiled32) {
-            [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 31u) / 32u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
         } else if (use_tiled) {
-            [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 15u) / 16u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 15u) / 16u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
         } else if (use_shared_row_reduce) {
             [encoder setThreadgroupMemoryLength:rows * 32u * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim, 1, 1), MTLSizeMake(32u, 1, 1));
         } else if (use_reduce) {
             [encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(out_dim, rows, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_dim, rows, 1), MTLSizeMake(32u, 1, 1));
         } else {
             const size_t total = rows * out_dim;
             NSUInteger thread_width = pipeline.maxTotalThreadsPerThreadgroup;
             if (thread_width == 0) thread_width = 64;
             if (thread_width > total && total > 0) thread_width = total;
-            [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(thread_width, 1, 1));
         }
         if (!planned_encoder) [encoder endEncoding];
         return 0;
@@ -40333,22 +40331,22 @@ int termite_metal_decode_runtime_apply_dense_mlp2_device(
 	        [first_encoder setComputePipelineState:first_pipeline];
         termite_metal_bind_four_buffers(first_encoder, input_buffer, input_offset, runtime->linear_weight_buffers[first_linear_slot], 0, runtime->linear_bias_buffers[first_linear_slot], 0, first_output_buffer, 0, &first_params, sizeof(first_params));
         if (first_bf16_mm) {
-            [first_encoder dispatchThreadgroups:MTLSizeMake((hidden_dim + 31u) / 32u, (rows + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(first_encoder, MTLSizeMake((hidden_dim + 31u) / 32u, (rows + 63u) / 64u, 1), MTLSizeMake(256u, 1u, 1u));
         } else if (first_bf16_tiled32_m16 || first_tiled32_m16) {
-            [first_encoder dispatchThreadgroups:MTLSizeMake((hidden_dim + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
+            antfly_metal_dispatch_threadgroups(first_encoder, MTLSizeMake((hidden_dim + 31u) / 32u, (rows + 15u) / 16u, 1), MTLSizeMake(8u, 16u, 1));
         } else if (first_tiled32) {
-            [first_encoder dispatchThreadgroups:MTLSizeMake((hidden_dim + 31u) / 32u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+            antfly_metal_dispatch_threadgroups(first_encoder, MTLSizeMake((hidden_dim + 31u) / 32u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
         } else if (first_tiled) {
-            [first_encoder dispatchThreadgroups:MTLSizeMake((hidden_dim + 15u) / 16u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+            antfly_metal_dispatch_threadgroups(first_encoder, MTLSizeMake((hidden_dim + 15u) / 16u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
         } else if (first_shared) {
             [first_encoder setThreadgroupMemoryLength:rows * 32u * sizeof(float) atIndex:0];
-            [first_encoder dispatchThreadgroups:MTLSizeMake(hidden_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(first_encoder, MTLSizeMake(hidden_dim, 1, 1), MTLSizeMake(32u, 1, 1));
         } else if (first_reduce) {
             [first_encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-            [first_encoder dispatchThreadgroups:MTLSizeMake(hidden_dim, rows, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(first_encoder, MTLSizeMake(hidden_dim, rows, 1), MTLSizeMake(32u, 1, 1));
         } else {
             const size_t first_total = rows * hidden_dim;
-            [first_encoder dispatchThreads:MTLSizeMake(first_total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(first_pipeline, first_total), 1, 1)];
+            antfly_metal_dispatch_threads(first_encoder, MTLSizeMake(first_total, 1, 1), MTLSizeMake(termite_metal_thread_width(first_pipeline, first_total), 1, 1));
         }
         if (!first_encoder_owned) {
             [first_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -40361,7 +40359,7 @@ int termite_metal_decode_runtime_apply_dense_mlp2_device(
         [activation_encoder setComputePipelineState:runtime->activation_pipeline];
         termite_metal_bind_two_buffers(activation_encoder, first_output_buffer, 0, activated_buffer, 0, &activation_params, sizeof(activation_params));
         const size_t activation_total = rows * hidden_dim;
-        [activation_encoder dispatchThreads:MTLSizeMake(activation_total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, activation_total), 1, 1)];
+        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(activation_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, activation_total), 1, 1));
         if (!activation_encoder_owned) {
             [activation_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
@@ -40398,28 +40396,28 @@ int termite_metal_decode_runtime_apply_dense_mlp2_device(
 	        [second_encoder setComputePipelineState:second_pipeline];
         termite_metal_bind_four_buffers(second_encoder, activated_buffer, 0, runtime->linear_weight_buffers[second_linear_slot], 0, runtime->linear_bias_buffers[second_linear_slot], 0, output_buffer, output_offset, &second_params, sizeof(second_params));
         if (second_bf16_mm) {
-            [second_encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(second_encoder, MTLSizeMake((out_dim + 31u) / 32u, (rows + 63u) / 64u, 1), MTLSizeMake(256u, 1u, 1u));
         } else if (second_bf16_tiled32_m16 || second_tiled32_m16) {
-            [second_encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
+            antfly_metal_dispatch_threadgroups(second_encoder, MTLSizeMake((out_dim + 31u) / 32u, (rows + 15u) / 16u, 1), MTLSizeMake(8u, 16u, 1));
         } else if (second_tiled32) {
-            [second_encoder dispatchThreadgroups:MTLSizeMake((out_dim + 31u) / 32u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+            antfly_metal_dispatch_threadgroups(second_encoder, MTLSizeMake((out_dim + 31u) / 32u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
         } else if (second_tiled) {
-            [second_encoder dispatchThreadgroups:MTLSizeMake((out_dim + 15u) / 16u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+            antfly_metal_dispatch_threadgroups(second_encoder, MTLSizeMake((out_dim + 15u) / 16u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
         } else if (second_shared) {
             [second_encoder setThreadgroupMemoryLength:rows * 32u * sizeof(float) atIndex:0];
-            [second_encoder dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(second_encoder, MTLSizeMake(out_dim, 1, 1), MTLSizeMake(32u, 1, 1));
         } else if (second_reduce) {
             [second_encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-            [second_encoder dispatchThreadgroups:MTLSizeMake(out_dim, rows, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(second_encoder, MTLSizeMake(out_dim, rows, 1), MTLSizeMake(32u, 1, 1));
         } else {
             const size_t second_total = rows * out_dim;
-            [second_encoder dispatchThreads:MTLSizeMake(second_total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(second_pipeline, second_total), 1, 1)];
+            antfly_metal_dispatch_threads(second_encoder, MTLSizeMake(second_total, 1, 1), MTLSizeMake(termite_metal_thread_width(second_pipeline, second_total), 1, 1));
         }
         termite_metal_end_scoped_compute_encoder(second_encoder, second_encoder_owned);
 
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -17;
     }
 }
@@ -40615,17 +40613,17 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
                         [first_encoder setBytes:&direct_activation_params length:sizeof(direct_activation_params) atIndex:5];
                     }
 	                    if (first_tiled32_m16) {
-	                        [first_encoder dispatchThreadgroups:MTLSizeMake((intermediate_size + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
+	                        antfly_metal_dispatch_threadgroups(first_encoder, MTLSizeMake((intermediate_size + 31u) / 32u, (rows + 15u) / 16u, 1), MTLSizeMake(8u, 16u, 1));
 	                    } else if (first_tiled32) {
-	                        [first_encoder dispatchThreadgroups:MTLSizeMake((intermediate_size + 31u) / 32u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+	                        antfly_metal_dispatch_threadgroups(first_encoder, MTLSizeMake((intermediate_size + 31u) / 32u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
                     } else if (first_tiled) {
-                        [first_encoder dispatchThreadgroups:MTLSizeMake((intermediate_size + 15u) / 16u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+                        antfly_metal_dispatch_threadgroups(first_encoder, MTLSizeMake((intermediate_size + 15u) / 16u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
                     } else if (first_reduce) {
                         [first_encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-                        [first_encoder dispatchThreadgroups:MTLSizeMake(intermediate_size, rows, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+                        antfly_metal_dispatch_threadgroups(first_encoder, MTLSizeMake(intermediate_size, rows, 1), MTLSizeMake(32u, 1, 1));
                     } else {
                         const size_t first_total = rows * intermediate_size;
-                        [first_encoder dispatchThreads:MTLSizeMake(first_total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(first_pipeline, first_total), 1, 1)];
+                        antfly_metal_dispatch_threads(first_encoder, MTLSizeMake(first_total, 1, 1), MTLSizeMake(termite_metal_thread_width(first_pipeline, first_total), 1, 1));
                     }
                     if (!first_encoder_owned) {
                         [first_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -40642,7 +40640,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
                         [activation_encoder setComputePipelineState:runtime->activation_pipeline];
                         termite_metal_bind_two_buffers(activation_encoder, first_output_buffer, 0, activated_buffer, 0, &direct_activation_params, sizeof(direct_activation_params));
                         const size_t activation_total = rows * intermediate_size;
-                        [activation_encoder dispatchThreads:MTLSizeMake(activation_total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, activation_total), 1, 1)];
+                        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(activation_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, activation_total), 1, 1));
                         if (!activation_encoder_owned) {
                             [activation_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
                         }
@@ -40692,17 +40690,17 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
 	                        [second_encoder setComputePipelineState:second_pipeline];
                         termite_metal_bind_four_buffers(second_encoder, activated_buffer, 0, runtime->linear_weight_buffers[second_linear_slot], 0, runtime->linear_bias_buffers[second_linear_slot], 0, projected_buffer, 0, &second_params, sizeof(second_params));
 	                        if (second_tiled32_m16) {
-	                            [second_encoder dispatchThreadgroups:MTLSizeMake((hidden_size + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
+	                            antfly_metal_dispatch_threadgroups(second_encoder, MTLSizeMake((hidden_size + 31u) / 32u, (rows + 15u) / 16u, 1), MTLSizeMake(8u, 16u, 1));
 	                        } else if (second_tiled32) {
-	                            [second_encoder dispatchThreadgroups:MTLSizeMake((hidden_size + 31u) / 32u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+	                            antfly_metal_dispatch_threadgroups(second_encoder, MTLSizeMake((hidden_size + 31u) / 32u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
                         } else if (second_tiled) {
-                            [second_encoder dispatchThreadgroups:MTLSizeMake((hidden_size + 15u) / 16u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+                            antfly_metal_dispatch_threadgroups(second_encoder, MTLSizeMake((hidden_size + 15u) / 16u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
                         } else if (second_reduce) {
                             [second_encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-                            [second_encoder dispatchThreadgroups:MTLSizeMake(hidden_size, rows, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+                            antfly_metal_dispatch_threadgroups(second_encoder, MTLSizeMake(hidden_size, rows, 1), MTLSizeMake(32u, 1, 1));
                         } else {
                             const size_t second_total = rows * hidden_size;
-                            [second_encoder dispatchThreads:MTLSizeMake(second_total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(second_pipeline, second_total), 1, 1)];
+                            antfly_metal_dispatch_threads(second_encoder, MTLSizeMake(second_total, 1, 1), MTLSizeMake(termite_metal_thread_width(second_pipeline, second_total), 1, 1));
                         }
                         if (!second_encoder_owned) {
                             [second_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -40724,15 +40722,15 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
                         termite_metal_bind_five_buffers(ln_encoder, projected_buffer, 0, residual_buffer, residual_offset, runtime->layer_norm_weight_buffers[layer_norm_slot], 0, runtime->layer_norm_bias_buffers[layer_norm_slot], 0, output_buffer, output_offset, &direct_ln_params, sizeof(direct_ln_params));
                         if (use_ln_rows_pipeline) {
                             [ln_encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-                            [ln_encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+                            antfly_metal_dispatch_threadgroups(ln_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
                         } else {
-                            [ln_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                            antfly_metal_dispatch_threads(ln_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
                         }
                         termite_metal_end_scoped_compute_encoder(ln_encoder, ln_encoder_owned);
 
                         if (!frame_owned) return 0;
-                        [command_buffer commit];
-                        [command_buffer waitUntilCompleted];
+                        antfly_metal_commit(command_buffer);
+                        antfly_metal_wait(command_buffer);
                         if (command_buffer.status == MTLCommandBufferStatusCompleted) return 0;
                         runtime->deberta_ffn_fused_fallbacks += 1;
                         return -16;
@@ -40771,7 +40769,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
             return -12;
         }
         termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
-        [first_mm encodeToCommandBuffer:command_buffer leftMatrix:first_left rightMatrix:first_right resultMatrix:first_result];
+        antfly_metal_encode_matrix(first_mm, command_buffer, first_left, first_right, first_result);
 
         termite_metal_apply_activation_params activation_params = {
             .activation_kind = activation_kind,
@@ -40789,7 +40787,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
         [activation_encoder setBuffer:activated_buffer offset:0 atIndex:2];
         [activation_encoder setBytes:&activation_params length:sizeof(activation_params) atIndex:3];
         const size_t activation_total = rows * intermediate_size;
-        [activation_encoder dispatchThreads:MTLSizeMake(activation_total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->bias_activation_pipeline, activation_total), 1, 1)];
+        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(activation_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->bias_activation_pipeline, activation_total), 1, 1));
         [activation_encoder endEncoding];
 
         MPSMatrixMultiplication *second_mm = termite_metal_decode_runtime_cached_mps_mm(runtime, second_linear_slot, rows, intermediate_size, hidden_size);
@@ -40814,7 +40812,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
             return -14;
         }
         termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
-        [second_mm encodeToCommandBuffer:command_buffer leftMatrix:second_left rightMatrix:second_right resultMatrix:second_result];
+        antfly_metal_encode_matrix(second_mm, command_buffer, second_left, second_right, second_result);
 
         termite_metal_apply_layer_norm_params ln_params = {
             .hidden_size = (uint32_t)hidden_size,
@@ -40836,9 +40834,9 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
         [ln_encoder setBytes:&ln_params length:sizeof(ln_params) atIndex:6];
         if (use_bias_ln_rows_pipeline) {
             [ln_encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-            [ln_encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(ln_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
         } else {
-            [ln_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            antfly_metal_dispatch_threads(ln_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
         }
         [ln_encoder endEncoding];
 
@@ -40850,8 +40848,8 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
         }
         runtime->mps_dense_linear_standalone_calls += 2;
         const uint64_t wait_start = termite_metal_clock_monotonic_nanos();
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         const uint64_t wait_end = termite_metal_clock_monotonic_nanos();
         if (wait_end > wait_start) runtime->mps_dense_linear_standalone_wait_nanos += wait_end - wait_start;
         if (command_buffer.status == MTLCommandBufferStatusCompleted) {
@@ -40979,17 +40977,17 @@ int termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
 	                [linear_encoder setComputePipelineState:linear_pipeline];
                 termite_metal_bind_four_buffers(linear_encoder, input_buffer, input_offset, runtime->linear_weight_buffers[linear_slot], 0, runtime->linear_bias_buffers[linear_slot], 0, projected_buffer, 0, &linear_params, sizeof(linear_params));
                 if (tiled32_m16) {
-                    [linear_encoder dispatchThreadgroups:MTLSizeMake((hidden_size + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
+                    antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake((hidden_size + 31u) / 32u, (rows + 15u) / 16u, 1), MTLSizeMake(8u, 16u, 1));
                 } else if (tiled32) {
-                    [linear_encoder dispatchThreadgroups:MTLSizeMake((hidden_size + 31u) / 32u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+                    antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake((hidden_size + 31u) / 32u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
                 } else if (tiled) {
-                    [linear_encoder dispatchThreadgroups:MTLSizeMake((hidden_size + 15u) / 16u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+                    antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake((hidden_size + 15u) / 16u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
                 } else if (reduce) {
                     [linear_encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-                    [linear_encoder dispatchThreadgroups:MTLSizeMake(hidden_size, rows, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+                    antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake(hidden_size, rows, 1), MTLSizeMake(32u, 1, 1));
                 } else {
                     const size_t total = rows * hidden_size;
-                    [linear_encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(linear_pipeline, total), 1, 1)];
+                    antfly_metal_dispatch_threads(linear_encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(linear_pipeline, total), 1, 1));
                 }
                 if (!linear_encoder_owned) {
                     [linear_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -41017,15 +41015,15 @@ int termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
                 termite_metal_bind_five_buffers(ln_encoder, projected_buffer, 0, residual_buffer, residual_offset, runtime->layer_norm_weight_buffers[layer_norm_slot], 0, runtime->layer_norm_bias_buffers[layer_norm_slot], 0, output_buffer, output_offset, &ln_params, sizeof(ln_params));
                 if (use_add_ln_rows_pipeline) {
                     [ln_encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-                    [ln_encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+                    antfly_metal_dispatch_threadgroups(ln_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
                 } else {
-                    [ln_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                    antfly_metal_dispatch_threads(ln_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
                 }
                 termite_metal_end_scoped_compute_encoder(ln_encoder, ln_encoder_owned);
 
                 if (!frame_owned) return 0;
-                [command_buffer commit];
-                [command_buffer waitUntilCompleted];
+                antfly_metal_commit(command_buffer);
+                antfly_metal_wait(command_buffer);
                 return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -14;
             }
             return -15;
@@ -41050,7 +41048,7 @@ int termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
                 &right,
                 &result)) return -12;
         termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
-        [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
+        antfly_metal_encode_matrix(mm, command_buffer, left, right, result);
 
         termite_metal_apply_layer_norm_params ln_params = {
             .hidden_size = (uint32_t)hidden_size,
@@ -41069,9 +41067,9 @@ int termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
         [ln_encoder setBytes:&ln_params length:sizeof(ln_params) atIndex:6];
         if (use_bias_ln_rows_pipeline) {
             [ln_encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-            [ln_encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(ln_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
         } else {
-            [ln_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            antfly_metal_dispatch_threads(ln_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
         }
         [ln_encoder endEncoding];
 
@@ -41082,8 +41080,8 @@ int termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
         }
         runtime->mps_dense_linear_standalone_calls += 1;
         const uint64_t wait_start = termite_metal_clock_monotonic_nanos();
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         const uint64_t wait_end = termite_metal_clock_monotonic_nanos();
         if (wait_end > wait_start) runtime->mps_dense_linear_standalone_wait_nanos += wait_end - wait_start;
         if (command_buffer.status == MTLCommandBufferStatusCompleted) {
@@ -41149,9 +41147,9 @@ static int termite_metal_decode_runtime_encode_bias_add_layer_norm(
     [ln_encoder setBytes:&ln_params length:sizeof(ln_params) atIndex:6];
     if (use_bias_ln_rows_pipeline) {
         [ln_encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-        [ln_encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        antfly_metal_dispatch_threadgroups(ln_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
     } else {
-        [ln_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        antfly_metal_dispatch_threads(ln_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
     }
     termite_metal_end_scoped_compute_encoder(ln_encoder, ln_encoder_owned);
     return 0;
@@ -41244,8 +41242,8 @@ int termite_metal_decode_runtime_apply_quantized_linear_layer_norm_device(
         if (ln_rc != 0) return ln_rc;
 
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -12;
     }
 }
@@ -41392,7 +41390,7 @@ int termite_metal_decode_runtime_apply_quantized_ffn_layer_norm_device(
         [activation_encoder setBuffer:activated_buffer offset:0 atIndex:2];
         [activation_encoder setBytes:&activation_params length:sizeof(activation_params) atIndex:3];
         const size_t activation_total = rows * intermediate_size;
-        [activation_encoder dispatchThreads:MTLSizeMake(activation_total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->bias_activation_pipeline, activation_total), 1, 1)];
+        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(activation_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->bias_activation_pipeline, activation_total), 1, 1));
         termite_metal_end_scoped_compute_encoder(activation_encoder, activation_encoder_owned);
 
         const int second_rc = termite_metal_decode_runtime_apply_quantized_linear_slot_device(
@@ -41433,8 +41431,8 @@ int termite_metal_decode_runtime_apply_quantized_ffn_layer_norm_device(
         }
 
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status == MTLCommandBufferStatusCompleted) return 0;
         runtime->deberta_ffn_fused_fallbacks += 1;
         return -15;
@@ -41492,7 +41490,7 @@ int termite_metal_decode_runtime_apply_i2_s_linear_slot(
         NSUInteger quantize_thread_width = runtime->i2_s_quantize_pipeline.maxTotalThreadsPerThreadgroup;
         if (quantize_thread_width == 0) quantize_thread_width = 1;
         if (quantize_thread_width > rows && rows > 0) quantize_thread_width = rows;
-        [quantize_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(quantize_thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(quantize_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(quantize_thread_width, 1, 1));
         [quantize_encoder endEncoding];
         id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
         if (encoder == nil) return -11;
@@ -41502,7 +41500,7 @@ int termite_metal_decode_runtime_apply_i2_s_linear_slot(
         if (thread_width == 0) thread_width = 32;
         const size_t total = rows * out_dim;
         if (thread_width > total && total > 0) thread_width = total;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(thread_width, 1, 1));
         [encoder endEncoding];
         const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
         if (finish_rc != 0) return finish_rc;
@@ -41569,7 +41567,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_slot_device(
                 termite_metal_tl2_params params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)in_dim, .out_dim = (uint32_t)out_dim, .scale_off = runtime->quant_linear_tl2_scale_off[slot], .three_value_len = runtime->quant_linear_tl2_three_value_len[slot], .three_sign_len = runtime->quant_linear_tl2_three_sign_len[slot], .bm = runtime->quant_linear_tl2_bm[slot], .cfg_by = runtime->quant_linear_tl2_cfg_by[slot], .bmm = runtime->quant_linear_tl2_bmm[slot], .three_cols = runtime->quant_linear_tl2_three_cols[slot], .two_cols = runtime->quant_linear_tl2_two_cols[slot] };
                 [encoder setBytes:&params length:sizeof(params) atIndex:3];
             }
-            [encoder dispatchThreads:MTLSizeMake(out_dim, rows, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, out_dim), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(out_dim, rows, 1), MTLSizeMake(termite_metal_thread_width(pipeline, out_dim), 1, 1));
             if (!planned_encoder) [encoder endEncoding];
             return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -13);
         }
@@ -41790,9 +41788,8 @@ int termite_metal_decode_runtime_prewarm_mapped_moe_layer0(
                 .page_count = page_counts[index],
             };
             termite_metal_bind_two_buffers(encoder, views[index], 0, scratch, 0, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(page_counts[index], 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(
-                    termite_metal_thread_width(runtime->mapped_page_touch_pipeline, page_counts[index]), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(page_counts[index], 1, 1), MTLSizeMake(
+                    termite_metal_thread_width(runtime->mapped_page_touch_pipeline, page_counts[index]), 1, 1));
         }
         [encoder endEncoding];
         if (termite_metal_commit_and_wait(command_buffer, __func__, -14) != 0) return -14;
@@ -41906,8 +41903,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_id_slot_device(
                     termite_metal_planned_range_make(output_buffer, run_output_offset, run_rows * out_dim * sizeof(float), TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[3], -15) != 0 ||
                     termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 4, -15) != 0) return -15;
                 termite_metal_bind_four_buffers(encoder, input_buffer, run_input_offset, expert_buffer, expert_buffer_offset, output_buffer, run_output_offset, zero_id_buffer, 0, &run_params, sizeof(run_params));
-                [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 7u) / 8u, run_rows, 1)
-                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 7u) / 8u, run_rows, 1), MTLSizeMake(64, 1, 1));
                 run_start = run_end;
             }
             if (!planned_encoder) [encoder endEncoding];
@@ -41947,8 +41943,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_id_slot_device(
 
         [encoder setComputePipelineState:runtime->q4_0_id_pipeline];
         termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, weight_buffer, runtime->quant_linear_weight_offsets[slot], output_buffer, output_offset, expert_id_buffer, 0, &params, sizeof(params));
-        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 7u) / 8u, rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 7u) / 8u, rows, 1), MTLSizeMake(64, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -16);
     }
@@ -42086,8 +42081,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_pair_id_slots_device(
                     termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 6, -15) != 0) return -15;
                 termite_metal_bind_six_buffers_only(encoder, input_buffer, run_input_offset, expert_buffer_a, expert_offset_a, expert_buffer_b, expert_offset_b, output_a_buffer, run_output_a_offset, output_b_buffer, run_output_b_offset, zero_id_buffer, 0);
                 [encoder setBytes:&run_params length:sizeof(run_params) atIndex:6];
-                [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 7u) / 8u, run_rows, 1)
-                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 7u) / 8u, run_rows, 1), MTLSizeMake(64, 1, 1));
                 run_start = run_end;
             }
             if (!planned_encoder) [encoder endEncoding];
@@ -42139,8 +42133,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_pair_id_slots_device(
         [encoder setComputePipelineState:runtime->q4_0_pair_id_pipeline];
         termite_metal_bind_six_buffers_only(encoder, input_buffer, input_offset, weight_a_buffer, weight_a_offset, weight_b_buffer, weight_b_offset, output_a_buffer, output_a_offset, output_b_buffer, output_b_offset, expert_id_buffer, 0);
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
-        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 7u) / 8u, rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + 7u) / 8u, rows, 1), MTLSizeMake(64, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -16);
     }
@@ -42200,8 +42193,7 @@ int termite_metal_decode_runtime_moe_scatter_add_device(
         [encoder setComputePipelineState:runtime->moe_scatter_add_pipeline];
         termite_metal_bind_five_buffers(encoder, base_buffer, base_offset, updates_buffer, updates_offset, row_id_buffer, 0, route_weight_buffer, 0, output_buffer, output_offset, &params, sizeof(params));
         const size_t total = base_rows * dim;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->moe_scatter_add_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->moe_scatter_add_pipeline, total), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -42282,7 +42274,7 @@ static int termite_metal_decode_runtime_apply_quantized_linear_k_bias_activation
         [encoder setComputePipelineState:runtime->bias_activation_pipeline];
         termite_metal_bind_three_buffers(encoder, intermediate_buffer, 0, bias_buffer, bias_offset, output_buffer, output_offset, &params, sizeof(params));
         const size_t total = rows * out_dim;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->bias_activation_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->bias_activation_pipeline, total), 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
     }
@@ -42571,7 +42563,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_gelu_slot_devi
         [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:5];
         [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:6];
         runtime->antfly_q4_k_small_batch_bias_gelu_dispatches += 1;
-        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, (rows + launch_shape.rows_per_threadgroup - 1u) / launch_shape.rows_per_threadgroup, 1) threadsPerThreadgroup:MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, (rows + launch_shape.rows_per_threadgroup - 1u) / launch_shape.rows_per_threadgroup, 1), MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -15);
     }
@@ -42628,7 +42620,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_slot_device(
         [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:5];
         [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:6];
         runtime->antfly_q4_k_small_batch_bias_dispatches += 1;
-        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, (rows + launch_shape.rows_per_threadgroup - 1u) / launch_shape.rows_per_threadgroup, 1) threadsPerThreadgroup:MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, (rows + launch_shape.rows_per_threadgroup - 1u) / launch_shape.rows_per_threadgroup, 1), MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -15);
     }
@@ -42691,7 +42683,7 @@ static int termite_metal_decode_runtime_apply_quantized_linear_k_bias_generated_
         [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:5];
         [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:6];
         *dispatch_counter += 1;
-        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, (rows + launch_shape.rows_per_threadgroup - 1u) / launch_shape.rows_per_threadgroup, 1) threadsPerThreadgroup:MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, (rows + launch_shape.rows_per_threadgroup - 1u) / launch_shape.rows_per_threadgroup, 1), MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -16);
     }
@@ -42745,7 +42737,7 @@ static int termite_metal_decode_runtime_apply_quantized_linear_generated_slot_de
         [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:4];
         [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:5];
         *dispatch_counter += 1;
-        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, rows, 1) threadsPerThreadgroup:MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, rows, 1), MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -15);
     }
@@ -43208,11 +43200,10 @@ static int termite_metal_encode_exact_quant_qkv_descriptor(
     [encoder setBytes:&rows_i length:sizeof(rows_i) atIndex:7];
     [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:8];
     [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:9];
-    [encoder dispatchThreadgroups:MTLSizeMake(
+    antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(
         (out_dim + exact->cols_per_threadgroup - 1u) / exact->cols_per_threadgroup,
         (rows + exact->rows_per_threadgroup - 1u) / exact->rows_per_threadgroup,
-        3u)
-        threadsPerThreadgroup:MTLSizeMake(exact->threads_per_threadgroup, 1, 1)];
+        3u), MTLSizeMake(exact->threads_per_threadgroup, 1, 1));
     if (encoder_owned) [encoder endEncoding];
 
     for (uint32_t projection = 0; projection < 3u; ++projection) {
@@ -43431,8 +43422,8 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
         }
 
 	        if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -17;
     }
 }
@@ -43871,8 +43862,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_scratch_device
                 if (split_encoder == nil) return -16;
                 [split_encoder setComputePipelineState:runtime->dense_qkv_split_pipeline];
                 termite_metal_bind_four_buffers(split_encoder, packed_output_buffer, 0, q_output_buffer, 0, k_output_buffer, 0, v_output_buffer, 0, &split_params, sizeof(split_params));
-                [split_encoder dispatchThreads:MTLSizeMake(rows * total_out_dim, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->dense_qkv_split_pipeline, rows * total_out_dim), 1, 1)];
+                antfly_metal_dispatch_threads(split_encoder, MTLSizeMake(rows * total_out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->dense_qkv_split_pipeline, rows * total_out_dim), 1, 1));
                 termite_metal_end_scoped_compute_encoder(split_encoder, split_encoder_owned);
             } else {
                 if (termite_metal_encode_q8_0_linear_family_with_offset(
@@ -44107,8 +44097,8 @@ int termite_metal_decode_runtime_apply_quantized_linear_pair_slots(
             .failure_code = -10,
         };
         if (termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor) != 0) return -10;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -11;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -44218,11 +44208,11 @@ int termite_metal_decode_runtime_apply_linear_bias_device(
         [encoder setComputePipelineState:runtime->linear_bias_pipeline];
         termite_metal_bind_two_buffers(encoder, output_buffer, output_offset, runtime->linear_bias_buffers[slot], 0, &params, sizeof(params));
         const size_t total = rows * out_dim;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_bias_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_bias_pipeline, total), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -9;
     }
 }
@@ -44266,7 +44256,7 @@ static int termite_metal_decode_runtime_encode_linear_pair_slots(
         };
         [encoder setComputePipelineState:runtime->linear_pipeline];
         termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, runtime->linear_weight_buffers[slots[i]], 0, runtime->linear_bias_buffers[slots[i]], 0, outputs[i], output_offsets[i], &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, out_dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, out_dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
     }
     return 0;
@@ -44431,9 +44421,9 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots(
         [q_encoder setComputePipelineState:(use_q_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         termite_metal_bind_four_buffers(q_encoder, input_buffer, 0, runtime->linear_weight_buffers[q_slot], 0, runtime->linear_bias_buffers[q_slot], 0, q_output_buffer, 0, &q_params, sizeof(q_params));
         if (use_q_reduce) {
-            [q_encoder dispatchThreads:MTLSizeMake(q_out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(q_encoder, MTLSizeMake(q_out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
-            [q_encoder dispatchThreads:MTLSizeMake(q_out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, q_out_dim), 1, 1)];
+            antfly_metal_dispatch_threads(q_encoder, MTLSizeMake(q_out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, q_out_dim), 1, 1));
         }
         [q_encoder endEncoding];
 
@@ -44443,9 +44433,9 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots(
         [k_encoder setComputePipelineState:(use_kv_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         termite_metal_bind_four_buffers(k_encoder, input_buffer, 0, runtime->linear_weight_buffers[k_slot], 0, runtime->linear_bias_buffers[k_slot], 0, k_output_buffer, 0, &kv_params, sizeof(kv_params));
         if (use_kv_reduce) {
-            [k_encoder dispatchThreads:MTLSizeMake(kv_out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(k_encoder, MTLSizeMake(kv_out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
-            [k_encoder dispatchThreads:MTLSizeMake(kv_out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, kv_out_dim), 1, 1)];
+            antfly_metal_dispatch_threads(k_encoder, MTLSizeMake(kv_out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, kv_out_dim), 1, 1));
         }
         [k_encoder endEncoding];
 
@@ -44454,14 +44444,14 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots(
         [v_encoder setComputePipelineState:(use_kv_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         termite_metal_bind_four_buffers(v_encoder, input_buffer, 0, runtime->linear_weight_buffers[v_slot], 0, runtime->linear_bias_buffers[v_slot], 0, v_output_buffer, 0, &kv_params, sizeof(kv_params));
         if (use_kv_reduce) {
-            [v_encoder dispatchThreads:MTLSizeMake(kv_out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(v_encoder, MTLSizeMake(kv_out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
-            [v_encoder dispatchThreads:MTLSizeMake(kv_out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, kv_out_dim), 1, 1)];
+            antfly_metal_dispatch_threads(v_encoder, MTLSizeMake(kv_out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, kv_out_dim), 1, 1));
         }
         [v_encoder endEncoding];
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -14;
     }
 }
@@ -44544,9 +44534,9 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots_device(
         [q_encoder setComputePipelineState:(use_q_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         termite_metal_bind_four_buffers(q_encoder, input_buffer, input_offset, runtime->linear_weight_buffers[q_slot], 0, runtime->linear_bias_buffers[q_slot], 0, q_output_buffer, q_output_offset, &q_params, sizeof(q_params));
         if (use_q_reduce) {
-            [q_encoder dispatchThreads:MTLSizeMake(q_out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(q_encoder, MTLSizeMake(q_out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
-            [q_encoder dispatchThreads:MTLSizeMake(q_out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, q_out_dim), 1, 1)];
+            antfly_metal_dispatch_threads(q_encoder, MTLSizeMake(q_out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, q_out_dim), 1, 1));
         }
         if (!planned_encoder) [q_encoder endEncoding];
 
@@ -44569,9 +44559,9 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots_device(
         [k_encoder setComputePipelineState:(use_kv_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         termite_metal_bind_four_buffers(k_encoder, input_buffer, input_offset, runtime->linear_weight_buffers[k_slot], 0, runtime->linear_bias_buffers[k_slot], 0, k_output_buffer, k_output_offset, &kv_params, sizeof(kv_params));
         if (use_kv_reduce) {
-            [k_encoder dispatchThreads:MTLSizeMake(kv_out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(k_encoder, MTLSizeMake(kv_out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
-            [k_encoder dispatchThreads:MTLSizeMake(kv_out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, kv_out_dim), 1, 1)];
+            antfly_metal_dispatch_threads(k_encoder, MTLSizeMake(kv_out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, kv_out_dim), 1, 1));
         }
         if (!planned_encoder) [k_encoder endEncoding];
 
@@ -44593,15 +44583,15 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots_device(
         [v_encoder setComputePipelineState:(use_kv_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         termite_metal_bind_four_buffers(v_encoder, input_buffer, input_offset, runtime->linear_weight_buffers[v_slot], 0, runtime->linear_bias_buffers[v_slot], 0, v_output_buffer, v_output_offset, &kv_params, sizeof(kv_params));
         if (use_kv_reduce) {
-            [v_encoder dispatchThreads:MTLSizeMake(kv_out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(v_encoder, MTLSizeMake(kv_out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
-            [v_encoder dispatchThreads:MTLSizeMake(kv_out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, kv_out_dim), 1, 1)];
+            antfly_metal_dispatch_threads(v_encoder, MTLSizeMake(kv_out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, kv_out_dim), 1, 1));
         }
         if (!planned_encoder) [v_encoder endEncoding];
 
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -17;
     }
 }
@@ -44729,14 +44719,14 @@ int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device(
             [linear_encoder setComputePipelineState:direct_linear_pipeline];
             termite_metal_bind_four_buffers(linear_encoder, input_buffer, input_offset, runtime->dense_qkv_packed_weight_buffers[q_slot], 0, runtime->dense_qkv_packed_bias_buffers[q_slot], 0, packed_output_buffer, 0, &linear_params, sizeof(linear_params));
 	            if (use_tiled32_m16) {
-	                [linear_encoder dispatchThreadgroups:MTLSizeMake((total_out_dim + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
+	                antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake((total_out_dim + 31u) / 32u, (rows + 15u) / 16u, 1), MTLSizeMake(8u, 16u, 1));
 	            } else if (use_tiled32) {
-	                [linear_encoder dispatchThreadgroups:MTLSizeMake((total_out_dim + 31u) / 32u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+	                antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake((total_out_dim + 31u) / 32u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
             } else if (use_tiled) {
-                [linear_encoder dispatchThreadgroups:MTLSizeMake((total_out_dim + 15u) / 16u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+                antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake((total_out_dim + 15u) / 16u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
             } else {
                 [linear_encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-                [linear_encoder dispatchThreadgroups:MTLSizeMake(total_out_dim, rows, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+                antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake(total_out_dim, rows, 1), MTLSizeMake(32u, 1, 1));
             }
             termite_metal_end_scoped_compute_encoder(linear_encoder, linear_encoder_owned);
 
@@ -44760,8 +44750,7 @@ int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device(
             if (split_encoder == nil) return -17;
             [split_encoder setComputePipelineState:runtime->dense_qkv_split_pipeline];
             termite_metal_bind_four_buffers(split_encoder, packed_output_buffer, 0, q_output_buffer, 0, k_output_buffer, 0, v_output_buffer, 0, &split_params, sizeof(split_params));
-            [split_encoder dispatchThreads:MTLSizeMake(rows * total_out_dim, 1, 1)
-                   threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->dense_qkv_split_pipeline, rows * total_out_dim), 1, 1)];
+            antfly_metal_dispatch_threads(split_encoder, MTLSizeMake(rows * total_out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->dense_qkv_split_pipeline, rows * total_out_dim), 1, 1));
             termite_metal_end_scoped_compute_encoder(split_encoder, split_encoder_owned);
 
             *q_output_handle = (__bridge void *)q_output_buffer;
@@ -44800,7 +44789,7 @@ int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device(
 	                &right,
 	                &result)) return -16;
 	        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
-	        [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
+	        antfly_metal_encode_matrix(mm, command_buffer, left, right, result);
 	        termite_metal_maybe_trace_dense_linear_dispatch(
 	            "dense_qkv_packed",
 	            q_slot,
@@ -44831,8 +44820,7 @@ int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device(
         [split_encoder setBuffer:k_output_buffer offset:0 atIndex:5];
         [split_encoder setBuffer:v_output_buffer offset:0 atIndex:6];
         [split_encoder setBytes:&params length:sizeof(params) atIndex:7];
-        [split_encoder dispatchThreads:MTLSizeMake(rows * total_out_dim, 1, 1)
-                   threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->dense_qkv_split_bias_pipeline, rows * total_out_dim), 1, 1)];
+        antfly_metal_dispatch_threads(split_encoder, MTLSizeMake(rows * total_out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->dense_qkv_split_bias_pipeline, rows * total_out_dim), 1, 1));
         [split_encoder endEncoding];
         runtime->mps_dense_linear_active_frame_calls += 1;
         runtime->active_frame_mps_dense_linear_count += 1;
@@ -44949,14 +44937,14 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
             [linear_encoder setComputePipelineState:direct_linear_pipeline];
             termite_metal_bind_four_buffers(linear_encoder, input_buffer, input_offset, runtime->dense_pair_packed_weight_buffers[a_slot], 0, runtime->dense_pair_packed_bias_buffers[a_slot], 0, packed_output_buffer, 0, &linear_params, sizeof(linear_params));
 	            if (use_tiled32_m16) {
-	                [linear_encoder dispatchThreadgroups:MTLSizeMake((total_out_dim + 31u) / 32u, (rows + 15u) / 16u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 16u, 1)];
+	                antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake((total_out_dim + 31u) / 32u, (rows + 15u) / 16u, 1), MTLSizeMake(8u, 16u, 1));
 	            } else if (use_tiled32) {
-	                [linear_encoder dispatchThreadgroups:MTLSizeMake((total_out_dim + 31u) / 32u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+	                antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake((total_out_dim + 31u) / 32u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
             } else if (use_tiled) {
-                [linear_encoder dispatchThreadgroups:MTLSizeMake((total_out_dim + 15u) / 16u, (rows + 7u) / 8u, 1) threadsPerThreadgroup:MTLSizeMake(8u, 8u, 1)];
+                antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake((total_out_dim + 15u) / 16u, (rows + 7u) / 8u, 1), MTLSizeMake(8u, 8u, 1));
             } else {
                 [linear_encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-                [linear_encoder dispatchThreadgroups:MTLSizeMake(total_out_dim, rows, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+                antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake(total_out_dim, rows, 1), MTLSizeMake(32u, 1, 1));
             }
             termite_metal_end_scoped_compute_encoder(linear_encoder, linear_encoder_owned);
 
@@ -44982,8 +44970,7 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
             [split_encoder setBuffer:a_output_buffer offset:0 atIndex:1];
             [split_encoder setBuffer:b_output_buffer offset:0 atIndex:2];
             [split_encoder setBytes:&split_params length:sizeof(split_params) atIndex:3];
-            [split_encoder dispatchThreads:MTLSizeMake(rows * total_out_dim, 1, 1)
-                   threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->dense_pair_split_pipeline, rows * total_out_dim), 1, 1)];
+            antfly_metal_dispatch_threads(split_encoder, MTLSizeMake(rows * total_out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->dense_pair_split_pipeline, rows * total_out_dim), 1, 1));
             termite_metal_end_scoped_compute_encoder(split_encoder, split_encoder_owned);
 
             *a_output_handle = (__bridge void *)a_output_buffer;
@@ -45018,7 +45005,7 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
         MPSMatrixMultiplication *mm = termite_metal_decode_runtime_cached_dense_pair_mps_mm(runtime, a_slot, rows, in_dim, total_out_dim);
         if (left == nil || right == nil || result == nil || mm == nil) return -15;
         termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
-        [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
+        antfly_metal_encode_matrix(mm, command_buffer, left, right, result);
 
         termite_metal_dense_pair_split_bias_params params = {
             .rows = (uint32_t)rows,
@@ -45030,8 +45017,7 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
         if (split_encoder == nil) return -16;
         [split_encoder setComputePipelineState:runtime->dense_pair_split_bias_pipeline];
         termite_metal_bind_five_buffers(split_encoder, packed_output_buffer, 0, runtime->linear_bias_buffers[a_slot], 0, runtime->linear_bias_buffers[b_slot], 0, a_output_buffer, 0, b_output_buffer, 0, &params, sizeof(params));
-        [split_encoder dispatchThreads:MTLSizeMake(rows * total_out_dim, 1, 1)
-                   threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->dense_pair_split_bias_pipeline, rows * total_out_dim), 1, 1)];
+        antfly_metal_dispatch_threads(split_encoder, MTLSizeMake(rows * total_out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->dense_pair_split_bias_pipeline, rows * total_out_dim), 1, 1));
         [split_encoder endEncoding];
         runtime->mps_dense_linear_active_frame_calls += 1;
         runtime->active_frame_mps_dense_linear_count += 1;
@@ -45234,8 +45220,8 @@ int termite_metal_decode_runtime_apply_quantized_q_kv_pair_linear_qkv_slots(
             -11,
             -12);
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -13;
     }
 }
@@ -45316,8 +45302,8 @@ static int termite_metal_decode_runtime_apply_quantized_q_kv_pair_linear_qkv_slo
             -15);
         if (rc != 0) return rc;
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -16;
     }
 }
@@ -45376,16 +45362,15 @@ static int termite_metal_encode_dense_linear_on_encoder(
     [encoder setComputePipelineState:pipeline];
     termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, runtime->linear_weight_buffers[slot], 0, runtime->linear_bias_buffers[slot], 0, output_buffer, output_offset, &params, sizeof(params));
     if (lighton_pipeline != nil) {
-        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + lighton_rows - 1) / lighton_rows, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + lighton_rows - 1) / lighton_rows, 1, 1), MTLSizeMake(32, 1, 1));
     } else if (use_reduce) {
-        [encoder dispatchThreads:MTLSizeMake(out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
     } else {
         id<MTLComputePipelineState> scalar_pipeline = use_f16 ? runtime->linear_f16_pipeline : (use_bf16 ? runtime->linear_bf16_pipeline : runtime->linear_pipeline);
         NSUInteger thread_width = scalar_pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0) thread_width = 64;
         if (thread_width > out_dim && out_dim > 0) thread_width = out_dim;
-        [encoder dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(out_dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
     }
     return 0;
 }
@@ -45421,8 +45406,8 @@ int termite_metal_decode_runtime_apply_linear_argmax(
         const int argmax_rc = termite_metal_encode_argmax_logits_on_encoder(runtime, encoder, runtime->sample_logits_buffer, 0, out_dim, -10);
         [encoder endEncoding];
         if (argmax_rc != 0) return argmax_rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -11;
         uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
         if (result == NULL) return -12;
@@ -45462,8 +45447,8 @@ int termite_metal_decode_runtime_apply_linear_argmax_device(
         const int argmax_rc = termite_metal_encode_argmax_logits_on_encoder(runtime, encoder, runtime->sample_logits_buffer, 0, out_dim, -11);
         [encoder endEncoding];
         if (argmax_rc != 0) return argmax_rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -12;
         uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
         if (result == NULL) return -13;
@@ -45571,8 +45556,8 @@ int termite_metal_decode_runtime_argmax_from_logits_device(
             int flush_rc = termite_metal_decode_runtime_flush_active_frame(runtime);
             if (flush_rc != 0) return -10;
         } else {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
         }
         uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
@@ -45649,8 +45634,8 @@ int termite_metal_decode_runtime_argmax_from_logits_suppress_device(
             int flush_rc = termite_metal_decode_runtime_flush_active_frame(runtime);
             if (flush_rc != 0) return -10;
         } else {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (command_buffer.status != MTLCommandBufferStatusCompleted) return -11;
         }
         uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
@@ -45692,8 +45677,8 @@ int termite_metal_decode_runtime_encode_argmax_from_logits_device(
         [encoder endEncoding];
         if (encode_rc != 0) return encode_rc;
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
         return 0;
     }
@@ -45743,7 +45728,7 @@ int termite_metal_decode_runtime_apply_layer_norm_linear_argmax(
         [norm_encoder setBuffer:runtime->layer_norm_bias_buffers[norm_slot] offset:0 atIndex:2];
         [norm_encoder setBuffer:hidden_buffer offset:0 atIndex:3];
         [norm_encoder setBuffer:norm_params_buffer offset:0 atIndex:4];
-        [norm_encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        antfly_metal_dispatch_threads(norm_encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         [norm_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> linear_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_TAIL);
@@ -45755,8 +45740,8 @@ int termite_metal_decode_runtime_apply_layer_norm_linear_argmax(
         [linear_encoder endEncoding];
         if (argmax_rc != 0) return argmax_rc;
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -14;
         uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
         if (result == NULL) return -15;
@@ -45814,7 +45799,7 @@ int termite_metal_decode_runtime_apply_layer_norm_linear(
         [norm_encoder setBuffer:runtime->layer_norm_bias_buffers[norm_slot] offset:0 atIndex:2];
         [norm_encoder setBuffer:hidden_buffer offset:0 atIndex:3];
         [norm_encoder setBuffer:norm_params_buffer offset:0 atIndex:4];
-        [norm_encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        antfly_metal_dispatch_threads(norm_encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         [norm_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> linear_encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_TAIL);
@@ -45827,17 +45812,17 @@ int termite_metal_decode_runtime_apply_layer_norm_linear(
         [linear_encoder setBuffer:output_buffer offset:0 atIndex:3];
         [linear_encoder setBuffer:linear_params_buffer offset:0 atIndex:4];
         if (use_reduce) {
-            [linear_encoder dispatchThreads:MTLSizeMake(out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(linear_encoder, MTLSizeMake(out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
             NSUInteger thread_width = runtime->linear_pipeline.maxTotalThreadsPerThreadgroup;
             if (thread_width == 0) thread_width = 64;
             if (thread_width > out_dim && out_dim > 0) thread_width = out_dim;
-            [linear_encoder dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+            antfly_metal_dispatch_threads(linear_encoder, MTLSizeMake(out_dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
         }
         [linear_encoder endEncoding];
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -14;
         float *result = (float *)output_buffer.contents;
         if (result == NULL) return -15;
@@ -45897,8 +45882,8 @@ int termite_metal_decode_runtime_apply_rms_norm_linear_argmax(
         [linear_encoder endEncoding];
         if (argmax_rc != 0) return argmax_rc;
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -14;
         uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
         if (result == NULL) return -15;
@@ -46100,8 +46085,8 @@ int termite_metal_decode_runtime_encode_rms_norm_linear_argmax_device(
         if (argmax_rc != 0) return argmax_rc;
 
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -16;
     }
 }
@@ -46351,8 +46336,8 @@ int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_argmax_device(
         if (argmax_rc != 0) return argmax_rc;
 
         if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -17;
     }
 }
@@ -46503,8 +46488,8 @@ int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_logits_device(
         if (linear_rc != 0) return linear_rc;
 
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (command_buffer.status != MTLCommandBufferStatusCompleted) return -17;
         }
         *logits_handle = (__bridge void *)runtime->sample_logits_buffer;
@@ -46746,7 +46731,7 @@ static int termite_metal_encode_ple_residual_q8_0_device(
             [gated_encoder setBuffer:ple_buffer offset:ple_offset atIndex:1];
             [gated_encoder setBuffer:gated_buffer offset:0 atIndex:2];
             [gated_encoder setBytes:&activation_params length:sizeof(activation_params) atIndex:3];
-            [gated_encoder dispatchThreads:MTLSizeMake(ple_elems, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_multiply_pipeline, ple_elems), 1, 1)];
+            antfly_metal_dispatch_threads(gated_encoder, MTLSizeMake(ple_elems, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_multiply_pipeline, ple_elems), 1, 1));
             termite_metal_end_scoped_compute_encoder(gated_encoder, gated_encoder_owned);
         }
 
@@ -47186,14 +47171,14 @@ int termite_metal_decode_runtime_whisper_logits_stats_device(
         termite_metal_bind_three_buffers(encoder, logits_buffer, logits_offset, suppress_buffer, 0, runtime->whisper_stats_partials_buffer, 0, params, sizeof(*params));
         [encoder setBuffer:runtime->whisper_grammar_buffer offset:0 atIndex:4];
         [encoder setThreadgroupMemoryLength:14u * 256u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(block_count, 1, 1), MTLSizeMake(256u, 1, 1));
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [encoder setComputePipelineState:runtime->whisper_logits_reduce_pipeline];
         termite_metal_bind_three_buffers(encoder, logits_buffer, logits_offset, runtime->whisper_stats_partials_buffer, 0, runtime->whisper_stats_buffer, 0, params, sizeof(*params));
         [encoder setBytes:&partial_count length:sizeof(partial_count) atIndex:4];
         [encoder setBuffer:runtime->whisper_grammar_buffer offset:0 atIndex:5];
         [encoder setBuffer:runtime->token_buffer offset:0 atIndex:6];
-        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -47286,7 +47271,7 @@ int termite_metal_decode_runtime_embedding_lookup_prepared_device_token(
         NSUInteger thread_width = runtime->embedding_lookup_pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0) thread_width = 64;
         if (thread_width > dim) thread_width = dim;
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return 0;
     }
@@ -47353,7 +47338,7 @@ int termite_metal_decode_runtime_apply_rms_norm_linear(
         [norm_encoder setBuffer:runtime->rms_norm_weight_buffers[norm_slot] offset:0 atIndex:1];
         [norm_encoder setBuffer:hidden_buffer offset:0 atIndex:2];
         [norm_encoder setBuffer:norm_params_buffer offset:0 atIndex:3];
-        [norm_encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        antfly_metal_dispatch_threads(norm_encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         [norm_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> linear_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -47366,17 +47351,17 @@ int termite_metal_decode_runtime_apply_rms_norm_linear(
         [linear_encoder setBuffer:output_buffer offset:0 atIndex:3];
         [linear_encoder setBuffer:linear_params_buffer offset:0 atIndex:4];
         if (use_reduce) {
-            [linear_encoder dispatchThreads:MTLSizeMake(out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(linear_encoder, MTLSizeMake(out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
             NSUInteger thread_width = runtime->linear_pipeline.maxTotalThreadsPerThreadgroup;
             if (thread_width == 0) thread_width = 64;
             if (thread_width > out_dim && out_dim > 0) thread_width = out_dim;
-            [linear_encoder dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+            antfly_metal_dispatch_threads(linear_encoder, MTLSizeMake(out_dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
         }
         [linear_encoder endEncoding];
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -14;
         float *result = (float *)output_buffer.contents;
         if (result == NULL) return -15;
@@ -47431,8 +47416,8 @@ static int termite_metal_decode_runtime_sample_from_logits(
             0.0f
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
         uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
         if (result == NULL) return -9;
@@ -47491,8 +47476,8 @@ int termite_metal_decode_runtime_sample_from_resident_logits(
             final_logit_softcap
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
         uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
         if (result == NULL) return -9;
@@ -47651,7 +47636,7 @@ static int termite_metal_decode_runtime_encode_sample_topk_from_logits_buffer(
         if (entries != NULL) free(entries);
         return -10;
     }
-    [partial_encoder dispatchThreads:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    antfly_metal_dispatch_threads(partial_encoder, MTLSizeMake(block_count, 1, 1), MTLSizeMake(1, 1, 1));
     [partial_encoder endEncoding];
 
     id<MTLComputeCommandEncoder> reduce_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -47661,7 +47646,7 @@ static int termite_metal_decode_runtime_encode_sample_topk_from_logits_buffer(
     }
     [reduce_encoder setComputePipelineState:runtime->sample_topk_reduce_pipeline];
     termite_metal_bind_four_buffers(reduce_encoder, runtime->sample_topk_values_buffer, 0, runtime->sample_topk_ids_buffer, 0, runtime->scratch_buffer, 0, runtime->token_buffer, 0, &reduce_params, sizeof(reduce_params));
-    [reduce_encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    antfly_metal_dispatch_threads(reduce_encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
     [reduce_encoder endEncoding];
     if (entries != NULL) free(entries);
     return 0;
@@ -47786,7 +47771,7 @@ static int termite_metal_decode_runtime_encode_sample_from_logits_buffer(
         }
         [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
         [encoder setThreadgroupMemoryLength:256u * sizeof(uint32_t) atIndex:1];
-        [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(block_count, 1, 1), MTLSizeMake(256, 1, 1));
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         const uint32_t block_count_u32 = (uint32_t)block_count;
         const int reduce_rc = termite_metal_encode_argmax_reduce_on_encoder(
@@ -47847,7 +47832,7 @@ static int termite_metal_decode_runtime_encode_sample_from_logits_buffer(
         if (entries != NULL) free(entries);
         return -10;
     }
-    [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
     [encoder endEncoding];
     if (entries != NULL) free(entries);
     return 0;
@@ -47899,8 +47884,8 @@ int termite_metal_decode_runtime_sample_from_logits_device(
             0.0f
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
         uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
         if (result == NULL) return -9;
@@ -47937,8 +47922,8 @@ int termite_metal_decode_runtime_test_sample_from_logits_device_softcap(
             temperature, 0, top_p, 0.0f, 1.0f, 0.0f, 0.0f,
             NULL, NULL, 0, seed, final_logit_softcap);
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
         const uint32_t *result = (const uint32_t *)runtime->token_buffer.contents;
         if (result == NULL) return -9;
@@ -48008,7 +47993,7 @@ int termite_metal_decode_runtime_apply_layer_norm_linear_sample_device(
         [norm_encoder setBuffer:runtime->layer_norm_bias_buffers[norm_slot] offset:0 atIndex:2];
         [norm_encoder setBuffer:hidden_buffer offset:0 atIndex:3];
         [norm_encoder setBuffer:norm_params_buffer offset:0 atIndex:4];
-        [norm_encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        antfly_metal_dispatch_threads(norm_encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         [norm_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> linear_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -48021,12 +48006,12 @@ int termite_metal_decode_runtime_apply_layer_norm_linear_sample_device(
         [linear_encoder setBuffer:runtime->sample_logits_buffer offset:0 atIndex:3];
         [linear_encoder setBuffer:linear_params_buffer offset:0 atIndex:4];
         if (use_reduce) {
-            [linear_encoder dispatchThreads:MTLSizeMake(out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(linear_encoder, MTLSizeMake(out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
             NSUInteger thread_width = runtime->linear_pipeline.maxTotalThreadsPerThreadgroup;
             if (thread_width == 0) thread_width = 64;
             if (thread_width > out_dim && out_dim > 0) thread_width = out_dim;
-            [linear_encoder dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+            antfly_metal_dispatch_threads(linear_encoder, MTLSizeMake(out_dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
         }
         [linear_encoder endEncoding];
 
@@ -48049,8 +48034,8 @@ int termite_metal_decode_runtime_apply_layer_norm_linear_sample_device(
             0.0f
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -14;
         uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
         if (result == NULL) return -15;
@@ -48118,7 +48103,7 @@ int termite_metal_decode_runtime_apply_rms_norm_linear_sample_device(
         [norm_encoder setBuffer:runtime->rms_norm_weight_buffers[norm_slot] offset:0 atIndex:1];
         [norm_encoder setBuffer:hidden_buffer offset:0 atIndex:2];
         [norm_encoder setBuffer:norm_params_buffer offset:0 atIndex:3];
-        [norm_encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        antfly_metal_dispatch_threads(norm_encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         [norm_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> linear_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -48131,12 +48116,12 @@ int termite_metal_decode_runtime_apply_rms_norm_linear_sample_device(
         [linear_encoder setBuffer:runtime->sample_logits_buffer offset:0 atIndex:3];
         [linear_encoder setBuffer:linear_params_buffer offset:0 atIndex:4];
         if (use_reduce) {
-            [linear_encoder dispatchThreads:MTLSizeMake(out_dim * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(linear_encoder, MTLSizeMake(out_dim * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
             NSUInteger thread_width = runtime->linear_pipeline.maxTotalThreadsPerThreadgroup;
             if (thread_width == 0) thread_width = 64;
             if (thread_width > out_dim && out_dim > 0) thread_width = out_dim;
-            [linear_encoder dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+            antfly_metal_dispatch_threads(linear_encoder, MTLSizeMake(out_dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
         }
         [linear_encoder endEncoding];
 
@@ -48159,8 +48144,8 @@ int termite_metal_decode_runtime_apply_rms_norm_linear_sample_device(
             0.0f
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -14;
         uint32_t *result = (uint32_t *)runtime->token_buffer.contents;
         if (result == NULL) return -15;
@@ -48202,10 +48187,10 @@ int termite_metal_decode_runtime_apply_activation(
         NSUInteger thread_width = runtime->activation_pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0) thread_width = 64;
         if (thread_width > dim && dim > 0) thread_width = dim;
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -48267,7 +48252,7 @@ int termite_metal_decode_runtime_apply_activation_device(
         NSUInteger thread_width = runtime->activation_pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0) thread_width = 64;
         if (thread_width > total && total > 0) thread_width = total;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(thread_width, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -48309,7 +48294,7 @@ int termite_metal_decode_runtime_apply_softmax_device(
         [encoder setComputePipelineState:runtime->softmax_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256, 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -48571,7 +48556,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
             };
             [encoder setComputePipelineState:runtime->moe_route_map_slots_pipeline];
             termite_metal_bind_four_buffers(encoder, runtime->moe_route_ids_buffer, 0, runtime->moe_expert_slot_map_buffers[layer_index], 0, runtime->moe_route_slots_buffer, 0, runtime->moe_route_miss_rows_buffer, 0, &map_params, sizeof(map_params));
-            [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
 
@@ -48588,8 +48573,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
         termite_metal_bind_four_buffers(encoder, input, input_offset, arena, 0, runtime->moe_route_slots_buffer, 0, runtime->moe_slot_gate_buffer, 0, &gate_up, sizeof(gate_up));
         [encoder setBuffer:runtime->moe_slot_up_buffer offset:0 atIndex:5];
         [encoder setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((inter_size + 1u) / 2u, route_rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((inter_size + 1u) / 2u, route_rows, 1), MTLSizeMake(128, 1, 1));
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         termite_metal_apply_activation_params activation = {
@@ -48598,8 +48582,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
         [encoder setComputePipelineState:runtime->activation_multiply_pipeline];
         termite_metal_bind_three_buffers(encoder, runtime->moe_slot_gate_buffer, 0, runtime->moe_slot_up_buffer, 0, runtime->moe_slot_gate_buffer, 0, &activation, sizeof(activation));
         const size_t activation_total = route_rows * inter_size;
-        [encoder dispatchThreads:MTLSizeMake(activation_total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_multiply_pipeline, activation_total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(activation_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_multiply_pipeline, activation_total), 1, 1));
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         termite_metal_moe_slot_q4_0_down_params down = {
@@ -48611,8 +48594,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
         };
         [encoder setComputePipelineState:runtime->moe_slot_q4_0_down_pipeline];
         termite_metal_bind_four_buffers(encoder, runtime->moe_slot_gate_buffer, 0, arena, 0, runtime->moe_route_slots_buffer, 0, runtime->moe_slot_route_output_buffer, 0, &down, sizeof(down));
-        [encoder dispatchThreadgroups:MTLSizeMake((hidden_size + 15u) / 16u, route_rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((hidden_size + 15u) / 16u, route_rows, 1), MTLSizeMake(64, 1, 1));
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         termite_metal_moe_slot_reduce_params reduce = {
@@ -48622,8 +48604,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
         [encoder setComputePipelineState:runtime->moe_slot_reduce_pipeline];
         termite_metal_bind_five_buffers(encoder, runtime->moe_slot_route_output_buffer, 0, runtime->moe_route_ids_buffer, 0, runtime->moe_route_weights_buffer, 0, scale, expert_scale_handle == NULL ? 0 : expert_scale_offset, output, output_offset, &reduce, sizeof(reduce));
         const size_t reduce_total = rows * hidden_size;
-        [encoder dispatchThreads:MTLSizeMake(reduce_total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->moe_slot_reduce_pipeline, reduce_total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(reduce_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->moe_slot_reduce_pipeline, reduce_total), 1, 1));
         termite_metal_concurrent_planned_dependency_barrier(runtime, encoder, encoder_owned);
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         const int rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
@@ -48924,8 +48905,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_selected_pages_device(
                         atIndex:2];
             [encoder setBuffer:zero_id_buffer offset:0 atIndex:3];
             [encoder setBytes:&gate_params length:sizeof(gate_params) atIndex:4];
-            [encoder dispatchThreadgroups:MTLSizeMake((gate_params.out_dim + 7u) / 8u, 1u, 1u)
-                threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((gate_params.out_dim + 7u) / 8u, 1u, 1u), MTLSizeMake(64u, 1u, 1u));
         }
         if (!merged_gate_up) {
             termite_metal_linear_id_params up_params = gate_params;
@@ -48933,8 +48913,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_selected_pages_device(
                 [encoder setBuffer:up_views[route] offset:up_offsets[route] atIndex:1];
                 [encoder setBuffer:runtime->moe_slot_up_buffer offset:route * inter_size * sizeof(float) atIndex:2];
                 [encoder setBytes:&up_params length:sizeof(up_params) atIndex:4];
-                [encoder dispatchThreadgroups:MTLSizeMake((inter_size + 7u) / 8u, 1u, 1u)
-                    threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+                antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((inter_size + 7u) / 8u, 1u, 1u), MTLSizeMake(64u, 1u, 1u));
             }
         }
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -48952,11 +48931,10 @@ int termite_metal_decode_runtime_moe_forward_q4_0_selected_pages_device(
             termite_metal_bind_three_buffers(encoder, runtime->moe_slot_gate_buffer, 0, runtime->moe_slot_up_buffer, 0, runtime->moe_slot_gate_buffer, 0, &activation, sizeof(activation));
         }
         const size_t activation_total = route_rows * inter_size;
-        [encoder dispatchThreads:MTLSizeMake(activation_total, 1u, 1u)
-            threadsPerThreadgroup:MTLSizeMake(
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(activation_total, 1u, 1u), MTLSizeMake(
                 termite_metal_thread_width(merged_gate_up
                     ? runtime->moe_merged_gate_up_activation_pipeline
-                    : runtime->activation_multiply_pipeline, activation_total), 1u, 1u)];
+                    : runtime->activation_multiply_pipeline, activation_total), 1u, 1u));
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         termite_metal_linear_id_params down_params = {
@@ -48978,8 +48956,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_selected_pages_device(
             [encoder setBuffer:runtime->moe_slot_route_output_buffer offset:route * hidden_size * sizeof(float) atIndex:2];
             [encoder setBuffer:zero_id_buffer offset:0 atIndex:3];
             [encoder setBytes:&down_params length:sizeof(down_params) atIndex:4];
-            [encoder dispatchThreadgroups:MTLSizeMake((hidden_size + 7u) / 8u, 1u, 1u)
-                threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((hidden_size + 7u) / 8u, 1u, 1u), MTLSizeMake(64u, 1u, 1u));
         }
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -48991,9 +48968,8 @@ int termite_metal_decode_runtime_moe_forward_q4_0_selected_pages_device(
         };
         [encoder setComputePipelineState:runtime->moe_slot_reduce_pipeline];
         termite_metal_bind_five_buffers(encoder, runtime->moe_slot_route_output_buffer, 0, runtime->moe_route_ids_buffer, 0, runtime->moe_route_weights_buffer, 0, scale, expert_scale_handle == NULL ? 0 : expert_scale_offset, output, output_offset, &reduce, sizeof(reduce));
-        [encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1u, 1u)
-            threadsPerThreadgroup:MTLSizeMake(
-                termite_metal_thread_width(runtime->moe_slot_reduce_pipeline, rows * hidden_size), 1u, 1u)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows * hidden_size, 1u, 1u), MTLSizeMake(
+                termite_metal_thread_width(runtime->moe_slot_reduce_pipeline, rows * hidden_size), 1u, 1u));
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
 
@@ -49366,9 +49342,8 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
                 [encoder setBuffer:runtime->moe_selected_expert_prefetch_scratch_buffer
                     offset:prefetch_scratch_offsets[index] atIndex:2];
                 [encoder setBytes:&params length:sizeof(params) atIndex:3];
-                [encoder dispatchThreads:MTLSizeMake(candidates, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(
-                        termite_metal_thread_width(runtime->mapped_selected_expert_page_touch_pipeline, candidates), 1, 1)];
+                antfly_metal_dispatch_threads(encoder, MTLSizeMake(candidates, 1, 1), MTLSizeMake(
+                        termite_metal_thread_width(runtime->mapped_selected_expert_page_touch_pipeline, candidates), 1, 1));
             }
             termite_metal_concurrent_planned_dependency_barrier(runtime, encoder, encoder_owned);
         }
@@ -49436,11 +49411,10 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
                 ? runtime->q4_0_id_a4b_gate_up_pipeline
                 : runtime->q4_0_id_pipeline];
             termite_metal_bind_four_buffers(encoder, input, input_offset, gate_weight, weight_view_offsets[0], runtime->moe_slot_gate_buffer, 0, runtime->moe_route_ids_buffer, 0, &gate_up, sizeof(gate_up));
-            [encoder dispatchThreadgroups:MTLSizeMake(
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(
                     (inter_size * 2u + 7u) / 8u,
                     route_rows,
-                    1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                    1), MTLSizeMake(64, 1, 1));
             termite_metal_concurrent_planned_dependency_barrier_resource(
                 runtime, encoder, encoder_owned, runtime->moe_slot_gate_buffer);
 
@@ -49479,8 +49453,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
             [encoder setComputePipelineState:runtime->moe_merged_gate_up_activation_pipeline];
             termite_metal_bind_two_buffers(encoder, runtime->moe_slot_gate_buffer, 0, runtime->moe_slot_up_buffer, 0, &activation, sizeof(activation));
             const size_t activation_total = route_rows * inter_size;
-            [encoder dispatchThreads:MTLSizeMake(activation_total, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->moe_merged_gate_up_activation_pipeline, activation_total), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(activation_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->moe_merged_gate_up_activation_pipeline, activation_total), 1, 1));
             runtime->mapped_moe_fused_gate_up_dispatches = termite_metal_u64_saturating_add(
                 runtime->mapped_moe_fused_gate_up_dispatches, 2);
             termite_metal_concurrent_planned_dependency_barrier_resource(
@@ -49495,8 +49468,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
             broadcast.input_strides_for_out[1] = 1u;
             [encoder setComputePipelineState:runtime->broadcast_f32_pipeline];
             termite_metal_bind_two_buffers(encoder, input, input_offset, runtime->moe_slot_route_output_buffer, 0, &broadcast, sizeof(broadcast));
-            [encoder dispatchThreads:MTLSizeMake(route_rows * hidden_size, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->broadcast_f32_pipeline, route_rows * hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(route_rows * hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->broadcast_f32_pipeline, route_rows * hidden_size), 1, 1));
             runtime->mapped_moe_broadcast_dispatches = termite_metal_u64_saturating_add(
                 runtime->mapped_moe_broadcast_dispatches, 1);
             termite_metal_concurrent_planned_dependency_barrier_resource(
@@ -49510,11 +49482,10 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
             };
             [encoder setComputePipelineState:runtime->q4_0_id_pipeline];
             termite_metal_bind_four_buffers(encoder, runtime->moe_slot_route_output_buffer, 0, gate_weight, weight_view_offsets[0], runtime->moe_slot_gate_buffer, 0, runtime->moe_route_ids_buffer, 0, &gate, sizeof(gate));
-            [encoder dispatchThreadgroups:MTLSizeMake(
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(
                     (inter_size + 7u) / 8u,
                     route_rows,
-                    1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                    1), MTLSizeMake(64, 1, 1));
 
             termite_metal_linear_id_params up = {
                 .rows = (uint32_t)route_rows, .in_dim = (uint32_t)hidden_size,
@@ -49525,11 +49496,10 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
             [encoder setBuffer:up_weight offset:weight_view_offsets[1] atIndex:1];
             [encoder setBuffer:runtime->moe_slot_up_buffer offset:0 atIndex:2];
             [encoder setBytes:&up length:sizeof(up) atIndex:4];
-            [encoder dispatchThreadgroups:MTLSizeMake(
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(
                     (inter_size + 7u) / 8u,
                     route_rows,
-                    1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                    1), MTLSizeMake(64, 1, 1));
             id<MTLResource> gate_up_resources[2] = {
                 runtime->moe_slot_gate_buffer,
                 runtime->moe_slot_up_buffer,
@@ -49572,8 +49542,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
             [encoder setComputePipelineState:runtime->activation_multiply_pipeline];
             termite_metal_bind_three_buffers(encoder, runtime->moe_slot_gate_buffer, 0, runtime->moe_slot_up_buffer, 0, runtime->moe_slot_gate_buffer, 0, &activation, sizeof(activation));
             const size_t activation_total = route_rows * inter_size;
-            [encoder dispatchThreads:MTLSizeMake(activation_total, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_multiply_pipeline, activation_total), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(activation_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_multiply_pipeline, activation_total), 1, 1));
             runtime->mapped_moe_split_gate_up_dispatches = termite_metal_u64_saturating_add(
                 runtime->mapped_moe_split_gate_up_dispatches, 3);
             termite_metal_concurrent_planned_dependency_barrier_resource(
@@ -49626,11 +49595,10 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
             ? runtime->q4_0_id_a4b_down_pipeline
             : runtime->q4_0_id_pipeline];
         termite_metal_bind_four_buffers(encoder, (merged_gate_up ? runtime->moe_slot_up_buffer : runtime->moe_slot_gate_buffer), 0, down_weight, weight_view_offsets[2], runtime->moe_slot_route_output_buffer, 0, runtime->moe_route_ids_buffer, 0, &down, sizeof(down));
-        [encoder dispatchThreadgroups:MTLSizeMake(
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(
                 (hidden_size + 7u) / 8u,
                 route_rows,
-                1)
-            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                1), MTLSizeMake(64, 1, 1));
         runtime->mapped_moe_down_dispatches = termite_metal_u64_saturating_add(
             runtime->mapped_moe_down_dispatches, 1);
         termite_metal_concurrent_planned_dependency_barrier_resource(
@@ -49677,8 +49645,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
         [encoder setComputePipelineState:runtime->moe_slot_reduce_pipeline];
         termite_metal_bind_five_buffers(encoder, runtime->moe_slot_route_output_buffer, 0, runtime->moe_route_ids_buffer, 0, runtime->moe_route_weights_buffer, 0, scale, expert_scale_handle == NULL ? 0 : expert_scale_offset, output, output_offset, &reduce, sizeof(reduce));
         const size_t reduce_total = rows * hidden_size;
-        [encoder dispatchThreads:MTLSizeMake(reduce_total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->moe_slot_reduce_pipeline, reduce_total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(reduce_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->moe_slot_reduce_pipeline, reduce_total), 1, 1));
         runtime->mapped_moe_reduce_dispatches = termite_metal_u64_saturating_add(
             runtime->mapped_moe_reduce_dispatches, 1);
         termite_metal_concurrent_planned_dependency_barrier_resource(
@@ -49987,13 +49954,12 @@ static int termite_metal_decode_runtime_select_moe_routes_device_impl(
             [encoder setBuffer:runtime->moe_route_miss_rows_buffer offset:0 atIndex:6];
         }
         if (use_a4b_route_select_tg) {
-            [encoder dispatchThreadgroups:MTLSizeMake(rows, 1u, 1u)
-                threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1u, 1u), MTLSizeMake(32u, 1u, 1u));
         } else {
             NSUInteger width = runtime->moe_route_select_pipeline.maxTotalThreadsPerThreadgroup;
             if (width == 0) width = 64;
             if (width > rows) width = rows;
-            [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(width, 1, 1));
         }
         if (fold_route_map) {
             runtime->a4b_route_slots_fold_valid = 1u;
@@ -50023,7 +49989,7 @@ static int termite_metal_decode_runtime_select_moe_routes_device_impl(
             NSUInteger map_width = runtime->moe_route_map_slots_pipeline.maxTotalThreadsPerThreadgroup;
             if (map_width == 0) map_width = 64;
             if (map_width > rows) map_width = rows;
-            [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(map_width, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(map_width, 1, 1));
         }
         if (!planned_encoder) [encoder endEncoding];
         if (no_host_output) {
@@ -50146,7 +50112,7 @@ int termite_metal_decode_runtime_masked_bce_with_logits_loss_device(
         [encoder setComputePipelineState:runtime->masked_bce_loss_pipeline];
         termite_metal_bind_four_buffers(encoder, logits_buffer, logits_offset, labels_buffer, labels_offset, mask_buffer, mask_offset, output_buffer, output_offset, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -50203,7 +50169,7 @@ int termite_metal_decode_runtime_masked_bce_with_logits_backward_device(
         [encoder setComputePipelineState:runtime->masked_bce_backward_pipeline];
         termite_metal_bind_five_buffers(encoder, logits_buffer, logits_offset, labels_buffer, labels_offset, mask_buffer, mask_offset, upstream_buffer, upstream_offset, output_buffer, output_offset, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -50246,7 +50212,7 @@ int termite_metal_decode_runtime_reduce_last_dim_device(
         [encoder setComputePipelineState:runtime->reduce_last_dim_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256, 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -50295,7 +50261,7 @@ int termite_metal_decode_runtime_nomic_pool_normalize_f32_device(
         [encoder setComputePipelineState:runtime->nomic_pool_normalize_pipeline];
         termite_metal_bind_three_buffers(encoder, hidden_buffer, hidden_offset, mask_slice.buffer, mask_slice.offset, output_buffer, output_offset, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(batch, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch, 1, 1), MTLSizeMake(256, 1, 1));
         [encoder endEncoding];
         return 0;
     }
@@ -50341,7 +50307,7 @@ int termite_metal_decode_runtime_multiply_reduce_last_dim_device(
         [encoder setComputePipelineState:runtime->multiply_reduce_last_dim_pipeline];
         termite_metal_bind_three_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256, 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -50391,8 +50357,7 @@ int termite_metal_decode_runtime_reduce_axis_f32_device(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:runtime->reduce_axis_f32_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(output_elems, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->reduce_axis_f32_pipeline, output_elems), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(output_elems, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->reduce_axis_f32_pipeline, output_elems), 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -50436,8 +50401,7 @@ int termite_metal_decode_runtime_broadcast_last_dim_device(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:runtime->broadcast_last_dim_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(output_total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->broadcast_last_dim_pipeline, output_total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(output_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->broadcast_last_dim_pipeline, output_total), 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -50480,8 +50444,7 @@ int termite_metal_decode_runtime_broadcast_f32_device(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:runtime->broadcast_f32_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(output_elems, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->broadcast_f32_pipeline, output_elems), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(output_elems, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->broadcast_f32_pipeline, output_elems), 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -50537,8 +50500,7 @@ int termite_metal_decode_runtime_gather_axis0_f32_2d_device(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:runtime->gather_axis0_f32_2d_pipeline];
         termite_metal_bind_three_buffers(encoder, input_buffer, input_offset, indices_buffer, indices_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(output_total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->gather_axis0_f32_2d_pipeline, output_total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(output_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->gather_axis0_f32_2d_pipeline, output_total), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -50600,8 +50562,7 @@ int termite_metal_decode_runtime_gather_axis0_add_bias_f32_2d_device(
         if (encoder == nil) return -12;
         [encoder setComputePipelineState:runtime->gather_axis0_add_bias_f32_2d_pipeline];
         termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, bias_buffer, bias_offset, indices_buffer, indices_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(output_total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->gather_axis0_add_bias_f32_2d_pipeline, output_total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(output_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->gather_axis0_add_bias_f32_2d_pipeline, output_total), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -13);
     }
@@ -50658,8 +50619,7 @@ int termite_metal_decode_runtime_concat_lastdim_f32_2d_device(
         if (encoder == nil) return -11;
         [encoder setComputePipelineState:runtime->concat_lastdim_f32_2d_pipeline];
         termite_metal_bind_three_buffers(encoder, a_buffer, a_offset, b_buffer, b_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(output_total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->concat_lastdim_f32_2d_pipeline, output_total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(output_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->concat_lastdim_f32_2d_pipeline, output_total), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
     }
@@ -50758,8 +50718,7 @@ int termite_metal_decode_runtime_gliner_boundary_reduced_linear_device(
         [encoder setBuffer:output offset:output_offset atIndex:dense_f16 ? 3 : 2];
         [encoder setBytes:&params length:sizeof(params) atIndex:dense_f16 ? 4 : 3];
         if (scratch_floats != 0) [encoder setThreadgroupMemoryLength:scratch_floats * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + outputs_per_group - 1) / outputs_per_group, rows, 1)
-                   threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + outputs_per_group - 1) / outputs_per_group, rows, 1), MTLSizeMake(thread_count, 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -16);
     }
@@ -50804,7 +50763,7 @@ int termite_metal_decode_runtime_gliner_boundary_device(
         [encoder setBytes:params length:sizeof(*params) atIndex:11];
         NSUInteger width=termite_metal_thread_width(runtime->gliner_boundary_f32_pipeline,work_items);
         if(simd_groups)width=MIN((NSUInteger)128,runtime->gliner_boundary_f32_pipeline.maxTotalThreadsPerThreadgroup)/32u*32u;
-        [encoder dispatchThreads:MTLSizeMake(work_items,1,1) threadsPerThreadgroup:MTLSizeMake(width,1,1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(work_items,1,1), MTLSizeMake(width,1,1));
         termite_metal_end_scoped_compute_encoder(encoder,encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer,frame_owned,-12);
     }
@@ -50862,8 +50821,7 @@ int termite_metal_decode_runtime_gliner_word_embeddings_f32_device(
         if (encoder == nil) return -11;
         [encoder setComputePipelineState:runtime->gliner_word_embeddings_f32_pipeline];
         termite_metal_bind_three_buffers(encoder, hidden_buffer, hidden_offset, mask_buffer, words_mask_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(output_total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->gliner_word_embeddings_f32_pipeline, output_total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(output_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->gliner_word_embeddings_f32_pipeline, output_total), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
     }
@@ -50921,8 +50879,7 @@ int termite_metal_decode_runtime_gliner_gru_combine_f32_device(
         if (encoder == nil) return -11;
         [encoder setComputePipelineState:runtime->gliner_gru_combine_f32_pipeline];
         termite_metal_bind_four_buffers(encoder, label_buffer, label_offset, gi_buffer, gi_offset, gh_buffer, gh_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->gliner_gru_combine_f32_pipeline, count), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->gliner_gru_combine_f32_pipeline, count), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
     }
@@ -50963,8 +50920,7 @@ int termite_metal_decode_runtime_argmax_axis_f32_device(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:runtime->argmax_axis_f32_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(output_total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->argmax_axis_f32_pipeline, output_total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(output_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->argmax_axis_f32_pipeline, output_total), 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -51005,7 +50961,7 @@ int termite_metal_decode_runtime_cumulative_sum_f32_device(
         if (encoder == nil) return -9;
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_two_buffers(encoder, input, input_offset, output, output_offset, params, sizeof(params));
-        [encoder dispatchThreadgroups:MTLSizeMake(outer * inner, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(outer * inner, 1, 1), MTLSizeMake(256, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -51040,7 +50996,7 @@ int termite_metal_decode_runtime_select_typed_device(termite_metal_decode_runtim
         if (encoder == nil) return -9;
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_four_buffers(encoder, c, cond_offset, t, true_offset, f, false_offset, out, output_offset, params, 37 * sizeof(uint32_t));
-        [encoder dispatchThreads:MTLSizeMake(params[0], 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, params[0]), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(params[0], 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, params[0]), 1, 1));
         if (!planned) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -51064,7 +51020,7 @@ static int termite_metal_decode_runtime_typed_binary_dispatch(termite_metal_deco
         if (encoder == nil) return -9;
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_three_buffers(encoder, input, input_offset, indices, indices_offset, output, output_offset, params, params_count * sizeof(uint32_t));
-        [encoder dispatchThreads:MTLSizeMake(params[0], 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, params[0]), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(params[0], 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, params[0]), 1, 1));
         if (!planned) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -51108,7 +51064,7 @@ int termite_metal_decode_runtime_cast_typed_device(termite_metal_decode_runtime 
         if (encoder == nil) return -9;
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_two_buffers(encoder, input, input_offset, output, output_offset, params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, count), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(count, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, count), 1, 1));
         if (!planned) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -51148,8 +51104,7 @@ int termite_metal_decode_runtime_convert_dtype_f32_device(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:runtime->convert_dtype_f32_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(elem_count, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->convert_dtype_f32_pipeline, elem_count), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(elem_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->convert_dtype_f32_pipeline, elem_count), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -51417,7 +51372,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             [encoder setBuffer:q_buffer offset:q_offset atIndex:0];[encoder setBuffer:k_buffer offset:k_offset atIndex:1];
             [encoder setBuffer:v_buffer offset:v_offset atIndex:2];[encoder setBuffer:vision_packed offset:0 atIndex:3];
             [encoder setBytes:&params length:sizeof(params) atIndex:4];
-            [encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(count,1,1), MTLSizeMake(256,1,1));
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             q_buffer=vision_packed;k_buffer=vision_packed;v_buffer=vision_packed;
             q_offset=0;k_offset=count*sizeof(uint16_t);v_offset=2u*count*sizeof(uint16_t);
@@ -51431,34 +51386,25 @@ int termite_metal_decode_runtime_sdpa_f32_device(
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
         if (use_florence_window_hd32) {
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((seq_len + 1u) * sizeof(float)) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * seq_len, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch * num_heads * seq_len, 1, 1), MTLSizeMake(32u, 1, 1));
         } else if (use_bert_prefill_q8) {
-            [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * (seq_len / 8u), 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch * num_heads * (seq_len / 8u), 1, 1), MTLSizeMake(256u, 1, 1));
         } else if (use_vision_hd64_flash_q32) {
             const size_t query_tile = vision_packed != nil ? 16u : 32u;
-            [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * ((seq_len + query_tile - 1u) / query_tile), 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(vision_packed != nil ? 128u : 256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch * num_heads * ((seq_len + query_tile - 1u) / query_tile), 1, 1), MTLSizeMake(vision_packed != nil ? 128u : 256u, 1, 1));
         } else if (use_vision_hd64_flash_q16) {
-            [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * ((seq_len + 15u) / 16u), 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch * num_heads * ((seq_len + 15u) / 16u), 1, 1), MTLSizeMake(256u, 1, 1));
         } else if (use_vision_hd64_q32) {
-            [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * ((seq_len + 31u) / 32u), 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch * num_heads * ((seq_len + 31u) / 32u), 1, 1), MTLSizeMake(256u, 1, 1));
         } else if (use_vision_hd64_q8) {
-            [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * ((seq_len + 7u) / 8u), 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch * num_heads * ((seq_len + 7u) / 8u), 1, 1), MTLSizeMake(256u, 1, 1));
         } else if (use_nomic_q8) {
-            [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * (seq_len / 8u), 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch * num_heads * (seq_len / 8u), 1, 1), MTLSizeMake(256u, 1, 1));
         } else if (use_tg) {
             [encoder setThreadgroupMemoryLength:tg_scratch_bytes atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(batch * num_heads * seq_len, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch * num_heads * seq_len, 1, 1), MTLSizeMake(tg_width, 1, 1));
         } else {
-            [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->sdpa_f32_pipeline, total), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->sdpa_f32_pipeline, total), 1, 1));
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         const int finish_rc=termite_metal_decode_runtime_finish_command_buffer(command_buffer,frame_owned,-16);
@@ -51557,14 +51503,14 @@ int termite_metal_decode_runtime_sdpa_segments_f32_device(
         termite_metal_bind_seven_buffers_only(encoder, q_buffer, q_offset, k_buffer, k_offset, v_buffer, v_offset, staged_slice.buffer, staged_slice.offset, staged_slice.buffer, staged_slice.offset + query_at, staged_slice.buffer, staged_slice.offset + key_at, output_buffer, output_offset);
         [encoder setBytes:&params length:sizeof(params) atIndex:7];
         if (use_blocks) {
-            [encoder dispatchThreadgroups:MTLSizeMake((queries + query_block - 1u) / query_block, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(query_block * 16u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((queries + query_block - 1u) / query_block, num_heads, 1), MTLSizeMake(query_block * 16u, 1, 1));
         } else if (use_wide) {
-            [encoder dispatchThreadgroups:MTLSizeMake((queries + 7u) / 8u, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(128u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((queries + 7u) / 8u, num_heads, 1), MTLSizeMake(128u, 1, 1));
         } else if (use_tiled) {
-            [encoder dispatchThreadgroups:MTLSizeMake((queries + 31u) / 32u, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(128u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((queries + 31u) / 32u, num_heads, 1), MTLSizeMake(128u, 1, 1));
         } else {
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((256u + width) * sizeof(float)) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(queries * num_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(queries * num_heads, 1, 1), MTLSizeMake(width, 1, 1));
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
@@ -51644,7 +51590,7 @@ int termite_metal_decode_runtime_sdpa_grouped_f32_device(
             [encoder setComputePipelineState:pipeline];
             termite_metal_bind_seven_buffers_only(encoder, q_buffer, q_offset, k_buffer, k_offset, v_buffer, v_offset, metadata.buffer, metadata.offset, metadata.buffer, metadata.offset + query_at, metadata.buffer, metadata.offset + key_at, output_buffer, output_offset);
             [encoder setBytes:&p length:sizeof(p) atIndex:7];
-            [encoder dispatchThreadgroups:MTLSizeMake((queries + bq - 1) / bq, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(short_range ? 32 : bq * 16, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((queries + bq - 1) / bq, num_heads, 1), MTLSizeMake(short_range ? 32 : bq * 16, 1, 1));
             termite_metal_end_scoped_compute_encoder(encoder, owned);
             return termite_metal_decode_runtime_finish_command_buffer(cb, frame_owned, -11);
         }
@@ -51666,7 +51612,7 @@ int termite_metal_decode_runtime_sdpa_grouped_f32_device(
         const uint32_t kv_tile[2] = { 0, 0 };
         [pack setBytes:kv_tile length:sizeof(kv_tile) atIndex:7];
         const size_t pack_values = kv_bytes / sizeof(float);
-        [pack dispatchThreads:MTLSizeMake(pack_values, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->sdpa_f32_grouped_pack_pipeline, pack_values), 1, 1)];
+        antfly_metal_dispatch_threads(pack, MTLSizeMake(pack_values, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->sdpa_f32_grouped_pack_pipeline, pack_values), 1, 1));
         termite_metal_end_scoped_compute_encoder(pack, pack_owned);
         for (size_t q0 = 0; q0 < queries;) {
             if (check_fn(check_ctx) != 0) return -12;
@@ -51696,7 +51642,7 @@ int termite_metal_decode_runtime_sdpa_grouped_f32_device(
             [query setComputePipelineState:runtime->sdpa_f32_grouped_pack_pipeline];
             [query setBuffer:q_buffer offset:q_offset atIndex:0]; [query setBuffer:k_buffer offset:k_offset atIndex:1]; [query setBuffer:v_buffer offset:v_offset atIndex:2];
             [query setBuffer:workspace offset:0 atIndex:3]; [query setBuffer:workspace offset:k_at atIndex:4]; [query setBuffer:workspace offset:v_at atIndex:5]; [query setBytes:&p length:sizeof(p) atIndex:6]; [query setBytes:query_tile_params length:sizeof(query_tile_params) atIndex:7];
-            [query dispatchThreads:MTLSizeMake(nt * hidden, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->sdpa_f32_grouped_pack_pipeline, nt * hidden), 1, 1)];
+            antfly_metal_dispatch_threads(query, MTLSizeMake(nt * hidden, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->sdpa_f32_grouped_pack_pipeline, nt * hidden), 1, 1));
             termite_metal_end_scoped_compute_encoder(query, query_owned);
             // Dense envelopes admit one batched operation. Partial envelopes
             // borrow compact K/V with a per-KV encode: MPS batched kernels can
@@ -51717,7 +51663,7 @@ int termite_metal_decode_runtime_sdpa_grouped_f32_device(
                 MPSMatrix *km = [[MPSMatrix alloc] initWithBuffer:workspace offset:k_at + (kh * keys + lo) * head_dim * sizeof(float) descriptor:kd];
                 MPSMatrix *sm = [[MPSMatrix alloc] initWithBuffer:workspace offset:score_at + kh * folded_rows * score_stride * sizeof(float) descriptor:st];
                 if (qm == nil || km == nil || sm == nil) return -10;
-                [qk encodeToCommandBuffer:cb leftMatrix:qm rightMatrix:km resultMatrix:sm];
+                antfly_metal_encode_matrix(qk, cb, qm, km, sm);
             }
             qk.batchSize = 1; // Cached plans are also used by scalar callers.
             // MPS transitions close the compute encoder and clear its access
@@ -51732,7 +51678,7 @@ int termite_metal_decode_runtime_sdpa_grouped_f32_device(
             uint32_t tiles[5] = { (uint32_t)nt, (uint32_t)nt, (uint32_t)lo, (uint32_t)span, (uint32_t)score_stride };
             [soft setComputePipelineState:runtime->sdpa_f32_grouped_softmax_pipeline];
             termite_metal_bind_four_buffers(soft, workspace, score_at, metadata.buffer, metadata.offset, metadata.buffer, metadata.offset + query_at, metadata.buffer, metadata.offset + key_at, &p, sizeof(p)); [soft setBytes:tiles length:sizeof(tiles) atIndex:5];
-            [soft dispatchThreadgroups:MTLSizeMake(nt, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            antfly_metal_dispatch_threadgroups(soft, MTLSizeMake(nt, num_heads, 1), MTLSizeMake(256, 1, 1));
             termite_metal_end_scoped_compute_encoder(soft, soft_owned);
             termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
             pv.batchStart = 0; pv.batchSize = matrix_count;
@@ -51741,7 +51687,7 @@ int termite_metal_decode_runtime_sdpa_grouped_f32_device(
                 MPSMatrix *vm = [[MPSMatrix alloc] initWithBuffer:workspace offset:v_at + (kh * keys + lo) * head_dim * sizeof(float) descriptor:kd];
                 MPSMatrix *om = [[MPSMatrix alloc] initWithBuffer:workspace offset:tile_at + kh * folded_rows * head_dim * sizeof(float) descriptor:qt];
                 if (sm == nil || vm == nil || om == nil) return -10;
-                [pv encodeToCommandBuffer:cb leftMatrix:sm rightMatrix:vm resultMatrix:om];
+                antfly_metal_encode_matrix(pv, cb, sm, vm, om);
             }
             pv.batchSize = 1;
             if (!frame_owned) runtime->active_frame_mps_dense_linear_count += 2 * encodes;
@@ -51751,7 +51697,7 @@ int termite_metal_decode_runtime_sdpa_grouped_f32_device(
             id<MTLComputeCommandEncoder> unpack = termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &unpack_owned);
             if (unpack == nil) return -8;
             [unpack setComputePipelineState:runtime->sdpa_f32_grouped_unpack_pipeline]; termite_metal_bind_two_buffers(unpack, workspace, tile_at, output_buffer, output_offset, &p, sizeof(p)); [unpack setBytes:tiles length:sizeof(tiles) atIndex:3];
-            [unpack dispatchThreads:MTLSizeMake(nt * hidden, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->sdpa_f32_grouped_unpack_pipeline, nt * hidden), 1, 1)];
+            antfly_metal_dispatch_threads(unpack, MTLSizeMake(nt * hidden, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->sdpa_f32_grouped_unpack_pipeline, nt * hidden), 1, 1));
             termite_metal_end_scoped_compute_encoder(unpack, unpack_owned);
             q0 += nt;
         }
@@ -51778,7 +51724,7 @@ static int termite_metal_decode_runtime_masked_mean_rows_impl(termite_metal_deco
         if (encoder == nil) return -6;
         uint32_t p[4] = { (uint32_t)rows, (uint32_t)width, (uint32_t)dimensions, (uint32_t)active };
         [encoder setComputePipelineState:runtime->masked_mean_rows_pipeline]; [encoder setBuffer:input offset:input_offset atIndex:0]; [encoder setBuffer:staged.buffer offset:staged.offset atIndex:1]; [encoder setBuffer:output offset:output_offset atIndex:2]; [encoder setBytes:p length:sizeof(p) atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(dimensions, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->masked_mean_rows_pipeline, dimensions), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dimensions, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->masked_mean_rows_pipeline, dimensions), 1, 1));
         if (normalize) {
             id<MTLResource> resource = output;
             [encoder memoryBarrierWithResources:&resource count:1];
@@ -51788,7 +51734,7 @@ static int termite_metal_decode_runtime_masked_mean_rows_impl(termite_metal_deco
             [encoder setBytes:&count length:sizeof(count) atIndex:1];
             size_t threads = 256;
             while (threads > runtime->normalize_embedding_pipeline.maxTotalThreadsPerThreadgroup) threads /= 2;
-            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(threads, 1, 1));
         }
         termite_metal_end_scoped_compute_encoder(encoder, owned);
         return termite_metal_decode_runtime_finish_command_buffer(cb, frame_owned, -7);
@@ -51820,7 +51766,7 @@ int antfly_metal_compose_rows(termite_metal_decode_runtime *runtime, void *wrapp
         const uint32_t p[2] = { (uint32_t)rows, (uint32_t)width };
         [encoder setComputePipelineState:runtime->compose_rows_pipeline];
         termite_metal_bind_four_buffers(encoder, wrappers, wrappers_handle ? wrappers_offset : media_offset, media, media_offset, staged.buffer, staged.offset, output, output_offset, p, sizeof(p));
-        [encoder dispatchThreads:MTLSizeMake(rows * width, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->compose_rows_pipeline, rows * width), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows * width, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->compose_rows_pipeline, rows * width), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, owned);
         return termite_metal_decode_runtime_finish_command_buffer(cb, frame_owned, -7);
     }
@@ -51845,7 +51791,7 @@ int antfly_metal_masked_mean_batch(termite_metal_decode_runtime *runtime, void *
         if (encoder == nil) return -6;
         uint32_t p[4] = { (uint32_t)rows, (uint32_t)width, (uint32_t)dimensions, (uint32_t)batch | (segmented ? 0x80000000u : 0u) };
         [encoder setComputePipelineState:runtime->masked_mean_batch_pipeline]; [encoder setBuffer:input offset:input_offset atIndex:0]; [encoder setBuffer:staged.buffer offset:staged.offset atIndex:1]; [encoder setBuffer:output offset:output_offset atIndex:2]; [encoder setBytes:p length:sizeof(p) atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(batch * dimensions, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->masked_mean_batch_pipeline, dimensions), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(batch * dimensions, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->masked_mean_batch_pipeline, dimensions), 1, 1));
         if (normalize) {
             id<MTLResource> resource = output;
             [encoder memoryBarrierWithResources:&resource count:1];
@@ -51855,7 +51801,7 @@ int antfly_metal_masked_mean_batch(termite_metal_decode_runtime *runtime, void *
             [encoder setBytes:&count length:sizeof(count) atIndex:1];
             size_t threads = 256;
             while (threads > runtime->normalize_embedding_pipeline.maxTotalThreadsPerThreadgroup) threads /= 2;
-            [encoder dispatchThreadgroups:MTLSizeMake(batch, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(batch, 1, 1), MTLSizeMake(threads, 1, 1));
         }
         termite_metal_end_scoped_compute_encoder(encoder, owned);
         return termite_metal_decode_runtime_finish_command_buffer(cb, frame_owned, -7);
@@ -51951,7 +51897,7 @@ int termite_metal_decode_runtime_segment_training_attention_v1(
         [encoder setBuffer:scratch_buffer offset:lse_at atIndex:3];
         [encoder setBytes:params length:sizeof(*params) atIndex:4];
         [encoder setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
-        [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+        antfly_metal_dispatch_threadgroups(encoder, groups, threads);
         if (params->backward != 0) {
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             const size_t delta_at = lse_at + stats_bytes;
@@ -51959,13 +51905,13 @@ int termite_metal_decode_runtime_segment_training_attention_v1(
             termite_metal_bind_seven_buffers_only(encoder, qkv_buffer, qkv_offset, control_buffer, control_offset, dout_buffer, dout_offset, scratch_buffer, scratch_offset, scratch_buffer, lse_at, scratch_buffer, delta_at, output_buffer, output_offset);
             [encoder setBytes:params length:sizeof(*params) atIndex:7];
             [encoder setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
-            [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+            antfly_metal_dispatch_threadgroups(encoder, groups, threads);
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [encoder setComputePipelineState:runtime->segment_training_attention_dkdv_pipeline];
             termite_metal_bind_seven_buffers_only(encoder, qkv_buffer, qkv_offset, control_buffer, control_offset, dout_buffer, dout_offset, scratch_buffer, lse_at, scratch_buffer, delta_at, output_buffer, output_offset + rows_bytes, output_buffer, output_offset + 2u * rows_bytes);
             [encoder setBytes:params length:sizeof(*params) atIndex:7];
             [encoder setThreadgroupMemoryLength:pair_bytes atIndex:0];
-            [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+            antfly_metal_dispatch_threadgroups(encoder, groups, threads);
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
@@ -52062,7 +52008,7 @@ int termite_metal_decode_runtime_segment_training_attention_flash_v1(
         else [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBuffer:scratch_buffer offset:lse_at atIndex:3];
         [encoder setBytes:params length:sizeof(*params) atIndex:4];
-        [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+        antfly_metal_dispatch_threadgroups(encoder, groups, threads);
         if (params->backward != 0) {
             const size_t delta_at = lse_at + stats_bytes;
             if (split_encoders) {
@@ -52075,7 +52021,7 @@ int termite_metal_decode_runtime_segment_training_attention_flash_v1(
             [encoder setComputePipelineState:runtime->segment_training_attention_flash_dq_pipeline];
             termite_metal_bind_seven_buffers_only(encoder, qkv_buffer, qkv_offset, control_buffer, control_offset, dout_buffer, dout_offset, scratch_buffer, scratch_offset, scratch_buffer, lse_at, scratch_buffer, delta_at, output_buffer, output_offset);
             [encoder setBytes:params length:sizeof(*params) atIndex:7];
-            [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+            antfly_metal_dispatch_threadgroups(encoder, groups, threads);
             if (split_encoders) {
                 termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
                 encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
@@ -52086,7 +52032,7 @@ int termite_metal_decode_runtime_segment_training_attention_flash_v1(
             [encoder setComputePipelineState:runtime->segment_training_attention_flash_dkdv_pipeline];
             termite_metal_bind_seven_buffers_only(encoder, qkv_buffer, qkv_offset, control_buffer, control_offset, dout_buffer, dout_offset, scratch_buffer, lse_at, scratch_buffer, delta_at, output_buffer, output_offset + rows_bytes, output_buffer, output_offset + 2u * rows_bytes);
             [encoder setBytes:params length:sizeof(*params) atIndex:7];
-            [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+            antfly_metal_dispatch_threadgroups(encoder, groups, threads);
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
@@ -52288,8 +52234,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
                     [pack_encoder setBuffer:packed_relative_buffer offset:0 atIndex:5];
                     [pack_encoder setBytes:&params length:sizeof(params) atIndex:6];
                     const size_t pack_count = total > packed_relative_count ? total : packed_relative_count;
-                    [pack_encoder dispatchThreads:MTLSizeMake(pack_count, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->deberta_attention_pack_f32_pipeline, pack_count), 1, 1)];
+                    antfly_metal_dispatch_threads(pack_encoder, MTLSizeMake(pack_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->deberta_attention_pack_f32_pipeline, pack_count), 1, 1));
                     termite_metal_end_scoped_compute_encoder(pack_encoder, pack_encoder_owned);
 
                     MPSMatrixDescriptor *token_desc = [MPSMatrixDescriptor matrixDescriptorWithRows:seq_len
@@ -52327,8 +52272,8 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
                     runtime->deberta_cc_mps_mm.batchSize = batch_heads;
                     runtime->deberta_relative_mps_mm.batchStart = 0;
                     runtime->deberta_relative_mps_mm.batchSize = batch_heads;
-                    [runtime->deberta_cc_mps_mm encodeToCommandBuffer:command_buffer leftMatrix:packed_q rightMatrix:packed_k resultMatrix:cc];
-                    [runtime->deberta_relative_mps_mm encodeToCommandBuffer:command_buffer leftMatrix:packed_q rightMatrix:packed_relative resultMatrix:c2p];
+                    antfly_metal_encode_matrix(runtime->deberta_cc_mps_mm, command_buffer, packed_q, packed_k, cc);
+                    antfly_metal_encode_matrix(runtime->deberta_relative_mps_mm, command_buffer, packed_q, packed_relative, c2p);
 
                     BOOL accumulate_encoder_owned = YES;
                     id<MTLComputeCommandEncoder> accumulate_encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &accumulate_encoder_owned);
@@ -52338,8 +52283,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
                     [accumulate_encoder setBuffer:c2p_buffer offset:0 atIndex:1];
                     [accumulate_encoder setBuffer:relative_index_buffer offset:relative_index_offset atIndex:2];
                     [accumulate_encoder setBytes:&params length:sizeof(params) atIndex:3];
-                    [accumulate_encoder dispatchThreads:MTLSizeMake(cc_score_count, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->deberta_relative_score_accumulate_f32_pipeline, cc_score_count), 1, 1)];
+                    antfly_metal_dispatch_threads(accumulate_encoder, MTLSizeMake(cc_score_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->deberta_relative_score_accumulate_f32_pipeline, cc_score_count), 1, 1));
                     termite_metal_end_scoped_compute_encoder(accumulate_encoder, accumulate_encoder_owned);
 
                     params.reserved2 = 1u;
@@ -52354,10 +52298,9 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
                     [relative_pack_encoder setBuffer:packed_k_buffer offset:0 atIndex:4];
                     [relative_pack_encoder setBuffer:packed_relative_buffer offset:0 atIndex:5];
                     [relative_pack_encoder setBytes:&params length:sizeof(params) atIndex:6];
-                    [relative_pack_encoder dispatchThreads:MTLSizeMake(packed_relative_count, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->deberta_attention_pack_f32_pipeline, packed_relative_count), 1, 1)];
+                    antfly_metal_dispatch_threads(relative_pack_encoder, MTLSizeMake(packed_relative_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->deberta_attention_pack_f32_pipeline, packed_relative_count), 1, 1));
                     termite_metal_end_scoped_compute_encoder(relative_pack_encoder, relative_pack_encoder_owned);
-                    [runtime->deberta_relative_mps_mm encodeToCommandBuffer:command_buffer leftMatrix:packed_k rightMatrix:packed_relative resultMatrix:p2c];
+                    antfly_metal_encode_matrix(runtime->deberta_relative_mps_mm, command_buffer, packed_k, packed_relative, p2c);
 
                     BOOL softmax_encoder_owned = YES;
                     id<MTLComputeCommandEncoder> softmax_encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &softmax_encoder_owned);
@@ -52373,8 +52316,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
                     [softmax_encoder setBuffer:relative_index_buffer offset:relative_index_offset atIndex:7];
                     const NSUInteger softmax_width = 64u;
                     [softmax_encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((seq_len + softmax_width) * sizeof(float)) atIndex:0];
-                    [softmax_encoder dispatchThreadgroups:MTLSizeMake(seq_len, num_heads, batch)
-                               threadsPerThreadgroup:MTLSizeMake(softmax_width, 1, 1)];
+                    antfly_metal_dispatch_threadgroups(softmax_encoder, MTLSizeMake(seq_len, num_heads, batch), MTLSizeMake(softmax_width, 1, 1));
                     runtime->deberta_attention_gemm_calls += 1;
                     termite_metal_end_scoped_compute_encoder(softmax_encoder, softmax_encoder_owned);
                     return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
@@ -52406,8 +52348,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
             const NSUInteger flash_query_block = 4u;
             const NSUInteger scratch_floats = flash_query_block * seq_len + flash_query_block + flash_query_block * flash_width;
             [flash_encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(scratch_floats * sizeof(float)) atIndex:0];
-            [flash_encoder dispatchThreadgroups:MTLSizeMake((seq_len + flash_query_block - 1u) / flash_query_block, num_heads, batch)
-                       threadsPerThreadgroup:MTLSizeMake(flash_width, 1, 1)];
+            antfly_metal_dispatch_threadgroups(flash_encoder, MTLSizeMake((seq_len + flash_query_block - 1u) / flash_query_block, num_heads, batch), MTLSizeMake(flash_width, 1, 1));
             runtime->deberta_attention_flash_calls += 1;
             termite_metal_end_scoped_compute_encoder(flash_encoder, flash_encoder_owned);
             return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
@@ -52449,18 +52390,15 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
                     };
                     [gemm_encoder setComputePipelineState:runtime->deberta_relative_score_gemm_f32_pipeline];
                     termite_metal_bind_five_buffers(gemm_encoder, q_buffer, q_offset, k_buffer, k_offset, q_r_buffer, q_r_offset, k_r_buffer, k_r_offset, cc_buffer, 0, &score_params, sizeof(score_params));
-                    [gemm_encoder dispatchThreads:MTLSizeMake(cc_score_count, 1, 1)
-                           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->deberta_relative_score_gemm_f32_pipeline, cc_score_count), 1, 1)];
+                    antfly_metal_dispatch_threads(gemm_encoder, MTLSizeMake(cc_score_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->deberta_relative_score_gemm_f32_pipeline, cc_score_count), 1, 1));
                     score_params.mode = 1;
                     [gemm_encoder setBuffer:c2p_buffer offset:0 atIndex:4];
                     [gemm_encoder setBytes:&score_params length:sizeof(score_params) atIndex:5];
-                    [gemm_encoder dispatchThreads:MTLSizeMake(rel_score_count, 1, 1)
-                           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->deberta_relative_score_gemm_f32_pipeline, rel_score_count), 1, 1)];
+                    antfly_metal_dispatch_threads(gemm_encoder, MTLSizeMake(rel_score_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->deberta_relative_score_gemm_f32_pipeline, rel_score_count), 1, 1));
                     score_params.mode = 2;
                     [gemm_encoder setBuffer:p2c_buffer offset:0 atIndex:4];
                     [gemm_encoder setBytes:&score_params length:sizeof(score_params) atIndex:5];
-                    [gemm_encoder dispatchThreads:MTLSizeMake(rel_score_count, 1, 1)
-                           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->deberta_relative_score_gemm_f32_pipeline, rel_score_count), 1, 1)];
+                    antfly_metal_dispatch_threads(gemm_encoder, MTLSizeMake(rel_score_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->deberta_relative_score_gemm_f32_pipeline, rel_score_count), 1, 1));
                     [gemm_encoder setComputePipelineState:runtime->deberta_relative_score_softmax_pv_f32_pipeline];
                     [gemm_encoder setBuffer:cc_buffer offset:0 atIndex:0];
                     [gemm_encoder setBuffer:c2p_buffer offset:0 atIndex:1];
@@ -52471,8 +52409,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
                     [gemm_encoder setBytes:&params length:sizeof(params) atIndex:6];
                     const NSUInteger softmax_width = 64u;
                     [gemm_encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((seq_len + softmax_width) * sizeof(float)) atIndex:0];
-                    [gemm_encoder dispatchThreadgroups:MTLSizeMake(seq_len, num_heads, batch)
-                           threadsPerThreadgroup:MTLSizeMake(softmax_width, 1, 1)];
+                    antfly_metal_dispatch_threadgroups(gemm_encoder, MTLSizeMake(seq_len, num_heads, batch), MTLSizeMake(softmax_width, 1, 1));
                     runtime->deberta_attention_gemm_calls += 1;
                     termite_metal_end_scoped_compute_encoder(gemm_encoder, gemm_encoder_owned);
                     return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
@@ -52500,8 +52437,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
             [tg_encoder setBuffer:relative_index_buffer offset:relative_index_offset atIndex:8];
             const NSUInteger tg_width = 64u;
             [tg_encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((seq_len + tg_width) * sizeof(float)) atIndex:0];
-            [tg_encoder dispatchThreadgroups:MTLSizeMake(seq_len, num_heads, batch)
-                       threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+            antfly_metal_dispatch_threadgroups(tg_encoder, MTLSizeMake(seq_len, num_heads, batch), MTLSizeMake(tg_width, 1, 1));
             runtime->deberta_attention_legacy_calls += 1;
             termite_metal_end_scoped_compute_encoder(tg_encoder, tg_encoder_owned);
             return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
@@ -52513,8 +52449,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
         termite_metal_bind_seven_buffers_only(encoder, q_buffer, q_offset, k_buffer, k_offset, v_buffer, v_offset, q_r_buffer, q_r_offset, k_r_buffer, k_r_offset, mask_buffer, mask_offset, output_buffer, output_offset);
         [encoder setBytes:&params length:sizeof(params) atIndex:7];
         [encoder setBuffer:relative_index_buffer offset:relative_index_offset atIndex:8];
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->disentangled_relative_attention_f32_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->disentangled_relative_attention_f32_pipeline, total), 1, 1));
         runtime->deberta_attention_legacy_calls += 1;
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
@@ -53059,10 +52994,10 @@ int termite_metal_decode_runtime_deberta_training_attention_v1_dispatch(
         }
         [encoder setBytes:p length:sizeof(*p) atIndex:lengths[p->phase]];
         if (p->phase <= 2) {
-            [encoder dispatchThreads:MTLSizeMake(p->count, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(p->count, 1, 1), MTLSizeMake(threads, 1, 1));
         } else {
             [encoder setThreadgroupMemoryLength:784 atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(p->phase == 7 ? p->group_count : p->count, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(p->phase == 7 ? p->group_count : p->count, 1, 1), MTLSizeMake(threads, 1, 1));
         }
         [encoder endEncoding];
         const int rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, true, -4);
@@ -53176,7 +53111,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_backward_f32_de
             [enc setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((2u * seq_len + width) * sizeof(float)) atIndex:0];
             // One threadgroup per (head, batch, query-row): qi comes from grid.z so
             // the S query rows run concurrently instead of a serial per-TG loop.
-            [enc dispatchThreadgroups:MTLSizeMake(num_heads, batch, seq_len) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            antfly_metal_dispatch_threadgroups(enc, MTLSizeMake(num_heads, batch, seq_len), MTLSizeMake(width, 1, 1));
             termite_metal_end_scoped_compute_encoder(enc, owned);
         }
         // K2: dV[b,j,h,d] = sum_i p[b,h,i,j] dO[b,i,h,d].
@@ -53192,7 +53127,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_backward_f32_de
             [enc setComputePipelineState:runtime->disentangled_relative_attention_bwd_dv_f32_pipeline];
             [enc setBuffer:p_scratch offset:0 atIndex:0]; [enc setBuffer:d_out_buffer offset:d_out_offset atIndex:1]; [enc setBuffer:dv_buffer offset:dv_offset atIndex:2];
             [enc setBytes:&params length:sizeof(params) atIndex:3];
-            [enc dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->disentangled_relative_attention_bwd_dv_f32_pipeline, total), 1, 1)];
+            antfly_metal_dispatch_threads(enc, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->disentangled_relative_attention_bwd_dv_f32_pipeline, total), 1, 1));
             termite_metal_end_scoped_compute_encoder(enc, owned);
         }
         // K3: dQ (mode 0) then dK (mode 1).
@@ -53215,7 +53150,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_backward_f32_de
             [enc setBuffer:dscore_scratch offset:0 atIndex:0]; [enc setBuffer:q_buffer offset:q_offset atIndex:1]; [enc setBuffer:k_buffer offset:k_offset atIndex:2];
             [enc setBuffer:q_r_buffer offset:q_r_offset atIndex:3]; [enc setBuffer:k_r_buffer offset:k_r_offset atIndex:4]; [enc setBuffer:out_buffer offset:out_offset atIndex:5];
             [enc setBytes:&mp length:sizeof(mp) atIndex:6];
-            [enc dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->disentangled_relative_attention_bwd_dq_dk_f32_pipeline, total), 1, 1)];
+            antfly_metal_dispatch_threads(enc, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->disentangled_relative_attention_bwd_dq_dk_f32_pipeline, total), 1, 1));
             termite_metal_end_scoped_compute_encoder(enc, owned);
         }
         // K4: dQ_r / dK_r (gather over batch + Toeplitz diagonal).
@@ -53232,7 +53167,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_backward_f32_de
             if (enc == nil) return -16;
             [enc setComputePipelineState:runtime->disentangled_relative_attention_bwd_dqr_dkr_f32_pipeline];
             termite_metal_bind_five_buffers(enc, dscore_scratch, 0, q_buffer, q_offset, k_buffer, k_offset, dq_r_buffer, dq_r_offset, dk_r_buffer, dk_r_offset, &params, sizeof(params));
-            [enc dispatchThreads:MTLSizeMake(rel_total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->disentangled_relative_attention_bwd_dqr_dkr_f32_pipeline, rel_total), 1, 1)];
+            antfly_metal_dispatch_threads(enc, MTLSizeMake(rel_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->disentangled_relative_attention_bwd_dqr_dkr_f32_pipeline, rel_total), 1, 1));
             termite_metal_end_scoped_compute_encoder(enc, owned);
         }
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
@@ -53334,12 +53269,11 @@ int termite_metal_decode_runtime_transpose_f32_device(
             [encoder setComputePipelineState:runtime->transpose_last2_tiled_f32_pipeline];
             termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &tp, sizeof(tp));
             MTLSize grid = MTLSizeMake((t_cols + 31u) / 32u, (t_rows + 31u) / 32u, t_batch);
-            [encoder dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(32, 32, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, grid, MTLSizeMake(32, 32, 1));
         } else {
             [encoder setComputePipelineState:runtime->transpose_f32_pipeline];
             termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->transpose_f32_pipeline, total), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->transpose_f32_pipeline, total), 1, 1));
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
@@ -53422,12 +53356,12 @@ int termite_metal_decode_runtime_gemm_f32_device(
         MPSMatrixMultiplication *mm = termite_metal_decode_runtime_cached_gemm_mps_mm(
             runtime, m, n, k, transpose_left, transpose_right, alpha, beta);
         if (left == nil || right == nil || result == nil || mm == nil) {
-            if (frame_owned) [command_buffer commit];
+            if (frame_owned) antfly_metal_commit(command_buffer);
             return -9;
         }
         mm.batchStart = 0;
         mm.batchSize = batch;
-        [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
+        antfly_metal_encode_matrix(mm, command_buffer, left, right, result);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
 }
@@ -53503,7 +53437,7 @@ int termite_metal_decode_runtime_dot_general_2d_f32_device(
             MPSMatrix *result = [[MPSMatrix alloc] initWithBuffer:output_buffer offset:output_offset descriptor:result_desc];
             MPSMatrixMultiplication *mm = termite_metal_decode_runtime_cached_dot_general_mps_mm(runtime, m, n, k, rhs_contract_axis);
             if (left != nil && right != nil && result != nil && mm != nil) {
-                [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
+                antfly_metal_encode_matrix(mm, command_buffer, left, right, result);
                 return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
             }
         }
@@ -53543,8 +53477,7 @@ int termite_metal_decode_runtime_dot_general_2d_f32_device(
                 }
             }
             [encoder setThreadgroupMemoryLength:64u * tile_width * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake((n + 15u) / 16u, (m + 3u) / 4u, 1)
-                   threadsPerThreadgroup:MTLSizeMake(tile_width, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((n + 15u) / 16u, (m + 3u) / 4u, 1), MTLSizeMake(tile_width, 1, 1));
         } else if (use_small_m_rows4_cols8) {
             NSUInteger tile_width = 32u;
             const char *tile_width_env = getenv("TERMITE_METAL_DOT_GENERAL_SMALL_M_ROWS4_COLS8_WIDTH");
@@ -53556,8 +53489,7 @@ int termite_metal_decode_runtime_dot_general_2d_f32_device(
                 }
             }
             [encoder setThreadgroupMemoryLength:32u * tile_width * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake((n + 7u) / 8u, (m + 3u) / 4u, 1)
-                   threadsPerThreadgroup:MTLSizeMake(tile_width, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((n + 7u) / 8u, (m + 3u) / 4u, 1), MTLSizeMake(tile_width, 1, 1));
         } else if (use_small_m_rows4_cols4) {
             NSUInteger tile_width = 16u;
             const char *tile_width_env = getenv("TERMITE_METAL_DOT_GENERAL_SMALL_M_ROWS4_COLS4_WIDTH");
@@ -53569,8 +53501,7 @@ int termite_metal_decode_runtime_dot_general_2d_f32_device(
                 }
             }
             [encoder setThreadgroupMemoryLength:16u * tile_width * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake((n + 3u) / 4u, (m + 3u) / 4u, 1)
-                   threadsPerThreadgroup:MTLSizeMake(tile_width, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((n + 3u) / 4u, (m + 3u) / 4u, 1), MTLSizeMake(tile_width, 1, 1));
         } else if (use_small_m_tile) {
             NSUInteger tile_width = 32u;
             const char *tile_width_env = getenv("TERMITE_METAL_DOT_GENERAL_SMALL_M_TILE_WIDTH");
@@ -53582,14 +53513,12 @@ int termite_metal_decode_runtime_dot_general_2d_f32_device(
                 }
             }
             [encoder setThreadgroupMemoryLength:8u * tile_width * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake((n + 7u) / 8u, m, 1)
-                   threadsPerThreadgroup:MTLSizeMake(tile_width, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((n + 7u) / 8u, m, 1), MTLSizeMake(tile_width, 1, 1));
         } else if (use_reduce) {
             [encoder setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(32u, 1, 1));
         } else {
-            [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->dot_general_2d_f32_pipeline, total), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->dot_general_2d_f32_pipeline, total), 1, 1));
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
@@ -53684,8 +53613,7 @@ int termite_metal_decode_runtime_gliner_boundary_packed_qkv_device(
         [encoder setComputePipelineState:runtime->dense_qkv_split_bias_pipeline];
         termite_metal_bind_seven_buffers_only(encoder, scratch_buffer, scratch_offset, q_bias_buffer, q_bias_offset, k_bias_buffer, k_bias_offset, v_bias_buffer, v_bias_offset, q_output_buffer, q_output_offset, k_output_buffer, k_output_offset, v_output_buffer, v_output_offset);
         [encoder setBytes:&params length:sizeof(params) atIndex:7];
-        [encoder dispatchThreads:MTLSizeMake(rows * total_out, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->dense_qkv_split_bias_pipeline, rows * total_out), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows * total_out, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->dense_qkv_split_bias_pipeline, rows * total_out), 1, 1));
         [encoder endEncoding];
         return 0;
     }
@@ -53792,8 +53720,7 @@ int termite_metal_decode_runtime_gliner_boundary_fused_ffn_device(
         [activation_encoder setBuffer:first_product_buffer offset:first_product_offset atIndex:2];
         [activation_encoder setBytes:&activation_params length:sizeof(activation_params) atIndex:3];
         const size_t activation_total = rows * intermediate;
-        [activation_encoder dispatchThreads:MTLSizeMake(activation_total, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->gliner_boundary_ffn_bias_gelu_exact_pipeline, activation_total), 1, 1)];
+        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(activation_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->gliner_boundary_ffn_bias_gelu_exact_pipeline, activation_total), 1, 1));
         [activation_encoder endEncoding];
 
         rc = termite_metal_decode_runtime_dot_general_2d_f32_device(
@@ -53828,7 +53755,7 @@ int termite_metal_decode_runtime_gliner_boundary_fused_ffn_device(
         [norm_encoder setBuffer:output_buffer offset:output_offset atIndex:5];
         [norm_encoder setBytes:&norm_params length:sizeof(norm_params) atIndex:6];
         const NSUInteger norm_width = MIN((NSUInteger)128, norm_pipeline.maxTotalThreadsPerThreadgroup) / 32u * 32u;
-        [norm_encoder dispatchThreads:MTLSizeMake(rows * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(norm_width, 1, 1)];
+        antfly_metal_dispatch_threads(norm_encoder, MTLSizeMake(rows * 32u, 1, 1), MTLSizeMake(norm_width, 1, 1));
         [norm_encoder endEncoding];
         return 0;
     }
@@ -53912,7 +53839,7 @@ int termite_metal_decode_runtime_dot_general_2d_many_f32_device(
             MPSMatrix *right = [[MPSMatrix alloc] initWithBuffer:rhs_buffers[i] offset:rhs_offsets[i] descriptor:right_desc];
             MPSMatrix *result = [[MPSMatrix alloc] initWithBuffer:output_buffers[i] offset:output_offsets[i] descriptor:result_desc];
             if (left == nil || right == nil || result == nil) return -12;
-            [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
+            antfly_metal_encode_matrix(mm, command_buffer, left, right, result);
         }
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -13);
     }
@@ -53972,13 +53899,12 @@ int termite_metal_decode_runtime_dot_general_rank1_f32_device(
         if (use_outer) {
             [encoder setComputePipelineState:runtime->dot_general_rank1_outer_f32_pipeline];
             termite_metal_bind_three_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->dot_general_rank1_outer_f32_pipeline, total), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->dot_general_rank1_outer_f32_pipeline, total), 1, 1));
         } else {
             [encoder setComputePipelineState:runtime->dot_general_rank1_reduce_f32_pipeline];
             termite_metal_bind_three_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, &params, sizeof(params));
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(256u * sizeof(float)) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(m, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(m, 1, 1), MTLSizeMake(256u, 1, 1));
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
@@ -54074,21 +54000,19 @@ int termite_metal_decode_runtime_lora_linear_f32_device(
             termite_metal_bind_seven_buffers_only(encoder, input_buffer, input_offset, base_buffer, base_offset, lora_a_buffer, lora_a_offset, lora_b_buffer, lora_b_offset, after_a_buffer, after_a_offset, after_b_buffer, after_b_offset, output_buffer, output_offset);
             [encoder setBytes:&params length:sizeof(params) atIndex:7];
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(256u * sizeof(float)) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
             termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
             return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
         }
         [encoder setComputePipelineState:runtime->lora_after_a_f32_pipeline];
         termite_metal_bind_three_buffers(encoder, input_buffer, input_offset, lora_a_buffer, lora_a_offset, after_a_buffer, after_a_offset, &params, sizeof(params));
         const size_t total_after_a = rows * rank;
-        [encoder dispatchThreads:MTLSizeMake(total_after_a, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->lora_after_a_f32_pipeline, total_after_a), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_after_a, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->lora_after_a_f32_pipeline, total_after_a), 1, 1));
         termite_metal_concurrent_planned_dependency_barrier(runtime, encoder, encoder_owned);
         [encoder setComputePipelineState:runtime->lora_finish_f32_pipeline];
         termite_metal_bind_five_buffers(encoder, base_buffer, base_offset, after_a_buffer, after_a_offset, lora_b_buffer, lora_b_offset, after_b_buffer, after_b_offset, output_buffer, output_offset, &params, sizeof(params));
         const size_t total_output = rows * out_dim;
-        [encoder dispatchThreads:MTLSizeMake(total_output, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->lora_finish_f32_pipeline, total_output), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_output, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->lora_finish_f32_pipeline, total_output), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
     }
@@ -54181,19 +54105,17 @@ int termite_metal_decode_runtime_lora_backward_f32_device(
         const size_t total_grad_b = out_dim * rank;
         [encoder setComputePipelineState:runtime->lora_grad_b_f32_pipeline];
         termite_metal_bind_three_buffers(encoder, output_grad_buffer, output_grad_offset, after_a_buffer, after_a_offset, grad_b_buffer, grad_b_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(total_grad_b, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->lora_grad_b_f32_pipeline, total_grad_b), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_grad_b, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->lora_grad_b_f32_pipeline, total_grad_b), 1, 1));
         const size_t total_after_a = rows * rank;
         [encoder setComputePipelineState:runtime->lora_grad_after_a_f32_pipeline];
         termite_metal_bind_three_buffers(encoder, output_grad_buffer, output_grad_offset, lora_b_buffer, lora_b_offset, grad_after_a_buffer, grad_after_a_offset, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(256u * sizeof(float)) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(total_after_a, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(total_after_a, 1, 1), MTLSizeMake(256u, 1, 1));
         termite_metal_concurrent_planned_dependency_barrier(runtime, encoder, encoder_owned);
         const size_t total_grad_a = rank * in_dim;
         [encoder setComputePipelineState:runtime->lora_grad_a_f32_pipeline];
         termite_metal_bind_three_buffers(encoder, grad_after_a_buffer, grad_after_a_offset, input_buffer, input_offset, grad_a_buffer, grad_a_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(total_grad_a, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->lora_grad_a_f32_pipeline, total_grad_a), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_grad_a, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->lora_grad_a_f32_pipeline, total_grad_a), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -54271,13 +54193,12 @@ int termite_metal_decode_runtime_lora_backward_b_f32_device(
         const size_t total_grad_b = rank * out_dim;
         [encoder setComputePipelineState:runtime->lora_grad_b_transposed_f32_pipeline];
         termite_metal_bind_three_buffers(encoder, output_grad_buffer, output_grad_offset, after_a_buffer, after_a_offset, grad_b_transposed_buffer, grad_b_transposed_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(total_grad_b, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->lora_grad_b_transposed_f32_pipeline, total_grad_b), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total_grad_b, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->lora_grad_b_transposed_f32_pipeline, total_grad_b), 1, 1));
         const size_t total_after_a = rows * rank;
         [encoder setComputePipelineState:runtime->lora_grad_after_a_f32_pipeline];
         termite_metal_bind_three_buffers(encoder, output_grad_buffer, output_grad_offset, lora_b_buffer, lora_b_offset, grad_after_a_buffer, grad_after_a_offset, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(256u * sizeof(float)) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(total_after_a, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(total_after_a, 1, 1), MTLSizeMake(256u, 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -54370,12 +54291,11 @@ int termite_metal_decode_runtime_lora_backward_rank1_f32_device(
         [encoder setComputePipelineState:runtime->lora_rank1_grad_b_after_a_f32_pipeline];
         termite_metal_bind_five_buffers(encoder, output_grad_buffer, output_grad_offset, after_a_buffer, after_a_offset, lora_b_buffer, lora_b_offset, grad_b_buffer, grad_b_offset, grad_after_a_buffer, grad_after_a_offset, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(256u * sizeof(float)) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(total_fused, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(total_fused, 1, 1), MTLSizeMake(256u, 1, 1));
         termite_metal_concurrent_planned_dependency_barrier(runtime, encoder, encoder_owned);
         [encoder setComputePipelineState:runtime->lora_grad_a_f32_pipeline];
         termite_metal_bind_three_buffers(encoder, grad_after_a_buffer, grad_after_a_offset, input_buffer, input_offset, grad_a_buffer, grad_a_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(in_dim, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->lora_grad_a_f32_pipeline, in_dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(in_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->lora_grad_a_f32_pipeline, in_dim), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -54434,8 +54354,7 @@ int termite_metal_decode_runtime_dot_general_batched_f32_device(
         if (encoder == nil) return -8;
         [encoder setComputePipelineState:runtime->dot_general_batched_f32_pipeline];
         termite_metal_bind_three_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->dot_general_batched_f32_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->dot_general_batched_f32_pipeline, total), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
     }
@@ -54495,8 +54414,7 @@ int termite_metal_decode_runtime_scatter_add_axis0_f32_device(
         if (thread_width == 0u || thread_width > 256u) thread_width = 256u;
         if (thread_width > dim) thread_width = dim;
         [encoder setThreadgroupMemoryLength:(thread_width + 1u) * sizeof(uint32_t) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(out_rows, (dim + thread_width - 1u) / thread_width, 1)
-           threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_rows, (dim + thread_width - 1u) / thread_width, 1), MTLSizeMake(thread_width, 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
     }
@@ -54551,8 +54469,7 @@ int termite_metal_decode_runtime_conv1d_f32_device(
         if (encoder == nil) return -11;
         [encoder setComputePipelineState:runtime->conv1d_f32_pipeline];
         termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, weight_buffer, weight_offset, bias_buffer, bias_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->conv1d_f32_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->conv1d_f32_pipeline, total), 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
     }
@@ -54610,8 +54527,7 @@ int termite_metal_decode_runtime_conv1d_im2col_f32_device(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:runtime->conv1d_im2col_f32_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->conv1d_im2col_f32_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->conv1d_im2col_f32_pipeline, total), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -54678,10 +54594,9 @@ int termite_metal_decode_runtime_conv2d_f32_device(
         const bool matrix = tiled && runtime->audio_conv_matrix_pipeline != nil && runtime->audio_conv_matrix_pipeline.threadExecutionWidth==32 && runtime->audio_conv_matrix_pipeline.maxTotalThreadsPerThreadgroup>=128 && !termite_metal_env_flag_enabled(getenv("ANTFLY_EMBEDDINGGEMMA2_METAL_TILED_CONV"));
         [encoder setComputePipelineState:matrix ? runtime->audio_conv_matrix_pipeline : tiled ? runtime->audio_conv_tiled_pipeline : runtime->conv2d_f32_pipeline];
         termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, weight_buffer, weight_offset, bias_buffer, bias_offset, output_buffer, output_offset, &params, sizeof(params));
-        if(matrix) [encoder dispatchThreadgroups:MTLSizeMake((out_h*out_w+15)/16,(out_channels+15)/16,batch) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
-        else if(tiled) [encoder dispatchThreadgroups:MTLSizeMake((out_h*out_w+15)/16,(out_channels+15)/16,batch) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
-        else [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->conv2d_f32_pipeline, total), 1, 1)];
+        if(matrix) antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_h*out_w+15)/16,(out_channels+15)/16,batch), MTLSizeMake(128,1,1));
+        else if(tiled) antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_h*out_w+15)/16,(out_channels+15)/16,batch), MTLSizeMake(16,16,1));
+        else antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->conv2d_f32_pipeline, total), 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -15);
     }
@@ -54733,7 +54648,7 @@ int termite_metal_decode_runtime_apply_gelu_backward_device(
         if (encoder == nil) return -9;
         [encoder setComputePipelineState:runtime->gelu_backward_pipeline];
         termite_metal_bind_three_buffers(encoder, input_buffer, input_offset, upstream_grad_buffer, upstream_grad_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->gelu_backward_pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->gelu_backward_pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -54780,7 +54695,7 @@ int termite_metal_decode_runtime_apply_activation_multiply_device(
         NSUInteger thread_width = runtime->activation_multiply_pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0) thread_width = 64;
         if (thread_width > total && total > 0) thread_width = total;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(thread_width, 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
     }
@@ -54820,10 +54735,10 @@ int termite_metal_decode_runtime_apply_add(
         NSUInteger thread_width = runtime->add_pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0) thread_width = 64;
         if (thread_width > dim && dim > 0) thread_width = dim;
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -54864,8 +54779,7 @@ int termite_metal_decode_runtime_training_accumulate_f32(
         if (encoder == nil) return -7;
         [encoder setComputePipelineState:runtime->training_accumulate_pipeline];
         termite_metal_bind_two_buffers(encoder, accum_buffer, accum_offset, grad_buffer, grad_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(elem_count, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_accumulate_pipeline, elem_count), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(elem_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->training_accumulate_pipeline, elem_count), 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
     }
@@ -54926,8 +54840,7 @@ int termite_metal_decode_runtime_training_adamw_f32(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:runtime->training_adamw_pipeline];
         termite_metal_bind_four_buffers(encoder, weight_buffer, weight_offset, grad_buffer, grad_offset, m_buffer, m_offset, v_buffer, v_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(elem_count, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_adamw_pipeline, elem_count), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(elem_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->training_adamw_pipeline, elem_count), 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -55014,8 +54927,7 @@ int termite_metal_decode_runtime_training_adamw_many_f32(
                 .reserved2 = 0u,
             };
             termite_metal_bind_four_buffers(encoder, weight_buffer, weight_offsets[idx], grad_buffer, grad_offsets[idx], m_buffer, m_offsets[idx], v_buffer, v_offsets[idx], &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(elem_count, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_adamw_pipeline, elem_count), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(elem_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->training_adamw_pipeline, elem_count), 1, 1));
         }
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
@@ -55078,8 +54990,7 @@ int termite_metal_decode_runtime_training_accumulate_into_many_f32(
                        atIndex:1];
             [encoder setBuffer:output_buffer offset:output[idx].offset atIndex:2];
             [encoder setBytes:&params length:sizeof(params) atIndex:3];
-            [encoder dispatchThreads:MTLSizeMake(elem_count, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_accumulate_into_pipeline, elem_count), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(elem_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->training_accumulate_into_pipeline, elem_count), 1, 1));
         }
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
@@ -55155,8 +55066,7 @@ int termite_metal_decode_runtime_training_adamw_into_many_f32(
             }
             [encoder setBytes:&params length:sizeof(params) atIndex:7];
             [encoder setBuffer:(__bridge id<MTLBuffer>)flag.handle offset:flag.offset atIndex:8];
-            [encoder dispatchThreads:MTLSizeMake(elem_count, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_adamw_into_pipeline, elem_count), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(elem_count, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->training_adamw_into_pipeline, elem_count), 1, 1));
         }
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
@@ -55193,7 +55103,7 @@ int termite_metal_decode_runtime_training_sumsq_f32(
         if (encoder == nil) return -7;
         [encoder setComputePipelineState:runtime->training_sumsq_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
     }
@@ -55255,7 +55165,7 @@ int termite_metal_decode_runtime_training_sumsq_many_f32(
                 .reserved2 = 0u,
             };
             termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset + idx * sizeof(float), &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         }
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
@@ -55314,7 +55224,7 @@ int termite_metal_decode_runtime_layer_norm_backward_f32(
         [encoder setComputePipelineState:runtime->layer_norm_bwd_dx_pipeline];
         termite_metal_bind_five_buffers(encoder, input_buffer, input_offset, gamma_buffer, gamma_offset, dy_buffer, dy_offset, output_buffer, output_offset, stats, 0, &params, sizeof(params));
         [encoder setThreadgroupMemoryLength:256u * 2u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(width, 1, 1));
 
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -55326,16 +55236,16 @@ int termite_metal_decode_runtime_layer_norm_backward_f32(
         if (partial != nil) {
             [encoder setComputePipelineState:runtime->layer_norm_bwd_dgdb_partial_pipeline];
             termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, dy_buffer, dy_offset, stats, 0, partial, 0, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, chunks, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, chunks, 1), MTLSizeMake(width, 1, 1));
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [encoder setComputePipelineState:runtime->layer_norm_bwd_dgdb_reduce_pipeline];
             termite_metal_bind_two_buffers(encoder, partial, 0, output_buffer, output_offset, &params, sizeof(params));
             [encoder setBytes:&chunks length:sizeof(chunks) atIndex:3];
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(width, 1, 1));
         } else {
             [encoder setComputePipelineState:runtime->layer_norm_bwd_dgdb_pipeline];
             termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, dy_buffer, dy_offset, stats, 0, output_buffer, output_offset, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(width, 1, 1));
         }
 
         [encoder endEncoding];
@@ -55397,7 +55307,7 @@ int termite_metal_decode_runtime_apply_add_device(
         NSUInteger thread_width = runtime->add_pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0) thread_width = 64;
         if (thread_width > dim && dim > 0) thread_width = dim;
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -55500,8 +55410,7 @@ static int termite_metal_decode_runtime_ffn_gelu_backward_rank1_branches_device(
         [encoder setBuffer:upstream_output_buffer offset:upstream_output_offset atIndex:7];
         [encoder setBuffer:gelu_output_buffer offset:gelu_output_offset atIndex:8];
         [encoder setBytes:&params length:sizeof(params) atIndex:9];
-        [encoder dispatchThreads:MTLSizeMake(intermediate_elems, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->ffn_gelu_backward_rank1_branches_pipeline, intermediate_elems), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(intermediate_elems, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->ffn_gelu_backward_rank1_branches_pipeline, intermediate_elems), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -18);
     }
@@ -55585,8 +55494,7 @@ static int termite_metal_decode_runtime_ffn_gelu_backward_rank1_first_branch_dev
         [encoder setComputePipelineState:runtime->ffn_gelu_backward_rank1_first_branch_pipeline];
         termite_metal_bind_seven_buffers_only(encoder, first_lhs_buffer, first_lhs_offset, first_rhs_buffer, first_rhs_offset, second_output_buffer, second_output_offset, gelu_input_buffer, gelu_input_offset, first_output_buffer, first_output_offset, upstream_output_buffer, upstream_output_offset, gelu_output_buffer, gelu_output_offset);
         [encoder setBytes:&params length:sizeof(params) atIndex:7];
-        [encoder dispatchThreads:MTLSizeMake(intermediate_elems, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->ffn_gelu_backward_rank1_first_branch_pipeline, intermediate_elems), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(intermediate_elems, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->ffn_gelu_backward_rank1_first_branch_pipeline, intermediate_elems), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -16);
     }
@@ -55724,8 +55632,7 @@ int termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
             [encoder setBuffer:gelu_output_buffer offset:gelu_output_offset atIndex:5];
             [encoder setBytes:&params length:sizeof(params) atIndex:6];
         }
-        [encoder dispatchThreads:MTLSizeMake(intermediate_elems, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(second_k == 1 ? runtime->ffn_gelu_backward_rank1_output_pipeline : runtime->ffn_gelu_backward_rank1_first_output_pipeline, intermediate_elems), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(intermediate_elems, 1, 1), MTLSizeMake(termite_metal_thread_width(second_k == 1 ? runtime->ffn_gelu_backward_rank1_output_pipeline : runtime->ffn_gelu_backward_rank1_first_output_pipeline, intermediate_elems), 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -19);
         if (finish_rc != 0) return finish_rc;
@@ -55978,7 +55885,7 @@ int termite_metal_decode_runtime_apply_add_device_rhs_repeat(
         if (encoder == nil) return -9;
         [encoder setComputePipelineState:runtime->add_pipeline];
         termite_metal_bind_three_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -56104,7 +56011,7 @@ int termite_metal_decode_runtime_apply_add_scale_device(
         [encoder setComputePipelineState:runtime->add_scale_pipeline];
         termite_metal_bind_three_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, &params, sizeof(params));
         [encoder setBytes:&scale length:sizeof(scale) atIndex:4];
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_scale_pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_scale_pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -56165,7 +56072,7 @@ int termite_metal_decode_runtime_apply_scaled_add_scale_device(
         [encoder setComputePipelineState:runtime->scaled_add_scale_pipeline];
         termite_metal_bind_three_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, &params, sizeof(params));
         [encoder setBytes:scales length:sizeof(scales) atIndex:4];
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->scaled_add_scale_pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->scaled_add_scale_pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -56222,7 +56129,7 @@ int termite_metal_decode_runtime_apply_multiply_add_device(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:runtime->multiply_add_pipeline];
         termite_metal_bind_four_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, addend_buffer, addend_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_add_pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->multiply_add_pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -56284,7 +56191,7 @@ int termite_metal_decode_runtime_apply_multiply_add2_device(
         if (encoder == nil) return -11;
         [encoder setComputePipelineState:runtime->multiply_add2_pipeline];
         termite_metal_bind_five_buffers(encoder, lhs0_buffer, lhs0_offset, rhs0_buffer, rhs0_offset, lhs1_buffer, lhs1_offset, rhs1_buffer, rhs1_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_add2_pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->multiply_add2_pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
     }
@@ -56348,7 +56255,7 @@ static int termite_metal_decode_runtime_apply_binary_device_typed(
         if (encoder == nil) return -9;
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_three_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -56479,7 +56386,7 @@ int termite_metal_decode_runtime_apply_divide_device_rhs_repeat(
         if (encoder == nil) return -9;
         [encoder setComputePipelineState:runtime->divide_pipeline];
         termite_metal_bind_three_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->divide_pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->divide_pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -56609,7 +56516,7 @@ int termite_metal_decode_runtime_apply_where_select_device_broadcast(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:runtime->where_select_pipeline];
         termite_metal_bind_four_buffers(encoder, cond_buffer, cond_offset, true_buffer, true_offset, false_buffer, false_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->where_select_pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->where_select_pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
@@ -56649,10 +56556,10 @@ int termite_metal_decode_runtime_apply_multiply(
         NSUInteger thread_width = runtime->multiply_pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0) thread_width = 64;
         if (thread_width > dim && dim > 0) thread_width = dim;
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -56715,7 +56622,7 @@ int termite_metal_decode_runtime_apply_multiply_device(
         NSUInteger thread_width = runtime->multiply_pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0) thread_width = 64;
         if (thread_width > dim && dim > 0) thread_width = dim;
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(thread_width, 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -56775,7 +56682,7 @@ int termite_metal_decode_runtime_apply_multiply_device_rhs_repeat(
         if (encoder == nil) return -9;
         [encoder setComputePipelineState:runtime->multiply_pipeline];
         termite_metal_bind_three_buffers(encoder, lhs_buffer, lhs_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, &params, sizeof(params));
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
@@ -56822,7 +56729,7 @@ int termite_metal_decode_runtime_apply_scale_device(
         if (encoder == nil) return -7;
         [encoder setComputePipelineState:runtime->scale_pipeline];
         termite_metal_bind_two_buffers(encoder, input_buffer, input_offset, output_buffer, output_offset, &scale, sizeof(scale));
-        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->scale_pipeline, dim), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(dim, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->scale_pipeline, dim), 1, 1));
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
     }
@@ -56897,9 +56804,9 @@ static int termite_metal_decode_runtime_gemma4_audio_dispatch(
         }
         [encoder setBytes:params length:params_bytes atIndex:(NSUInteger)binding_count];
         if (threadgroup_width != 0) {
-            [encoder dispatchThreadgroups:MTLSizeMake(threads, grid_y, 1) threadsPerThreadgroup:MTLSizeMake(threadgroup_width, 1, 1)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(threads, grid_y, 1), MTLSizeMake(threadgroup_width, 1, 1));
         } else {
-            [encoder dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, threads), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(threads, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, threads), 1, 1));
         }
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
@@ -57238,7 +57145,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tern
             if (encoder == nil) return -10;
             [encoder setComputePipelineState:runtime->rms_norm_pipeline];
             termite_metal_bind_four_buffers_only(encoder, current_buffer, 0, runtime->rms_norm_weight_buffers[attention_pre_linear_rms_norm_slot], 0, tmp_a, 0, params_buffer, 0);
-            [encoder dispatchThreads:MTLSizeMake(attention_input_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, attention_input_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(attention_input_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, attention_input_size), 1, 1));
             [encoder endEncoding];
             current_buffer = tmp_a;
         }
@@ -57252,7 +57159,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tern
             if (encoder == nil) return -12;
             [encoder setComputePipelineState:TERMITE_METAL_TERNARY_ATTENTION_PIPELINE(runtime)];
             termite_metal_bind_four_buffers_only(encoder, current_buffer, 0, weight_buffer, runtime->quant_linear_weight_offsets[attention_linear_slot], projected_buffer, 0, params_buffer, 0);
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_TERNARY_ATTENTION_PIPELINE(runtime), hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_TERNARY_ATTENTION_PIPELINE(runtime), hidden_size), 1, 1));
             [encoder endEncoding];
             current_buffer = projected_buffer;
         }
@@ -57265,7 +57172,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tern
             if (encoder == nil) return -14;
             [encoder setComputePipelineState:runtime->rms_norm_pipeline];
             termite_metal_bind_four_buffers_only(encoder, current_buffer, 0, runtime->rms_norm_weight_buffers[attention_post_linear_rms_norm_slot], 0, tmp_b, 0, params_buffer, 0);
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, hidden_size), 1, 1));
             [encoder endEncoding];
             current_buffer = tmp_b;
         }
@@ -57278,7 +57185,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tern
             if (encoder == nil) return -16;
             [encoder setComputePipelineState:runtime->add_pipeline];
             termite_metal_bind_four_buffers_only(encoder, current_buffer, 0, residual_buffer, 0, output_buffer, 0, params_buffer, 0);
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1));
             [encoder endEncoding];
         }
         return 0;
@@ -57332,7 +57239,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_i2_s
             if (encoder == nil) return -12;
             [encoder setComputePipelineState:runtime->rms_norm_pipeline];
             termite_metal_bind_three_buffers(encoder, current_buffer, 0, runtime->rms_norm_weight_buffers[attention_pre_linear_rms_norm_slot], 0, tmp_a, 0, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(attention_input_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, attention_input_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(attention_input_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, attention_input_size), 1, 1));
             [encoder endEncoding];
             current_buffer = tmp_a;
         }
@@ -57348,7 +57255,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_i2_s
             if (encoder == nil) return -14;
             [encoder setComputePipelineState:runtime->i2_s_pipeline];
             termite_metal_bind_three_buffers(encoder, current_buffer, 0, attention_view.weight_buffer, attention_view.weight_offset, projected_buffer, 0, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->i2_s_pipeline, hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->i2_s_pipeline, hidden_size), 1, 1));
             [encoder endEncoding];
             current_buffer = projected_buffer;
         }
@@ -57359,7 +57266,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_i2_s
             if (encoder == nil) return -16;
             [encoder setComputePipelineState:runtime->rms_norm_pipeline];
             termite_metal_bind_three_buffers(encoder, current_buffer, 0, runtime->rms_norm_weight_buffers[attention_post_linear_rms_norm_slot], 0, tmp_b, 0, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, hidden_size), 1, 1));
             [encoder endEncoding];
             current_buffer = tmp_b;
         }
@@ -57370,7 +57277,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_i2_s
             if (encoder == nil) return -18;
             [encoder setComputePipelineState:runtime->add_pipeline];
             termite_metal_bind_three_buffers(encoder, current_buffer, 0, residual_buffer, residual_offset, output_buffer, 0, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1));
             [encoder endEncoding];
         }
         return 0;
@@ -57733,7 +57640,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q5_k
             if (encoder == nil) return -12;
             [encoder setComputePipelineState:runtime->rms_norm_pipeline];
             termite_metal_bind_three_buffers(encoder, current_buffer, 0, runtime->rms_norm_weight_buffers[attention_pre_linear_rms_norm_slot], 0, tmp_a, 0, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(attention_input_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, attention_input_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(attention_input_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, attention_input_size), 1, 1));
             [encoder endEncoding];
             current_buffer = tmp_a;
         }
@@ -57749,7 +57656,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q5_k
             if (encoder == nil) return -13;
             [encoder setComputePipelineState:runtime->q5_k_pipeline];
             termite_metal_bind_three_buffers(encoder, current_buffer, 0, attention_view.weight_buffer, attention_view.weight_offset, projected_buffer, 0, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->q5_k_pipeline, hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->q5_k_pipeline, hidden_size), 1, 1));
             [encoder endEncoding];
             current_buffer = projected_buffer;
         }
@@ -57760,7 +57667,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q5_k
             if (encoder == nil) return -14;
             [encoder setComputePipelineState:runtime->rms_norm_pipeline];
             termite_metal_bind_three_buffers(encoder, current_buffer, 0, runtime->rms_norm_weight_buffers[attention_post_linear_rms_norm_slot], 0, tmp_b, 0, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, hidden_size), 1, 1));
             [encoder endEncoding];
             current_buffer = tmp_b;
         }
@@ -57771,7 +57678,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q5_k
             if (encoder == nil) return -15;
             [encoder setComputePipelineState:runtime->add_pipeline];
             termite_metal_bind_three_buffers(encoder, current_buffer, 0, residual_buffer, residual_offset, output_buffer, 0, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1));
             [encoder endEncoding];
         }
         return 0;
@@ -57939,7 +57846,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q8_0
             if (encoder == nil) return -15;
             [encoder setComputePipelineState:runtime->add_pipeline];
             termite_metal_bind_three_buffers(encoder, current_buffer, 0, residual_buffer, residual_offset, output_buffer, 0, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows * hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1));
             [encoder endEncoding];
         }
         return 0;
@@ -57980,8 +57887,8 @@ int termite_metal_decode_runtime_apply_attention_residual_ternary_slot(
             runtime, command_buffer, input_buffer, attention_pre_linear_rms_norm_slot, attention_linear_slot, attention_post_linear_rms_norm_slot, residual_buffer, attention_input_size, hidden_size, eps, output_buffer
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
         if (!output_borrowed) memcpy(output, output_buffer.contents, hidden_bytes);
         return 0;
@@ -58018,8 +57925,8 @@ int termite_metal_decode_runtime_apply_attention_residual_i2_s_slot(
             runtime, command_buffer, input_buffer, attention_pre_linear_rms_norm_slot, attention_linear_slot, attention_post_linear_rms_norm_slot, residual_buffer, 0, attention_input_size, hidden_size, eps, output_buffer
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -58057,8 +57964,8 @@ int termite_metal_decode_runtime_apply_attention_residual_q4_k_slot(
             runtime, command_buffer, input_buffer, attention_pre_linear_rms_norm_slot, attention_linear_slot, attention_post_linear_rms_norm_slot, residual_buffer, 0, 1, attention_input_size, hidden_size, eps, output_buffer
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -58096,8 +58003,8 @@ int termite_metal_decode_runtime_apply_attention_residual_q5_k_slot(
             runtime, command_buffer, input_buffer, attention_pre_linear_rms_norm_slot, attention_linear_slot, attention_post_linear_rms_norm_slot, residual_buffer, 0, attention_input_size, hidden_size, eps, output_buffer
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -58135,8 +58042,8 @@ int termite_metal_decode_runtime_apply_attention_residual_q8_0_slot(
             runtime, command_buffer, input_buffer, attention_pre_linear_rms_norm_slot, attention_linear_slot, attention_post_linear_rms_norm_slot, residual_buffer, 0, 1, attention_input_size, hidden_size, eps, output_buffer
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -58370,8 +58277,8 @@ int termite_metal_decode_runtime_apply_attention_span_residual_ternary_slot(
             );
         }
         if (rc == 0) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
         }
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
@@ -58438,8 +58345,8 @@ int termite_metal_decode_runtime_apply_attention_span_residual_i2_s_slot(
             );
         }
         if (rc == 0) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
         }
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
@@ -58547,8 +58454,8 @@ int termite_metal_decode_runtime_apply_attention_f32_span_residual_q8_0_slot(
             );
         }
         if (rc == 0) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -5;
         }
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
@@ -58626,7 +58533,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_ternary_slots(
         [gate_encoder setBuffer:gate_weight_buffer offset:runtime->quant_linear_weight_offsets[gate_linear_slot] atIndex:1];
         [gate_encoder setBuffer:gate_output_buffer offset:0 atIndex:2];
         [gate_encoder setBuffer:gate_params_buffer offset:0 atIndex:3];
-        [gate_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2), intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(gate_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2), intermediate_size), 1, 1));
         [gate_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> up_encoder = termite_metal_tracked_compute_command_encoder_at(command_buffer, command_label, __LINE__);
@@ -58636,7 +58543,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_ternary_slots(
         [up_encoder setBuffer:up_weight_buffer offset:runtime->quant_linear_weight_offsets[up_linear_slot] atIndex:1];
         [up_encoder setBuffer:up_output_buffer offset:0 atIndex:2];
         [up_encoder setBuffer:up_params_buffer offset:0 atIndex:3];
-        [up_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2), intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(up_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2), intermediate_size), 1, 1));
         [up_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> activation_encoder = termite_metal_tracked_compute_command_encoder_at(command_buffer, command_label, __LINE__);
@@ -58645,7 +58552,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_ternary_slots(
         [activation_encoder setBuffer:gate_output_buffer offset:0 atIndex:0];
         [activation_encoder setBuffer:activated_buffer offset:0 atIndex:1];
         [activation_encoder setBuffer:activation_params_buffer offset:0 atIndex:2];
-        [activation_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, intermediate_size), 1, 1));
         [activation_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> multiply_encoder = termite_metal_tracked_compute_command_encoder_at(command_buffer, command_label, __LINE__);
@@ -58655,7 +58562,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_ternary_slots(
         [multiply_encoder setBuffer:up_output_buffer offset:0 atIndex:1];
         [multiply_encoder setBuffer:gated_buffer offset:0 atIndex:2];
         [multiply_encoder setBuffer:multiply_params_buffer offset:0 atIndex:3];
-        [multiply_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(multiply_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, intermediate_size), 1, 1));
         [multiply_encoder endEncoding];
 
         id<MTLBuffer> down_input_buffer = gated_buffer;
@@ -58667,7 +58574,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_ternary_slots(
             [rms_encoder setBuffer:runtime->rms_norm_weight_buffers[post_gate_rms_norm_slot] offset:0 atIndex:1];
             [rms_encoder setBuffer:normed_gated_buffer offset:0 atIndex:2];
             [rms_encoder setBuffer:rms_params_buffer offset:0 atIndex:3];
-            [rms_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, intermediate_size), 1, 1)];
+            antfly_metal_dispatch_threads(rms_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, intermediate_size), 1, 1));
             [rms_encoder endEncoding];
             down_input_buffer = normed_gated_buffer;
         }
@@ -58679,7 +58586,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_ternary_slots(
         [down_encoder setBuffer:down_weight_buffer offset:runtime->quant_linear_weight_offsets[down_linear_slot] atIndex:1];
         [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
         [down_encoder setBuffer:down_params_buffer offset:0 atIndex:3];
-        [down_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2), hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(down_encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_TERNARY_PIPELINE(runtime, is_tl2), hidden_size), 1, 1));
         [down_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> add_encoder = termite_metal_tracked_compute_command_encoder_at(command_buffer, command_label, __LINE__);
@@ -58689,11 +58596,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_ternary_slots(
         [add_encoder setBuffer:residual_buffer offset:0 atIndex:1];
         [add_encoder setBuffer:output_buffer offset:0 atIndex:2];
         [add_encoder setBuffer:add_params_buffer offset:0 atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(add_encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1));
         [add_encoder endEncoding];
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -16;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -58766,14 +58673,14 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
         if (pair_encoder == nil) return -14;
         [pair_encoder setComputePipelineState:runtime->i2_s_pair_pipeline];
         termite_metal_bind_five_buffers(pair_encoder, input_buffer, 0, gate_view.weight_buffer, gate_view.weight_offset, up_view.weight_buffer, up_view.weight_offset, gate_output_buffer, 0, up_output_buffer, 0, &pair_params, sizeof(pair_params));
-        [pair_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->i2_s_pair_pipeline, rows * intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(pair_encoder, MTLSizeMake(rows * intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->i2_s_pair_pipeline, rows * intermediate_size), 1, 1));
         [pair_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> activation_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
         if (activation_encoder == nil) return -15;
         [activation_encoder setComputePipelineState:runtime->activation_pipeline];
         termite_metal_bind_two_buffers(activation_encoder, gate_output_buffer, 0, activated_buffer, 0, &activation_params, sizeof(activation_params));
-        [activation_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, rows * intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(rows * intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, rows * intermediate_size), 1, 1));
         [activation_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> multiply_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -58783,7 +58690,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
         [multiply_encoder setBuffer:up_output_buffer offset:0 atIndex:1];
         [multiply_encoder setBuffer:gated_buffer offset:0 atIndex:2];
         [multiply_encoder setBytes:&multiply_params length:sizeof(multiply_params) atIndex:3];
-        [multiply_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, rows * intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(multiply_encoder, MTLSizeMake(rows * intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, rows * intermediate_size), 1, 1));
         [multiply_encoder endEncoding];
 
         id<MTLBuffer> down_input_buffer = gated_buffer;
@@ -58795,7 +58702,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
             [rms_encoder setBuffer:runtime->rms_norm_weight_buffers[post_gate_rms_norm_slot] offset:0 atIndex:1];
             [rms_encoder setBuffer:normed_gated_buffer offset:0 atIndex:2];
             [rms_encoder setBytes:&rms_params length:sizeof(rms_params) atIndex:3];
-            [rms_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+            antfly_metal_dispatch_threads(rms_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1));
             [rms_encoder endEncoding];
             down_input_buffer = normed_gated_buffer;
         }
@@ -58807,7 +58714,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
         [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
         [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
         [down_encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
-        [down_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->i2_s_pipeline, rows * hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(down_encoder, MTLSizeMake(rows * hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->i2_s_pipeline, rows * hidden_size), 1, 1));
         [down_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> add_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -58817,11 +58724,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
         [add_encoder setBuffer:residual_buffer offset:0 atIndex:1];
         [add_encoder setBuffer:output_buffer offset:0 atIndex:2];
         [add_encoder setBytes:&add_params length:sizeof(add_params) atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(add_encoder, MTLSizeMake(rows * hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1));
         [add_encoder endEncoding];
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -20;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -58942,7 +58849,7 @@ static __attribute__((always_inline)) inline int termite_metal_apply_host_gated_
         if (activation_encoder == nil) return -17;
         [activation_encoder setComputePipelineState:runtime->activation_pipeline];
         termite_metal_bind_two_buffers(activation_encoder, gate_output_buffer, 0, activated_buffer, 0, &activation_params, sizeof(activation_params));
-        [activation_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, rows * intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(rows * intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, rows * intermediate_size), 1, 1));
         [activation_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> multiply_encoder = termite_metal_tracked_compute_command_encoder_at(command_buffer, command_label, __LINE__);
@@ -58952,7 +58859,7 @@ static __attribute__((always_inline)) inline int termite_metal_apply_host_gated_
         [multiply_encoder setBuffer:up_output_buffer offset:0 atIndex:1];
         [multiply_encoder setBuffer:gated_buffer offset:0 atIndex:2];
         [multiply_encoder setBytes:&multiply_params length:sizeof(multiply_params) atIndex:3];
-        [multiply_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, rows * intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(multiply_encoder, MTLSizeMake(rows * intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, rows * intermediate_size), 1, 1));
         [multiply_encoder endEncoding];
 
         id<MTLBuffer> down_input_buffer = gated_buffer;
@@ -58977,7 +58884,7 @@ static __attribute__((always_inline)) inline int termite_metal_apply_host_gated_
                 [rms_encoder setBuffer:runtime->rms_norm_weight_buffers[post_gate_rms_norm_slot] offset:0 atIndex:1];
                 [rms_encoder setBuffer:normed_gated_buffer offset:0 atIndex:2];
                 [rms_encoder setBytes:&rms_params length:sizeof(rms_params) atIndex:3];
-                [rms_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+                antfly_metal_dispatch_threads(rms_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1));
                 [rms_encoder endEncoding];
             }
             down_input_buffer = normed_gated_buffer;
@@ -59010,7 +58917,7 @@ static __attribute__((always_inline)) inline int termite_metal_apply_host_gated_
             [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
             [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
             [down_encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
-            [down_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_DOWN_PIPELINE(runtime, policy.down_format), rows * hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(down_encoder, MTLSizeMake(rows * hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(TERMITE_METAL_HOST_DOWN_PIPELINE(runtime, policy.down_format), rows * hidden_size), 1, 1));
         }
         [down_encoder endEncoding];
 
@@ -59023,7 +58930,7 @@ static __attribute__((always_inline)) inline int termite_metal_apply_host_gated_
             [post_down_encoder setBuffer:runtime->rms_norm_weight_buffers[post_down_rms_norm_slot] offset:0 atIndex:1];
             [post_down_encoder setBuffer:post_down_buffer offset:0 atIndex:2];
             [post_down_encoder setBytes:&post_down_rms_params length:sizeof(post_down_rms_params) atIndex:3];
-            [post_down_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+            antfly_metal_dispatch_threads(post_down_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1));
             [post_down_encoder endEncoding];
             add_input_buffer = post_down_buffer;
         }
@@ -59035,11 +58942,11 @@ static __attribute__((always_inline)) inline int termite_metal_apply_host_gated_
         [add_encoder setBuffer:residual_buffer offset:0 atIndex:1];
         [add_encoder setBuffer:output_buffer offset:0 atIndex:2];
         [add_encoder setBytes:&add_params length:sizeof(add_params) atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(add_encoder, MTLSizeMake(rows * hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1));
         [add_encoder endEncoding];
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -23;
         if (policy.track_output_borrowed ? !output_borrowed : output_buffer.contents != (void *)output) {
             memcpy(output, [output_buffer contents], hidden_bytes);
@@ -59127,7 +59034,7 @@ int termite_metal_decode_runtime_apply_rms_norm_i2_s_linear_residual_slot(
         [rms_encoder setBuffer:runtime->rms_norm_weight_buffers[post_gate_rms_norm_slot] offset:0 atIndex:1];
         [rms_encoder setBuffer:normed_input_buffer offset:0 atIndex:2];
         [rms_encoder setBuffer:rms_params_buffer offset:0 atIndex:3];
-        [rms_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(rms_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, intermediate_size), 1, 1));
         [rms_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> down_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -59137,7 +59044,7 @@ int termite_metal_decode_runtime_apply_rms_norm_i2_s_linear_residual_slot(
         [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
         [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
         [down_encoder setBuffer:down_params_buffer offset:0 atIndex:3];
-        [down_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->i2_s_pipeline, hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(down_encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->i2_s_pipeline, hidden_size), 1, 1));
         [down_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> add_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -59147,11 +59054,11 @@ int termite_metal_decode_runtime_apply_rms_norm_i2_s_linear_residual_slot(
         [add_encoder setBuffer:residual_buffer offset:0 atIndex:1];
         [add_encoder setBuffer:output_buffer offset:0 atIndex:2];
         [add_encoder setBuffer:add_params_buffer offset:0 atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(add_encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1));
         [add_encoder endEncoding];
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -15;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -59235,7 +59142,7 @@ int termite_metal_decode_runtime_apply_linear_activation_linear_residual(
         NSUInteger first_linear_thread_width = runtime->linear_pipeline.maxTotalThreadsPerThreadgroup;
         if (first_linear_thread_width == 0) first_linear_thread_width = 64;
         if (first_linear_thread_width > intermediate_size) first_linear_thread_width = intermediate_size;
-        [first_linear_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(first_linear_thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(first_linear_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(first_linear_thread_width, 1, 1));
         [first_linear_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> activation_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -59247,7 +59154,7 @@ int termite_metal_decode_runtime_apply_linear_activation_linear_residual(
         NSUInteger activation_thread_width = runtime->activation_pipeline.maxTotalThreadsPerThreadgroup;
         if (activation_thread_width == 0) activation_thread_width = 64;
         if (activation_thread_width > intermediate_size) activation_thread_width = intermediate_size;
-        [activation_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(activation_thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(activation_thread_width, 1, 1));
         [activation_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> second_linear_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -59261,7 +59168,7 @@ int termite_metal_decode_runtime_apply_linear_activation_linear_residual(
         NSUInteger second_linear_thread_width = runtime->linear_pipeline.maxTotalThreadsPerThreadgroup;
         if (second_linear_thread_width == 0) second_linear_thread_width = 64;
         if (second_linear_thread_width > hidden_size) second_linear_thread_width = hidden_size;
-        [second_linear_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(second_linear_thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(second_linear_encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(second_linear_thread_width, 1, 1));
         [second_linear_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> add_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -59274,11 +59181,11 @@ int termite_metal_decode_runtime_apply_linear_activation_linear_residual(
         NSUInteger add_thread_width = runtime->add_pipeline.maxTotalThreadsPerThreadgroup;
         if (add_thread_width == 0) add_thread_width = 64;
         if (add_thread_width > hidden_size) add_thread_width = hidden_size;
-        [add_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(add_thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(add_encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(add_thread_width, 1, 1));
         [add_encoder endEncoding];
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -16;
         if (output_needs_copyback) {
             memcpy(output, [output_buffer contents], hidden_bytes);
@@ -59460,7 +59367,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
         if (activation_encoder == nil) return -17;
         [activation_encoder setComputePipelineState:runtime->activation_pipeline];
         termite_metal_bind_two_buffers(activation_encoder, gate_output_buffer, 0, activated_buffer, 0, &activation_params, sizeof(activation_params));
-        [activation_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, rows * intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(rows * intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, rows * intermediate_size), 1, 1));
         [activation_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> multiply_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -59470,7 +59377,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
         [multiply_encoder setBuffer:up_output_buffer offset:0 atIndex:1];
         [multiply_encoder setBuffer:gated_buffer offset:0 atIndex:2];
         [multiply_encoder setBytes:&multiply_params length:sizeof(multiply_params) atIndex:3];
-        [multiply_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, rows * intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(multiply_encoder, MTLSizeMake(rows * intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, rows * intermediate_size), 1, 1));
         [multiply_encoder endEncoding];
 
         id<MTLBuffer> down_input_buffer = gated_buffer;
@@ -59512,7 +59419,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
                 [rms_encoder setBuffer:runtime->rms_norm_weight_buffers[post_gate_rms_norm_slot] offset:0 atIndex:1];
                 [rms_encoder setBuffer:normed_gated_buffer offset:0 atIndex:2];
                 [rms_encoder setBytes:&rms_params length:sizeof(rms_params) atIndex:3];
-                [rms_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+                antfly_metal_dispatch_threads(rms_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1));
                 [rms_encoder endEncoding];
                 down_input_buffer = normed_gated_buffer;
             }
@@ -59542,7 +59449,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
             [post_down_encoder setBuffer:runtime->rms_norm_weight_buffers[post_down_rms_norm_slot] offset:0 atIndex:1];
             [post_down_encoder setBuffer:post_down_buffer offset:0 atIndex:2];
             [post_down_encoder setBytes:&post_down_rms_params length:sizeof(post_down_rms_params) atIndex:3];
-            [post_down_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+            antfly_metal_dispatch_threads(post_down_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1));
             [post_down_encoder endEncoding];
             add_lhs_buffer = post_down_buffer;
         }
@@ -59554,11 +59461,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
         [add_encoder setBuffer:residual_buffer offset:0 atIndex:1];
         [add_encoder setBuffer:output_buffer offset:0 atIndex:2];
         [add_encoder setBytes:&add_params length:sizeof(add_params) atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(add_encoder, MTLSizeMake(rows * hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1));
         [add_encoder endEncoding];
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -23;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -59721,7 +59628,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
             [gated_encoder setBuffer:up_output_buffer offset:0 atIndex:1];
             [gated_encoder setBuffer:gated_buffer offset:0 atIndex:2];
             [gated_encoder setBytes:&activation_params length:sizeof(activation_params) atIndex:3];
-            [gated_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_multiply_pipeline, rows * intermediate_size), 1, 1)];
+            antfly_metal_dispatch_threads(gated_encoder, MTLSizeMake(rows * intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_multiply_pipeline, rows * intermediate_size), 1, 1));
             termite_metal_end_scoped_compute_encoder(gated_encoder, gated_encoder_owned);
         }
 
@@ -59764,7 +59671,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
                 [rms_encoder setBuffer:runtime->rms_norm_weight_buffers[post_gate_rms_norm_slot] offset:0 atIndex:1];
                 [rms_encoder setBuffer:normed_gated_buffer offset:0 atIndex:2];
                 [rms_encoder setBytes:&rms_params length:sizeof(rms_params) atIndex:3];
-                [rms_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+                antfly_metal_dispatch_threads(rms_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1));
                 [rms_encoder endEncoding];
                 down_input_buffer = normed_gated_buffer;
             }
@@ -59794,7 +59701,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
             [post_down_encoder setBuffer:runtime->rms_norm_weight_buffers[post_down_rms_norm_slot] offset:0 atIndex:1];
             [post_down_encoder setBuffer:post_down_buffer offset:0 atIndex:2];
             [post_down_encoder setBytes:&post_down_rms_params length:sizeof(post_down_rms_params) atIndex:3];
-            [post_down_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+            antfly_metal_dispatch_threads(post_down_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1));
             [post_down_encoder endEncoding];
             add_lhs_buffer = post_down_buffer;
         }
@@ -59806,11 +59713,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
         [add_encoder setBuffer:residual_buffer offset:0 atIndex:1];
         [add_encoder setBuffer:output_buffer offset:0 atIndex:2];
         [add_encoder setBytes:&add_params length:sizeof(add_params) atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(add_encoder, MTLSizeMake(rows * hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1));
         [add_encoder endEncoding];
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -23;
         if (!output_borrowed) {
             memcpy(output, [output_buffer contents], hidden_bytes);
@@ -60390,7 +60297,7 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
             [gated_encoder setBuffer:up_output_buffer offset:0 atIndex:1];
             [gated_encoder setBuffer:gated_buffer offset:0 atIndex:2];
             [gated_encoder setBytes:&activation_params length:sizeof(activation_params) atIndex:3];
-            [gated_encoder dispatchThreads:MTLSizeMake(rows * intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(gated_pipeline, rows * intermediate_size), 1, 1)];
+            antfly_metal_dispatch_threads(gated_encoder, MTLSizeMake(rows * intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(gated_pipeline, rows * intermediate_size), 1, 1));
             termite_metal_end_scoped_compute_encoder(gated_encoder, gated_encoder_owned);
             if (enable_q4_k_high_row_f16_ffn) gated_buffer_f16 = YES;
         }
@@ -60445,7 +60352,7 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                 [rms_encoder setBuffer:runtime->rms_norm_weight_buffers[post_gate_rms_norm_slot] offset:0 atIndex:1];
                 [rms_encoder setBuffer:normed_gated_buffer offset:0 atIndex:2];
                 [rms_encoder setBytes:&rms_params length:sizeof(rms_params) atIndex:3];
-                [rms_encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+                antfly_metal_dispatch_threads(rms_encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1));
                 termite_metal_end_scoped_compute_encoder(rms_encoder, rms_encoder_owned);
                 down_input_buffer = normed_gated_buffer;
             }
@@ -60682,7 +60589,7 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
         [add_encoder setBuffer:residual_buffer offset:residual_offset atIndex:1];
         [add_encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [add_encoder setBytes:&add_params length:sizeof(add_params) atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(add_encoder, MTLSizeMake(rows * hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, rows * hidden_size), 1, 1));
         termite_metal_end_scoped_compute_encoder(add_encoder, add_encoder_owned);
 
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -23);
@@ -61174,8 +61081,8 @@ int termite_metal_decode_runtime_update_attention_span_from_f32_key_device(
             kv_position_offset
         );
         if (rc == 0) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -3;
         }
         return rc;
@@ -61229,8 +61136,8 @@ int termite_metal_decode_runtime_update_attention_span_from_f32_key_device_slot(
             kv_position_offset
         );
         if (rc == 0) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
         }
         return rc;
@@ -61389,11 +61296,9 @@ static int termite_metal_decode_runtime_encode_attention_paged_update_from_f32_k
                 [encoder setComputePipelineState:pipeline];
                 termite_metal_bind_three_buffers_only(encoder, k_buffer, (k_offset + source_row * raw_source_row_bytes), runtime->attention_span_encoded_key_buffers[slot], (physical_token * key_row_bytes), params_buffer, 0);
                 if (format == 4u) {
-                    [encoder dispatchThreads:MTLSizeMake(int8_tg_size, num_kv_heads, 1)
-                          threadsPerThreadgroup:MTLSizeMake(int8_tg_size, 1, 1)];
+                    antfly_metal_dispatch_threads(encoder, MTLSizeMake(int8_tg_size, num_kv_heads, 1), MTLSizeMake(int8_tg_size, 1, 1));
                 } else {
-                    [encoder dispatchThreads:MTLSizeMake(compressed_work_items, 1, 1)
-                          threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, compressed_work_items), 1, 1)];
+                    antfly_metal_dispatch_threads(encoder, MTLSizeMake(compressed_work_items, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, compressed_work_items), 1, 1));
                 }
                 [encoder endEncoding];
             }
@@ -61536,8 +61441,7 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
         }
         [encoder setBytes:&params length:sizeof(params) atIndex:5];
         const size_t total = suffix_tokens * (values_per_row > v_row_stride ? values_per_row : v_row_stride);
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->paged_f16_kv_seed_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->paged_f16_kv_seed_pipeline, total), 1, 1));
     } else {
 
         termite_metal_encode_key_params key_params = {
@@ -61561,11 +61465,9 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
             [encoder setComputePipelineState:key_pipeline];
             termite_metal_bind_two_buffers(encoder, k_buffer, (k_offset + source_row * raw_source_row_bytes), runtime->attention_span_encoded_key_buffers[slot], (physical_token * key_row_bytes), &key_params, sizeof(key_params));
             if (format == 4u) {
-                [encoder dispatchThreads:MTLSizeMake(int8_tg_size, num_kv_heads, 1)
-                      threadsPerThreadgroup:MTLSizeMake(int8_tg_size, 1, 1)];
+                antfly_metal_dispatch_threads(encoder, MTLSizeMake(int8_tg_size, num_kv_heads, 1), MTLSizeMake(int8_tg_size, 1, 1));
             } else {
-                [encoder dispatchThreads:MTLSizeMake(compressed_work_items, 1, 1)
-                      threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(key_pipeline, compressed_work_items), 1, 1)];
+                antfly_metal_dispatch_threads(encoder, MTLSizeMake(compressed_work_items, 1, 1), MTLSizeMake(termite_metal_thread_width(key_pipeline, compressed_work_items), 1, 1));
             }
         }
 
@@ -61589,8 +61491,7 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
         }
         [encoder setBytes:&v_params length:sizeof(v_params) atIndex:3];
         const size_t v_total = suffix_tokens * v_row_stride;
-        [encoder dispatchThreads:MTLSizeMake(v_total, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->paged_f32_v_seed_pipeline, v_total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(v_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->paged_f32_v_seed_pipeline, v_total), 1, 1));
     }
 
     runtime->attention_span_slot_tokens[slot] = total_tokens;
@@ -61698,8 +61599,7 @@ static int termite_metal_encode_paged_f32_kv_seed_on_encoder(
     }
     [encoder setBytes:&params length:sizeof(params) atIndex:5];
     const size_t total = suffix_tokens * (values_per_row > v_row_stride ? values_per_row : v_row_stride);
-    [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-       threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->paged_f32_kv_seed_pipeline, total), 1, 1)];
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->paged_f32_kv_seed_pipeline, total), 1, 1));
 
     runtime->attention_span_slot_tokens[slot] = total_tokens;
     runtime->attention_span_slot_key_row_bytes[slot] = key_row_bytes;
@@ -61768,8 +61668,8 @@ int termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot
             page_size
         );
         if (rc == 0 && frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -25;
         }
         return rc;
@@ -62015,8 +61915,8 @@ int termite_metal_decode_runtime_compact_attention_span_slot(
                            size:v_row_bytes];
         }
         [blit endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -13;
         runtime->attention_span_slot_tokens[destination_slot] = selected_count;
         runtime->attention_span_slot_key_row_bytes[destination_slot] = key_row_bytes;
@@ -62264,7 +62164,7 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
     termite_metal_bind_three_buffers_only(encoder, k_buffer, 0, runtime->attention_span_encoded_key_buffers[slot], (suffix_start * key_row_bytes), params_buffer, 0);
     const size_t residual_bytes = (num_kv_heads * 32u + 7u) / 8u;
     const size_t work_items = format == 0u ? suffix_tokens * base_key_row_bytes : suffix_tokens * (base_key_row_bytes + residual_bytes);
-    [encoder dispatchThreads:MTLSizeMake(work_items, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, work_items), 1, 1)];
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(work_items, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, work_items), 1, 1));
     [encoder endEncoding];
 
     termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_ATTENTION_SPAN);
@@ -62385,8 +62285,7 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
         [k_encoder setBuffer:k_buffer offset:k_offset atIndex:0];
         [k_encoder setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:(suffix_start * key_row_bytes) atIndex:1];
         [k_encoder setBuffer:params_buffer offset:0 atIndex:2];
-        [k_encoder dispatchThreads:MTLSizeMake(tg_size, suffix_tokens * num_kv_heads, 1)
-              threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        antfly_metal_dispatch_threads(k_encoder, MTLSizeMake(tg_size, suffix_tokens * num_kv_heads, 1), MTLSizeMake(tg_size, 1, 1));
         [k_encoder endEncoding];
 
         // Values: raw f32 blit matching the polar4/turbo3 path.
@@ -62425,7 +62324,7 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
         [k_encoder setBuffer:k_buffer offset:k_offset atIndex:0];
         [k_encoder setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:(suffix_start * key_row_bytes) atIndex:1];
         [k_encoder setBuffer:params_buffer offset:0 atIndex:2];
-        [k_encoder dispatchThreads:MTLSizeMake(work_items, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+        antfly_metal_dispatch_threads(k_encoder, MTLSizeMake(work_items, 1, 1), MTLSizeMake(tg_width, 1, 1));
         [k_encoder endEncoding];
 
         // Values: slot holds v_row_stride halfs per row. Suffix write offset
@@ -62436,7 +62335,7 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
         [v_encoder setBuffer:v_buffer offset:v_offset atIndex:0];
         [v_encoder setBuffer:runtime->attention_span_v_buffers[slot] offset:(suffix_start * v_row_stride * sizeof(uint16_t)) atIndex:1];
         [v_encoder setBuffer:params_buffer offset:0 atIndex:2];
-        [v_encoder dispatchThreads:MTLSizeMake(work_items, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+        antfly_metal_dispatch_threads(v_encoder, MTLSizeMake(work_items, 1, 1), MTLSizeMake(tg_width, 1, 1));
         [v_encoder endEncoding];
     } else {
         id<MTLComputePipelineState> pipeline = nil;
@@ -62463,7 +62362,7 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
         termite_metal_bind_three_buffers_only(encoder, k_buffer, k_offset, runtime->attention_span_encoded_key_buffers[slot], (suffix_start * key_row_bytes), params_buffer, 0);
         const size_t residual_bytes = (num_kv_heads * 32u + 7u) / 8u;
         const size_t work_items = format == 0u ? suffix_tokens * base_key_row_bytes : suffix_tokens * (base_key_row_bytes + residual_bytes);
-        [encoder dispatchThreads:MTLSizeMake(work_items, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, work_items), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(work_items, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, work_items), 1, 1));
         [encoder endEncoding];
 
         termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_ATTENTION_SPAN);
@@ -62549,10 +62448,10 @@ int termite_metal_decode_runtime_attention_span(
         NSUInteger thread_width = pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0) thread_width = 64;
         if (thread_width > num_heads && num_heads > 0) thread_width = num_heads;
-        [encoder dispatchThreads:MTLSizeMake(num_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(num_heads, 1, 1), MTLSizeMake(thread_width, 1, 1));
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -13;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
@@ -62896,7 +62795,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
         runtime->generated_attention_flash_prefill_hd512_calls += 1;
         termite_metal_record_prefill_kv_route(runtime, use_prefill_direct_kv);
         [encoder setThreadgroupMemoryLength:TERMITE_METAL_GENERATED_FLASH_HD512_MEMORY_BYTES atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((q_len + 7u) / 8u, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_HD512_THREADS, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((q_len + 7u) / 8u, num_heads, 1), MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_HD512_THREADS, 1, 1));
     } else if (use_prefill_sg) {
         if (generated_prefill_sg) runtime->generated_attention_flash_prefill_calls += 1;
         termite_metal_record_prefill_kv_route(runtime, use_prefill_direct_kv);
@@ -62904,15 +62803,15 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
             ? TERMITE_METAL_GENERATED_FLASH_MEMORY_BYTES(head_dim)
             : TERMITE_METAL_HANDWRITTEN_FLASH_MEMORY_BYTES(head_dim);
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(prefill_sg_memory_bytes) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((q_len + 7u) / 8u, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_THREADS, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((q_len + 7u) / 8u, num_heads, 1), MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_THREADS, 1, 1));
     } else if (use_decode_1x) {
         runtime->paged_attention_1x_calls += 1;
         if (runtime->attention_1x_generated_pipeline != nil) runtime->generated_attention_decode_1x_calls += 1;
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((kv_tokens * 2u + TERMITE_METAL_GENERATED_DECODE_THREADS) * sizeof(float)) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(q_len, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_GENERATED_DECODE_THREADS, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(q_len, num_heads, 1), MTLSizeMake(TERMITE_METAL_GENERATED_DECODE_THREADS, 1, 1));
     } else {
         const size_t total = q_len * num_heads;
-        [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->attention_paged_pipeline, total), 1, 1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->attention_paged_pipeline, total), 1, 1));
     }
     if (!planned_encoder) [encoder endEncoding];
     (void)block_table_buffer;
@@ -62985,8 +62884,8 @@ int termite_metal_decode_runtime_attention_paged_slot_device(
         );
         if (rc != 0) return rc;
         if (frame_active) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
     }
 }
@@ -63060,8 +62959,8 @@ int termite_metal_decode_runtime_attention_paged_slot_device_selected(
         );
         if (rc != 0) return rc;
         if (frame_active) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
     }
 }
@@ -63096,8 +62995,8 @@ int termite_metal_decode_runtime_score_selected_attention(
         termite_selection_score_params_host p={0}; p.p.q_len=(uint32_t)query_count;p.p.kv_tokens=(uint32_t)key_count;p.p.num_heads=(uint32_t)num_heads;p.p.num_kv_heads=(uint32_t)num_kv_heads;p.p.head_dim=(uint32_t)head_dim;p.p.key_row_bytes=(uint32_t)key_row_bytes;p.p.base_key_row_bytes=(uint32_t)base_key_row_bytes;p.p.format=format;p.p.softcap=softcap;p.score_scale=score_scale;
         id<MTLCommandBuffer> cb=termite_metal_new_command_buffer(runtime->queue,__func__); if(cb==nil)return -5;
         id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder]; if(e==nil)return -5;
-        [e setComputePipelineState:runtime->selection_score_norm_pipeline];[e setBuffer:q offset:0 atIndex:0];[e setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];[e setBuffer:qp offset:0 atIndex:2];[e setBuffer:kp offset:0 atIndex:3];[e setBuffer:norm offset:0 atIndex:4];[e setBytes:&p length:sizeof(p) atIndex:5];size_t n=query_count*num_heads;[e dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->selection_score_norm_pipeline,n),1,1)];[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return -6;if(check_fn(check_ctx)!=0)return -12;
-        cb=termite_metal_new_command_buffer(runtime->queue,__func__);e=[cb computeCommandEncoder];if(e==nil)return -5;[e setComputePipelineState:runtime->selection_score_reduce_pipeline];[e setBuffer:q offset:0 atIndex:0];[e setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];[e setBuffer:qp offset:0 atIndex:2];[e setBuffer:kp offset:0 atIndex:3];[e setBuffer:norm offset:0 atIndex:4];[e setBuffer:out offset:0 atIndex:5];[e setBytes:&p length:sizeof(p) atIndex:6];[e dispatchThreads:MTLSizeMake(key_count,1,1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->selection_score_reduce_pipeline,key_count),1,1)];[e endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status!=MTLCommandBufferStatusCompleted)return -6;if(check_fn(check_ctx)!=0)return -12;memcpy(scores_out,out.contents,key_count*sizeof(float));return 0;
+        [e setComputePipelineState:runtime->selection_score_norm_pipeline];[e setBuffer:q offset:0 atIndex:0];[e setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];[e setBuffer:qp offset:0 atIndex:2];[e setBuffer:kp offset:0 atIndex:3];[e setBuffer:norm offset:0 atIndex:4];[e setBytes:&p length:sizeof(p) atIndex:5];size_t n=query_count*num_heads;antfly_metal_dispatch_threads(e, MTLSizeMake(n,1,1), MTLSizeMake(termite_metal_thread_width(runtime->selection_score_norm_pipeline,n),1,1));[e endEncoding];antfly_metal_commit(cb);antfly_metal_wait(cb);if(cb.status!=MTLCommandBufferStatusCompleted)return -6;if(check_fn(check_ctx)!=0)return -12;
+        cb=termite_metal_new_command_buffer(runtime->queue,__func__);e=[cb computeCommandEncoder];if(e==nil)return -5;[e setComputePipelineState:runtime->selection_score_reduce_pipeline];[e setBuffer:q offset:0 atIndex:0];[e setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];[e setBuffer:qp offset:0 atIndex:2];[e setBuffer:kp offset:0 atIndex:3];[e setBuffer:norm offset:0 atIndex:4];[e setBuffer:out offset:0 atIndex:5];[e setBytes:&p length:sizeof(p) atIndex:6];antfly_metal_dispatch_threads(e, MTLSizeMake(key_count,1,1), MTLSizeMake(termite_metal_thread_width(runtime->selection_score_reduce_pipeline,key_count),1,1));[e endEncoding];antfly_metal_commit(cb);antfly_metal_wait(cb);if(cb.status!=MTLCommandBufferStatusCompleted)return -6;if(check_fn(check_ctx)!=0)return -12;memcpy(scores_out,out.contents,key_count*sizeof(float));return 0;
     }
 }
 
@@ -63224,7 +63123,7 @@ static int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_slot(
         [norm_encoder setBuffer:runtime->rms_norm_weight_buffers[norm_slot] offset:0 atIndex:1];
         [norm_encoder setBuffer:normed_buffer offset:0 atIndex:2];
         [norm_encoder setBytes:&norm_params length:sizeof(norm_params) atIndex:3];
-        [norm_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(norm_encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, hidden_size), 1, 1));
         [norm_encoder endEncoding];
 
         termite_metal_linear_params linear_params = {
@@ -63240,7 +63139,7 @@ static int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_slot(
         [linear_encoder setBuffer:linear_weight_buffer offset:linear_weight_offset atIndex:1];
         [linear_encoder setBuffer:output_buffer offset:0 atIndex:2];
         [linear_encoder setBytes:&linear_params length:sizeof(linear_params) atIndex:3];
-        [linear_encoder dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(linear_pipeline, out_dim), 1, 1)];
+        antfly_metal_dispatch_threads(linear_encoder, MTLSizeMake(out_dim, 1, 1), MTLSizeMake(termite_metal_thread_width(linear_pipeline, out_dim), 1, 1));
         [linear_encoder endEncoding];
         return 0;
     }
@@ -63282,8 +63181,8 @@ int termite_metal_decode_runtime_apply_rms_norm_q4_k_linear_slot(
             output
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -8;
     }
 }
@@ -63324,8 +63223,8 @@ int termite_metal_decode_runtime_apply_rms_norm_q5_k_linear_slot(
             output
         );
         if (rc != 0) return rc;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -8;
     }
 }
@@ -63420,7 +63319,7 @@ static int termite_metal_decode_runtime_encode_attention_span_slot(
     if (encoder == nil) return -11;
     [encoder setComputePipelineState:pipeline];
     termite_metal_bind_five_buffers_only(encoder, q_buffer, q_offset, runtime->attention_span_encoded_key_buffers[slot], 0, runtime->attention_span_v_buffers[slot], 0, output_buffer, output_offset, params_buffer, 0);
-    [encoder dispatchThreads:MTLSizeMake(num_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, num_heads), 1, 1)];
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(num_heads, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, num_heads), 1, 1));
     [encoder endEncoding];
     return 0;
 }
@@ -63530,7 +63429,7 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
             if (encoder == nil) return -8;
             [encoder setComputePipelineState:runtime->rms_norm_pipeline];
             termite_metal_bind_four_buffers_only(encoder, current_buffer, current_offset, runtime->rms_norm_weight_buffers[attention_pre_linear_rms_norm_slot], 0, tmp_a, 0, params_buffer, 0);
-            [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
             [encoder endEncoding];
             current_buffer = tmp_a;
             current_offset = 0;
@@ -63546,9 +63445,9 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
             [encoder setComputePipelineState:(use_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
             termite_metal_bind_five_buffers_only(encoder, current_buffer, current_offset, runtime->linear_weight_buffers[attention_linear_slot], 0, runtime->linear_bias_buffers[attention_linear_slot], 0, tmp_b, 0, params_buffer, 0);
             if (use_reduce) {
-                [encoder dispatchThreads:MTLSizeMake(hidden_size * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size * 32u, 1, 1), MTLSizeMake(32, 1, 1));
             } else {
-                [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, hidden_size), 1, 1)];
+                antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, hidden_size), 1, 1));
             }
             [encoder endEncoding];
             current_buffer = tmp_b;
@@ -63563,7 +63462,7 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
             if (encoder == nil) return -12;
             [encoder setComputePipelineState:runtime->rms_norm_pipeline];
             termite_metal_bind_four_buffers_only(encoder, current_buffer, current_offset, runtime->rms_norm_weight_buffers[attention_post_linear_rms_norm_slot], 0, tmp_a, 0, params_buffer, 0);
-            [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
             [encoder endEncoding];
             current_buffer = tmp_a;
             current_offset = 0;
@@ -63577,7 +63476,7 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
             if (encoder == nil) return -14;
             [encoder setComputePipelineState:runtime->add_pipeline];
             termite_metal_bind_four_buffers_only(encoder, current_buffer, current_offset, residual_buffer, residual_offset, attn_added_buffer, attn_added_offset, params_buffer, 0);
-            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1));
             [encoder endEncoding];
         }
 
@@ -63589,7 +63488,7 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
             if (encoder == nil) return -16;
             [encoder setComputePipelineState:runtime->layer_norm_pipeline];
             termite_metal_bind_five_buffers_only(encoder, attn_added_buffer, attn_added_offset, runtime->layer_norm_weight_buffers[ffn_layer_norm_slot], 0, runtime->layer_norm_bias_buffers[ffn_layer_norm_slot], 0, ffn_input_buffer, ffn_input_offset, params_buffer, 0);
-            [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
             [encoder endEncoding];
         } else if (ffn_rms_norm_slot != SIZE_MAX) {
             termite_metal_apply_layer_norm_params params = { .hidden_size = (uint32_t)hidden_size, .eps = eps };
@@ -63599,7 +63498,7 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
             if (encoder == nil) return -18;
             [encoder setComputePipelineState:runtime->rms_norm_pipeline];
             termite_metal_bind_four_buffers_only(encoder, attn_added_buffer, attn_added_offset, runtime->rms_norm_weight_buffers[ffn_rms_norm_slot], 0, ffn_input_buffer, ffn_input_offset, params_buffer, 0);
-            [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
             [encoder endEncoding];
         } else {
             termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_FFN_COPY);
@@ -63667,8 +63566,8 @@ int termite_metal_decode_runtime_apply_attention_block_prefix(
         );
         if (rc != 0) return rc;
 
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -5;
     }
 }
@@ -63718,7 +63617,7 @@ static int termite_metal_decode_runtime_encode_dense_ffn_residual(
         [first_linear_encoder setBuffer:runtime->linear_bias_buffers[first_linear_slot] offset:0 atIndex:2];
         [first_linear_encoder setBuffer:first_output_buffer offset:0 atIndex:3];
         [first_linear_encoder setBuffer:first_linear_params_buffer offset:0 atIndex:4];
-        [first_linear_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(first_linear_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, intermediate_size), 1, 1));
         [first_linear_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> activation_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -63727,7 +63626,7 @@ static int termite_metal_decode_runtime_encode_dense_ffn_residual(
         [activation_encoder setBuffer:first_output_buffer offset:0 atIndex:0];
         [activation_encoder setBuffer:activated_buffer offset:0 atIndex:1];
         [activation_encoder setBuffer:activation_params_buffer offset:0 atIndex:2];
-        [activation_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, intermediate_size), 1, 1));
         [activation_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> second_linear_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -63738,7 +63637,7 @@ static int termite_metal_decode_runtime_encode_dense_ffn_residual(
         [second_linear_encoder setBuffer:runtime->linear_bias_buffers[second_linear_slot] offset:0 atIndex:2];
         [second_linear_encoder setBuffer:second_output_buffer offset:0 atIndex:3];
         [second_linear_encoder setBuffer:second_linear_params_buffer offset:0 atIndex:4];
-        [second_linear_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(second_linear_encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, hidden_size), 1, 1));
         [second_linear_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> add_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -63748,7 +63647,7 @@ static int termite_metal_decode_runtime_encode_dense_ffn_residual(
         [add_encoder setBuffer:residual_buffer offset:0 atIndex:1];
         [add_encoder setBuffer:output_buffer offset:0 atIndex:2];
         [add_encoder setBuffer:add_params_buffer offset:0 atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(add_encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1));
         [add_encoder endEncoding];
         return 0;
     }
@@ -63822,7 +63721,7 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
             [pair_linear_encoder setBuffer:gate_output_buffer offset:0 atIndex:5];
             [pair_linear_encoder setBuffer:up_output_buffer offset:0 atIndex:6];
             [pair_linear_encoder setBuffer:pair_linear_params_buffer offset:0 atIndex:7];
-            [pair_linear_encoder dispatchThreads:MTLSizeMake(intermediate_size * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(pair_linear_encoder, MTLSizeMake(intermediate_size * 32u, 1, 1), MTLSizeMake(32, 1, 1));
             [pair_linear_encoder endEncoding];
         } else {
             id<MTLComputeCommandEncoder> gate_linear_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -63833,7 +63732,7 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
             [gate_linear_encoder setBuffer:runtime->linear_bias_buffers[gate_linear_slot] offset:0 atIndex:2];
             [gate_linear_encoder setBuffer:gate_output_buffer offset:0 atIndex:3];
             [gate_linear_encoder setBuffer:pair_linear_params_buffer offset:0 atIndex:4];
-            [gate_linear_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, intermediate_size), 1, 1)];
+            antfly_metal_dispatch_threads(gate_linear_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, intermediate_size), 1, 1));
             [gate_linear_encoder endEncoding];
 
             id<MTLComputeCommandEncoder> up_linear_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -63844,7 +63743,7 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
             [up_linear_encoder setBuffer:runtime->linear_bias_buffers[up_linear_slot] offset:0 atIndex:2];
             [up_linear_encoder setBuffer:up_output_buffer offset:0 atIndex:3];
             [up_linear_encoder setBuffer:pair_linear_params_buffer offset:0 atIndex:4];
-            [up_linear_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, intermediate_size), 1, 1)];
+            antfly_metal_dispatch_threads(up_linear_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, intermediate_size), 1, 1));
             [up_linear_encoder endEncoding];
         }
 
@@ -63854,7 +63753,7 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
         [activation_encoder setBuffer:gate_output_buffer offset:0 atIndex:0];
         [activation_encoder setBuffer:activated_buffer offset:0 atIndex:1];
         [activation_encoder setBuffer:activation_params_buffer offset:0 atIndex:2];
-        [activation_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(activation_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, intermediate_size), 1, 1));
         [activation_encoder endEncoding];
 
         id<MTLComputeCommandEncoder> multiply_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -63864,7 +63763,7 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
         [multiply_encoder setBuffer:up_output_buffer offset:0 atIndex:1];
         [multiply_encoder setBuffer:gated_buffer offset:0 atIndex:2];
         [multiply_encoder setBuffer:multiply_params_buffer offset:0 atIndex:3];
-        [multiply_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, intermediate_size), 1, 1)];
+        antfly_metal_dispatch_threads(multiply_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, intermediate_size), 1, 1));
         [multiply_encoder endEncoding];
 
         id<MTLBuffer> down_input_buffer = gated_buffer;
@@ -63877,7 +63776,7 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
             [gated_rms_norm_encoder setBuffer:runtime->rms_norm_weight_buffers[post_gate_rms_norm_slot] offset:0 atIndex:1];
             [gated_rms_norm_encoder setBuffer:normed_gated_buffer offset:0 atIndex:2];
             [gated_rms_norm_encoder setBuffer:gated_rms_norm_params_buffer offset:0 atIndex:3];
-            [gated_rms_norm_encoder dispatchThreads:MTLSizeMake(intermediate_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, intermediate_size), 1, 1)];
+            antfly_metal_dispatch_threads(gated_rms_norm_encoder, MTLSizeMake(intermediate_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_pipeline, intermediate_size), 1, 1));
             [gated_rms_norm_encoder endEncoding];
             down_input_buffer = normed_gated_buffer;
         }
@@ -63892,9 +63791,9 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
         [down_linear_encoder setBuffer:projected_buffer offset:0 atIndex:3];
         [down_linear_encoder setBuffer:down_linear_params_buffer offset:0 atIndex:4];
         if (use_down_reduce) {
-            [down_linear_encoder dispatchThreads:MTLSizeMake(hidden_size * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(down_linear_encoder, MTLSizeMake(hidden_size * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
-            [down_linear_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, hidden_size), 1, 1)];
+            antfly_metal_dispatch_threads(down_linear_encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, hidden_size), 1, 1));
         }
         [down_linear_encoder endEncoding];
 
@@ -63905,7 +63804,7 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
         [add_encoder setBuffer:residual_buffer offset:residual_offset atIndex:1];
         [add_encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [add_encoder setBuffer:add_params_buffer offset:0 atIndex:3];
-        [add_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1)];
+        antfly_metal_dispatch_threads(add_encoder, MTLSizeMake(hidden_size, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->add_pipeline, hidden_size), 1, 1));
         [add_encoder endEncoding];
         return 0;
     }
@@ -64028,8 +63927,8 @@ int termite_metal_decode_runtime_apply_attention_dense_block(
             );
         }
         if (rc == 0) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
             if (rc == 0) memcpy(output, output_buffer.contents, hidden_bytes);
         }
@@ -64161,8 +64060,8 @@ int termite_metal_decode_runtime_apply_attention_dense_block_device_kv_device(
             );
         }
         if (rc == 0) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
         }
         return rc;
@@ -64328,8 +64227,8 @@ int termite_metal_decode_runtime_apply_attention_gated_block(
         }
         if (rc == 0) {
             stage_started_at = termite_metal_clock_monotonic_nanos();
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (timing != NULL) timing->command_wait_nanos += termite_metal_clock_monotonic_nanos() - stage_started_at;
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
             if (rc == 0) {
@@ -64425,12 +64324,12 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q_slot(
         [q_encoder setComputePipelineState:(use_q_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         termite_metal_bind_four_buffers(q_encoder, input_buffer, 0, runtime->linear_weight_buffers[q_linear_slot], 0, runtime->linear_bias_buffers[q_linear_slot], 0, q_buffer, 0, &q_params, sizeof(q_params));
         if (use_q_reduce) {
-            [q_encoder dispatchThreads:MTLSizeMake(attention_input_size * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(q_encoder, MTLSizeMake(attention_input_size * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
             NSUInteger q_thread_width = runtime->linear_pipeline.maxTotalThreadsPerThreadgroup;
             if (q_thread_width == 0) q_thread_width = 64;
             if (q_thread_width > attention_input_size && attention_input_size > 0) q_thread_width = attention_input_size;
-            [q_encoder dispatchThreads:MTLSizeMake(attention_input_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(q_thread_width, 1, 1)];
+            antfly_metal_dispatch_threads(q_encoder, MTLSizeMake(attention_input_size, 1, 1), MTLSizeMake(q_thread_width, 1, 1));
         }
         [q_encoder endEncoding];
         if (timing != NULL) timing->attention_span_nanos += termite_metal_clock_monotonic_nanos() - stage_started_at;
@@ -64538,8 +64437,8 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q_slot(
         }
         if (rc == 0) {
             stage_started_at = termite_metal_clock_monotonic_nanos();
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (timing != NULL) timing->command_wait_nanos += termite_metal_clock_monotonic_nanos() - stage_started_at;
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -12;
             if (rc == 0) {
@@ -64718,8 +64617,8 @@ int termite_metal_decode_runtime_apply_attention_gated_block_device_kv_device(
         }
         if (rc == 0) {
             stage_started_at = termite_metal_clock_monotonic_nanos();
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (timing != NULL) timing->command_wait_nanos += termite_metal_clock_monotonic_nanos() - stage_started_at;
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
         }
@@ -64812,12 +64711,12 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q_slot_device_kv_de
         [q_encoder setComputePipelineState:(use_q_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         termite_metal_bind_four_buffers(q_encoder, input_buffer, attention_input_offset, runtime->linear_weight_buffers[q_linear_slot], 0, runtime->linear_bias_buffers[q_linear_slot], 0, q_buffer, 0, &q_params, sizeof(q_params));
         if (use_q_reduce) {
-            [q_encoder dispatchThreads:MTLSizeMake(attention_input_size * 32u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            antfly_metal_dispatch_threads(q_encoder, MTLSizeMake(attention_input_size * 32u, 1, 1), MTLSizeMake(32, 1, 1));
         } else {
             NSUInteger q_thread_width = runtime->linear_pipeline.maxTotalThreadsPerThreadgroup;
             if (q_thread_width == 0) q_thread_width = 64;
             if (q_thread_width > attention_input_size && attention_input_size > 0) q_thread_width = attention_input_size;
-            [q_encoder dispatchThreads:MTLSizeMake(attention_input_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(q_thread_width, 1, 1)];
+            antfly_metal_dispatch_threads(q_encoder, MTLSizeMake(attention_input_size, 1, 1), MTLSizeMake(q_thread_width, 1, 1));
         }
         [q_encoder endEncoding];
         if (timing != NULL) timing->attention_span_nanos += termite_metal_clock_monotonic_nanos() - stage_started_at;
@@ -64927,8 +64826,8 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q_slot_device_kv_de
         }
         if (rc == 0) {
             stage_started_at = termite_metal_clock_monotonic_nanos();
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (timing != NULL) timing->command_wait_nanos += termite_metal_clock_monotonic_nanos() - stage_started_at;
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -12;
         }
@@ -65092,7 +64991,7 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q8_0_device_kv_devi
                 if (encoder == nil) return -6;
                 [encoder setComputePipelineState:runtime->layer_norm_pipeline];
                 termite_metal_bind_four_buffers(encoder, attn_added_buffer, 0, runtime->layer_norm_weight_buffers[ffn_layer_norm_slot], 0, runtime->layer_norm_bias_buffers[ffn_layer_norm_slot], 0, ffn_input_buffer, 0, &params, sizeof(params));
-                [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
                 [encoder endEncoding];
                 ffn_gate_input_buffer = ffn_input_buffer;
             } else if (ffn_rms_norm_slot != SIZE_MAX) {
@@ -65137,8 +65036,8 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q8_0_device_kv_devi
 
         if (rc == 0 && frame_owned) {
             stage_started_at = termite_metal_clock_monotonic_nanos();
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (timing != NULL) timing->command_wait_nanos += termite_metal_clock_monotonic_nanos() - stage_started_at;
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -9;
         }
@@ -65675,7 +65574,7 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
                 }
                 [encoder setComputePipelineState:runtime->layer_norm_pipeline];
                 termite_metal_bind_four_buffers(encoder, attn_added_buffer, 0, runtime->layer_norm_weight_buffers[ffn_layer_norm_slot], 0, runtime->layer_norm_bias_buffers[ffn_layer_norm_slot], 0, ffn_input_buffer, 0, &params, sizeof(params));
-                [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                antfly_metal_dispatch_threads(encoder, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
                 [encoder endEncoding];
                 ffn_gate_input_buffer = ffn_input_buffer;
                 if (timing != NULL) timing->layer_norm_kernels += 1;
@@ -65854,15 +65753,15 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
             [encoder setComputePipelineState:runtime->scale_pipeline];
             termite_metal_bind_two_buffers(encoder, output_buffer, output_offset, output_buffer, output_offset, &output_scale, sizeof(output_scale));
             const size_t elems = q_len * hidden_size;
-            [encoder dispatchThreads:MTLSizeMake(elems, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->scale_pipeline, elems), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(elems, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->scale_pipeline, elems), 1, 1));
             [encoder endEncoding];
             termite_metal_restore_compute_region(runtime, previous_region);
         }
 
         if (rc == 0 && frame_owned) {
             stage_started_at = termite_metal_clock_monotonic_nanos();
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             if (timing != NULL) timing->command_wait_nanos += termite_metal_clock_monotonic_nanos() - stage_started_at;
             if (timing != NULL) timing->gpu_nanos += termite_metal_command_buffer_gpu_elapsed_nanos(command_buffer);
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -16;
@@ -66315,7 +66214,7 @@ int antfly_metal_audio_storage_clear(termite_metal_decode_runtime *r) {
     for (size_t i = 0; i < 128; i++) {
         id<MTLCommandBuffer> fence = r->audio_reuse_fences[i];
         if (fence && !antfly_audio_fence_complete(fence))
-            [fence waitUntilCompleted];
+            antfly_metal_wait(fence);
         r->audio_reuse_buffers[i] = nil;
         r->audio_reuse_fences[i] = nil;
     }
@@ -66646,7 +66545,7 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
         if (runtime->scratch_pool_pending_frame_release[slot] == 1)
             runtime->scratch_pool_pending_frame_release[slot] = 2;
     }
-    [cb commit];
+    antfly_metal_commit(cb);
     runtime->frame_submit_count = termite_metal_u64_saturating_add(runtime->frame_submit_count, 1);
     runtime->submitted_frame_cb = cb;
     runtime->active_frame_cb = nil;
@@ -66812,7 +66711,7 @@ int termite_metal_decode_runtime_wait_frame(termite_metal_decode_runtime *runtim
     id<MTLCommandBuffer> cb = runtime->submitted_frame_cb;
     if (cb == nil) return -2;
     const uint64_t wait_started = termite_metal_clock_monotonic_nanos();
-    [cb waitUntilCompleted];
+    antfly_metal_wait(cb);
     const uint64_t wait_finished = termite_metal_clock_monotonic_nanos();
     if (wait_finished > wait_started) {
         const uint64_t wait_nanos = wait_finished - wait_started;
@@ -66982,8 +66881,8 @@ int termite_metal_decode_runtime_concat_rows_device(
         [blit endEncoding];
         runtime->active_frame_blit_encoder_count += (frame_owned ? 0 : 1);
         if (frame_owned) {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            antfly_metal_commit(command_buffer);
+            antfly_metal_wait(command_buffer);
             return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -8;
         }
         return 0;
@@ -67979,7 +67878,7 @@ static int termite_metal_lightonocr3_copy_on_frame(termite_metal_decode_runtime 
     [encoder setBuffer:src offset:src_offset atIndex:0];
     [encoder setBuffer:dst offset:dst_offset atIndex:1];
     [encoder setBytes:&count length:sizeof(count) atIndex:2];
-    [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(count, 1, 1), MTLSizeMake(128, 1, 1));
     if (runtime->lightonocr3_copy_dispatches++ == 0 &&
         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_LIGHTONOCR3_COMPUTE_COPIES")))
         fprintf(stderr, "lightonocr3_compute_copy: bytes=%zu planned=1\n", length);
@@ -68208,8 +68107,7 @@ int termite_metal_buffer_slice_last_dim_2d(
                 }
                 [planned_encoder setComputePipelineState:runtime->slice_last_dim_f32_2d_pipeline];
                 termite_metal_bind_two_buffers(planned_encoder, src, src_offset, dst, dst_offset, &params, sizeof(params));
-                [planned_encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-                           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->slice_last_dim_f32_2d_pipeline, total), 1, 1)];
+                antfly_metal_dispatch_threads(planned_encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->slice_last_dim_f32_2d_pipeline, total), 1, 1));
                 return 0;
             }
             bool frame_owned = true;
@@ -68219,8 +68117,7 @@ int termite_metal_buffer_slice_last_dim_2d(
             if (encoder == nil) return -5;
             [encoder setComputePipelineState:runtime->slice_last_dim_f32_2d_pipeline];
             termite_metal_bind_two_buffers(encoder, src, src_offset, dst, dst_offset, &params, sizeof(params));
-            [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->slice_last_dim_f32_2d_pipeline, total), 1, 1)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->slice_last_dim_f32_2d_pipeline, total), 1, 1));
             [encoder endEncoding];
             return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -6);
         }
@@ -68410,10 +68307,10 @@ static int termite_metal_dispatch(termite_metal_provider *provider, id<MTLComput
         if (thread_width == 0) thread_width = 64;
         if (thread_width > total && total > 0) thread_width = total;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -7;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the
         // caller's buffer instead of aliasing it, so results must be copied back.
@@ -68599,8 +68496,8 @@ static int termite_metal_dispatch_quant_matmul_none(termite_metal_provider *prov
             return rc;
         }
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status == MTLCommandBufferStatusCompleted) {
             // newBufferWithBytes (the non-page-aligned fallback) snapshots the
             // caller's buffer instead of aliasing it, so results must be copied back.
@@ -68766,10 +68663,10 @@ static int termite_metal_dispatch_generated_quant_bias(termite_metal_provider *p
         termite_metal_bind_four_buffers(encoder, input_buffer, 0, weight_buffer, 0, bias_buffer, 0, output_buffer, 0, &rows_i, sizeof(rows_i));
         [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:5];
         [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:6];
-        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, rows, 1) threadsPerThreadgroup:MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, rows, 1), MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1));
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status == MTLCommandBufferStatusCompleted) {
             // newBufferWithBytes (the non-page-aligned fallback) snapshots the
             // caller's buffer instead of aliasing it, so results must be copied back.
@@ -68809,10 +68706,10 @@ static int termite_metal_dispatch_generated_quant_relu(termite_metal_provider *p
         termite_metal_bind_three_buffers(encoder, input_buffer, 0, weight_buffer, 0, output_buffer, 0, &rows_i, sizeof(rows_i));
         [encoder setBytes:&in_dim_i length:sizeof(in_dim_i) atIndex:4];
         [encoder setBytes:&out_dim_i length:sizeof(out_dim_i) atIndex:5];
-        [encoder dispatchThreadgroups:MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, rows, 1) threadsPerThreadgroup:MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((out_dim + launch_shape.cols_per_threadgroup - 1u) / launch_shape.cols_per_threadgroup, rows, 1), MTLSizeMake(launch_shape.threads_per_threadgroup, 1, 1));
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status == MTLCommandBufferStatusCompleted) {
             // newBufferWithBytes (the non-page-aligned fallback) snapshots the
             // caller's buffer instead of aliasing it, so results must be copied back.
@@ -68864,10 +68761,10 @@ static int termite_metal_dispatch_pair(termite_metal_provider *provider, id<MTLC
         if (thread_width == 0) thread_width = 32;
         if (thread_width > out_dim && out_dim > 0) thread_width = out_dim;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -7;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the
         // caller's buffer instead of aliasing it, so results must be copied back.
@@ -68911,10 +68808,10 @@ static int termite_metal_dispatch_key_scores(termite_metal_provider *provider, i
         if (thread_width == 0) thread_width = 64;
         if (thread_width > output_len && output_len > 0) thread_width = output_len;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -7;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the
         // caller's buffer instead of aliasing it, so results must be copied back.
@@ -68949,10 +68846,10 @@ static int termite_metal_dispatch_tl1(termite_metal_provider *provider, const fl
         if (thread_width == 0) thread_width = 32;
         if (thread_width > out_dim && out_dim > 0) thread_width = out_dim;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -7;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the
         // caller's buffer instead of aliasing it, so results must be copied back.
@@ -68987,10 +68884,10 @@ static int termite_metal_dispatch_tl2(termite_metal_provider *provider, const fl
         if (thread_width == 0) thread_width = 32;
         if (thread_width > out_dim && out_dim > 0) thread_width = out_dim;
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        antfly_metal_dispatch_threads(encoder, grid_size, group_size);
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -7;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the
         // caller's buffer instead of aliasing it, so results must be copied back.
@@ -69078,8 +68975,8 @@ int termite_metal_provider_linear_q8_0_planned(termite_metal_provider *provider,
             return rc;
         }
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -7;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the
         // caller's buffer instead of aliasing it, so results must be copied back.
@@ -69252,16 +69149,14 @@ static int termite_metal_a4b_route_select_replay_dispatch(
             [encoder setComputePipelineState:pipeline];
             termite_metal_bind_three_buffers(encoder, logits, 0, route_ids, 0, route_weights, 0, params, sizeof(*params));
             if (candidate) {
-                [encoder dispatchThreadgroups:MTLSizeMake(params->rows, 1u, 1u)
-                    threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
+                antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(params->rows, 1u, 1u), MTLSizeMake(32u, 1u, 1u));
             } else {
-                [encoder dispatchThreads:MTLSizeMake(params->rows, 1u, 1u)
-                    threadsPerThreadgroup:MTLSizeMake(params->rows, 1u, 1u)];
+                antfly_metal_dispatch_threads(encoder, MTLSizeMake(params->rows, 1u, 1u), MTLSizeMake(params->rows, 1u, 1u));
             }
         }
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted || command_buffer.error != nil) return -3;
         const double seconds = command_buffer.GPUEndTime - command_buffer.GPUStartTime;
         if (!(seconds > 0.0) || !isfinite(seconds)) return -4;
@@ -69447,12 +69342,11 @@ static int termite_metal_a4b_router_projection_replay_dispatch(
         for (size_t dispatch = 0; dispatch < dispatch_count; ++dispatch) {
             [encoder setComputePipelineState:pipeline];
             termite_metal_bind_four_buffers(encoder, input, 0, weight, 0, bias, 0, output, 0, params, sizeof(*params));
-            [encoder dispatchThreadgroups:MTLSizeMake(simd4 ? (params->out_dim + 3u) / 4u : params->out_dim, 1u, 1u)
-                threadsPerThreadgroup:MTLSizeMake(simd4 ? 128u : 32u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(simd4 ? (params->out_dim + 3u) / 4u : params->out_dim, 1u, 1u), MTLSizeMake(simd4 ? 128u : 32u, 1u, 1u));
         }
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted || command_buffer.error != nil) return -3;
         const double seconds = command_buffer.GPUEndTime - command_buffer.GPUStartTime;
         if (!(seconds > 0.0) || !isfinite(seconds)) return -4;
@@ -69571,11 +69465,10 @@ static int termite_metal_a4b_lm_head_replay_dispatch(
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_three_buffers(encoder, input, 0, weight, 0, output, 0, params, sizeof(*params));
         [encoder setThreadgroupMemoryLength:16u * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake((params->out_dim + 3u) / 4u, 1u, 1u)
-            threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((params->out_dim + 3u) / 4u, 1u, 1u), MTLSizeMake(64u, 1u, 1u));
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted || command_buffer.error != nil) return -3;
         const double seconds = command_buffer.GPUEndTime - command_buffer.GPUStartTime;
         if (!(seconds > 0.0) || !isfinite(seconds)) return -4;
@@ -69605,13 +69498,13 @@ static int termite_metal_a4b_argmax_replay_dispatch(
         if (threadgroup_reduce) {
             [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
             [encoder setThreadgroupMemoryLength:256u * sizeof(uint32_t) atIndex:1];
-            [encoder dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(1u, 1u, 1u), MTLSizeMake(256u, 1u, 1u));
         } else {
-            [encoder dispatchThreads:MTLSizeMake(1u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(1u, 1u, 1u)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(1u, 1u, 1u), MTLSizeMake(1u, 1u, 1u));
         }
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         return command_buffer.status == MTLCommandBufferStatusCompleted && command_buffer.error == nil ? 0 : -3;
     }
 }
@@ -69820,11 +69713,10 @@ static int termite_metal_a4b_replay_dispatch(
         if (command_buffer == nil || encoder == nil) return -2;
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_four_buffers(encoder, input, 0, weight, 0, output, 0, expert_ids, 0, params, sizeof(*params));
-        [encoder dispatchThreadgroups:MTLSizeMake(grid_x, 8u, 1u)
-            threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(grid_x, 8u, 1u), MTLSizeMake(64u, 1u, 1u));
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted || command_buffer.error != nil) return -3;
         const double seconds = command_buffer.GPUEndTime - command_buffer.GPUStartTime;
         if (!(seconds > 0.0) || !isfinite(seconds)) return -4;
@@ -69877,19 +69769,19 @@ static int termite_metal_a4b_gate_activation_replay_dispatch(
         if (fused) {
             [encoder setComputePipelineState:fused_pipeline];
             termite_metal_bind_five_buffers(encoder, input, 0, weight, 0, weight, 0, output, 0, expert_ids, 0, &fused_params, sizeof(fused_params));
-            [encoder dispatchThreadgroups:MTLSizeMake(88u, 8u, 1u) threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(88u, 8u, 1u), MTLSizeMake(64u, 1u, 1u));
         } else {
             [encoder setComputePipelineState:gate_pipeline];
             termite_metal_bind_four_buffers(encoder, input, 0, weight, 0, merged, 0, expert_ids, 0, &gate_params, sizeof(gate_params));
-            [encoder dispatchThreadgroups:MTLSizeMake(176u, 8u, 1u) threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(176u, 8u, 1u), MTLSizeMake(64u, 1u, 1u));
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [encoder setComputePipelineState:activation_pipeline];
             termite_metal_bind_two_buffers(encoder, merged, 0, output, 0, &activation_params, sizeof(activation_params));
-            [encoder dispatchThreads:MTLSizeMake(8u * 704u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(8u * 704u, 1u, 1u), MTLSizeMake(256u, 1u, 1u));
         }
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted || command_buffer.error != nil) return -3;
         const double seconds = command_buffer.GPUEndTime - command_buffer.GPUStartTime;
         if (!(seconds > 0.0) || !isfinite(seconds)) return -4;
@@ -69942,22 +69834,19 @@ static int termite_metal_a4b_down_reduce_replay_dispatch(
             [encoder setBuffer:output offset:0 atIndex:5];
             [encoder setBytes:&fused_params length:sizeof(fused_params) atIndex:6];
             [encoder setThreadgroupMemoryLength:64u * sizeof(float) atIndex:0];
-            [encoder dispatchThreadgroups:MTLSizeMake(352u, 1u, 1u)
-                threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(352u, 1u, 1u), MTLSizeMake(64u, 1u, 1u));
         } else {
             [encoder setComputePipelineState:down_pipeline];
             termite_metal_bind_four_buffers(encoder, input, 0, weight, 0, route_output, 0, expert_ids, 0, &down_params, sizeof(down_params));
-            [encoder dispatchThreadgroups:MTLSizeMake(352u, 8u, 1u)
-                threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(352u, 8u, 1u), MTLSizeMake(64u, 1u, 1u));
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [encoder setComputePipelineState:reduce_pipeline];
             termite_metal_bind_five_buffers(encoder, route_output, 0, expert_ids, 0, route_weights, 0, expert_scale, 0, output, 0, &reduce_params, sizeof(reduce_params));
-            [encoder dispatchThreads:MTLSizeMake(2816u, 1u, 1u)
-                threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(reduce_pipeline, 2816u), 1u, 1u)];
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(2816u, 1u, 1u), MTLSizeMake(termite_metal_thread_width(reduce_pipeline, 2816u), 1u, 1u));
         }
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted || command_buffer.error != nil) return -3;
         const double seconds = command_buffer.GPUEndTime - command_buffer.GPUStartTime;
         if (!(seconds > 0.0) || !isfinite(seconds)) return -4;
@@ -70268,11 +70157,10 @@ static int termite_metal_a4b_common_pair_replay_dispatch(
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_four_buffers(encoder, input, 0, gate_weight, 0, up_weight, 0, output, 0, params, sizeof(*params));
         [encoder setBytes:activation length:sizeof(*activation) atIndex:5];
-        [encoder dispatchThreadgroups:MTLSizeMake((params->out_dim + 7u) / 8u, 1u, 1u)
-            threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((params->out_dim + 7u) / 8u, 1u, 1u), MTLSizeMake(64u, 1u, 1u));
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted || command_buffer.error != nil) return -3;
         const double seconds = command_buffer.GPUEndTime - command_buffer.GPUStartTime;
         if (!(seconds > 0.0) || !isfinite(seconds)) return -4;
@@ -70300,11 +70188,10 @@ static int termite_metal_a4b_common_down_replay_dispatch(
         if (command_buffer == nil || encoder == nil) return -2;
         [encoder setComputePipelineState:pipeline];
         termite_metal_bind_three_buffers(encoder, input, 0, weight, 0, output, 0, params, sizeof(*params));
-        [encoder dispatchThreadgroups:MTLSizeMake((params->out_dim + 15u) / 16u, 1u, 1u)
-            threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake((params->out_dim + 15u) / 16u, 1u, 1u), MTLSizeMake(128u, 1u, 1u));
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
         if (command_buffer.status != MTLCommandBufferStatusCompleted || command_buffer.error != nil) return -3;
         const double seconds = command_buffer.GPUEndTime - command_buffer.GPUStartTime;
         if (!(seconds > 0.0) || !isfinite(seconds)) return -4;
@@ -70737,9 +70624,8 @@ int antfly_metal_clipped_linear_tune(termite_metal_decode_runtime *r, size_t slo
                     [e setBuffer:r->linear_weight_buffers[slot] offset:0 atIndex:1];
                     [e setBuffer:y offset:0 atIndex:2];
                     [e setBytes:p length:32 atIndex:3];
-                    [e dispatchThreadgroups:MTLSizeMake((p->out_dim + 31) / 32, (p->rows + 31) / 32,
-                                                        1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    antfly_metal_dispatch_threadgroups(e, MTLSizeMake((p->out_dim + 31) / 32, (p->rows + 31) / 32,
+                                                        1), MTLSizeMake(256, 1, 1));
                     [e endEncoding];
                 } else {
                     if (p->flags & 3) {
@@ -70749,11 +70635,10 @@ int antfly_metal_clipped_linear_tune(termite_metal_decode_runtime *r, size_t slo
                         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
                         [e setComputePipelineState:r->gemma4_audio_clamp_pipeline];
                         termite_metal_bind_two_buffers(e, x, 0, tmp, 0, &cp, sizeof(cp));
-                        [e dispatchThreads:MTLSizeMake(cp.total, 1, 1)
-                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        antfly_metal_dispatch_threads(e, MTLSizeMake(cp.total, 1, 1), MTLSizeMake(256, 1, 1));
                         [e endEncoding];
                     }
-                    [mm encodeToCommandBuffer:cb leftMatrix:a rightMatrix:b resultMatrix:c];
+                    antfly_metal_encode_matrix(mm, cb, a, b, c);
                     if (p->flags & 28) {
                         termite_metal_gemma4_audio_clamp_params cp = {
                             (uint32_t)((size_t)p->rows * p->out_dim), (p->flags >> 2) & 3,
@@ -70763,13 +70648,12 @@ int antfly_metal_clipped_linear_tune(termite_metal_decode_runtime *r, size_t slo
                                                        ? r->gemma4_audio_clamp_silu_pipeline
                                                        : r->gemma4_audio_clamp_pipeline];
                         termite_metal_bind_two_buffers(e, y, 0, y, 0, &cp, sizeof(cp));
-                        [e dispatchThreads:MTLSizeMake(cp.total, 1, 1)
-                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        antfly_metal_dispatch_threads(e, MTLSizeMake(cp.total, 1, 1), MTLSizeMake(256, 1, 1));
                         [e endEncoding];
                     }
                 }
-                [cb commit];
-                [cb waitUntilCompleted];
+                antfly_metal_commit(cb);
+                antfly_metal_wait(cb);
                 double dt = cb.GPUEndTime - cb.GPUStartTime;
                 if (cb.error || !(dt > 0) || !isfinite(dt))
                     valid = false;
@@ -70838,14 +70722,20 @@ int antfly_metal_audio_pad(termite_metal_decode_runtime *r,void *x,size_t xo,voi
 }
 
 // Admission queries precede allocation; actual charges include driver padding.
+// Upper bound for fresh owned MTLBuffer. Audio cache bucket padding is a
+// separate policy below and must not inflate generic physical-plan banks.
+size_t antfly_metal_physical_allocation_bytes(termite_metal_decode_runtime *r,size_t bytes) {
+    if(!r || !bytes)return 0;
+    MTLSizeAndAlign sa=[r->device heapBufferSizeAndAlignWithLength:bytes options:MTLResourceStorageModePrivate];
+    return MAX(bytes,(size_t)sa.size);
+}
 size_t antfly_metal_audio_allocation_bytes(termite_metal_decode_runtime *r,size_t bytes,int shared) {
     if(!r || !bytes)return 0;
     // Shared heaps are unavailable on some supported Intel devices. Reserve
     // conservatively and verify the actual driver allocation before retaining.
     size_t n=bytes;
     if(!shared) {
-        MTLSizeAndAlign sa=[r->device heapBufferSizeAndAlignWithLength:bytes options:MTLResourceStorageModePrivate];
-        n=MAX(bytes,(size_t)sa.size);
+        n=antfly_metal_physical_allocation_bytes(r,bytes);
     } else {
         if(bytes>SIZE_MAX-65535)return 0;
         n=(bytes+65535)&~(size_t)65535;
@@ -70891,7 +70781,7 @@ int antfly_metal_rotary_table(termite_metal_decode_runtime *runtime, void *outpu
         struct { uint32_t dim,x,y,vision; float theta; } params = {dim,x,y,vision,theta};
         [encoder setComputePipelineState:runtime->rotary_table_pipeline];
         [encoder setBuffer:out offset:offset atIndex:0]; [encoder setBytes:&params length:sizeof(params) atIndex:1];
-        [encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(count,1,1), MTLSizeMake(64,1,1));
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(cb, owned, -5);
     }
@@ -71185,7 +71075,7 @@ int antfly_metal_lighton_embed_tokens(termite_metal_decode_runtime *r,
     [e setBuffer:r->token_buffer offset:0 atIndex:1];
     [e setBuffer:out offset:out_offset atIndex:2];
     [e setBytes:&p length:sizeof(p) atIndex:3];
-    [e dispatchThreads:MTLSizeMake(rows * dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    antfly_metal_dispatch_threads(e, MTLSizeMake(rows * dim, 1, 1), MTLSizeMake(256, 1, 1));
     return 0;
 }
 

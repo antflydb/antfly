@@ -26,6 +26,7 @@
 //
 // Matches Go inference's lib/pipelines/encoder_decoder.go pattern.
 
+const stage_runtime = @import("../execution/encoder_decoder_runtime.zig");
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const c_file = @import("../util/c_file.zig");
@@ -203,11 +204,37 @@ pub const EncoderDecoderPipeline = struct {
         return std.math.cast(i32, best) orelse error.LogitsSizeMismatch;
     }
 
+    /// Default task entry point. Stage placement is decided before encoding;
+    /// explicit host-output APIs remain available to callers that request them.
+    pub fn generateMasked(self: *EncoderDecoderPipeline, allocator: std.mem.Allocator, input_ids: []const i64, mask: []const i64) !EncoderDecoderResult {
+        if (input_ids.len == 0 or input_ids.len != mask.len) return error.InvalidInputShape;
+        const shape = [_]i64{ 1, @intCast(input_ids.len) };
+        const inputs = [_]backends.Tensor{
+            .{ .name = "input_ids", .data = @constCast(std.mem.sliceAsBytes(input_ids)), .shape = &shape, .dtype = .i64, .allocator = allocator, .owns_data = false, .owns_shape = false },
+            .{ .name = "attention_mask", .data = @constCast(std.mem.sliceAsBytes(mask)), .shape = &shape, .dtype = .i64, .allocator = allocator, .owns_data = false, .owns_shape = false },
+        };
+        if (self.execution_control) |control| try control.update(.executing, 0, 1);
+        var encoded = try stage_runtime.encode(allocator, self.encoder, self.decoder, &inputs, self.batch_dispatch, self.execution_control);
+        defer encoded.deinit(allocator);
+        return self.greedyDecodeOutputs(allocator, &encoded, mask, input_ids.len);
+    }
+
     /// Greedy autoregressive decode from encoder outputs.
     pub fn greedyDecode(
         self: *EncoderDecoderPipeline,
         allocator: std.mem.Allocator,
         encoder_outputs: []backends.Tensor,
+        encoder_attention_mask: []const i64,
+        encoder_seq_len: usize,
+    ) !EncoderDecoderResult {
+        var encoded = stage_runtime.EncoderOutputs{ .host = encoder_outputs };
+        return self.greedyDecodeOutputs(allocator, &encoded, encoder_attention_mask, encoder_seq_len);
+    }
+
+    fn greedyDecodeOutputs(
+        self: *EncoderDecoderPipeline,
+        allocator: std.mem.Allocator,
+        encoder_outputs: *const stage_runtime.EncoderOutputs,
         encoder_attention_mask: []const i64,
         encoder_seq_len: usize,
     ) !EncoderDecoderResult {
@@ -221,9 +248,11 @@ pub const EncoderDecoderPipeline = struct {
         defer allocator.free(dec_ids_i64);
         dec_ids_i64[0] = self.config.decoder_start_token_id;
 
-        if (encoder_outputs.len == 0) return error.NoEncoderOutput;
-        const encoder_hidden = &encoder_outputs[0];
-        var incremental = @import("seq2seq_decode.zig").State.init(allocator, self.decoder, encoder_hidden.*, encoder_attention_mask, self.config.vocab_size);
+        const encoder_hidden: ?*const backends.Tensor = switch (encoder_outputs.*) {
+            .host => |outputs| if (outputs.len != 0) &outputs[0] else return error.NoEncoderOutput,
+            .resident => null,
+        };
+        var incremental = if (encoder_hidden) |hidden| @import("seq2seq_decode.zig").State.init(allocator, self.decoder, hidden.*, encoder_attention_mask, self.config.vocab_size) else null;
         defer if (incremental) |*state| state.deinit();
 
         for (0..max_len) |step| {
@@ -232,7 +261,9 @@ pub const EncoderDecoderPipeline = struct {
             const dec_seq_len: usize = output_ids.items.len;
 
             // Run one decoder step
-            const next_token = if (incremental) |*state| blk: {
+            const next_token = if (encoder_hidden == null)
+                try stage_runtime.finalGreedyToken(allocator, self.decoder, encoder_outputs, dec_ids_i64[0..dec_seq_len], encoder_attention_mask, self.config.vocab_size, self.execution_control)
+            else if (incremental) |*state| blk: {
                 var logits = try state.step(dec_ids_i64[0..dec_seq_len], self.batch_dispatch, self.execution_control);
                 defer logits.deinit();
                 const values = logits.asFloat32();
@@ -246,7 +277,7 @@ pub const EncoderDecoderPipeline = struct {
                 allocator,
                 dec_ids_i64[0..dec_seq_len],
                 dec_seq_len,
-                encoder_hidden,
+                encoder_hidden.?,
                 encoder_attention_mask,
                 encoder_seq_len,
             );

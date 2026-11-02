@@ -87,6 +87,53 @@ pub fn computeLastUse(allocator: std.mem.Allocator, graph: *const Graph, options
     return last_use;
 }
 
+/// Alias sources are physical facts supplied by the selected implementation,
+/// not guesses from operator names. Sources precede views in the graph's node
+/// order; null_node denotes an independently owned value. Logical handle
+/// retirement extends only sources, while donation considers every sibling in
+/// the backing group. Both use the same checked lifetime propagation.
+pub const AliasLivenessOptions = struct {
+    reachable: ?[]const bool = null,
+    propagation: enum { sources, backing_group } = .backing_group,
+};
+
+pub fn computeAliasLastUse(allocator: std.mem.Allocator, last_use: []const u32, sources: []const NodeId, options: AliasLivenessOptions) ![]u32 {
+    if (last_use.len != sources.len) return error.InvalidAliasSources;
+    if (options.reachable) |reachable| if (reachable.len != sources.len) return error.InvalidReachability;
+    for (sources, 0..) |source, index| {
+        if (options.reachable) |reachable| if (!reachable[index]) continue;
+        if (source != null_node and source >= index) return error.InvalidAliasSource;
+    }
+    const result = try allocator.dupe(u32, last_use);
+    errdefer allocator.free(result);
+    if (options.propagation == .sources) {
+        var index = sources.len;
+        while (index != 0) {
+            index -= 1;
+            if (options.reachable) |reachable| if (!reachable[index]) continue;
+            const source = sources[index];
+            if (source != null_node) result[source] = @max(result[source], result[index]);
+        }
+        return result;
+    }
+    const roots = try allocator.alloc(NodeId, sources.len);
+    defer allocator.free(roots);
+    for (sources, roots, 0..) |source, *root, index| {
+        root.* = @intCast(index);
+        if (options.reachable) |reachable| if (!reachable[index]) continue;
+        if (source != null_node) root.* = roots[source];
+    }
+    for (roots, 0..) |root, index| {
+        if (options.reachable) |reachable| if (!reachable[index]) continue;
+        result[root] = @max(result[root], last_use[index]);
+    }
+    for (roots, 0..) |root, index| {
+        if (options.reachable) |reachable| if (!reachable[index]) continue;
+        result[index] = result[root];
+    }
+    return result;
+}
+
 /// Compute liveness intervals for all reachable nodes.
 pub fn computeLiveness(
     allocator: std.mem.Allocator,
@@ -379,4 +426,31 @@ test "memory planning cleans intervals on every allocation failure" {
         defer a.free(reachable);
         try std.testing.checkAllAllocationFailures(a, checkPlanningAllocationFailures, .{ &g, reachable });
     }
+}
+
+test "alias lifetime authority separates handle retirement from backing-group donation" {
+    const a = std.testing.allocator;
+    // Two sibling views of a view remain live through different consumers.
+    const sources = [_]NodeId{ null_node, 0, 1, 1, null_node };
+    const uses = [_]u32{ 1, 3, 4, 9, 5 };
+    const handles = try computeAliasLastUse(a, &uses, &sources, .{ .propagation = .sources });
+    defer a.free(handles);
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9, 4, 9, 5 }, handles);
+    const donations = try computeAliasLastUse(a, &uses, &sources, .{});
+    defer a.free(donations);
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9, 9, 9, 5 }, donations);
+    const outputs = [_]u32{ 1, 3, std.math.maxInt(u32), 9, 5 };
+    const pinned = try computeAliasLastUse(a, &outputs, &sources, .{});
+    defer a.free(pinned);
+    try std.testing.expectEqualSlices(u32, &.{ std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32), 5 }, pinned);
+    try std.testing.expectError(error.InvalidAliasSource, computeAliasLastUse(a, &uses, &.{ null_node, 2, 1, 1, null_node }, .{}));
+    try std.testing.expectError(error.InvalidAliasSources, computeAliasLastUse(a, &uses, &.{null_node}, .{}));
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const result = try computeAliasLastUse(allocator, &uses, &sources, .{});
+            defer allocator.free(result);
+            try std.testing.expectEqualSlices(u32, &.{ 9, 9, 9, 9, 5 }, result);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{});
 }

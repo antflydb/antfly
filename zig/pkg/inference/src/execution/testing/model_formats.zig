@@ -466,3 +466,89 @@ pub fn runDecoder(kind: Backend) !void {
     defer a.free(actual_onnx);
     try compare(expected, actual_onnx);
 }
+
+// Append beside the existing model_formats test fixtures. Its graph/weight
+// serializers remain private here; no new production fixture API is needed.
+const NativeResidentLifetimeCase = enum { output, weight, control };
+fn nativeResidentCloseCase(mode: NativeResidentLifetimeCase) !void {
+    const hold_weight = mode == .weight;
+    const Probe = struct {
+        alive: bool = true,
+        calls: usize = 0,
+        expired_calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!self.alive) {
+                self.expired_calls += 1;
+                return error.ExpiredResidentRequestControl;
+            }
+            self.calls += 1;
+        }
+    };
+    var probe = Probe{};
+    const factory = @import("../../architectures/session_factory.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var graph = ml.graph.Graph.init(scratch);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const ids = try builder.parameter("ids", ml.graph.Shape.init(.i64, &.{4}));
+    const positions = try builder.parameter("positions", ml.graph.Shape.init(.i64, &.{4}));
+    const types = try builder.parameter("types", ml.graph.Shape.init(.i64, &.{4}));
+    const mask = try builder.parameter("mask", ml.graph.Shape.init(.f32, &.{ 1, 4, 4 }));
+    const built = try @import("../../architectures/bert_graph.zig").buildForwardGraph(&builder, .{ .vocab_size = 8, .hidden_size = 64, .num_hidden_layers = 1, .num_attention_heads = 1, .intermediate_size = 128, .max_position_embeddings = 4 }, 1, 4, .{ .input_ids = ids, .position_ids = positions, .token_type_ids = types, .attn_bias = mask });
+    try graph.markOutput(built.output_node);
+    const weights = try weightValues(scratch, &graph);
+    const bytes = try safetensorsBytes(scratch, weights);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"bert\",\"architectures\":[\"BertModel\"],\"hidden_size\":64,\"num_hidden_layers\":1,\"num_attention_heads\":1,\"intermediate_size\":128,\"vocab_size\":8,\"max_position_embeddings\":4,\"type_vocab_size\":2}" });
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = bytes });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..] });
+    defer a.free(path);
+    var session = try factory.createNativeSessionWithTaskOverride(a, path, .generic);
+    var session_open = true;
+    defer if (session_open) session.close();
+    var token_ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 4 }, &.{ 0, 1, 2, 3 });
+    defer token_ids.deinit();
+    var attention_mask = try Tensor.initInt64(a, "attention_mask", &.{ 1, 4 }, &.{ 1, 1, 1, 1 });
+    defer attention_mask.deinit();
+    const inputs = [_]Tensor{ token_ids, attention_mask };
+    var resident = if (mode == .control) blk: {
+        var permit = try session.admit(try session.planRun(&inputs, null));
+        defer permit.deinit();
+        const outputs = (try permit.runResidentWithControl(&inputs, a, .{ .ptr = &probe, .check_fn = Probe.check })) orelse return error.MissingResidentOutput;
+        try std.testing.expect(probe.calls > 0);
+        break :blk outputs;
+    } else (try session.runResident(&inputs, a)) orelse return error.MissingResidentOutput;
+    defer resident.deinit();
+    const value = if (hold_weight) try resident.backend.getWeight("embeddings.word_embeddings.weight") else resident.outputs[0];
+    defer if (hold_weight) resident.backend.free(value);
+    const before = try resident.backend.toFloat32(value, a);
+    defer a.free(before);
+    if (mode == .control) {
+        probe.alive = false;
+    } else {
+        session.close();
+        session_open = false;
+    }
+    // The numerical backend owner remains usable while its published result
+    // pins it. Acquired immutable weight handles must keep their storage too.
+    const after = try resident.backend.toFloat32(value, a);
+    defer a.free(after);
+    try std.testing.expectEqualSlices(f32, before, after);
+    try std.testing.expectEqual(@as(usize, 0), probe.expired_calls);
+}
+
+test "native resident outputs survive session close with their backend owner" {
+    try nativeResidentCloseCase(.output);
+}
+
+test "native acquired resident weights retain their model inventory after session close" {
+    try nativeResidentCloseCase(.weight);
+}
+
+test "native resident results do not retain request execution callbacks" {
+    try nativeResidentCloseCase(.control);
+}

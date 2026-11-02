@@ -835,6 +835,30 @@ pub const WeightStore = struct {
 };
 
 /// Internal wrapper: an owned or borrowed f32 slice.
+/// One dense payload owner, independent of any tensor wrapper or compute
+/// context. The existing refcount allocation also remembers the exact original
+/// span and allocator, so views never free storage through a consumer context.
+const DenseStorage = struct {
+    references: usize = 1,
+    allocator: std.mem.Allocator,
+    data: []f32,
+
+    fn create(allocator: std.mem.Allocator, data: []f32) !*DenseStorage {
+        const owner = try allocator.create(DenseStorage);
+        owner.* = .{ .allocator = allocator, .data = data };
+        return owner;
+    }
+
+    fn release(self: *DenseStorage) void {
+        std.debug.assert(self.references > 0);
+        self.references -= 1;
+        if (self.references != 0) return;
+        const allocator = self.allocator;
+        allocator.free(self.data);
+        allocator.destroy(self);
+    }
+};
+
 const Buf = struct {
     data: []f32,
     allocator: std.mem.Allocator,
@@ -844,7 +868,7 @@ const Buf = struct {
     source_row: usize = 0,
     weight_handle_name: ?[]const u8 = null,
     weight_handle_refs: usize = 0,
-    shared_data_refcount: ?*usize = null,
+    dense_storage: ?*DenseStorage = null,
     physical_lease: ?*ops.physical_storage.Lease = null,
     logical_shape: ?[]i64 = null,
     logical_shape_inline: bool = false,
@@ -873,18 +897,9 @@ fn maybeLogLargeTensor(op_name: []const u8, len: usize, shape: ?[]const i64) voi
 
 fn releaseOwnedDenseData(buf: *Buf) void {
     if (!buf.owned) return;
-    if (buf.shared_data_refcount) |refcount| {
-        std.debug.assert(refcount.* > 0);
-        refcount.* -= 1;
-        if (refcount.* == 0) {
-            buf.allocator.free(buf.data);
-            buf.allocator.destroy(refcount);
-        }
-    } else {
-        buf.allocator.free(buf.data);
-    }
+    if (buf.dense_storage) |owner| owner.release() else buf.allocator.free(buf.data);
     buf.owned = false;
-    buf.shared_data_refcount = null;
+    buf.dense_storage = null;
 }
 
 fn releaseLogicalShape(buf: *Buf) void {
@@ -952,8 +967,7 @@ fn materializeViewData(buf: *Buf) !void {
     // Publish only after every allocation succeeds. In particular, a failed
     // refcount allocation must leave the original data, strides and shape
     // alive so the caller can retry or release the view safely.
-    const refcount = try buf.allocator.create(usize);
-    refcount.* = 1;
+    const refcount = try DenseStorage.create(buf.allocator, output);
     releaseOwnedDenseData(buf);
     if (replacement_shape) |shape| {
         releaseLogicalShape(buf);
@@ -963,7 +977,7 @@ fn materializeViewData(buf: *Buf) !void {
     }
     buf.data = output;
     buf.owned = true;
-    buf.shared_data_refcount = refcount;
+    buf.dense_storage = refcount;
     buf.allocator.free(view_strides);
     buf.view_strides = null;
     buf.view_base_offset = 0;
@@ -996,7 +1010,7 @@ fn getData(ct: CT) []f32 {
             releaseLogicalShape(buf);
             buf.data = &.{};
             buf.owned = false;
-            buf.shared_data_refcount = null;
+            buf.dense_storage = null;
         };
     }
     materializeIntegerNumericView(buf) catch |err| {
@@ -1067,7 +1081,7 @@ test "native tensor view readback preserves materialization OOM and nullable clo
                 try std.testing.expectEqual(live, budget.live);
                 try std.testing.expectEqual(!backing_failure, budget.denied);
                 try std.testing.expectEqual(before.data.ptr, toBuf(view).data.ptr);
-                try std.testing.expectEqual(before.shared_data_refcount, toBuf(view).shared_data_refcount);
+                try std.testing.expectEqual(before.dense_storage, toBuf(view).dense_storage);
                 try std.testing.expectEqual(before.logical_shape.?.ptr, toBuf(view).logical_shape.?.ptr);
                 try std.testing.expectEqual(before.view_strides.?.ptr, toBuf(view).view_strides.?.ptr);
                 try std.testing.expectEqualSlices(f32, &original, toBuf(source).data);
@@ -1111,8 +1125,8 @@ fn ownedDenseBufWithMaxSharedRefs(ct: CT, max_shared_refs: usize) ?*Buf {
     // Named weights and their views remain immutable even if the dense
     // conversion itself is allocator-owned and has only one host reference.
     if (buf.name.len != 0 or buf.tensor_refs != 1) return null;
-    if (!buf.owned or buf.shared_data_refcount == null) return null;
-    if (buf.shared_data_refcount.?.* == 0 or buf.shared_data_refcount.?.* > max_shared_refs) return null;
+    if (!buf.owned or buf.dense_storage == null) return null;
+    if (buf.dense_storage.?.references == 0 or buf.dense_storage.?.references > max_shared_refs) return null;
     if (buf.view_strides != null) return null;
     if (buf.lazy_entry != null or buf.quantized_storage != null or buf.source_tensor != null or buf.owned_quantized_storage != null or buf.owned_source_tensor != null) return null;
     return buf;
@@ -1130,15 +1144,13 @@ fn aliasDenseBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !
 
     // Slices can own storage without a refcount. A reshape alias must retain
     // that storage before its source wrapper is released by the caller.
-    if (source.owned and source.shared_data_refcount == null) {
-        const refcount = try source.allocator.create(usize);
-        refcount.* = 1;
-        source.shared_data_refcount = refcount;
+    if (source.owned and source.dense_storage == null) {
+        source.dense_storage = try DenseStorage.create(source.allocator, source.data);
     }
 
-    if (source.owned and source.shared_data_refcount != null) {
-        source.shared_data_refcount.?.* += 1;
-        errdefer source.shared_data_refcount.?.* -= 1;
+    if (source.owned and source.dense_storage != null) {
+        source.dense_storage.?.references += 1;
+        errdefer source.dense_storage.?.references -= 1;
 
         const alias = try self.allocator.create(Buf);
         errdefer self.allocator.destroy(alias);
@@ -1146,7 +1158,7 @@ fn aliasDenseBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !
             .data = source.data,
             .allocator = self.allocator,
             .owned = true,
-            .shared_data_refcount = source.shared_data_refcount,
+            .dense_storage = source.dense_storage,
             .logical_shape = try self.allocator.dupe(i64, shape),
             .view_strides = null,
             .view_base_offset = 0,
@@ -1169,7 +1181,7 @@ fn aliasDenseBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !
         .data = source.data,
         .allocator = self.allocator,
         .owned = false,
-        .shared_data_refcount = null,
+        .dense_storage = null,
         .logical_shape = try self.allocator.dupe(i64, shape),
         .view_strides = null,
         .view_base_offset = 0,
@@ -1215,13 +1227,13 @@ fn makeDenseViewAlias(
     errdefer self.allocator.free(view_strides);
     // Stage every fallible metadata allocation before retaining the source
     // and publishing the alias. This also covers non-owning borrowed input.
-    const shared = if (source.owned) source.shared_data_refcount else null;
-    if (shared) |refs| refs.* = try std.math.add(usize, refs.*, 1);
+    const shared = if (source.owned) source.dense_storage else null;
+    if (shared) |refs| refs.references = try std.math.add(usize, refs.references, 1);
     alias.* = .{
         .data = source.data,
         .allocator = self.allocator,
         .owned = shared != null,
-        .shared_data_refcount = shared,
+        .dense_storage = shared,
         .logical_shape = logical_shape,
         .view_strides = view_strides,
         .view_base_offset = base_offset,
@@ -1267,7 +1279,7 @@ test "native dense view alias metadata failure preserves owned and borrowed inpu
                 failing.fail_index = failing.alloc_index + failure_offset;
                 try std.testing.expectError(error.OutOfMemory, primTransposeOp(&compute, input, &.{ 1, 0 }, &.{ 2, 3 }));
                 try std.testing.expect(toBuf(input).view_strides == null);
-                if (owned) try std.testing.expectEqual(@as(usize, 1), toBuf(input).shared_data_refcount.?.*);
+                if (owned) try std.testing.expectEqual(@as(usize, 1), toBuf(input).dense_storage.?.references);
                 try std.testing.expectEqualSlices(f32, &borrowed, try getDataChecked(input));
                 failing.fail_index = std.math.maxInt(usize);
                 const retry = try primTransposeOp(&compute, input, &.{ 1, 0 }, &.{ 2, 3 });
@@ -3847,7 +3859,6 @@ pub const NativeCompute = struct {
             else => {},
         }
         const converted = try convertTensorToOwnedF32(self.allocator, tensor);
-        errdefer self.allocator.free(converted);
         return self.importDenseTensor(tensor.name, tensor.dtype, tensor.shape, converted);
     }
 
@@ -3863,23 +3874,29 @@ pub const NativeCompute = struct {
         var owned_tensor = tensor;
         defer owned_tensor.deinit();
         const converted = try convertTensorToOwnedF32(self.allocator, &owned_tensor);
-        errdefer self.allocator.free(converted);
         return self.importDenseTensor(owned_tensor.name, owned_tensor.dtype, owned_tensor.shape, converted);
     }
 
-    pub fn importDenseTensor(
-        self: *NativeCompute,
-        name: []const u8,
-        dtype: tensor_mod.DType,
-        shape: []const i64,
-        data: []f32,
-    ) !CT {
-        const buf = try self.makeBuf(data, true);
-        errdefer self.freeImportedTensor(buf);
-        toBuf(buf).logical_shape = try self.allocator.dupe(i64, shape);
-        toBuf(buf).declared_dtype = dtype;
-        toBuf(buf).name = name;
-        return buf;
+    pub const OwnedFloat32 = struct { values: []f32, allocator: std.mem.Allocator };
+
+    /// Consumes the payload on success and failure. Metadata stays local to
+    /// this compute context; the storage owner retains the supplied allocator.
+    pub fn importOwnedDenseTensor(self: *NativeCompute, name: []const u8, dtype: tensor_mod.DType, shape: []const i64, payload: OwnedFloat32) !CT {
+        errdefer payload.allocator.free(payload.values);
+        const tensor = try self.makeBuf(payload.values, false);
+        errdefer self.freeImportedTensor(tensor);
+        _ = try self.withLogicalShape(tensor, shape);
+        const owner = try DenseStorage.create(payload.allocator, payload.values);
+        const buf = toBuf(tensor);
+        buf.dense_storage = owner;
+        buf.owned = true;
+        buf.declared_dtype = dtype;
+        buf.name = name;
+        return tensor;
+    }
+
+    pub fn importDenseTensor(self: *NativeCompute, name: []const u8, dtype: tensor_mod.DType, shape: []const i64, data: []f32) !CT {
+        return self.importOwnedDenseTensor(name, dtype, shape, .{ .values = data, .allocator = self.allocator });
     }
 
     fn freeImportedTensor(self: *NativeCompute, tensor: CT) void {
@@ -3930,17 +3947,12 @@ pub const NativeCompute = struct {
     ) !CT {
         const b = try self.allocator.create(Buf);
         errdefer self.allocator.destroy(b);
-        var shared_data_refcount: ?*usize = null;
-        errdefer if (shared_data_refcount) |refcount| self.allocator.destroy(refcount);
-        if (owned) {
-            shared_data_refcount = try self.allocator.create(usize);
-            shared_data_refcount.?.* = 1;
-        }
+        const dense_storage = if (owned) try DenseStorage.create(self.allocator, data) else null;
         b.* = .{
             .data = data,
             .allocator = self.allocator,
             .owned = owned,
-            .shared_data_refcount = shared_data_refcount,
+            .dense_storage = dense_storage,
             .logical_shape = null,
             .view_strides = null,
             .view_base_offset = 0,
@@ -3970,7 +3982,7 @@ pub const NativeCompute = struct {
             .data = empty_f32[0..],
             .allocator = self.allocator,
             .owned = false,
-            .shared_data_refcount = null,
+            .dense_storage = null,
             .logical_shape = null,
             .view_strides = null,
             .view_base_offset = 0,
@@ -4001,7 +4013,7 @@ pub const NativeCompute = struct {
             .data = empty_f32[0..],
             .allocator = self.allocator,
             .owned = false,
-            .shared_data_refcount = null,
+            .dense_storage = null,
             .logical_shape = null,
             .view_strides = null,
             .view_base_offset = 0,
@@ -4738,11 +4750,11 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     if (b.view_strides) |strides| b.allocator.free(strides);
     if (b.owned_quantized_storage) |storage| {
         storage.deinit();
-        self.allocator.destroy(storage);
+        b.allocator.destroy(storage);
     }
     if (b.owned_source_tensor) |source| {
         source.deinit();
-        self.allocator.destroy(source);
+        b.allocator.destroy(source);
     }
     const parent = b.retained_parent;
     const physical_lease = b.physical_lease;
@@ -6808,7 +6820,7 @@ test "native layer norm backward preserves view and integer inputs on materializ
             if (before.view_strides) |strides| try std.testing.expectEqual(strides.ptr, after.view_strides.?.ptr);
             try std.testing.expectEqual(before.data.len, after.data.len);
             if (before.data.len != 0) try std.testing.expectEqual(before.data.ptr, after.data.ptr);
-            try std.testing.expectEqual(before.shared_data_refcount, after.shared_data_refcount);
+            try std.testing.expectEqual(before.dense_storage, after.dense_storage);
             try std.testing.expectEqual(before.source_tensor, after.source_tensor);
             try std.testing.expectEqual(before.logical_shape != null, after.logical_shape != null);
             if (before.logical_shape) |shape| try std.testing.expectEqualSlices(i64, shape, after.logical_shape.?);
@@ -6978,9 +6990,8 @@ fn activationMultiplyOp(ctx: *anyopaque, gate: CT, up: CT, kind: ops.DecoderRunt
     tensor = try self.makeBuf(output, false);
     _ = try self.withLogicalShape(tensor.?, toBuf(gate).logical_shape orelse &.{@intCast(values.len)});
     // Shared ownership metadata must exist before ownership transfers.
-    const refcount = try self.allocator.create(usize);
-    refcount.* = 1;
-    toBuf(tensor.?).shared_data_refcount = refcount;
+    const refcount = try DenseStorage.create(self.allocator, output);
+    toBuf(tensor.?).dense_storage = refcount;
     toBuf(tensor.?).owned = true;
     return tensor.?;
 }
@@ -35104,7 +35115,7 @@ test "native typed gather preserves view materialization OOM and retry" {
                 try std.testing.expectEqual(live, budget.live);
                 try std.testing.expectEqual(!backing_failure, budget.denied);
                 try std.testing.expectEqual(before.data.ptr, toBuf(view).data.ptr);
-                try std.testing.expectEqual(before.shared_data_refcount, toBuf(view).shared_data_refcount);
+                try std.testing.expectEqual(before.dense_storage, toBuf(view).dense_storage);
                 try std.testing.expectEqual(before.logical_shape.?.ptr, toBuf(view).logical_shape.?.ptr);
                 try std.testing.expectEqual(before.view_strides.?.ptr, toBuf(view).view_strides.?.ptr);
                 try std.testing.expectEqualSlices(f32, &original, toBuf(source).data);
@@ -36051,7 +36062,7 @@ fn hostFloat32ReadOp(_: *anyopaque, tensor: CT) !?[]const f32 {
 }
 fn hostFloat32WriteOp(ctx: *anyopaque, tensor: CT) !?[]f32 {
     const buf = toBuf(tensor);
-    if (!buf.owned or buf.tensor_refs != 1 or buf.retained_parent != null or buf.lazy_entry != null or buf.weight_handle_name != null or (buf.shared_data_refcount != null and buf.shared_data_refcount.?.* != 1)) return null;
+    if (!buf.owned or buf.tensor_refs != 1 or buf.retained_parent != null or buf.lazy_entry != null or buf.weight_handle_name != null or (buf.dense_storage != null and buf.dense_storage.?.references != 1)) return null;
     return if (try hostFloat32ReadOp(ctx, tensor)) |data| @constCast(data) else null;
 }
 
@@ -36506,7 +36517,7 @@ fn copyRows2DOp(ctx: *anyopaque, dst: CT, dst_row: usize, src: CT, src_row: usiz
     const target = toBuf(dst);
     // Never mutate immutable weight storage, strided views or shared aliases.
     if (!target.owned or target.source_tensor != null or target.view_strides != null or target.weight_handle_name != null or
-        (target.shared_data_refcount != null and target.shared_data_refcount.?.* != 1)) return error.InvalidTensorShape;
+        (target.dense_storage != null and target.dense_storage.?.references != 1)) return error.InvalidTensorShape;
     const source = try getDataChecked(src);
     const region = kernel_geometry.RowCopy.init(target.data.len, source.len, dst_row, src_row, rows, cols) catch |err| switch (err) {
         error.InvalidShape => return error.InvalidTensorShape,
@@ -45433,10 +45444,10 @@ test "native arithmetic donation covers SIMD tails cyclic inputs and retained ow
                 try std.testing.expectEqual(donated, result);
                 try std.testing.expectEqualSlices(f32, expected[0..len], getData(result));
                 // Three retained physical owners must decline without mutation.
-                const refs = toBuf(donated).shared_data_refcount.?;
-                const saved = refs.*;
-                refs.* = 3;
-                defer refs.* = saved;
+                const refs = toBuf(donated).dense_storage.?;
+                const saved = refs.references;
+                refs.references = 3;
+                defer refs.references = saved;
                 try std.testing.expectEqual(@as(?CT, null), try case[0](&compute, if (case[1]) other else donated, if (case[1]) donated else other));
                 try std.testing.expectEqualSlices(f32, expected[0..len], getData(donated));
             }
@@ -48820,6 +48831,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
             }
         },
     }
+    @import("../execution/runtime_observation.zig").nativeAssignedDispatch();
     return true;
 }
 
@@ -50965,4 +50977,168 @@ test "native cold prefetch teardown never touches an uninitialized queue" {
     try std.testing.expect(store.prefetch.worker_enabled);
     try std.testing.expect(!store.prefetch_initialized);
     deinitPrefetchQueue(&store);
+}
+
+// Append to ops/native_compute.zig. Both tagged allocators use the same real
+// backing allocator: an old misrouted free is recorded and safely forwarded,
+// making the baseline failure a bounded assertion rather than heap damage.
+const ProvenanceAllocator = struct {
+    backing: std.mem.Allocator,
+    records: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    wrong_owner_free: bool = false,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    fn deinit(self: *@This()) void {
+        // A mismatched baseline free was already forwarded to the real owner.
+        // The remaining keys are evidence, not additional allocation ownership.
+        self.records.deinit(self.backing);
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const pointer = self.backing.rawAlloc(len, alignment, address) orelse return null;
+        self.records.put(self.backing, @intFromPtr(pointer), {}) catch {
+            self.backing.rawFree(pointer[0..len], alignment, address);
+            return null;
+        };
+        return pointer;
+    }
+    fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, address: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.records.contains(@intFromPtr(memory.ptr))) self.wrong_owner_free = true;
+        return self.backing.rawResize(memory, alignment, len, address);
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, address: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.records.remove(@intFromPtr(memory.ptr))) self.wrong_owner_free = true;
+        self.backing.rawFree(memory, alignment, address);
+    }
+    const vtable = std.mem.Allocator.VTable{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+};
+
+test "native shared dense views preserve their original allocator across compute contexts" {
+    var first = ProvenanceAllocator{ .backing = std.testing.allocator };
+    defer first.deinit();
+    var second = ProvenanceAllocator{ .backing = std.testing.allocator };
+    defer second.deinit();
+    const source_allocator = first.allocator();
+    const destination_allocator = second.allocator();
+    var source_store = WeightStore{ .allocator = source_allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer source_store.deinitOwned();
+    var destination_store = WeightStore{ .allocator = destination_allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer destination_store.deinitOwned();
+    var source_compute = NativeCompute.init(source_allocator, &source_store, null);
+    defer source_compute.deinit();
+    var destination_compute = NativeCompute.init(destination_allocator, &destination_store, null);
+    defer destination_compute.deinit();
+    const source_backend = source_compute.computeBackend();
+    const destination_backend = destination_compute.computeBackend();
+    const source = try source_backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    var source_open = true;
+    defer if (source_open) source_backend.free(source);
+    const alias = try destination_backend.primReshape(source, &.{4});
+    var alias_open = true;
+    defer if (alias_open) destination_backend.free(alias);
+    source_backend.free(source);
+    source_open = false;
+    const values = try destination_backend.toFloat32(alias, std.testing.allocator);
+    defer std.testing.allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
+    destination_backend.free(alias);
+    alias_open = false;
+    try std.testing.expect(!first.wrong_owner_free);
+    try std.testing.expect(!second.wrong_owner_free);
+}
+
+test "native owned static imports preserve the caller allocation owner" {
+    var first = ProvenanceAllocator{ .backing = std.testing.allocator };
+    defer first.deinit();
+    var second = ProvenanceAllocator{ .backing = std.testing.allocator };
+    defer second.deinit();
+    const source_allocator = first.allocator();
+    const destination_allocator = second.allocator();
+    var store = WeightStore{ .allocator = destination_allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(destination_allocator, &store, null);
+    defer compute.deinit();
+    var context = @import("../backends/compute_context.zig").BackendContext{ .native = .{ .compute = &compute, .weight_store = &store } };
+    const values = try source_allocator.dupe(f32, &.{ 1, 2, 3, 4 });
+    // Successful import consumes values; the CT must retain that allocator.
+    const imported = try context.importDenseStaticF32(source_allocator, .f32, &.{ 2, 2 }, values);
+    const backend = compute.computeBackend();
+    backend.free(imported);
+    try std.testing.expect(!first.wrong_owner_free);
+    try std.testing.expect(!second.wrong_owner_free);
+}
+
+test "native retained typed literals retire metadata through its original allocator" {
+    var first = ProvenanceAllocator{ .backing = std.testing.allocator };
+    defer first.deinit();
+    var second = ProvenanceAllocator{ .backing = std.testing.allocator };
+    defer second.deinit();
+    const source_allocator = first.allocator();
+    const destination_allocator = second.allocator();
+    var source_store = WeightStore{ .allocator = source_allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer source_store.deinitOwned();
+    var destination_store = WeightStore{ .allocator = destination_allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer destination_store.deinitOwned();
+    var source_compute = NativeCompute.init(source_allocator, &source_store, null);
+    defer source_compute.deinit();
+    var destination_compute = NativeCompute.init(destination_allocator, &destination_store, null);
+    defer destination_compute.deinit();
+    var context = @import("../backends/compute_context.zig").BackendContext{ .native = .{ .compute = &source_compute, .weight_store = &source_store } };
+    const tensor = try tensor_mod.Tensor.initFloat32(source_allocator, "literal", &.{ 2, 2 }, &.{ 1, 2, 3, 4 });
+    const source = try context.importStaticTensor(source_allocator, tensor);
+    const source_backend = source_compute.computeBackend();
+    const destination_backend = destination_compute.computeBackend();
+    const alias = (try destination_backend.retainImmutableTensor(source, destination_allocator)).?;
+    source_backend.free(source);
+    const values = try destination_backend.toFloat32(alias, std.testing.allocator);
+    defer std.testing.allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
+    destination_backend.free(alias);
+    try std.testing.expect(!first.wrong_owner_free);
+    try std.testing.expect(!second.wrong_owner_free);
+}
+
+test "native owned imports and foreign dense aliases unwind every allocation failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var source = ProvenanceAllocator{ .backing = a };
+            defer source.deinit();
+            var destination = ProvenanceAllocator{ .backing = a };
+            defer destination.deinit();
+            const source_allocator = source.allocator();
+            const destination_allocator = destination.allocator();
+            var store = WeightStore{ .allocator = destination_allocator, .resident_weights = .empty, .lazy_weights = .empty };
+            defer store.deinitOwned();
+            // No background queue is needed to own a standalone dense literal.
+            var compute = NativeCompute{ .allocator = destination_allocator, .data = &store };
+            defer compute.deinit();
+            var context = @import("../backends/compute_context.zig").BackendContext{ .native = .{ .compute = &compute, .weight_store = &store } };
+            const values = try source_allocator.dupe(f32, &.{ 1, 2, 3, 4 });
+            // Every backend consumes an owned static payload on failure too.
+            const tensor = try context.importDenseStaticF32(source_allocator, .f32, &.{ 2, 2 }, values);
+            const backend = compute.computeBackend();
+            var tensor_open = true;
+            defer if (tensor_open) backend.free(tensor);
+            const view = try backend.primReshape(tensor, &.{4});
+            var view_open = true;
+            defer if (view_open) backend.free(view);
+            backend.free(tensor);
+            tensor_open = false;
+            const actual = try backend.toFloat32(view, a);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, actual);
+            backend.free(view);
+            view_open = false;
+            try std.testing.expect(!source.wrong_owner_free and !destination.wrong_owner_free);
+            try std.testing.expect(source.records.count() == 0 and destination.records.count() == 0);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

@@ -202,3 +202,22 @@ test "backend factory CUDA request handles borrow one stable model owner" {
     try std.testing.expectEqualSlices(f32, &.{ 1, 4, 9, 16 }, values);
     try std.testing.expectEqualSlices(f32, &.{ -2, 4, -6, 8 }, retained);
 }
+
+/// Optional PJRT plugin ownership belongs to backend construction. The native
+/// fallback remains explicit and is selected before any model execution.
+pub fn createPjrtClient(allocator: std.mem.Allocator) if (build_options.enable_pjrt) ?@import("pjrt").pjrt.Client else void {
+    if (comptime !build_options.enable_pjrt) return;
+    return @import("pjrt").pjrt.Client.initFromEnv(allocator) catch |err| {
+        std.log.warn("PJRT plugin not found ({s}); PJRT session will use native CPU fallback", .{@errorName(err)});
+        return null;
+    };
+}
+
+/// Install guards only after the inventory reaches its final stable address.
+/// The session owner closes the partially initialized inventory on failure.
+pub fn initializeNativeWeightPrefetch(weights: *native.WeightStore, allocator: std.mem.Allocator) !void {
+    native.initPrefetchQueue(weights, allocator);
+    var it = weights.lazy_weights.iterator();
+    while (it.next()) |entry| entry.value_ptr.guard = weights.prefetch.lockHandle();
+    if (weights.lazy_weights.count() > 0) try native.startPrefetchWorker(weights);
+}

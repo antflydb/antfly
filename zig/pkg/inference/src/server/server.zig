@@ -34524,7 +34524,7 @@ test "component session pool adapter retains explicit resource-managed backend p
     var manager = model_manager_mod.ModelManager.init(std.testing.allocator, session_manager);
     defer manager.deinit();
 
-    var loader = model_manager_mod.ModelManager.ComponentLoader{ .manager = &manager };
+    var loader = model_manager_mod.ModelManager.ComponentLoader{ .services = manager.componentLoadServices() };
     loader.allowed_backends[0] = .native;
     loader.allowed_backends[1] = .metal;
     loader.allowed_backend_count = 2;

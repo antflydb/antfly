@@ -126,6 +126,7 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("execution/testing/model_formats.zig");
     _ = @import("tile/q4_q8_schedule.zig");
     // Keep host-only ownership/descriptor tests reachable under narrow filters.
     if (!build_options.enable_wasm) _ = @import("ops/cuda/embedded_module.zig");
@@ -134,6 +135,10 @@ test {
     _ = @import("models/loaded_runtime.zig");
     _ = @import("ops/index_metadata.zig");
     _ = execution.reader_pool;
+    _ = execution.architecture_session;
+    _ = execution.decoder_checkpoint;
+    _ = execution.encoder_decoder_runtime;
+    _ = execution.seq2seq_runtime;
     _ = execution.sequence_pool;
     _ = execution.text_inputs;
     _ = execution.submission;

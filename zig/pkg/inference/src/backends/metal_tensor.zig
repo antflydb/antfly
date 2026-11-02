@@ -70,6 +70,10 @@ const DeviceBufferRef = struct {
     /// Legacy wrappers retain the C allocator. Strict bounded callers may
     /// supply an owner that outlives every retained view of this buffer.
     allocator: std.mem.Allocator = std.heap.c_allocator,
+    /// Only leased views carry this reference. The allocation's original
+    /// owner has no back-reference, so there is no ownership cycle. Retained
+    /// views share this record and release the bank pin with their last view.
+    physical_lease: ?*@import("../ops/physical_storage.zig").Lease = null,
 };
 
 pub const MemoryStats = struct {
@@ -427,6 +431,7 @@ extern fn termite_metal_buffer_alloc_fresh(
     length: usize,
     storage_mode: c_int,
 ) ?*anyopaque;
+extern fn termite_metal_buffer_allocated_bytes(handle: *anyopaque) usize;
 extern fn termite_metal_buffer_release(handle: *anyopaque) void;
 extern fn termite_metal_decode_runtime_release_buffer(runtime: *anyopaque, handle: *anyopaque) void;
 extern fn termite_metal_buffer_contents(handle: *anyopaque) ?*anyopaque;
@@ -592,6 +597,44 @@ pub const MetalTensor = struct {
         return t;
     }
 
+    /// A view pins the plan's backing lease, and every retained metadata view
+    /// shares that pin. The original backing reference remains independent.
+    /// Allocate the ownership record before taking the pin so OOM is atomic.
+    pub fn deviceLeasedView(allocator: std.mem.Allocator, source: *const MetalTensor, lease: *@import("../ops/physical_storage.zig").Lease, dims: []const i32) !MetalTensor {
+        const device = source.device orelse return error.UnsupportedTensorType;
+        const handle = source.deviceHandle() orelse return error.ReleasedDeviceBuffer;
+        if (source.dtype != .f32 or dims.len > max_dims) return error.UnsupportedTensorType;
+        var elements: usize = 1;
+        for (dims) |extent| {
+            if (extent <= 0) return error.InvalidTensorShape;
+            elements = try std.math.mul(usize, elements, @intCast(extent));
+        }
+        const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+        if (bytes > device.byte_len) return error.InvalidTensorShape;
+        const ref = try allocator.create(DeviceBufferRef);
+        ref.* = .{
+            .handle = handle,
+            .runtime = device.ref.runtime,
+            .byte_len = bytes,
+            .ref_count = 1,
+            .released = false,
+            .release_on_drop = false,
+            .recycle_on_drop = false,
+            .allocator = allocator,
+            .physical_lease = lease,
+        };
+        lease.retain();
+        memory_stats.device_borrowed_tensors_created += 1;
+        return deviceView(ref, device.byte_offset, bytes, dims, .f32);
+    }
+
+    /// True only for storage whose execution-plan lease pins every view and
+    /// prevents frame reuse while any published value remains alive.
+    pub fn hasPhysicalLease(self: *const MetalTensor) bool {
+        const device = self.device orelse return false;
+        return !device.ref.released and device.ref.ref_count != 0 and device.ref.physical_lease != null;
+    }
+
     fn createDeviceBufferRef(runtime: *anyopaque, handle: *anyopaque, release_on_drop: bool, byte_len: usize) *DeviceBufferRef {
         const ref = std.heap.c_allocator.create(DeviceBufferRef) catch @panic("Metal buffer ref alloc failed");
         ref.* = .{
@@ -624,7 +667,9 @@ pub const MetalTensor = struct {
             noteDeviceOwnedRelease(ref.handle, ref.byte_len);
         }
         if (ref.ref_count == 0) {
+            const lease = ref.physical_lease;
             ref.allocator.destroy(ref);
+            if (lease) |owner| owner.release();
         }
     }
 
@@ -920,6 +965,13 @@ pub const MetalTensor = struct {
     pub fn deviceByteOffset(self: *const MetalTensor) usize {
         if (self.device) |d| return d.byte_offset;
         return 0;
+    }
+
+    /// Actual rounded MTLResource span retained by every view of this buffer.
+    /// This is allocated address space, not physical device residency.
+    pub fn allocatedDeviceBytes(self: *const MetalTensor) ?usize {
+        const handle = self.deviceHandle() orelse return null;
+        return termite_metal_buffer_allocated_bytes(handle);
     }
 
     /// Physical allocation retained by a view, for lifetime admission.

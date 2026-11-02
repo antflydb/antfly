@@ -19,7 +19,7 @@
 //! separate scope; these measurements cover this prepared program's leases.
 const std = @import("std");
 
-pub const Class = enum { constant, activation, workspace };
+pub const Class = enum { constant, activation, workspace, host_workspace };
 pub const Usage = struct {
     requested_live_bytes: u64 = 0,
     requested_peak_bytes: u64 = 0,
@@ -33,6 +33,7 @@ pub const Snapshot = struct {
     constant: Usage = .{},
     activation: Usage = .{},
     workspace: Usage = .{},
+    host_workspace: Usage = .{},
 };
 
 const Gauge = struct {
@@ -126,6 +127,7 @@ pub const Ledger = struct {
             .constant = self.classes[@backingInt(Class.constant)].snapshot(),
             .activation = self.classes[@backingInt(Class.activation)].snapshot(),
             .workspace = self.classes[@backingInt(Class.workspace)].snapshot(),
+            .host_workspace = self.classes[@backingInt(Class.host_workspace)].snapshot(),
         };
     }
 };

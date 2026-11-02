@@ -94,3 +94,36 @@ test "Metal buffer memory renders unsigned live and peak gauges without counter 
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_inference_metal_owned_buffer_peak_bytes 18446744073709551615\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "_total") == null);
 }
+
+/// Uniform execution diagnostics keep these measurements explicitly scoped to
+/// all tracked buffers/contexts in this worker, never this request alone.
+pub fn runtimeProcessSnapshot() @import("../execution/runtime_telemetry.zig").Process {
+    const values = snapshot(true);
+    const memory = memorySnapshot(true);
+    return .{
+        .counters = .{
+            .upload_bytes = values[0],
+            .upload_calls = values[1],
+            .download_bytes = values[2],
+            .download_calls = values[3],
+            .copy_bytes = values[4],
+            .copy_calls = values[5],
+            .completed_commands = values[6],
+            .failed_commands = values[7],
+            .physical_allocations = values[10],
+            .physical_frees = values[11],
+            .allocated_bytes = values[12],
+            .freed_bytes = values[13],
+            .initialized_bytes = values[18],
+            .initialization_calls = values[19],
+        },
+        .owned_live_bytes = memory[0],
+        .owned_lifetime_peak_bytes = memory[1],
+        .private_live_bytes = memory[2],
+        .private_lifetime_peak_bytes = memory[3],
+        .host_visible_live_bytes = memory[4],
+        .host_visible_lifetime_peak_bytes = memory[5],
+        .alias_live_bytes = memory[6],
+        .alias_lifetime_peak_bytes = memory[7],
+    };
+}

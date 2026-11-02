@@ -153,7 +153,13 @@ pub const Descriptor = struct {
 };
 /// Per-invocation scratch. Targets expose their own layout inside this region;
 /// its physical owner and reuse lifetime belong to the executable plan.
-pub const WorkspaceRequirement = struct { byte_size: usize = 0, alignment: u32 = @alignOf(f32) };
+pub const WorkspaceRequirement = struct {
+    byte_size: usize = 0,
+    alignment: u32 = @alignOf(f32),
+    /// Byte-addressed host control scratch, disjoint from device workspace.
+    /// The physical plan owns one reusable maximum-sized span per frame.
+    host_byte_size: usize = 0,
+};
 pub const max_auxiliaries = 3;
 /// A representation of the output retained for a downstream implementation,
 /// or a saved mathematical result. Every plane follows its primary output's
@@ -176,6 +182,7 @@ pub const Invocation = struct {
     /// Null is a legality query. A decline must precede any writes/submission.
     output: ?CT = null,
     workspace: ?CT = null,
+    host_workspace: []u8 = &.{},
     auxiliaries: []const AuxiliaryBinding = &.{},
     pub inline fn operatorPlan(self: *const Invocation) ?@import("../graph/operator_plan.zig").OperatorPlan {
         return if (self.operator_plan) |plan| plan.* else null;
