@@ -2128,6 +2128,7 @@ pub const Store = struct {
             self.file.allocator_cancel_token = cancel;
             defer self.file.allocator_cancel_token = previous_cancel;
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+            try self.releaseDeferredArtifactLeases();
             _ = try artifact_source.cleanupOrphans(&self.file, &self.artifact_cleanup_cursor);
             try self.artifact_marker_sweep.run(&self.file);
             if (try self.file.retirementNeedsService()) {
@@ -2913,6 +2914,33 @@ pub const Store = struct {
         return request.result;
     }
 
+    /// Queue ownership is returned on failure; retries are idempotent. The
+    /// inode check prevents old-generation cleanup from touching a replacement.
+    fn stageArtifactReleases(self: *Store, first: ?*native.ReaderCoordinator.ArtifactRelease) !void {
+        if (first == null) return;
+        const inode = (try self.file.file.stat(self.file.runtime())).inode;
+        var mutations: [64]native.CatalogMutation = undefined;
+        var count: usize = 0;
+        var next = first;
+        while (next) |ticket| : (next = ticket.next) {
+            if (ticket.inode != inode) continue;
+            mutations[count] = .{ .key = ticket.key, .is_delete = true };
+            count += 1;
+        }
+        if (count != 0) try self.file.putCatalogBatch(mutations[0..count]);
+    }
+
+    fn releaseDeferredArtifactLeases(self: *Store) !void {
+        const coordinator = self.file.reader_coordinator orelse return;
+        const first = coordinator.takeArtifactReleases(64) orelse return;
+        errdefer coordinator.enqueueArtifactReleases(first);
+        try self.file.beginArtifactLeaseTransaction();
+        errdefer self.file.abortTransaction();
+        try self.stageArtifactReleases(first);
+        try self.file.commitTransactionWithDurability(self.writer_admission != null);
+        coordinator.destroyArtifactReleases(first);
+    }
+
     fn applyMutationGroup(self: *Store, head: *MutationRequest) !void {
         var index_only = true;
         var artifact_lease_only = true;
@@ -2936,6 +2964,10 @@ pub const Store = struct {
             try self.file.beginTransaction();
         }
         errdefer self.file.abortTransaction();
+        const coordinator = self.file.reader_coordinator;
+        const releases = if (artifact_lease_only and coordinator != null) coordinator.?.takeArtifactReleases(64) else null;
+        errdefer if (releases) |first| coordinator.?.enqueueArtifactReleases(first);
+        try self.stageArtifactReleases(releases);
         var current: ?*MutationRequest = head;
         // Detached writers release their kernel lease after this group. The
         // next owner must see its allocator and index roots on disk; a volatile
@@ -2947,6 +2979,7 @@ pub const Store = struct {
             current = item.next;
         }
         try self.file.commitTransactionWithDurability(durable);
+        if (releases) |first| coordinator.?.destroyArtifactReleases(first);
     }
 
     fn writerSlotAvailable(self: *Store) bool {

@@ -33,7 +33,63 @@ pub const Coordinator = struct {
     batch_data_epoch: ?*SharedEpoch = null,
     batch_metadata_epoch: ?*SharedEpoch = null,
 
+    artifact_release_mutex: std.atomic.Mutex = .unlocked,
+    artifact_release_head: ?*ArtifactRelease = null,
+    artifact_release_tail: ?*ArtifactRelease = null,
+
     known: ?struct { inode: u64, tip: [32]u8 } = null,
+
+    pub const ArtifactRelease = struct {
+        inode: u64,
+        key: []u8,
+        next: ?*ArtifactRelease = null,
+    };
+    pub fn retain(self: *Coordinator) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
+    pub fn reserveArtifactRelease(self: *Coordinator, inode: u64, key: []const u8) !*ArtifactRelease {
+        const ticket = try self.allocator.create(ArtifactRelease);
+        errdefer self.allocator.destroy(ticket);
+        ticket.* = .{ .inode = inode, .key = try self.allocator.dupe(u8, key) };
+        return ticket;
+    }
+    fn lockArtifactReleases(self: *Coordinator) void {
+        @import("antfly_platform").sync.lockYielding(&self.artifact_release_mutex);
+    }
+    pub fn enqueueArtifactReleases(self: *Coordinator, first: *ArtifactRelease) void {
+        var tail = first;
+        while (tail.next) |next| tail = next;
+        self.lockArtifactReleases();
+        defer self.artifact_release_mutex.unlock();
+        if (self.artifact_release_tail) |last| last.next = first else self.artifact_release_head = first;
+        self.artifact_release_tail = tail;
+    }
+    pub fn hasArtifactReleases(self: *Coordinator) bool {
+        self.lockArtifactReleases();
+        defer self.artifact_release_mutex.unlock();
+        return self.artifact_release_head != null;
+    }
+    pub fn takeArtifactReleases(self: *Coordinator, maximum: usize) ?*ArtifactRelease {
+        std.debug.assert(maximum > 0);
+        self.lockArtifactReleases();
+        defer self.artifact_release_mutex.unlock();
+        const first = self.artifact_release_head orelse return null;
+        var tail = first;
+        var count: usize = 1;
+        while (count < maximum) : (count += 1) tail = tail.next orelse break;
+        self.artifact_release_head = tail.next;
+        if (tail.next == null) self.artifact_release_tail = null;
+        tail.next = null;
+        return first;
+    }
+    pub fn destroyArtifactReleases(self: *Coordinator, first: ?*ArtifactRelease) void {
+        var next = first;
+        while (next) |ticket| {
+            next = ticket.next;
+            self.allocator.free(ticket.key);
+            self.allocator.destroy(ticket);
+        }
+    }
 
     const SharedEpoch = struct {
         lease: epochs.Lease,
@@ -171,6 +227,7 @@ pub const Coordinator = struct {
         std.debug.assert(self.readers.items.len == 0);
         std.debug.assert(self.registration_batches == 0 and self.batch_data_epoch == null and self.batch_metadata_epoch == null);
         self.readers.deinit(self.allocator);
+        self.destroyArtifactReleases(self.artifact_release_head);
     }
     /// The descriptor already holds its kernel shared lock. Registration may
     /// wait for a writer, which then treats this unregistered lock as external.

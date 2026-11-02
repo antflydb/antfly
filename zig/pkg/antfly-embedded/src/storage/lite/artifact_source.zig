@@ -97,6 +97,7 @@ pub const Registry = struct {
     references: std.atomic.Value(usize) = .init(1),
     first: ?*State = null,
     retired_bytes: std.atomic.Value(u64) = .init(0),
+    coordinator: ?*native.ReaderCoordinator = null,
     owned_resources: ?struct { manager: *@import("../resource_manager.zig").ResourceManager, allocator: Allocator } = null,
 
     pub fn create(allocator: Allocator, store: *docs.Store) !*Registry {
@@ -106,6 +107,9 @@ pub const Registry = struct {
         errdefer allocator.free(path);
         self.* = .{ .allocator = allocator, .io_impl = limits.initService(allocator), .path = path, .store = store };
         errdefer self.io_impl.deinit();
+        self.coordinator = store.file.reader_coordinator;
+        if (self.coordinator) |coordinator| coordinator.retain();
+        errdefer if (self.coordinator) |coordinator| coordinator.release();
         if (!store.read_only) self.publication_guard = try openPublicationGuard(allocator, self.io(), path);
         return self;
     }
@@ -133,6 +137,7 @@ pub const Registry = struct {
             owner.manager.deinit(owner.allocator);
             owner.allocator.destroy(owner.manager);
         }
+        if (self.coordinator) |coordinator| coordinator.release();
         self.allocator.free(self.path);
         self.allocator.destroy(self);
     }
@@ -352,6 +357,11 @@ pub const Registry = struct {
             capture.value = try reader.openIndexValue(a, key, capture.checkpoint);
         } else try owner.submitArtifactLeaseMutation(&capture, Capture.apply);
         const captured_inode = (try reader.file.stat(reader.runtime())).inode;
+        const release_ticket = if (!reader_fenced and self.coordinator != null)
+            try self.coordinator.?.reserveArtifactRelease(captured_inode, lease_key)
+        else
+            null;
+        errdefer if (release_ticket) |ticket| self.coordinator.?.destroyArtifactReleases(ticket);
         state.* = .{
             .registry = self,
             .reader = reader,
@@ -359,6 +369,7 @@ pub const Registry = struct {
             .checkpoint = capture.checkpoint,
             .generation = owner.assessment_generation,
             .lease_key = lease_key,
+            .release_ticket = release_ticket,
             .marker_path = marker_path,
             .marker = marker,
             .resource_manager = owner.resource_manager,
@@ -417,6 +428,7 @@ const State = struct {
     checkpoint: native.CheckpointSlot,
     generation: u64,
     lease_key: []u8,
+    release_ticket: ?*native.ReaderCoordinator.ArtifactRelease = null,
     marker_path: []u8,
     marker: ?std.Io.File,
     next: ?*State = null,
@@ -446,6 +458,10 @@ const State = struct {
             marker.close(self.registry.io());
             self.marker = null;
             std.Io.Dir.cwd().deleteFile(self.registry.io(), self.marker_path) catch {};
+        }
+        if (self.release_ticket) |ticket| {
+            self.release_ticket = null;
+            self.registry.coordinator.?.enqueueArtifactReleases(ticket);
         }
         self.resources_closed.store(true, .release);
     }

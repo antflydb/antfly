@@ -958,7 +958,7 @@ fn mapRuntimeNamespace(namespace: backend_types.Namespace) !MainKeyspace {
 fn runtimeNamespace(keyspace: MainKeyspace) backend_types.Namespace {
     return switch (keyspace) {
         .segments => .{ .name = "segments" },
-        .meta => .{ .name = "meta" },
+        .meta => .{ .name = "meta", .transient_storage_snapshot = true },
         .deletions => .{ .name = "deletions" },
     };
 }

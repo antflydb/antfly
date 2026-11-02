@@ -1593,6 +1593,8 @@ pub const Owner = struct {
             self.releaseMaintenanceTurnAssumeLocked();
             self.gate.mutex.unlock(turn_io);
         }
+        if (self.options.profile == .native and self.reader_coordinator.hasArtifactReleases())
+            self.maintenance_storage_pending = true;
         if (self.options.profile == .native and self.maintenance_storage_pending) {
             // A physical maintenance error must remain observable without
             // preventing subsequent replay turns from making progress.
@@ -5307,7 +5309,13 @@ test "capi native replay admission refuses a transform before commit and returns
         }
         const increment = "{\"transforms\":[{\"key\":\"counter\",\"operations\":[{\"op\":\"$inc\",\"path\":\"count\",\"value\":1}]}],\"sync_level\":\"write\"}";
         for (0..2) |_| {
+            const refusals = fixture.connection.owner.publication_stats.replay_backpressure_waits;
+            const polls = api.test_replay_capacity_polls.load(.monotonic);
             try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_batch_json(fixture.id, .fromSlice(increment), &output));
+            // Capacity polling must not repeatedly enter mutation admission or
+            // reconstruct serving runtimes while the same journal stays full.
+            try std.testing.expectEqual(refusals + 1, fixture.connection.owner.publication_stats.replay_backpressure_waits);
+            try std.testing.expect(api.test_replay_capacity_polls.load(.monotonic) > polls + 1);
             const raw = (try fixture.connection.owner.current.?.db.get(std.testing.allocator, "counter")).?;
             defer std.testing.allocator.free(raw);
             var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
@@ -5322,4 +5330,51 @@ test "capi native replay admission refuses a transform before commit and returns
         defer parsed.deinit();
         try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
     }
+}
+
+test "capi native replay admission capacity wait releases registry pins for close" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("replay-capacity-close", 5000, .batch);
+    var closed = false;
+    defer if (!closed) fixture.deinit() else {
+        std.testing.allocator.free(fixture.path);
+        fixture.tmp.cleanup();
+    };
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const file = &fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+        var state = (try file.replayAdmission()).?;
+        state.limits.records = state.records;
+        try file.putDocument(native.replay_admission.key, &state.encode());
+    }
+    const Request = struct {
+        id: *anyopaque,
+        code: h.capi.ErrorCode = .ok,
+        fn run(self: *@This()) void {
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&output);
+            self.code = api.antfly_db_batch_json(self.id, .fromSlice("{\"inserts\":{\"waiter\":{\"value\":1}},\"sync_level\":\"write\"}"), &output);
+        }
+    };
+    var request = Request{ .id = fixture.id };
+    const polls = api.test_replay_capacity_polls.load(.monotonic);
+    const worker = try std.Thread.spawn(.{}, Request.run, .{&request});
+    var joined = false;
+    defer if (!joined) worker.join();
+    const limit = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds + 2 * std.time.ns_per_s;
+    while (api.test_replay_capacity_polls.load(.monotonic) == polls) {
+        if (std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds >= limit) return error.CapacityWaitDidNotStart;
+        try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+    }
+    api.antfly_db_close(fixture.id);
+    closed = true;
+    // Joining synchronizes the worker's plain result field.
+    worker.join();
+    joined = true;
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, request.code);
 }

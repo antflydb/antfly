@@ -1208,6 +1208,14 @@ Prepared votes reserve their future replay credits. Consumer work has reserved
 headroom; new producers wait with the configured Busy timeout while releasing
 registry, runtime and file leases. Refusal occurs before commit. Visibility errors
 after commit retain the committed outcome and must not trigger a blind retry.
+A refused batch carries an observed positive replay footprint. Waiting polls the
+small durable aggregate through a short read-only file pin, releasing that pin
+before sleeping; it does not rebuild serving indexes merely to discover the
+same refusal. Inode or catalog changes request ordinary revalidation. The hint
+never grants or reserves credits: the retried physical transaction repeats exact
+accounting, including prepared-decision and consumer rules. Polls and admission
+share one deadline, cancellation stops re-entry, and close retains no registry
+pins while a batch waits.
 
 Replay prepares full-text inputs outside writer admission, then publishes each
 prepared chunk and its progress metadata in separate bounded admission groups.
@@ -1359,6 +1367,21 @@ snapshot and admission, released before computation or publication. Read scopes
 reject writes and preserve their captured bytes across later index changes.
 Obsolete-file backoff begins after a completed sweep, so slow
 I/O cannot leave its next retry deadline already expired.
+
+Admitted short metadata scans explicitly opt into a native catalog read snapshot
+for their cursor lifetime. Ordinary scans keep artifact-specific source leases. Table-index and data-block misses both read that captured view, even
+if a peer removes the run's catalog name. Shared block caches retain owned bytes,
+never the snapshot. Closing the cursor releases its epoch. Short metadata scans
+therefore do not publish durable artifact aliases per SST; persistent text
+segments continue to use artifact-specific leases rather than retaining a whole
+checkpoint in an idle runtime.
+
+Closed artifact leases enqueue preallocated release hints after their reader
+and marker are closed. The next artifact publication drains at most 64 hints in
+its transaction, and physical maintenance also services a bounded batch. Hints
+survive registry refresh through the shared connection coordinator, requeue on
+failed publication, and compare the captured inode before deleting a unique
+lease key. The bounded orphan sweep remains the crash-recovery fallback.
 
 Native persistent index handles are caches of committed index state. Opening or
 closing a cache preserves durable, replayed mutable WAL state without publishing

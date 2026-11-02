@@ -4615,6 +4615,7 @@ pub const NativeFile = struct {
     /// metadata/deletes do not consume replay capacity at all.
     replay_consumer_admission: bool = false,
     replay_preflight_refused: bool = false,
+    replay_wait_hint: ?replay_admission.WaitHint = null,
     durable_header: ?Header = null,
     last_synced_header: ?Header = null,
     change_capture: ?*ChangeCapture = null,
@@ -8167,6 +8168,11 @@ pub const NativeFile = struct {
             if (!resolves_reservation and (try self.documentLength(replay_admission.coordinator_key)) == null) {
                 if (loaded != null and self.transaction_writes == null and self.transaction_header != null and std.meta.eql(self.header, self.transaction_header.?))
                     self.replay_preflight_refused = true;
+                self.replay_wait_hint = .{
+                    .growth = .{ .bytes = after.bytes -| before.bytes, .records = after.records -| before.records },
+                    .inode = (try self.file.stat(self.runtime())).inode,
+                    .metadata = self.activeCheckpoint().logical.metadata,
+                };
                 return err;
             }
         };
@@ -11630,6 +11636,7 @@ pub const NativeFile = struct {
         if (self.checkpoint_publication_uncertain) return error.OutcomeUnknown;
         self.transaction_header = self.header;
         self.replay_preflight_refused = false;
+        self.replay_wait_hint = null;
         self.artifact_lease_transaction = false;
         self.allocator_certificate_staged = false;
     }

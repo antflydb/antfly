@@ -4699,15 +4699,50 @@ pub fn antfly_db_write_transaction(
     return .ok;
 }
 
+/// No serving runtime, registry pin or file pin survives a capacity poll.
+/// A changed inode/catalog or absent aggregate requests normal revalidation;
+/// only the actual mutation transaction may admit and consume durable credits.
+pub var test_replay_capacity_polls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
+
+fn waitForReplayCapacity(ptr: ?*anyopaque, path: []const u8, hint: lite_backend.native.replay_admission.WaitHint, deadline: i96, backoff: *i96) !void {
+    const alloc = std.heap.c_allocator;
+    const io = handleLockIo();
+    while (true) {
+        const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+        if (remaining <= 0) return error.LiteReplayBacklogExceeded;
+        try io.sleep(.fromNanoseconds(@min(backoff.*, remaining)), .awake);
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.LiteReplayBacklogExceeded;
+        backoff.* = @min(backoff.* * 2, 50 * std.time.ns_per_ms);
+        const entry = HandleEntry.capture(ptr) orelse return error.InvalidArgument;
+        entry.release();
+        if (comptime builtin.is_test) _ = test_replay_capacity_polls.fetchAdd(1, .monotonic);
+        const ready = ready: {
+            var file = lite_backend.native.NativeFile.openWithIo(alloc, io, path, .{ .read_only = true }) catch |err| switch (err) {
+                error.FileBusy, error.WouldBlock => break :ready false,
+                else => return err,
+            };
+            defer file.close();
+            if ((try file.file.stat(io)).inode != hint.inode or
+                !std.mem.eql(u8, &file.activeCheckpoint().logical.metadata, &hint.metadata)) break :ready true;
+            const state = (try file.replayAdmission()) orelse break :ready true;
+            break :ready hint.ready(state);
+        };
+        if (ready) return;
+    }
+}
+
 /// Retry only native replay capacity refusals known to precede primary
 /// commit. Registry/runtime/path access is released during sleep. Request data
 /// is caller-owned or allocated independently of a refreshed runtime.
 fn executeBatchWithReplayAdmissionRetry(ptr: ?*anyopaque, request: *anyopaque, apply: *const fn (*anyopaque, *Handle) anyerror!void) capi.ErrorCode {
+    const alloc = std.heap.c_allocator;
     var entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);
     const timeout_ms = if (entry.lock_handle.lite_connection) |connection| connection.options.busy_timeout_ms else 0;
     const io = handleLockIo();
     const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
     var backoff: i96 = std.time.ns_per_ms;
+    var wait_path: ?[]u8 = null;
+    defer if (wait_path) |path| alloc.free(path);
     while (true) {
         const guard = enterWithAdmissionRetryDeadline(entry, ptr, .write, .mutation, false, deadline) orelse return capi.mapError(error.InvalidArgument);
         var held = true;
@@ -4719,10 +4754,17 @@ fn executeBatchWithReplayAdmissionRetry(ptr: ?*anyopaque, request: *anyopaque, a
             if (err != error.LiteReplayBacklogExceeded or timeout_ms == 0) return capi.mapError(err);
             const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
             if (remaining <= 0) return capi.mapError(err);
-            if (guard.connection) |connection| connection.owner.publication_stats.replay_backpressure_waits +|= 1;
+            var hint: ?lite_backend.native.replay_admission.WaitHint = null;
+            if (guard.connection) |connection| {
+                connection.owner.publication_stats.replay_backpressure_waits +|= 1;
+                hint = connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file.replay_wait_hint;
+                if (hint != null and wait_path == null) wait_path = alloc.dupe(u8, connection.path) catch |copy_err| return capi.mapError(copy_err);
+            }
             guard.leave();
             held = false;
-            io.sleep(.fromNanoseconds(@min(backoff, remaining)), .awake) catch |sleep_err| return capi.mapError(sleep_err);
+            if (hint) |refusal| {
+                waitForReplayCapacity(ptr, wait_path.?, refusal, deadline, &backoff) catch |wait_err| return capi.mapError(wait_err);
+            } else io.sleep(.fromNanoseconds(@min(backoff, remaining)), .awake) catch |sleep_err| return capi.mapError(sleep_err);
             // Do not reacquire an expired or canceled operation's admission.
             if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return capi.mapError(error.LiteReplayBacklogExceeded);
             entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);

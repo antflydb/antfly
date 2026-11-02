@@ -87,6 +87,11 @@ pub const Namespace = struct {
     /// always retained normally. This is a read hint and is deliberately not
     /// part of namespace identity or persisted state.
     block_cache_admission: BlockCacheAdmission = .retain,
+    /// An admitted short metadata scan may borrow one provider snapshot until
+    /// its cursor closes. Ordinary/long scans retain artifact-specific sources
+    /// instead, avoiding a checkpoint-wide pin in an idle or streaming owner.
+    /// This opt-in lifetime contract is not namespace identity or durable data.
+    transient_storage_snapshot: bool = false,
     /// Opt-in owner-bounded local point borrowing; ordinary point APIs keep
     /// their owned-result contract. This hint is not namespace identity.
     borrow_local_point_results: bool = false,

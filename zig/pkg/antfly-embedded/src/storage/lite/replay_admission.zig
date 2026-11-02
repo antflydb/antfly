@@ -55,6 +55,22 @@ pub const State = struct {
     }
 };
 
+/// A refusal hint is never an admission grant. It only avoids reconstructing
+/// serving runtimes while the same producer footprint still cannot fit. The
+/// physical transaction repeats exact accounting before it can commit.
+pub const WaitHint = struct {
+    growth: Cost,
+    inode: u64,
+    metadata: [16]u8,
+
+    pub fn ready(self: WaitHint, state: State) bool {
+        var after = state;
+        self.growth.add(&after) catch return false;
+        State.checkIncrease(state, after, state.limits) catch return false;
+        return true;
+    }
+};
+
 fn logicalKey(physical: []const u8) []const u8 {
     var logical = physical;
     if (std.mem.startsWith(u8, logical, "\x02db/")) {
@@ -124,4 +140,12 @@ test "native replay admission rejects growth but permits an over-limit consumer 
     var corrupt = state.encode();
     corrupt[8] ^= 1;
     try std.testing.expectError(error.InvalidNativeReplayAdmission, State.decode(&corrupt));
+}
+
+test "native replay refusal hints wait for actual credits and permit empty oversized records" {
+    const hint = WaitHint{ .growth = .{ .bytes = 10, .records = 5 }, .inode = 1, .metadata = @splat(1) };
+    try std.testing.expect(!hint.ready(.{ .bytes = 1, .records = 4095 }));
+    try std.testing.expect(hint.ready(.{ .bytes = 1, .records = 4091 }));
+    try std.testing.expect(!hint.ready(.{ .bytes = 15, .records = 1, .limits = .{ .bytes = 20 } }));
+    try std.testing.expect(hint.ready(.{ .limits = .{ .bytes = 1, .records = 1 } }));
 }

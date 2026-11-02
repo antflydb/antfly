@@ -1,0 +1,358 @@
+{
+  "schema_version": 1,
+  "status": "local diagnostic qualification in progress; final host qualification pending",
+  "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
+  "pushed_runtime_commit": "ae7f2982ae71368364b9bf1fbe13bddcecbcbeae",
+  "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+  "constraints": [
+    "Original importer unchanged",
+    "Local debugging only; wolfspider reserved for final qualification",
+    "Independent source and artifact hashes for every candidate",
+    "No native compilation during timed workloads",
+    "Private inputs and per-document logs remain ignored"
+  ],
+  "root_cause_evidence": [
+    "Earlier profiles showed repeated writer admission and small independent replay/durability publications.",
+    "The ae7 ten-minute run retained 70,419 closed artifact aliases after workers closed; ordinary bounded orphan cleanup did not keep pace with runtime/source churn.",
+    "Deferred closed-lease release reduced the next ten-minute storage peak from 366,911,488 to 17,879,040 bytes, with zero growth after warmup. Throughput and active visibility still failed.",
+    "A fresh queue-candidate profile showed short segment-metadata merge scans opening durable per-run sources during foreground/runtime refresh. Scoped cursor catalog reads remove those publications while preserving a captured read epoch."
+  ],
+  "candidate_design": [
+    "Prepare full-text inputs outside writer admission; group index and progress publications with exact inode/catalog/recovery validation.",
+    "Preserve durable native WAL across cache refresh; distinguish durability from immutable checkpoint creation.",
+    "Account file-wide replay debt atomically, including prepared reservations, and refuse producer work before primary commit. Release leases while waiting; committed outcomes remain non-retryable.",
+    "Close artifact readers and markers before enqueuing preallocated unique-key release hints. Bound deletion batches, requeue failures, check inode, and retain orphan recovery.",
+    "Explicit short metadata scans use one captured catalog view for table-index and data-block reads. Cached values own bytes independently; ordinary cursors and persistent segments retain artifact-specific protection.",
+    "A refused producer waits on a footprint hint and cheap durable aggregate reads without registry/runtime/file pins during sleep. Actual commit rechecks exact credits; inode/catalog changes request revalidation."
+  ],
+  "local_debug_diagnostics": [
+    {
+      "status": "sustained_qualification_failed",
+      "library_sha256": "626b9dac6e85a673da118aa0d0439fedf61a99c3127fc9a00cce453085c06a3e",
+      "successful_calls": 6732,
+      "busy_calls": 211,
+      "elapsed_seconds": 603.3274108750047,
+      "success_p50_ns": 245894625,
+      "success_p95_ns": 2516004959,
+      "success_p99_ns": 4157007834,
+      "file_bytes": 305790976,
+      "peak_file_bytes": 366911488,
+      "allocator_proof_walks": 9,
+      "sustained_qualification": {
+        "active_visibility": {
+          "passed": false,
+          "reason": "active_visibility_did_not_reach_prior_target"
+        },
+        "late_to_early_throughput_fraction": 0.19661816751867872,
+        "minute_successful_calls": [
+          2924,
+          1452,
+          658,
+          433,
+          284,
+          302,
+          179,
+          175,
+          177,
+          148
+        ],
+        "passed": false,
+        "policy": {
+          "maximum_tail_growth_fraction": 0.25,
+          "minimum_growth_allowance_bytes": 16777216,
+          "minimum_late_throughput_fraction": 0.75,
+          "warmup_seconds": 180
+        },
+        "tail_growth_allowance_bytes": 27470848.0,
+        "tail_growth_bytes": 257028096,
+        "tail_initial_file_bytes": 109883392
+      },
+      "source": "ae7f2982ae",
+      "acknowledged_latest_values_verified": 1024,
+      "integrity_and_acknowledgments": {
+        "checked_last_writes": 1024,
+        "integrity": {
+          "compact_size": 8310784,
+          "file_size": 306053120,
+          "issue": null,
+          "live_accounting": {
+            "control_documents": {
+              "key_bytes": 432845,
+              "records": 18914,
+              "value_bytes": 458770
+            },
+            "documents": {
+              "key_bytes": 21605,
+              "records": 1536,
+              "value_bytes": 3177984
+            },
+            "index_catalog": {
+              "key_bytes": 3365,
+              "records": 57,
+              "value_bytes": 297293
+            },
+            "metadata_catalog": {
+              "key_bytes": 33,
+              "records": 1,
+              "value_bytes": 16
+            }
+          },
+          "live_bytes": 4391911,
+          "live_file_count": 20508,
+          "reclaimable_bytes": 297742336,
+          "record_count": 90927,
+          "tail_bytes": 0,
+          "valid": true,
+          "valid_prefix_size": 306053120
+        }
+      }
+    },
+    {
+      "status": "sustained_qualification_failed",
+      "library_sha256": "59e1aba2bffb80123d69d8e1be43fe26a6a096d4c60aba4c0f48d05bc21aeca9",
+      "successful_calls": 7574,
+      "busy_calls": 44,
+      "elapsed_seconds": 601.1588729580399,
+      "success_p50_ns": 337337958,
+      "success_p95_ns": 2484481833,
+      "success_p99_ns": 3510903167,
+      "file_bytes": 17879040,
+      "peak_file_bytes": 17879040,
+      "allocator_proof_walks": 1,
+      "sustained_qualification": {
+        "active_visibility": {
+          "passed": false,
+          "reason": "active_visibility_did_not_reach_prior_target"
+        },
+        "late_to_early_throughput_fraction": 0.3223811364514882,
+        "minute_successful_calls": [
+          3004,
+          1496,
+          630,
+          461,
+          413,
+          386,
+          350,
+          319,
+          289,
+          226
+        ],
+        "passed": false,
+        "policy": {
+          "maximum_tail_growth_fraction": 0.25,
+          "minimum_growth_allowance_bytes": 16777216,
+          "minimum_late_throughput_fraction": 0.75,
+          "warmup_seconds": 180
+        },
+        "tail_growth_allowance_bytes": 16777216,
+        "tail_growth_bytes": 0,
+        "tail_initial_file_bytes": 17879040
+      },
+      "source": {
+        "base_commit": "ae7f2982ae71368364b9bf1fbe13bddcecbcbeae",
+        "patch_sha256": "9226a7932e83492c21338c22eeff62ad579e11393fc78259869c7c4691d84732",
+        "library_sha256": "59e1aba2bffb80123d69d8e1be43fe26a6a096d4c60aba4c0f48d05bc21aeca9",
+        "mode": "Debug"
+      },
+      "acknowledged_latest_values_verified": 1024,
+      "integrity_and_acknowledgments": {
+        "checked_last_writes": 1024,
+        "integrity": {
+          "compact_size": 8294400,
+          "file_size": 17879040,
+          "issue": null,
+          "live_accounting": {
+            "control_documents": {
+              "key_bytes": 431945,
+              "records": 18824,
+              "value_bytes": 454130
+            },
+            "documents": {
+              "key_bytes": 21605,
+              "records": 1536,
+              "value_bytes": 3177984
+            },
+            "index_catalog": {
+              "key_bytes": 3494,
+              "records": 59,
+              "value_bytes": 296580
+            },
+            "metadata_catalog": {
+              "key_bytes": 33,
+              "records": 1,
+              "value_bytes": 16
+            }
+          },
+          "live_bytes": 4385787,
+          "live_file_count": 20420,
+          "reclaimable_bytes": 9584640,
+          "record_count": 20790,
+          "tail_bytes": 0,
+          "valid": true,
+          "valid_prefix_size": 17879040
+        }
+      }
+    },
+    {
+      "status": "sustained_qualification_failed",
+      "library_sha256": "48a9cfce632ff9764d71f84884d73dd50c82b13389f462ba391ff04fe5911a48",
+      "successful_calls": 14708,
+      "busy_calls": 0,
+      "elapsed_seconds": 600.3197812080034,
+      "success_p50_ns": 192979667,
+      "success_p95_ns": 1001215667,
+      "success_p99_ns": 2070904541,
+      "file_bytes": 17719296,
+      "peak_file_bytes": 17719296,
+      "allocator_proof_walks": 1,
+      "sustained_qualification": {
+        "active_visibility": {
+          "maximum_allowed_seconds": 60,
+          "maximum_watermark_visibility_upper_seconds": 58.577223083004355,
+          "passed": true,
+          "samples": 108
+        },
+        "late_to_early_throughput_fraction": 0.5753076772807189,
+        "minute_successful_calls": [
+          3018,
+          1994,
+          1728,
+          1397,
+          1291,
+          1216,
+          1119,
+          993,
+          1024,
+          928
+        ],
+        "passed": false,
+        "policy": {
+          "maximum_tail_growth_fraction": 0.25,
+          "minimum_growth_allowance_bytes": 16777216,
+          "minimum_late_throughput_fraction": 0.75,
+          "warmup_seconds": 180
+        },
+        "tail_growth_allowance_bytes": 16777216,
+        "tail_growth_bytes": 606208,
+        "tail_initial_file_bytes": 17113088
+      },
+      "source": {
+        "base_commit": "ae7f2982ae71368364b9bf1fbe13bddcecbcbeae",
+        "patch_sha256": "5b297d3cf81439a8c511db6121b0f73ca7c27acc11ac357a4fd32f519996779c",
+        "library_sha256": "48a9cfce632ff9764d71f84884d73dd50c82b13389f462ba391ff04fe5911a48",
+        "mode": "Debug",
+        "note": "Test fixture compilation error fixed after provider built; runtime sources unchanged."
+      },
+      "acknowledged_latest_values_verified": 1024,
+      "integrity_and_acknowledgments": {
+        "checked_last_writes": 1024,
+        "integrity": {
+          "compact_size": 8658944,
+          "file_size": 17719296,
+          "issue": null,
+          "live_accounting": {
+            "control_documents": {
+              "key_bytes": 431845,
+              "records": 18814,
+              "value_bytes": 453610
+            },
+            "documents": {
+              "key_bytes": 21605,
+              "records": 1536,
+              "value_bytes": 3179008
+            },
+            "index_catalog": {
+              "key_bytes": 6649,
+              "records": 112,
+              "value_bytes": 593819
+            },
+            "metadata_catalog": {
+              "key_bytes": 33,
+              "records": 1,
+              "value_bytes": 16
+            }
+          },
+          "live_bytes": 4686585,
+          "live_file_count": 20463,
+          "reclaimable_bytes": 9060352,
+          "record_count": 20678,
+          "tail_bytes": 0,
+          "valid": true,
+          "valid_prefix_size": 17719296
+        }
+      }
+    },
+    {
+      "source": {
+        "base_commit": "ae7f2982ae71368364b9bf1fbe13bddcecbcbeae",
+        "patch_sha256": "cab66b1f7fd52d31215eb52e6f32efe582689cbb52f6febde7fa909f78a41370",
+        "library_sha256": "7fc46a48ba5487374117715efd95b2b00831f25bcd80afffdbd1fb0c0d19f13b",
+        "mode": "Debug",
+        "note": "Focused test assertion fixed after provider compilation; production source unchanged."
+      },
+      "status": "pending"
+    }
+  ],
+  "ae7_correctness": {
+    "native_passed": 717,
+    "native_skipped_benchmarks": 5,
+    "capi_passed": 300,
+    "capi_expected_model_skips": 3,
+    "sdk_sql_catalog_concurrency_crash_passed": 205,
+    "runtime_error_transport_passed": 41,
+    "reporting_accounting_passed": 16,
+    "installed_model_passed": 5,
+    "public_exports": 134,
+    "lsm_passed": 611,
+    "lsm_skipped": 23,
+    "persistent_passed": 59,
+    "persistent_skipped": 1,
+    "wal_passed": 100,
+    "wal_vopr_passed": 4,
+    "leaks": 0
+  },
+  "followup_correctness": {
+    "deferred_release_failure_requeue_refresh_stale_inode_regression": "passed",
+    "release_queue_sdk_concurrency_passed": 28,
+    "scoped_cursor_no_durable_publication_and_retained_catalog_regression": "passed",
+    "capacity_wait_prototype": {
+      "source": {
+        "base_commit": "ae7f2982ae71368364b9bf1fbe13bddcecbcbeae",
+        "patch_sha256": "0546e7cc658d10221f2a1fa404f37b72c60d84fb4769ff42bf94a84a1af11b07",
+        "library_sha256": "bedef56601ba7db016ec3d39eacd0cf8de8b9711a4c246d09a008eca2bb9afeb",
+        "mode": "Debug"
+      },
+      "native_passed": 719,
+      "native_skipped_benchmarks": 5,
+      "capi_passed": 301,
+      "capi_expected_model_skips": 3,
+      "sdk_sql_catalog_concurrency_crash_passed": 205,
+      "reporting_accounting_passed": 16,
+      "leaks": 0,
+      "note": "Before limiting snapshot opt-in to short metadata cursors"
+    },
+    "metadata_scoped_candidate": {
+      "source": {
+        "base_commit": "ae7f2982ae71368364b9bf1fbe13bddcecbcbeae",
+        "patch_sha256": "cab66b1f7fd52d31215eb52e6f32efe582689cbb52f6febde7fa909f78a41370",
+        "library_sha256": "7fc46a48ba5487374117715efd95b2b00831f25bcd80afffdbd1fb0c0d19f13b",
+        "mode": "Debug",
+        "note": "Focused test assertion fixed after provider compilation; production source unchanged."
+      },
+      "focused_native_and_shared_cursor_regressions": "passed",
+      "sdk_concurrency_passed": 28,
+      "public_exports": 134,
+      "c_linkage": "passed"
+    },
+    "final_integrated_gates": "pending"
+  },
+  "pending": [
+    "Finish local sustained throughput and active visibility qualification",
+    "Final integrated native/CAPI/ABI/SDK/model/shared-storage gates",
+    "Matched wolfspider Debug and ReleaseFast comparisons",
+    "All frozen original-importer inputs and three-writer/one-reader contention",
+    "Optimized ten-minute active-write qualification, index catch-up, integrity, search and reopen",
+    "Warm large-file batch/SQL cost comparison",
+    "Repository aggregate CI and factory qualification"
+  ]
+}

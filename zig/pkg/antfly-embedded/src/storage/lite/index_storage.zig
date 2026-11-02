@@ -2768,51 +2768,130 @@ test "lite lsm artifact sources reuse navigation without checkpoint pins and sur
     try std.testing.expectEqual(@as(u64, 0), (try docs.reclamationStatus()).retired_file_bytes);
 }
 
-test "lite lsm merge cursor retains active run sources and trims idle leases on close" {
+test "lite lsm ordinary merge cursor retains artifact sources without a checkpoint snapshot" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try testPath(a, tmp, "lsm-cursor-leases.aflite");
+    const path = try testPath(a, tmp, "lsm-cursor-artifacts.aflite");
     defer a.free(path);
     var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
     defer docs.close();
     docs.maintenance_start_suppressed = true;
     var indexes = Store.init(a, &docs);
-    const Backend = @import("../lsm_backend.zig").Backend;
-    const options = @import("../lsm_backend.zig").Options{ .storage = indexes.storage(), .flush_threshold = 1, .compact_threshold_runs = 100, .l0_overlap_compact_threshold_runs = 100, .l0_hard_limit_runs = 100, .table_block_compression = .none };
+    const lsm = @import("../lsm_backend.zig");
+    const options = lsm.Options{ .storage = indexes.storage(), .flush_threshold = 1, .compact_threshold_runs = 100, .l0_overlap_compact_threshold_runs = 100, .l0_hard_limit_runs = 100, .table_block_compression = .none };
     {
-        var backend = try Backend.open(a, "/cursor-runs", options);
+        var backend = try lsm.Backend.open(a, "/cursor-runs", options);
         defer backend.close();
         var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
         defer runtime.deinit();
         for (0..24) |i| {
             var first: [32]u8 = undefined;
             var last: [32]u8 = undefined;
-            var txn = try runtime.beginWrite();
-            errdefer txn.abort();
-            try txn.put(try std.fmt.bufPrint(&first, "a{d:0>2}", .{i}), "first");
-            try txn.put(try std.fmt.bufPrint(&last, "z{d:0>2}", .{i}), "last");
-            try txn.commit();
+            var write = try runtime.beginWrite();
+            errdefer write.abort();
+            try write.put(try std.fmt.bufPrint(&first, "a{d:0>2}", .{i}), "first");
+            try write.put(try std.fmt.bufPrint(&last, "z{d:0>2}", .{i}), "last");
+            try write.commit();
         }
     }
-    var backend = try Backend.open(a, "/cursor-runs", options);
-    defer backend.close();
+    var backend = try lsm.Backend.open(a, "/cursor-runs", options);
+    defer backend.closePreservingWal();
     var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
     defer runtime.deinit();
     var read = try runtime.beginRead();
     defer read.abort();
     var cursor = try read.openCursor();
-    var cursor_open = true;
-    defer if (cursor_open) cursor.close();
+    var opened = true;
+    defer if (opened) cursor.close();
     _ = (try cursor.first()).?;
     try std.testing.expect(backend.run_sources.items.len > 16);
+    var runs = backend.runs.cursor();
+    while (runs.next()) |run| try indexes.storage().deleteFileAbsolute(run.path.?);
     var count: usize = 1;
     while (try cursor.next()) |_| count += 1;
     try std.testing.expectEqual(@as(usize, 48), count);
     cursor.close();
-    cursor_open = false;
+    opened = false;
     try std.testing.expect(backend.run_sources.items.len <= 16);
-    try std.testing.expectEqualStrings("first", try read.get("a00"));
+}
+
+test "lite lsm merge cursor scans through one catalog snapshot without durable source leases" {
+    const a = std.testing.allocator;
+    // Exercise uncached, local-cache and shared-cache readers, including
+    // compressed blocks. Every mode must preserve both lazy metadata and data.
+    for (0..3) |cache_mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "lsm-cursor-leases.aflite");
+        defer a.free(path);
+        var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+        defer docs.close();
+        docs.maintenance_start_suppressed = true;
+        var indexes = Store.init(a, &docs);
+        const lsm = @import("../lsm_backend.zig");
+        var cache = lsm.Cache.init(a, 4 * 1024 * 1024);
+        defer cache.deinit();
+        const options = lsm.Options{ .storage = indexes.storage(), .flush_threshold = 1, .compact_threshold_runs = 100, .l0_overlap_compact_threshold_runs = 100, .l0_hard_limit_runs = 100, .table_block_compression = if (cache_mode == 0) .none else .snappy_adaptive, .local_block_cache_enabled = cache_mode == 1, .cache = if (cache_mode == 2) &cache else null };
+        {
+            var backend = try lsm.Backend.open(a, "/cursor-runs", options);
+            defer backend.close();
+            var runtime = try backend.runtimeStore(a, .{ .name = "meta", .transient_storage_snapshot = true });
+            defer runtime.deinit();
+            for (0..24) |i| {
+                var first: [32]u8 = undefined;
+                var last: [32]u8 = undefined;
+                var txn = try runtime.beginWrite();
+                errdefer txn.abort();
+                try txn.put(try std.fmt.bufPrint(&first, "a{d:0>2}", .{i}), "first");
+                try txn.put(try std.fmt.bufPrint(&last, "z{d:0>2}", .{i}), "last");
+                try txn.commit();
+            }
+        }
+        {
+            var backend = try lsm.Backend.open(a, "/cursor-runs", options);
+            defer backend.close();
+            var runtime = try backend.runtimeStore(a, .{ .name = "meta", .transient_storage_snapshot = true });
+            defer runtime.deinit();
+            var read = try runtime.beginRead();
+            defer read.abort();
+            const checkpoint = docs.file.activeCheckpoint();
+            const opens = docs.file.allocator_work.artifact_source_opens;
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var count: usize = 0;
+            var entry = try cursor.first();
+            while (entry != null) : (entry = try cursor.next()) count += 1;
+            try std.testing.expectEqual(@as(usize, 48), count);
+            try std.testing.expectEqual(@as(usize, 0), backend.run_sources.items.len);
+            try std.testing.expectEqualDeep(checkpoint, docs.file.activeCheckpoint());
+            try std.testing.expectEqual(opens, docs.file.allocator_work.artifact_source_opens);
+        }
+        // Drop all cached metadata before testing lazy reads after deletion.
+        cache.deinit();
+        cache = lsm.Cache.init(a, 4 * 1024 * 1024);
+        var backend = try lsm.Backend.open(a, "/cursor-runs", options);
+        defer backend.closePreservingWal();
+        var runtime = try backend.runtimeStore(a, .{ .name = "meta", .transient_storage_snapshot = true });
+        defer runtime.deinit();
+        var read = try runtime.beginRead();
+        defer read.abort();
+        var captured = try read.openCursor();
+        defer captured.close();
+        var runs = backend.runs.cursor();
+        while (runs.next()) |run| try indexes.storage().deleteFileAbsolute(run.path.?);
+        for (0..32) |i| {
+            var key: [32]u8 = undefined;
+            var write = try docs.beginWrite();
+            errdefer write.abort();
+            try write.put(try std.fmt.bufPrint(&key, "reuse-{d}", .{i}), "replacement");
+            try write.commit();
+        }
+        var count: usize = 0;
+        var entry = try captured.first();
+        while (entry != null) : (entry = try captured.next()) count += 1;
+        try std.testing.expectEqual(@as(usize, 48), count);
+    }
 }
 
 test "lite lsm idle run source releases retired inode during vacuum" {
@@ -3024,4 +3103,75 @@ test "lite wal metadata revisions invalidate mutations and foreign adoption" {
     const after_primary = storage.loadedWalMetadataRevision("/one").?;
     try docs.file.putDocument("primary", "changed");
     try std.testing.expectEqualDeep(after_primary, storage.loadedWalMetadataRevision("/one").?);
+}
+
+test "lite artifact closed leases retire with the next publication across registry refresh" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "release-queue.aflite");
+    defer a.free(path);
+    const coordinator = try native.ReaderCoordinator.create(a, std.testing.io);
+    defer coordinator.release();
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.file.reader_coordinator = coordinator;
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.init(a, &docs);
+    try indexes.storage().writeFileAbsolute("/runs/churn", "immutable body");
+    for (0..192) |_| {
+        var source = try docs.openArtifactSource("/runs/churn");
+        var bytes: [9]u8 = undefined;
+        try source.readInto(0, &bytes);
+        try std.testing.expectEqualStrings("immutable", &bytes);
+        source.close();
+        try std.testing.expect(coordinator.hasArtifactReleases());
+        // No writer admission is acquired by close. The next source publishes
+        // its alias and the exact closed aliases in one transaction.
+        var cursor = try docs.file.metadataCatalogCursor(docs.file.activeCheckpoint(), native.NativeFile.artifact_lease_key_prefix);
+        defer cursor.deinit();
+        var count: usize = 0;
+        while (try cursor.next()) |record| {
+            a.free(record.key);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), count);
+    }
+    const before_failure = docs.file.header;
+    docs.file.test_page_write_fail_after = 0;
+    try std.testing.expectError(error.TestPageWriteFailure, docs.openArtifactSource("/runs/churn"));
+    docs.file.test_page_write_fail_after = null;
+    try std.testing.expectEqualDeep(before_failure, docs.file.header);
+    try std.testing.expect(coordinator.hasArtifactReleases());
+    try std.testing.expect((try docs.file.check()).valid);
+
+    // A late release from an old inode must not delete a replacement alias.
+    var active = try docs.openArtifactSource("/runs/churn");
+    var active_open = true;
+    defer if (active_open) active.close();
+    const live_key = blk: {
+        var cursor = try docs.file.metadataCatalogCursor(docs.file.activeCheckpoint(), native.NativeFile.artifact_lease_key_prefix);
+        defer cursor.deinit();
+        const record = (try cursor.next()) orelse return error.TestUnexpectedResult;
+        break :blk record.key;
+    };
+    defer a.free(live_key);
+    const inode = (try docs.file.file.stat(docs.file.runtime())).inode;
+    coordinator.enqueueArtifactReleases(try coordinator.reserveArtifactRelease(inode + 1, live_key));
+    try indexes.storage().writeFileAbsolute("/runs/other", "other immutable body");
+    var other = try docs.openArtifactSource("/runs/other");
+    var bytes: [9]u8 = undefined;
+    try active.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("immutable", &bytes);
+    other.close();
+    active.close();
+    active_open = false;
+    // A new registry on the same file adopts releases from the old one.
+    var replacement = try docstore.Store.openWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer replacement.close();
+    replacement.file.reader_coordinator = coordinator;
+    replacement.maintenance_start_suppressed = true;
+    var source = try replacement.openArtifactSource("/runs/churn");
+    source.close();
+    try std.testing.expect((try replacement.file.check()).valid);
 }

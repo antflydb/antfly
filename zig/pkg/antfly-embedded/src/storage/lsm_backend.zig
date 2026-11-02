@@ -7064,6 +7064,10 @@ pub const Backend = struct {
     }
 
     pub fn getCachedRunIndexIndex(self: *Backend, path: []const u8, run_id: u64) !usize {
+        return try self.getCachedRunIndexIndexWithStorage(path, run_id, self.storage.?);
+    }
+
+    pub fn getCachedRunIndexIndexWithStorage(self: *Backend, path: []const u8, run_id: u64, read_storage: storage_io.Storage) !usize {
         for (self.run_index_cache.items, 0..) |*cached, i| {
             if (cached.run_id == run_id and std.mem.eql(u8, cached.path, path)) return i;
         }
@@ -7074,7 +7078,7 @@ pub const Backend = struct {
         const loaded = try self.allocator.create(lsm_table_file.TableIndex);
         errdefer self.allocator.destroy(loaded);
         const start_ns = self.readStatsNowNs();
-        const loaded_index = repository_mod.loadRunTableIndexAllocWithStorage(self.storage.?, self.allocator, path);
+        const loaded_index = repository_mod.loadRunTableIndexAllocWithStorage(read_storage, self.allocator, path);
         self.recordTableIndexLoad(self.readStatsElapsedNs(start_ns));
         loaded.* = try loaded_index;
         errdefer loaded.deinit(self.allocator);
