@@ -26,6 +26,8 @@ class ModelRef:
             kind (ModelKind): Model registry kind.
             name (str): Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
                 Example: antflydb/gemma-e2b.
+            pin (bool | Unset): Keep a successfully preloaded model pinned against eviction. Set false to warm the ordinary
+                evictable cache before serving; idle and model-count policy still apply. Default: True.
             backend (ModelBackend | Unset): Optional backend preference for model loading or request execution.
                 `auto` keeps the node default behavior.
                 `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
@@ -49,6 +51,7 @@ class ModelRef:
 
     kind: ModelKind
     name: str
+    pin: bool | Unset = True
     backend: ModelBackend | Unset = UNSET
     format_: ModelFormat | Unset = UNSET
     quantization: ModelQuantization | Unset = UNSET
@@ -59,6 +62,8 @@ class ModelRef:
         kind = self.kind.value
 
         name = self.name
+
+        pin = self.pin
 
         backend: str | Unset = UNSET
         if not isinstance(self.backend, Unset):
@@ -86,6 +91,8 @@ class ModelRef:
                 "name": name,
             }
         )
+        if pin is not UNSET:
+            field_dict["pin"] = pin
         if backend is not UNSET:
             field_dict["backend"] = backend
         if format_ is not UNSET:
@@ -105,6 +112,8 @@ class ModelRef:
         kind = ModelKind(d.pop("kind"))
 
         name = d.pop("name")
+
+        pin = d.pop("pin", UNSET)
 
         _backend = d.pop("backend", UNSET)
         backend: ModelBackend | Unset
@@ -139,6 +148,7 @@ class ModelRef:
         model_ref = cls(
             kind=kind,
             name=name,
+            pin=pin,
             backend=backend,
             format_=format_,
             quantization=quantization,

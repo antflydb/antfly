@@ -53695,6 +53695,17 @@ components:
         native_items:
           type: integer
           minimum: 0
+        max_native_step_items:
+          type: integer
+          minimum: 0
+          description: >
+            Largest successfully executed native decoder step observed by these
+
+            items, including peers from other requests. Zero or absent means
+
+            unobserved, one means singleton execution. This is measured at
+
+            execution, never inferred from native_items or request cardinality.
         serial_items:
           type: integer
           minimum: 0
@@ -67501,6 +67512,12 @@ components:
           description: Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>`
             format.
           example: antflydb/gemma-e2b
+        pin:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: true
+          description: Keep a successfully preloaded model pinned against eviction. Set false to warm
+            the ordinary evictable cache before serving; idle and model-count policy still apply.
         backend:
           $ref: '#/components/schemas/ModelBackend'
         format:

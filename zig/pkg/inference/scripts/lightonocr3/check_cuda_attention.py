@@ -33,7 +33,7 @@ class Page(c.Structure):
         ("tokens", c.c_uint32),
         ("query_position", c.c_uint32),
         ("block_count", c.c_uint32),
-        ("blocks", c.c_uint32 * 64),
+        ("block_offset", c.c_uint32),
     ]
 
 
@@ -64,7 +64,7 @@ class Params(c.Structure):
                 "capacity",
             ]
         ]
-        + [("pages", Page * 64)]
+        + [("pages", Page * 64), ("blocks", c.c_uint32 * 4096)]
         + [
             ("graph_progress", c.c_uint64),
             ("graph_step", c.c_uint32),
@@ -73,7 +73,7 @@ class Params(c.Structure):
     )
 
 
-assert c.sizeof(Page) == 268 and c.sizeof(Params) == 17264
+assert c.sizeof(Page) == 16 and c.sizeof(Params) == 17520
 
 
 def launch(driver, name, grid, p):
@@ -124,7 +124,7 @@ def main():
     results = []
     try:
         for h, kh in [(8, 2), (16, 4)]:
-            for b in [1, 2, 16, 64]:
+            for b in [1, 2, 4, 16, 64]:
                 lengths = (
                     [
                         1,
@@ -143,11 +143,17 @@ def main():
                         864,
                         1000,
                         1024,
+                        1914,
+                        2697,
+                        4096,
+                        8192,
                     ]
                     * 4
                 )[:b]
                 if b == 1:
                     lengths = [432]
+                elif b in (2, 4):
+                    lengths = [1914, 2697, 4096, 8192][:b]
                 size = 16 if b < 16 else 64
                 blocks = sum(math.ceil(n / size) for n in lengths)
                 capacity = (2 * blocks + 2) * size
@@ -186,9 +192,12 @@ def main():
                 for i, n in enumerate(lengths):
                     count = math.ceil(n / size)
                     ids = [2 * x + 1 for x in order[cursor : cursor + count]]
+                    offset = cursor
                     cursor += count
+                    assert cursor <= 4096
                     query = n - 1 if i % 3 else max(0, n - 7)
-                    p.pages[i] = Page(n, query, count, (c.c_uint32 * 64)(*ids))
+                    p.pages[i] = Page(n, query, count, offset)
+                    p.blocks[offset : offset + count] = ids
                     rows = torch.cat(
                         [torch.arange(x * size, (x + 1) * size) for x in ids]
                     )[:n]
@@ -228,7 +237,10 @@ def main():
                 p.new_k, p.new_v = new_kg.data_ptr(), new_vg.data_ptr()
                 for i, n in enumerate(lengths):
                     page = p.pages[i]
-                    physical = page.blocks[(n - 1) // size] * size + (n - 1) % size
+                    physical = (
+                        p.blocks[page.block_offset + (n - 1) // size] * size
+                        + (n - 1) % size
+                    )
                     k[physical] = new_k[i].half()
                     v[physical] = new_v[i].half()
                 launch(
@@ -251,7 +263,9 @@ def main():
                     rows = torch.cat(
                         [
                             torch.arange(x * size, (x + 1) * size)
-                            for x in page.blocks[: page.block_count]
+                            for x in p.blocks[
+                                page.block_offset : page.block_offset + page.block_count
+                            ]
                         ]
                     )[:n]
                     kk = k[rows].float().repeat_interleave(h // kh, dim=1)

@@ -542,8 +542,9 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assertEqual(
             stable["recovery_sources"], ["github-release", "object-storage"]
         )
-        self.assertEqual((next_name, next_channel["npm_tag"]), ("next", "next"))
-        self.assertTrue(next_channel["publish_npm"])
+        self.assertEqual((next_name, next_channel["npm_tag"]), ("next", None))
+        self.assertFalse(next_channel["publish_npm"])
+        self.assertEqual(next_channel["bootstrap_sources"], ["object-storage"])
         self.assertEqual(next_channel["retention"]["grace_days"], 90)
         self.assertEqual(
             (nightly_name, nightly["npm_tag"], nightly["github_release"]),
@@ -562,6 +563,8 @@ class ReleasePromotionTests(unittest.TestCase):
             0,
         )
         identity = channels.github_outputs(next_name, next_channel, "v1.3.0-rc.2")
+        self.assertEqual(identity["publish_npm"], "false")
+        self.assertEqual(identity["npm_tag"], "")
         self.assertEqual(
             {
                 key: identity[key]
