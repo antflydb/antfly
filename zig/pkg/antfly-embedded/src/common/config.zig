@@ -399,6 +399,7 @@ pub const Config = struct {
             cuda_precision: ?CudaPrecision = null,
             kind: []u8,
             name: []u8,
+            pin: bool = true,
             backend: ?[]u8 = null,
             format: ?[]u8 = null,
             quantization: ?[]u8 = null,
@@ -2465,7 +2466,7 @@ pub fn parseInferencePreloadModels(
             .object => |entry| entry,
             else => return error.InvalidConfig,
         };
-        if (!objectContainsOnly(model_object, &.{ "kind", "name", "backend", "cuda_precision", "format", "quantization", "residency_mode", "memory_budget_mb" }))
+        if (!objectContainsOnly(model_object, &.{ "kind", "name", "pin", "backend", "cuda_precision", "format", "quantization", "residency_mode", "memory_budget_mb" }))
             return error.InvalidConfig;
         // Include the partially parsed entry in error cleanup as soon as any
         // owned fields can be allocated (e.g. a missing name after kind).
@@ -2473,6 +2474,7 @@ pub fn parseInferencePreloadModels(
         filled = i + 1;
         out[i].kind = try requiredStringFieldDup(alloc, model_object, "kind");
         out[i].name = try requiredStringFieldDup(alloc, model_object, "name");
+        out[i].pin = try optionalBoolField(model_object, "pin") orelse true;
         out[i].backend = try optionalStringFieldDup(alloc, model_object, "backend");
         out[i].cuda_precision = try optionalEnumField(Config.InferenceConfig.WarmModelConfig.CudaPrecision, model_object, "cuda_precision");
         out[i].format = try optionalStringFieldDup(alloc, model_object, "format");

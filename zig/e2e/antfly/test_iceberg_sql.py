@@ -1400,6 +1400,51 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         }
         empty_cut = call("POST", "/tables/wal_windows/query", empty_request)
         assert len(empty_cut["hits"]["hits"]) == row_count, empty_cut
+        # Reproduce HN's exact receipt check: replace an already published row
+        # with the same values, then immediately perform a metadata-only read.
+        # Text matching alone does not exercise lazy metadata membership.
+        unchanged = {
+            "id": 0,
+            "body": "quasar ",
+            **(
+                {"dense_native": "[1,0]", "sparse_native": '{"1":1}'}
+                if vector_kind
+                else {}
+            ),
+        }
+        noop = call(
+            "POST",
+            "/tables/wal_windows/lake/changes",
+            {
+                "batch_id": "unchanged-row",
+                "source": "e2e",
+                "epoch": "1",
+                "checkpoint": "noop-probe",
+                "expected_checkpoint": "0",
+                "key_fields": ["id"],
+                "changes": [{"op": "upsert", "row": unchanged}],
+            },
+        )
+        noop_query = {
+            "full_text_search": {"match_all": {}},
+            "filter_query": {"term": {"path": "/id", "value": 0}},
+            "fields": ["id", "body"],
+            "limit": 2,
+            "read_requirements": {
+                "visibility": "accepted",
+                "after_write": noop["read_receipt"],
+            },
+        }
+        visible = call("POST", "/tables/wal_windows/query", noop_query)
+        assert [h["_source"] for h in visible["hits"]["hits"]] == [
+            {"id": 0, "body": "quasar "}
+        ], visible
+        noop_query["remote_snapshot"] = visible["remote_snapshot"]
+        excluded_query = dict(noop_query, limit=row_count)
+        excluded_query["exclusion_query"] = excluded_query.pop("filter_query")
+        excluded = call("POST", "/tables/wal_windows/query", excluded_query)
+        assert len(excluded["hits"]["hits"]) == row_count - 1, excluded
+        assert all(h["_source"]["id"] != 0 for h in excluded["hits"]["hits"])
         vector_image = (
             {"dense_native": "[0,1]", "sparse_native": '{"2":2}'} if vector_kind else {}
         )
@@ -1411,7 +1456,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 "source": "e2e",
                 "epoch": "1",
                 "checkpoint": "1",
-                "expected_checkpoint": "0",
+                "expected_checkpoint": "noop-probe",
                 "key_fields": ["id"],
                 "changes": [
                     {"op": "delete", "row": {"id": 1}},
@@ -1627,6 +1672,12 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         for restart in (False, True):
             if restart:
                 server.restart()
+            # A newer accepted cut and a process restart must not alter this
+            # receipt's pinned no-op row or its lazy inclusion/exclusion result.
+            unchanged_cut = call("POST", "/tables/wal_windows/query", noop_query)
+            assert unchanged_cut["hits"] == visible["hits"]
+            excluded_cut = call("POST", "/tables/wal_windows/query", excluded_query)
+            assert excluded_cut["hits"] == excluded["hits"]
             original = call(
                 "POST",
                 "/tables/wal_windows/query",

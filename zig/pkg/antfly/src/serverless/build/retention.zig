@@ -94,14 +94,14 @@ pub const Pruner = struct {
         operation_pruner.alloc = operation_alloc;
         operation_pruner.manifests = &manifests;
         var result = operation_pruner.pruneNamespaceAdmitted(namespace, keep_latest_versions, cancellation) catch |err| {
-            if (err == error.OutOfMemory and working_set.limit_exceeded) return error.GarbageCollectionBudgetExceeded;
+            if (err == error.OutOfMemory and working_set.limitExceeded()) return error.GarbageCollectionBudgetExceeded;
             return err;
         };
         errdefer result.deinit(operation_alloc);
         const owned_namespace = try self.alloc.dupe(u8, result.namespace);
         operation_alloc.free(result.namespace);
         result.namespace = owned_namespace;
-        std.debug.assert(working_set.live_bytes == 0);
+        std.debug.assert(working_set.liveBytes() == 0);
         return result;
     }
 

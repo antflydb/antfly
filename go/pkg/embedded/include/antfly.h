@@ -41,8 +41,10 @@ typedef enum antfly_error_code {
     /* The operation requires a capability unavailable on this platform or
      * filesystem. Retrying unchanged will not succeed. */
     ANTFLY_UNSUPPORTED = 8,
-    /* Derived work stalled or a worker failed. Inspect pending-work diagnostics
-     * and repair or reopen the database; primary-only writes may still succeed. */
+    /* Derived work stalled or a worker failed. A batch may already have
+     * committed its primary write; inspect the error detail and pending-work
+     * diagnostics. Do not replay a batch reported as committed. Repair or
+     * reopen the database; primary-only writes may still succeed. */
     ANTFLY_STALLED = 9,
     /* The operation was cancelled, including a pending replacement or a
      * progress/stream callback returning false. */

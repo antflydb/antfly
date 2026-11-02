@@ -4506,3 +4506,42 @@ test "opaque metadata durable job state reads preserve group cursor and ownershi
     defer a.free(recovered);
     try std.testing.expectEqualStrings(value, recovered);
 }
+
+test "metadata durable job facade preserves state owner counts and bounded scan envelopes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = root, .no_sync = true });
+    defer store.deinit();
+    try std.testing.expect((try store.getJobState(a, 41, "documents/example")) == null);
+    try std.testing.expectEqual(@as(u64, 0), try store.getJobOwnerCount(a, 41, "alice"));
+    const queued = "{\"owner\":\"alice\",\"state\":\"queued\"}";
+    try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = "documents/example", .expected_hash = "", .value = queued } });
+    const value = (try store.getJobState(a, 41, "documents/example")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings(queued, value);
+    try std.testing.expectEqual(@as(u64, 1), try store.getJobOwnerCount(a, 41, "alice"));
+    const encoded = try store.scanJobState(a, 41, null);
+    defer a.free(encoded);
+    const page = try std.json.parseFromSlice(@import("../metadata/job_state.zig").Page, a, encoded, .{});
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
+    try std.testing.expectEqualStrings("documents/example", page.value.rows[0].key);
+    try std.testing.expectEqualStrings(queued, page.value.rows[0].value);
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, store.scanJobState(a, 41, "../bad"));
+    const limit = @import("../metadata/job_state.zig").max_active_per_owner;
+    for (1..limit) |i| {
+        const key = try std.fmt.allocPrint(a, "documents/example-{d}", .{i});
+        defer a.free(key);
+        try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = key, .expected_hash = "", .value = queued } });
+    }
+    try std.testing.expectEqual(limit, try store.getJobOwnerCount(a, 41, "alice"));
+    // Raft apply rejects quota conflicts as deterministic no-ops; the service
+    // reports TooManyActiveJobs before proposal using this owner-count read.
+    try store.applyStandaloneCommand(41, .{ .compare_and_set_job_state = .{ .key = "documents/over-quota", .expected_hash = "", .value = queued } });
+    try std.testing.expect((try store.getJobState(a, 41, "documents/over-quota")) == null);
+    try std.testing.expectEqual(limit, try store.getJobOwnerCount(a, 41, "alice"));
+    try std.testing.expectError(error.TooManyActiveJobs, error_identity.statusToError(error_identity.statusFromError(error.TooManyActiveJobs)));
+}

@@ -206,6 +206,12 @@ pub fn liteSchemaJson(handle: *h.Handle, alloc: std.mem.Allocator, id: u64) !?[]
 }
 
 pub fn get(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {
+    const database = try getUnrecovered(handle, name);
+    try @import("sql_ddl.zig").requireRecovered(handle, database, name);
+    return database;
+}
+
+fn getUnrecovered(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {
     try loadCatalog(handle);
     if (std.mem.eql(u8, name, "default")) return &handle.db;
     handle.embedded_table_open_mutex.lockUncancelable(h.handleLockIo());
@@ -231,7 +237,10 @@ pub fn create(handle: *h.Handle, name: []const u8, schema: []const u8, if_not_ex
     if (name.len == 0 or name.len > 1024 or std.mem.indexOfScalar(u8, name, 0) != null or !std.unicode.utf8ValidateSlice(name)) return error.InvalidSqlParameters;
     try loadCatalog(handle);
     if (std.mem.eql(u8, name, "default") or handle.embedded_table_records.contains(name)) {
-        if (if_not_exists) return;
+        if (if_not_exists) {
+            _ = try get(handle, name);
+            return;
+        }
         return error.TableAlreadyExists;
     }
     var parsed_schema = try h.tables_api.parseValidatedTableSchema(handle.alloc, schema);

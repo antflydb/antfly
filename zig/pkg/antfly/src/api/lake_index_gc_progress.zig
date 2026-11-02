@@ -47,6 +47,7 @@ pub const Job = union(enum) {
     artifact: Ref,
     contribution_page: Ref,
     chunk: artifacts.ChunkRef,
+    cover_directory: artifacts.ChunkRef,
     text_directory: artifacts.ChunkRef,
     text_root: artifacts.ChunkRef,
     text_manifest: struct { ref: artifacts.ChunkRef, seekable: bool, maintenance_only: bool = false },
@@ -109,6 +110,12 @@ pub const Progress = struct {
         switch (job) {
             .chunk => |chunk| {
                 _ = try self.record(chunk);
+            },
+            .cover_directory => |ref| {
+                if (!try self.expand(ref, "cover-directory-v1")) return;
+                try stores.chargeReadBudget(&collector.remaining_reads, ref.byte_len);
+                const directory = try @import("lake_index_cover_columns.zig").readDirectory(a, collector.store, ref, collector.cancellation());
+                try self.enqueue(.{ .chunk = directory.pack });
             },
             .artifact => |artifact| try collector.markArtifact(a, artifact),
             .text_directory => |ref| try collector.markTextDirectory(a, ref),
@@ -224,7 +231,10 @@ pub const Progress = struct {
                             return;
                         }
                         if (!visitor.ordered) return;
-                        if (try @import("lake_index_ordered_rows.zig").coverReference(visitor.a, visitor.progress.value.domain, bytes)) |cover| try visitor.progress.enqueue(.{ .chunk = cover.block });
+                        if (try @import("lake_index_ordered_rows.zig").coverReference(visitor.a, visitor.progress.value.domain, bytes)) |cover| {
+                            try visitor.progress.enqueue(.{ .chunk = cover.block });
+                            if (cover.striped) try visitor.progress.enqueue(.{ .cover_directory = cover.block });
+                        }
                     }
                 };
                 var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .native_files = job_page.native_files, .native_generation = job_page.native_generation, .native_chunks = job_page.native_chunks, .contributions = job_page.contributions, .text_files = job_page.text_files, .a = a };

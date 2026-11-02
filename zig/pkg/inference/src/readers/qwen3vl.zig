@@ -15,6 +15,10 @@
 
 const std = @import("std");
 
+/// Per-page OCR completion budget when the caller omits max_tokens.
+/// Request and deployment limits remain authoritative.
+pub const default_max_tokens: usize = 4096;
+
 pub const DefaultPrompt = "Transcribe all visible text exactly. Preserve the original reading order, line breaks, punctuation, and accents. Return only the transcription.";
 
 /// Use the OCR default for omitted or blank prompts; preserve custom prompts verbatim.

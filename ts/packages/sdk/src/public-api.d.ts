@@ -23683,7 +23683,11 @@ export interface components {
              */
             prompt?: string;
             /**
-             * @description Maximum tokens to generate (256 by default for generator readers). For audio, this is supported by generator backends; Whisper uses its recognition and execution budgets and rejects an explicit max_tokens.
+             * @description Maximum output tokens per page. When omitted, the selected reader
+             *     model supplies its default, bounded by deployment limits. Explicit
+             *     values override the model default and must fit model and server limits.
+             *     Audio generator backends accept this option; Whisper uses its recognition
+             *     and execution budgets and rejects an explicit max_tokens.
              * @example 256
              */
             max_tokens?: number;
@@ -24754,6 +24758,13 @@ export interface components {
             requested_items: number;
             native_batches: number;
             native_items: number;
+            /**
+             * @description Largest successfully executed native decoder step observed by these
+             *     items, including peers from other requests. Zero or absent means
+             *     unobserved, one means singleton execution. This is measured at
+             *     execution, never inferred from native_items or request cardinality.
+             */
+            max_native_step_items?: number;
             serial_items: number;
             /** @description Items rejected before model execution by validation, resolution, or admission. */
             rejected_items: number;
@@ -30511,6 +30522,11 @@ export interface components {
              * @example antflydb/gemma-e2b
              */
             name: string;
+            /**
+             * @description Keep a successfully preloaded model pinned against eviction. Set false to warm the ordinary evictable cache before serving; idle and model-count policy still apply.
+             * @default true
+             */
+            pin?: boolean;
             backend?: components["schemas"]["ModelBackend"];
             format?: components["schemas"]["ModelFormat"];
             quantization?: components["schemas"]["ModelQuantization"];

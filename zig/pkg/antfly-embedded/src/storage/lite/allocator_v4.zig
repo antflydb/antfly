@@ -114,6 +114,8 @@ pub const State = struct {
     free_pages: u64 = 0,
     data_pending: u64 = 0,
     pending: std.AutoHashMapUnmanaged(u64, Retirement) = .empty,
+    pending_removals_since_rehash: usize = 0,
+    stale_heap_items: usize = 0,
     heap: Heap,
     metadata_heap: Heap,
     chains_heap: Heap,
@@ -288,9 +290,14 @@ pub const State = struct {
     /// Admission checks the complete loaded state independently of any cache
     /// left by earlier use. Only trusted mutations use the incremental path.
     pub fn rebuildFingerprint(self: *State) !ledger_digest.Digest {
+        return self.rebuildFingerprintWithCancel(null);
+    }
+
+    pub fn rebuildFingerprintWithCancel(self: *State, cancel: ?*const std.atomic.Value(bool)) !ledger_digest.Digest {
         if (self.digest_cache) |*cache| cache.deinit(self.allocator);
         self.digest_cache = null;
-        return self.fingerprint();
+        try self.prepareDigestWithCancel(cancel);
+        return self.incrementalFingerprint();
     }
 
     pub fn digestWork(self: *const State) u64 {
@@ -449,11 +456,14 @@ pub const State = struct {
     }
     pub fn eligible(self: *State, data_frontier: u64, metadata_frontier: u64) ?Retirement {
         for ([_]*Heap{ &self.metadata_heap, &self.chains_heap, &self.heap }, [_]u64{ metadata_frontier, metadata_frontier, data_frontier }) |q, frontier| {
+            self.pruneHeap(q);
             if (q.peek()) |item| if (item.epoch <= frontier) return item;
         }
         return null;
     }
     pub fn eligibleWork(self: *State, data_frontier: u64, metadata_frontier: u64) ?Retirement {
+        self.pruneHeap(&self.chains_heap);
+        self.pruneHeap(&self.heap);
         if (self.chains_heap.peek()) |item| if (item.epoch <= metadata_frontier) return item;
         if (self.heap.peek()) |item| if (item.epoch <= data_frontier) return item;
         return null;
@@ -467,13 +477,15 @@ pub const State = struct {
         if (linked.previous != 0) self.pending.getPtr(linked.previous).?.next = linked.next else self.first_pending = linked.next;
         if (linked.next != 0) self.pending.getPtr(linked.next).?.previous = linked.previous else self.last_pending = linked.previous;
         if (self.root.build_cursor == item.id) self.root.build_cursor = linked.next;
-        _ = self.pending.remove(item.id);
+        _ = self.removePending(item.id);
+        self.pruneHeap(self.queue(item.kind));
         self.collected +|= 1;
         if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending -= 1;
     }
     /// Private-image publication discards all earlier private recovery roots.
     /// Rebase pending epochs and checkpoint the queue at that final boundary.
     pub fn rebaseEpochs(self: *State, epoch: u64, cancel_requested: ?*const std.atomic.Value(bool)) !void {
+        self.stale_heap_items = 0;
         self.heap.clearRetainingCapacity();
         self.metadata_heap.clearRetainingCapacity();
         self.chains_heap.clearRetainingCapacity();
@@ -487,7 +499,134 @@ pub const State = struct {
         self.force_checkpoint = true;
     }
 
+    fn removePending(self: *State, id: u64) bool {
+        if (!self.pending.remove(id)) return false;
+        self.pending_removals_since_rehash +|= 1;
+        // Both a collector turn and journal replay can remove thousands of
+        // entries before persistence cleanup. Neither caller retains a map
+        // entry pointer across this removal.
+        self.rehashPendingIfNeeded();
+        return true;
+    }
+
+    fn pruneHeap(self: *State, q: *Heap) void {
+        while (q.peek()) |item| {
+            if (self.pending.contains(item.id)) return;
+            _ = q.pop();
+            self.stale_heap_items -= 1;
+        }
+    }
+
+    /// Advance a trusted in-memory ledger over a bounded immutable journal
+    /// suffix. A completed snapshot rotation uses the full loader. Partial
+    /// builders continue from their authenticated root cursors and journal.
+    /// False leaves state unchanged; on error the caller must discard it.
+    pub fn rebase(self: *State, io: IO, root_page: u64, max_pages: usize) !bool {
+        if (self.digest_cache == null or self.changes.count() != 0 or self.added.items.len != 0 or
+            self.completed.items.len != 0) return false;
+        const raw = try io.read(io.context, self.allocator, root_page);
+        defer self.allocator.free(raw);
+        const next = try decodeRoot(raw);
+        if (get64(raw, 56) < 2) return false;
+        if (next.snapshot != self.root.snapshot or next.pending != self.root.pending or
+            next.delta_stop != self.root.delta_stop or next.covered_pages < self.root.covered_pages or
+            next.next_id < self.root.next_id) return false;
+        var deltas: std.ArrayList(u64) = .empty;
+        defer deltas.deinit(self.allocator);
+        var page = next.deltas;
+        while (page != self.root.deltas) {
+            try io.checkCancel();
+            if (page == 0 or page == next.delta_stop or deltas.items.len >= max_pages) return false;
+            if (page >= next.covered_pages) return error.InvalidNativeAllocator;
+            for (deltas.items) |seen| if (seen == page) return error.InvalidNativeAllocator;
+            try deltas.append(self.allocator, page);
+            const payload = try io.read(io.context, self.allocator, page);
+            defer self.allocator.free(payload);
+            if (payload.len < 16 or !std.mem.eql(u8, payload[0..4], "L4DL") or (payload.len - 16) % 56 != 0) return error.InvalidNativeAllocator;
+            page = get64(payload, 8);
+        }
+        try self.ensure(next.covered_pages - 1);
+        var i = deltas.items.len;
+        while (i != 0) {
+            i -= 1;
+            try io.checkCancel();
+            const payload = try io.read(io.context, self.allocator, deltas.items[i]);
+            defer self.allocator.free(payload);
+            var offset: usize = 16;
+            while (offset < payload.len) : (offset += 56) {
+                const entry = payload[offset..][0..56];
+                switch (entry[0]) {
+                    1 => {
+                        const changed = get64(entry, 8);
+                        if (changed >= next.covered_pages) return error.InvalidNativeAllocator;
+                        try self.set(changed, std.math.cast(u32, get64(entry, 16)) orelse return error.InvalidNativeAllocator, false);
+                    },
+                    2 => {
+                        var item = try decodeRetirement(entry[8..][0..48]);
+                        if (item.id < self.root.next_id or item.id >= next.next_id or item.page == 0 or self.pending.contains(item.id) or
+                            self.pending.count() >= max_pending_objects + collector_reserve) return error.InvalidNativeAllocator;
+                        try self.dirtyPending(item.id);
+                        item.previous = self.last_pending;
+                        try self.pending.put(self.allocator, item.id, item);
+                        if (self.last_pending != 0) self.pending.getPtr(self.last_pending).?.next = item.id else self.first_pending = item.id;
+                        self.last_pending = item.id;
+                        try self.queue(item.kind).push(self.allocator, item);
+                        if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending += 1;
+                    },
+                    3 => {
+                        const id = get64(entry, 8);
+                        const item = self.pending.get(id) orelse return error.InvalidNativeAllocator;
+                        try self.dirtyPending(id);
+                        if (item.previous != 0) self.pending.getPtr(item.previous).?.next = item.next else self.first_pending = item.next;
+                        if (item.next != 0) self.pending.getPtr(item.next).?.previous = item.previous else self.last_pending = item.previous;
+                        _ = self.removePending(id);
+                        self.stale_heap_items += 1;
+                        if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending -= 1;
+                    },
+                    else => return error.InvalidNativeAllocator,
+                }
+            }
+        }
+        self.root = next;
+        self.root_page = root_page;
+        if (root_page >= next.covered_pages or self.count(root_page) == free) return error.InvalidNativeAllocator;
+        for (deltas.items) |metadata_page| if (self.count(metadata_page) == free) return error.InvalidNativeAllocator;
+        if (next.build_cursor != 0 and !self.pending.contains(next.build_cursor)) return error.InvalidNativeAllocator;
+        self.pruneHeap(&self.heap);
+        self.pruneHeap(&self.metadata_heap);
+        self.pruneHeap(&self.chains_heap);
+        // Bound lazy deletions, amortizing an occasional rebuild over removals.
+        if (self.stale_heap_items > @max(@as(usize, 128), self.pending.count())) {
+            self.heap.clearRetainingCapacity();
+            self.metadata_heap.clearRetainingCapacity();
+            self.chains_heap.clearRetainingCapacity();
+            var items = self.pending.valueIterator();
+            while (items.next()) |item| try self.queue(item.kind).push(self.allocator, item.*);
+            self.stale_heap_items = 0;
+        }
+        // These lists are transient traversal inventories, never ownership.
+        // A builder continues from Root's durable heads/cursors; retirement
+        // follows those chains, not the inventory of pages seen by this owner.
+        self.metadata.clearRetainingCapacity();
+        self.builder_metadata.clearRetainingCapacity();
+        try self.metadata.append(self.allocator, root_page);
+        try self.metadata.appendSlice(self.allocator, deltas.items);
+        return true;
+    }
+
+    fn rehashPendingIfNeeded(self: *State) void {
+        // Monotonic retirement IDs eventually leave no genuinely empty hash
+        // buckets, even when very few objects remain. Missing-key lookups then
+        // scan the entire retained capacity. Rehash without allocating at safe
+        // boundaries; the linear sweep is amortized over prior removals.
+        if (self.pending_removals_since_rehash >= @max(@as(usize, 64), @as(usize, self.pending.capacity()) / 16)) {
+            self.pending.rehash(std.hash_map.AutoContext(u64){});
+            self.pending_removals_since_rehash = 0;
+        }
+    }
+
     pub fn clean(self: *State) void {
+        self.rehashPendingIfNeeded();
         self.changes.clearRetainingCapacity();
         self.added.clearRetainingCapacity();
         self.completed.clearRetainingCapacity();
@@ -506,12 +645,17 @@ pub const State = struct {
         inline for (.{ "delta_stop", "build_snapshot", "build_pending", "build_end", "build_cursor", "build_limit", "build_boundary", "build_delta_bytes" }, 0..) |name, i| put64(out, 64 + i * 8, @field(root, name));
     }
     pub fn decodeRoot(raw: []const u8) !Root {
-        if ((raw.len != 64 and raw.len != 128) or !std.mem.eql(u8, raw[0..8], "AFL4ALOC") or (get64(raw, 56) != 1 and get64(raw, 56) != 2) or (get64(raw, 56) == 2 and raw.len != 128)) return error.InvalidNativeAllocator;
+        if (raw.len != 64 and raw.len != 128 and raw.len != 192) return error.InvalidNativeAllocator;
+        const version = get64(raw, 56);
+        if (!std.mem.eql(u8, raw[0..8], "AFL4ALOC") or version < 1 or version > 3 or
+            (version == 2 and raw.len != 128) or (version == 3 and raw.len != 192)) return error.InvalidNativeAllocator;
         var root: Root = .{ .snapshot = get64(raw, 8), .pending = get64(raw, 16), .deltas = get64(raw, 24), .next_id = get64(raw, 32), .covered_pages = get64(raw, 40), .delta_bytes = get64(raw, 48) };
-        if (get64(raw, 56) == 2) inline for (.{ "delta_stop", "build_snapshot", "build_pending", "build_end", "build_cursor", "build_limit", "build_boundary", "build_delta_bytes" }, 0..) |name, i| {
+        if (version >= 2) inline for (.{ "delta_stop", "build_snapshot", "build_pending", "build_end", "build_cursor", "build_limit", "build_boundary", "build_delta_bytes" }, 0..) |name, i| {
             @field(root, name) = get64(raw, 64 + i * 8);
         };
         if (root.next_id == 0 or root.covered_pages == 0 or root.snapshot == 0) return error.InvalidNativeAllocator;
+        for ([_]u64{ root.snapshot, root.pending, root.deltas, root.build_snapshot, root.build_pending }) |page|
+            if (page >= root.covered_pages) return error.InvalidNativeAllocator;
         if (root.delta_stop >= root.covered_pages or root.build_boundary >= root.covered_pages) return error.InvalidNativeAllocator;
         if (root.build_limit == 0) {
             if (root.build_snapshot != 0 or root.build_pending != 0 or root.build_end != 0 or root.build_cursor != 0 or root.build_boundary != 0 or root.build_delta_bytes != 0) return error.InvalidNativeAllocator;
@@ -609,7 +753,7 @@ pub const State = struct {
                     3 => {
                         const id = get64(entry, 8);
                         if (id == 0 or id >= self.root.next_id) return error.InvalidNativeAllocator;
-                        if (!self.pending.remove(id) and get64(raw, 56) == 1) return error.InvalidNativeAllocator;
+                        if (!self.removePending(id) and get64(raw, 56) == 1) return error.InvalidNativeAllocator;
                     },
                     else => return error.InvalidNativeAllocator,
                 }
@@ -960,6 +1104,55 @@ const TestLedger = struct {
     }
 };
 
+test "lite allocator v4 checked root extension retains canonical allocator fields" {
+    const root: Root = .{ .snapshot = 1, .covered_pages = 10, .next_id = 2 };
+    var raw: [192]u8 = @splat(0);
+    State.encodeRoot(root, raw[0..128]);
+    put64(&raw, 56, 3);
+    @memset(raw[128..], 0x5a);
+    try std.testing.expectEqual(root, try State.decodeRoot(&raw));
+    try std.testing.expectError(error.InvalidNativeAllocator, State.decodeRoot(raw[0..128]));
+    put64(&raw, 56, 4);
+    try std.testing.expectError(error.InvalidNativeAllocator, State.decodeRoot(&raw));
+}
+
+test "lite allocator v4 bounded foreign journal rebase matches independent reload" {
+    const a = std.testing.allocator;
+    var state = State.init(a);
+    defer state.deinit();
+    var disk = TestLedger{ .state = &state, .next = 1001 };
+    defer disk.deinit();
+    for (1..1001) |page| try state.retain(page);
+    try disk.publish(1);
+    state.incremental = true;
+    var cached = try State.load(a, disk.io(), state.root_page);
+    defer cached.deinit();
+    _ = try cached.fingerprint();
+    for (0..100) |round| {
+        try state.retain(10 + round);
+        try state.retire(.{ .epoch = round + 1, .page = 500 + round, .kind = .page });
+        if (round % 3 == 0) if (state.oldest(std.math.maxInt(u64))) |item| try state.complete(item);
+        try disk.publish(round + 2);
+        const before = try cached.fingerprint();
+        try std.testing.expect(!try cached.rebase(disk.io(), state.root_page, 0));
+        try std.testing.expectEqual(before, try cached.fingerprint());
+        try std.testing.expect(try cached.rebase(disk.io(), state.root_page, 128));
+        var independent = try State.load(a, disk.io(), state.root_page);
+        defer independent.deinit();
+        try std.testing.expectEqual(try independent.fingerprint(), try cached.fingerprint());
+        try std.testing.expectEqual(independent.free_pages, cached.free_pages);
+        try std.testing.expectEqual(independent.data_pending, cached.data_pending);
+        try std.testing.expectEqualSlices(u32, independent.counts.items, cached.counts.items);
+    }
+    // A different snapshot anchor is a safe full-load fallback, not a suffix.
+    state.force_checkpoint = true;
+    state.incremental = false;
+    try disk.publish(200);
+    const before = try cached.fingerprint();
+    try std.testing.expect(!try cached.rebase(disk.io(), state.root_page, 128));
+    try std.testing.expectEqual(before, try cached.fingerprint());
+}
+
 test "lite allocator v4 incremental checkpoints reconcile mutations and resume after reopen" {
     const a = std.testing.allocator;
     var state = State.init(a);
@@ -972,6 +1165,9 @@ test "lite allocator v4 incremental checkpoints reconcile mutations and resume a
     state.incremental = true;
     try state.retain(500);
     try disk.publish(2);
+    var cached = try State.load(a, disk.io(), state.root_page);
+    defer cached.deinit();
+    _ = try cached.fingerprint();
     state.force_checkpoint = true;
     var rounds: usize = 0;
     while (state.checkpointDue()) : (rounds += 1) {
@@ -989,9 +1185,14 @@ test "lite allocator v4 incremental checkpoints reconcile mutations and resume a
             try state.retire(.{ .epoch = 1, .page = 20, .kind = .page });
         }
         try disk.publish(rounds + 2);
+        if (!try cached.rebase(disk.io(), state.root_page, 128)) {
+            cached.deinit();
+            cached = try State.load(a, disk.io(), state.root_page);
+        }
         const root = state.root_page;
         state.deinit();
         state = try State.load(a, disk.io(), root);
+        try std.testing.expectEqual(try state.fingerprint(), try cached.fingerprint());
         state.incremental = true;
     }
     try std.testing.expect(rounds > 30);
@@ -1198,6 +1399,43 @@ test "lite allocator v4 pending digest memory follows live chunks rather than hi
     try std.testing.expectEqual(@as(usize, 3), state.digest_cache.?.pending.nodes);
     try state.complete(state.eligible(7, 7).?);
     try expectDigestMatchesRebuild(&state);
+}
+
+test "lite allocator v4 retirement churn keeps absent pending lookups bounded" {
+    for ([_]u32{ 256, 4096 }) |reserve| for ([_]bool{ false, true }) |persist_each| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        try state.ensure(2);
+        try state.pending.ensureTotalCapacity(state.allocator, reserve);
+        // Keep one protected retirement alive while monotonically increasing
+        // IDs are inserted and collected, as in a long maintenance drain.
+        try state.retire(.{ .epoch = 1000, .page = 1, .kind = .page });
+        const capacity = state.pending.capacity();
+        for (0..@as(usize, capacity) * 16) |_| {
+            try state.retire(.{ .epoch = 1, .page = 2, .kind = .page });
+            try state.complete(state.eligible(1, 1).?);
+            if (persist_each) state.clean();
+        }
+        if (!persist_each) {
+            // Keep the entire turn's persistence deltas: hash maintenance
+            // must not discard additions or completions before they persist.
+            try std.testing.expectEqual(@as(usize, capacity) * 16 + 1, state.added.items.len);
+            try std.testing.expectEqual(@as(usize, capacity) * 16, state.completed.items.len);
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.pending.count());
+        const absent = state.root.next_id;
+        try std.testing.expect(state.pending.get(absent) == null);
+        // Count the metadata probes made by an absent-key lookup. Timing is
+        // deliberately excluded: a tombstone-filled table scans its retained
+        // capacity despite containing just one live entry.
+        const context: std.hash_map.AutoContext(u64) = .{};
+        var index: usize = @intCast(context.hash(absent) & @as(u64, capacity - 1));
+        var probes: usize = 1;
+        while (!state.pending.metadata.?[index].isFree() and probes <= capacity) : (probes += 1)
+            index = (index + 1) & (capacity - 1);
+        try std.testing.expect(probes <= 16);
+        try expectDigestMatchesRebuild(&state);
+    };
 }
 
 test "lite allocator v4 canceled digest initialization retains no partial cache" {

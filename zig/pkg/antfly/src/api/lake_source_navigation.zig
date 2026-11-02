@@ -220,7 +220,7 @@ fn reduceFiles(a: A, entries: []const tree.Entry, height: u8) ![]u8 {
         const summary = if (height == 0) leaf: {
             const record = try std.json.parseFromSliceLeaky(Record, scratch.allocator(), entry.value, .{});
             const id = key(record.file.file_id);
-            if (!std.mem.eql(u8, entry.key, &id)) return error.InvalidNativeLakeFileState;
+            if (entry.keyView().order(tree.KeyView.from(&id)) != .eq) return error.InvalidNativeLakeFileState;
             break :leaf Summary{ .first = id, .last = id, .count = 1, .digest = proofHash(id, record.digest) };
         } else branch: {
             if (entry.aggregate.len == 0) return try a.alloc(u8, 0);
@@ -899,7 +899,7 @@ pub const CostingBuilder = struct {
             if ((if (column.files) |ref| ref.records else 0) != self.root.count) continue;
             var sketch: Sketch = .{};
             if (column.files) |ref| {
-                var page = try tree.readPage(ca, store, ref);
+                var page = try tree.readNavigationPage(ca, store, ref);
                 defer page.deinit(ca);
                 sketch = try Sketch.decode(page.aggregate);
             }
@@ -985,9 +985,9 @@ pub const Resolver = struct {
             fn decode(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 const owned = item.arena.allocator();
-                const page = try owned.create(tree.Page);
-                page.* = try tree.readPage(owned, self_.owner.storage(), self_.ref);
-                for (page.entries) |entry| if (entry.key.len != 32) return error.InvalidNativeLakeFileState;
+                const page = try owned.create(tree.NavigationPage);
+                page.* = try tree.readNavigationPage(owned, self_.owner.storage(), self_.ref);
+                for (page.entries, 0..) |_, i| if (page.key(i).len() != 32) return error.InvalidNativeLakeFileState;
                 item.payload = .{ .extension = page };
             }
         };
@@ -1014,21 +1014,21 @@ pub const Resolver = struct {
             };
             defer lease.release();
             try context.ensureActive();
-            const page: *const tree.Page = @ptrCast(@alignCast(lease.item.payload.extension));
-            if (lower) |first| if (!std.mem.eql(u8, page.entries[0].key, &first)) return error.InvalidNativeLakeFileState;
-            if (upper) |last| if (std.mem.order(u8, page.entries[page.entries.len - 1].key, &last) != .lt) return error.InvalidNativeLakeFileState;
+            const page: *const tree.NavigationPage = @ptrCast(@alignCast(lease.item.payload.extension));
+            if (lower) |first| if (page.key(0).order(tree.KeyView.from(&first)) != .eq) return error.InvalidNativeLakeFileState;
+            if (upper) |last| if (page.key(page.entries.len - 1).order(tree.KeyView.from(&last)) != .lt) return error.InvalidNativeLakeFileState;
             var lo: usize = 0;
             var hi = page.entries.len;
             while (lo < hi) {
                 const mid = lo + (hi - lo) / 2;
-                if (std.mem.order(u8, page.entries[mid].key, id) != .gt) lo = mid + 1 else hi = mid;
+                if (page.key(mid).order(tree.KeyView.from(id)) != .gt) lo = mid + 1 else hi = mid;
             }
             if (lo == 0) return null;
             const entry = page.entries[lo - 1];
-            if (ref.height == 0) return if (std.mem.eql(u8, entry.key, id)) try a.dupe(u8, entry.value) else null;
+            if (ref.height == 0) return if (page.key(lo - 1).order(tree.KeyView.from(id)) == .eq) try a.dupe(u8, entry.value) else null;
             ref = (entry.child orelse return error.InvalidNativeLakeFileState).*;
-            lower = entry.key[0..32].*;
-            if (lo < page.entries.len) upper = page.entries[lo].key[0..32].*;
+            lower = page.key(lo - 1).tail(32).?;
+            if (lo < page.entries.len) upper = page.key(lo).tail(32).?;
         }
     }
     pub fn file(self: *@This(), a: A, hex: []const u8, public: bool) !?[]const u8 {

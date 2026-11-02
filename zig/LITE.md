@@ -1157,16 +1157,63 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-4 files (`AFLITE\x04P`) with packed records and
+Native owners create revision-7 files (`AFLITE\x07P`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
 owners migrate revision 3 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-4 signature before checkpoint selection.
+and older binaries reject the revision-7 signature before checkpoint selection.
+Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-7 image.
 
-Revision 4 removes historical record chains. Ordered indexes identify live
+Revision 7 records separate opaque identities for primary data, runtime metadata,
+and index inputs in each recovery slot. Allocator-only checkpoints and scoped
+reader leases preserve those identities, so admission can retain an unchanged
+serving runtime after both physical slots advance. Allocator caches independently
+validate journal ancestry and the current seal; a repeated physical root ID does
+not establish a cache hit. Compaction assigns fresh identities to every logical
+root family before sealing its replacement generation; allocator-only publication
+normalization preserves those identities.
+
+Schema and SQL recovery-state writes atomically mark their namespace in a durable
+recovery agenda. Admission checks pending namespaces instead of opening every
+table and index. Recovery acknowledges only terminal work under the path lease,
+and rotates bounded pages so one namespace cannot monopolize a turn. The page
+cursor schedules discovery; it never authorizes access. Every operation checks
+its affected namespaces, and catalog-dependent operations check their schema
+participants, before admission. Published constraints may still be validating;
+existing integrity guards permit repairs that unblock that validation. Such work
+keeps its agenda marker until activation settles. Read-only handles carry a clean-sweep witness
+across pages for the same logical metadata generation; data-only commits preserve
+it and new DDL invalidates it. An interrupted namespace check disqualifies the
+sweep from certifying cleanliness, including when its cursor has already advanced.
+Revision-3 conversion bootstraps this agenda before
+publishing the replacement generation.
+
+Detached replay uses per-index-kind feedback retained by the namespace scheduling
+owner. Cheap full windows can grow up to 2,048 records and 16 MiB; slow or failed
+windows shrink, and observed blocked reuse lowers retention limits. The 25 ms
+quantum is a sizing target, not preemption of an individual record/provider call.
+Background and foreground retirement work remains capped per publication. Pending
+work diagnostics report replay budgets and the current retirement-work limit.
+Explicit integrity reports split logical bytes among documents, control documents,
+metadata catalogs, and index artifacts; allocator checks independently load disk
+state rather than using a writer's transient traversal inventory. Document bytes
+cover authored primary/relational rows and unreserved raw records. Control bytes
+include transaction receipts, replay/identity metadata, columnar controls and
+other reserved internal rows, including derived records. Namespace wrappers are
+removed structurally before classification; document IDs containing reserved
+text remain documents.
+
+Database-wide compact preparation drains and merges named-table indexes as well
+as the default namespace. The C API also settles cross-table promotion before
+merging. An unavailable namespace fails explicit compaction rather than silently
+reporting a partially settled database. Logical-byte comparisons must use the
+same inputs and equivalent index catch-up/merge state.
+
+The indexed layout removes historical record chains. Ordered indexes identify live
 records; journaled ownership counters and a hierarchical bitmap replenish free
 pages through incremental retirement. Shared values and packed slots retire
 independently, behind recovery, durability, and reader fences. Page reuse remains
@@ -1175,16 +1222,28 @@ compact generation independently of routine reuse. See the
 [reclamation design](../docs/design/lite-reclamation.md) for policy options,
 storage admission, format encoding, memory costs, and qualification.
 
-Native connection owners publish checked allocator handoff certificates inside
-their existing commits, so another writer can validate the current ownership
-metadata without repeating a graph walk after each peer publication. Both
-recovery slots and the canonical ledger must match; an uncertified writer or
-changed state retains the full-proof path. Allocator-only cleanup also retains
-that path so sealing does not perpetuate retirement work. Clean-close certificates
-remain compatible with older runtimes. Live seals use a cached chunked Merkle
-digest: warm updates hash changed chunks and bounded trie paths, while a cold
-ledger load constructs the cache once. This adds catalog writes without another
-checkpoint publication or durability barrier per transaction.
+Background shrink assessments and generation copies use coordinated snapshots.
+Their fences retain both data and allocator metadata. Revision-7 cooperating
+processes publish locked reader epochs in a bounded `.aflite-readers-<path-hash>`
+directory. The header binds a persistent random identity and directory inode;
+the pathname only locates that namespace. Missing or replaced namespaces cannot
+authorize reuse. A namespace guard also protects marker registration against
+scans from another inode generation. Hard-link aliases and other unmatched namespaces retain non-suspendable
+inode protection; their writers cannot promote or reuse pages. Symlinks resolving
+to the original namespace retain coordinated reuse. Private API snapshots and
+generation rewrites bind their destination before publication. A manual filesystem
+move/copy can conservatively disable epoch reuse until a generation rewrite.
+Directory hints of unknown type are validated using descriptor metadata.
+
+Native connection owners seal their private allocator root inside existing
+commits, including allocator-only cleanup. A peer validates both recovery slots
+and the canonical ownership digest without a repeated graph walk. An uncertified
+writer or mismatched state retains the full-proof path. Legacy catalog certificates
+remain readable in supported files. Live seals use a cached chunked Merkle digest:
+warm updates hash changed chunks and bounded trie paths, and a cold ledger load
+constructs the cache once. Sealing adds no catalog allocation or durability barrier.
+Pending-retirement maps periodically rehash after removals during retirement
+service and journal replay, amortized over prior removals.
 Contended path leases join a cancelable kernel lock wait using a bounded,
 owner-scoped executor. Missing read-only sidecars and executor exhaustion retain
 short randomized retries, capped at four milliseconds. The configured busy
@@ -1200,10 +1259,50 @@ inode, checkpoint and immutable index inputs. Background path-lease waits are
 capped at five seconds per acquisition. Like other coordination inodes, the sidecar
 must remain in place while any process may have the database open. Refused turns
 back off for 100 ms, including during an otherwise immediate namespace round.
+An initialized root with an explicitly empty index catalog, no configured
+enrichments or resolvers, no named tables, and no pending SQL or graph-build
+recovery work can reopen without that turn: it publishes no index readers.
+Named tables remain guarded because API-entry recovery can open their indexes.
+This lets diagnostics observe a root-only database's current tip during a peer's
+proof. Mutations still require allocator admission.
 
 Full-text catch-up treats `CapacityUnavailable` and `CapacityObservationStale` as
 recoverable admission failures, with bounded backoff and persisted progress after
-successful retry. These changes require a rebuilt native library; they do not
+successful retry. Owners that drive replay without optional workers run synchronous
+merges when text-publication admission is blocked. A reduction in the blocked
+segment or heap-byte dimension renews their no-progress wait budget; unrelated or
+stale work does not. Total merge time remains visible in backpressure telemetry.
+Owners with background merge workers retain their existing wait budget.
+Manual merge turns participate in runtime lifecycle admission too. Pause and stop
+prevent new tasks and drain borrowed index state before structural index changes;
+permanent shutdown also drains producer/assistance bookkeeping. Resuming a manual
+runtime restores admission without starting an optional worker.
+
+A batch can commit primary data before its requested full-text visibility is
+ready. Failures in retryable admission after that commit are reported as
+`CommitVisibilityNotSatisfied` (`ANTFLY_STALLED` at the C boundary), with a
+committed/visibility-pending diagnostic. Resume derived work rather than replaying
+the batch, especially for transforms such as `$inc`. Pre-commit Busy refusals keep
+their existing retry behavior. SQL retains its committed-pending outcome.
+
+Physical maintenance releases detached catalog/source pins before starting
+allocator service or a vacuum assessment. Bounded allocator/orphan service joins
+the fair writer queue and starts from the current checkpoint; prepared vacuum
+publication still rejects a changed tip. A worthwhile shrink assessment retains
+an automatic retry deadline across checkpoint refreshes until a rewrite succeeds
+or a later assessment finds no useful shrink. Retries require no additional file
+growth and preserve the scan-cost budget (at least 30 seconds, or 64 times the
+previous scan duration).
+
+Ordinary coordinated native read-only
+opens retain allocator metadata as well as data, preserving integrity inspection
+of both captured recovery slots. Logical transaction read pins remain explicit
+data-only views.
+Writer-leased refresh records the authoritative checkpoint before admitting new
+reader pins. Readers captured before an unknown peer publication retain their
+whole-inode protection; readers captured after refresh can use coordinated reuse.
+
+These changes require a rebuilt native library; they do not
 change SDK request schemas or the public C ABI.
 
 Small records in multi-key transactions share immutable record pages. A tagged

@@ -600,8 +600,10 @@ def test_logical_identity_reuses_reordered_native_indexes(
                 + str(base + 17)
                 + " ORDER BY id DESC LIMIT 9",
                 "SELECT COUNT(*) FROM {table}",
-                "SELECT body, COUNT(*), SUM(id), MIN(id), MAX(id) "
-                "FROM {table} GROUP BY body ORDER BY body",
+                (
+                    "SELECT body, COUNT(*), SUM(id), MIN(id), MAX(id) "
+                    "FROM {table} GROUP BY body ORDER BY body"
+                ),
             ):
                 actual = call(
                     "POST", "/sql", {"statement": statement.format(table="logical")}

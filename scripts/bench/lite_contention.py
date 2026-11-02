@@ -35,6 +35,7 @@ import queue
 import resource
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -254,8 +255,10 @@ def native_worker(config, index, ready, start, results, finish=None):
             began = time.monotonic()
             deadline = began + config["seconds"]
             success, busy = [], []
+            success_windows = [0] * max(1, math.ceil(config["seconds"] / 60))
             sequence = 0
             last_write = None
+            latest_churn_writes = {}
             while time.monotonic() < deadline:
                 key = f"worker-{index}-{sequence if config['workload'] == 'append' else sequence % 128}"
                 payload = {"inserts": {key: {"text": "v" * 1024, "sequence": sequence}}}
@@ -263,7 +266,13 @@ def native_worker(config, index, ready, start, results, finish=None):
                 try:
                     db.batch_json(payload)
                     success.append(time.perf_counter_ns() - began_call)
+                    window = min(
+                        len(success_windows) - 1, int((time.monotonic() - began) / 60)
+                    )
+                    success_windows[window] += 1
                     last_write = {"key": key, "sequence": sequence}
+                    if config["workload"] == "churn":
+                        latest_churn_writes[key] = last_write
                 except af.BusyError:
                     busy.append(time.perf_counter_ns() - began_call)
                 sequence += 1
@@ -317,6 +326,7 @@ def native_worker(config, index, ready, start, results, finish=None):
                 "started": began,
                 "ended": ended,
                 "success_latency_ns": success,
+                "success_windows": success_windows,
                 "busy_latency_ns": busy,
                 "proofs": proofs,
                 "background_publication_deltas": {
@@ -331,6 +341,7 @@ def native_worker(config, index, ready, start, results, finish=None):
                         "replay_attempts",
                         "replay_refused",
                         "maintenance_errors",
+                        "allocator_service_admissions",
                     )
                 },
                 "last_maintenance_error": final_stats.get("last_maintenance_error"),
@@ -338,8 +349,16 @@ def native_worker(config, index, ready, start, results, finish=None):
                 "proof_observed_until": proof_observed_until,
                 "admission": admission,
                 "last_write": last_write,
+                # At most 128 keys per worker, including holes left by Busy.
+                "latest_churn_writes": list(latest_churn_writes.values()),
                 **usage,
             }
+            if config.get("allocator_diagnostics", False):
+                # Admission/status reads can perturb storage. Collect only
+                # after every timed worker and proof snapshot has finished.
+                result["allocator_diagnostics"] = (
+                    db.status().get("storage", {}).get("reclamation", {})
+                )
         # close()/__exit__ is part of worker success. Emit exactly one terminal
         # result so a close failure cannot follow an already accepted success.
         results.put(result)
@@ -355,6 +374,18 @@ def native_worker(config, index, ready, start, results, finish=None):
         if not announced:
             ready.put(failure)
         results.put(failure)
+
+
+def acknowledged_writes(workers: list[dict]) -> list[dict]:
+    """Use actual acknowledgments; Busy can leave holes in a churn sequence."""
+    return [
+        write
+        for worker in workers
+        for write in (
+            worker.get("latest_churn_writes")
+            or ([worker["last_write"]] if worker.get("last_write") else [])
+        )
+    ]
 
 
 def verify(library: str, database: Path, expected: list[dict]) -> None:
@@ -408,11 +439,22 @@ def aggregate(workers: list[dict]) -> dict:
     if proof_elapsed <= 0:
         raise RuntimeError("invalid proof-observation interval")
     starved = sum(not row["success_latency_ns"] for row in workers)
+    stalled = sum(0 in row.get("success_windows", []) for row in workers)
+    status = "ok"
+    if not successful:
+        status = "no_progress"
+    elif starved:
+        status = "starved_workers"
+    elif stalled:
+        status = "stalled_workers"
     result = {
-        "status": (
-            "no_progress" if not successful else "starved_workers" if starved else "ok"
-        ),
+        "status": status,
         "workers_without_success": starved,
+        "workers_with_stalled_windows": stalled,
+        "progress_window_seconds": 60,
+        "per_worker_success_windows": [
+            row.get("success_windows", []) for row in workers
+        ],
         "per_worker_background_publication_deltas": [
             row.get("background_publication_deltas", {}) for row in workers
         ],
@@ -479,6 +521,11 @@ def aggregate(workers: list[dict]) -> dict:
         "involuntary_context_switches",
     ):
         result[field] = sum(row[field] for row in workers)
+    if any("allocator_diagnostics" in row for row in workers):
+        result["allocator_diagnostics_after_workload"] = [
+            {"index": row["index"], **row.get("allocator_diagnostics", {})}
+            for row in workers
+        ]
     return result
 
 
@@ -543,6 +590,7 @@ def native_cases(args):
                 "seconds": args.seconds,
                 "watchdog": args.watchdog,
                 "workload": args.workload,
+                "allocator_diagnostics": args.allocator_diagnostics,
             }
             processes = [
                 context.Process(
@@ -552,6 +600,26 @@ def native_cases(args):
                 for i in range(concurrency)
             ]
             workers = []
+            file_size_samples = []
+            file_size_errors = []
+            sample_stop = threading.Event()
+            sample_thread = None
+
+            def sample_file_size():
+                began = time.monotonic()
+                while True:
+                    try:
+                        file_size_samples.append(
+                            {
+                                "elapsed_seconds": time.monotonic() - began,
+                                "file_bytes": database.stat().st_size,
+                            }
+                        )
+                    except OSError as error:
+                        file_size_errors.append(str(error))
+                    if sample_stop.wait(1):
+                        return
+
             worker_started = time.monotonic()
             row = {
                 "kind": "native",
@@ -576,6 +644,8 @@ def native_cases(args):
                     notice = ready.get(timeout=max(0.01, ready_by - time.monotonic()))
                     if notice["status"] != "ok":
                         raise RuntimeError(notice["diagnostic"])
+                sample_thread = threading.Thread(target=sample_file_size, daemon=True)
+                sample_thread.start()
                 start.set()
                 finish_by = (
                     time.monotonic()
@@ -618,16 +688,36 @@ def native_cases(args):
                     if process.is_alive():
                         process.kill()
                         process.join()
+                sample_stop.set()
+                if sample_thread is not None:
+                    sample_thread.join()
                 ready.close()
                 results.close()
+            row["file_size_samples"] = file_size_samples
+            row["peak_file_bytes"] = max(
+                (sample["file_bytes"] for sample in file_size_samples),
+                default=database.stat().st_size,
+            )
+            row["file_size_sampling_errors"] = file_size_errors
+            if file_size_errors:
+                row.update(status="file_size_sampling_error")
             row["worker_lifetime_seconds"] = time.monotonic() - worker_started
             row["file_bytes"] = database.stat().st_size
-            if row["status"] in ("ok", "no_progress", "starved_workers"):
+            row["peak_file_bytes"] = max(row["peak_file_bytes"], row["file_bytes"])
+            if row["status"] in (
+                "ok",
+                "no_progress",
+                "starved_workers",
+                "stalled_workers",
+            ):
                 expected = [
                     worker["last_write"]
                     for worker in workers
                     if worker["last_write"] is not None
                 ]
+                row["expected_last_writes"] = expected
+                expected = acknowledged_writes(workers)
+                row["expected_latest_writes"] = expected
                 try:
                     checked = subprocess.run(
                         [
@@ -636,8 +726,9 @@ def native_cases(args):
                             "_verify",
                             library,
                             str(database),
-                            json.dumps(expected),
+                            "-",
                         ],
+                        input=json.dumps(expected),
                         capture_output=True,
                         check=False,
                         text=True,
@@ -682,6 +773,11 @@ def main():
     parser.add_argument("--seed-records", type=int, default=1024)
     parser.add_argument("--workload", choices=("append", "churn"), default="churn")
     parser.add_argument("--no-sync", action="store_true")
+    parser.add_argument(
+        "--allocator-diagnostics",
+        action="store_true",
+        help="collect allocator counters after timed work; status reads can perturb storage",
+    )
     parser.add_argument(
         "--no-index",
         action="store_true",
@@ -741,6 +837,10 @@ if __name__ == "__main__":
             bool(int(sys.argv[6])) if len(sys.argv) > 6 else False,
         )
     elif len(sys.argv) > 1 and sys.argv[1] == "_verify":
-        verify(sys.argv[2], Path(sys.argv[3]), json.loads(sys.argv[4]))
+        verify(
+            sys.argv[2],
+            Path(sys.argv[3]),
+            json.loads(sys.stdin.read() if sys.argv[4] == "-" else sys.argv[4]),
+        )
     else:
         main()

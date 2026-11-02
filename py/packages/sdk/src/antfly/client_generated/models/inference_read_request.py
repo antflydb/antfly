@@ -48,9 +48,12 @@ class InferenceReadRequest:
                 - Pix2Struct: "What type of document is this?"
                 - Moondream: "Describe this image."
                  Example: What type of document is this?.
-            max_tokens (int | Unset): Maximum tokens to generate (256 by default for generator readers). For audio, this is
-                supported by generator backends; Whisper uses its recognition and execution budgets and rejects an explicit
-                max_tokens. Example: 256.
+            max_tokens (int | Unset): Maximum output tokens per page. When omitted, the selected reader
+                model supplies its default, bounded by deployment limits. Explicit
+                values override the model default and must fit model and server limits.
+                Audio generator backends accept this option; Whisper uses its recognition
+                and execution budgets and rejects an explicit max_tokens.
+                 Example: 256.
     """
 
     model: str

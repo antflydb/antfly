@@ -428,6 +428,7 @@ fn runConfiguredWarmModel(model: common_config.Config.InferenceConfig.WarmModelC
     return .{
         .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidArguments,
         .name = model.name,
+        .pin = model.pin,
         .backend = try parseOptionalBackendType(model.backend),
         .cuda_precision = if (model.cuda_precision) |value| switch (value) {
             .auto => .auto,
@@ -489,6 +490,7 @@ fn resolveRunModelSettings(alloc: std.mem.Allocator, config: ?*const common_conf
                 if (configured.kind != warm.kind or configured.backend != warm.backend) continue;
                 if (matched) return error.AmbiguousPreloadModelConfig;
                 matched = true;
+                warm.pin = configured.pin; // CLI identity flags do not specify retention.
                 warm.cuda_precision = warm.cuda_precision orelse configured.cuda_precision;
                 warm.residency_mode = warm.residency_mode orelse configured.residency_mode;
                 warm.memory_budget_mb = warm.memory_budget_mb orelse configured.memory_budget_mb;

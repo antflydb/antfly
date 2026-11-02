@@ -1067,6 +1067,13 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             store.file.read_only = true;
         }
         guard.entry_sequence = root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        if (!pinned) @import("sql_commit.zig").recover(root) catch |err| {
+            guard.entry_error = capi.mapError(err);
+        };
+        if (!pinned and guard.entry_error == null) @import("sql_ddl.zig").recover(root) catch |err| {
+            guard.entry_error = capi.mapError(err);
+        };
+        if (guard.entry_error != null) return guard;
         if (handle.parent_id != null) {
             const database = @import("tables.zig").get(root, handle.selected_table_name orelse "default") catch |err| {
                 guard.entry_error = capi.mapError(err);
@@ -1084,10 +1091,7 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             guard.entry_error = catalogOwnershipError(err);
             return guard;
         };
-        if (!pinned) @import("sql_commit.zig").recover(root) catch |err| {
-            guard.entry_error = capi.mapError(err);
-        };
-        if (!pinned and guard.entry_error == null) @import("sql_ddl.zig").recover(root) catch |err| {
+        if (!pinned and guard.entry_error == null) @import("sql_ddl.zig").requireRecovered(root, guard.handle.database(), guard.handle.selected_table_name orelse "default") catch |err| {
             guard.entry_error = capi.mapError(err);
         };
         return guard;
@@ -1117,6 +1121,10 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             return guard;
         };
         @import("sql_ddl.zig").recover(lock_handle) catch |err| {
+            guard.entry_error = capi.mapError(err);
+            return guard;
+        };
+        @import("sql_ddl.zig").requireRecovered(lock_handle, handle.database(), handle.selected_table_name orelse "default") catch |err| {
             guard.entry_error = capi.mapError(err);
             return guard;
         };
@@ -2613,6 +2621,8 @@ pub const LiteResolvedOpenOptions = struct {
     reader_coordinator: ?*lite_backend.native.ReaderCoordinator = null,
     /// Borrowed only during open, under the connection's publication fence.
     allocator_verification_owner: ?*lite_backend.native.NativeFile = null,
+    /// Exclusive temporary verifier; consumes its cache before DB.open.
+    allocator_state_donor: ?*lite_backend.native.NativeFile = null,
 };
 
 pub fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -2860,6 +2870,10 @@ pub fn openLiteHandleAllocWithSharedInference(
     if (resolved.allocator_verification_owner) |verified| {
         if (!resolved.externally_locked) return error.InvalidArgument;
         try backend.native_docstore.?.file.inheritAllocatorVerification(verified);
+    }
+    if (resolved.allocator_state_donor) |donor| {
+        if (!resolved.externally_locked) return error.InvalidArgument;
+        _ = try backend.native_docstore.?.file.takeVerifiedAllocator(donor);
     }
     if (resolved.externally_locked) {
         backend.native_docstore.?.file.externally_locked = true;
@@ -3541,11 +3555,15 @@ pub const LiteCompactReport = struct {
 };
 
 pub fn prepareLiteCompact(handle: *Handle) !void {
-    try handle.database().*.runUntilIdle();
-    try handle.database().*.forceCompactTextIndexes();
-    try handle.database().*.drainScheduledTextMerges();
-    try handle.database().*.sync(true);
-    try handle.database().*.syncIndexes(true);
+    const root = handle.parent_handle orelse handle;
+    // Compaction is database-wide. Fail on an unavailable namespace rather
+    // than reporting a partially settled artifact as fully compacted.
+    try @import("tables.zig").load(root);
+    try @import("entity_sink.zig").runUntilIdle(root);
+    try @import("../storage/lite/connection.zig").prepareDatabaseCompact(&root.db);
+    var iterator = root.embedded_tables.valueIterator();
+    while (iterator.next()) |table|
+        try @import("../storage/lite/connection.zig").prepareDatabaseCompact(&table.*.db);
 }
 
 pub fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
@@ -3771,6 +3789,15 @@ pub fn restorePortableSourceToLiteFile(
     }
 
     if (cancel) |token| try token.check();
+
+    {
+        // The populated temporary inode has no remaining borrowers. Bind its
+        // epoch authority to the final name before the rename commit point;
+        // publishing the temporary namespace would disable reuse after restore.
+        var prepared = try antfly.lite.native.NativeFile.openWithIo(alloc, io, tmp_path, .{ .externally_locked = true });
+        defer prepared.close();
+        try prepared.preparePrivatePublication(dest_path);
+    }
 
     capiRenameFilePath(io, tmp_path, dest_path) catch |err| {
         capiDeleteFilePath(io, tmp_path) catch {};
@@ -4678,7 +4705,10 @@ pub fn antfly_db_batch(
     defer guard.leave();
     const handle = guard.handle;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": write and predicate pointers must not be null when their counts are nonzero");
-    batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return capi.mapError(err);
+    batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return if (err == error.CommitVisibilityNotSatisfied)
+        capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch")
+    else
+        capi.mapError(err);
     return .ok;
 }
 
@@ -4700,7 +4730,10 @@ pub fn antfly_db_batch_json(
     var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
 
-    handle.database().*.batch(owned.req) catch |err| return capi.mapError(err);
+    handle.database().*.batch(owned.req) catch |err| return if (err == error.CommitVisibilityNotSatisfied)
+        capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch")
+    else
+        capi.mapError(err);
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err| return capi.mapError(err);
     out_buf.* = .{
         .ptr = response.ptr,
