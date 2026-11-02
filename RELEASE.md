@@ -567,6 +567,10 @@ CLI npm and embedded npm/PyPI/crates.io publication is stable-only. RCs and othe
 prereleases retain their built package snapshots and native archives as release
 artifacts, without uploading package versions to those registries. They do not
 update the `latest` R2 channel, Homebrew stable formula, or container `latest` tag.
+Promotion verifies the complete payload for every channel, but only uploads a
+separate CLI snapshot for registry jobs when npm or PyPI publishing is enabled.
+Registry preflight uses the same policy to skip that snapshot download for RCs
+and nightlies, including exact-ledger recovery runs.
 
 Nightly snapshots publish:
 
