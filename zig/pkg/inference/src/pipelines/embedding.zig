@@ -19,6 +19,7 @@
 // Uses the unified Tokenizer interface (HuggingFace or SentencePiece) and any
 // backend Session (ONNX, native).
 
+const text_inputs = @import("../execution/text_inputs.zig");
 const std = @import("std");
 const build_options = @import("build_options");
 const antfly_image = @import("antfly_image");
@@ -76,20 +77,7 @@ const PreprocessScratchAdmission = struct {
     }
 };
 
-const TextInputTensorSet = struct {
-    items: [3]Tensor = undefined,
-    len: usize = 0,
-    token_type_tensor: ?Tensor = null,
-
-    fn slice(self: *const TextInputTensorSet) []const Tensor {
-        return self.items[0..self.len];
-    }
-
-    pub fn deinit(self: *TextInputTensorSet) void {
-        if (self.token_type_tensor) |*tensor| tensor.deinit();
-        self.* = undefined;
-    }
-};
+const TextInputTensorSet = text_inputs.Set;
 
 pub const PoolingStrategy = enum {
     mean,
@@ -1033,8 +1021,7 @@ pub const EmbeddingPipeline = struct {
         // admit backend workspace at the actual padded sequence length. This
         // preserves fail-closed memory accounting without forcing short BGE-M3
         // batches to reserve 8K-token attention/FFN scratch.
-        const admitted_tokens = std.math.mul(usize, batch, effective_len) catch
-            return error.ResourceLimitExceeded;
+        const text_plan = try text_inputs.Plan.init(input_info, &.{ @intCast(batch), @intCast(effective_len) }, .{ .attention_heads = text_session.model_contract.text_attention_heads });
         if (self.execution_control) |control| try control.check();
         // Workspace belongs to the running batch, not to waiters behind the
         // serialized backend. Admission stays inside this execution gate.
@@ -1048,8 +1035,8 @@ pub const EmbeddingPipeline = struct {
         var run_permit = try text_session.admit(.{
             .batch = batch,
             .sequence = effective_len,
-            .input_bytes = std.math.mul(usize, admitted_tokens, 24) catch
-                return error.ResourceLimitExceeded,
+            .input_bytes = text_plan.input_bytes,
+            .host_preprocess_bytes = text_plan.temporary_bytes,
         });
         defer run_permit.deinit();
         if (self.execution_control) |control| try control.check();
@@ -1086,7 +1073,7 @@ pub const EmbeddingPipeline = struct {
         var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, mask_i64);
         defer attention_mask_tensor.deinit();
 
-        var input_set = try textInputTensorSet(alloc, input_info, input_ids_tensor, attention_mask_tensor, &shape);
+        var input_set = try text_plan.materialize(alloc, input_ids_tensor, attention_mask_tensor, .{});
         defer input_set.deinit();
         const vectors = try self.embedPreparedTextInputs(
             input_set.slice(),
@@ -1127,8 +1114,7 @@ pub const EmbeddingPipeline = struct {
         defer input_ids_tensor.deinit();
         var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, attention_mask);
         defer attention_mask_tensor.deinit();
-        var input_set = try textInputTensorSet(alloc, text_session.inputInfo(), input_ids_tensor, attention_mask_tensor, &shape);
-        defer input_set.deinit();
+        const text_plan = try text_inputs.Plan.init(text_session.inputInfo(), &shape, .{ .attention_heads = text_session.model_contract.text_attention_heads });
 
         const mask_i32 = try alloc.alloc(i32, total);
         defer alloc.free(mask_i32);
@@ -1157,10 +1143,8 @@ pub const EmbeddingPipeline = struct {
             .batch = if (compact_policy) 1 else batch,
             .sequence = if (compact_policy) active_rows else seq_len,
             .output_bytes = if (compact_policy) batch * self.config.embedding_gemma2_dimensions * @sizeOf(f32) else null,
-            .input_bytes = std.math.mul(usize, total, 24) catch
-                return error.ResourceLimitExceeded,
-            .host_preprocess_bytes = std.math.mul(usize, total, 32) catch
-                return error.ResourceLimitExceeded,
+            .input_bytes = text_plan.input_bytes,
+            .host_preprocess_bytes = try std.math.add(usize, try std.math.mul(usize, total, 32), text_plan.temporary_bytes),
             .workspace_bytes = if (session_factory.getEmbeddingGemma2Config(self.session) != null)
                 try std.math.add(usize, 256 * 1024 * 1024, try std.math.mul(usize, if (compact_policy) active_rows else total, 192 * 1024))
             else
@@ -1168,6 +1152,8 @@ pub const EmbeddingPipeline = struct {
         });
         defer run_permit.deinit();
         if (self.execution_control) |control| try control.check();
+        var input_set = try text_plan.materialize(alloc, input_ids_tensor, attention_mask_tensor, .{});
+        defer input_set.deinit();
         return self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, &run_permit);
     }
 
@@ -3440,42 +3426,7 @@ fn textInputTensorSet(
     attention_mask_tensor: Tensor,
     shape: []const i64,
 ) !TextInputTensorSet {
-    var needs_attention_mask = false;
-    var needs_token_type = false;
-    for (input_info) |info| {
-        if (std.mem.eql(u8, info.name, "attention_mask")) needs_attention_mask = true;
-        if (std.mem.eql(u8, info.name, "token_type_ids")) needs_token_type = true;
-    }
-
-    var set = TextInputTensorSet{};
-    set.items[set.len] = input_ids_tensor;
-    set.len += 1;
-
-    if (needs_attention_mask) {
-        set.items[set.len] = attention_mask_tensor;
-        set.len += 1;
-    }
-
-    if (needs_token_type) {
-        const total = try shapeNumelUsize(shape);
-        const zeros = try alloc.alloc(i64, total);
-        defer alloc.free(zeros);
-        @memset(zeros, 0);
-        set.token_type_tensor = try Tensor.initInt64(alloc, "token_type_ids", shape, zeros);
-        set.items[set.len] = set.token_type_tensor.?;
-        set.len += 1;
-    }
-
-    return set;
-}
-
-fn shapeNumelUsize(shape: []const i64) !usize {
-    var total: usize = 1;
-    for (shape) |dim| {
-        if (dim < 0) return error.InvalidInputShape;
-        total = std.math.mul(usize, total, @intCast(dim)) catch return error.InvalidInputShape;
-    }
-    return total;
+    return text_inputs.build(alloc, input_info, input_ids_tensor, attention_mask_tensor, shape, .{});
 }
 
 fn expectTextInputNames(input_info: []const backends.TensorInfo, expected: []const []const u8) !void {

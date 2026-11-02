@@ -18,6 +18,7 @@
 // Accepts a query and list of documents, returns relevance scores.
 // Uses [CLS] query [SEP] document [SEP] tokenization for cross-encoders.
 
+const text_inputs = @import("../execution/text_inputs.zig");
 const std = @import("std");
 const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
@@ -883,32 +884,16 @@ pub const RerankingPipeline = struct {
         defer input_ids_tensor.deinit();
         var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, mask_i64);
         defer attention_mask_tensor.deinit();
-        var token_type_tensor: ?Tensor = null;
-        defer if (token_type_tensor) |*t| t.deinit();
-
-        const input_info = self.session.inputInfo();
-        var needs_attention_mask = false;
-        var needs_token_type = false;
-        for (input_info) |info| {
-            if (std.mem.eql(u8, info.name, "attention_mask")) needs_attention_mask = true;
-            if (std.mem.eql(u8, info.name, "token_type_ids")) needs_token_type = true;
-        }
-
-        const inputs = if (needs_token_type) blk: {
-            if (!include_cross_segments) {
-                // Late-interaction models should still receive a stable zero token_type_ids tensor
-                // when the backend session expects it.
-            }
-            token_type_tensor = try Tensor.initInt64(alloc, "token_type_ids", &shape, token_type_ids);
-            if (needs_attention_mask) {
-                break :blk &[_]Tensor{ input_ids_tensor, attention_mask_tensor, token_type_tensor.? };
-            }
-            break :blk &[_]Tensor{ input_ids_tensor, token_type_tensor.? };
-        } else if (needs_attention_mask) &[_]Tensor{ input_ids_tensor, attention_mask_tensor } else &[_]Tensor{input_ids_tensor};
+        _ = include_cross_segments; // The caller supplies exact cross/zero segment IDs.
+        var input_set = try text_inputs.build(alloc, self.session.inputInfo(), input_ids_tensor, attention_mask_tensor, &shape, .{
+            .attention_heads = self.session.model_contract.text_attention_heads,
+            .token_type_ids = token_type_ids,
+        });
+        defer input_set.deinit();
 
         return .{
             .allocator = alloc,
-            .outputs = try self.lockedSessionRun(permit, inputs, alloc),
+            .outputs = try self.lockedSessionRun(permit, input_set.slice(), alloc),
         };
     }
 
@@ -936,13 +921,12 @@ pub const RerankingPipeline = struct {
     ) !session_mod.RunPermit {
         try self.checkExecution();
         const width = self.batchSequenceWidth(sequence);
-        const tokens = std.math.mul(usize, batch, width) catch
-            return error.ResourceLimitExceeded;
+        const text_plan = try text_inputs.Plan.init(self.session.inputInfo(), &.{ @intCast(batch), @intCast(width) }, .{ .attention_heads = self.session.model_contract.text_attention_heads });
         var permit = try self.session.admit(.{
             .batch = batch,
             .sequence = width,
-            .input_bytes = std.math.mul(usize, tokens, 24) catch
-                return error.ResourceLimitExceeded,
+            .input_bytes = text_plan.input_bytes,
+            .host_preprocess_bytes = text_plan.temporary_bytes,
         });
         errdefer permit.deinit();
         try self.checkExecution();

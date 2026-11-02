@@ -22,6 +22,7 @@ const ModelManifest = @import("manifest.zig").ModelManifest;
 pub fn resolve(base: ModelContract, manifest: *const ModelManifest, backend: BackendType) ModelContract {
     var contract = base;
     contract.resolved = true;
+    if (contract.text_attention_heads == 0) contract.text_attention_heads = manifest.num_attention_heads;
     if (contract.task == null) contract.task = switch (manifest.model_type) {
         .classifier, .reranker => .classifier,
         .extractor => .extractor,
@@ -78,4 +79,10 @@ test "resolved session contract preserves task overrides and embedding processor
     // Copies retain the same resolved semantics without inspecting a vtable.
     const copied = specialized;
     try std.testing.expectEqual(embedding.family, copied.embedding.?.family);
+}
+
+test "resolved text attention geometry retains an implementation override" {
+    const manifest = ModelManifest{ .allocator = std.testing.allocator, .num_attention_heads = 12 };
+    try std.testing.expectEqual(@as(u32, 12), resolve(.{}, &manifest, .native).text_attention_heads);
+    try std.testing.expectEqual(@as(u32, 8), resolve(.{ .text_attention_heads = 8 }, &manifest, .metal).text_attention_heads);
 }

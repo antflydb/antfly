@@ -660,6 +660,8 @@ pub const ModelContract = struct {
     resolved: bool = false,
     padding: enum { declared, batch_max } = .declared,
     resident_text_embeddings: bool = false,
+    /// Geometry for declared additive attention masks, resolved by the model owner.
+    text_attention_heads: u32 = 0,
 };
 
 pub const ComputeBackendOptions = struct {
