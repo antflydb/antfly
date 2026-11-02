@@ -268,7 +268,8 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         .mul, .fused_elem_multiply => .{ .binary = .multiply },
         .div => .{ .binary = .divide },
         .fused_linear, .fused_linear_no_bias => |attrs| blk: {
-            if (attrs.rows == 0 or attrs.in_dim == 0 or attrs.out_dim == 0 or attrs.num_projections != 0 or shape.rank() != 2 or shape.dim(0) != attrs.rows or shape.dim(1) != attrs.out_dim) return null;
+            if (attrs.rows == 0 or attrs.in_dim == 0 or attrs.out_dim == 0 or (node.op == .fused_linear and attrs.num_projections != 0) or shape.rank() != 2 or shape.dim(0) != attrs.rows or shape.dim(1) != attrs.out_dim) return null;
+            kernel_geometry.validateProjectionGroups(&attrs.projection_out_dims, attrs.num_projections, attrs.out_dim) catch return null;
             break :blk .{ .linear = .{ .rows = attrs.rows, .in_dim = attrs.in_dim, .out_dim = attrs.out_dim, .bias = node.op == .fused_linear } };
         },
         .dot_general => |attrs| blk: {

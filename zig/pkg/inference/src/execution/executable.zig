@@ -1086,3 +1086,67 @@ test "assigned single-axis reductions use the Metal plan output and preserve hel
         for (expected, retained) |wanted, value| try std.testing.expectApproxEqAbs(wanted, value, 1e-6);
     }
 }
+test "prepared grouped projections retain resident assigned outputs across reuse and held frames" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const ml = @import("ml");
+    const a = std.testing.allocator;
+    const input_values = [_]f32{ 1, 2, 3, 4, -4, -3, -2, -1, 0.5, -0.5, 1, -1 };
+    const weights = [_]f32{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, -1, 1, -1, 1 };
+    const expected = [_]f32{ 1, 2, 3, 4, 10, 2, -4, -3, -2, -1, -10, 2, 0.5, -0.5, 1, -1, 0, -3 };
+    inline for (.{ .native, .metal, .cuda }) |kind| {
+        if (comptime (kind == .native and !@import("build_options").enable_native) or
+            (kind == .metal and !@import("build_options").enable_metal) or
+            (kind == .cuda and !@import("build_options").enable_cuda)) continue;
+        var context = try @import("../backends/compute_context.zig").BackendContext.init(a, kind, std.testing.io);
+        defer context.deinit(a);
+        const cb = context.computeBackend();
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&input_values, &.{ 3, 4 }));
+        defer cb.free(input);
+        const weight = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&weights, &.{ 6, 4 }));
+        defer cb.free(weight);
+        // Immutable matrix mirrors/packing are preparation work. Warm the
+        // existing grouped route before enforcing activation-readback policy.
+        const warmed = try cb.linearNoBiasGrouped(input, weight, 3, 4, 6, &.{ 2, 1, 3 }, 3);
+        cb.free(warmed);
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.graph.Builder.init(&graph);
+        const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 3, 4 }));
+        const w = try b.parameter("w", ml.graph.Shape.init(.f32, &.{ 6, 4 }));
+        const output = try graph.addNode(.{
+            .op = .{ .fused_linear_no_bias = .{ .rows = 3, .in_dim = 4, .out_dim = 6, .projection_out_dims = .{ 2, 1, 3, 0 }, .num_projections = 3 } },
+            .output_shape = ml.graph.Shape.init(.f32, &.{ 3, 6 }),
+            .inputs = .{ x, w, ml.graph.null_node, ml.graph.null_node },
+            .num_inputs = 2,
+        });
+        try graph.markOutput(output);
+        var program = try ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "w", .node_id = w, .kind = .weight } });
+        defer program.deinit();
+        var raw_inputs = [_]interpreter.RuntimeInput{ .{ .node_id = x, .value = input, .source_backend = &cb }, .{ .node_id = w, .value = weight, .source_backend = &cb } };
+        const inputs = try program.remapInputs(&raw_inputs);
+        var executable = try prepareWithOptions(a, &program, &cb, .partitioned, .{ .input_bindings = inputs, .physical_replay = false });
+        defer executable.deinit();
+        var held: ?@import("../backends/session.zig").ResidentOutputs = null;
+        defer if (held) |*owner| owner.deinit();
+        for (0..5) |iteration| {
+            var result = try executable.run(a, .{ .runtime_inputs = inputs, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+            defer result.deinit(&executable.runtime);
+            const owner = result.backendFor(&executable.runtime, 0);
+            try std.testing.expectEqual(cb.kind(), owner.kind());
+            try std.testing.expectEqual(@as(u64, 1), result.stats.assigned_kernel_dispatches);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.device_host_accesses);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.boundary_output_materializations);
+            if (iteration > 1) try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
+            const actual = try owner.toFloat32(result.outputs[0], a);
+            defer a.free(actual);
+            for (expected, actual) |wanted, value| try std.testing.expectApproxEqAbs(wanted, value, 1e-6);
+            if (iteration == 0) {
+                held = .{ .outputs = result.outputs, .allocator = a, .backend = owner };
+                result.outputs = &.{};
+            }
+        }
+        const retained = try held.?.backend.toFloat32(held.?.outputs[0], a);
+        defer a.free(retained);
+        for (expected, retained) |wanted, value| try std.testing.expectApproxEqAbs(wanted, value, 1e-6);
+    }
+}

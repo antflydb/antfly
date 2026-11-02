@@ -164,7 +164,8 @@ pub fn decide(query: partition.CapabilityQuery) partition.CapabilityDecision {
         },
         .fused_linear, .fused_linear_no_bias => |attrs| {
             const expected_inputs: u8 = if (query.op == .fused_linear) 3 else 2;
-            if (node.num_inputs != expected_inputs or attrs.rows == 0 or attrs.in_dim == 0 or attrs.out_dim == 0 or attrs.num_projections != 0) return reject(.unsupported_op);
+            if (node.num_inputs != expected_inputs or attrs.rows == 0 or attrs.in_dim == 0 or attrs.out_dim == 0 or (query.op == .fused_linear and attrs.num_projections != 0)) return reject(.unsupported_op);
+            primitive_plans.validateProjectionGroups(&attrs.projection_out_dims, attrs.num_projections, attrs.out_dim) catch return reject(.unsupported_op);
             const lhs = query.graph.node(node.inputs[0]).output_shape;
             const rhs = query.graph.node(node.inputs[1]).output_shape;
             if (node.output_shape.rank() != 2 or node.output_shape.dim(0) != attrs.rows or node.output_shape.dim(1) != attrs.out_dim) return reject(.unsupported_op);
@@ -264,4 +265,33 @@ test "CUDA graph legality admits materialized static slices and concat with exac
     try std.testing.expect(!decide(concat_query).can_execute);
     graph.nodeMut(y).output_shape.dims[0] = 3;
     try std.testing.expect(!decide(.{ .graph = &graph, .node_id = joined, .op = graph.node(joined).op }).can_execute);
+}
+
+test "CUDA grouped projections lower their combined matrix without admitting malformed hints" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 3, 4 }));
+    const w = try b.parameter("w", ml.graph.Shape.init(.f32, &.{ 6, 4 }));
+    const id = try graph.addNode(.{
+        .op = .{ .fused_linear_no_bias = .{ .rows = 3, .in_dim = 4, .out_dim = 6, .projection_out_dims = .{ 2, 1, 3, 0 }, .num_projections = 3 } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ 3, 6 }),
+        .inputs = .{ x, w, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 2,
+    });
+    const descriptor = @import("../ops/kernel_descriptor.zig");
+    try std.testing.expect(decide(.{ .graph = &graph, .node_id = id, .op = graph.node(id).op }).can_execute);
+    try std.testing.expectEqual(@as(u32, 6), descriptor.lower(&graph, id).?.operation.linear.out_dim);
+    for (0..3) |invalid| {
+        const attrs = &graph.nodeMut(id).op.fused_linear_no_bias;
+        attrs.num_projections = if (invalid == 0) 5 else 3;
+        attrs.projection_out_dims = switch (invalid) {
+            0 => .{ 2, 1, 3, 0 },
+            1 => .{ 2, 0, 4, 0 },
+            else => .{ 2, 1, 4, 0 },
+        };
+        try std.testing.expect(!decide(.{ .graph = &graph, .node_id = id, .op = graph.node(id).op }).can_execute);
+        try std.testing.expect(descriptor.lower(&graph, id) == null);
+    }
 }

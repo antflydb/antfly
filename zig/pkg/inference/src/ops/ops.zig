@@ -3703,6 +3703,7 @@ pub const ComputeBackend = struct {
         if (self.vtable.linearNoBiasGrouped) |op| {
             return op(self.ptr, input, weight, rows, in_dim, out_dim, projection_out_dims, num_projections);
         }
+        try @import("kernel_geometry.zig").validateProjectionGroups(projection_out_dims, num_projections, out_dim);
         return self.linearNoBias(input, weight, rows, in_dim, out_dim);
     }
 

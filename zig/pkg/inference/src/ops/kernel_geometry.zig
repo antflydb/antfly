@@ -998,3 +998,25 @@ test "single-axis reduction address plans preserve outer inner and keep-dimensio
     malformed.output_count += 1;
     try std.testing.expectError(error.InvalidShape, ReductionAxis.init(malformed));
 }
+
+/// Grouped projection weights are already concatenated along output rows.
+/// The hint can select a tuned schedule, but never changes the GEMM layout.
+pub fn validateProjectionGroups(widths: []const u32, count: usize, out_dim: usize) !void {
+    if (count > widths.len) return error.InvalidTensorShape;
+    if (count == 0) return;
+    var total: usize = 0;
+    for (widths[0..count]) |width| {
+        if (width == 0) return error.InvalidTensorShape;
+        total = std.math.add(usize, total, width) catch return error.InvalidTensorShape;
+    }
+    if (total != out_dim) return error.InvalidTensorShape;
+}
+
+test "grouped projection hints retain combined matrix geometry and reject invalid splits" {
+    try validateProjectionGroups(&.{ 32, 8, 8, 0 }, 3, 48);
+    try validateProjectionGroups(&.{}, 0, 48);
+    try std.testing.expectError(error.InvalidTensorShape, validateProjectionGroups(&.{ 32, 8 }, 3, 48));
+    try std.testing.expectError(error.InvalidTensorShape, validateProjectionGroups(&.{ 32, 0, 16 }, 3, 48));
+    try std.testing.expectError(error.InvalidTensorShape, validateProjectionGroups(&.{ 32, 8, 8 }, 3, 47));
+    try std.testing.expectError(error.InvalidTensorShape, validateProjectionGroups(&.{ 4294967295, 1 }, 2, 4294967295));
+}

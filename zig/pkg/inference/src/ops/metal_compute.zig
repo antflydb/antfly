@@ -19829,13 +19829,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         projection_out_dims: []const u32,
         num_projections: usize,
     ) anyerror!CT {
-        if (num_projections == 0 or num_projections > projection_out_dims.len) return error.InvalidTensorShape;
-        var total: usize = 0;
-        for (projection_out_dims[0..num_projections]) |dim| {
-            if (dim == 0) return error.InvalidTensorShape;
-            total += @intCast(dim);
-        }
-        if (total != out_dim) return error.InvalidTensorShape;
+        if (num_projections == 0) return error.InvalidTensorShape;
+        try @import("kernel_geometry.zig").validateProjectionGroups(projection_out_dims, num_projections, out_dim);
 
         // The graph pass has already concatenated the projection weights. The
         // Metal backend can therefore use the existing single combined linear
