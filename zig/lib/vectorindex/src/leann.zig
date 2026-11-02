@@ -95,7 +95,12 @@ pub const Config = struct {
     /// RaBitQ bits per dimension, 1 to 8. One uses the repo's 1-bit kernel;
     /// more use extended RaBitQ (`antfly_vector.rabitq_ex`), whose tighter
     /// estimates and bounds trade index bytes for fewer recomputations.
-    rabitq_bits: u8 = 1,
+    /// 0 picks the default: `default_rabitq_bits` for RaBitQ, 1 for PQ.
+    rabitq_bits: u8 = 0,
+
+    /// 4 bits cut recomputations about 15x against 1 bit on NYTimes-256 and
+    /// raise recall, for about twice the index bytes (see LEANN.md).
+    pub const default_rabitq_bits: u8 = 4;
 
     pub fn resolved(self: Config) !Config {
         if (self.dims == 0) return error.InvalidConfig;
@@ -103,9 +108,10 @@ pub const Config = struct {
         if (self.ef_construction == 0) return error.InvalidConfig;
         if (self.quantizer == .rabitq and self.dims < 2) return error.InvalidConfig;
         if (!(self.hub_fraction >= 0 and self.hub_fraction <= 1)) return error.InvalidConfig;
-        if (self.rabitq_bits == 0 or self.rabitq_bits > rqx.max_bits) return error.InvalidConfig;
-        if (self.quantizer != .rabitq and self.rabitq_bits != 1) return error.InvalidConfig;
+        if (self.rabitq_bits > rqx.max_bits) return error.InvalidConfig;
+        if (self.quantizer != .rabitq and self.rabitq_bits > 1) return error.InvalidConfig;
         var out = self;
+        if (out.rabitq_bits == 0) out.rabitq_bits = if (out.quantizer == .rabitq) default_rabitq_bits else 1;
         if (out.low_degree == 0) out.low_degree = @max(2, out.max_degree / 5);
         if (out.low_degree > out.max_degree) return error.InvalidConfig;
         if (out.pq_subspaces == 0) {
@@ -1560,8 +1566,9 @@ pub const Index = struct {
         cfg.hub_fraction = @bitCast(try readU32(&r));
         cfg.pq_subspaces = try readU32(&r);
         cfg.seed = r.takeInt(u64, .little) catch return error.InvalidFormat;
-        // Version 4 predates multi-bit RaBitQ.
-        if (file_version >= 5) cfg.rabitq_bits = r.takeByte() catch return error.InvalidFormat;
+        // Version 4 predates multi-bit RaBitQ: its codes are 1-bit.
+        cfg.rabitq_bits = if (file_version >= 5) r.takeByte() catch return error.InvalidFormat else 1;
+        if (cfg.rabitq_bits == 0) return error.InvalidFormat;
         cfg = cfg.resolved() catch return error.InvalidFormat;
         const n = try readU32(&r);
         const entry = try readU32(&r);
@@ -2840,6 +2847,13 @@ test "leann: config resolution and validation" {
     try testing.expectError(error.InvalidConfig, (Config{ .dims = 16, .pq_subspaces = 5 }).resolved());
     try testing.expectError(error.InvalidConfig, (Config{ .dims = 16, .max_degree = 4, .low_degree = 8 }).resolved());
     try testing.expectError(error.InvalidConfig, (Config{ .dims = 16, .hub_fraction = 1.5 }).resolved());
+    // Bits default to 4 for RaBitQ and 1 for PQ; PQ has no wider codes.
+    try testing.expectEqual(Config.default_rabitq_bits, (try (Config{ .dims = 16, .quantizer = .rabitq }).resolved()).rabitq_bits);
+    try testing.expectEqual(@as(u8, 4), Config.default_rabitq_bits);
+    try testing.expectEqual(@as(u8, 1), (try (Config{ .dims = 16, .quantizer = .pq }).resolved()).rabitq_bits);
+    try testing.expectEqual(@as(u8, 1), (try (Config{ .dims = 16, .quantizer = .pq, .rabitq_bits = 1 }).resolved()).rabitq_bits);
+    try testing.expectError(error.InvalidConfig, (Config{ .dims = 16, .quantizer = .pq, .rabitq_bits = 2 }).resolved());
+    try testing.expectError(error.InvalidConfig, (Config{ .dims = 16, .quantizer = .rabitq, .rabitq_bits = 9 }).resolved());
 }
 
 test "leann: recall with recomputation across metrics" {
@@ -3138,9 +3152,14 @@ test "leann: rebuild from codes keeps codes and live nodes" {
         defer rebuilt.deinit();
         try testing.expectEqual(@as(u32, @intCast(live.items.len)), rebuilt.node_count);
         try testing.expectEqual(@as(u32, 0), rebuilt.deleted_count);
-        const width = index.rabitq.?.width;
+        const codes = &index.rabitq.?;
+        const width = codes.width;
         for (live.items, 0..) |old, new| {
-            try testing.expectEqualSlices(u64, index.rabitq.?.codes.items[old * width ..][0..width], rebuilt.rabitq.?.codes.items[new * width ..][0..width]);
+            if (codes.ex != null) {
+                try testing.expectEqualSlices(u8, codes.exRow(old), rebuilt.rabitq.?.exRow(@intCast(new)));
+            } else {
+                try testing.expectEqualSlices(u64, codes.codes.items[old * width ..][0..width], rebuilt.rabitq.?.codes.items[new * width ..][0..width]);
+            }
         }
         var src = SliceEmbeddingSource{ .vectors = live_vectors.items, .dims = 32 };
         // Each live vector finds itself through the rebuilt graph.
@@ -3229,7 +3248,7 @@ test "leann: multi-bit rabitq recomputes less and round-trips" {
     var fx = try Fixture.init(alloc, 2400, 20, 64, 16, 47);
     defer fx.deinit(alloc);
     var src = SliceEmbeddingSource{ .vectors = fx.data, .dims = 64 };
-    var one_bit = try Index.build(alloc, .{ .dims = 64, .metric = .cosine, .quantizer = .rabitq, .max_degree = 16 }, fx.data[0 .. 2000 * 64]);
+    var one_bit = try Index.build(alloc, .{ .dims = 64, .metric = .cosine, .quantizer = .rabitq, .rabitq_bits = 1, .max_degree = 16 }, fx.data[0 .. 2000 * 64]);
     defer one_bit.deinit();
     var four_bit = try Index.build(alloc, .{ .dims = 64, .metric = .cosine, .quantizer = .rabitq, .rabitq_bits = 4, .max_degree = 16 }, fx.data[0 .. 2000 * 64]);
     defer four_bit.deinit();

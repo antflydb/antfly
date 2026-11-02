@@ -23176,6 +23176,7 @@ pub const IndexManager = struct {
                         .metric = dense_cfg.metric,
                         .max_degree = leann_opts.max_degree,
                         .quantizer = leann_opts.quantizer,
+                        .rabitq_bits = leann_opts.rabitq_bits,
                         .search_ef = leann_opts.search_ef,
                         .bound_scale = leann_opts.bound_scale,
                         .batch_size = leann_opts.batch_size,
@@ -34561,6 +34562,8 @@ fn parseEmbeddingSemanticProducerAlloc(alloc: Allocator, raw: []const u8) !?[]u8
 const LeannDenseOptions = struct {
     max_degree: u32 = 30,
     quantizer: @import("antfly_vectorindex").leann.Quantizer = .rabitq,
+    /// `quantization_bits`; 0 picks the quantizer's default (4 for rabitq).
+    rabitq_bits: u8 = 0,
     search_ef: u32 = 0,
     bound_scale: f32 = 1.0,
     batch_size: u32 = 0,
@@ -34586,10 +34589,12 @@ fn parseLeannDenseOptions(root: std.json.ObjectMap) !?LeannDenseOptions {
     if (try Int.get(value.object, "max_degree", 4, 128)) |v| out.max_degree = v;
     if (try Int.get(value.object, "search_ef", 0, 4096)) |v| out.search_ef = v;
     if (try Int.get(value.object, "batch_size", 0, 1024)) |v| out.batch_size = v;
+    if (try Int.get(value.object, "quantization_bits", 0, 8)) |v| out.rabitq_bits = @intCast(v);
     if (value.object.get("quantizer")) |v| {
         if (v != .string) return error.InvalidIndexConfig;
         out.quantizer = std.meta.stringToEnum(@import("antfly_vectorindex").leann.Quantizer, v.string) orelse return error.InvalidIndexConfig;
     }
+    if (out.quantizer != .rabitq and out.rabitq_bits > 1) return error.InvalidIndexConfig;
     if (value.object.get("bound_scale")) |v| {
         const f: f64 = switch (v) {
             .integer => |i| @floatFromInt(i),
@@ -34600,6 +34605,37 @@ fn parseLeannDenseOptions(root: std.json.ObjectMap) !?LeannDenseOptions {
         out.bound_scale = @floatCast(f);
     }
     return out;
+}
+
+test "leann dense options parse quantization_bits" {
+    const alloc = std.testing.allocator;
+    const Case = struct { raw: []const u8, bits: ?u8 };
+    for ([_]Case{
+        .{ .raw =
+        \\{"algorithm":"leann"}
+        , .bits = 0 },
+        .{ .raw =
+        \\{"algorithm":"leann","leann":{"quantization_bits":2}}
+        , .bits = 2 },
+        .{ .raw =
+        \\{"algorithm":"leann","leann":{"quantizer":"pq","quantization_bits":1}}
+        , .bits = 1 },
+        .{ .raw =
+        \\{"algorithm":"leann","leann":{"quantization_bits":9}}
+        , .bits = null },
+        .{ .raw =
+        \\{"algorithm":"leann","leann":{"quantizer":"pq","quantization_bits":4}}
+        , .bits = null },
+    }) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.raw, .{});
+        defer parsed.deinit();
+        if (case.bits) |bits| {
+            const opts = (try parseLeannDenseOptions(parsed.value.object)).?;
+            try std.testing.expectEqual(bits, opts.rabitq_bits);
+        } else {
+            try std.testing.expectError(error.InvalidIndexConfig, parseLeannDenseOptions(parsed.value.object));
+        }
+    }
 }
 
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
@@ -51123,6 +51159,8 @@ test "leann dense index applies writes, searches, deletes, and reopens" {
         const entry = manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
         try std.testing.expect(entry.index.leann != null);
         try std.testing.expect(entry.index.leann.?.index != null); // past the build threshold
+        // The config leaves quantization_bits out, so codes use the default.
+        try std.testing.expectEqual(@as(u8, 4), entry.index.leann.?.index.?.config.rabitq_bits);
         try std.testing.expectEqual(@as(u64, n), entry.index.stats().active_count);
 
         for ([_]usize{ 7, 123, 299 }) |i| {
@@ -51162,6 +51200,7 @@ test "leann dense index applies writes, searches, deletes, and reopens" {
         try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
         const entry = manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
         try std.testing.expectEqual(@as(u64, n - 1), entry.index.stats().active_count);
+        try std.testing.expectEqual(@as(u8, 4), entry.index.leann.?.index.?.config.rabitq_bits);
         var results = try entry.index.searchWithRequest(.{ .query = &vectors[7], .k = 3 });
         defer results.deinit();
         var best = results.items.items[0];

@@ -34405,6 +34405,8 @@ pub const LeannIndexConfig = struct {
     max_degree: ?i64 = null,
     /// Compact code used to steer the graph walk. "rabitq" (default) carries error bounds, so only candidates that can still reach the top k are recomputed. "pq" follows the LEANN paper's fixed rerank ratio; prefer it only for very low dimensions (below about 64).
     quantizer: ?[]const u8 = null,
+    /// RaBitQ bits per dimension (rabitq only; pq allows only 0 or 1). 0 picks the default: 4 for rabitq, 1 for pq. More bits tighten the error bounds, so fewer candidates are recomputed (about 15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits/8 bytes per dimension: 4 bits roughly doubles the index against 1. Existing graphs keep their width until they are rebuilt.
+    quantization_bits: ?i64 = null,
     /// Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
     search_ef: ?i64 = null,
     /// Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates and loses fewer true neighbors.
@@ -34416,6 +34418,7 @@ pub const LeannIndexConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "max_degree", "max_degree", true },
         .{ "quantizer", "quantizer", true },
+        .{ "quantization_bits", "quantization_bits", true },
         .{ "search_ef", "search_ef", true },
         .{ "bound_scale", "bound_scale", true },
         .{ "batch_size", "batch_size", true },
@@ -34437,6 +34440,10 @@ pub const LeannIndexConfig = struct {
         }
         if (self.quantizer) |value| {
             try jw.objectField("quantizer");
+            try jw.write(value);
+        }
+        if (self.quantization_bits) |value| {
+            try jw.objectField("quantization_bits");
             try jw.write(value);
         }
         if (self.search_ef) |value| {

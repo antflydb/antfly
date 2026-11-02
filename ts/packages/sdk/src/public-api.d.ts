@@ -17603,6 +17603,11 @@ export interface components {
              */
             quantizer?: "rabitq" | "pq";
             /**
+             * @description RaBitQ bits per dimension (rabitq only; pq allows only 0 or 1). 0 picks the default: 4 for rabitq, 1 for pq. More bits tighten the error bounds, so fewer candidates are recomputed (about 15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits/8 bytes per dimension: 4 bits roughly doubles the index against 1. Existing graphs keep their width until they are rebuilt.
+             * @default 0
+             */
+            quantization_bits?: number;
+            /**
              * @description Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
              * @default 0
              */

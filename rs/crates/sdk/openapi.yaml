@@ -39990,6 +39990,17 @@ components:
           description: Compact code used to steer the graph walk. "rabitq" (default) carries error bounds,
             so only candidates that can still reach the top k are recomputed. "pq" follows the LEANN paper's
             fixed rerank ratio; prefer it only for very low dimensions (below about 64).
+        quantization_bits:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          maximum: 8
+          default: 0
+          description: 'RaBitQ bits per dimension (rabitq only; pq allows only 0 or 1). 0 picks the default:
+            4 for rabitq, 1 for pq. More bits tighten the error bounds, so fewer candidates are recomputed
+            (about 15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits/8 bytes per dimension:
+            4 bits roughly doubles the index against 1. Existing graphs keep their width until they are
+            rebuilt.'
         search_ef:
           x-go-type-skip-optional-pointer: true
           type: integer

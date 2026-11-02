@@ -51,6 +51,9 @@ pub const Options = struct {
     metric: vec.DistanceMetric,
     max_degree: u32 = 30,
     quantizer: leann.Quantizer = .rabitq,
+    /// RaBitQ bits per dimension; 0 picks `leann.Config.default_rabitq_bits`.
+    /// Existing graphs keep the width they were built with until rebuilt.
+    rabitq_bits: u8 = 0,
     search_ef: u32 = 0,
     bound_scale: f32 = 1.0,
     batch_size: u32 = 0,
@@ -155,6 +158,7 @@ pub const LeannStore = struct {
                     .dims = opts.dims,
                     .metric = @fromBackingInt(@intCast(@as(u8, @intCast(@backingInt(opts.metric))))),
                     .quantizer = opts.quantizer,
+                    .rabitq_bits = opts.rabitq_bits,
                     .max_degree = opts.max_degree,
                     .seed = opts.seed,
                 },
@@ -358,6 +362,7 @@ pub const LeannStore = struct {
             .dims = self.opts.dims,
             .metric = @fromBackingInt(@intCast(@as(u8, @intCast(@backingInt(self.opts.metric))))),
             .quantizer = self.opts.quantizer,
+            .rabitq_bits = self.opts.rabitq_bits,
             .max_degree = self.opts.max_degree,
             .seed = self.opts.seed,
         };

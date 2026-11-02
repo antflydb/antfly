@@ -3,8 +3,8 @@
 ## Status
 
 Dense `embeddings` indexes accept `algorithm: "leann"` (default `"hbc"`)
-with optional `leann` tuning (`max_degree`, `quantizer`, `search_ef`,
-`bound_scale`, `batch_size`). The algorithm is in
+with optional `leann` tuning (`max_degree`, `quantizer`, `quantization_bits`,
+`search_ef`, `bound_scale`, `batch_size`). The algorithm is in
 `lib/vectorindex/src/leann.zig`; the table integration is described in
 [Table integration](#table-integration). Not yet supported for LEANN indexes:
 shard splits, remote dense storage, native index backups (backups use the
@@ -20,8 +20,9 @@ HBC keeps full-precision vectors for rerank. LEANN keeps none. It stores:
 - one compressed code per vector, either
   - **PQ** (`quantizer = .pq`, the paper's choice): `pq_subspaces` bytes plus a
     fixed `256 * dims`-float codebook, or
-  - **RaBitQ** (`quantizer = .rabitq`): 1 bit per dimension plus 16 bytes of
-    per-vector factors, using the same RaBitQ kernel as HBC,
+  - **RaBitQ** (`quantizer = .rabitq`): `rabitq_bits` per dimension (default
+    4; see [Multi-bit RaBitQ codes](#multi-bit-rabitq-codes)) plus 16 bytes of
+    per-vector factors. 1 bit uses the same RaBitQ kernel as HBC,
 - one flag byte and one level byte per vector.
 
 At query time the graph is walked with approximate distances, and only
@@ -38,7 +39,8 @@ already stored and the embedder is local.
 | Raw f32 embedding | 3072 | 100% |
 | LEANN: 96 PQ bytes + ~9 edges + offset + flag + level + upper layers | ~143 | ~4.7% |
 | LEANN with `pq_subspaces = 32` | ~79 | ~2.6% |
-| LEANN with RaBitQ: 96 code bytes + 16 factor bytes + graph | ~159 | ~5.2% |
+| LEANN with 1-bit RaBitQ: 96 code bytes + 16 factor bytes + graph | ~159 | ~5.2% |
+| LEANN with 4-bit RaBitQ (default): 384 code bytes + 16 factor bytes + graph | ~447 | ~15% |
 
 ## API
 
@@ -367,8 +369,12 @@ bounds ×1, 200 queries:
   after a rebuild) and costs more bytes than 4-bit codes, so it is not
   worth keeping.
 
-Recommendation: 4 bits for LEANN (3 when index bytes matter more). It is
-not yet exposed in the public `leann` config.
+4 bits is the default (`Config.default_rabitq_bits`; `rabitq_bits = 0` or
+`quantization_bits: 0` in the table config picks it, and PQ resolves to 1).
+Use 3 when index bytes matter more, or 1 for the smallest index. Graphs
+built before this default keep their width (version 4 files are 1-bit)
+until a rebuild, which reloads the exact vectors and encodes them at the
+configured width.
 
 ### Multi-bit codes for HBC (measured by simulation)
 
@@ -414,7 +420,7 @@ cutoff.
 
 ```json
 {"type": "embeddings", "field": "body", "embedder": {...},
- "algorithm": "leann", "leann": {"quantizer": "rabitq", "max_degree": 30}}
+ "algorithm": "leann", "leann": {"quantizer": "rabitq", "quantization_bits": 4, "max_degree": 30}}
 ```
 
 - **Config.** `specs/openapi/antfly/indexes.yaml` adds `DenseIndexAlgorithm`

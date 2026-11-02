@@ -3215,6 +3215,10 @@ fn denseAlgorithmIsLeann(root: std.json.ObjectMap) !bool {
     return leann;
 }
 
+/// Mirrors `leann.Config.default_rabitq_bits` (this module does not depend on
+/// the vector index library).
+const leann_default_rabitq_bits: i64 = 4;
+
 /// Emits the normalized internal `"algorithm":"leann","leann":{...}` fields,
 /// validating the public LeannIndexConfig ranges. Every knob is written so
 /// the stored config (and its hash) is explicit.
@@ -3224,6 +3228,7 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     var search_ef: i64 = 0;
     var bound_scale: f64 = 1.0;
     var batch_size: i64 = 0;
+    var quantization_bits: i64 = 0;
     if (root.get("leann")) |leann| {
         if (leann != .object) return error.InvalidCreateTableRequest;
         var it = leann.object.iterator();
@@ -3247,13 +3252,19 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
                 if (!(bound_scale >= 0 and bound_scale <= 8)) return error.InvalidCreateTableRequest;
             } else if (std.mem.eql(u8, key, "batch_size")) {
                 batch_size = try jsonIntegerInRange(value, 0, 1024);
+            } else if (std.mem.eql(u8, key, "quantization_bits")) {
+                quantization_bits = try jsonIntegerInRange(value, 0, 8);
             } else return error.InvalidCreateTableRequest;
         }
     }
+    // 0 picks the quantizer's default. PQ codes have no bit width above 1.
+    const rabitq = std.mem.eql(u8, quantizer, "rabitq");
+    if (!rabitq and quantization_bits > 1) return error.InvalidCreateTableRequest;
+    if (quantization_bits == 0) quantization_bits = if (rabitq) leann_default_rabitq_bits else 1;
     const json = try std.fmt.allocPrint(
         alloc,
-        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d}}}",
-        .{ max_degree, quantizer, search_ef, bound_scale, batch_size },
+        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d}}}",
+        .{ max_degree, quantizer, quantization_bits, search_ef, bound_scale, batch_size },
     );
     defer alloc.free(json);
     try out.appendSlice(alloc, json);
@@ -3275,6 +3286,26 @@ test "managed embedder translates leann algorithm into dense config" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"algorithm\":\"leann\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"max_degree\":16") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"quantizer\":\"rabitq\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"quantization_bits\":4") != null);
+
+    for ([_][2][]const u8{
+        .{
+            \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"quantization_bits":2}}
+            ,
+            "\"quantization_bits\":2",
+        },
+        .{
+            \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"quantizer":"pq"}}
+            ,
+            "\"quantization_bits\":1",
+        },
+    }) |case| {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, case[0], .{});
+        defer p.deinit();
+        const translated = try translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", p.value, .{});
+        defer alloc.free(translated);
+        try std.testing.expect(std.mem.indexOf(u8, translated, case[1]) != null);
+    }
 
     for ([_][]const u8{
         \\{"external":true,"dimension":4,"leann":{"max_degree":16}}
@@ -3285,10 +3316,19 @@ test "managed embedder translates leann algorithm into dense config" {
         ,
         \\{"external":true,"sparse":true,"algorithm":"leann"}
         ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"quantization_bits":9}}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"quantizer":"pq","quantization_bits":4}}
+        ,
     }) |bad| {
         var p = try std.json.parseFromSlice(std.json.Value, alloc, bad, .{});
         defer p.deinit();
-        try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", p.value, .{}));
+        // Unknown enum values fail typed parsing (InvalidEnumTag) before the
+        // LEANN checks run; either rejection is fine.
+        if (translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", p.value, .{})) |translated| {
+            alloc.free(translated);
+            return error.TestExpectedError;
+        } else |_| {}
     }
 }
 
