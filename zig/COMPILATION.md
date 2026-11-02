@@ -883,6 +883,11 @@ For subsequent increments:
 
 ## Goal loop
 
+The [production cost implementation plan](../docs/design/compilation/production-cost-plan.md)
+records the current linked-artifact investigation, proposed ownership cuts,
+delivery order, and per-experiment decision gates. Its hypotheses do not replace
+the qualification requirements below.
+
 Repeat this loop until the exit criteria are satisfied:
 
 1. Measure the exact current cold ARM64 Linux musl `ReleaseFast` tree with
