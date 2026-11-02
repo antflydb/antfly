@@ -73,6 +73,38 @@ Remote deployments must supply a TLS proxy or authenticated private transport;
 that flag does not add TLS. The default listener is disabled. Configure each
 process's port separately when running multiple nodes on one host.
 
+## Hosted proxy authentication
+
+A protected gateway can use the reserved startup username
+`__antfly_trusted_principal__` and pass an HTTP trusted-principal JWT as the
+PostgreSQL password. This path is enabled only when the node's existing
+trusted-principal signing authority is configured. It never treats a Cloud API
+key, startup username, or database name as native authority. Native user/password
+logins continue to use the existing live password verifier.
+
+The adapter preserves the token's subject, table/operation capabilities and row
+filters. Trusted SQL sessions use the same credential principal as HTTP SQL.
+The signature and issuer are verified at login and renewal, then an owned
+immutable identity is retained. Statement/page checkpoints reject expiry,
+issuer changes and signing-key rotation without repeatedly decoding the JWT.
+Internal-service principals are rejected on this public SQL transport.
+
+Trusted-only listeners do not require a native UserManager or bootstrap admin.
+Native password sessions still require independently configured native users.
+After authentication, renewable sessions advertise the private ParameterStatus
+`antfly_trusted_principal_refresh=1`. A protected gateway may send a subsequent
+PasswordMessage containing a replacement signed JWT. Renewal is serialized
+between protocol operations, emits no response, and preserves prepared portals
+and transaction ownership. The authenticated subject cannot change. Password
+sessions cannot use this extension. Gateways must prevent client injection of
+renewal frames and revalidate the complete Cloud grant before renewal.
+Renewal does not reset the native idle timeout.
+
+The gateway must authenticate the customer, bind the tenant to the upstream
+instance, supply TLS, and recheck live customer grants. It must close or renew a
+session before its signed token expires. The Antfly listener does not turn the
+proxy's login into an unbounded, cached grant or retry a canceled mutation.
+
 ## Supported protocol boundary
 
 - PostgreSQL v3 startup and password authentication through a mandatory backend
@@ -457,3 +489,144 @@ small payload pulls, and retire at page completion or a changed ID window.
 Sorted range cohorts in linked values continue from the last touched page;
 extent-backed values keep their indexed lookup path. Neither change introduces
 a primary or transport format version.
+
+Trusted gateways must also require `antfly_session_completion=10`. After joining
+execution and tearing down the session, the listener emits a private backend
+`y` frame containing a version 10 JSON completion witness. The witness carries
+pending DDL receipts and transaction IDs, or explicitly marks unknown outcomes.
+Completion delivery has a separate five-second watchdog. EOF and transport
+deadlines never prove completion. Gateways persist pending witnesses and use
+read-only management status probes to retire them after native owners settle;
+missing or unknown witnesses retain external fencing without wall-clock expiry.
+
+SQL policy v2 signs explicit `table_write_exclusions` with a key derived from
+the trusted principal secret and `antfly.trusted-principal.sql-policy.v2`, and
+sets JWT `kid=antfly-sql-policy-v2`. Older verifiers reject this signature rather
+than ignore the denials. Denials override positive wildcard permissions and
+follow catalog name projection onto physical tables. Native HTTP SQL supplies
+`X-Antfly-SQL-Completion` with a base64url witness; authenticated management
+probes use `X-Antfly-SQL-Settlement: 8` on the SQL endpoint and never replay SQL.
+
+Completion storage reserves room before renewable-session execution, including
+room for an outcome diagnostic and disconnect cleanup. Duplicate owner receipts
+share an entry. When that bounded budget is exhausted, further execution is
+rejected before backend admission with `54000`; ROLLBACK and disconnect remain
+available. A full manifest never admits another mutation and then discards its
+known owner. Reconnect after pending work settles to start a new budget.
+
+HTTP completion is attached in the shared linked/direct dispatch exit, including
+transaction sessions and SQL connection management. FK settlement uses child
+table IDs to read the appropriate initial-create or generation publication with
+internal publication authority and verifies the exact hexadecimal plan ID before
+accepting a terminal phase.
+
+The bounded settlement response includes the remaining owner manifest. A caller
+can persist that subset and continue a later probe without restarting an already
+verified prefix. Unknown witnesses remain unknown and cannot be cleared by
+partial progress.
+
+Completion witnesses carry durable consumer references. Transaction commit
+admission prepares its proof before sealing the execution plan. Refused
+preparations admit no mutation; joined failures settle from the issuer record.
+Each later commit attempt gets a new reference. After execution joins, proven
+terminal references that have not been published are retired locally. Local
+proof retirement and intent deletion share one atomic batch. Successful
+statements therefore do not consume the connection's bounded pending manifest;
+unresolved work and failed retirement remain available for Cloud reconciliation.
+Ordinary BEGIN/ROLLBACK leaves no permanent proof.
+Terminal transaction, FK publication, restore-job and table-retirement cuts
+settle their registered consumers atomically. Physical table IDs qualify generic
+DDL, so dropping or replacing a SQL name cannot invalidate an issued receipt.
+Restore proofs survive deletion of the terminal job payload.
+
+Cloud records acknowledgement debt atomically with its fence CAS, then sends
+`X-Antfly-SQL-Settlement: ack-v10` using management authority. An acknowledgement
+releases exactly one settled consumer and is idempotent. Native references have
+no TTL; Cloud's durable outbox retries after restarts or lost responses. An uncertain pin
+keeps its reference ID for reconciliation. Completion admission requires topology
+protocol 76 during rolling upgrades; reference mutations retain their protocol 69
+wire format.
+
+HTTP gateways may qualify an exact upstream connection with an authenticated,
+empty POST to `/db/v1/sql`, `X-Antfly-SQL-Probe: 10`, and an SQL fence header.
+The read-only probe returns 204, `X-Antfly-SQL-Capability: 10`, and an empty v10
+completion witness. It never parses or executes a statement. Qualification is
+per connection, so an older pod in a rolling deployment cannot receive SQL
+based on another pod's capability advertisement.
+
+Cloud completion admission uses protocol v10 and requires durable session storage,
+durable IO, and fleet topology protocol 76. Distributed issuers also require owner
+routing with native internal-service credentials. Missing prerequisites reject
+trusted completion admission before execution. Existing v3/v4/v5/v6/v7/v8/v9 receipts remain
+readable for reconciliation during upgrades. Transaction consumer operations route
+to the durable owner, including after session-payload cleanup.
+
+Each pending completion has a durable registration outbox entry on its issuing
+node. Receipts carry `registration_node_id`; reconciliation routes there and
+retries the same reference after owner backpressure or restart. Acknowledgement
+persists its phase before retiring remote proof and deleting the outbox entry.
+Producer sequence checkpoints reject late registration after acknowledgement,
+even after acknowledgement markers are collected. Collection is bounded and
+never expires active proofs. Producers have a 65,536-sequence retirement window.
+Ingress reserves that capacity before backend execution, retaining slots through
+error reporting and disconnect. Read-only sessions reuse memory permits without
+allocating outbox records. A full window rejects new execution before effects;
+retirement makes capacity available again. Both linked and direct HTTP dispatch
+share this admission rule; management probes remain available at capacity.
+
+Runtime session, connection, lease, completion, and outbox writes share a mutation
+lock. Atomic storage batches alone do not serialize their read/modify/write
+snapshots. Per-reference registration locks serialize remote registration and
+acknowledgement without holding the store mutation lock across network IO.
+
+Cloud batches four response-producing frames plus Sync, including repeated
+executions. This preserves an ordinary extended-query batch while
+bounding the queue ahead of token renewal. Recovery retains the first queued
+Sync and subsequent requests after an extended-protocol error.
+
+Forwarded session requests preserve their SQL fence header so the execution
+owner performs admission and emits its own prepared completion witness. New
+admission requires fleet protocol 76, including forwarding destinations; legacy
+managed reference reconciliation retains its protocol 71 requirement.
+
+DDL consumers are prepared before CREATE, schema changes, FK publication,
+schema rewrites, and TRUNCATE submit effects. Preparation uses immutable table,
+publication, or restore job identities and reserves bounded owner capacity even
+before the payload exists. Terminal publication and payload retirement update
+these prepared consumers atomically. Definitive admission refusals publish a
+no-effect witness; transport failures preserve the pending proof.
+
+Definitive transaction commit rejections publish a durable abort before session
+retirement. Recovery applies the same rule, so permanently rejected plans stop
+retrying while their consumer evidence remains available for acknowledgement.
+A failed abort write leaves the transaction unresolved for a later recovery pass.
+
+Metadata API nodes bind a persistent node-local session store before opening SQL
+listeners. Every issuer runs bounded local recovery regardless of metadata
+leadership. On restart, recovery scans only references allocated by earlier
+store instances. Unpublished subscriptions are discarded without claiming the
+underlying transaction or DDL completed; published receipts still require a
+terminal witness and Cloud acknowledgement. Discard markers reject late pins.
+
+Schema rewrite and TRUNCATE admission report the actual persistence boundary.
+Failures before submission retire their prepared consumer; failures after a
+possible submission retain the native owner for reconciliation.
+
+HTTP SQL prepared and connection handles carry their immutable metadata issuer
+in the existing 32-character handle. A request may arrive on any public API pod;
+execution and close forward once to the issuer with the original principal,
+execution limits and completion fence. Conflicting issuers are rejected before
+dispatch. Legacy random handles remain usable on their issuing node.
+
+Completion v10 requires submission-aware native metadata sources and fleet
+protocol 76. DDL preflight failures retire prepared consumers. Distributed
+metadata records submission when Raft assigns the command's accepted index;
+RPCs preserve definite non-admission separately from lost/uncertain replies.
+Middleware can publish an explicit no-execution witness before dispatch,
+including gzip body-capacity refusal, without guessing from HTTP status codes.
+
+Completion v10 / fleet protocol 76 preserves an earlier unknown transaction
+when a later planning attempt is rejected. Only a fresh dispatch can prove
+non-admission from a domain rejection; recovery needs an authoritative terminal
+outcome. HTTP connection-resource operations attach their joined witness on
+capacity and local storage failures, while failed remote dispatch stays unknown.

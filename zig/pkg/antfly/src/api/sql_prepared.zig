@@ -137,7 +137,7 @@ pub fn loadForConnection(store: *transactions.DurableSessionStore, alloc: std.me
     };
 }
 
-fn resourceKey(id: []const u8) ![key.len + 1 + 32]u8 {
+pub fn resourceKey(id: []const u8) ![key.len + 1 + 32]u8 {
     if (id.len != 32) return error.SqlPreparedNotFound;
     var result: [key.len + 1 + 32]u8 = undefined;
     @memcpy(result[0..key.len], key);

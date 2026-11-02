@@ -577,7 +577,7 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
     const metadata_incarnation = (try service.metadataIncarnation()) orelse
         return error.MissingMetadataIncarnation;
     try context.ensureActive();
-    const receipt = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{
+    const receipt = try proposeCatalogWithContext(service, context, .{ .compare_and_replace_table = .{
         .expected = expected,
         .replacement = replacement,
         .relation_guard = relation_guard,
@@ -3498,6 +3498,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
     };
     if (has_lake_catalog) return metadata_topology_protocol.lake_index_catalog_version;
     const requires_v11 = switch (command) {
+        .apply_sql_completion_reference => return metadata_topology_protocol.sql_completion_reference_version,
         .apply_store_root_enrollment, .ack_initial_fk_retirement => return metadata_topology_protocol.store_root_enrollment_version,
         .apply_fk_generation_publication => return metadata_topology_protocol.fk_generation_publication_version,
         // Initial CREATE carries the v2 reservation and retirement scope in
@@ -6324,19 +6325,23 @@ pub const MetadataService = struct {
         self: *MetadataService,
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null, null);
     }
 
     pub fn proposeTransitionCommandWithReceiptInTerm(self: *MetadataService, command: metadata_storage.TransitionCommand, expected_term: u64) !MetadataProposalReceipt {
         if (expected_term == 0) return error.NotLeader;
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term, null);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term, null, null);
     }
 
     pub fn proposeTopologyActivationWithReceipt(self: *MetadataService, bytes: []const u8, readiness: TableTopologyProtocolReadiness) !MetadataProposalReceipt {
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .activate_topology_protocol = bytes }, readiness.term, try topologyActivationAdmission(self, bytes, readiness));
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .activate_topology_protocol = bytes }, readiness.term, try topologyActivationAdmission(self, bytes, readiness), null);
     }
 
-    fn proposeTransitionCommandWithReceiptInExpectedTerm(self: *MetadataService, command: metadata_storage.TransitionCommand, expected_term: ?u64, activation_admission: ?CoordinatedDecoderAdmission) !MetadataProposalReceipt {
+    pub fn proposeTransitionCommandWithReceiptObserved(self: *MetadataService, command: metadata_storage.TransitionCommand, submitted: ?*bool) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null, submitted);
+    }
+
+    fn proposeTransitionCommandWithReceiptInExpectedTerm(self: *MetadataService, command: metadata_storage.TransitionCommand, expected_term: ?u64, activation_admission: ?CoordinatedDecoderAdmission, submitted: ?*bool) !MetadataProposalReceipt {
         const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmission(self, &.{command});
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
@@ -6362,6 +6367,9 @@ pub const MetadataService = struct {
         var dispatch_error: ?anyerror = null;
         self.raft.host.host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
             dispatch_error = err;
+        };
+        if (accepted_index != null) if (submitted) |observed| {
+            observed.* = true;
         };
         const index = try acceptedMetadataProposalIndex(accepted_index, dispatch_error);
         try self.raft.host.host.trackProposalReceipt(
@@ -8960,7 +8968,7 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null, null);
     }
 
     pub fn proposeTransitionCommandsWithReceipt(
@@ -9022,11 +9030,15 @@ pub const MetadataHttpService = struct {
         expected_term: u64,
     ) !MetadataProposalReceipt {
         if (expected_term == 0) return error.NotLeader;
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term, null);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term, null, null);
     }
 
     pub fn proposeTopologyActivationWithReceipt(self: *MetadataHttpService, bytes: []const u8, readiness: TableTopologyProtocolReadiness) !MetadataProposalReceipt {
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .activate_topology_protocol = bytes }, readiness.term, try topologyActivationAdmission(self, bytes, readiness));
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .activate_topology_protocol = bytes }, readiness.term, try topologyActivationAdmission(self, bytes, readiness), null);
+    }
+
+    pub fn proposeTransitionCommandWithReceiptObserved(self: *MetadataHttpService, command: metadata_storage.TransitionCommand, submitted: ?*bool) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null, submitted);
     }
 
     fn proposeTransitionCommandWithReceiptInExpectedTerm(
@@ -9034,6 +9046,7 @@ pub const MetadataHttpService = struct {
         command: metadata_storage.TransitionCommand,
         expected_term: ?u64,
         activation_admission: ?CoordinatedDecoderAdmission,
+        submitted: ?*bool,
     ) !MetadataProposalReceipt {
         const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmission(self, &.{command});
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
@@ -9063,6 +9076,9 @@ pub const MetadataHttpService = struct {
         var dispatch_error: ?anyerror = null;
         self.raft.host.http_host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
             dispatch_error = err;
+        };
+        if (accepted_index != null) if (submitted) |observed| {
+            observed.* = true;
         };
         const index = try acceptedMetadataProposalIndex(accepted_index, dispatch_error);
         try self.raft.host.http_host.host.trackProposalReceipt(
@@ -23278,4 +23294,13 @@ test "metadata.lake index object table engine requires its own decoder capabilit
     const table: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "objects", .storage = .{ .engine = .object }, .min_ranges = 0, .desired_replica_count = 0 };
     try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
     try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } }));
+}
+
+pub fn proposeCatalogWithContext(service: anytype, context: api_operation.RequestContext, command: metadata_storage.TransitionCommand) @TypeOf(service.proposeTransitionCommandWithReceipt(command)) {
+    try context.ensureActive();
+    if (comptime @hasDecl(@TypeOf(service.*), "proposeTransitionCommandWithReceiptObserved"))
+        return service.proposeTransitionCommandWithReceiptObserved(command, context.sql_completion_submission);
+    // Foreign/test services without an admission witness remain conservative.
+    context.markSQLSubmission();
+    return service.proposeTransitionCommandWithReceipt(command);
 }

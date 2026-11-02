@@ -28,6 +28,8 @@ const Mock = struct {
     lake_count: usize = 0,
     read_log: [64]@import("session_commands.zig").ReadRequirements = undefined,
     authentications: usize = 0,
+    renewable_auth: bool = false,
+    renewals: usize = 0,
     disconnects: usize = 0,
     releases: usize = 0,
     fail_auth: bool = false,
@@ -43,6 +45,7 @@ const Mock = struct {
     ddl_unknown: bool = false,
     unknown_outcome: bool = false,
     mutation_outcome: ?backend.MutationOutcome = null,
+    completion_safe_after_run: bool = true,
     owned_results: bool = false,
     nested_owned_results: bool = false,
     result_releases: usize = 0,
@@ -102,8 +105,8 @@ const Mock = struct {
     }
 
     fn source(self: *Mock) backend.Backend {
-        if (self.native_parameters) return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        if (self.native_parameters) return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .refresh = refresh, .describe = describe, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .refresh = refresh, .describe = describe, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
     }
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -209,7 +212,12 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.authentications += 1;
         if (self.fail_auth or !std.mem.eql(u8, user, "tester") or !std.mem.eql(u8, password, "secret")) return error.Unauthorized;
-        return .{ .context = self, .release = release };
+        return .{ .context = self, .release = release, .renewable = self.renewable_auth };
+    }
+    fn refresh(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, token: []const u8) !void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        if (!self.renewable_auth or !std.mem.eql(u8, token, "renewed")) return error.Unauthorized;
+        self.renewals += 1;
     }
     fn describe(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Description {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -444,7 +452,10 @@ fn run(mock: *Mock, input: []const u8, limits: protocol.Limits) !std.Io.Writer.A
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     errdefer output.deinit();
     var session = protocol.Session{ .alloc = std.testing.allocator, .io = std.testing.io, .source = mock.source(), .reader = &reader, .writer = &output.writer, .limits = limits };
-    defer session.deinit();
+    defer {
+        session.deinit();
+        mock.completion_safe_after_run = session.completion_safe;
+    }
     try session.run();
     return output;
 }
@@ -1610,6 +1621,7 @@ test "pgwire committed outcomes retain native owner until portal cleanup and emi
         try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
         try std.testing.expect(std.mem.endsWith(u8, observed, "DsDNC3Z"));
         try std.testing.expect(std.mem.indexOf(u8, output.written(), @tagName(outcome)) != null);
+        try std.testing.expectEqual(outcome != .committed_pending and outcome != .committed_repair_required, mock.completion_safe_after_run);
     }
 }
 
@@ -1622,6 +1634,7 @@ test "pgwire pending DDL returns error receipt without successful command comple
     var mock = Mock{ .ddl_pending = true };
     var output = try run(&mock, input.written(), .{});
     defer output.deinit();
+    try std.testing.expect(!mock.completion_safe_after_run);
     const observed = try tags(std.testing.allocator, output.written());
     defer std.testing.allocator.free(observed);
     try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') != null);
@@ -2515,4 +2528,177 @@ test "pgwire typed cells match column-aware materialized text and binary frames"
         try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, failures, "D"));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, failures, "E"));
     }
+}
+
+test "pgwire trusted renewal is private silent and preserves prepared portals" {
+    const a = std.testing.allocator;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "q", "SELECT $1", true);
+    try bind(&input.writer, "p", "q", 7);
+    try frame(&input.writer, 'p', "renewed\x00");
+    try execute(&input.writer, "p", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .renewable_auth = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.renewals);
+    try std.testing.expectEqual(@as(usize, 1), mock.authentications);
+    try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    const message_tags = try tags(a, output.written());
+    defer a.free(message_tags);
+    try std.testing.expect(std.mem.indexOfScalar(u8, message_tags, 'E') == null);
+    var basic: Mock = .{};
+    try std.testing.expectError(error.Unauthorized, run(&basic, input.written(), .{}));
+    try std.testing.expectEqual(@as(usize, 0), basic.renewals);
+}
+
+test "pgwire pending work completion witness retains durable DDL owner" {
+    const Fixture = struct {
+        fn executeOnce(raw: *anyopaque, alloc: std.mem.Allocator, identity: backend.Identity, request: backend.Request) !backend.Result {
+            const mock: *Mock = @ptrCast(@alignCast(raw));
+            defer mock.ddl_pending = false;
+            return Mock.execute(raw, alloc, identity, request);
+        }
+        fn completion(_: *anyopaque, _: backend.Identity) bool {
+            return true;
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "CREATE UNIQUE INDEX i ON t (id)\x00");
+    try frame(&input.writer, 'Q', "SELECT 1\x00");
+    try frame(&input.writer, 'X', "");
+    var mock = Mock{ .ddl_pending = true, .renewable_auth = true };
+    var source = mock.source();
+    var vtable = source.vtable.*;
+    vtable.execute = Fixture.executeOnce;
+    vtable.completion_safe = Fixture.completion;
+    vtable.pin_completion = pinMockCompletion;
+    vtable.completion_ready = mockCompletionReady;
+    source.vtable = &vtable;
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var session = protocol.Session{ .alloc = std.testing.allocator, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
+    try session.run();
+    var completion: @import("completion.zig").Completion = .{};
+    session.completion_destination = &completion;
+    session.deinit();
+    defer completion.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), mock.executions);
+    try std.testing.expect(!mock.ddl_pending);
+    try std.testing.expect(!completion.unknown);
+    try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+    try std.testing.expect(completion.outcomes.items[0].ddl_receipt_json != null);
+}
+
+test "pgwire completion budget rejects new execution before losing known owners" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn executePending(raw: *anyopaque, alloc: std.mem.Allocator, identity: backend.Identity, request: backend.Request) !backend.Result {
+            var result = try Mock.execute(raw, alloc, identity, request);
+            const mock: *Mock = @ptrCast(@alignCast(raw));
+            result.ddl_receipt_json = try std.fmt.allocPrint(alloc, "{{\"table_id\":\"{d}\",\"state\":\"pending\"}}", .{mock.executions});
+            return result;
+        }
+        fn safe(_: *anyopaque, _: backend.Identity) bool {
+            return true;
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    for (0..65) |_| try frame(&input.writer, 'Q', "CREATE TABLE pending (id INT)\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .ddl_pending = true, .renewable_auth = true };
+    var source = mock.source();
+    var vtable = source.vtable.*;
+    vtable.execute = Fixture.executePending;
+    vtable.completion_safe = Fixture.safe;
+    vtable.pin_completion = pinMockCompletion;
+    vtable.completion_ready = mockCompletionReady;
+    source.vtable = &vtable;
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    var session: protocol.Session = .{ .alloc = a, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
+    var completion: @import("completion.zig").Completion = .{};
+    session.completion_destination = &completion;
+    try session.run();
+    session.deinit();
+    defer completion.deinit(a);
+    try std.testing.expectEqual(@as(usize, 62), mock.executions);
+    try std.testing.expectEqual(mock.executions, completion.outcomes.items.len);
+    try std.testing.expect(!completion.unknown);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "54000") != null);
+}
+
+test "pgwire duplicate completion owners preserve tracking capacity and rollback stays available" {
+    const a = std.testing.allocator;
+    var completion: @import("completion.zig").Completion = .{};
+    defer completion.deinit(a);
+    for (0..100) |_| completion.add(a, "known-owner", null);
+    try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+    try completion.reserveExecution(a);
+    try std.testing.expect(!completion.unknown);
+    const commands = @import("session_commands.zig");
+    try std.testing.expect(commands.isRollback("ROLLBACK WORK;"));
+    try std.testing.expect(commands.isRollback("ABORT TRANSACTION"));
+    try std.testing.expect(!commands.isRollback("ROLLBACK; INSERT INTO t VALUES(1)"));
+    try std.testing.expect(!commands.isRollback("ROLLBACK TO SAVEPOINT p"));
+}
+
+fn pinMockCompletion(_: *anyopaque, alloc: std.mem.Allocator, completion: *@import("completion.zig").Completion) void {
+    for (completion.outcomes.items, 0..) |*outcome, index| {
+        if (outcome.reference_id == null) outcome.reference_id = std.fmt.allocPrint(alloc, "{x:0>32}", .{index + 1}) catch {
+            completion.unknown = true;
+            return;
+        };
+    }
+}
+
+fn mockCompletionReady(_: *anyopaque) bool {
+    return true;
+}
+
+test "pgwire producer capacity rejects execution before backend and preserves rollback" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn reserve(_: *anyopaque, completion: *@import("completion.zig").Completion, _: usize) !void {
+            // Startup reserves cleanup capacity; the producer fills before the
+            // next statement arrives. No backend call may follow the rejection.
+            if (completion.capacity.remaining != 0) return error.SessionLimitExceeded;
+            completion.capacity.remaining = 3;
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "INSERT INTO t VALUES (1)\x00");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .renewable_auth = true };
+    var source = mock.source();
+    var vtable = source.vtable.*;
+    vtable.reserve_completion = Fixture.reserve;
+    vtable.completion_safe = struct {
+        fn safe(_: *anyopaque, _: backend.Identity) bool {
+            return true;
+        }
+    }.safe;
+    vtable.completion_ready = mockCompletionReady;
+    source.vtable = &vtable;
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    var session: protocol.Session = .{ .alloc = a, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
+    defer session.deinit();
+    try session.run();
+    try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    try std.testing.expect(!session.completion.unknown);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "54000") != null);
 }

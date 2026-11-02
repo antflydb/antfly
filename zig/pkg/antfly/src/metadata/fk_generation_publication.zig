@@ -36,6 +36,15 @@ pub fn schemaHasForeignKeys(alloc: std.mem.Allocator, schema_json: []const u8) !
     defer parsed.deinit();
     return if (parsed.value.foreign_keys) |foreign_keys| foreign_keys.len != 0 else false;
 }
+// A terminal witness is independent of the replaceable publication payload.
+// Keep it for the lifetime of the metadata owner; callers can hold receipts
+// across arbitrary schema changes and outages.
+pub const CompletionRequest = struct { child_table_id: u64, publication_id: Id, initial: bool = false };
+pub fn completionKey(buf: []u8, group: u64, request: CompletionRequest) ![]const u8 {
+    const id = std.fmt.bytesToHex(request.publication_id, .lower);
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:fk_completion:{d}:{d}:{d}:{s}", .{ group, @intFromBool(request.initial), request.child_table_id, &id });
+}
+
 pub const prefix = "\x00\x00__metadata__:fk_generation_publication:";
 
 pub fn prefixForGroup(buf: []u8, metadata_group_id: u64) ![]const u8 {

@@ -1083,6 +1083,7 @@ const LocalStandaloneMetadata = struct {
             .vtable = &.{
                 .status = status,
                 .system_catalog = systemCatalog,
+                .tracks_sql_submission = true,
                 .supports_query_definitions = true,
                 .supports_resolver_catalog_read = true,
                 .supports_resolver_authority = true,
@@ -2611,6 +2612,7 @@ const LocalStandaloneMetadata = struct {
         errdefer alloc.free(reply);
         try context.ensureActive();
         const previous = self.durable_revision;
+        context.markSQLSubmission();
         try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .compare_and_replace_table = .{ .expected = request.expected, .replacement = request.replacement, .relation_guard = request.guard } });
         const actual = (store.getTable(alloc, group_ids.main_metadata_group_id, request.expected.table_id) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
         defer antfly.metadata.table_manager.freeTable(alloc, actual);
@@ -2648,17 +2650,17 @@ const LocalStandaloneMetadata = struct {
         }
         if (call == .resolver_authority_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.hot_standby_catalog_server) |server|
+            call == .sql_completion_reference_mutate or call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.hot_standby_catalog_server) |server|
         {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
         var lease = if (call == .resolver_authority_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .fk_initial_create_begin or call == .fk_initial_create_mutate) (if (self.hot_standby_catalog_server) |server| server.hot_standby_mutation_barrier.acquireShared() else null) else null;
+            call == .sql_completion_reference_mutate or call == .fk_initial_create_begin or call == .fk_initial_create_mutate) (if (self.hot_standby_catalog_server) |server| server.hot_standby_mutation_barrier.acquireShared() else null) else null;
         defer if (lease) |*value| value.release();
         if (call == .resolver_authority_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.hot_standby_catalog_server) |server|
+            call == .sql_completion_reference_mutate or call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.hot_standby_catalog_server) |server|
         {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
@@ -2719,6 +2721,10 @@ const LocalStandaloneMetadata = struct {
             .store_root_enroll,
             .store_root_enrollment_status,
             => return error.UnsupportedOperation,
+            .sql_completion_ready,
+            .sql_completion_reference,
+            .sql_completion_reference_mutate,
+            .fk_publication_completion,
             .fk_generation_publication_status,
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
@@ -2728,6 +2734,16 @@ const LocalStandaloneMetadata = struct {
                 if (!self.localFkPublicationSupported()) return error.UnsupportedOperation;
                 const store = self.lifecycle_store.?;
                 return switch (call) {
+                    .sql_completion_ready => alloc.dupe(u8, "true"),
+                    .sql_completion_reference => |reference| store.sqlCompletionReferenceJson(alloc, group_ids.main_metadata_group_id, reference),
+                    .sql_completion_reference_mutate => |command| blk: {
+                        const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+                        defer alloc.free(bytes);
+                        try store.preflightSqlCompletionReference(group_ids.main_metadata_group_id, bytes);
+                        try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_sql_completion_reference = bytes });
+                        break :blk alloc.dupe(u8, "true");
+                    },
+                    .fk_publication_completion => |request| store.fkPublicationCompletionJson(alloc, group_ids.main_metadata_group_id, request),
                     .fk_generation_publication_status => |table_id| store.fkGenerationPublicationStatusJson(alloc, group_ids.main_metadata_group_id, table_id),
                     .fk_generation_publication_work => |after| store.fkGenerationPublicationWorkJson(alloc, group_ids.main_metadata_group_id, after),
                     .fk_generation_publication_decision => |request| store.fkGenerationPublicationDecisionJson(alloc, group_ids.main_metadata_group_id, request),
@@ -2752,6 +2768,7 @@ const LocalStandaloneMetadata = struct {
                 if (bytes.len > publication.max_bytes) return error.CatalogCommandTooLarge;
                 try context.ensureActive();
                 const prior_projection_revision = self.durable_revision;
+                context.markSQLSubmission();
                 try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_fk_generation_publication = bytes });
                 if (command.action == .publish_child) {
                     self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
@@ -2840,6 +2857,7 @@ const LocalStandaloneMetadata = struct {
                     else => return err,
                 };
                 try context.ensureActive();
+                context.markSQLSubmission();
                 try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_fk_initial_create = bytes });
                 self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 const observed = store.fkInitialCreateStatusJson(alloc, group_ids.main_metadata_group_id, command.child_table_id) catch return error.MetadataMutationOutcomeUnknown;
@@ -3165,6 +3183,7 @@ const LocalStandaloneMetadata = struct {
                 try mutation.applyCatalog(self, delta);
                 self.epoch +|= 1;
                 try context.ensureActive();
+                context.markSQLSubmission();
                 if (self.hot_standby_catalog_server != null and self.lifecycle_store == null) {
                     try self.commitCatalogCreate(alloc, &mutation, .{
                         .table = table.?,

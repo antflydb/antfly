@@ -1739,7 +1739,11 @@ pub const ApiHttpServerConfig = struct {
     session_executor: ?http_common.RequestExecutor = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
+    /// Keep session persistence independent of workflow stores. Metadata nodes
+    /// attach replicated restore persistence after constructing the API owner.
+    session_store_path_only: bool = false,
     session_store_scope: transactions_api.SessionStoreScope = .node_local,
+    session_maintenance_local_only: bool = false,
     hot_standby_admin_executor: ?hot_standby_http_operation.Executor = null,
     /// Dedicated HA administration credential. This is intentionally separate
     /// from native user authentication and other internal admin surfaces.
@@ -2023,6 +2027,7 @@ pub const StatusSource = struct {
         supports_resolver_catalog_read: bool = false,
         supports_resolver_authority: bool = false,
         acquire_join_planning: ?*const fn (*anyopaque, table_router.RouteBudget) anyerror!?*join_planning.Generation = null,
+        tracks_sql_submission: bool = false,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
@@ -2105,7 +2110,29 @@ pub const StatusSource = struct {
             },
             else => {},
         }
-        const bytes = try self.rawSystemCatalog(alloc, context, input);
+        const completion_owner = if (context.sql_completion != null) try @import("sql_completion.zig").metadataOwnerForCall(alloc, input) else null;
+        if (completion_owner) |target| {
+            try @import("sql_completion.zig").prepareMetadataWithContext(context, target);
+            context.ensureActive() catch |err| {
+                try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, target);
+                return err;
+            };
+        }
+        var submitted = false;
+        var observed_context = context;
+        if (completion_owner != null and observed_context.sql_completion_submission == null)
+            observed_context.sql_completion_submission = &submitted;
+        if (input.isMutation() and !(self.vtable.tracks_sql_submission and input.tracksSQLSubmission()))
+            observed_context.markSQLSubmission();
+        const bytes = self.rawSystemCatalog(alloc, observed_context, input) catch |err| {
+            if (completion_owner) |target| {
+                if (observed_context.sql_completion_submission != null and !observed_context.sql_completion_submission.?.*)
+                    try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, target)
+                else
+                    try @import("sql_completion.zig").rejectMetadataWithContext(context, target, err);
+            }
+            return err;
+        };
         errdefer alloc.free(bytes);
         switch (input) {
             .query_definition => {
@@ -2778,6 +2805,7 @@ pub const StatusSource = struct {
 
         return .{
             .system_catalog = Gen.systemCatalog,
+            .tracks_sql_submission = true,
             .supports_query_definitions = true,
             .supports_object_tables = true,
             .supports_resolver_catalog_read = true,
@@ -2840,6 +2868,7 @@ pub const StatusSource = struct {
     fn makeHttpServiceVTable() VTable {
         var vtable = makeServiceVTable(metadata_service.MetadataHttpService);
         vtable.system_catalog = HttpRoutedCatalog.call;
+        vtable.tracks_sql_submission = true;
         vtable.create_table = HttpRoutedTableMutations.createTable;
         vtable.drop_table = HttpRoutedTableMutations.dropTable;
         vtable.drop_table_exact = HttpRoutedTableMutations.dropTableExact;
@@ -2847,12 +2876,28 @@ pub const StatusSource = struct {
     }
 
     const HttpRoutedCatalog = struct {
+        // Signing a service grant must preserve the native caller's authority.
+        // Otherwise a follower could admit a read rejected by the same leader.
+        fn authorizeRead(context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) !void {
+            if (input.requiresAdministrativeGrant() and !context.setting_admin) return error.Forbidden;
+            switch (input) {
+                .sql_completion_ready, .sql_completion_reference, .fk_publication_completion, .fk_generation_publication_status, .fk_generation_publication_work, .fk_generation_publication_decision, .fk_generation_publication_source_decision, .fk_initial_create_prepare, .fk_initial_child_decision, .fk_initial_create_status, .fk_generation_table_locked, .fk_initial_create_work, .fk_initial_parent_decision => if (!context.fk_generation_publication_authority) return error.Forbidden,
+                .policy_install_snapshot, .policy_publication_work => if (!context.row_policy_install_authority) return error.Forbidden,
+                .setting_snapshot => |scope| if (context.principal != null and (context.setting_read_principal == null or !std.mem.eql(u8, context.setting_read_principal.?, scope.principal))) return error.Forbidden,
+                .policy_snapshot => |scope| if (context.principal != null and (context.setting_read_principal == null or !std.mem.eql(u8, context.setting_read_principal.?, scope.principal))) return error.Forbidden,
+                else => {},
+            }
+        }
         fn call(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
+            try authorizeRead(context, input);
             const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
             var result: ?[]u8 = null;
             errdefer if (result) |bytes| alloc.free(bytes);
-            const ops = Ops{ .svc = svc, .alloc = alloc, .request = context, .input = input, .result = &result };
-            try runRoutedTableMutation(svc, ops);
+            const native = try context.platformDeadline();
+            const ops = Ops{ .svc = svc, .alloc = alloc, .request = native, .input = input, .result = &result };
+            try raft_mutation_forwarding.runRoutedMutation(svc, ops, .{
+                .initial_remaining_ms = @min(try native.remainingTimeoutMs() orelse raft_mutation_forwarding.max_remaining_ms, raft_mutation_forwarding.max_remaining_ms),
+            });
             return result orelse error.MetadataMutationOutcomeUnknown;
         }
         const Ops = struct {
@@ -2865,10 +2910,26 @@ pub const StatusSource = struct {
                 self.result.* = try system_catalog_operations.call(self.svc, self.alloc, self.request, self.input);
             }
             pub fn forward(self: @This(), peer: metadata_service.ReallocationProtocolPeer, forwarding: raft_mutation_forwarding.Context) anyerror!void {
+                try self.request.ensureActive();
                 var client = self.svc.tableMutationForwardClient();
-                const response = try client.forwardSystemCatalog(peer.orchestration_url orelse return error.NotLeader, self.input, forwarding, self.request.setting_admin);
-                defer client.alloc.free(response);
-                self.result.* = try self.alloc.dupe(u8, response);
+                const uri = peer.orchestration_url orelse return error.NotLeader;
+                if (!self.input.isMutation()) {
+                    // Reads need their body-bound read grant and catalog
+                    // identity, even when readiness activates a protocol floor.
+                    const incarnation = (try self.svc.metadataIncarnation()) orelse return error.MetadataIncarnationUnavailable;
+                    var cancellation = http_common.RequestCancellation.fromToken(self.request.cancellation);
+                    const read = try client.readSystemCatalog(uri, self.input, forwarding.remaining_ms, &cancellation);
+                    defer read.deinit(client.alloc);
+                    if (read.metadata_group_id != self.svc.metadata_group_id or !std.meta.eql(read.metadata_incarnation, incarnation)) return error.MetadataIncarnationMismatch;
+                    self.result.* = try self.alloc.dupe(u8, read.body);
+                } else {
+                    const admin = self.input.requiresAdministrativeGrant();
+                    if (admin and !self.request.setting_admin) return error.Forbidden;
+                    const response = try client.forwardSystemCatalogObserved(uri, self.input, forwarding, admin, self.request.sql_completion_submission);
+                    defer client.alloc.free(response);
+                    // A lost result allocation must retain an ambiguous write.
+                    self.result.* = self.alloc.dupe(u8, response) catch return error.MetadataMutationOutcomeUnknown;
+                }
             }
         };
     };
@@ -3928,6 +3989,10 @@ pub const ApiHttpServer = struct {
     cfg: ApiHttpServerConfig,
     query_admission: RequestAdmission,
     sql_preparation_admission: RequestAdmission,
+    sql_settlement_active: std.atomic.Value(bool) = .init(false),
+    sql_completion_owner_active: std.atomic.Value(bool) = .init(false),
+    sql_completion_recovery_after: u64 = 0,
+    sql_completion_consumer_active: std.atomic.Value(bool) = .init(false),
     write_admission: RequestAdmission,
     inference_admission: RequestAdmission,
     source: StatusSource,
@@ -4631,12 +4696,14 @@ pub const ApiHttpServer = struct {
 
     pub fn initWithConfig(
         alloc: std.mem.Allocator,
-        cfg: ApiHttpServerConfig,
+        supplied_cfg: ApiHttpServerConfig,
         source: StatusSource,
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) !ApiHttpServer {
-        var effective_cfg = cfg;
+        var cfg = supplied_cfg;
+        if (cfg.session_store_path_only) cfg.session_store_path = null;
+        var effective_cfg = supplied_cfg;
         const request_alloc = if (builtin.is_test)
             alloc
         else
@@ -4663,7 +4730,7 @@ pub const ApiHttpServer = struct {
         );
         owner_ids_transferred = true;
         errdefer server.deinit();
-        if (cfg.session_store_path) |path| {
+        if (supplied_cfg.session_store_path) |path| {
             if (cfg.session_store != null) return error.InvalidApiServerConfig;
             const opened = try alloc.create(transactions_api.OpenedSessionStore);
             errdefer alloc.destroy(opened);
@@ -5360,7 +5427,18 @@ pub const ApiHttpServer = struct {
         return try self.ensureForeignRegistry();
     }
 
+    fn runLocalSessionMaintenanceOnce(self: *ApiHttpServer) !void {
+        @import("sql_completion.zig").recoverUnpublished(self, self.alloc, 32) catch |err| {
+            std.log.warn("unpublished SQL completion cleanup deferred err={s}", .{@errorName(err)});
+        };
+        self.retryPendingTransactionRecovery(32) catch |err| {
+            std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
+        };
+        try self.maybeCleanupExpiredSessions();
+        try self.maybeRenewOwnedSessionLeases();
+    }
     pub fn runSessionMaintenanceOnce(self: *ApiHttpServer) !void {
+        if (self.cfg.session_maintenance_local_only) return self.runLocalSessionMaintenanceOnce();
         // Policy phase decisions and owner receipts each use the shared HA
         // metadata/owner outbox. Run this coordinator on a writable HA primary
         // as well, while leaving unrelated primary-local jobs frozen.
@@ -5449,11 +5527,7 @@ pub const ApiHttpServer = struct {
         self.ensurePendingIndexInstallationWorker() catch |err| {
             std.log.warn("failed to resume pending index installation reconciliation err={s}", .{@errorName(err)});
         };
-        self.retryPendingTransactionRecovery(32) catch |err| {
-            std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
-        };
-        try self.maybeCleanupExpiredSessions();
-        try self.maybeRenewOwnedSessionLeases();
+        try self.runLocalSessionMaintenanceOnce();
         // Durable index controls and cancellation are server-owned work.
         // Advance at most one queued pass per supervisor
         // tick; the repair-job FIFO and BackendRuntime maintenance queue keep
@@ -6343,28 +6417,13 @@ pub const ApiHttpServer = struct {
                             }) orelse continue;
                             continue;
                         },
-                        error.InvalidBatchRequest,
-                        error.RelationalCheckViolation,
-                        error.RelationalExpressionOverflow,
-                        error.RelationalExpressionDivisionByZero,
-                        error.RelationalExpressionBudgetExceeded,
-                        error.RelationalIndexKeyTooLarge,
-                        error.InvalidRelationalExpressionInput,
-                        error.InvalidRelationalGeneratedValue,
-                        error.InvalidArgument,
-                        error.InvalidGraphEdges,
-                        error.UnsupportedTransformOperation,
-                        error.TopologyChanged,
-                        error.DecisionConflict,
-                        error.DocIdentityNamespaceMismatch,
-                        error.UnsupportedOperation,
-                        error.TableNotFound,
-                        error.UnknownGroup,
-                        => {
-                            _ = self.txn_sessions.remove(self.alloc, txn_id);
-                            continue;
-                        },
+                        // An execution error alone is not a durable abort
+                        // decision. Retain its owner until recovery proves a
+                        // terminal outcome rather than manufacturing a proof.
                         else => {
+                            // This ID already crossed a durable execution boundary.
+                            // Replanning can reject after an earlier attempt committed;
+                            // only an authoritative terminal outcome can retire it.
                             std.log.warn("stable transaction commit recovery deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                             continue;
                         },
@@ -6373,6 +6432,7 @@ pub const ApiHttpServer = struct {
                         .conflict => {
                             // A replayed transaction ID can only conflict when
                             // the coordinator durably chose abort.
+                            _ = (self.txn_sessions.recordTerminalAbort(self.alloc, txn_id) catch continue) orelse continue;
                             _ = self.txn_sessions.remove(self.alloc, txn_id);
                         },
                         .committed => |committed| {
@@ -6599,7 +6659,7 @@ pub const ApiHttpServer = struct {
     };
 
     pub fn scheduleSessionMaintenance(self: *ApiHttpServer) !void {
-        try self.scheduleLakeArtifactCollection();
+        if (!self.cfg.session_maintenance_local_only) try self.scheduleLakeArtifactCollection();
         // The data runtime can complete many rounds per second. Rate-limit
         // submission before allocating work so an idle server does not churn
         // cleanup jobs. The worker's per-task clocks retain the configured
@@ -8556,19 +8616,26 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(signing_input);
 
         var expected_mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
-        std.crypto.auth.hmac.sha2.HmacSha256.create(expected_mac[0..], signing_input, secret);
+        // SQL policy v2 uses a domain-derived key. An old verifier cannot
+        // authenticate it while silently ignoring mutation exclusions.
+        const header_probe = try base64UrlDecodeAlloc(self.alloc, header_b64);
+        defer self.alloc.free(header_probe);
+        var probe = try std.json.parseFromSlice(std.json.Value, self.alloc, header_probe, .{});
+        defer probe.deinit();
+        if (probe.value != .object) return error.Unauthorized;
+        const kid = jsonStringField(probe.value.object.get("kid"));
+        var derived: [32]u8 = undefined;
+        const verification_key = if (kid) |value| blk: {
+            if (!std.mem.eql(u8, value, "antfly-sql-policy-v2")) return error.Unauthorized;
+            std.crypto.auth.hmac.sha2.HmacSha256.create(&derived, "antfly.trusted-principal.sql-policy.v2", secret);
+            break :blk @as([]const u8, &derived);
+        } else secret;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(expected_mac[0..], signing_input, verification_key);
         const signature = try base64UrlDecodeAlloc(self.alloc, signature_b64);
         defer self.alloc.free(signature);
         if (!constantTimeEql(signature, expected_mac[0..])) return error.Unauthorized;
 
-        const header_json = try base64UrlDecodeAlloc(self.alloc, header_b64);
-        defer self.alloc.free(header_json);
-        var parsed_header = try std.json.parseFromSlice(std.json.Value, self.alloc, header_json, .{});
-        defer parsed_header.deinit();
-        const header_obj = switch (parsed_header.value) {
-            .object => |object| object,
-            else => return error.Unauthorized,
-        };
+        const header_obj = probe.value.object;
         if (!std.mem.eql(u8, jsonStringField(header_obj.get("alg")) orelse "", "HS256")) return error.Unauthorized;
 
         const payload_json = try base64UrlDecodeAlloc(self.alloc, payload_b64);
@@ -8605,6 +8672,7 @@ pub const ApiHttpServer = struct {
             internal_service_auth.principal_kind,
         ) and bounded_service_lifetime;
 
+        if (payload.get("table_write_exclusions") != null and kid == null) return error.Unauthorized;
         const permissions = try trustedPrincipalPermissionsFromPayload(self.alloc, payload);
         errdefer {
             for (permissions) |*permission| permission.deinit(self.alloc);
@@ -13592,17 +13660,22 @@ pub const ApiHttpServer = struct {
         target: []const u8,
         authorization: ?[]const u8,
         trusted_principal: ?[]const u8 = null,
+        sql_fence: ?[]const u8 = null,
         content_type: ?[]const u8,
         body: []const u8,
     };
 
-    fn sessionTrustedPrincipalHeaders(
-        token: ?[]const u8,
-        storage: *[1]http_common.RequestHeader,
-    ) []const http_common.RequestHeader {
-        const value = token orelse return storage[0..0];
-        storage[0] = .{ .name = trusted_principal_header, .value = value };
-        return storage[0..1];
+    fn sessionForwardHeaders(token: ?[]const u8, fence: ?[]const u8, storage: *[2]http_common.RequestHeader) []const http_common.RequestHeader {
+        var count: usize = 0;
+        if (token) |value| {
+            storage[count] = .{ .name = trusted_principal_header, .value = value };
+            count += 1;
+        }
+        if (fence) |value| {
+            storage[count] = .{ .name = "X-Antfly-SQL-Fence", .value = value };
+            count += 1;
+        }
+        return storage[0..count];
     }
 
     pub fn forwardSessionOperation(
@@ -13610,9 +13683,10 @@ pub const ApiHttpServer = struct {
         txn_id: db_mod.types.TxnId,
         request: SessionForwardRequest,
     ) !?contextual_operations.OwnedResponse {
-        var trusted_header_storage: [1]http_common.RequestHeader = undefined;
-        const trusted_headers = sessionTrustedPrincipalHeaders(
+        var trusted_header_storage: [2]http_common.RequestHeader = undefined;
+        const trusted_headers = sessionForwardHeaders(
             request.trusted_principal,
+            request.sql_fence,
             &trusted_header_storage,
         );
         var response = (try self.forwardSessionRequest(txn_id, .{
@@ -13630,6 +13704,10 @@ pub const ApiHttpServer = struct {
         })) orelse return null;
         defer response.deinit(self.alloc);
 
+        return try self.cloneForwardedResponse(response);
+    }
+
+    fn cloneForwardedResponse(self: *ApiHttpServer, response: http_common.HttpResponse) !contextual_operations.OwnedResponse {
         const headers = try self.alloc.alloc(contextual_operations.Header, response.headers.len);
         errdefer self.alloc.free(headers);
         var initialized: usize = 0;
@@ -13647,6 +13725,35 @@ pub const ApiHttpServer = struct {
             .body = try self.alloc.dupe(u8, response.body),
             .headers = headers,
         };
+    }
+
+    pub fn forwardSQLResourceOperation(self: *ApiHttpServer, id: []const u8, kind: @import("sql_resource_routing.zig").Kind, request: http_common.HttpRequest, forwarded: *bool) !?contextual_operations.OwnedResponse {
+        const routing = @import("sql_resource_routing.zig");
+        const owner = try routing.owner(id);
+        const router = self.cfg.session_router orelse return null;
+        if (owner == 0 or owner == router.localNodeId()) return null;
+        if (self.txn_sessions.durable) |store| if (try routing.containsLocal(store, id, kind)) return null;
+        const executor = self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
+        const base = (try router.nodeBaseUri(self.alloc, owner)) orelse return null;
+        defer self.alloc.free(base);
+        for (request.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-SQL-Resource-Hop") and std.mem.eql(u8, header.value, "forwarded")) return error.SqlConnectionWrongOwner;
+        var headers: std.ArrayList(http_common.RequestHeader) = .empty;
+        defer headers.deinit(self.alloc);
+        try headers.appendSlice(self.alloc, request.headers);
+        try headers.append(self.alloc, .{ .name = "X-Antfly-SQL-Resource-Hop", .value = "forwarded" });
+        const uri = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ base, request.uri });
+        defer self.alloc.free(uri);
+        var outgoing = request;
+        outgoing.uri = uri;
+        outgoing.headers = headers.items;
+        // Resource close is bodyless. The handler's synthetic decoding body
+        // must not be sent on DELETE (std.http.Client forbids that framing).
+        if (outgoing.method == .DELETE) outgoing.body = "";
+        outgoing.timeout_ms = 10 * 60 * 1000;
+        forwarded.* = true;
+        var response = try executor.execute(self.alloc, outgoing);
+        defer response.deinit(self.alloc);
+        return try self.cloneForwardedResponse(response);
     }
 
     fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
@@ -17745,6 +17852,7 @@ pub const ApiHttpServer = struct {
         var start: restore_jobs.StartRequest = .{ .scope = .cluster, .source_kind = .schema_rewrite, .backup_id = backup_id, .location = try std.fmt.allocPrint(alloc, "metadata://schema-rewrite/{s}", .{std.fmt.bytesToHex(plan_id, .lower)}), .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = namespace, .idempotency_key = key, .destination_authorization_principal = storedDestinationPrincipal(identity) };
         if (try self.restore_job_store.existingRewriteAdmission(self.alloc, start)) |existing| {
             defer self.alloc.free(existing);
+            if (context.sql_completion_submission) |observed| observed.* = true;
             return self.restoreJobResponse(202, existing);
         }
         const Observer = struct {
@@ -17783,7 +17891,7 @@ pub const ApiHttpServer = struct {
         const plan = try admission.buildWithPolicies(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, .{ .default_columns = default_columns });
         start.rewrite_plan_json = try std.json.Stringify.valueAlloc(alloc, plan, .{});
         try ensureTableOperationActive(context);
-        const accepted = self.restore_job_store.startRecoverable(self.alloc, start) catch |err| return restoreJobStartErrorResponse(self.alloc, err);
+        const accepted = self.restore_job_store.startRecoverableObserved(self.alloc, start, true, context.sql_completion_submission) catch |err| return restoreJobStartErrorResponse(self.alloc, err);
         const encoded = switch (accepted) {
             .accepted => |value| value,
             .unknown => |value| {
@@ -29002,11 +29110,17 @@ pub fn permissionsAllow(
     resource: []const u8,
     permission_type: usermgr.PermissionType,
 ) bool {
+    if (permission_type != .read) for (permissions) |permission| {
+        if (!permission.deny_mutation) continue;
+        if ((permission.resource_type == .@"*" or permission.resource_type == resource_type) and
+            (std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource) or
+                (resource_type == .table and system_catalog_routes.tableResourceMatches(permission.resource, resource)))) return false;
+    };
     for (permissions) |permission| {
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
         const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource) or (resource_type == .table and system_catalog_routes.tableResourceMatches(permission.resource, resource));
         if (!type_match or !resource_match) continue;
-        if (permission.type.allows(permission_type)) return true;
+        if (!permission.deny_mutation and permission.type.allows(permission_type)) return true;
     }
     return false;
 }
@@ -29821,6 +29935,19 @@ fn trustedPrincipalPermissionsFromPayload(alloc: std.mem.Allocator, payload: std
             try appendTrustedPrincipalPermissionsForTable(alloc, &out, entry.key_ptr.*, entry.value_ptr.array.items);
         }
     }
+    if (payload.get("table_write_exclusions")) |excluded| {
+        if (excluded != .array or excluded.array.items.len > 1024) return error.Unauthorized;
+        for (excluded.array.items) |entry| {
+            const name = jsonStringValue(entry) orelse return error.Unauthorized;
+            if (name.len == 0) return error.Unauthorized;
+            var denial = try usermgr.Permission.initOwned(alloc, .table, name, .write);
+            denial.deny_mutation = true;
+            out.append(alloc, denial) catch |err| {
+                denial.deinit(alloc);
+                return err;
+            };
+        }
+    }
     return try out.toOwnedSlice(alloc);
 }
 
@@ -30537,6 +30664,7 @@ fn clonePermissions(alloc: std.mem.Allocator, permissions: []const usermgr.Permi
             permission.resource,
             permission.type,
         );
+        cloned.deny_mutation = permission.deny_mutation;
         var cloned_owned = true;
         errdefer if (cloned_owned) cloned.deinit(alloc);
         try out.append(alloc, cloned);
@@ -37457,12 +37585,15 @@ test "transaction principals bind sessions to credential identity" {
         transactionPrincipal(basic).?,
         transactionPrincipal(api_key).?,
     ));
-    var forwarded_header: [1]http_common.RequestHeader = undefined;
-    const forwarded = ApiHttpServer.sessionTrustedPrincipalHeaders(
+    var forwarded_header: [2]http_common.RequestHeader = undefined;
+    const forwarded = ApiHttpServer.sessionForwardHeaders(
         "trusted-token",
+        "completion-fence",
         &forwarded_header,
     );
-    try std.testing.expectEqual(@as(usize, 1), forwarded.len);
+    try std.testing.expectEqual(@as(usize, 2), forwarded.len);
+    try std.testing.expectEqualStrings("X-Antfly-SQL-Fence", forwarded[1].name);
+    try std.testing.expectEqualStrings("completion-fence", forwarded[1].value);
     try std.testing.expectEqualStrings(trusted_principal_header, forwarded[0].name);
     try std.testing.expectEqualStrings("trusted-token", forwarded[0].value);
 }
@@ -58310,6 +58441,7 @@ pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *Authenticated
         const original = identity.permissions[i];
         if (original.resource_type != .table or !system_catalog_routes.tableResourceMatches(original.resource, logical)) continue;
         var permission = try usermgr.Permission.initOwned(alloc, .table, physical, original.type);
+        permission.deny_mutation = original.deny_mutation;
         errdefer permission.deinit(alloc);
         identity.permissions = try alloc.realloc(identity.permissions, identity.permissions.len + 1);
         identity.permissions[identity.permissions.len - 1] = permission;
@@ -60581,4 +60713,1050 @@ test "httpx inference gateway native delivery preserves retries and source only 
         try std.testing.expect(nested.json.len != 0);
         try std.testing.expect(nested.delivered_bytes == null);
     }
+}
+
+test "SQL pgwire native mutation denials override wildcard grants and survive cloning" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"tables":["*"],"operations":["read","write"],"table_write_exclusions":["antfly_sources","filtered"]}
+    , .{});
+    defer parsed.deinit();
+    const permissions = try trustedPrincipalPermissionsFromPayload(a, parsed.value.object);
+    defer freePermissions(a, permissions);
+    const cloned = try clonePermissions(a, permissions);
+    defer freePermissions(a, cloned);
+    for ([_][]const usermgr.Permission{ permissions, cloned }) |grants| {
+        try std.testing.expect(permissionsAllow(grants, .table, "ordinary", .write));
+        try std.testing.expect(permissionsAllow(grants, .table, "filtered", .read));
+        try std.testing.expect(!permissionsAllow(grants, .table, "filtered", .write));
+        try std.testing.expect(!permissionsAllow(grants, .table, "antfly_sources", .write));
+        try std.testing.expect(!permissionsAllow(grants, .table, "antfly_sources", .admin));
+    }
+}
+
+test "SQL pgwire native FK settlement uses durable child lookup and exact publication identity" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    const Fixture = struct {
+        initial: bool = true,
+        phase: []const u8 = "published",
+        plan_id: [16]u8 = @splat(1),
+        calls: usize = 0,
+        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, context: sources.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(context.fk_generation_publication_authority);
+            try std.testing.expect(call == .sql_completion_reference);
+            const refs = @import("../metadata/sql_completion_references.zig");
+            self.calls += 1;
+            return std.json.Stringify.valueAlloc(alloc, refs.Status{ .record = .{ .reference_id = call.sql_completion_reference, .owner = .{ .table_id = 7, .schema_version = if (self.initial) 0 else 2, .kind = if (self.initial) .fk_initial else .fk_generation, .publication_id = self.plan_id }, .complete = std.mem.eql(u8, self.phase, "published") or std.mem.eql(u8, self.phase, "canceled") } }, .{});
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.catalog } }, null, null);
+    defer server.deinit();
+    const plan_hex = std.fmt.bytesToHex(@as([16]u8, @splat(1)), .lower);
+    var ddl: sources.sql_catalog.DdlReceipt = .{ .database = "default", .namespace = "public", .table = "child", .table_id = "7", .schema_version = 0, .state = .pending, .fk_generation_publication_id = &plan_hex };
+    for ([_]bool{ true, false }) |initial| {
+        fixture.initial = initial;
+        ddl.schema_version = if (initial) 0 else 2;
+        const encoded = try std.json.Stringify.valueAlloc(a, ddl, .{});
+        defer a.free(encoded);
+        const receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = &.{.{ .reference_id = "00000000000000000000000000000001", .ddl_receipt_json = encoded }} };
+        fixture.phase = "published";
+        try std.testing.expect(try @import("sql_completion.zig").settled(&server, a, receipt, .{}));
+        fixture.phase = "canceled";
+        try std.testing.expect(try @import("sql_completion.zig").settled(&server, a, receipt, .{}));
+        fixture.phase = "publishing_child";
+        try std.testing.expect(!try @import("sql_completion.zig").settled(&server, a, receipt, .{}));
+        fixture.phase = "published";
+        fixture.plan_id = @splat(2);
+        try std.testing.expect(!try @import("sql_completion.zig").settled(&server, a, receipt, .{}));
+        fixture.plan_id = @splat(1);
+    }
+    try std.testing.expectEqual(@as(usize, 8), fixture.calls);
+    const encoded = try std.json.Stringify.valueAlloc(a, ddl, .{});
+    defer a.free(encoded);
+    const partial = try @import("sql_completion.zig").remaining(&server, a, .{ .outcomes = &.{ .{ .reference_id = "00000000000000000000000000000001", .ddl_receipt_json = encoded }, .{ .transaction_id = "unresolved-owner" } } }, .{});
+    defer a.free(partial.outcomes);
+    try std.testing.expect(!partial.unknown);
+    try std.testing.expectEqual(@as(usize, 1), partial.outcomes.len);
+    try std.testing.expectEqualStrings("unresolved-owner", partial.outcomes[0].transaction_id.?);
+}
+
+test "SQL pgwire native terminal proof survives expiry and registry restart" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/review5-proof", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var durable = transactions_api.DurableSessionStore.init(a, &store);
+    var server = ApiHttpServer.init(a, .{ .session_store = &durable }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    const session = try server.txn_sessions.begin(a, .{ .sync_level = .write }, 0);
+    var request = try transactions_api.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{\"value\":1}}}}}");
+    defer request.deinit(a);
+    var sealed = (try server.txn_sessions.cloneCommitRequest(a, session.txn_id, &request)).?;
+    sealed.deinit(a);
+    _ = (try server.txn_sessions.markCommitExecutionStarted(a, session.txn_id)).?;
+    const reference: [16]u8 = @splat(4);
+    try durable.pinCompletion(session.txn_id, reference);
+    const second_reference: [16]u8 = @splat(5);
+    try durable.pinCompletion(session.txn_id, second_reference);
+    try std.testing.expect(!try durable.acknowledgeCompletion(session.txn_id, reference));
+    durable.fail_writes_for_test = true;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, server.txn_sessions.recordTerminalAbort(a, session.txn_id));
+    durable.fail_writes_for_test = false;
+    try std.testing.expect(!try durable.completionReferenceSettled(session.txn_id, reference));
+    _ = (try server.txn_sessions.recordTerminalAbort(a, session.txn_id)).?;
+    const reference_hex = std.fmt.bytesToHex(reference, .lower);
+    const id = std.fmt.bytesToHex(session.txn_id, .lower);
+    const receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = &.{.{ .transaction_id = &id, .reference_id = &reference_hex }} };
+    try std.testing.expect(try @import("sql_completion.zig").settled(&server, a, receipt, .{}));
+    _ = try server.txn_sessions.cleanupExpired(a, std.math.maxInt(u64));
+    try std.testing.expect(try @import("sql_completion.zig").settled(&server, a, receipt, .{}));
+    try std.testing.expect((try durable.load(session.txn_id)) == null);
+    var restarted = ApiHttpServer.init(a, .{ .session_store = &durable }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer restarted.deinit();
+    try std.testing.expect(try @import("sql_completion.zig").settled(&restarted, a, receipt, .{}));
+    try std.testing.expectError(error.SqlTransactionOutcomeUnknown, restarted.txn_sessions.beginForPrincipalWithSettingsAndId(a, .{}, 0, null, &.{}, null, session.txn_id));
+    try std.testing.expect(try @import("sql_completion.zig").acknowledge(&restarted, a, receipt, .{}));
+    try std.testing.expect(try @import("sql_completion.zig").acknowledge(&restarted, a, receipt, .{}));
+    try std.testing.expect(!try durable.completionReferenceSettled(session.txn_id, reference));
+    try std.testing.expect(try durable.completionReferenceSettled(session.txn_id, second_reference));
+    try std.testing.expect(try durable.acknowledgeCompletion(session.txn_id, second_reference));
+    const pending = try restarted.txn_sessions.begin(a, .{ .sync_level = .write }, 0);
+    var pending_request = (try restarted.txn_sessions.cloneCommitRequest(a, pending.txn_id, &request)).?;
+    pending_request.deinit(a);
+    _ = (try restarted.txn_sessions.markCommitExecutionStarted(a, pending.txn_id)).?;
+    _ = try restarted.txn_sessions.cleanupExpired(a, std.math.maxInt(u64));
+    var retained = (try durable.load(pending.txn_id)).?;
+    defer retained.deinit(a);
+    try std.testing.expect(!try durable.completionSettled(pending.txn_id));
+}
+test "SQL pgwire native ordinary rollback leaves no permanent completion proofs" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/ordinary-rollback-ledger", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var durable = transactions_api.DurableSessionStore.init(a, &store);
+    var registry = transactions_api.SessionRegistry.init(&durable);
+    defer registry.deinit(a);
+    var ids: [128][16]u8 = undefined;
+    for (&ids) |*id| {
+        const session = try registry.begin(a, .{}, 0);
+        id.* = session.txn_id;
+        try std.testing.expect(registry.removeBeforeExecution(a, session.txn_id));
+    }
+    try std.testing.expectEqual(@as(usize, 0), registry.sessions.count());
+    for (ids) |id| {
+        try std.testing.expect(!try durable.completionSettled(id));
+        const directory = try std.fmt.allocPrint(a, "\x00\x00__api_completion_consumers__:{s}", .{&std.fmt.bytesToHex(id, .lower)});
+        defer a.free(directory);
+        try std.testing.expectError(error.NotFound, store.get(a, directory));
+    }
+}
+test "SQL pgwire native uncertain pin responses retain recoverable consumer identity" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/uncertain-pin", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var storage = try docstore_mod.DocStore.open(a, path, .{});
+    defer storage.close();
+    const refs = @import("../metadata/sql_completion_references.zig");
+    const Fixture = struct {
+        storage: *docstore_mod.DocStore,
+        admitted: ?[16]u8 = null,
+        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: @import("antfly_local_sources").api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var key_buf: [200]u8 = undefined;
+            if (call == .sql_completion_reference_mutate) {
+                const command = call.sql_completion_reference_mutate;
+                const encoded = try std.json.Stringify.valueAlloc(alloc, refs.Record{ .reference_id = command.reference_id, .owner = command.owner, .complete = true }, .{});
+                defer alloc.free(encoded);
+                try self.storage.put(try refs.key(&key_buf, 1, command.reference_id), encoded);
+                self.admitted = command.reference_id;
+                return error.MetadataMutationOutcomeUnknown;
+            }
+            try std.testing.expect(call == .sql_completion_reference);
+            const encoded = try self.storage.get(alloc, try refs.key(&key_buf, 1, call.sql_completion_reference));
+            defer alloc.free(encoded);
+            var record = try std.json.parseFromSlice(refs.Record, alloc, encoded, .{});
+            defer record.deinit();
+            return std.json.Stringify.valueAlloc(alloc, refs.Status{ .record = record.value }, .{});
+        }
+    };
+    var fixture: Fixture = .{ .storage = &storage };
+    var durable = transactions_api.DurableSessionStore.init(a, &storage);
+    var server = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.catalog } }, null, null);
+    defer server.deinit();
+    const ddl = @import("antfly_local_sources").sql_catalog.DdlReceipt{ .database = "default", .namespace = "public", .table = "docs", .table_id = "7", .schema_version = 1, .state = .pending };
+    const json = try std.json.Stringify.valueAlloc(a, ddl, .{});
+    defer a.free(json);
+    var completion: @import("../pgwire/completion.zig").Completion = .{};
+    defer completion.deinit(a);
+    completion.add(a, null, json);
+    @import("sql_completion.zig").pinJoined(&server, a, &completion, std.testing.io);
+    try std.testing.expect(fixture.admitted != null);
+    try std.testing.expect(!completion.unknown);
+    try std.testing.expect(!completion.outcomes.items[0].registration_pending);
+    try std.testing.expect(completion.outcomes.items[0].reference_id != null);
+    const forgotten = std.fmt.bytesToHex(fixture.admitted.?, .lower);
+    const recoverable: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = &.{.{ .ddl_receipt_json = json, .reference_id = &forgotten }} };
+    try std.testing.expect(try @import("sql_completion.zig").settled(&server, a, recoverable, .{}));
+    const emitted: @import("../pgwire/completion.zig").Receipt = .{ .unknown = completion.unknown, .outcomes = completion.outcomes.items };
+    try std.testing.expect(try @import("sql_completion.zig").settled(&server, a, emitted, .{}));
+}
+
+test "SQL pgwire native transaction proofs route to the original node after payload expiry" {
+    const a = std.testing.allocator;
+    const completion_mod = @import("sql_completion.zig");
+    const service_secret = "0123456789abcdef0123456789abcdef";
+    const Router = struct {
+        node: u64,
+        fn local(raw: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.node;
+        }
+        fn status(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+        fn uri(_: *anyopaque, alloc: std.mem.Allocator, node: u64) !?[]u8 {
+            try std.testing.expectEqual(@as(u64, 1), node);
+            return try alloc.dupe(u8, "http://owner");
+        }
+    };
+    const Transport = struct {
+        owner: *ApiHttpServer,
+        calls: usize = 0,
+        reject: bool = false,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("http://owner/db/v1/sql", request.uri);
+            var authenticated = false;
+            var owner_mode = false;
+            for (request.headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) {
+                    var identity = try self.owner.authenticateInternalServiceRequest(header.value);
+                    defer identity.deinit(self.owner.alloc);
+                    authenticated = identity.is_internal_service;
+                }
+                if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-SQL-Settlement")) owner_mode = std.mem.eql(u8, header.value, "owner-v10");
+            }
+            try std.testing.expect(authenticated and owner_mode);
+            if (self.reject) return .{ .status = 503, .body = try alloc.dupe(u8, "busy") };
+            var parsed = try std.json.parseFromSlice(completion_mod.OwnerRequest, alloc, request.body, .{});
+            defer parsed.deinit();
+            const done = try completion_mod.ownerAction(self.owner, alloc, parsed.value, false);
+            return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, .{ .complete = done }, .{}) };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const first_path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/owner-routing", .{tmp.sub_path}, 0);
+    defer a.free(first_path);
+    const other_path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/other-routing", .{tmp.sub_path}, 0);
+    defer a.free(other_path);
+    var first = try docstore_mod.DocStore.open(a, first_path, .{});
+    defer first.close();
+    var other = try docstore_mod.DocStore.open(a, other_path, .{});
+    defer other.close();
+    var owned = transactions_api.DurableSessionStore.init(a, &first);
+    var unrelated = transactions_api.DurableSessionStore.init(a, &other);
+    var router1: Router = .{ .node = 1 };
+    var router2: Router = .{ .node = 2 };
+    var owner = ApiHttpServer.init(a, .{ .session_store = &owned, .internal_service_secret = service_secret, .internal_service_issuer = "routing-test", .session_router = .{ .ptr = &router1, .vtable = &.{ .local_node_id = Router.local, .local_status = Router.status, .node_base_uri = Router.uri } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer owner.deinit();
+    var transport: Transport = .{ .owner = &owner };
+    var other_api = ApiHttpServer.init(a, .{ .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io }, .session_store = &unrelated, .internal_service_secret = service_secret, .internal_service_issuer = "routing-test", .session_router = .{ .ptr = &router2, .vtable = &.{ .local_node_id = Router.local, .local_status = Router.status, .node_base_uri = Router.uri } }, .session_executor = .{ .ptr = &transport, .vtable = &.{ .execute = Transport.execute } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer other_api.deinit();
+    const session = try owner.txn_sessions.begin(a, .{}, 1);
+    var request = try transactions_api.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"n\":1}}}}}");
+    defer request.deinit(a);
+    var sealed = (try owner.txn_sessions.cloneCommitRequest(a, session.txn_id, &request)).?;
+    sealed.deinit(a);
+    _ = (try owner.txn_sessions.markCommitExecutionStarted(a, session.txn_id)).?;
+    const reference: [16]u8 = @splat(3);
+    const pin: completion_mod.OwnerRequest = .{ .transaction_id = session.txn_id, .reference_id = reference, .action = .pin };
+    try std.testing.expect(try completion_mod.ownerAction(&other_api, a, pin, true));
+    _ = (try owner.txn_sessions.recordTerminalAbort(a, session.txn_id)).?;
+    _ = try owner.txn_sessions.cleanupExpired(a, std.math.maxInt(u64));
+    const id = std.fmt.bytesToHex(session.txn_id, .lower);
+    const ref = std.fmt.bytesToHex(reference, .lower);
+    const receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = &.{.{ .transaction_id = &id, .reference_id = &ref }} };
+    try std.testing.expect(try completion_mod.settled(&other_api, a, receipt, .{}));
+    try std.testing.expect(try completion_mod.acknowledge(&other_api, a, receipt, .{}));
+    try std.testing.expect(!try owned.completionReferenceSettled(session.txn_id, reference));
+    try std.testing.expect(try completion_mod.acknowledge(&other_api, a, receipt, .{}));
+    try std.testing.expectEqual(@as(usize, 4), transport.calls);
+    try std.testing.expectError(error.CompletionWrongOwner, completion_mod.ownerAction(&other_api, a, pin, false));
+    // Preparation is the handoff boundary, before any commit can execute.
+    // Lose owner connectivity after execution, retire the payload, then restart
+    // the issuer and recover entirely from the pre-existing consumer proof.
+    const pending = try owner.txn_sessions.begin(a, .{}, 1);
+    var staged = (try owner.txn_sessions.cloneCommitRequest(a, pending.txn_id, &request)).?;
+    staged.deinit(a);
+    var completion: @import("../pgwire/completion.zig").Completion = .{};
+    defer completion.deinit(a);
+    try completion_mod.reserveJoined(&other_api, &completion, 3, std.testing.io);
+    try completion_mod.prepareTransaction(&other_api, a, &completion, pending.txn_id);
+    var managed_reference: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&managed_reference, completion.outcomes.items[0].reference_id.?);
+    try std.testing.expect(!try owned.completionReferenceSettled(pending.txn_id, managed_reference));
+    _ = (try owner.txn_sessions.markCommitExecutionStarted(a, pending.txn_id)).?;
+    transport.reject = true;
+    completion_mod.pinJoined(&other_api, a, &completion, std.testing.io);
+    try std.testing.expect(!completion.unknown);
+    _ = (try owner.txn_sessions.recordTerminalAbort(a, pending.txn_id)).?;
+    _ = try owner.txn_sessions.cleanupExpired(a, std.math.maxInt(u64));
+    try std.testing.expect((try owned.load(pending.txn_id)) == null);
+    transport.reject = false;
+    var restarted = ApiHttpServer.init(a, other_api.cfg, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer restarted.deinit();
+    const issued: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = completion.outcomes.items };
+    try std.testing.expect(try completion_mod.settled(&restarted, a, issued, .{}));
+    try std.testing.expect(try completion_mod.acknowledge(&restarted, a, issued, .{}));
+    try std.testing.expect(try completion_mod.acknowledge(&restarted, a, issued, .{}));
+    try std.testing.expect((try unrelated.loadRegistration(a, managed_reference)) == null);
+    try std.testing.expectError(error.CompletionWrongOwner, completion_mod.ownerAction(&owner, a, .{ .reference_id = managed_reference, .consumer_node_id = 1, .action = .acknowledge }, false));
+    try std.testing.expectError(error.CompletionAcknowledged, completion_mod.ownerAction(&owner, a, .{ .transaction_id = pending.txn_id, .reference_id = managed_reference, .action = .prepare, .managed = true }, false));
+
+    // A refused preparation has admitted no mutation. Its durable issuer can
+    // settle even when the target payload expires before the first pin succeeds.
+    const refused = try owner.txn_sessions.begin(a, .{}, 1);
+    var denied: @import("../pgwire/completion.zig").Completion = .{};
+    defer denied.deinit(a);
+    try completion_mod.reserveJoined(&other_api, &denied, 3, std.testing.io);
+    transport.reject = true;
+    if (completion_mod.prepareTransaction(&other_api, a, &denied, refused.txn_id)) |_| return error.TestExpectedPreparationFailure else |_| {}
+    completion_mod.pinJoined(&other_api, a, &denied, std.testing.io);
+    _ = try owner.txn_sessions.cleanupExpired(a, std.math.maxInt(u64));
+    try std.testing.expect((try owned.load(refused.txn_id)) == null);
+    const denied_receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = denied.outcomes.items };
+    try std.testing.expect(try completion_mod.settled(&restarted, a, denied_receipt, .{}));
+    transport.reject = false;
+    // A lost issuer delete must be safe after the remote ACK already landed.
+    unrelated.fail_writes_for_test = true;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, completion_mod.acknowledge(&restarted, a, denied_receipt, .{}));
+    unrelated.fail_writes_for_test = false;
+    try std.testing.expect(try completion_mod.acknowledge(&restarted, a, denied_receipt, .{}));
+
+    // A new commit attempt for the same transaction cannot reuse a proof from
+    // an earlier refused preparation that is already safe to acknowledge.
+    const retry = try owner.txn_sessions.begin(a, .{}, 1);
+    var retry_request = (try owner.txn_sessions.cloneCommitRequest(a, retry.txn_id, &request)).?;
+    retry_request.deinit(a);
+    var attempts: @import("../pgwire/completion.zig").Completion = .{};
+    defer attempts.deinit(a);
+    try completion_mod.reserveJoined(&other_api, &attempts, 3, std.testing.io);
+    transport.reject = true;
+    if (completion_mod.prepareTransaction(&other_api, a, &attempts, retry.txn_id)) |_| return error.TestExpectedPreparationFailure else |_| {}
+    completion_mod.pinJoined(&other_api, a, &attempts, std.testing.io);
+    transport.reject = false;
+    try completion_mod.reserveJoined(&other_api, &attempts, 3, std.testing.io);
+    try completion_mod.prepareTransaction(&other_api, a, &attempts, retry.txn_id);
+    try std.testing.expectEqual(@as(usize, 2), attempts.outcomes.items.len);
+    try std.testing.expect(!std.mem.eql(u8, attempts.outcomes.items[0].reference_id.?, attempts.outcomes.items[1].reference_id.?));
+    _ = (try owner.txn_sessions.markCommitExecutionStarted(a, retry.txn_id)).?;
+    completion_mod.pinJoined(&other_api, a, &attempts, std.testing.io);
+    const retry_receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = attempts.outcomes.items };
+    try std.testing.expect(!try completion_mod.settled(&restarted, a, retry_receipt, .{}));
+    _ = (try owner.txn_sessions.recordTerminalAbort(a, retry.txn_id)).?;
+    _ = try owner.txn_sessions.cleanupExpired(a, std.math.maxInt(u64));
+    try std.testing.expect(try completion_mod.settled(&restarted, a, retry_receipt, .{}));
+    try std.testing.expect(try completion_mod.acknowledge(&restarted, a, retry_receipt, .{}));
+}
+
+test "SQL pgwire native producer capacity is reserved before execution and recovers after retirement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/completion-admission", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var storage = try docstore_mod.DocStore.open(a, path, .{});
+    defer storage.close();
+    var durable = transactions_api.DurableSessionStore.init(a, &storage);
+    const outbox = @import("completion_outbox.zig");
+    const first = try durable.createRegistration(@splat(3), .{ .transaction_id = "owner" });
+    var state: outbox.Producer = .{ .id = first[0..8].*, .next = outbox.max_window + 1, .active = 1 };
+    const bytes = try std.json.Stringify.valueAlloc(a, state, .{});
+    defer a.free(bytes);
+    try storage.put("\x00\x00__sql_completion_producer__", bytes);
+    try std.testing.expectError(error.SessionLimitExceeded, durable.reserveRegistrations(3));
+    try std.testing.expectEqual(@as(usize, 0), durable.reserved_registrations);
+    try durable.removeRegistration(first);
+    try durable.reserveRegistrations(outbox.max_window);
+    try std.testing.expectError(error.SessionLimitExceeded, durable.createRegistration(@splat(4), .{ .transaction_id = "unreserved" }));
+    const reserved = try durable.createReservedRegistration(@splat(4), .{ .transaction_id = "reserved" });
+    try std.testing.expectEqual(@as(usize, outbox.max_window - 1), durable.reserved_registrations);
+    durable.releaseRegistrations(outbox.max_window - 1);
+    try durable.removeRegistration(reserved);
+    state = .{ .id = first[0..8].*, .next = std.math.maxInt(u64) - 1, .active = 0 };
+    const last_bytes = try std.json.Stringify.valueAlloc(a, state, .{});
+    defer a.free(last_bytes);
+    try storage.put("\x00\x00__sql_completion_producer__", last_bytes);
+    try std.testing.expectError(error.SessionLimitExceeded, durable.reserveRegistrations(2));
+    try durable.reserveRegistrations(1);
+    durable.releaseRegistrations(1);
+}
+
+test "SQL pgwire native session forwarding preserves completion admission at the execution owner" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        called: bool = false,
+        fn local(_: *anyopaque) u64 {
+            return 2;
+        }
+        fn status(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+        fn uri(_: *anyopaque, alloc: std.mem.Allocator, node: u64) !?[]u8 {
+            try std.testing.expectEqual(@as(u64, 1), node);
+            return try alloc.dupe(u8, "http://owner");
+        }
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("http://owner/db/v1/sql", request.uri);
+            var principal = false;
+            var fence = false;
+            for (request.headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, trusted_principal_header)) principal = std.mem.eql(u8, header.value, "credential");
+                if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-SQL-Fence")) fence = std.mem.eql(u8, header.value, "cloud-request");
+            }
+            try std.testing.expect(principal and fence);
+            self.called = true;
+            return .{ .status = 202, .body = try alloc.dupe(u8, "{}") };
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(a, .{
+        .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = Fixture.status, .node_base_uri = Fixture.uri } },
+        .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
+    }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    var id: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, id[0..8], 1, .big);
+    var response = (try server.forwardSessionOperation(id, .{ .method = .post, .target = "/db/v1/sql", .authorization = null, .trusted_principal = "credential", .sql_fence = "cloud-request", .content_type = "application/json", .body = "{}" })).?;
+    defer response.deinit(a);
+    try std.testing.expect(fixture.called);
+}
+
+test "SQL pgwire native successful unpublished proofs retire without filling the connection manifest" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/local-completion-handoff", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var storage = try docstore_mod.DocStore.open(a, path, .{});
+    defer storage.close();
+    var durable = transactions_api.DurableSessionStore.init(a, &storage);
+    var server = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    var completion: @import("../pgwire/completion.zig").Completion = .{};
+    defer completion.deinit(a);
+    const completion_mod = @import("sql_completion.zig");
+    var request = try transactions_api.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"n\":1}}}}}");
+    defer request.deinit(a);
+    for (0..128) |_| {
+        try completion_mod.reserveJoined(&server, &completion, 3, std.testing.io);
+        const session = try server.txn_sessions.begin(a, .{}, 0);
+        var staged = (try server.txn_sessions.cloneCommitRequest(a, session.txn_id, &request)).?;
+        staged.deinit(a);
+        try completion_mod.prepareTransaction(&server, a, &completion, session.txn_id);
+        var reference: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&reference, completion.outcomes.items[0].reference_id.?);
+        var prepared = (try durable.loadRegistration(a, reference)).?;
+        defer prepared.deinit();
+        try std.testing.expect(prepared.value.execution_admitted and !prepared.value.joined);
+        try std.testing.expect(!try durable.completionReferenceSettled(session.txn_id, reference));
+        _ = (try server.txn_sessions.markCommitExecutionStarted(a, session.txn_id)).?;
+        _ = (try server.txn_sessions.recordTerminalCommitWithRepair(a, session.txn_id, .committed, false, null, null)).?;
+        completion_mod.pinJoined(&server, a, &completion, std.testing.io);
+        try std.testing.expect(!completion.unknown);
+        try std.testing.expectEqual(@as(usize, 0), completion.outcomes.items.len);
+        try std.testing.expect((try durable.loadRegistration(a, reference)) == null);
+        _ = try server.txn_sessions.cleanupExpired(a, std.math.maxInt(u64));
+    }
+    try std.testing.expectEqual(@as(u64, 128), try durable.registrationFloor());
+}
+
+test "SQL pgwire native recovery rejection requires an authoritative abort before retirement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/local-completion-handoff", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var storage = try docstore_mod.DocStore.open(a, path, .{});
+    defer storage.close();
+    var durable = transactions_api.DurableSessionStore.init(a, &storage);
+    const Rejected = struct {
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TransactionTooLarge;
+        }
+        fn commit(_: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
+            return error.TransactionTooLarge;
+        }
+    };
+    const writes: table_writes.TableWriteSource = .{ .ptr = undefined, .vtable = &.{ .batch = Rejected.batch, .commit_transaction_with_id = Rejected.commit } };
+    var server = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, writes);
+    defer server.deinit();
+    var completion: @import("../pgwire/completion.zig").Completion = .{};
+    defer completion.deinit(a);
+    const completion_mod = @import("sql_completion.zig");
+    var request = try transactions_api.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"n\":1}}}}}");
+    defer request.deinit(a);
+    for (0..1) |_| {
+        try completion_mod.reserveJoined(&server, &completion, 3, std.testing.io);
+        const session = try server.txn_sessions.begin(a, .{}, 0);
+        var staged = (try server.txn_sessions.cloneCommitRequest(a, session.txn_id, &request)).?;
+        staged.deinit(a);
+        try completion_mod.prepareTransaction(&server, a, &completion, session.txn_id);
+        var reference: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&reference, completion.outcomes.items[0].reference_id.?);
+        var prepared = (try durable.loadRegistration(a, reference)).?;
+        defer prepared.deinit();
+        try std.testing.expect(prepared.value.execution_admitted and !prepared.value.joined);
+        try std.testing.expect(!try durable.completionReferenceSettled(session.txn_id, reference));
+        _ = (try server.txn_sessions.markCommitExecutionStarted(a, session.txn_id)).?;
+        try std.testing.expect(!server.txn_sessions.remove(a, session.txn_id));
+        var retained = (try durable.load(session.txn_id)).?;
+        defer retained.deinit(a);
+        completion_mod.pinJoined(&server, a, &completion, std.testing.io);
+        try std.testing.expect(!completion.unknown);
+        try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+        const receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = completion.outcomes.items };
+        durable.fail_writes_for_test = true;
+        try server.retryPendingTransactionRecovery(32);
+        try std.testing.expectError(error.InjectedSessionStoreFailure, completion_mod.settled(&server, a, receipt, .{}));
+        try std.testing.expect(!try durable.completionReferenceSettled(session.txn_id, reference));
+        durable.fail_writes_for_test = false;
+        for (0..3) |_| try server.retryPendingTransactionRecovery(32);
+        var unknown = (try durable.load(session.txn_id)).?;
+        unknown.deinit(a);
+        try std.testing.expect(!try completion_mod.settled(&server, a, receipt, .{}));
+        // Simulate an authoritative coordinator abort arriving after retries.
+        _ = (try server.txn_sessions.recordTerminalAbort(a, session.txn_id)).?;
+        try server.retryPendingTransactionRecovery(32);
+        try std.testing.expect(try completion_mod.settled(&server, a, receipt, .{}));
+        try std.testing.expect(try completion_mod.acknowledge(&server, a, receipt, .{}));
+        try std.testing.expect((try durable.loadRegistration(a, reference)) == null);
+        _ = try server.txn_sessions.cleanupExpired(a, std.math.maxInt(u64));
+    }
+    try std.testing.expectEqual(@as(u64, 1), try durable.registrationFloor());
+}
+
+test "SQL pgwire native prepared metadata survives retention and refused admission leaves no orphan" {
+    const a = std.testing.allocator;
+    const Store = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    const Fixture = struct {
+        metadata: *Store,
+        reject: bool = false,
+        fn call(raw: *anyopaque, alloc: std.mem.Allocator, _: @import("antfly_local_sources").api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.CompletionOwnerUnavailable;
+            return switch (input) {
+                .sql_completion_reference_mutate => |command| blk: {
+                    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+                    defer alloc.free(bytes);
+                    try self.metadata.preflightSqlCompletionReference(group, bytes);
+                    try self.metadata.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = bytes });
+                    break :blk try alloc.dupe(u8, "{}");
+                },
+                .sql_completion_reference => |reference| self.metadata.sqlCompletionReferenceJson(alloc, group, reference),
+                else => error.TestUnexpectedResult,
+            };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/metadata-preparation", .{tmp.sub_path});
+    defer a.free(root);
+    var metadata_store = try Store.init(a, .{ .root_dir = root });
+    defer metadata_store.deinit();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/metadata-issuer", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var storage = try docstore_mod.DocStore.open(a, path, .{});
+    defer storage.close();
+    var durable = transactions_api.DurableSessionStore.init(a, &storage);
+    var fixture: Fixture = .{ .metadata = &metadata_store };
+    var server = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.call } }, null, null);
+    defer server.deinit();
+    const completion_mod = @import("sql_completion.zig");
+    var completion: @import("../pgwire/completion.zig").Completion = .{};
+    defer completion.deinit(a);
+    try completion_mod.reserveJoined(&server, &completion, 3, std.testing.io);
+    try completion_mod.prepareMetadata(&server, a, &completion, .{ .id = 7, .schema_version = 2, .kind = .restore });
+    // Pending diagnostics report the public receipt, not the provisional minimal
+    // envelope. Their immutable owner identity must share the prepared proof.
+    completion.add(a, null, "{\"database\":\"db\",\"namespace\":\"public\",\"table\":\"docs\",\"table_id\":\"999\",\"schema_version\":2,\"restore_job_id\":\"7\",\"state\":\"pending\"}");
+    completion.add(a, null, null);
+    try std.testing.expect(!completion.unknown);
+    try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+    const job_key = "\x00\x00__api_restore_jobs__:0000000000000007";
+    try metadata_store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = job_key, .value = "{\"job_id\":7,\"phase\":\"running\",\"staging_attempt_id\":1,\"staging_resolution\":\"active\"}" } });
+    fixture.reject = true;
+    completion_mod.pinJoined(&server, a, &completion, std.testing.io);
+    try std.testing.expect(!completion.unknown);
+    try metadata_store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = job_key, .value = "{\"job_id\":7,\"phase\":\"cancelled\",\"staging_attempt_id\":1,\"staging_resolution\":\"canceled\"}" } });
+    try metadata_store.applyStandaloneCommand(group, .{ .remove_restore_job = .{ .key = job_key } });
+    fixture.reject = false;
+    const receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = completion.outcomes.items };
+    try std.testing.expect(try completion_mod.settled(&server, a, receipt, .{}));
+    try std.testing.expect(try completion_mod.acknowledge(&server, a, receipt, .{}));
+    var denied: @import("../pgwire/completion.zig").Completion = .{};
+    defer denied.deinit(a);
+    try completion_mod.reserveJoined(&server, &denied, 3, std.testing.io);
+    fixture.reject = true;
+    if (completion_mod.prepareMetadata(&server, a, &denied, .{ .id = 8, .schema_version = 1 })) |_| return error.TestExpectedPreparationFailure else |_| {}
+    completion_mod.pinJoined(&server, a, &denied, std.testing.io);
+    try std.testing.expect(!denied.unknown);
+    const denied_receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = denied.outcomes.items };
+    try std.testing.expect(try completion_mod.settled(&server, a, denied_receipt, .{}));
+    fixture.reject = false;
+    try std.testing.expect(try completion_mod.acknowledge(&server, a, denied_receipt, .{}));
+}
+
+test "SQL pgwire native restart discards unpublished subscriptions without claiming pending work completed" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/local-completion-handoff", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var storage = try docstore_mod.DocStore.open(a, path, .{});
+    defer storage.close();
+    var durable = transactions_api.DurableSessionStore.init(a, &storage);
+    var server = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    var completion: @import("../pgwire/completion.zig").Completion = .{};
+    defer completion.deinit(a);
+    const completion_mod = @import("sql_completion.zig");
+    var request = try transactions_api.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"n\":1}}}}}");
+    defer request.deinit(a);
+    for ([_]bool{ false, true }) |terminal| {
+        try completion_mod.reserveJoined(&server, &completion, 3, std.testing.io);
+        const session = try server.txn_sessions.begin(a, .{}, 0);
+        var staged = (try server.txn_sessions.cloneCommitRequest(a, session.txn_id, &request)).?;
+        staged.deinit(a);
+        try completion_mod.prepareTransaction(&server, a, &completion, session.txn_id);
+        var reference: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&reference, completion.outcomes.items[0].reference_id.?);
+        var prepared = (try durable.loadRegistration(a, reference)).?;
+        defer prepared.deinit();
+        try std.testing.expect(prepared.value.execution_admitted and !prepared.value.joined);
+        try std.testing.expect(!try durable.completionReferenceSettled(session.txn_id, reference));
+        _ = (try server.txn_sessions.markCommitExecutionStarted(a, session.txn_id)).?;
+        if (terminal) _ = (try server.txn_sessions.recordTerminalCommitWithRepair(a, session.txn_id, .committed, false, null, null)).?;
+        // Simulate loss of the volatile execution collector before pinJoined.
+        try std.testing.expectEqual(terminal, try durable.completionReferenceSettled(session.txn_id, reference));
+        var restarted_durable = transactions_api.DurableSessionStore.init(a, &storage);
+        var restarted = ApiHttpServer.init(a, .{ .session_store = &restarted_durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+        defer restarted.deinit();
+        const receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = completion.outcomes.items };
+        restarted_durable.fail_writes_for_test = true;
+        try std.testing.expectError(error.InjectedSessionStoreFailure, completion_mod.recoverUnpublished(&restarted, a, 32));
+        restarted_durable.fail_writes_for_test = false;
+        for (0..3) |_| try completion_mod.recoverUnpublished(&restarted, a, 32);
+        try std.testing.expect((try restarted_durable.loadRegistration(a, reference)) == null);
+        // Forget is not positive settlement, even for a terminal former owner.
+        try std.testing.expect(!try completion_mod.settled(&restarted, a, receipt, .{}));
+        try std.testing.expectError(error.CompletionAcknowledged, completion_mod.ownerAction(&restarted, a, .{ .transaction_id = session.txn_id, .reference_id = reference, .action = .prepare, .managed = true }, true));
+        if (!terminal) {
+            var still_running = (try durable.load(session.txn_id)).?;
+            defer still_running.deinit(a);
+            try std.testing.expect(still_running.commit_execution_started and !still_running.terminal_abort);
+            _ = (try server.txn_sessions.recordTerminalAbort(a, session.txn_id)).?;
+        }
+        // A fresh live collector belongs to this store instance and is never
+        // eligible for its restart sweep, including after cursor wraparound.
+        var fresh: @import("../pgwire/completion.zig").Completion = .{};
+        defer fresh.deinit(a);
+        try completion_mod.reserveJoined(&restarted, &fresh, 3, std.testing.io);
+        const fresh_session = try restarted.txn_sessions.begin(a, .{}, 0);
+        try completion_mod.prepareTransaction(&restarted, a, &fresh, fresh_session.txn_id);
+        var fresh_reference: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&fresh_reference, fresh.outcomes.items[0].reference_id.?);
+        for (0..3) |_| try completion_mod.recoverUnpublished(&restarted, a, 1);
+        var live = (try restarted_durable.loadRegistration(a, fresh_reference)).?;
+        defer live.deinit();
+        try std.testing.expect(live.value.prepared and !live.value.joined);
+        // Join this fixture's live, unstarted attempt normally before the next
+        // simulated restart, so the next loop has no unrelated orphan.
+        completion_mod.pinJoined(&restarted, a, &fresh, std.testing.io);
+        _ = try server.txn_sessions.cleanupExpired(a, std.math.maxInt(u64));
+        completion.deinit(a);
+        completion = .{};
+    }
+    try std.testing.expectEqual(@as(u64, 4), try durable.registrationFloor());
+}
+
+test "SQL pgwire native schema rewrite pre-submission failure retires its prepared proof" {
+    const a = std.testing.allocator;
+    const Store = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    const Fixture = struct {
+        metadata: *Store,
+        reject: bool = false,
+        fail_after_forget: ?*transactions_api.DurableSessionStore = null,
+        fn call(raw: *anyopaque, alloc: std.mem.Allocator, _: @import("antfly_local_sources").api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.CompletionOwnerUnavailable;
+            return switch (input) {
+                .sql_completion_reference_mutate => |command| blk: {
+                    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+                    defer alloc.free(bytes);
+                    try self.metadata.preflightSqlCompletionReference(group, bytes);
+                    try self.metadata.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = bytes });
+                    const refs = @import("../metadata/sql_completion_references.zig");
+                    const observed = try self.metadata.sqlCompletionReferenceJson(alloc, group, command.reference_id);
+                    defer alloc.free(observed);
+                    var status = try std.json.parseFromSlice(refs.Status, alloc, observed, .{});
+                    defer status.deinit();
+                    try refs.validateApplied(command, status.value);
+                    if (command.action == .forget) if (self.fail_after_forget) |issuer| {
+                        issuer.fail_writes_for_test = true;
+                    };
+                    break :blk try alloc.dupe(u8, "{}");
+                },
+                .sql_completion_reference => |reference| self.metadata.sqlCompletionReferenceJson(alloc, group, reference),
+                else => error.TestUnexpectedResult,
+            };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/metadata-preparation", .{tmp.sub_path});
+    defer a.free(root);
+    var metadata_store = try Store.init(a, .{ .root_dir = root });
+    defer metadata_store.deinit();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/metadata-issuer", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var storage = try docstore_mod.DocStore.open(a, path, .{});
+    defer storage.close();
+    var durable = transactions_api.DurableSessionStore.init(a, &storage);
+    var fixture: Fixture = .{ .metadata = &metadata_store };
+    var server = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.call } }, null, null);
+    defer server.deinit();
+    const completion_mod = @import("sql_completion.zig");
+    var completion: @import("../pgwire/completion.zig").Completion = .{};
+    defer completion.deinit(a);
+    try completion_mod.reserveJoined(&server, &completion, 3, std.testing.io);
+    try completion_mod.prepareMetadata(&server, a, &completion, .{ .id = 7, .schema_version = 2, .kind = .restore });
+    // Pending diagnostics report the public receipt, not the provisional minimal
+    // envelope. Their immutable owner identity must share the prepared proof.
+    completion.add(a, null, "{\"database\":\"db\",\"namespace\":\"public\",\"table\":\"docs\",\"table_id\":\"999\",\"schema_version\":2,\"restore_job_id\":\"7\",\"state\":\"pending\"}");
+    completion.add(a, null, null);
+    try std.testing.expect(!completion.unknown);
+    try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+    const job_key = "\x00\x00__api_restore_jobs__:0000000000000007";
+    try metadata_store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = job_key, .value = "{\"job_id\":7,\"phase\":\"running\",\"staging_attempt_id\":1,\"staging_resolution\":\"active\"}" } });
+    fixture.reject = true;
+    completion_mod.pinJoined(&server, a, &completion, std.testing.io);
+    try std.testing.expect(!completion.unknown);
+    try metadata_store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = job_key, .value = "{\"job_id\":7,\"phase\":\"cancelled\",\"staging_attempt_id\":1,\"staging_resolution\":\"canceled\"}" } });
+    try metadata_store.applyStandaloneCommand(group, .{ .remove_restore_job = .{ .key = job_key } });
+    fixture.reject = false;
+    const receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = completion.outcomes.items };
+    try std.testing.expect(try completion_mod.settled(&server, a, receipt, .{}));
+    try std.testing.expect(try completion_mod.acknowledge(&server, a, receipt, .{}));
+    var denied: @import("../pgwire/completion.zig").Completion = .{};
+    defer denied.deinit(a);
+    try completion_mod.reserveJoined(&server, &denied, 3, std.testing.io);
+    fixture.reject = true;
+    if (completion_mod.prepareMetadata(&server, a, &denied, .{ .id = 8, .schema_version = 1 })) |_| return error.TestExpectedPreparationFailure else |_| {}
+    completion_mod.pinJoined(&server, a, &denied, std.testing.io);
+    try std.testing.expect(!denied.unknown);
+    const denied_receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = denied.outcomes.items };
+    try std.testing.expect(try completion_mod.settled(&server, a, denied_receipt, .{}));
+    fixture.reject = false;
+    try std.testing.expect(try completion_mod.acknowledge(&server, a, denied_receipt, .{}));
+
+    const Reject = struct {
+        server: *ApiHttpServer,
+        completion: *@import("../pgwire/completion.zig").Completion,
+        fn reject(raw: *anyopaque, target: @import("antfly_local_sources").api_operation.SQLCompletionOwner) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try @import("sql_completion.zig").rejectMetadata(self.server, std.testing.allocator, self.completion, target);
+        }
+    };
+    var expired: @import("../pgwire/completion.zig").Completion = .{};
+    defer expired.deinit(a);
+    try completion_mod.reserveJoined(&server, &expired, 3, std.testing.io);
+    const expired_owner: @import("antfly_local_sources").api_operation.SQLCompletionOwner = .{ .id = 9, .schema_version = 2, .kind = .restore };
+    try completion_mod.prepareMetadata(&server, a, &expired, expired_owner);
+    var rejection: Reject = .{ .server = &server, .completion = &expired };
+    var submitted = false;
+    const expired_context: @import("antfly_local_sources").api_operation.RequestContext = .{
+        .deadline_ns = 0,
+        .sql_completion_submission = &submitted,
+        .sql_completion = .{ .ptr = &rejection, .prepare_transaction = undefined, .reject_metadata = Reject.reject },
+    };
+    // This is the first check in handleSchemaRewrite; no snapshot or mutation
+    // is reached, so the undefined table is deliberately never dereferenced.
+    try std.testing.expectError(error.DeadlineExceeded, server.handleSchemaRewrite(undefined, "{}", null, null, expired_context, &.{}));
+    try std.testing.expect(!submitted);
+    try completion_mod.rejectMetadataBeforeSubmission(expired_context, expired_owner);
+    completion_mod.pinJoined(&server, a, &expired, std.testing.io);
+    try std.testing.expect(!expired.unknown);
+    try std.testing.expectEqual(@as(usize, 0), expired.outcomes.items.len);
+
+    var private: @import("../pgwire/completion.zig").Completion = .{};
+    defer private.deinit(a);
+    var published: @import("../pgwire/completion.zig").Completion = .{};
+    defer published.deinit(a);
+    for ([_]struct { collector: *@import("../pgwire/completion.zig").Completion, job: u64 }{
+        .{ .collector = &private, .job = 10 }, .{ .collector = &published, .job = 11 },
+    }) |entry| {
+        try completion_mod.reserveJoined(&server, entry.collector, 3, std.testing.io);
+        try completion_mod.prepareMetadata(&server, a, entry.collector, .{ .id = entry.job, .schema_version = 2, .kind = .restore });
+        var key_buf: [80]u8 = undefined;
+        const job_key_value = try std.fmt.bufPrint(&key_buf, "\x00\x00__api_restore_jobs__:{x:0>16}", .{entry.job});
+        const job_json = try std.fmt.allocPrint(a, "{{\"job_id\":{d},\"phase\":\"running\",\"staging_attempt_id\":1,\"staging_resolution\":\"active\"}}", .{entry.job});
+        defer a.free(job_json);
+        try metadata_store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = job_key_value, .value = job_json } });
+    }
+    completion_mod.pinJoined(&server, a, &published, std.testing.io);
+    var private_ref: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&private_ref, private.outcomes.items[0].reference_id.?);
+    var public_ref: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&public_ref, published.outcomes.items[0].reference_id.?);
+    var restarted_durable = transactions_api.DurableSessionStore.init(a, &storage);
+    var restarted = ApiHttpServer.init(a, .{ .session_store = &restarted_durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, server.source, null, null);
+    defer restarted.deinit();
+    fixture.fail_after_forget = &restarted_durable;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, completion_mod.recoverUnpublished(&restarted, a, 32));
+    restarted_durable.fail_writes_for_test = false;
+    fixture.fail_after_forget = null;
+    var discarding = (try restarted_durable.loadRegistration(a, private_ref)).?;
+    defer discarding.deinit();
+    try std.testing.expect(discarding.value.phase == .discarding and !discarding.value.joined);
+    for (0..3) |_| try completion_mod.recoverUnpublished(&restarted, a, 1);
+    try std.testing.expect((try restarted_durable.loadRegistration(a, private_ref)) == null);
+    var still_published = (try restarted_durable.loadRegistration(a, public_ref)).?;
+    defer still_published.deinit();
+    try std.testing.expect(still_published.value.joined);
+    const published_receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = published.outcomes.items };
+    try std.testing.expect(!try completion_mod.settled(&restarted, a, published_receipt, .{}));
+    const canceled_key = "\x00\x00__api_restore_jobs__:000000000000000b";
+    try metadata_store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = canceled_key, .value = "{\"job_id\":11,\"phase\":\"cancelled\",\"staging_attempt_id\":1,\"staging_resolution\":\"canceled\"}" } });
+    try std.testing.expect(try completion_mod.settled(&restarted, a, published_receipt, .{}));
+    try std.testing.expect(try completion_mod.acknowledge(&restarted, a, published_receipt, .{}));
+}
+
+test "SQL pgwire native catalog forwarding preserves native read authority" {
+    try std.testing.expectError(error.Forbidden, StatusSource.HttpRoutedCatalog.authorizeRead(.{}, .sql_completion_ready));
+    try StatusSource.HttpRoutedCatalog.authorizeRead(.{ .fk_generation_publication_authority = true }, .sql_completion_ready);
+}
+
+test "SQL pgwire native CREATE preflight failure retires prepared owner" {
+    const a = std.testing.allocator;
+    const Store = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    const Fixture = struct {
+        metadata: *Store,
+        reject: bool = false,
+        fail_after_forget: ?*transactions_api.DurableSessionStore = null,
+        fn call(raw: *anyopaque, alloc: std.mem.Allocator, _: @import("antfly_local_sources").api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.CompletionOwnerUnavailable;
+            return switch (input) {
+                .sql_completion_reference_mutate => |command| blk: {
+                    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+                    defer alloc.free(bytes);
+                    try self.metadata.preflightSqlCompletionReference(group, bytes);
+                    try self.metadata.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = bytes });
+                    const refs = @import("../metadata/sql_completion_references.zig");
+                    const observed = try self.metadata.sqlCompletionReferenceJson(alloc, group, command.reference_id);
+                    defer alloc.free(observed);
+                    var status = try std.json.parseFromSlice(refs.Status, alloc, observed, .{});
+                    defer status.deinit();
+                    try refs.validateApplied(command, status.value);
+                    if (command.action == .forget) if (self.fail_after_forget) |issuer| {
+                        issuer.fail_writes_for_test = true;
+                    };
+                    break :blk try alloc.dupe(u8, "{}");
+                },
+                .mutate => error.DeadlineExceeded,
+                .sql_completion_reference => |reference| self.metadata.sqlCompletionReferenceJson(alloc, group, reference),
+                else => error.TestUnexpectedResult,
+            };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/metadata-preparation", .{tmp.sub_path});
+    defer a.free(root);
+    var metadata_store = try Store.init(a, .{ .root_dir = root });
+    defer metadata_store.deinit();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/metadata-issuer", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var storage = try docstore_mod.DocStore.open(a, path, .{});
+    defer storage.close();
+    var durable = transactions_api.DurableSessionStore.init(a, &storage);
+    var fixture: Fixture = .{ .metadata = &metadata_store };
+    var server = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.call, .tracks_sql_submission = true } }, null, null);
+    defer server.deinit();
+    const completion_mod = @import("sql_completion.zig");
+    var completion: @import("../pgwire/completion.zig").Completion = .{};
+    defer completion.deinit(a);
+    try completion_mod.reserveJoined(&server, &completion, 3, std.testing.io);
+    const Capability = struct {
+        server: *ApiHttpServer,
+        collector: *@import("../pgwire/completion.zig").Completion,
+        fn prepare(raw: *anyopaque, owner: api_operation.SQLCompletionOwner) !void {
+            const cap: *@This() = @ptrCast(@alignCast(raw));
+            try @import("sql_completion.zig").prepareMetadata(cap.server, std.testing.allocator, cap.collector, owner);
+        }
+        fn reject(raw: *anyopaque, owner: api_operation.SQLCompletionOwner) !void {
+            const cap: *@This() = @ptrCast(@alignCast(raw));
+            try @import("sql_completion.zig").rejectMetadata(cap.server, std.testing.allocator, cap.collector, owner);
+        }
+    };
+    var cap: Capability = .{ .server = &server, .collector = &completion };
+    var submitted = false;
+    const context: api_operation.RequestContext = .{ .sql_completion_submission = &submitted, .sql_completion = .{ .ptr = &cap, .prepare_transaction = undefined, .prepare_metadata = Capability.prepare, .reject_metadata = Capability.reject } };
+    try std.testing.expectError(error.DeadlineExceeded, server.source.systemCatalog(a, context, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .table, .name = "never_admitted" }, .physical_name = "table:never-admitted", .create_table_json = "{\"num_shards\":1}" } }));
+    try std.testing.expect(!submitted);
+    completion_mod.pinJoined(&server, a, &completion, std.testing.io);
+    try std.testing.expect(!completion.unknown);
+    try std.testing.expectEqual(@as(usize, 0), completion.outcomes.items.len);
+}
+
+test "SQL pgwire native HTTP resources forward once with original authority and witness" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        calls: usize = 0,
+        fn local(_: *anyopaque) u64 {
+            return 2;
+        }
+        fn uri(_: *anyopaque, alloc: std.mem.Allocator, node: u64) !?[]u8 {
+            if (node != 1) return null;
+            return try alloc.dupe(u8, "http://issuer");
+        }
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const f: *@This() = @ptrCast(@alignCast(ptr));
+            f.calls += 1;
+            try std.testing.expectEqualStrings("signed-principal", request.header(trusted_principal_header).?);
+            try std.testing.expectEqualStrings("fence", request.header("X-Antfly-SQL-Fence").?);
+            try std.testing.expectEqualStrings("forwarded", request.header("X-Antfly-SQL-Resource-Hop").?);
+            if (request.method == .DELETE) try std.testing.expectEqualStrings("", request.body) else try std.testing.expectEqualStrings("{\"statement\":\"SELECT 1\"}", request.body);
+            try std.testing.expect(std.mem.startsWith(u8, request.uri, "http://issuer/"));
+            const headers = try alloc.alloc(http_common.Header, 1);
+            headers[0] = .{ .name = try alloc.dupe(u8, "X-Antfly-SQL-Completion"), .value = try alloc.dupe(u8, "owner-witness") };
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{}"), .headers = headers };
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(a, .{ .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = undefined, .node_base_uri = Fixture.uri } }, .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    const handle = @import("sql_resource_routing.zig").encode(1, @splat(3));
+    var forwarded = false;
+    const req: http_common.HttpRequest = .{ .method = .POST, .uri = "/db/v1/sql", .body = "{\"statement\":\"SELECT 1\"}", .headers = &.{ .{ .name = trusted_principal_header, .value = "signed-principal" }, .{ .name = "X-Antfly-SQL-Fence", .value = "fence" } } };
+    var response = (try server.forwardSQLResourceOperation(&handle, .connection, req, &forwarded)).?;
+    defer response.deinit(a);
+    try std.testing.expect(forwarded);
+    try std.testing.expectEqualStrings("X-Antfly-SQL-Completion", response.headers[0].name);
+    try std.testing.expectEqualStrings("owner-witness", response.headers[0].value);
+    var loop = req;
+    loop.headers = &.{.{ .name = "X-Antfly-SQL-Resource-Hop", .value = "forwarded" }};
+    try std.testing.expectError(error.SqlConnectionWrongOwner, server.forwardSQLResourceOperation(&handle, .connection, loop, &forwarded));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    var close_request = req;
+    close_request.method = .DELETE;
+    close_request.body = "{}";
+    var closed = (try server.forwardSQLResourceOperation(&handle, .prepared, close_request, &forwarded)).?;
+    defer closed.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    const own = @import("sql_resource_routing.zig").encode(2, @splat(4));
+    try std.testing.expect((try server.forwardSQLResourceOperation(&own, .prepared, req, &forwarded)) == null);
+}
+
+test "SQL pgwire native replay routing rejection preserves an earlier unknown execution" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/local-completion-handoff", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var storage = try docstore_mod.DocStore.open(a, path, .{});
+    defer storage.close();
+    var durable = transactions_api.DurableSessionStore.init(a, &storage);
+    const Rejected = struct {
+        calls: usize = 0,
+        earlier_execution_running: bool = false,
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+        fn missing(_: *anyopaque) anyerror!metadata_api.AdminSnapshot {
+            return error.TableNotFound;
+        }
+        fn commit(raw: *anyopaque, alloc: std.mem.Allocator, id: db_mod.types.TxnId, timestamp: u64, tables: []const distributed_txn.TableCommitRequest, sync: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1) {
+                self.earlier_execution_running = true;
+                return error.CommitDecisionUnknown;
+            }
+            const catalog: table_catalog.CatalogSource = .{ .ptr = self, .vtable = &.{ .admin_snapshot = missing, .free_admin_snapshot = undefined } };
+            // Real planner fails before reaching any participant status probe.
+            return try distributed_txn.executeMultiTableCommitWithOptions(alloc, catalog, .{ .ptr = undefined, .vtable = undefined }, id, timestamp, timestamp + 1, tables, sync, null, .{ .retain_terminal = true });
+        }
+    };
+    var fixture: Rejected = .{};
+    const writes: table_writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Rejected.batch, .commit_transaction_with_id = Rejected.commit } };
+    var server = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, writes);
+    defer server.deinit();
+    var completion: @import("../pgwire/completion.zig").Completion = .{};
+    defer completion.deinit(a);
+    const completion_mod = @import("sql_completion.zig");
+    var request = try transactions_api.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"n\":1}}}}}");
+    defer request.deinit(a);
+    for (0..1) |_| {
+        try completion_mod.reserveJoined(&server, &completion, 3, std.testing.io);
+        const session = try server.txn_sessions.begin(a, .{}, 0);
+        var staged = (try server.txn_sessions.cloneCommitRequest(a, session.txn_id, &request)).?;
+        staged.deinit(a);
+        try completion_mod.prepareTransaction(&server, a, &completion, session.txn_id);
+        var reference: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&reference, completion.outcomes.items[0].reference_id.?);
+        var prepared = (try durable.loadRegistration(a, reference)).?;
+        defer prepared.deinit();
+        try std.testing.expect(prepared.value.execution_admitted and !prepared.value.joined);
+        try std.testing.expect(!try durable.completionReferenceSettled(session.txn_id, reference));
+        _ = (try server.txn_sessions.markCommitExecutionStarted(a, session.txn_id)).?;
+        var initial_view = try request.distributedTables(a);
+        defer initial_view.deinit();
+        try std.testing.expectError(error.CommitDecisionUnknown, writes.commitTransactionWithId(a, session.txn_id, session.begin_timestamp, initial_view.tables, .write));
+        try std.testing.expect(!server.txn_sessions.remove(a, session.txn_id));
+        var retained = (try durable.load(session.txn_id)).?;
+        defer retained.deinit(a);
+        completion_mod.pinJoined(&server, a, &completion, std.testing.io);
+        try std.testing.expect(!completion.unknown);
+        try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+        const receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = completion.outcomes.items };
+        durable.fail_writes_for_test = true;
+        try server.retryPendingTransactionRecovery(32);
+        try std.testing.expectError(error.InjectedSessionStoreFailure, completion_mod.settled(&server, a, receipt, .{}));
+        try std.testing.expect(!try durable.completionReferenceSettled(session.txn_id, reference));
+        durable.fail_writes_for_test = false;
+        for (0..3) |_| try server.retryPendingTransactionRecovery(32);
+        var unknown = (try durable.load(session.txn_id)).?;
+        unknown.deinit(a);
+        try std.testing.expect(fixture.earlier_execution_running);
+        try std.testing.expect(fixture.calls >= 2);
+        try std.testing.expect(!try completion_mod.settled(&server, a, receipt, .{}));
+        fixture.earlier_execution_running = false;
+        _ = (try server.txn_sessions.recordTerminalAbort(a, session.txn_id)).?;
+        try server.retryPendingTransactionRecovery(32);
+        try std.testing.expect(try completion_mod.settled(&server, a, receipt, .{}));
+        try std.testing.expect(try completion_mod.acknowledge(&server, a, receipt, .{}));
+        try std.testing.expect((try durable.loadRegistration(a, reference)) == null);
+        _ = try server.txn_sessions.cleanupExpired(a, std.math.maxInt(u64));
+    }
+    try std.testing.expectEqual(@as(u64, 1), try durable.registrationFloor());
 }

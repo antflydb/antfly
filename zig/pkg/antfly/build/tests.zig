@@ -344,6 +344,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
+    const metadata_sql_sessions = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[4],
+        .filters = &.{ "metadata server can expose admin listener endpoints", "metadata SQL session routing" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-sql-sessions-test", "Verify persistent metadata API sessions and issuer routing")
+        .dependOn(&addFilteredTestRunArtifact(b, metadata_sql_sessions).step);
+    const metadata_sql_submission = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "SQL pgwire native metadata", "system catalog relation replacement preserves private grants", "table definition stamp distinguishes rejection", "metadata proposal receipt survives a post-acceptance dispatch failure" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-sql-submission-test", "Verify SQL metadata submission evidence and RPC outcomes")
+        .dependOn(&addFilteredTestRunArtifact(b, metadata_sql_submission).step);
     const media_status_owners = [_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[2], api_http_runtime_test_mod };
     const media_status_filters = [_][]const []const u8{ &.{"runtime status"}, &.{"runtime status output counters"}, &.{ "runtime status media output counters", "index encoders expose local shard runtime status" } };
     for (media_status_owners, media_status_filters) |owner, filters| {
@@ -451,7 +465,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
-    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire" } });
+    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
     b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
         .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
     const sql_native_cells_tests = b.addTest(.{

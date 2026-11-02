@@ -5906,6 +5906,7 @@ pub const TransitionCommand = union(enum) {
     apply_sql_settings: []const u8,
     apply_sql_policies: []const u8,
     apply_sql_policy_publication: []const u8,
+    apply_sql_completion_reference: []const u8,
     apply_fk_generation_publication: []const u8,
     apply_fk_initial_create: []const u8,
     apply_store_root_enrollment: []const u8,
@@ -6065,7 +6066,7 @@ pub const TransitionCommand = union(enum) {
         switch (self.*) {
             .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .apply_resolver_authority, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .apply_resolver_authority, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_completion_reference, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -6198,6 +6199,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         .advance_resolver_namespace => |intent| if (intent.table_id == 0) return error.InvalidResolverCurationRequest,
         .apply_resolver_authority => |bytes| if (bytes.len == 0 or bytes.len > topology_protocol.max_transition_command_bytes) return error.InvalidResolverCurationRequest,
         .apply_restore_staging => |bytes| if (bytes.len == 0 or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging,
+        .apply_sql_completion_reference => |bytes| if (bytes.len == 0 or bytes.len > 8192) return error.CatalogCommandTooLarge,
         .apply_fk_generation_publication => |bytes| if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication,
         .apply_fk_initial_create => |bytes| if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication,
         .apply_store_root_enrollment, .ack_initial_fk_retirement => |bytes| if (bytes.len == 0 or bytes.len > 8192) return error.InvalidStoreRootEnrollment,
@@ -13003,6 +13005,215 @@ pub const RaftApplyStore = struct {
         }
     }
 
+    fn restoreCompletionSettled(alloc: std.mem.Allocator, value: []const u8, expected_id: u64) !bool {
+        const Shape = struct {
+            job_id: u64 = 0,
+            phase: enum { queued, running, succeeded, failed, cancelled } = .queued,
+            staging_attempt_id: u64 = 0,
+            staging_resolution: enum { active, published, canceled } = .active,
+        };
+        var state = try std.json.parseFromSlice(Shape, alloc, value, .{ .ignore_unknown_fields = true });
+        defer state.deinit();
+        const terminal = state.value.phase == .succeeded or state.value.phase == .failed or state.value.phase == .cancelled;
+        return state.value.job_id == expected_id and terminal and (state.value.staging_attempt_id == 0 or state.value.staging_resolution != .active);
+    }
+
+    pub fn sqlCompletionReferenceJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, reference: [16]u8) ![]u8 {
+        const refs = @import("../sql_completion_references.zig");
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var buf: [200]u8 = undefined;
+        const raw = txn.get(try refs.key(&buf, group, reference)) catch |err| switch (err) {
+            error.NotFound => return std.json.Stringify.valueAlloc(alloc, refs.Status{}, .{}),
+            else => return err,
+        };
+        if (std.mem.eql(u8, raw, @import("../../api/completion_retirement.zig").marker)) return std.json.Stringify.valueAlloc(alloc, refs.Status{}, .{});
+        var parsed = try std.json.parseFromSlice(refs.Record, alloc, raw, .{});
+        defer parsed.deinit();
+        var result: refs.Status = .{ .record = parsed.value };
+        if (!parsed.value.complete) {
+            const table = txn.get(try tableKeyForGroup(&buf, group, parsed.value.owner.table_id)) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (table) |bytes| {
+                const record = try decodeTableRecord(alloc, bytes);
+                defer metadata_table_manager.freeTable(alloc, record);
+                result.physical_name = record.name;
+                return std.json.Stringify.valueAlloc(alloc, result, .{});
+            }
+        }
+        return std.json.Stringify.valueAlloc(alloc, result, .{});
+    }
+    pub fn preflightSqlCompletionReference(self: *RaftApplyStore, group: u64, bytes: []const u8) !void {
+        var txn = try self.store.beginWriteTxn();
+        defer txn.abort();
+        try self.mutateSqlCompletionReferenceTxn(&txn, group, bytes);
+    }
+    fn applySqlCompletionReferenceTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, bytes: []const u8) !void {
+        // A peer can win after leader preflight. Such a stale command is a
+        // deterministic no-op, never a permanently failing Raft apply entry.
+        self.mutateSqlCompletionReferenceTxn(txn, group, bytes) catch |err| switch (err) {
+            error.CompletionAcknowledged, error.InvalidArgument, error.NotFound, error.TransactionInProgress, error.SessionLimitExceeded, error.TableNotFound, error.SchemaVersionChanged, error.GenerationPublicationNotFound, error.GenerationPublicationChanged => return,
+            else => return err,
+        };
+    }
+    fn mutateSqlCompletionReferenceTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, bytes: []const u8) !void {
+        const refs = @import("../sql_completion_references.zig");
+        var decoded = try std.json.parseFromSlice(refs.Command, self.alloc, bytes, .{});
+        defer decoded.deinit();
+        const cmd = decoded.value;
+        if (cmd.owner.table_id == 0) return error.InvalidArgument;
+        const retirement = @import("../../api/completion_retirement.zig");
+        if (cmd.managed) {
+            var root_buf: [180]u8 = undefined;
+            const root = try std.fmt.bufPrint(&root_buf, "\x00\x00__metadata__:sql_completion:{d}:retired:", .{group});
+            const floor = try retirement.advance(txn, self.alloc, root, cmd.reference_id, cmd.retired_through);
+            if (retirement.sequence(cmd.reference_id) <= floor) {
+                if (cmd.action == .acknowledge or cmd.action == .abandon or cmd.action == .forget) return;
+                return error.CompletionAcknowledged;
+            }
+        }
+        var kb: [200]u8 = undefined;
+        var ib: [200]u8 = undefined;
+        var cb: [200]u8 = undefined;
+        const key = try refs.key(&kb, group, cmd.reference_id);
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        var state: refs.Record = .{ .reference_id = cmd.reference_id, .owner = cmd.owner };
+        if (raw) |value| {
+            if (std.mem.eql(u8, value, retirement.marker)) {
+                if (cmd.action == .acknowledge or cmd.action == .abandon or cmd.action == .forget) return;
+                return error.CompletionAcknowledged;
+            }
+            var old = try std.json.parseFromSlice(refs.Record, self.alloc, value, .{});
+            defer old.deinit();
+            if (!refs.sameOwner(old.value.owner, cmd.owner)) return error.InvalidArgument;
+            state = old.value;
+            if (cmd.action == .pin or cmd.action == .prepare) return;
+        } else if (cmd.action == .acknowledge) return else if (cmd.action != .pin and cmd.action != .prepare and cmd.action != .abandon and cmd.action != .forget) return error.NotFound;
+        const index = try refs.indexKey(&ib, group, cmd.owner.table_id, cmd.reference_id);
+        const count_key = try refs.countKey(&cb, group, cmd.owner.table_id);
+        const count_raw = txn.get(count_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        var count: u64 = if (count_raw) |value| try std.fmt.parseInt(u64, value, 10) else 0;
+        if (cmd.action == .acknowledge or cmd.action == .forget) {
+            if (cmd.action != .forget and !state.complete) return error.TransactionInProgress;
+            if (cmd.managed) {
+                var root_buf: [180]u8 = undefined;
+                const root = try std.fmt.bufPrint(&root_buf, "\x00\x00__metadata__:sql_completion:{d}:retired:", .{group});
+                try retirement.acknowledge(txn, self.alloc, root, cmd.reference_id, key);
+            } else try txn.delete(key);
+            try txn.delete(index);
+            if (raw != null) count -|= 1;
+        } else {
+            if (cmd.action == .pin or cmd.action == .prepare or (cmd.action == .abandon and raw == null)) {
+                if (count >= 4096) return error.SessionLimitExceeded;
+                var tb: [200]u8 = undefined;
+                if (cmd.action == .prepare or cmd.action == .abandon) {
+                    state.complete = cmd.action == .abandon;
+                } else if (cmd.owner.kind == .restore) {
+                    var logical: [128]u8 = undefined;
+                    const lk = try std.fmt.bufPrint(&logical, "{s}{x:0>16}", .{ restore_job_logical_prefix, cmd.owner.table_id });
+                    const value = try txn.get(try restoreJobKeyForGroup(&tb, group, lk));
+                    state.complete = try restoreCompletionSettled(self.alloc, value, cmd.owner.table_id);
+                } else if (cmd.owner.kind == .table) {
+                    const table = txn.get(try tableKeyForGroup(&tb, group, cmd.owner.table_id)) catch return error.TableNotFound;
+                    const record = try decodeTableRecord(self.alloc, table);
+                    defer metadata_table_manager.freeTable(self.alloc, record);
+                    if (try @import("../../api/tables.zig").schemaVersion(record.schema_json) < cmd.owner.schema_version) return error.SchemaVersionChanged;
+                } else {
+                    const publication = @import("../fk_generation_publication.zig");
+                    const pk = if (cmd.owner.kind == .fk_initial) try publication.initialKey(&tb, group, cmd.owner.table_id) else try publication.key(&tb, group, cmd.owner.table_id);
+                    const value = txn.get(pk) catch return error.GenerationPublicationNotFound;
+                    const Shape = struct { plan: struct { id: [16]u8 }, phase: []const u8 };
+                    var job = try std.json.parseFromSlice(Shape, self.alloc, value, .{ .ignore_unknown_fields = true });
+                    defer job.deinit();
+                    if (cmd.owner.publication_id == null or !std.mem.eql(u8, &job.value.plan.id, &cmd.owner.publication_id.?)) return error.GenerationPublicationChanged;
+                    state.complete = std.mem.eql(u8, job.value.phase, "published") or std.mem.eql(u8, job.value.phase, "canceled");
+                }
+                count += 1;
+                try txn.put(index, &cmd.reference_id);
+            } else state.complete = true;
+            const value = try std.json.Stringify.valueAlloc(self.alloc, state, .{});
+            defer self.alloc.free(value);
+            try txn.put(key, value);
+        }
+        if (count == 0) {
+            try txn.delete(count_key);
+        } else {
+            var number: [24]u8 = undefined;
+            try txn.put(count_key, try std.fmt.bufPrint(&number, "{d}", .{count}));
+        }
+    }
+    fn settleSqlCompletionReferencesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, table: u64, publication_id: ?[16]u8, restore_only: bool, initial: bool) !void {
+        const refs = @import("../sql_completion_references.zig");
+        var pb: [200]u8 = undefined;
+        const prefix = try refs.indexPrefix(&pb, group, table);
+        var ids: std.ArrayList([16]u8) = .empty;
+        defer ids.deinit(self.alloc);
+        var cursor = try txn.openCursor();
+        var cursor_open = true;
+        defer if (cursor_open) cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (entry.value.len != 16) return error.InvalidCatalogRecord;
+            try ids.append(self.alloc, entry.value[0..16].*);
+        }
+        cursor.close();
+        cursor_open = false;
+        for (ids.items) |id| {
+            var kb: [200]u8 = undefined;
+            const key = try refs.key(&kb, group, id);
+            var state = try std.json.parseFromSlice(refs.Record, self.alloc, try txn.get(key), .{});
+            defer state.deinit();
+            if ((state.value.owner.kind == .restore) != restore_only) continue;
+            if (publication_id) |expected| {
+                const expected_kind: @FieldType(refs.Owner, "kind") = if (initial) .fk_initial else .fk_generation;
+                if (state.value.owner.kind != expected_kind) continue;
+                if (state.value.owner.publication_id == null or !std.mem.eql(u8, &state.value.owner.publication_id.?, &expected)) continue;
+            }
+            state.value.complete = true;
+            const value = try std.json.Stringify.valueAlloc(self.alloc, state.value, .{});
+            defer self.alloc.free(value);
+            try txn.put(key, value);
+        }
+    }
+
+    pub fn fkPublicationCompletionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.CompletionRequest) ![]u8 {
+        if (request.child_table_id == 0) return error.InvalidGenerationPublication;
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var buf: [200]u8 = undefined;
+        const witness = txn.get(try fk_generation_publication.completionKey(&buf, group_id, request)) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (witness) |value| return std.json.Stringify.valueAlloc(alloc, .{ .complete = std.mem.eql(u8, value, "settled-v1") }, .{});
+        // Read compatibility for terminal publications written before compact
+        // witnesses existed. Replacing such a record first preserves its proof.
+        const key = if (request.initial) try fk_generation_publication.initialKey(&buf, group_id, request.child_table_id) else try fk_generation_publication.key(&buf, group_id, request.child_table_id);
+        const bytes = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return alloc.dupe(u8, "{\"complete\":false}"),
+            else => return err,
+        };
+        const State = struct { plan: struct { id: [16]u8 }, phase: []const u8 };
+        var state = try std.json.parseFromSlice(State, alloc, bytes, .{ .ignore_unknown_fields = true });
+        defer state.deinit();
+        return std.json.Stringify.valueAlloc(alloc, .{ .complete = std.mem.eql(u8, &state.value.plan.id, &request.publication_id) and (std.mem.eql(u8, state.value.phase, "published") or std.mem.eql(u8, state.value.phase, "canceled")) }, .{});
+    }
+
+    fn preserveFkCompletionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, child: u64, id: [16]u8, initial: bool) !void {
+        try self.settleSqlCompletionReferencesTxn(txn, group, child, id, false, initial);
+        var buf: [200]u8 = undefined;
+        try txn.put(try fk_generation_publication.completionKey(&buf, group, .{ .child_table_id = child, .publication_id = id, .initial = initial }), "settled-v1");
+    }
+
     pub fn fkGenerationPublicationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, child_table_id: u64) ![]u8 {
         if (child_table_id == 0) return error.InvalidGenerationPublication;
         var txn = try self.store.beginReadTxn();
@@ -13764,6 +13975,7 @@ pub const RaftApplyStore = struct {
             }
             if (publication.phase == .published or publication.phase == .canceled) {
                 try self.terminalizeInitialFkReplicasTxn(txn, group_id, publication);
+                try self.preserveFkCompletionTxn(txn, group_id, publication.plan.child.table_id, publication.plan.id, true);
                 try self.setFkInitialTableLocksTxn(txn, group_id, publication.plan, false);
                 var name_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
                 try txn.delete(try fk_generation_publication.initialNameKey(&name_buf, group_id, publication.plan.namespace_id, publication.plan.logical_name));
@@ -14040,10 +14252,18 @@ pub const RaftApplyStore = struct {
         var previous: ?std.json.Parsed(fk_generation_publication.Publication) = null;
         defer if (previous) |*value| value.deinit();
         if (command.action == .begin) {
+            var completion_buf: [200]u8 = undefined;
+            const retired = txn.get(try fk_generation_publication.completionKey(&completion_buf, group_id, .{ .child_table_id = table_id, .publication_id = command.plan_id })) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (retired != null) return error.GenerationPublicationChanged;
             if (existing) |current_bytes| {
                 var prior_terminal = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, current_bytes, .{});
                 defer prior_terminal.deinit();
                 if (prior_terminal.value.phase != .published and prior_terminal.value.phase != .canceled) return error.GenerationPublicationChanged;
+                if (std.mem.eql(u8, &prior_terminal.value.plan.id, &command.plan_id)) return error.GenerationPublicationChanged;
+                try self.preserveFkCompletionTxn(txn, group_id, table_id, prior_terminal.value.plan.id, false);
                 if (source_tracked) previous_source_digest = try relationFkSourceDigest(prior_terminal.value, table_id);
             }
             const plan = command.plan.?;
@@ -14079,6 +14299,7 @@ pub const RaftApplyStore = struct {
             const digest = try relationFkSourceDigest(publication, table_id);
             if (previous_source_digest == null or !std.mem.eql(u8, &previous_source_digest.?, &digest)) try relation_reconciliation.advanceSource(txn, group_id);
         }
+        if (publication.phase == .published or publication.phase == .canceled) try self.preserveFkCompletionTxn(txn, group_id, table_id, publication.plan.id, false);
         try txn.put(key, encoded);
         var work_key_buf: [160]u8 = undefined;
         const work_key = try fk_generation_publication.workKey(&work_key_buf, group_id, table_id);
@@ -17785,6 +18006,7 @@ pub const RaftApplyStore = struct {
     const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
     const MetadataSnapshotProjection = enum {
         secret_collection,
+        sql_completion_reference,
         system_catalog,
         relation_writer,
         relation_names,
@@ -17857,6 +18079,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .job_state, .key = .{ .prefix = jobStatePrefixForGroup } },
         .{ .projection = .job_owner, .key = .{ .prefix = jobOwnerPrefixForGroup } },
         .{ .projection = .job_schedule, .key = .{ .prefix = jobSchedulePrefixForGroup } },
+        .{ .projection = .sql_completion_reference, .key = .{ .prefix = @import("../sql_completion_references.zig").prefixForGroup } },
         .{ .projection = .secret_collection, .key = .{ .prefix = secret_store.prefixForGroup } },
         .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
@@ -17943,8 +18166,9 @@ pub const RaftApplyStore = struct {
             .apply_sql_settings => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
             .apply_sql_policies => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
             .apply_sql_policy_publication => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.catalog_revision),
-            .apply_fk_generation_publication => metadataSnapshotProjectionBit(.fk_generation_publication) | metadataSnapshotProjectionBit(.fk_generation_work) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.catalog_revision),
-            .apply_fk_initial_create => metadataSnapshotProjectionBit(.fk_initial_create) | metadataSnapshotProjectionBit(.fk_initial_work) | metadataSnapshotProjectionBit(.fk_initial_name) | metadataSnapshotProjectionBit(.fk_initial_physical_name) | metadataSnapshotProjectionBit(.fk_initial_group) | metadataSnapshotProjectionBit(.fk_initial_replica) | metadataSnapshotProjectionBit(.fk_initial_replica_live) | metadataSnapshotProjectionBit(.fk_initial_replica_live_count) | metadataSnapshotProjectionBit(.fk_initial_retire) | metadataSnapshotProjectionBit(.fk_initial_replica_count) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.catalog_revision),
+            .apply_sql_completion_reference => metadataSnapshotProjectionBit(.sql_completion_reference),
+            .apply_fk_generation_publication => metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.fk_generation_publication) | metadataSnapshotProjectionBit(.fk_generation_work) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.catalog_revision),
+            .apply_fk_initial_create => metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.fk_initial_create) | metadataSnapshotProjectionBit(.fk_initial_work) | metadataSnapshotProjectionBit(.fk_initial_name) | metadataSnapshotProjectionBit(.fk_initial_physical_name) | metadataSnapshotProjectionBit(.fk_initial_group) | metadataSnapshotProjectionBit(.fk_initial_replica) | metadataSnapshotProjectionBit(.fk_initial_replica_live) | metadataSnapshotProjectionBit(.fk_initial_replica_live_count) | metadataSnapshotProjectionBit(.fk_initial_retire) | metadataSnapshotProjectionBit(.fk_initial_replica_count) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.catalog_revision),
             .initialize_metadata_incarnation => metadataSnapshotProjectionBit(.metadata_incarnation) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
@@ -17957,9 +18181,9 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.placement_version) | metadataSnapshotProjectionBit(.fk_initial_replica_live) | metadataSnapshotProjectionBit(.fk_initial_replica_live_count),
             .advance_resolver_namespace, .apply_resolver_authority => metadataSnapshotProjectionBit(.resolver_namespaces) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.catalog_revision),
             .mutate_lake_index_lifecycle => metadataSnapshotProjectionBit(.lake_index_lifecycle),
-            .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
+            .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.catalog_revision),
-            .apply_table_topology => metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
+            .apply_table_topology => metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_schema_progress_batch, .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
@@ -17982,7 +18206,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.table_transition_fence),
             .upsert_reconcile_lease, .remove_reconcile_lease => metadataSnapshotProjectionBit(.reconcile_lease),
             .upsert_shuffle_join_lease, .remove_shuffle_join_lease => metadataSnapshotProjectionBit(.shuffle_join_lease),
-            .upsert_restore_job, .create_restore_job, .remove_restore_job, .remove_restore_jobs, .remove_restore_job_if_matches => metadataSnapshotProjectionBit(.restore_job),
+            .upsert_restore_job, .create_restore_job, .remove_restore_job, .remove_restore_jobs, .remove_restore_job_if_matches => metadataSnapshotProjectionBit(.restore_job) | metadataSnapshotProjectionBit(.sql_completion_reference),
             .create_restore_job_with_staging => metadataSnapshotProjectionBit(.restore_job) | metadataSnapshotProjectionBit(.restore_staging),
             .compare_and_set_job_state => metadataSnapshotProjectionBit(.job_state) | metadataSnapshotProjectionBit(.job_owner) | metadataSnapshotProjectionBit(.job_schedule),
             .compare_and_set_backup_cohort => metadataSnapshotProjectionBit(.backup_cohort) | metadataSnapshotProjectionBit(.backup_cohort_progress) | metadataSnapshotProjectionBit(.backup_cohort_lock),
@@ -18001,7 +18225,7 @@ pub const RaftApplyStore = struct {
         };
         // Table publication and DROP update lifecycle roots in the same cut.
         return if ((mask & metadataSnapshotProjectionBit(.table)) != 0)
-            mask | metadataSnapshotProjectionBit(.resolver_namespaces) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names) |
+            mask | metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.resolver_namespaces) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names) |
                 metadataSnapshotProjectionBit(.relation_reconciliation) | metadataSnapshotProjectionBit(.relation_candidates) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) | metadataSnapshotProjectionBit(.relation_source)
         else
@@ -20322,6 +20546,7 @@ pub const RaftApplyStore = struct {
             .apply_sql_settings => |bytes| try self.applySqlSettingsTxn(txn, group_id, bytes),
             .apply_sql_policies => |bytes| try self.applySqlPoliciesTxn(txn, group_id, bytes),
             .apply_sql_policy_publication => |bytes| try self.applySqlPolicyPublicationTxn(txn, group_id, bytes),
+            .apply_sql_completion_reference => |bytes| try self.applySqlCompletionReferenceTxn(txn, group_id, bytes),
             .apply_fk_generation_publication => |bytes| try self.applyFkGenerationPublicationTxn(txn, group_id, bytes),
             .apply_fk_initial_create => |bytes| try self.applyCommittedFkInitialCreateTxn(txn, group_id, bytes),
             .apply_store_root_enrollment => |bytes| self.applyStoreRootEnrollmentTxn(txn, group_id, bytes) catch |err| switch (err) {
@@ -20952,6 +21177,21 @@ pub const RaftApplyStore = struct {
                     if (existing != null) return;
                 }
                 try txn.put(key, record.value);
+                // Only consumers add this work to ordinary restore writes.
+                // The persistence API accepts opaque legacy values; neither
+                // validation nor JSON scanning changes for unreferenced jobs.
+                const suffix = record.key[restore_job_logical_prefix.len..];
+                const parsed_id: ?u64 = if (suffix.len == 16) std.fmt.parseInt(u64, suffix, 16) catch null else null;
+                if (parsed_id) |job_id| {
+                    const refs = @import("../sql_completion_references.zig");
+                    var consumer_buf: [200]u8 = undefined;
+                    const consumers = try stagingGet(txn, try refs.countKey(&consumer_buf, group_id, job_id));
+                    if (consumers != null and (restoreCompletionSettled(self.alloc, record.value, job_id) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => false,
+                    }))
+                        try self.settleSqlCompletionReferencesTxn(txn, group_id, job_id, null, true, false);
+                }
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .restore_job,
@@ -21184,6 +21424,7 @@ pub const RaftApplyStore = struct {
             if (try self.relationalDropBlockedTxn(txn, group_id, existing)) return error.ConstraintRetirementRequired;
             try self.dropLakeIndexLifecycleTxn(txn, group_id, existing);
         }
+        try self.settleSqlCompletionReferencesTxn(txn, group_id, table_id, null, false, false);
         {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -27299,6 +27540,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    apply_sql_completion_reference = 81,
     advance_resolver_namespace = 80,
     apply_resolver_authority = 78,
     apply_relation_reconciliation = 76,
@@ -27463,6 +27705,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .apply_sql_policy_publication => |bytes| {
             if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @backingInt(TransitionTag.apply_sql_policy_publication));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_sql_completion_reference => |bytes| {
+            if (bytes.len > 8192) return error.CatalogCommandTooLarge;
+            try out.append(alloc, @backingInt(TransitionTag.apply_sql_completion_reference));
             try appendRequiredString(alloc, &out, bytes);
         },
         .apply_fk_generation_publication => |bytes| {
@@ -27931,6 +28178,10 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .apply_resolver_authority => blk: {
             if (encoded.len > topology_protocol.max_transition_command_bytes) return error.CatalogCommandTooLarge;
             break :blk .{ .apply_resolver_authority = try readRequiredString(alloc, encoded, &pos) };
+        },
+        .apply_sql_completion_reference => blk: {
+            if (encoded.len > 8192) return error.CatalogCommandTooLarge;
+            break :blk .{ .apply_sql_completion_reference = try readRequiredString(alloc, encoded, &pos) };
         },
         .apply_fk_generation_publication => blk: {
             if (encoded.len > fk_generation_publication.max_bytes + 16) return error.CatalogCommandTooLarge;
@@ -43366,4 +43617,359 @@ test "metadata durable job state snapshot retains scheduling quotas and group is
     defer page.deinit();
     try std.testing.expectEqual(@as(usize, 1), page.value.rows.len);
     try std.testing.expectEqualStrings("documents/finished", page.value.rows[0].key);
+}
+
+test "system catalog relation namespace transaction FK generation publication completion history survives replacement and restart" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/fk-completion-history", .{tmp.sub_path});
+    defer a.free(root);
+    const group = group_ids.main_metadata_group_id;
+    const first: fk_generation_publication.CompletionRequest = .{ .child_table_id = 7, .publication_id = @splat(1) };
+    const second: fk_generation_publication.CompletionRequest = .{ .child_table_id = 7, .publication_id = @splat(2) };
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        var buf: [200]u8 = undefined;
+        // A terminal record from an older writer has no compact witness yet.
+        const old = try std.json.Stringify.valueAlloc(a, .{ .plan = .{ .id = first.publication_id }, .phase = "published" }, .{});
+        defer a.free(old);
+        var seed = try store.store.beginWriteTxn();
+        errdefer seed.abort();
+        try seed.put(try fk_generation_publication.key(&buf, group, first.child_table_id), old);
+        try seed.commit();
+        const legacy = try store.fkPublicationCompletionJson(a, group, first);
+        defer a.free(legacy);
+        try std.testing.expectEqualStrings("{\"complete\":true}", legacy);
+        // Replacement and preservation are one atomic storage transaction.
+        const current = try std.json.Stringify.valueAlloc(a, .{ .plan = .{ .id = second.publication_id }, .phase = "fencing_child" }, .{});
+        defer a.free(current);
+        var replacement = try store.store.beginWriteTxn();
+        errdefer replacement.abort();
+        try store.preserveFkCompletionTxn(&replacement, group, first.child_table_id, first.publication_id, false);
+        try replacement.put(try fk_generation_publication.key(&buf, group, second.child_table_id), current);
+        try replacement.commit();
+        var rolled_back = try store.store.beginWriteTxn();
+        try store.preserveFkCompletionTxn(&rolled_back, group, second.child_table_id, second.publication_id, false);
+        rolled_back.abort();
+    }
+    var restarted = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer restarted.deinit();
+    const old = try restarted.fkPublicationCompletionJson(a, group, first);
+    defer a.free(old);
+    try std.testing.expectEqualStrings("{\"complete\":true}", old);
+    const pending = try restarted.fkPublicationCompletionJson(a, group, second);
+    defer a.free(pending);
+    try std.testing.expectEqualStrings("{\"complete\":false}", pending);
+    var wrong_child = first;
+    wrong_child.child_table_id += 1;
+    const missing = try restarted.fkPublicationCompletionJson(a, group, wrong_child);
+    defer a.free(missing);
+    try std.testing.expectEqualStrings("{\"complete\":false}", missing);
+    var wrong_family = first;
+    wrong_family.initial = true;
+    const initial = try restarted.fkPublicationCompletionJson(a, group, wrong_family);
+    defer a.free(initial);
+    try std.testing.expectEqualStrings("{\"complete\":false}", initial);
+}
+
+test "system catalog relation namespace transaction SQL completion references survive table removal and restart until independently acknowledged" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/completion-consumers", .{tmp.sub_path});
+    defer a.free(root);
+    const group = group_ids.main_metadata_group_id;
+    const refs = @import("../sql_completion_references.zig");
+    const owner: refs.Owner = .{ .table_id = 7, .schema_version = 1 };
+    const ids = [_][16]u8{ @splat(1), @splat(2) };
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "physical-original", .schema_json = "{\"version\":1}" } });
+        for (ids) |id| {
+            const bytes = try std.json.Stringify.valueAlloc(a, refs.Command{ .reference_id = id, .owner = owner, .action = .pin }, .{});
+            defer a.free(bytes);
+            try store.preflightSqlCompletionReference(group, bytes);
+            try store.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = bytes });
+            const status = try store.sqlCompletionReferenceJson(a, group, id);
+            defer a.free(status);
+            var parsed = try std.json.parseFromSlice(refs.Status, a, status, .{});
+            defer parsed.deinit();
+            try std.testing.expect(!parsed.value.record.?.complete);
+            try std.testing.expectEqualStrings("physical-original", parsed.value.physical_name.?);
+        }
+        // Retirement and completion publication are one abortable native cut.
+        var aborted = try store.store.beginWriteTxn();
+        try store.removeTableTxn(&aborted, group, 7, 0);
+        aborted.abort();
+        const before = try store.sqlCompletionReferenceJson(a, group, ids[0]);
+        defer a.free(before);
+        var pending = try std.json.parseFromSlice(refs.Status, a, before, .{});
+        defer pending.deinit();
+        try std.testing.expect(!pending.value.record.?.complete);
+        var removal = try store.store.beginWriteTxn();
+        errdefer removal.abort();
+        try store.removeTableTxn(&removal, group, 7, 0);
+        try removal.commit();
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "physical-original", .schema_json = "{\"version\":1}" } });
+    }
+    var restarted = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer restarted.deinit();
+    const snapshot = try restarted.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    const follower_root = try std.fmt.allocPrint(a, "{s}-follower", .{root});
+    defer a.free(follower_root);
+    var follower = try RaftApplyStore.init(a, .{ .root_dir = follower_root });
+    defer follower.deinit();
+    try std.testing.expect(try follower.snapshotBuilder().installSnapshot(a, group, 100, snapshot));
+    const restored = try follower.sqlCompletionReferenceJson(a, group, ids[0]);
+    defer a.free(restored);
+    var restored_status = try std.json.parseFromSlice(refs.Status, a, restored, .{});
+    defer restored_status.deinit();
+    try std.testing.expect(restored_status.value.record.?.complete);
+    for (ids, 0..) |id, index| {
+        const status = try restarted.sqlCompletionReferenceJson(a, group, id);
+        defer a.free(status);
+        var parsed = try std.json.parseFromSlice(refs.Status, a, status, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.record.?.complete);
+        const bytes = try std.json.Stringify.valueAlloc(a, refs.Command{ .reference_id = id, .owner = owner, .action = .acknowledge }, .{});
+        defer a.free(bytes);
+        for (0..2) |_| {
+            try restarted.preflightSqlCompletionReference(group, bytes);
+            try restarted.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = bytes });
+        }
+        const gone = try restarted.sqlCompletionReferenceJson(a, group, id);
+        defer a.free(gone);
+        try std.testing.expectEqualStrings("{\"record\":null,\"physical_name\":null}", gone);
+        if (index == 0) {
+            const other = try restarted.sqlCompletionReferenceJson(a, group, ids[1]);
+            defer a.free(other);
+            try std.testing.expect(!std.mem.eql(u8, gone, other));
+        }
+    }
+    var buf: [200]u8 = undefined;
+    const count_key = try refs.countKey(&buf, group, 7);
+    try std.testing.expectError(error.NotFound, restarted.store.get(a, count_key));
+}
+
+test "system catalog relation namespace transaction SQL restore completion consumers outlive terminal job retention" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/restore-consumers", .{tmp.sub_path});
+    defer a.free(root);
+    const group = group_ids.main_metadata_group_id;
+    const refs = @import("../sql_completion_references.zig");
+    const id: [16]u8 = @splat(3);
+    const owner: refs.Owner = .{ .table_id = 7, .schema_version = 2, .kind = .restore };
+    const logical = restore_job_logical_prefix ++ "0000000000000007";
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = restore_job_logical_prefix ++ "0000000000000009", .value = "opaque legacy record" } });
+    try store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical, .value = "{\"job_id\":7,\"phase\":\"running\",\"staging_attempt_id\":1,\"staging_resolution\":\"active\"}" } });
+    const pin = try std.json.Stringify.valueAlloc(a, refs.Command{ .reference_id = id, .owner = owner, .action = .pin }, .{});
+    defer a.free(pin);
+    try store.preflightSqlCompletionReference(group, pin);
+    try store.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = pin });
+    // A nominal terminal phase still owes native staging cleanup.
+    try store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical, .value = "{\"job_id\":7,\"phase\":\"failed\",\"staging_attempt_id\":1,\"staging_resolution\":\"active\"}" } });
+    const pending = try store.sqlCompletionReferenceJson(a, group, id);
+    defer a.free(pending);
+    var before = try std.json.parseFromSlice(refs.Status, a, pending, .{});
+    defer before.deinit();
+    try std.testing.expect(!before.value.record.?.complete);
+    try store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical, .value = "{\"job_id\":7,\"phase\":\"cancelled\",\"staging_attempt_id\":1,\"staging_resolution\":\"canceled\"}" } });
+    try store.applyStandaloneCommand(group, .{ .remove_restore_job = .{ .key = logical } });
+    try std.testing.expect((try store.getRestoreJobValue(a, group, logical)) == null);
+    const status = try store.sqlCompletionReferenceJson(a, group, id);
+    defer a.free(status);
+    var after = try std.json.parseFromSlice(refs.Status, a, status, .{});
+    defer after.deinit();
+    try std.testing.expect(after.value.record.?.complete);
+    const ack = try std.json.Stringify.valueAlloc(a, refs.Command{ .reference_id = id, .owner = owner, .action = .acknowledge }, .{});
+    defer a.free(ack);
+    try store.preflightSqlCompletionReference(group, ack);
+    try store.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = ack });
+}
+
+test "system catalog relation namespace transaction SQL completion references distinguish initial and generation publication families" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/fk-consumers", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const refs = @import("../sql_completion_references.zig");
+    const plan: [16]u8 = @splat(1);
+    const ids = [_][16]u8{ @splat(1), @splat(2) };
+    const value = try std.json.Stringify.valueAlloc(a, .{ .plan = .{ .id = plan }, .phase = "fencing_child" }, .{});
+    defer a.free(value);
+    {
+        var seed = try store.store.beginWriteTxn();
+        errdefer seed.abort();
+        var buf: [200]u8 = undefined;
+        try seed.put(try fk_generation_publication.key(&buf, group, 7), value);
+        try seed.put(try fk_generation_publication.initialKey(&buf, group, 7), value);
+        try seed.commit();
+    }
+    for (ids, 0..) |id, index| {
+        const command = try std.json.Stringify.valueAlloc(a, refs.Command{ .reference_id = id, .owner = .{ .table_id = 7, .schema_version = if (index == 0) 0 else 2, .kind = if (index == 0) .fk_initial else .fk_generation, .publication_id = plan }, .action = .pin }, .{});
+        defer a.free(command);
+        try store.preflightSqlCompletionReference(group, command);
+        try store.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = command });
+    }
+    {
+        var terminal = try store.store.beginWriteTxn();
+        errdefer terminal.abort();
+        try store.preserveFkCompletionTxn(&terminal, group, 7, plan, false);
+        try terminal.commit();
+    }
+    for (ids, 0..) |id, index| {
+        const status = try store.sqlCompletionReferenceJson(a, group, id);
+        defer a.free(status);
+        var parsed = try std.json.parseFromSlice(refs.Status, a, status, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(index == 1, parsed.value.record.?.complete);
+    }
+}
+
+test "system catalog relation namespace transaction SQL managed reference retirement rejects delayed registration after GC" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/managed-consumers", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const refs = @import("../sql_completion_references.zig");
+    const logical = restore_job_logical_prefix ++ "0000000000000007";
+    try store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical, .value = "{\"job_id\":7,\"phase\":\"succeeded\"}" } });
+    var first: [16]u8 = @splat(1);
+    std.mem.writeInt(u64, first[8..16], 1, .big);
+    var second = first;
+    std.mem.writeInt(u64, second[8..16], 2, .big);
+    const owner: refs.Owner = .{ .table_id = 7, .schema_version = 0, .kind = .restore };
+    const Fixture = struct {
+        fn apply(s: *RaftApplyStore, cmd: refs.Command) !void {
+            const encoded = try std.json.Stringify.valueAlloc(a, cmd, .{});
+            defer a.free(encoded);
+            try s.preflightSqlCompletionReference(group, encoded);
+            try s.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = encoded });
+        }
+    };
+    const original: refs.Command = .{ .managed = true, .reference_id = first, .owner = owner, .action = .pin };
+    try Fixture.apply(&store, original);
+    try Fixture.apply(&store, .{ .managed = true, .reference_id = first, .owner = owner, .action = .acknowledge });
+    const replay = try std.json.Stringify.valueAlloc(a, original, .{});
+    defer a.free(replay);
+    try std.testing.expectError(error.CompletionAcknowledged, store.preflightSqlCompletionReference(group, replay));
+    // The next live consumer advances the producer's durable floor and collects
+    // the acknowledged marker. Replaying the old pin remains a no-op.
+    try Fixture.apply(&store, .{ .managed = true, .retired_through = 1, .reference_id = second, .owner = owner, .action = .pin });
+    var buf: [200]u8 = undefined;
+    try std.testing.expectError(error.NotFound, store.store.get(a, try refs.key(&buf, group, first)));
+    try std.testing.expectError(error.CompletionAcknowledged, store.preflightSqlCompletionReference(group, replay));
+    try store.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = replay });
+    const status = try store.sqlCompletionReferenceJson(a, group, first);
+    defer a.free(status);
+    try std.testing.expectEqualStrings("{\"record\":null,\"physical_name\":null}", status);
+    const count = try store.store.get(a, try refs.countKey(&buf, group, 7));
+    defer a.free(count);
+    try std.testing.expectEqualStrings("1", count);
+}
+
+test "system catalog relation namespace transaction prepared restore consumer precedes admission and survives payload retention" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/restore-consumers", .{tmp.sub_path});
+    defer a.free(root);
+    const group = group_ids.main_metadata_group_id;
+    const refs = @import("../sql_completion_references.zig");
+    const id: [16]u8 = @splat(3);
+    const owner: refs.Owner = .{ .table_id = 7, .schema_version = 2, .kind = .restore };
+    const logical = restore_job_logical_prefix ++ "0000000000000007";
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const prepare = try std.json.Stringify.valueAlloc(a, refs.Command{ .managed = true, .reference_id = id, .owner = owner, .action = .prepare }, .{});
+    defer a.free(prepare);
+    try store.preflightSqlCompletionReference(group, prepare);
+    try store.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = prepare });
+    try store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = restore_job_logical_prefix ++ "0000000000000009", .value = "opaque legacy record" } });
+    try store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical, .value = "{\"job_id\":7,\"phase\":\"running\",\"staging_attempt_id\":1,\"staging_resolution\":\"active\"}" } });
+    // A nominal terminal phase still owes native staging cleanup.
+    try store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical, .value = "{\"job_id\":7,\"phase\":\"failed\",\"staging_attempt_id\":1,\"staging_resolution\":\"active\"}" } });
+    try store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical, .value = "{\"job_id\":7,\"phase\":\"cancelled\",\"staging_attempt_id\":1,\"staging_resolution\":\"canceled\"}" } });
+    try store.applyStandaloneCommand(group, .{ .remove_restore_job = .{ .key = logical } });
+    try std.testing.expect((try store.getRestoreJobValue(a, group, logical)) == null);
+    const pin = try std.json.Stringify.valueAlloc(a, refs.Command{ .reference_id = id, .owner = owner, .action = .pin }, .{});
+    defer a.free(pin);
+    try store.preflightSqlCompletionReference(group, pin);
+    try store.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = pin });
+    const absent = try store.sqlCompletionReferenceJson(a, group, id);
+    defer a.free(absent);
+    var parsed = try std.json.parseFromSlice(refs.Status, a, absent, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.record.?.complete);
+    const ack = try std.json.Stringify.valueAlloc(a, refs.Command{ .managed = true, .reference_id = id, .owner = owner, .action = .acknowledge }, .{});
+    defer a.free(ack);
+    try store.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = ack });
+    try std.testing.expectError(error.CompletionAcknowledged, store.preflightSqlCompletionReference(group, prepare));
+}
+
+test "system catalog relation namespace transaction prepared table and FK consumers survive owner replacement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/future-metadata-owners", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const refs = @import("../sql_completion_references.zig");
+    const plan: [16]u8 = @splat(4);
+    const owners = [_]refs.Owner{
+        .{ .table_id = 7, .schema_version = 2 },
+        .{ .table_id = 8, .schema_version = 0, .kind = .fk_initial, .publication_id = plan },
+        .{ .table_id = 8, .schema_version = 3, .kind = .fk_generation, .publication_id = plan },
+    };
+    for (owners, 0..) |owner_value, index| {
+        const reference: [16]u8 = @splat(@intCast(index + 1));
+        const prepare = try std.json.Stringify.valueAlloc(a, refs.Command{ .reference_id = reference, .owner = owner_value, .action = .prepare }, .{});
+        defer a.free(prepare);
+        try store.preflightSqlCompletionReference(group, prepare);
+        try store.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = prepare });
+        const before = try store.sqlCompletionReferenceJson(a, group, reference);
+        defer a.free(before);
+        var pending = try std.json.parseFromSlice(refs.Status, a, before, .{});
+        defer pending.deinit();
+        try std.testing.expect(!pending.value.record.?.complete);
+    }
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "future-create", .schema_json = "{\"version\":1}" } });
+    try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = 7, .expected_transition_generation = 0 } });
+    {
+        var terminal = try store.store.beginWriteTxn();
+        errdefer terminal.abort();
+        try store.preserveFkCompletionTxn(&terminal, group, 8, plan, true);
+        try store.preserveFkCompletionTxn(&terminal, group, 8, plan, false);
+        try terminal.commit();
+    }
+    for (owners, 0..) |owner_value, index| {
+        const reference: [16]u8 = @splat(@intCast(index + 1));
+        const pin = try std.json.Stringify.valueAlloc(a, refs.Command{ .reference_id = reference, .owner = owner_value, .action = .pin }, .{});
+        defer a.free(pin);
+        try store.preflightSqlCompletionReference(group, pin);
+        try store.applyStandaloneCommand(group, .{ .apply_sql_completion_reference = pin });
+        const after = try store.sqlCompletionReferenceJson(a, group, reference);
+        defer a.free(after);
+        var complete = try std.json.parseFromSlice(refs.Status, a, after, .{});
+        defer complete.deinit();
+        try std.testing.expect(complete.value.record.?.complete);
+    }
 }

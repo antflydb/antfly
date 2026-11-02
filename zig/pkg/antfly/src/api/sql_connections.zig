@@ -191,8 +191,8 @@ pub const Action = union(enum) {
 };
 
 pub fn mutate(store: *transactions.DurableSessionStore, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64) !usize {
-    @import("antfly_platform").sync.lockYielding(&store.sql_connection_mutex);
-    defer store.sql_connection_mutex.unlock();
+    @import("antfly_platform").sync.lockYielding(&store.mutation_mutex);
+    defer store.mutation_mutex.unlock();
     if (store.fail_writes_for_test) return error.InjectedSessionStoreFailure;
     return switch (store.backend) {
         .docstore => |backend| blk: {
