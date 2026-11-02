@@ -68,23 +68,21 @@ def main():
             if write["key"] not in hits(write["text_token"]):
                 raise RuntimeError(f"latest posting absent: {write['key']}")
             latest += 1
-            if write["sequence"] >= 128:
-                previous = (
-                    write["text_token"].rsplit("sequence", 1)[0]
-                    + "sequence"
-                    + str(write["sequence"] - 128)
-                )
+            if previous := write.get("replaced_text_token"):
                 if write["key"] in hits(previous):
                     raise RuntimeError(
                         f"replaced posting still visible: {write['key']}"
                     )
                 old += 1
+        if old == 0:
+            raise RuntimeError("workload recorded no acknowledged text replacements")
         if not db.check()["valid"]:
             raise RuntimeError("read-only integrity failed")
     result = {
         "library_sha256": library_sha256,
         "latest_token_queries_passed": latest,
         "old_token_removals_passed": old,
+        "replacement_reference": "actual acknowledged previous token",
         "readonly_integrity": True,
         "seconds": time.monotonic() - began,
     }

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "local sustained gate passed; final integrated and matched final-host qualification in progress",
+  "status": "local sustained gate passed; local correctness gates passed; matched final-host qualification in progress",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -534,7 +534,44 @@
       "short_debug_wal_bytes": 174905,
       "note": "The subsequent ten-minute gate passed; see local_debug_diagnostics and catch-up receipt"
     },
-    "final_integrated_gates": "pending"
+    "final_integrated_gates": {
+      "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
+      "native_passed": 722,
+      "native_benchmark_skips": 5,
+      "physical_capi_passed": 217,
+      "consumer_capi_passed": 84,
+      "optional_model_skips": 3,
+      "sdk_sql_catalog_concurrency_crash_passed": 205,
+      "stable_runtime_error_passed": 41,
+      "reporting_accounting_passed": 16,
+      "lsm_passed": 611,
+      "lsm_skips": 23,
+      "wal_passed": 100,
+      "wal_simulation_passed": 4,
+      "native_checkpoint_passed": 3,
+      "persistent_passed": 59,
+      "persistent_skip": 1,
+      "artifact_passed": 8,
+      "installed_model_passed": 5,
+      "installed_model_skips": 0,
+      "public_exports": 134,
+      "c_executable_and_shared_library_linkage": "passed",
+      "leaks": 0
+    },
+    "replacement_posting_functional_check": {
+      "library_sha256": "88335f9470b3addb5dd03aa8fcdf82cc932f35321758555e222702229d1bcaa3",
+      "latest_token_queries_passed": 256,
+      "old_token_removals_passed": 256,
+      "readonly_integrity": true,
+      "seconds": 0.3446942500304431
+    }
+  },
+  "local_sustained_final_layout": {
+    "sst_count": 9,
+    "sst_bytes": 33683,
+    "wal_bytes": 17400,
+    "artifact_aliases": 9,
+    "file_bytes": 22945792
   },
   "local_sustained_catchup": {
     "library_sha256": "88335f9470b3addb5dd03aa8fcdf82cc932f35321758555e222702229d1bcaa3",
@@ -909,7 +946,6 @@
     "final_file_bytes": 22945792
   },
   "pending": [
-    "Final integrated native/CAPI/ABI/SDK/model/shared-storage gates",
     "Matched wolfspider Debug and ReleaseFast comparisons",
     "All frozen original-importer inputs and three-writer/one-reader contention",
     "Optimized ten-minute active-write qualification, index catch-up, integrity, search and reopen",

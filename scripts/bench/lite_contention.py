@@ -296,6 +296,9 @@ def native_worker(config, index, ready, start, results, finish=None):
                     last_write = {"key": key, "sequence": sequence}
                     if token:
                         last_write["text_token"] = token
+                        previous = latest_churn_writes.get(key)
+                        if previous is not None:
+                            last_write["replaced_text_token"] = previous["text_token"]
                     if config["workload"] == "churn":
                         latest_churn_writes[key] = last_write
                 except af.BusyError:
