@@ -315,7 +315,13 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         if (req.native_write_read_ahead) {
             var indexed = try @import("serverless/wal/indexed_object_store.zig").IndexedObjectStore.init(a, data_client, req.bucket, req.prefix);
             defer indexed.deinit();
-            return std.json.Stringify.valueAlloc(a, .{ .reads = try indexed.writeReadAhead(a, req.namespace) }, .{});
+            const reads = try indexed.writeReadAhead(a, req.namespace);
+            // Serialization copies descriptors; the request owns their storage.
+            defer {
+                for (reads) |item| a.free(item.key);
+                a.free(reads);
+            }
+            return std.json.Stringify.valueAlloc(a, .{ .reads = reads }, .{});
         }
     }
     const artifact_prefix = try std.fmt.allocPrint(a, "{s}/artifacts", .{req.prefix});

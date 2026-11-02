@@ -304,6 +304,9 @@ test('conditional ROOT supports native plans, bounded read cuts and reopen witho
   assert.equal((await f.call({op:'lookup',doc_id:'one',required_visibility:first.visibility})).body,mutation.mutations[0].body);
   const updated=await f.call({op:'mutate',operation_id:'conditional-second',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"new fence"}'}]});
   assert.equal((await f.call({op:'lookup',doc_id:'one',required_visibility:updated.visibility})).body,'{"text":"new fence"}');
+  // Each nonempty read-ahead result must release its keys and array before
+  // the native request quota is destroyed, including reuse of the same host.
+  for(let i=0;i<4;i++)await f.call({op:'mutate',operation_id:'repeat-'+i,mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"new fence"}'}]});
   await f.call({},'/wipe-platform');await f.reopen();
   assert.equal((await f.call(mutation)).visibility,first.visibility);
   assert.equal((await f.call({op:'lookup',doc_id:'one'})).body,'{"text":"new fence"}');
@@ -322,6 +325,9 @@ test('bounded immutable journal supports native plans, bounded read cuts and reo
   assert.equal((await f.call({op:'lookup',doc_id:'one',required_visibility:first.visibility})).body,mutation.mutations[0].body);
   const updated=await f.call({op:'mutate',operation_id:'conditional-second',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"new fence"}'}]});
   assert.equal((await f.call({op:'lookup',doc_id:'one',required_visibility:updated.visibility})).body,'{"text":"new fence"}');
+  // Each nonempty read-ahead result must release its keys and array before
+  // the native request quota is destroyed, including reuse of the same host.
+  for(let i=0;i<4;i++)await f.call({op:'mutate',operation_id:'repeat-'+i,mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"new fence"}'}]});
   await f.call({},'/wipe-platform');await f.reopen();
   assert.equal((await f.call(mutation)).visibility,first.visibility);
   assert.equal((await f.call({op:'lookup',doc_id:'one'})).body,'{"text":"new fence"}');

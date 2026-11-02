@@ -132,28 +132,36 @@ not establish a hosted latency improvement, bound the first unobserved prefix,
 or provide a continuation inside an ordinary fast batch. Those remain work
 before another hosted qualification attempt.
 
-Validation for this feedback change: 630 Node tests pass, including simulated
-slow-storage capacity recovery. The R2 workerd suite passes 16 of 18 checks,
-including publication failure/retry through HTTP and Queue and exact count/body
-verification. Conditional-root and bounded-journal update tests trap with native
-`unreachable` on a second mutation after publication. Both reproduce using the
-previous committed JavaScript (`eef2a5a18e`) and the same retained WASM modules;
-they are unresolved existing native-path failures, not passing regression checks
-or evidence of a `SQLITE_NOMEM` cause. Preserve those failures before qualifying
-these metadata backends.
+Current validation after the ownership fix: all 630 Node tests and all 18 R2
+workerd checks pass, including simulated slow-storage capacity recovery,
+publication failure/retry through HTTP and Queue, exact count/body verification,
+and repeated updates in both affected backends. The two earlier failures were
+native `unreachable` traps on a second
+mutation after publication in conditional-root and bounded-journal tests, also
+reproduced with previous committed JavaScript and unchanged WASM. A synchronous
+native reproduction isolates the cause: read-ahead succeeds, but its allocated
+keys and result array survive serialization. Request teardown then fails the
+allocator's zero-live-allocation assertion. The fix releases those descriptors
+on both success and serialization failure. Repeated-update coverage exercises
+both metadata backends without changing memory limits or assertion behavior.
+This is a distinct native allocation-ownership defect; it does not establish
+the cause of the historical hosted `SQLITE_NOMEM`.
 
 All 11 Workers, six captured namespaces and four R2 buckets have explicit scoped
-404 absence checks; three disposable app-token files are removed. Two export
-configurations remain pending: deployment authentication returns 403 for their
-deletion, and automatic approval review blocked the separately protected account
-credential. Runtime-only cleanup keeps that outstanding obligation in its manifest
-rather than falsely reporting complete cleanup. Local setup reports, postmortem
-windows, hashes and cleanup receipts are retained. Diagnostic coverage is partial.
+404 absence checks; three disposable app-token files are removed. After the
+operator changed approval settings, the existing account credential was used only
+in memory to delete the two remaining export configurations and verify their
+absence. This deployment cleanup is complete. The original sealed manifests keep
+their historical partial-cleanup state; a separate final destination receipt
+records completion without rewriting failed-run evidence. Local setup reports,
+postmortem windows, hashes and cleanup receipts are retained. Diagnostic coverage
+is partial.
 
 ## Current modules and next sequence
 
 The latest main integration includes lazy navigation and reclaimer-aware quotas.
-Current rebuilt full/compact/observe module SHA-256 values are:
+The full/compact/observe module SHA-256 values used for the retained local
+latency comparison are:
 
 - `d7f626e64130eb9253840fe14ff1b7e48b7a4c9fe7118f4adf07a33c143a11ec`
 - `e8022a42b86f0996acf132df7a3e19d93c0753c9999f9432fcbb253b375cc4e1`
@@ -161,14 +169,16 @@ Current rebuilt full/compact/observe module SHA-256 values are:
 
 The preceding integration passed 623 JavaScript tests, 209 object-store checks
 (two provider skips), 96 graph/page, 16 read-state, 14 publication/plan, 27 native
-host contracts and six actual-workerd checks. Current rebuilt-module validation passes all 625 JavaScript tests and 27 native
-host contracts. The actual-workerd comparison below exercises reconstruction and
+host contracts and six actual-workerd checks. That comparison's rebuilt-module
+validation passed all 625 JavaScript tests and 27 native host contracts. The
+actual-workerd comparison below exercises reconstruction and
 concurrent reads/writes on those exact rebuilt modules; it does not rerun every
 earlier native/provider suite.
 The approved control remains immutable; rebuilt modules do not replace its bytes.
 
-The current short local comparison completed both execution orders on the rebuilt
-modules above, four tenants of 512 documents, 20 ms injected storage delay and
+The retained short local comparison completed both execution orders on the
+modules above (before the read-ahead ownership fix), four tenants of 512
+documents, 20 ms injected storage delay and
 zero-delay setup. It offered 128 reads at 16 reads/s with one write per sixteen
 reads, per case, using fresh stores and required fences plus latest-read checks.
 
