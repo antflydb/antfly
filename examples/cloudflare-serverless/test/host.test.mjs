@@ -1257,3 +1257,56 @@ test('fresh WAL point updates and deletes defer base facts I/O, including resume
  await assert.rejects(cold.request(native('lookup',{doc_id:'stable',required_visibility:changed.visibility})));assert.ok(denied>0,'a base miss must still authenticate its published facts');
  forbid=false;assert.equal((await(await setup(bucket)).host.request(native('lookup',{doc_id:'stable',required_visibility:changed.visibility}))).body,body('stable'));
 });
+
+
+test('hosted WAL collection retains every external payload page',async()=>{
+ const {host,bucket}=await setup(),body=JSON.stringify({text:'large live payload',data:'x'.repeat(600*1024)});
+ await host.request(request('mutate',{operation_id:'external-payload',mutations:[{kind:'upsert',doc_id:'large',body}]}));
+ const plan=await host.request(request('gc_wal',{gc_id:'c'.repeat(32),gc_keep_from:'1'})),pending=[...plan.roots],marked=new Set();
+ for(let i=0;i<pending.length;i++){
+  assert.ok(i<1000,'bounded trace must terminate');
+  const result=await host.request(request('gc_trace',{gc_task:pending[i]}));
+  if(result.key)marked.add(result.key);for(const key of result.keys??[])marked.add(key);pending.push(...(result.children??[]));
+ }
+ // Use the real sweep's retired-epoch predicate. Keep the live HEAD and all
+ // reachable pages, then verify the retained transaction is still readable.
+ for(const key of [...bucket.objects.keys()])if(key.startsWith(plan.wal_prefix)){
+  const epoch=key.slice(plan.wal_prefix.length).split('/')[0];
+  if(/^[a-f0-9]{16}$/.test(epoch)&&BigInt('0x'+epoch)<BigInt(plan.retired_before)&&!marked.has(key)){await bucket.delete(key);}
+ }
+ assert.equal((await host.request(request('lookup',{doc_id:'large'}))).body,body);
+ assert.ok(marked.size>=6,'record, receipt, payload root and chunks are all traced');
+});
+
+test('pooled hosts isolate physical bindings while keeping warm state across wrappers',async()=>{
+ const stores=[];
+ for(const text of['physical A','physical B']){
+  const bucket=new Bucket(),transport=createR2Transport({database:bucket}),writer=await instantiateHost(module,transport);
+  const body=JSON.stringify({text});await writer.request(request('mutate',{operation_id:'same',mutations:[{kind:'upsert',doc_id:'same',body}]}));await writer.request(request('publish'));
+  stores.push({bucket,transport,body});
+ }
+ for(const resident of[false,true])for(const explicitScope of[false,true]){
+  const pooled=await instantiateHost(module,null),samples=[];
+  for(const index of[0,0,1,1,0]){
+   const store=stores[index],transport=explicitScope?((req,body)=>store.transport(req,body)):store.transport;
+   const result=await pooled.request(request('lookup',{doc_id:'same',resident_read_state:resident}),{transport,...(explicitScope?{storageScope:store.bucket}:{}),onMetrics:sample=>samples.push(sample)});
+   assert.equal(result.body,store.body);
+  }
+  assert.ok(samples[1].decoded_manifest_cache_hits>0,'stable binding retains the decoded manifest across request wrappers');
+  if(resident)assert.ok(samples[1].resident_read_cache_hits>0);
+ }
+});
+
+
+test('hosts without the storage-binding ABI reject physical rebinding and remain usable for their original scope',async()=>{
+ // Model an older module by removing only the optional reset export. The
+ // native serving paths and caches are otherwise the real compiled engine.
+ const bytes=await readFile(new URL('../dist/antfly-serverless.wasm',import.meta.url)),name=Buffer.from('antfly_host_bind_storage_scope'),at=bytes.indexOf(name);
+ assert.ok(at>=0);bytes[at]='x'.charCodeAt(0);
+ const legacy=await WebAssembly.compile(bytes);assert.ok(!WebAssembly.Module.exports(legacy).some(e=>e.name===name.toString()));
+ const host=await instantiateHost(legacy,null),a=await setup(),b=await setup();
+ assert.equal((await host.request(request('latest'),{transport:a.transport})).visibility.slice(-16),'0000000000000000');
+ await assert.rejects(host.request(request('latest'),{transport:b.transport}),/StorageBindingScopeUnsupported/);
+ await assert.rejects(host.request(request('latest'),{transport:a.transport,storageScope:'untrusted JSON scope'}),/invalid storage scope/);
+ assert.equal(host.usable(),true);assert.equal((await host.request(request('latest'),{transport:a.transport})).visibility.slice(-16),'0000000000000000');
+});

@@ -996,3 +996,30 @@ test('publication preparation permits exactly its immutable manifest and rejects
  assert.throws(()=>withNativeReadPreparation(()=>{},{manifestKey:'antfly/progress/docs/HEAD'}),/InvalidImmutableManifestKey/);
  assert.equal(calls.length,1);
 });
+
+
+test('speculative preparations drain capacity for the oldest larger reservation', async () => {
+ const {withNativeReadPlanPermit}=await import('../native-read-plan.mjs');
+ const MiB=1024*1024,kernel={maxReservedBytes:32*MiB,slots:Array(4).fill({}),pending:[],drain(){}},releases=[],finishes=[],order=[];
+ const run=(name,bytes,signal)=>withNativeReadPlanPermit(kernel,bytes,async(_,release)=>{order.push(name);releases.push(release);await new Promise(resolve=>finishes.push(resolve));},{deadlineMs:Date.now()+30000,signal});
+ const work=[run('a',8*MiB),run('b',8*MiB),run('c',8*MiB)];
+ const tick=()=>new Promise(resolve=>setImmediate(resolve));
+ await tick();work.push(run('large',16*MiB),run('small',8*MiB));
+ releases[0]();await tick();assert.deepEqual(order,['a','b','c'],'later small work must not steal released capacity');
+ releases[1]();await tick();assert.deepEqual(order,['a','b','c','large']);
+ releases[2]();await tick();assert.deepEqual(order,['a','b','c','large','small']);
+ for(const finish of finishes)finish();await Promise.all(work);
+ assert.equal(kernel.waitingReadPlans,0);assert.equal(kernel.capacityListeners.size,0);
+});
+
+test('canceling a blocked speculative head immediately admits the next reservation',async()=>{
+ const{withNativeReadPlanPermit}=await import('../native-read-plan.mjs');
+ const MiB=1024*1024,kernel={maxReservedBytes:32*MiB,slots:Array(4).fill({}),pending:[],drain(){}},held=[],cancel=new AbortController();
+ const run=bytes=>withNativeReadPlanPermit(kernel,bytes,async()=>new Promise(resolve=>held.push(resolve)));
+ const work=[run(8*MiB),run(8*MiB)];await new Promise(resolve=>setImmediate(resolve));
+ const blocked=withNativeReadPlanPermit(kernel,16*MiB,async()=>assert.fail('canceled reservation ran'),{signal:cancel.signal});
+ const rejected=assert.rejects(blocked,/DeadlineExceeded/);let started=false;
+ const next=withNativeReadPlanPermit(kernel,8*MiB,async()=>{started=true;});
+ await new Promise(resolve=>setImmediate(resolve));assert.equal(started,false);cancel.abort();await rejected;await next;assert.equal(started,true);
+ for(const release of held)release();await Promise.all(work);assert.equal(kernel.waitingReadPlans,0);assert.equal(kernel.capacityListeners.size,0);
+});

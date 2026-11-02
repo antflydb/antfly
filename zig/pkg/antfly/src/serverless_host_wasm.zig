@@ -22,6 +22,12 @@ const wal_types = @import("serverless/wal/types.zig");
 const visibility = @import("serverless/visibility.zig");
 const a = std.heap.wasm_allocator;
 
+// The WAL-only kernel is stateless between calls; richer kernels provide the
+// same binding ABI with an explicit reset of all persistent serving caches.
+export fn antfly_host_bind_storage_scope(binding: u64) void {
+    if (comptime @hasDecl(@import("root"), "bindStorageScope")) @import("root").bindStorageScope(binding);
+}
+
 export fn antfly_host_alloc(len: usize) usize {
     const bytes = a.alloc(u8, len) catch return 0;
     return @intFromPtr(bytes.ptr);

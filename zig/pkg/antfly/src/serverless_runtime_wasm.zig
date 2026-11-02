@@ -25,6 +25,23 @@ var prepared_reads: @import("serverless/query/read_plan.zig").PreparedCache = .{
 var read_states: @import("serverless/query/read_state_cache.zig").Cache = .{};
 var resident_shard: @import("serverless/query/serving_shard.zig").Shard = .{};
 var serving_scope: ?[32]u8 = null;
+var storage_binding: ?u64 = null;
+fn clearServingCaches() void {
+    decoded_manifests.deinit(wasm_allocator);
+    prepared_reads.deinit(wasm_allocator);
+    resident_shard.deinit(wasm_allocator);
+    read_states.deinit();
+    shared_read_leases = .{};
+    serving_scope = null;
+}
+// Host-only physical binding capability, independent of logical JSON names.
+// Called only while the serialized kernel is idle, before entering a request.
+pub fn bindStorageScope(binding: u64) void {
+    if (storage_binding == null or storage_binding.? != binding) {
+        clearServingCaches();
+        storage_binding = binding;
+    }
+}
 // A kernel is serialized by the host pool. These caches own no request pointers
 // and must never cross a bucket/prefix boundary when a kernel is reused.
 fn prepareServingScope(bucket: []const u8, prefix: []const u8) void {
@@ -37,11 +54,7 @@ fn prepareServingScope(bucket: []const u8, prefix: []const u8) void {
     }
     const digest = hasher.finalResult();
     if (serving_scope == null or !std.mem.eql(u8, &serving_scope.?, &digest)) {
-        decoded_manifests.deinit(wasm_allocator);
-        prepared_reads.deinit(wasm_allocator);
-        resident_shard.deinit(wasm_allocator);
-        read_states.deinit();
-        shared_read_leases = .{};
+        clearServingCaches();
         serving_scope = digest;
     }
 }

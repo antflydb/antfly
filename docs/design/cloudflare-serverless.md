@@ -29,6 +29,16 @@ inputs have aggregate module-wide bounds. Cached kernels rebind transport per
 request; they cannot retain RPC stubs, timers, callbacks or I/O promises owned by
 another invocation. Queued callers receive permits and execute in their own context.
 
+A pooled host also binds native serving caches to a host-only `storageScope`
+object capability before each request. The R2 profile passes the stable physical
+bucket binding, so per-request transport wrappers do not flush warm immutable
+state. A capability change clears decoded manifests, prepared reads, resident
+state, overlays and shared read leases before entering WASM. Logical bucket,
+prefix and incarnation checks still apply within that binding. When no capability
+is supplied, transport function identity is the conservative scope. Older WASM
+modules without the binding ABI reject rebinding rather than reuse uncertain
+state. This capability is never accepted from the query JSON.
+
 `new_sqlite_classes` registers a supported Cloudflare actor namespace. Native R2
 readers/builders do not thereby acquire application SQL authority. The compatibility
 profile in `wrangler.jsonc` and the native profile in `wrangler.r2.jsonc` are distinct.
@@ -82,6 +92,13 @@ groups share paths and commit work without weakening all-or-nothing keyed replay
 Model calls remain outside the commit section. A lost unkeyed response is ambiguous;
 unkeyed ingestion must not invent an idempotency identity or silently retry.
 
+Native lake CDC admission owns one format-selected WAL handle and one captured
+HEAD/receipt observation across source/schema validation and conditional append.
+The captured revision is used only on the first CAS attempt; contention reloads
+HEAD and receipts before retrying. The original root lifetime is never renewed.
+Exact receipts resolve before current-schema/coverage policy, including after body
+retirement; ambiguous commit responses reconcile against a fresh receipt.
+
 Publication continues within large records and postings, not just between records.
 Prepared slices, adaptive byte/work budgets and packed immutable batches reuse
 native decoders and canonical checksums. Small bodies may reuse canonical bytes
@@ -97,6 +114,12 @@ fences and ownership transitions invalidate uncertain views. Dependency loaders
 hold physical reservations until actual completion, even after logical timeout;
 late resource errors remain reportable.
 
+Speculative read preparations have a bounded FIFO permit queue. An older larger
+reservation drains capacity before later smaller reservations, and cancellation
+removes its queue entry immediately. This queue keeps one eight-MiB authority
+lane outside its byte and slot budgets, including while prepared queries wait
+for fresh admission. It transfers permits, never request-owned I/O.
+
 `RESIDENT_COLD_PIPELINE` adds compressed committed bootstrap headers, combined
 metadata projection and cohort-wide dependency discovery. Native decoding validates
 checksums, sizes, ranges and conditions. Missing hints fall back to authoritative
@@ -111,6 +134,12 @@ R2-only storage or an SQLite-memory fix. Dirty intent precedes R2 advancement;
 application acknowledgment still follows R2 commit. Clean checkpoint export is
 try-only maintenance, so it cannot hold the metadata queue waiting for foreground
 capacity. Full state transitions are in [durability](antfly-object-storage-backend.md).
+
+WAL collection uses the same native edge decoder in hosted and native collectors:
+it follows structural page children and external record payload descriptors.
+Payload trees stay in the WAL's epoch and authenticated page namespace. Hosted
+traversal retains its entry offsets and bounded continuation tasks; neither
+collector may sweep payload chunks while a protected WAL root references them.
 
 ## Rollout and source ownership
 

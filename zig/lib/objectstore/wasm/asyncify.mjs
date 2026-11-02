@@ -17,6 +17,19 @@
 // restores the original computation instead of re-executing writes or queries.
 import { ObjectStoreError } from "./r2.mjs";
 import { validatePutBatch, executePutBatch, validateGetBatch, executeGetBatch } from "./batch.mjs";
+// Unforgeable host capabilities: no request JSON or caller-chosen string can
+// alias a different physical binding. IDs are unique for this host module.
+const storageScopes = new WeakMap();
+let nextStorageScope = 1n;
+function storageScopeId(scope) {
+  if ((typeof scope !== "object" || scope === null) && typeof scope !== "function") throw new TypeError("invalid storage scope");
+  let id = storageScopes.get(scope);
+  if (id == null) {
+    if (nextStorageScope > 0xffffffffffffffffn) throw new Error("StorageScopeExhausted");
+    storageScopes.set(scope, id = nextStorageScope++);
+  }
+  return id;
+}
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 export async function instantiateHost(module, transport, { batchConcurrency = 4, stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now, refreshClock = (delayMs = 0) => new Promise(resolve => setTimeout(resolve, delayMs)) } = {}) {
@@ -32,7 +45,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
     bytes(ptr, value.byteLength).set(value);
     return ptr;
   }
-  let lastWall = 0, invalidClock = false;
+  let lastWall = 0, invalidClock = false, boundStorageScope = null;
   function exchange(ptr, len, bodyPtr, bodyLen, replyPtr, handler, objectOperation = false) {
       if (wasm.asyncify_get_state() === 2) {
         wasm.asyncify_stop_rewind();
@@ -126,7 +139,7 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
       if (options.signal?.aborted) abort(); else arm();
     });
   }
-  async function request(value, { transport: requestTransport = transport, signal,
+  async function request(value, { transport: requestTransport = transport, storageScope = requestTransport, signal,
     inference, drainTransport, background, onIoSettled, onMetrics: requestMetrics = onMetrics, deadlineMs = clock() + 30000, maxOperations = 1024, maxTransferBytes = 32 * 1024 * 1024 } = {}) {
     const unusable = poisoned || invalidClock;
     if (busy || unusable) throw new Error(unusable ? "WASM instance is unusable" : "WASM instance is busy");
@@ -137,6 +150,13 @@ export async function instantiateHost(module, transport, { batchConcurrency = 4,
     // Serialize before taking the execution lane: caller errors such as a
     // circular value must not leave an otherwise idle instance busy.
     const input = encoder.encode(JSON.stringify(value));
+    const scope = storageScopeId(storageScope);
+    if (scope !== boundStorageScope) {
+      if (wasm.antfly_host_bind_storage_scope) wasm.antfly_host_bind_storage_scope(scope);
+      // Older modules cannot safely switch physical bindings with warm state.
+      else if (boundStorageScope != null) throw new Error("StorageBindingScopeUnsupported");
+      boundStorageScope = scope;
+    }
     busy = true;
     activeTransport = requestTransport;
     activeOptions = { signal, deadlineMs, maxOperations, maxTransferBytes, inference };

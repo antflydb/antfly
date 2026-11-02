@@ -272,6 +272,18 @@ pub const ObjectStore = struct {
         indexed.cancellation = self.cancellation;
         self.indexed = indexed;
     }
+    /// Complete a read-only opener's format selection before its first write.
+    /// Existing selections are cached; only a pristine namespace needs a CAS.
+    pub fn initializeIndexed(self: *ObjectStore) !void {
+        const indexed = self.indexed orelse return error.WalNotConfigured;
+        const wanted: Layout = if (self.prefix.len == 0)
+            (if (indexed.managed_reads) .managed_indexed_relative else .indexed_relative)
+        else
+            (if (indexed.managed_reads) .managed_indexed else .indexed);
+        // Preserve any already selected relative or historical layout.
+        const selected = self.layout.load(.acquire);
+        try self.ensureLayout(if (selected != 0) @fromBackingInt(@intCast(selected)) else wanted, true);
+    }
     pub fn deinit(self: *ObjectStore) void {
         if (self.indexed) |value| {
             value.deinit();

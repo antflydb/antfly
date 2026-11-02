@@ -83,25 +83,56 @@ pub const Store = struct {
         defer wal.deinit();
         return wal.indexed.?.findIdempotent(namespace, 0, payload, id);
     }
+    /// One format check and one HEAD/receipt observation for the whole CDC
+    /// admission. The Store (and its cancellation context) must outlive it.
+    pub fn beginAdmission(self: *const Store, a: A, id: []const u8, payload: []const u8) !Admission {
+        var wal = try self.open(a, false);
+        errdefer wal.deinit();
+        const observation = try wal.indexed.?.beginAdmission(namespace, 0, payload, id);
+        return .{ .wal = wal, .observation = observation, .context = &self.context };
+    }
+    pub const Admission = struct {
+        wal: ObjectWal,
+        observation: IndexedWal.Admission,
+        context: *const catalog.types.Context,
+        pub fn deinit(self: *@This()) void {
+            self.observation.deinit();
+            self.wal.deinit();
+        }
+        pub fn latest(self: *@This(), a: A) !?Record {
+            const cut = self.observation.captured;
+            if (cut.snapshot.latest_lsn < cut.snapshot.first_lsn) return null;
+            const rows = try self.wal.indexed.?.readCapturedRangeAlloc(a, namespace, cut, .{ .start_lsn = cut.snapshot.latest_lsn, .end_lsn = cut.snapshot.latest_lsn, .max_records = 1, .max_bytes = 32 * 1024 * 1024, .cancellation = catalog.types.contextCancellation(self.context) });
+            const records = try Store.adaptRows(a, rows);
+            defer a.free(records);
+            return records[0];
+        }
+        pub fn append(self: *@This(), covered_lsn: u64) !u64 {
+            if (self.observation.accepted) |accepted| return accepted;
+            try self.context.ensureActive();
+            const latest_lsn = self.observation.captured.snapshot.latest_lsn;
+            if (covered_lsn > latest_lsn) return error.LakeWalCoverageGap;
+            if (latest_lsn - covered_lsn >= max_pending) return error.LakeIngestionBackpressure;
+            const indexed = self.wal.indexed.?;
+            indexed.max_new_lsn = std.math.add(u64, covered_lsn, max_pending) catch return error.InvalidWal;
+            try self.wal.initializeIndexed();
+            return (self.observation.append() catch |err| {
+                // A lost ACK may follow the atomic HEAD CAS. Reconcile only
+                // that exceptional path against a fresh durable receipt.
+                if (try indexed.findIdempotent(namespace, 0, self.observation.payload, self.observation.operation_id)) |accepted| return accepted;
+                return switch (err) {
+                    error.PublicationLagExceeded => error.LakeIngestionBackpressure,
+                    else => err,
+                };
+            }) orelse error.LakeCheckpointConflict;
+        }
+    };
     pub fn append(self: Store, a: A, id: []const u8, payload: []const u8, expected_lsn: u64, covered_lsn: u64) !u64 {
-        var wal = try self.open(a, true);
-        defer wal.deinit();
-        const indexed = wal.indexed.?;
-        if (try indexed.findIdempotent(namespace, 0, payload, id)) |accepted| return accepted;
-        const latest_lsn = try indexed.latestLsn(namespace);
-        if (latest_lsn != expected_lsn) return error.LakeCheckpointConflict;
-        if (covered_lsn > latest_lsn) return error.LakeWalCoverageGap;
-        if (latest_lsn - covered_lsn >= max_pending) return error.LakeIngestionBackpressure;
-        indexed.max_new_lsn = std.math.add(u64, covered_lsn, max_pending) catch return error.InvalidWal;
-        return (indexed.appendIdempotentIfLatest(namespace, 0, payload, id, expected_lsn) catch |err| {
-            // A failed response can follow the atomic HEAD commit. A durable
-            // receipt resolves it; replay never creates another transaction.
-            if (try indexed.findIdempotent(namespace, 0, payload, id)) |accepted| return accepted;
-            return switch (err) {
-                error.PublicationLagExceeded => error.LakeIngestionBackpressure,
-                else => err,
-            };
-        }) orelse error.LakeCheckpointConflict;
+        var admission = try self.beginAdmission(a, id, payload);
+        defer admission.deinit();
+        if (admission.observation.accepted) |accepted| return accepted;
+        if (admission.observation.captured.snapshot.latest_lsn != expected_lsn) return error.LakeCheckpointConflict;
+        return admission.append(covered_lsn);
     }
     pub fn pin(self: Store, a: A, cut: u64) !?Head {
         var wal = try self.open(a, false);
@@ -291,4 +322,70 @@ test "external lake unified WAL shares indexed records and rejects an unmarked l
     var listed = try client.listObjects("archive", .{ .prefix = "old/" });
     defer listed.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), listed.entries.len);
+}
+
+test "external lake unified WAL admission reuses format HEAD and receipt observation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Count = struct {
+        var gets: usize = 0;
+        var formats: usize = 0;
+        var heads: usize = 0;
+        fn get(raw: *anyopaque, alloc: A, bucket: []const u8, key: []const u8, opts: objectstore.GetOptions) !objectstore.GetResult {
+            gets += 1;
+            if (std.mem.endsWith(u8, key, "/WAL_FORMAT")) formats += 1;
+            if (std.mem.endsWith(u8, key, "/HEAD")) heads += 1;
+            const memory: *objectstore.MemoryClient = @ptrCast(@alignCast(raw));
+            var inner = memory.client();
+            inner.allocator = alloc;
+            return inner.getObject(bucket, key, opts);
+        }
+    };
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    var vtable = client.vtable.*;
+    vtable.get_object = Count.get;
+    client.vtable = &vtable;
+    const store: Store = .{ .client = client, .bucket = "archive", .prefix = "admission-reads" };
+    _ = try store.append(scratch, "one", "payload one", 0, 0);
+    Count.gets = 0;
+    Count.formats = 0;
+    Count.heads = 0;
+    var admission = try store.beginAdmission(scratch, "two", "payload two");
+    defer admission.deinit();
+    try std.testing.expectEqual(@as(?u64, null), admission.observation.accepted);
+    try std.testing.expectEqualStrings("payload one", (try admission.latest(scratch)).?.payload);
+    try std.testing.expectEqual(@as(u64, 2), try admission.append(0));
+    try std.testing.expectEqual(@as(usize, 1), Count.formats);
+    try std.testing.expectEqual(@as(usize, 1), Count.heads);
+    // One receipt seek plus the two updated tree paths, no repeated admission.
+    try std.testing.expect(Count.gets <= 5);
+}
+
+test "external lake unified WAL admission fences stale validation and reconciles concurrent exact replay" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    const store: Store = .{ .client = memory.client(), .bucket = "archive", .prefix = "admission-cas" };
+    _ = try store.append(scratch, "one", "payload one", 0, 0);
+    var stale = try store.beginAdmission(scratch, "stale", "payload stale");
+    defer stale.deinit();
+    var exact = try store.beginAdmission(scratch, "two", "payload two");
+    defer exact.deinit();
+    _ = try store.append(scratch, "two", "payload two", 1, 0);
+    try std.testing.expectError(error.LakeCheckpointConflict, stale.append(0));
+    try std.testing.expectEqual(@as(u64, 2), try exact.append(0));
+    // Durable receipts survive payload retirement and still precede policy.
+    _ = try store.prune(scratch, 2, 256, false);
+    var replay = try store.beginAdmission(scratch, "two", "payload two");
+    defer replay.deinit();
+    try std.testing.expectEqual(@as(?u64, 2), replay.observation.accepted);
+    try std.testing.expectEqual(@as(u64, 2), try replay.append(999));
+    try std.testing.expectError(error.WalIdempotencyConflict, store.beginAdmission(scratch, "two", "changed"));
 }

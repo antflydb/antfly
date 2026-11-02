@@ -68,7 +68,9 @@ export async function withNativeReadPlanPermit(kernel,bytes,run,{deadlineMs=Date
  let pool=speculativePools.get(kernel);if(!pool){pool={bytes:0,active:0,pending:[]};speculativePools.set(kernel,pool);}
  if(signal?.aborted||Date.now()>=deadlineMs)throw Error('DeadlineExceeded');
  if(pool.pending.length>=64)throw Error('CoordinatorCommitBusy');
- const drain=()=>{if(kernel.pending?.some(job=>(kernel.clock?.()??Date.now())-job.admittedAt>=5000))return;for(let i=0;i<pool.pending.length;){const item=pool.pending[i];if(pool.active>=slots||pool.bytes+item.bytes>capacity){i++;continue;}pool.pending.splice(i,1);item.cleanup();pool.bytes+=item.bytes;pool.active++;kernel.waitingReadPlans=(kernel.waitingReadPlans??0)+1;item.resolve();}};
+ // FIFO prevents a stream of smaller preparations from consuming every
+ // released byte while an older, larger preparation waits for capacity.
+ const drain=()=>{if(kernel.pending?.some(job=>(kernel.clock?.()??Date.now())-job.admittedAt>=5000))return;for(let i=0;i<pool.pending.length;){const item=pool.pending[i];if(pool.active>=slots||pool.bytes+item.bytes>capacity)break;pool.pending.splice(i,1);item.cleanup();pool.bytes+=item.bytes;pool.active++;kernel.waitingReadPlans=(kernel.waitingReadPlans??0)+1;item.resolve();}};
  (kernel.capacityListeners??=new Set()).add(drain);
  await new Promise((resolve,reject)=>{
   let timer;const item={bytes,resolve,cleanup:()=>{clearTimeout(timer);signal?.removeEventListener('abort',cancel);}};

@@ -466,7 +466,7 @@ pub const Collector = struct {
                 defer page.deinit(self.collector.alloc);
                 var children = std.ArrayList(tree.Ref).empty;
                 for (page.entries) |entry| {
-                    if (entry.child) |child| try children.append(self.arena, child.*) else if (try @import("payload.zig").child(self.arena, entry.key, entry.value)) |child| try children.append(self.arena, child);
+                    if (try @import("payload.zig").traceChild(self.arena, entry)) |child| try children.append(self.arena, child);
                 }
                 if (meta.child_offset > children.items.len) return error.InvalidCollectionState;
                 const end = @min(children.items.len, @as(usize, meta.child_offset) + child_chunk);

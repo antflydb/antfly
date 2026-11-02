@@ -148,27 +148,39 @@ pub const IndexedObjectStore = struct {
     }
 
     pub fn append(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8) !u64 {
-        return (try self.commit(namespace, timestamp, payload, null, null)).?;
+        return (try self.commit(namespace, timestamp, payload, null, null, null)).?;
     }
 
     pub fn appendIdempotent(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8, operation_id: []const u8) !u64 {
-        return (try self.commit(namespace, timestamp, payload, operation_id, null)).?;
+        return (try self.commit(namespace, timestamp, payload, operation_id, null, null)).?;
     }
 
     pub fn appendIdempotentIfLatest(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8, operation_id: []const u8, latest: u64) !?u64 {
-        return self.commit(namespace, timestamp, payload, operation_id, latest);
+        return self.commit(namespace, timestamp, payload, operation_id, latest, null);
     }
 
-    fn commit(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8, operation_id: ?[]const u8, expected_latest: ?u64) !?u64 {
+    fn commit(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8, operation_id: ?[]const u8, expected_latest: ?u64, initial: ?*Admission) !?u64 {
         // Bound opaque transaction admission before any object write. Large
         // transactions use authenticated payload pages in this WAL epoch.
         if (payload.len > payload_store.max_bytes) return error.WalRecordTooLarge;
         if (operation_id) |id| if (id.len == 0 or id.len > 4096) return error.InvalidWalOperationId;
         var ctx = try Context.init(self, namespace, null);
         defer ctx.deinit();
-        for (0..self.max_attempts) |_| {
-            var current = try ctx.readHead();
-            defer current.deinit(self.alloc);
+        if (initial) |admission| {
+            if (admission.consumed) return error.WalAdmissionConsumed;
+            admission.consumed = true;
+            if (admission.accepted) |lsn| return lsn;
+            ctx.opened_ns = admission.captured.observed_ns;
+            ctx.bounded_roots = admission.current.value.root_lifetime_ms != null;
+            ctx.pack_enabled = self.packed_pages_enabled or (admission.current.value.packed_pages orelse false);
+        }
+        for (0..self.max_attempts) |attempt| {
+            // Only the first CAS can use the operation-owned observation.
+            // Contention must refresh both HEAD and durable receipts.
+            const borrowed = initial != null and attempt == 0;
+            var current = if (borrowed) initial.?.current else try ctx.readHead();
+            defer if (!borrowed) current.deinit(self.alloc);
+            try Context.check(&ctx);
             ctx.setEpoch(current.value.write_epoch);
             var uploads = tree.Forest{ .alloc = self.alloc, .underlying = ctx.store() };
             defer uploads.deinit();
@@ -178,7 +190,7 @@ pub const IndexedObjectStore = struct {
             var receipt: [48]u8 = undefined;
             std.mem.writeInt(u64, receipt[8..16], timestamp, .little);
             Sha256.hash(payload, receipt[16..48], .{});
-            if (operation_id) |id| {
+            if (!borrowed) if (operation_id) |id| {
                 const found = try self.lookupReceipts(self.alloc, pages, current.value, &.{id});
                 defer self.alloc.free(found);
                 defer if (found[0]) |value| value.deinit(self.alloc);
@@ -189,7 +201,7 @@ pub const IndexedObjectStore = struct {
                     if (committed == 0 or committed > current.value.latest_lsn) return error.InvalidWal;
                     return committed;
                 }
-            }
+            };
             if (expected_latest) |latest| if (current.value.latest_lsn != latest) return null;
             const next = std.math.add(u64, current.value.latest_lsn, 1) catch return error.WalLsnExhausted;
             // Reserve maxInt for the exclusive upper bound and retained floor.
@@ -636,6 +648,48 @@ pub const IndexedObjectStore = struct {
         defer head.deinit(self.alloc);
         return .{ .head = head.value, .snapshot = try describeHead(self.alloc, ctx.domain, head.value), .observed_ns = ctx.opened_ns, .scope = try self.captureScope(namespace) };
     }
+    /// An operation-scoped admission observation. Payload/ID/namespace are
+    /// borrowed until deinit. HEAD's conditional revision and the receipt
+    /// decision stay together; a caller cannot combine unrelated observations.
+    pub const Admission = struct {
+        owner: *IndexedObjectStore,
+        namespace: []const u8,
+        timestamp: u64,
+        payload: []const u8,
+        operation_id: []const u8,
+        current: Snapshot,
+        captured: CapturedHead,
+        accepted: ?u64,
+        consumed: bool = false,
+        pub fn deinit(self: *@This()) void {
+            self.current.deinit(self.owner.alloc);
+        }
+        pub fn append(self: *@This()) !?u64 {
+            return self.owner.commit(self.namespace, self.timestamp, self.payload, self.operation_id, self.current.value.latest_lsn, self);
+        }
+    };
+    pub fn beginAdmission(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8, operation_id: []const u8) !Admission {
+        if (payload.len > payload_store.max_bytes) return error.WalRecordTooLarge;
+        if (operation_id.len == 0 or operation_id.len > 4096) return error.InvalidWalOperationId;
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        var head = try ctx.readHead();
+        errdefer head.deinit(self.alloc);
+        const accepted = try self.findReceipt(ctx.store(), head.value, timestamp, payload, operation_id);
+        return .{ .owner = self, .namespace = namespace, .timestamp = timestamp, .payload = payload, .operation_id = operation_id, .current = head, .accepted = accepted, .captured = .{ .head = head.value, .snapshot = try describeHead(self.alloc, ctx.domain, head.value), .observed_ns = ctx.opened_ns, .scope = try self.captureScope(namespace) } };
+    }
+    fn findReceipt(self: *@This(), pages: tree.Store, head: Head, timestamp: u64, payload: []const u8, operation_id: []const u8) !?u64 {
+        const found = try self.lookupReceipts(self.alloc, pages, head, &.{operation_id});
+        defer self.alloc.free(found);
+        const value = found[0] orelse return null;
+        defer value.deinit(self.alloc);
+        var digest: [32]u8 = undefined;
+        Sha256.hash(payload, &digest, .{});
+        if (value.value.len != 48 or std.mem.readInt(u64, value.value[8..16], .little) != timestamp or !std.mem.eql(u8, value.value[16..48], &digest)) return error.WalIdempotencyConflict;
+        const lsn = std.mem.readInt(u64, value.value[0..8], .little);
+        if (lsn == 0 or lsn > head.latest_lsn) return error.InvalidWal;
+        return lsn;
+    }
     /// Receipt lookup remains available after payload retention. It never
     /// allocates an LSN or mutates HEAD merely to resolve a source retry.
     pub fn findIdempotent(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8, operation_id: []const u8) !?u64 {
@@ -644,17 +698,9 @@ pub const IndexedObjectStore = struct {
         defer ctx.deinit();
         var head = try ctx.readHead();
         defer head.deinit(self.alloc);
-        const found = try self.lookupReceipts(self.alloc, ctx.store(), head.value, &.{operation_id});
-        defer self.alloc.free(found);
-        const value = found[0] orelse return null;
-        defer value.deinit(self.alloc);
-        var digest: [32]u8 = undefined;
-        Sha256.hash(payload, &digest, .{});
-        if (value.value.len != 48 or std.mem.readInt(u64, value.value[8..16], .little) != timestamp or !std.mem.eql(u8, value.value[16..48], &digest)) return error.WalIdempotencyConflict;
-        const lsn = std.mem.readInt(u64, value.value[0..8], .little);
-        if (lsn == 0 or lsn > head.value.latest_lsn) return error.InvalidWal;
-        return lsn;
+        return self.findReceipt(ctx.store(), head.value, timestamp, payload, operation_id);
     }
+
     pub fn readPointAlloc(self: *@This(), a: A, namespace: []const u8, id: []const u8, range: types.ReadRange) !types.PointRead {
         try range.check();
         if (range.start_lsn == 0 or range.end_lsn == std.math.maxInt(u64) or range.start_lsn > range.end_lsn) return error.InvalidWal;
@@ -2236,4 +2282,17 @@ test "serverless indexed unified WAL bounds external point reads and compaction 
     try std.testing.expectEqual(@as(u64, 2), first.value.physical_first_lsn);
     try std.testing.expect(!try wal.compactPrefixStep("docs", 256));
     try std.testing.expectEqual(@as(?u64, 1), try wal.findIdempotent("docs", 0, payload, "first"));
+}
+
+test "serverless multiprovider admission cannot renew an expired managed HEAD" {
+    var fixture: ManagedReadFixture = undefined;
+    try fixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    _ = try fixture.wal.appendIdempotent("docs", 0, "first", "one");
+    var admission = try fixture.wal.beginAdmission("docs", 0, "second", "two");
+    defer admission.deinit();
+    fixture.now_ns += 31 * std.time.ns_per_s;
+    try std.testing.expectError(error.WalSnapshotExpired, admission.append());
+    try std.testing.expectError(error.WalAdmissionConsumed, admission.append());
+    try std.testing.expectEqual(@as(u64, 1), try fixture.wal.latestLsn("docs"));
 }

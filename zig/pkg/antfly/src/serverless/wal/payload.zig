@@ -84,8 +84,15 @@ pub fn load(a: A, pages: tree.Store, encoded: []const u8, limit: usize) ![]u8 {
     return out;
 }
 
-/// A collector follows payload roots only in actual WAL record leaves. Chunk
-/// values carry a distinct fixed magic and cannot be mistaken for WAL records.
+/// All collectors must traverse both structural edges and external record
+/// payload roots. Chunk leaves themselves carry no further references.
+pub fn traceChild(a: A, entry: tree.DecodedEntry) !?tree.Ref {
+    if (entry.child) |ref| return ref.*;
+    return child(a, entry.key, entry.value);
+}
+
+/// Payload roots occur only in actual WAL record leaves. Chunk values carry
+/// distinct fixed magic and cannot be mistaken for WAL records.
 pub fn child(a: A, key: []const u8, value: []const u8) !?tree.Ref {
     if (key.len != 8) return null;
     const record = codec.parseRecord(value, 0) catch return null;

@@ -228,8 +228,8 @@ pub const Context = struct {
                 const end = @min(page.entries.len, task.offset +| @as(usize, if (task.kind == .facts_page) 95 else 128));
                 if (task.offset > page.entries.len) return error.InvalidCollectionTask;
                 for (page.entries[task.offset..end]) |entry| {
-                    if (entry.child) |child| {
-                        try children.append(a, .{ .kind = task.kind, .page = child.*, .vector_dims = task.vector_dims });
+                    if (if (task.kind == .wal_page) try @import("wal/payload.zig").traceChild(a, entry) else if (entry.child) |ref_child| ref_child.* else null) |child| {
+                        try children.append(a, .{ .kind = task.kind, .page = child, .vector_dims = task.vector_dims });
                     } else if (task.kind == .vector_docs_page and entry.value.len != 0 and @import("vector_segment/blocks.zig").isCompact(entry.value)) {
                         const c = try @import("vector_segment/blocks.zig").control(entry.value, task.vector_dims);
                         const id = try c.residual.identity(pages.domain);

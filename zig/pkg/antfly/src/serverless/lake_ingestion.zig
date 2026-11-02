@@ -92,14 +92,16 @@ pub fn accept(a: A, binding: Binding, options: Options, context: Context, body: 
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
     const identity = try std.json.Stringify.valueAlloc(scratch, .{ batch.source, batch.epoch, batch.batch_id }, .{});
     const operation_id = &catalog.types.digestHex(identity);
-    if (try store.find(scratch, operation_id, payload)) |accepted| return accepted;
+    var admission = try store.beginAdmission(scratch, operation_id, payload);
+    defer admission.deinit();
+    if (admission.observation.accepted) |accepted| return accepted;
     // Resolve an acknowledged retry before current-schema or checkpoint tests.
     // Source evolution cannot turn a durable exact replay into a new append.
     var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
     defer current.deinit(a);
     try catalog.row_commit.validate(a, current.table.metadata_json, batch, context);
-    const last = try store.latest(scratch);
-    const latest = if (last) |record| record.lsn else try store.watermark(scratch);
+    const last = try admission.latest(scratch);
+    const latest = admission.observation.captured.snapshot.latest_lsn;
     const covered = try coverage(a, current.table);
     // Retirement may race the catalog read. A missing last body is usable only
     // when this catalog cut proves the complete accepted high watermark.
@@ -123,7 +125,7 @@ pub fn accept(a: A, binding: Binding, options: Options, context: Context, body: 
         }
     }
     try context.ensureActive();
-    return store.append(scratch, operation_id, payload, latest, covered);
+    return admission.append(covered);
 }
 fn keyFieldsEqual(left: []const []const u8, right: []const []const u8) bool {
     if (left.len != right.len) return false;
