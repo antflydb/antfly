@@ -159,24 +159,24 @@ pub fn upload(a: A, files: Files, relative: []const u8, bytes: []const u8) ![]co
     var client = files.client;
     var result = client.putObject(files.bucket, key, bytes, .{ .if_none_match = true, .cancellation = types.contextCancellation(&files.context) }) catch |err| switch (err) {
         error.PreconditionFailed, error.ObjectAlreadyExists => {
-            var existing = try client.getObject(files.bucket, key, .{ .cancellation = types.contextCancellation(&files.context) });
+            var existing = try client.getObject(files.bucket, key, .{ .skip_metadata_probe = true, .cancellation = types.contextCancellation(&files.context) });
             defer existing.deinit(client.allocator);
             if (!std.mem.eql(u8, existing.body, bytes)) return error.LakeArtifactIdentityConflict;
-            return recordOwnership(a, files, relative, bytes, existing.metadata.etag);
+            return recordOwnership(a, files, relative, bytes, existing.metadata.writeRevision());
         },
         else => return err,
     };
     defer result.deinit(client.allocator);
-    return recordOwnership(a, files, relative, bytes, result.etag);
+    return recordOwnership(a, files, relative, bytes, result.writeRevision());
 }
-fn recordOwnership(a: A, files: Files, relative: []const u8, bytes: []const u8, etag: ?[]const u8) ![]const u8 {
+fn recordOwnership(a: A, files: Files, relative: []const u8, bytes: []const u8, revision: ?objectstore.ObjectRevision) ![]const u8 {
     const uri = try std.fmt.allocPrint(a, "{s}/{s}", .{ std.mem.trimEnd(u8, files.uri, "/"), relative });
     const key = try std.fmt.allocPrint(a, "{s}{s}.antfly-owned/{s}.json", .{ files.prefix, if (files.prefix.len == 0) "" else "/", types.digestHex(uri) });
-    const marker = try std.json.Stringify.valueAlloc(a, .{ .uri = uri, .sha256 = &types.digestHex(bytes), .etag = etag, .owner = "antfly-native-lake-v1" }, .{});
+    const marker = try std.json.Stringify.valueAlloc(a, .{ .uri = uri, .sha256 = &types.digestHex(bytes), .revision = revision orelse return error.MissingObjectRevision, .owner = "antfly-native-lake-v2" }, .{});
     var client = files.client;
     var stored = client.putObject(files.bucket, key, marker, .{ .if_none_match = true, .cancellation = types.contextCancellation(&files.context) }) catch |err| switch (err) {
         error.PreconditionFailed, error.ObjectAlreadyExists => {
-            var existing = try client.getObject(files.bucket, key, .{ .cancellation = types.contextCancellation(&files.context) });
+            var existing = try client.getObject(files.bucket, key, .{ .skip_metadata_probe = true, .cancellation = types.contextCancellation(&files.context) });
             defer existing.deinit(client.allocator);
             if (!std.mem.eql(u8, existing.body, marker)) return error.LakeArtifactIdentityConflict;
             return uri;

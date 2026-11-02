@@ -210,7 +210,7 @@ pub const ObjectStore = struct {
         errdefer alloc.free(owned_bucket);
         const owned_prefix = try alloc.dupe(u8, prefix);
         errdefer alloc.free(owned_prefix);
-        const inventory: ?@import("fs_store.zig").FsStore = if (options.filesystem) |fs| value: {
+        const inventory: ?@import("fs_store.zig").FsStore = if (comptime @import("builtin").os.tag == .freestanding) null else if (options.filesystem) |fs| value: {
             if (prefix.len != 0) {
                 if (std.fs.path.isAbsolute(prefix) or std.mem.indexOfScalar(u8, prefix, 0) != null or std.mem.indexOfScalar(u8, prefix, '\\') != null) return error.InvalidObjectPrefix;
                 var components = std.mem.splitScalar(u8, std.mem.trimEnd(u8, prefix, "/"), '/');
@@ -249,9 +249,9 @@ pub const ObjectStore = struct {
         self.verified_objects.deinit(self.alloc);
         self.verified_mu.unlock();
         if (self.owns_client) self.client.deinit();
-        if (self.fs_client) |fs| self.alloc.destroy(fs);
-        if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
-        if (self.s3_client) |s3| self.alloc.destroy(s3);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.fs_client) |fs| self.alloc.destroy(fs);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.s3_client) |s3| self.alloc.destroy(s3);
         self.alloc.free(self.bucket);
         self.alloc.free(self.prefix);
         self.* = undefined;
@@ -267,6 +267,10 @@ pub const ObjectStore = struct {
         return supported;
     }
     fn generation(self: *ObjectStore, id: []const u8, token: CancellationToken) !?[]u8 {
+        if (comptime @import("builtin").os.tag == .freestanding) {
+            if (self.cloud_reader != null or self.cloud_writer != null) return error.HostedObjectVersionUnsupported;
+            return null;
+        }
         // Range reads may borrow an arena-owned store. Reclaim selectors after
         // every request rather than retaining one parse per posting block.
         const a = std.heap.page_allocator;
@@ -289,7 +293,7 @@ pub const ObjectStore = struct {
             .namespace_identity = self.namespace_identity,
             .allocator = self.alloc,
             .ptr = self,
-            .vtable = &vtable,
+            .vtable = if (@import("builtin").os.tag == .freestanding) &hosted_vtable else &vtable,
         };
     }
 
@@ -302,6 +306,7 @@ pub const ObjectStore = struct {
     }
 
     fn putInScope(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        if (comptime @import("builtin").os.tag == .freestanding) return self.putHosted(alloc, scope, contents, cancellation);
         try cancellation.check();
         if (self.read_only) return error.ArtifactStoreReadOnly;
         const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
@@ -355,6 +360,32 @@ pub const ObjectStore = struct {
             .byte_len = @intCast(contents.len),
             .checksum = checksum,
         };
+    }
+
+    fn putHosted(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        try cancellation.check();
+        if (self.read_only) return error.ArtifactStoreReadOnly;
+        const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
+        errdefer alloc.free(checksum);
+        const id = if (scope) |value| try alloc.dupe(u8, &try value.artifactId(checksum)) else try makeArtifactIdAlloc(alloc, checksum);
+        errdefer alloc.free(id);
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, id);
+        defer alloc.free(key);
+        var result = self.client.putObject(self.bucket, key, contents, .{
+            .if_none_match = true,
+            .content_type = "application/octet-stream",
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => {
+                const existing = try self.getBoundedAllocWithCancellation(alloc, id, contents.len, cancellation);
+                defer alloc.free(existing);
+                if (!std.mem.eql(u8, existing, contents)) return error.ArtifactIntegrityMismatch;
+                return .{ .artifact_id = id, .checksum = checksum, .byte_len = contents.len };
+            },
+            else => return err,
+        };
+        defer result.deinit(self.client.allocator);
+        return .{ .artifact_id = id, .checksum = checksum, .byte_len = contents.len };
     }
 
     pub fn getAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
@@ -884,6 +915,28 @@ pub const ObjectStore = struct {
     fn objectStore(raw: *anyopaque) *ObjectStore {
         return @ptrCast(@alignCast(raw));
     }
+    // Hosted stores retain object-backed immutable writes and reads. Native
+    // filesystem retention and versioned-generation capabilities are absent;
+    // deletion requires a separately implemented hosted collection protocol.
+    const hosted_vtable: artifact_store.ArtifactStore.VTable = .{
+        .deinit = erasedDeinit,
+        .put = erasedPut,
+        .put_with_cancellation = erasedPutWithCancellation,
+        .put_scoped = erasedPutScoped,
+        .put_scoped_many = if (@import("builtin").os.tag == .freestanding) erasedPutScopedMany else null,
+        .delete = hostedDeleteUnsupported,
+        .get_alloc = erasedGetAlloc,
+        .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
+        .get_bounded_alloc_with_cancellation = erasedGetBoundedAllocWithCancellation,
+        .get_range_alloc = erasedGetRangeAlloc,
+        .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
+        .stat = erasedStat,
+        .stat_with_cancellation = erasedStatWithCancellation,
+    };
+    fn hostedDeleteUnsupported(_: *anyopaque, _: []const u8) !void {
+        return error.HostedMaintenanceUnsupported;
+    }
+
     const vtable: artifact_store.ArtifactStore.VTable = .{
         .object_store = objectStore,
         .retention_witness = retentionWitness,
@@ -895,6 +948,7 @@ pub const ObjectStore = struct {
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,
         .put_scoped = erasedPutScoped,
+        .put_scoped_many = if (@import("builtin").os.tag == .freestanding) erasedPutScopedMany else null,
         .visit_scoped_uploads = erasedVisitScopedUploads,
         .reclaim_retired_scoped_inventory = erasedReclaimRetiredScopedInventory,
         .get_alloc = erasedGetAlloc,
@@ -924,6 +978,45 @@ pub const ObjectStore = struct {
     fn erasedPutWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.putWithCancellation(alloc, contents, cancellation);
+    }
+
+    fn erasedPutScopedMany(raw: *anyopaque, alloc: std.mem.Allocator, scope: artifact_store.UploadScope, contents: []const []const u8, cancellation: CancellationToken) ![]artifact_store.ArtifactMetadata {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.read_only) return error.ArtifactStoreReadOnly;
+        try cancellation.check();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const metadata = try alloc.alloc(artifact_store.ArtifactMetadata, contents.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (metadata[0..initialized]) |*item| item.deinit(alloc);
+            alloc.free(metadata);
+        }
+        var requests: [8]objectstore.PutObjectRequest = undefined;
+        var count: usize = 0;
+        for (contents, metadata) |bytes, *item| {
+            try cancellation.check();
+            item.* = meta: {
+                const checksum = try sha256StringWithCancellationAlloc(alloc, bytes, cancellation);
+                errdefer alloc.free(checksum);
+                break :meta .{ .checksum = checksum, .artifact_id = try alloc.dupe(u8, &try scope.artifactId(checksum)), .byte_len = bytes.len };
+            };
+            initialized += 1;
+            const key = try keyForArtifactIdAlloc(arena.allocator(), self.prefix, item.artifact_id);
+            const duplicate = for (requests[0..count]) |request| {
+                if (std.mem.eql(u8, request.key, key)) break true;
+            } else false;
+            if (duplicate) continue;
+            requests[count] = .{ .key = key, .body = bytes, .options = .{ .if_none_match = true, .content_type = "application/octet-stream", .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn) } };
+            count += 1;
+        }
+        const uploaded = try self.client.putObjects(self.bucket, requests[0..count]);
+        defer {
+            for (uploaded) |*item| item.deinit(self.client.allocator);
+            self.client.allocator.free(uploaded);
+        }
+        try cancellation.check();
+        return metadata;
     }
 
     fn erasedPutScoped(ptr: *anyopaque, alloc: std.mem.Allocator, scope: artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {

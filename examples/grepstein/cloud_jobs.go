@@ -144,6 +144,7 @@ func cloudJobRequest(client *http.Client, method, endpoint, token string, body a
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "antfly-grepstein/1")
 	req.Header.Set("Authorization", "Bearer "+token)
 	response, err := client.Do(req)
 	if err != nil {
