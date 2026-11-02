@@ -362,9 +362,11 @@ in `scripts/release/platforms.json`; channel behavior lives in
 promotion and retention read those policies instead of maintaining independent
 conditionals or platform tables. PyPI publication of the native CLI installer
 is temporarily paused: `publish_pypi` is false for stable and next. The separate
-`embedded-release-publish.yml` workflow publishes `antfly-embedded` independently,
-after its registry setup is complete. CLI wheels are still built and verified as
-release artifacts. Restore those policy flags to resume CLI PyPI publication.
+`embedded-release-publish.yml` workflow publishes embedded npm, PyPI and crates.io
+packages only for stable releases. Prereleases are authenticated but skip the
+publication dispatch, registry preparation and all credential-bearing publish jobs.
+CLI wheels are still built and verified as release artifacts. Restore those
+policy flags to resume CLI PyPI publication.
 To finish a partially published CLI release under
 the updated policy, use the exact-ledger recovery dispatch from `main`; rerunning
 an old workflow retains its original policy. Python
@@ -559,11 +561,12 @@ RC releases publish:
 - GitHub Release artifacts marked prerelease
 - R2 release artifacts
 - the `next` R2 metadata pointer
-- npm CLI packages with dist-tag `next`
 - container tags `<version>` and `next`
 
-RC releases do not update the `latest` R2 channel, Homebrew stable formula, or
-container `latest` tag.
+CLI npm and embedded npm/PyPI/crates.io publication is stable-only. RCs and other
+prereleases retain their built package snapshots and native archives as release
+artifacts, without uploading package versions to those registries. They do not
+update the `latest` R2 channel, Homebrew stable formula, or container `latest` tag.
 
 Nightly snapshots publish:
 
