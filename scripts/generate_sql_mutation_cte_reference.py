@@ -20,7 +20,12 @@ import argparse
 import json
 from decimal import Decimal
 
-from generate_sql_postgres_reference import FIXTURES, postgres
+from generate_sql_postgres_reference import (
+    ARRAY_TYPES,
+    FIXTURES,
+    array_reference,
+    postgres,
+)
 
 
 def value(item):
@@ -29,6 +34,23 @@ def value(item):
     if isinstance(item, (list, tuple)):
         return [value(cell) for cell in item]
     return item
+
+
+def rows(cursor):
+    """Preserve PostgreSQL array bounds and NULLs from its binary result frame."""
+    result = []
+    for index, row in enumerate(cursor.fetchall()):
+        cells = []
+        for ordinal, (column, cell) in enumerate(
+            zip(cursor.description, row, strict=True)
+        ):
+            raw = cursor.pgresult.get_value(index, ordinal)
+            if raw is not None and column.type_code in ARRAY_TYPES:
+                cells.append(array_reference(raw, column.type_code))
+            else:
+                cells.append(value(cell))
+        result.append(cells)
+    return result
 
 
 def reference():
@@ -396,21 +418,22 @@ def reference():
                     }
                 )
             try:
-                cursor = db.execute(query)
+                cursor = db.execute(query, binary=True)
                 entry["command_tag"] = cursor.statusmessage
                 if cursor.description is not None:
                     entry["columns"] = [
                         {"name": col.name, "oid": col.type_code}
                         for col in cursor.description
                     ]
-                    entry["rows"] = value(cursor.fetchall())
+                    entry["rows"] = rows(cursor)
             except Error as error:
                 entry["sqlstate"] = error.sqlstate
             entry["tables"] = {
-                table: value(
+                table: rows(
                     db.execute(
-                        "SELECT id,status,v,a,n FROM " + table + " ORDER BY id"
-                    ).fetchall()
+                        "SELECT id,status,v,a,n FROM " + table + " ORDER BY id",
+                        binary=True,
+                    )
                 )
                 for table in ("usage_records", "source_records", "archived_records")
             }

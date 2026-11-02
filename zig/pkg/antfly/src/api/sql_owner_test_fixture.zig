@@ -243,7 +243,10 @@ pub const Context = struct {
     progress: [4]*raft.ManagedProgressDriver,
 
     pub fn checkDrivers(self: *const Context) !void {
-        for (self.progress) |driver| try driver.check();
+        // A slow durable round is a readiness observation, not a failed owner.
+        // Let the same owner finish within each request's bounded deadline;
+        // restarting or abandoning it at the health threshold loses evidence.
+        for (self.progress) |driver| try driver.checkFailure();
     }
 };
 

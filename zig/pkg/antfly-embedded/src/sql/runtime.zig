@@ -2384,7 +2384,7 @@ pub const Context = struct {
                 for (table.columns, all) |column, *name| name.* = column.name;
                 break :blk all;
             };
-            const projection = try @import("document_row.zig").Projection.init(a, table, names);
+            const projection = try @import("document_row.zig").Projection.initPrepared(a, table, names);
             return .{ .table = table, .projection = projection, .layout = try projection.pageLayout(a), .write_version = write_version };
         }
 
@@ -3515,11 +3515,18 @@ fn mutationArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     try std.testing.expect(array.flatCell(1).sql_null);
     try std.testing.expectEqualStrings("2", array.flatCell(2).value.object.get("x").?.array.items[1].number_string);
     try std.testing.expect(!(try row.cell("j")).sql_null);
+    // Scalar-only postimages still canonicalize exact integer lexemes. A
+    // narrow projection must not decode or retain an unrequested array.
+    var narrow_object: std.json.ObjectMap = .empty;
+    try narrow_object.put(a, "n", .{ .number_string = "3" });
+    try narrow_object.put(a, "a", .{ .string = "unrequested array" });
+    const narrow_mutation: catalog.Mutation = .{ .key = "key", .expected_version = 0, .row = .{ .object = narrow_object } };
     const narrow = try Context.ReturningImages.init(a, table, &.{"n"});
-    try std.testing.expect(!narrow.projection.has_typed_cells);
-    const scalar_row = try narrow.row(a, mutation, mutation);
-    try std.testing.expect(scalar_row.typed_cells == null);
-    try std.testing.expectEqual(@as(i64, 3), (try scalar_row.cell("n")).value.integer);
+    const scalar_row = try narrow.row(a, narrow_mutation, narrow_mutation);
+    try std.testing.expectEqual(@as(usize, 1), scalar_row.typed_cells.?.values.len);
+    const scalar_cell = try scalar_row.cell("n");
+    try std.testing.expect(scalar_cell.value == .integer);
+    try std.testing.expectEqual(@as(i64, 3), scalar_cell.value.integer);
 }
 
 test "SQL mutation array boundary owns payloads and unwinds every allocation failure" {
@@ -9177,4 +9184,8 @@ test "SQL statement effect CTE receipt dependencies include producers below zero
     try std.testing.expect(try describe.findPhysicalTable(description.binding, 99999) == null);
     try std.testing.expectEqual(@as(usize, 0), provider.base.statement_opens);
     try std.testing.expectEqual(@as(usize, 0), provider.begins);
+}
+
+comptime {
+    if (@import("builtin").is_test) _ = @import("mutation_returning.zig");
 }

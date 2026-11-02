@@ -15,18 +15,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -35,18 +52,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -89,18 +123,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -109,18 +160,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -174,18 +242,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -194,18 +279,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -255,18 +357,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -275,18 +394,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -355,18 +491,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -375,18 +528,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -455,18 +625,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -475,18 +662,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -549,18 +753,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -569,18 +790,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -649,18 +887,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -669,18 +924,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -723,18 +995,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -743,18 +1032,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -797,18 +1103,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -817,18 +1140,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -871,18 +1211,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -891,18 +1248,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -945,18 +1319,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -965,18 +1356,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1030,18 +1438,35 @@
             "a",
             "queued",
             2,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             3,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1050,18 +1475,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1115,18 +1557,35 @@
             "a",
             "queued",
             2,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             3,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1135,18 +1594,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1189,18 +1665,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1209,18 +1702,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1263,18 +1773,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1283,18 +1810,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1337,18 +1881,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1357,18 +1918,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1411,18 +1989,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1431,18 +2026,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1501,18 +2113,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1521,7 +2150,11 @@
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1592,18 +2225,35 @@
             "a",
             "merged",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "merged",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1612,18 +2262,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1681,17 +2348,34 @@
       "rows": [
         [
           "a",
-          [
-            1,
-            null,
-            3
-          ],
+          {
+            "dimensions": [
+              {
+                "length": 3,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "1",
+              null,
+              "3"
+            ],
+            "sql_nulls": [
+              false,
+              true,
+              false
+            ]
+          },
           "9007199254740993.0101",
           "9007199254740993.0101"
         ],
         [
           "b",
-          [],
+          {
+            "dimensions": [],
+            "values": [],
+            "sql_nulls": []
+          },
           null,
           null
         ]
@@ -1702,18 +2386,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1722,18 +2423,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0101"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1787,18 +2505,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1807,18 +2542,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1885,18 +2637,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1905,18 +2674,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1962,18 +2748,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -1982,18 +2785,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2031,18 +2851,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2051,18 +2888,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2112,18 +2966,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2132,18 +3003,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2215,18 +3103,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2235,18 +3140,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2309,18 +3231,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2329,18 +3268,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2409,18 +3365,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2429,18 +3402,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2500,18 +3490,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2520,18 +3527,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2581,18 +3605,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2601,18 +3642,35 @@
             "a",
             "ready",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "ready",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2655,18 +3713,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2675,18 +3750,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2729,18 +3821,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2749,18 +3858,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2803,18 +3929,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2823,18 +3966,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2877,18 +4037,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2897,18 +4074,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2965,18 +4159,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -2985,18 +4196,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3039,18 +4267,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3059,18 +4304,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3113,18 +4375,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3133,18 +4412,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3187,18 +4483,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3207,18 +4520,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3261,18 +4591,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3281,18 +4628,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3335,18 +4699,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3355,18 +4736,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3420,18 +4818,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3440,18 +4855,35 @@
             "a",
             "queued",
             2,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             3,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3514,18 +4946,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3604,18 +5053,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3674,18 +5140,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3694,18 +5177,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3748,18 +5248,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3768,18 +5285,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3822,18 +5356,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3842,18 +5393,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3907,18 +5475,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3927,18 +5512,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -3988,18 +5590,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4008,18 +5627,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4073,18 +5709,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4093,18 +5746,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4173,18 +5843,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4193,18 +5880,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4247,18 +5951,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4267,18 +5988,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4335,18 +6073,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4355,18 +6110,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4409,18 +6181,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4429,18 +6218,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4483,18 +6289,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4503,18 +6326,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4557,18 +6397,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4577,18 +6434,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4631,18 +6505,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4651,18 +6542,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4712,18 +6620,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4732,18 +6657,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4812,18 +6754,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4832,18 +6791,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4912,18 +6888,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -4932,18 +6925,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5001,18 +7011,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5021,18 +7048,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5089,18 +7133,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5109,18 +7170,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5178,18 +7256,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5198,18 +7293,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5252,18 +7364,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5272,18 +7401,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5326,18 +7472,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5346,18 +7509,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5400,18 +7580,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5420,18 +7617,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5474,18 +7688,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5494,18 +7725,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5548,18 +7796,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5568,18 +7833,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5629,18 +7911,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5649,18 +7948,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5714,18 +8030,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5734,18 +8067,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5799,18 +8149,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5819,18 +8186,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5873,18 +8257,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5893,18 +8294,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5961,18 +8379,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -5981,18 +8416,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -6035,18 +8487,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -6055,18 +8524,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -6109,18 +8595,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -6129,18 +8632,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -6194,18 +8714,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -6214,18 +8751,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -6276,18 +8830,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],
@@ -6296,18 +8867,35 @@
             "a",
             "queued",
             1,
-            [
-              1,
-              null,
-              3
-            ],
+            {
+              "dimensions": [
+                {
+                  "length": 3,
+                  "lower_bound": 1
+                }
+              ],
+              "values": [
+                "1",
+                null,
+                "3"
+              ],
+              "sql_nulls": [
+                false,
+                true,
+                false
+              ]
+            },
             "9007199254740993.0100"
           ],
           [
             "b",
             "closed",
             2,
-            [],
+            {
+              "dimensions": [],
+              "values": [],
+              "sql_nulls": []
+            },
             null
           ]
         ],

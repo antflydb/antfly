@@ -59,6 +59,12 @@ def reference():
             "entries"
         ]
     }
+    # The original removes an existing boolean JSONB member. The parser-derived
+    # campaign uses a text placeholder for paths; native execution must declare
+    # the real seed type rather than fail ingestion before running the SQL.
+    schemas["sql-0900"]["document_schemas"]["doc"]["schema"]["properties"]["obsolete"][
+        "type"
+    ] = "boolean"
     entries = []
     with postgres() as db:
         db.execute("CREATE SCHEMA antfly")

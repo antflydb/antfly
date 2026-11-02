@@ -4614,6 +4614,36 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
     try std.testing.expectEqual(graph_commits + 1, fake.commits);
     try std.testing.expectEqual(graph_attempts + 1, fake.commit_attempts);
     try std.testing.expect(adapter.command == null);
+    // Publication failures retain the existing no-replay contract even when
+    // the root is SELECT and every write came from a private WITH producer.
+    const positive_body = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .statement = "WITH changed AS (UPDATE usage_records SET status=status RETURNING id,status) SELECT id,status FROM changed" }, .{});
+    defer std.testing.allocator.free(positive_body);
+    for ([_]struct { conflict: bool, code: []const u8, retryable: bool }{
+        .{ .conflict = true, .code = "40001", .retryable = true },
+        .{ .conflict = false, .code = "40003", .retryable = false },
+    }) |fault| {
+        fake.source_conflict = fault.conflict;
+        fake.unknown_commit = !fault.conflict;
+        const attempts = fake.commit_attempts;
+        const commits = fake.commits;
+        const captures = fake.captures;
+        var fault_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/db/v1/sql");
+        defer fault_request.deinit();
+        fault_request.body = positive_body;
+        var fault_context = httpx.Context.init(std.testing.allocator, std.testing.io, &fault_request);
+        defer fault_context.deinit();
+        var fault_response = try handler.executeSQL(&fault_context);
+        defer fault_response.deinit();
+        try std.testing.expectEqual(@as(u16, 409), fault_response.status.code);
+        const fault_detail = try std.json.parseFromSlice(wire.SQLDiagnostic, std.testing.allocator, fault_response.body.?, .{});
+        defer fault_detail.deinit();
+        try std.testing.expectEqualStrings(fault.code, fault_detail.value.code);
+        try std.testing.expectEqual(@as(?bool, fault.retryable), fault_detail.value.retryable);
+        if (!fault.conflict) try std.testing.expectEqual(@as(usize, 32), fault_detail.value.transaction_id.?.len);
+        try std.testing.expectEqual(attempts + 1, fake.commit_attempts);
+        try std.testing.expectEqual(commits, fake.commits);
+        try std.testing.expectEqual(captures + 1, fake.captures);
+    }
 }
 
 test "SQL stateless fallback rejects JSON scans before transport" {

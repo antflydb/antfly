@@ -1784,7 +1784,11 @@ pub const UniqueAdmission = struct {
     const ClaimState = struct { table: []const u8, base: ?planner.storage.Claim, logical: Builder.StatementState };
 
     pub fn create(a: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, previous: []const contract.TableCommitRequest, control: RequestContext, modes: []const native.ConstraintTiming) !*UniqueAdmission {
-        const bounded = try boundedControl(control);
+        // This owner spans ordered SQL work between admissions. Preserve its
+        // caller's statement deadline; only unscoped callers need the default
+        // one-shot cap. Individual one-shot preparation paths remain bounded.
+        const bounded = if (control.deadline_ns == null) try boundedControl(control) else control;
+        try bounded.ensureActive();
         const self = try a.create(UniqueAdmission);
         self.* = .{ .owner_allocator = a, .arena = .init(a), .row_arena = .init(a), .builder = undefined };
         const owned = self.arena.allocator();
@@ -4471,4 +4475,40 @@ test "distributed txn command unique primary updates avoid redundant observation
         const found = try owner.resolve(output.allocator(), "rows", 1, .{ .columns = &.{"id"} }, &.{.{ .key = "probe", .value = "{\"id\":-1}" }});
         try std.testing.expectEqualStrings(binary_key, found[0].key.?);
     }
+}
+
+test "distributed txn command unique admission retains caller deadlines across ordered work" {
+    const FakeClock = struct {
+        fn now(ptr: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const value: *const u64 = @ptrCast(@alignCast(ptr.?));
+            return .{ .nanoseconds = value.* };
+        }
+    };
+    const a = std.testing.allocator;
+    var now: u64 = 17;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = FakeClock.now;
+    const io: std.Io = .{ .userdata = &now, .vtable = &vtable };
+    const clock = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
+    var fixture: UniqueAdmissionTest = .{ .envelope = "", .schema_digest = @splat(0), .generation_set = @splat(0) };
+    const metadata = [_]TableRecord{.{ .table_id = 2, .name = "docs" }};
+    const deadline = now + 60 * std.time.ns_per_s;
+    const owner = try UniqueAdmission.create(a, fixture.source(), &metadata, &.{}, &.{}, .{ .deadline_ns = deadline, .deadline_io = clock }, &.{});
+    defer owner.deinit();
+    // Time spent in intervening ordered expressions is not a new admission
+    // budget and must not consume an unrelated five-second preparation cap.
+    now += 6 * std.time.ns_per_s;
+    const write = [_]contract.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "row", .value = "{}" }}, .predicates = &.{.{ .key = "row", .expected_version = 7 }} }};
+    try owner.admitPrepared(&write);
+    try std.testing.expectEqual(@as(usize, 1), owner.rows);
+    try std.testing.expectEqual(@as(usize, 0), fixture.primary_reads);
+    now = deadline;
+    try std.testing.expectError(error.DeadlineExceeded, owner.admitPrepared(&write));
+    try std.testing.expectEqual(@as(usize, 1), owner.rows);
+
+    const unscoped = try UniqueAdmission.create(a, fixture.source(), &metadata, &.{}, &.{}, .{ .deadline_io = clock }, &.{});
+    defer unscoped.deinit();
+    now += 5 * std.time.ns_per_s;
+    try std.testing.expectError(error.DeadlineExceeded, unscoped.admitPrepared(&write));
+    try std.testing.expectError(error.DeadlineExceeded, UniqueAdmission.create(a, fixture.source(), &metadata, &.{}, &.{}, .{ .deadline_ns = now, .deadline_io = clock }, &.{}));
 }

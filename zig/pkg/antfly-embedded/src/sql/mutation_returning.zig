@@ -49,3 +49,48 @@ pub fn bind(a: std.mem.Allocator, backend: catalog.Backend, scope: []const relat
     }
     return .{ .columns = columns, .programs = programs };
 }
+
+test "SQL RETURNING dense integer slots preserve arithmetic errors across PostgreSQL widths" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compile(a, "SELECT v/(v-v)", .{});
+    defer compiled.deinit();
+    for ([_]@import("array_value.zig").ElementType{ .int16, .int32, .int64 }) |width| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const scope = [_]relation.Column{
+            .{ .name = "id", .internal = "target_id", .qualifier = "target", .type = .string, .nullable = false },
+            .{ .name = "v", .internal = "target_v", .qualifier = "target", .type = .integer, .element_type = width, .nullable = true },
+        };
+        const slots = [_]scalar.Column{.{ .name = "target_v", .type = .integer, .element_type = width }};
+        var token: u8 = 0;
+        const backend: catalog.Backend = .{ .ptr = &token, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = undefined } };
+        const plan = try bind(owned, backend, &scope, &slots, compiled.statement.select.columns, "target", &.{});
+        const table: catalog.Table = .{ .id = 1, .physical_name = "target", .schema_version = 1, .columns = &.{.{ .name = "v", .path = "v", .type = .integer, .element_type = width, .nullable = true }} };
+        const images = try @import("runtime.zig").Context.ReturningImages.init(owned, table, &.{"v"});
+        for ([_]std.json.Value{ .{ .integer = 1 }, .{ .number_string = "1" }, .null }) |value_| {
+            var object: std.json.ObjectMap = .empty;
+            try object.put(owned, "v", value_);
+            const mutation: catalog.Mutation = .{ .key = "row", .expected_version = 1, .row = .{ .object = object } };
+            const row = try images.row(owned, mutation, mutation);
+            const cell = try row.cell("v");
+            const borrowed = try images.projection.adaptBorrowed(owned, images.layout, row);
+            try std.testing.expect(borrowed.typed_cells.?.values.ptr == row.typed_cells.?.values.ptr);
+            if (value_ == .null) {
+                try std.testing.expect((try plan.programs[0].evaluate(owned, &.{cell}, &.{}, .{})).sql_null);
+            } else try std.testing.expectError(error.SqlDivisionByZero, plan.programs[0].evaluate(owned, &.{cell}, &.{}, .{}));
+        }
+        if (width == .int64) {
+            var exact = try @import("compiler.zig").compile(a, "SELECT (v+1)-v", .{});
+            defer exact.deinit();
+            const exact_plan = try bind(owned, backend, &scope, &slots, exact.statement.select.columns, "target", &.{});
+            var object: std.json.ObjectMap = .empty;
+            try object.put(owned, "v", .{ .number_string = "9007199254740993" });
+            const mutation: catalog.Mutation = .{ .key = "row", .expected_version = 1, .row = .{ .object = object } };
+            const row = try images.row(owned, mutation, mutation);
+            const cell = try row.cell("v");
+            try std.testing.expectEqual(@as(i64, 9007199254740993), cell.value.integer);
+            try std.testing.expectEqual(@as(i64, 1), (try exact_plan.programs[0].evaluate(owned, &.{cell}, &.{}, .{})).value.integer);
+        }
+    }
+}

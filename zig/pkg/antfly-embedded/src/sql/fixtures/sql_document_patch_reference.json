@@ -336,7 +336,7 @@
               "type": "object",
               "properties": {
                 "obsolete": {
-                  "type": "text"
+                  "type": "boolean"
                 }
               },
               "additionalProperties": true

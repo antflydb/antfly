@@ -18012,7 +18012,7 @@ generation, full formatting, license/boundary checks, the independent PostgreSQL
 reference check and inventory integrity pass. The inventory remains incomplete
 with 98 unresolved originals; this is not a release-readiness result.
 
-### Atomic writable WITH command graph (in progress, 2026-11-02)
+### Atomic writable WITH command graph (2026-11-02)
 
 Writable WITH now has typed statement-local relation slots, rather than
 fabricated catalog tables. Binding authorizes every producer, shares one
@@ -18073,15 +18073,17 @@ observation; a retired tuple allows reinsert. Component/native fixtures cover
 these cases and show that overlay descriptors borrow owned prepared payloads
 without mutating the preceding session snapshot.
 
-Public activation remains unfinished. The API backend must attach the native
-command port after establishing its guarded SQL session and validate graph
-receipt/prepared bindings. Native immediate unique admission still needs reuse
-of compiled unique plans/claim directories instead of expanding accumulated
-target rows for each ordered candidate. The new producer drivers do not by
-themselves activate that native unique boundary. Mounted multi-owner, cold-recovery and failure campaigns
-are required before marking `sql-0015` implemented. The inventory remains 911
-implemented, 138 rejected, 449 superseded and 88 unresolved; 64 unresolved entries
-are DDL. No component-only witness receives original-case credit.
+The public API backend now attaches its native command port after establishing
+the guarded SQL session and checks graph receipts and prepared bindings. Native
+immediate unique admission reuses compiled plans, original physical observations
+and a separate logical claim directory. Ordinary snapshot scans never read that
+directory. The command owner honors its caller's statement deadline across
+intervening ordered work; one-shot admission retains its bounded default.
+Dense temporal-uniqueness prefix histories can still require quadratic overlap
+work and are not claimed optimized by this change. Mounted qualification now
+closes the unchanged original `sql-0015`: 912 implemented, 138 rejected,
+449 superseded and 87 unresolved; 64 unresolved entries are DDL. Supplemental
+profiles and component-only witnesses receive no additional original-case credit.
 
 The PostgreSQL witnesses distinguish MERGE action timing from ON CONFLICT:
 MERGE evaluates a repeated target's selected assignment before cardinality
@@ -18092,5 +18094,31 @@ calls by enforcing row uniqueness early. Scalar RETURNING also stays in the
 pinned target's namespace despite surrounding statement-CTE bindings. Error
 prefixes, successful LIMIT completion, same-command MERGE conflicts, all three
 MERGE write arms, duplicate upserts and exhaustive allocation failures cover
-these component contracts. Public transport/native durability qualification is
-still required before original-case credit.
+these component contracts. Prepared scalar postimages now enter the same typed
+projection boundary as array postimages, preserving integer lexemes exactly
+before RETURNING arithmetic. SMALLINT, INTEGER and BIGINT tests cover division
+errors, NULLs, values above 2^53 and direct reuse of already-typed cells.
+
+The mounted native campaign compares all 77 PostgreSQL profiles through public
+HTTP against isolated native metadata/data/session owners, then cold-reopens
+them. It checks complete postimages, physical version/digest fingerprints,
+sequence counters and stable identities. The unchanged original also exercises
+authenticated pgwire preparation/execution and future unique enforcement.
+Supplemental native seeds use stable physical keys to reproduce the oracle's
+seed scan order without imposing a production UPDATE sort. The independent
+PostgreSQL binary array decoder preserves dimensions, lower bounds and NULLs.
+The original's fast regression joins the existing CI integration graph; the
+full 77-profile cold campaign has an explicit opt-in target. Final Debug
+qualification passes 1,715 SQL engine tests, 254 parser/support tests,
+147 transaction contracts and 432 public API contracts. All 77 mounted profiles
+and the unchanged original pass with no skips, failures or leaks. Four existing
+benchmark-only engine tests skip under Debug. PostgreSQL independently verifies
+all 77 profiles and the 12 original document patches; the latter now declares
+its removed boolean field consistently with its seed.
+
+Qualification also removes the smoke fixture's oversized schema-inspection
+frame: query checks have a separate helper, reducing that frame from 5.9 MiB to
+2.2 MiB without enlarging the process stack or removing assertions. Borrowed
+write-source runtimes outlive error cleanup. Native Darwin Debug API compiler
+admission covers the measured 23,968,071,680-byte peak with a 28 GiB reservation;
+Linux, release and cross-host claims retain their existing profiles.

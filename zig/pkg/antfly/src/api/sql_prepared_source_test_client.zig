@@ -179,7 +179,9 @@ fn once(ctx: *fixture.Context, original: []const u8, name: []const u8, expected:
 /// An unchanged statement whose defined PostgreSQL result is an atomic error.
 /// No admission retry can replay it after any command acknowledgement.
 pub fn runRejected(ctx: *fixture.Context, original: []const u8, sqlstate: []const u8) !void {
-    const a = ctx.alloc;
+    var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
     const api = if (ctx.data.http_server) |*value| value else return error.MissingNativeSqlApi;
     try std.testing.expect(api.cfg.auth_enabled);
     var adapter: @import("sql_pgwire.zig").Adapter = .{ .server = api };

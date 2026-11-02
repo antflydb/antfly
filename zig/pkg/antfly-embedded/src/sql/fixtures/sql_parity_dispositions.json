@@ -4598,6 +4598,57 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-writable-cte-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-writable-cte-lifecycle-test",
+        "-Doptimize=Debug",
+        "-Dtest-filter=original writable CTE",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-writable-cte-cohort-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-writable-cte-cohort-test",
+        "-Doptimize=Debug",
+        "-Dtest-filter=writable CTE",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-writable-cte-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_mutation_cte_reference.py",
+        "--check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 600
+    },
+    "sql-qualified-writable-cte-contract-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-transactions-test",
+        "public-api-parity-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
     }
   },
   "entries": [
@@ -4891,8 +4942,30 @@
     },
     {
       "id": "sql-0015",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through the native typed writable WITH command graph. Its producer and MERGE attempt to change the same tuple, yielding PostgreSQL 21000 with unchanged primary versions/digests and future UNIQUE enforcement through authenticated HTTP and pgwire before and after complete cold recovery. A supplemental 77-profile PostgreSQL/native differential cohort checks typed postimages, ordered sequence effects, FK actions, conflict ownership, planning errors and rollback; public API contracts retain prepared bindings and no-replay serialization/unknown-outcome behavior.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original writable CTE preserves PostgreSQL rollback and cold identities",
+          "gate": "sql-qualified-writable-cte-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL writable CTE PostgreSQL cohort preserves typed effects and cold owners",
+          "gate": "sql-qualified-writable-cte-cohort-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original writable CTE preserves PostgreSQL rollback and cold identities",
+          "gate": "sql-qualified-writable-cte-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_execution.zig",
+          "test": "SQL API cross-table MERGE retains both source and target range proofs",
+          "gate": "sql-qualified-writable-cte-contract-debug"
+        }
+      ]
     },
     {
       "id": "sql-0016",

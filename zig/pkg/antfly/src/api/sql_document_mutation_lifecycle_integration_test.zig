@@ -145,6 +145,7 @@ pub const SourceCampaign = struct {
             try std.testing.expectEqual(@as(u16, 200), response.status);
             var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
             defer result.deinit();
+            errdefer std.debug.print("source mutation postimage profile={s} table={s} actual={s}\n", .{ self.entry.profile, table.name, response.body });
             try expectSourceResult(ctx.alloc, result.value, table.final, true);
         }
     }
@@ -235,11 +236,16 @@ pub const SourceCampaign = struct {
             try self.verify(ctx, false);
             return;
         }
-        var response = try client.execute(ctx, original.sql, .write_admission);
+        try self.executeStatement(ctx, original.sql);
+    }
+
+    fn executeStatement(self: *@This(), ctx: *fixture.Context, statement: []const u8) !void {
+        var response = try client.execute(ctx, statement, .write_admission);
         defer response.deinit(ctx.alloc);
+        errdefer std.debug.print("source mutation execution profile={s} actual={s}\n", .{ self.entry.profile, response.body });
         if (self.entry.sqlstate) |code| {
-            if (response.status != 400) std.debug.print("source mutation reject original={s} status={d} body={s}\n", .{ self.entry.id, response.status, response.body });
-            try std.testing.expectEqual(@as(u16, 400), response.status);
+            const status: u16 = if (std.mem.eql(u8, code, "0A000")) 501 else 400;
+            try std.testing.expectEqual(status, response.status);
             var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
             defer diagnostic.deinit();
             try std.testing.expectEqualStrings(code, diagnostic.value.code);
@@ -250,7 +256,10 @@ pub const SourceCampaign = struct {
             defer result.deinit();
             try std.testing.expectEqualStrings(self.entry.command_tag, result.value.command_tag);
             try std.testing.expectEqual(self.entry.affected, result.value.rows_affected);
-            try expectSourceResult(ctx.alloc, result.value, self.entry.output, false);
+            expectSourceResult(ctx.alloc, result.value, self.entry.output, false) catch |err| {
+                std.debug.print("source mutation result profile={s} actual={s}\n", .{ self.entry.profile, response.body });
+                return err;
+            };
         }
         try self.verifyClaims(ctx);
         try self.verify(ctx, false);
@@ -1578,10 +1587,12 @@ test "mounted SQL original writable CTE preserves PostgreSQL rollback and cold i
         pub const cold_catalog = true;
         inner: SourceCampaign,
         pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
-            try self.inner.beforeRestart(ctx);
+            try self.inner.setup(ctx);
+            ctx.headers = ctx.admin_headers;
             var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
             defer corpus.deinit();
             const original = try corpus.get("sql-0015");
+            try self.inner.executeStatement(ctx, original.sql);
             try @import("sql_prepared_source_test_client.zig").runRejected(ctx, original.sql, "21000");
             try self.inner.verifyRows(ctx);
             try self.inner.fingerprints(ctx, .prepared);
@@ -1619,4 +1630,145 @@ test "mounted SQL original writable CTE preserves PostgreSQL rollback and cold i
     }
     const original: SourceEntry = .{ .id = "sql-0015", .profile = "mutation_cte_atomic_cardinality", .sqlstate = "21000", .command_tag = "", .affected = 0, .output = .{ .columns = &.{}, .column_oids = &.{}, .rows = &.{} }, .tables = tables };
     try fixture.runWithState(WritableCteCampaign, .{ .inner = .{ .entry = original, .retained = &retained } });
+}
+
+/// Supplemental PostgreSQL profiles exercise the same public command graph as
+/// the original case. Each profile has isolated native roots and a cold reopen.
+const WritableCteCohortCampaign = struct {
+    pub const native_sessions = true;
+    pub const native_auth = true;
+    pub const cold_catalog = true;
+    inner: SourceCampaign,
+    statement: []const u8,
+    sequence: []const Json,
+    sequence_id: ?u64 = null,
+
+    fn checkSequence(self: *@This(), ctx: *fixture.Context) !void {
+        const sequences = @import("../system_catalog/sequence_catalog.zig");
+        const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        const request: sequences.SnapshotRequest = .{ .targets = &.{.{ .table = "effect_sequence" }}, .include_counters = true };
+        const bytes = try source.systemCatalog(ctx.alloc, .{ .setting_admin = true }, .{ .sql_sequence_snapshot = request });
+        defer ctx.alloc.free(bytes);
+        var snapshot = try std.json.parseFromSlice(sequences.Snapshot, ctx.alloc, bytes, .{});
+        defer snapshot.deinit();
+        try snapshot.value.validate(request);
+        const entry = snapshot.value.entries[0];
+        try std.testing.expect(entry.value == .sequence);
+        const id = entry.value.sequence.id;
+        if (self.sequence_id) |previous| try std.testing.expectEqual(previous, id) else self.sequence_id = id;
+        const counter = entry.counter orelse return error.MissingSequenceCounter;
+        try std.testing.expectEqual(self.sequence[0].integer, counter.last_value);
+        try std.testing.expectEqual(self.sequence[1].bool, counter.is_called);
+    }
+
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.inner.setup(ctx);
+        // Fixture provisioning uses its cluster administrator. Execution must
+        // retain the ordinary table-scoped public credential, not mint broader
+        // database/namespace grants for the command under test.
+        var created = try client.execute(ctx, "CREATE SEQUENCE effect_sequence", .write_admission);
+        defer created.deinit(ctx.alloc);
+        if (created.status != 200) std.debug.print("writable CTE sequence setup status={d} body={s}\n", .{ created.status, created.body });
+        try std.testing.expectEqual(@as(u16, 200), created.status);
+        ctx.headers = ctx.admin_headers;
+        try self.inner.executeStatement(ctx, self.statement);
+        try self.checkSequence(ctx);
+    }
+
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.inner.afterRestart(ctx);
+        try self.checkSequence(ctx);
+    }
+};
+
+fn writableCteReferenceRows(a: std.mem.Allocator, raw: Json) ![]const []const Json {
+    const rows = try a.alloc([]const Json, raw.array.items.len);
+    for (rows, raw.array.items) |*row, value| row.* = value.array.items;
+    return rows;
+}
+
+fn writableCteReferenceTables(a: std.mem.Allocator, entry: Json) ![]const SourceTable {
+    const names = [_][]const u8{ "usage_records", "source_records", "archived_records", "fk_parents", "fk_children" };
+    // Only profiles referencing FK tables need the FK cohort. Provisioning an
+    // unrelated activation job for every other profile adds owner coordination
+    // without extending the SQL graph being tested.
+    const with_foreign = std.mem.indexOf(u8, entry.object.get("sql").?.string, "fk_") != null;
+    const tables = try a.alloc(SourceTable, if (with_foreign) names.len else 3);
+    for (tables[0..3], names[0..3]) |*table, name| {
+        const seed = if (std.mem.eql(u8, name, "archived_records"))
+            "INSERT INTO archived_records(id,status,v,a,n) SELECT id,status,v,a,n FROM usage_records WHERE false"
+        else
+            // Match PostgreSQL's seed heap order without imposing a sort on
+            // production UPDATE scans, whose row order is unspecified. The
+            // SQL under test and every visible seed value remain unchanged.
+            try std.fmt.allocPrint(a, "INSERT INTO {s}(_id,id,status,v,a,n) VALUES ('a','a','queued',1,ARRAY[1,NULL,3],9007199254740993.0100),('b','b','closed',2,ARRAY[]::integer[],NULL)", .{name});
+        table.* = .{
+            .name = name,
+            .create = try std.fmt.allocPrint(a, "CREATE TABLE {s} (id TEXT PRIMARY KEY,status TEXT,v INTEGER DEFAULT 0,a INTEGER[],n NUMERIC(20,4))", .{name}),
+            .seed = seed,
+            .read = try std.fmt.allocPrint(a, "SELECT id,status,v,a,n FROM {s} ORDER BY id", .{name}),
+            .final = .{ .columns = &.{ "id", "status", "v", "a", "n" }, .column_oids = &.{ 25, 25, 23, 1007, 1700 }, .rows = try writableCteReferenceRows(a, entry.object.get("tables").?.object.get(name).?) },
+        };
+    }
+    if (!with_foreign) return tables;
+    tables[3] = .{
+        .name = "fk_parents",
+        .create = "CREATE TABLE fk_parents(id TEXT PRIMARY KEY)",
+        .seed = "INSERT INTO fk_parents(id) VALUES ('a'),('b')",
+        .read = "SELECT id FROM fk_parents ORDER BY id",
+        .final = .{ .columns = &.{"id"}, .column_oids = &.{25}, .rows = try writableCteReferenceRows(a, entry.object.get("fk_tables").?.object.get("fk_parents").?) },
+    };
+    tables[4] = .{
+        .name = "fk_children",
+        .create = "CREATE TABLE fk_children(id TEXT PRIMARY KEY,parent_id TEXT REFERENCES fk_parents(id) ON DELETE CASCADE,status TEXT)",
+        .seed = "INSERT INTO fk_children(id,parent_id,status) VALUES ('ca','a','old'),('cb','b','old')",
+        .read = "SELECT id,parent_id,status FROM fk_children ORDER BY id",
+        .final = .{ .columns = &.{ "id", "parent_id", "status" }, .column_oids = &.{ 25, 25, 25 }, .rows = try writableCteReferenceRows(a, entry.object.get("fk_tables").?.object.get("fk_children").?) },
+    };
+    return tables;
+}
+
+test "mounted SQL writable CTE PostgreSQL cohort preserves typed effects and cold owners" {
+    const a = std.testing.allocator;
+    var reference = try std.json.parseFromSlice(Json, a, local.sql_parity_fixtures.mutation_cte_reference, .{});
+    defer reference.deinit();
+    const entries = reference.value.object.get("entries").?.array.items;
+    try std.testing.expectEqual(@as(usize, 77), entries.len);
+    var failures: usize = 0;
+    for (entries, 0..) |entry, ordinal| {
+        const name = entry.object.get("name").?.string;
+        if (ordinal % 16 == 0) std.debug.print("writable CTE native cohort {d}/{d}\n", .{ ordinal, entries.len });
+        errdefer std.debug.print("writable CTE PostgreSQL profile={s} sql={s}\n", .{ name, entry.object.get("sql").?.string });
+        var retained = std.heap.ArenaAllocator.init(a);
+        defer retained.deinit();
+        const owned = retained.allocator();
+        const columns = if (entry.object.get("columns")) |value| value.array.items else &.{};
+        const labels = try owned.alloc([]const u8, columns.len);
+        const oids = try owned.alloc(u32, columns.len);
+        for (columns, labels, oids) |column, *label, *oid| {
+            label.* = column.object.get("name").?.string;
+            oid.* = @intCast(column.object.get("oid").?.integer);
+        }
+        const tag = if (entry.object.get("command_tag")) |value| value.string else "";
+        const split = std.mem.indexOfScalar(u8, tag, ' ') orelse tag.len;
+        const command = tag[0..split];
+        const affected: i64 = if (tag.len == 0 or std.mem.eql(u8, command, "SELECT")) 0 else try std.fmt.parseInt(i64, tag[(std.mem.lastIndexOfScalar(u8, tag, ' ') orelse return error.MissingPostgresCommandCount) + 1 ..], 10);
+        fixture.runWithState(WritableCteCohortCampaign, .{
+            .inner = .{ .retained = &retained, .entry = .{
+                .id = name,
+                .profile = name,
+                .sqlstate = if (entry.object.get("sqlstate")) |value| value.string else null,
+                .command_tag = command,
+                .affected = affected,
+                .output = .{ .columns = labels, .column_oids = oids, .rows = if (entry.object.get("rows")) |raw| try writableCteReferenceRows(owned, raw) else &.{} },
+                .tables = try writableCteReferenceTables(owned, entry),
+            } },
+            .statement = entry.object.get("sql").?.string,
+            .sequence = entry.object.get("sequence").?.array.items,
+        }) catch |err| {
+            failures += 1;
+            std.debug.print("writable CTE failed profile={s} error={s} sql={s}\n", .{ name, @errorName(err), entry.object.get("sql").?.string });
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 0), failures);
 }

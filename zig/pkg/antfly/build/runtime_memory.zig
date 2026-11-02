@@ -278,7 +278,9 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
         const floors = [_]struct { name: []const u8, gib: usize }{
             .{ .name = "metadata-unit-lane-a-tests", .gib = 22 },
             .{ .name = "metadata-unit-lane-b-tests", .gib = 22 },
-            .{ .name = "public-api-parity", .gib = 22 },
+            // Native Debug/SDK 26.5 measured 23,968,071,680 bytes.
+            // Reserve >=25% headroom; this is compiler memory, not runtime.
+            .{ .name = "public-api-parity", .gib = 28 },
             .{ .name = "api-docid-tests", .gib = 18 },
             .{ .name = "api-auth-tests", .gib = 17 },
             .{ .name = "api-derived-coverage-tests", .gib = 17 },
@@ -616,14 +618,14 @@ test "native Darwin Debug test reservations cover measured peaks without unsafe 
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
     const gib = 1024 * 1024 * 1024;
-    const peak: usize = 18_029_035_520;
+    const peak: usize = 23_968_071_680;
     const claim = testCompileMaxRss("public-api-parity", macos, macos, .debug, 15 * gib);
     try std.testing.expect(claim >= peak + peak / 4);
     // A 30 GiB local compiler budget cannot overlap this object with another
     // 15 GiB API compile. Smaller work can still use the remaining capacity.
     try std.testing.expect(claim + 15 * gib > 30 * gib);
-    try std.testing.expect(claim + 4 * gib <= 30 * gib);
-    try std.testing.expectEqual(24 * gib, testCompileMaxRss("public-api-parity", macos, macos, .debug, 24 * gib));
+    try std.testing.expect(claim + 2 * gib <= 30 * gib);
+    try std.testing.expectEqual(32 * gib, testCompileMaxRss("public-api-parity", macos, macos, .debug, 32 * gib));
     try std.testing.expectEqual(15 * gib, testCompileMaxRss("public-api-parity", macos, macos, .safe, 15 * gib));
     try std.testing.expectEqual(15 * gib, testCompileMaxRss("public-api-parity", macos, linux, .debug, 15 * gib));
     try std.testing.expectEqual(15 * gib, testCompileMaxRss("public-api-parity", linux, macos, .debug, 15 * gib));

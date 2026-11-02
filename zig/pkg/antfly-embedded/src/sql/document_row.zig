@@ -411,6 +411,15 @@ pub const Projection = struct {
         alloc.free(self.columns);
     }
 
+    /// Prepared postimages are internal SQL rows even when their projection
+    /// contains only scalars. Decode exact JSON integer lexemes once before
+    /// expressions consume them; native typed cells retain the direct path.
+    pub fn initPrepared(alloc: std.mem.Allocator, table: catalog.Table, fields: []const []const u8) !Projection {
+        var result = try init(alloc, table, fields);
+        result.has_typed_cells = true;
+        return result;
+    }
+
     /// The returned directory belongs to the page, not this scan/cursor. Bind
     /// once per page, and reuse across every row regardless of array length.
     pub fn pageLayout(self: Projection, alloc: std.mem.Allocator) !?*const catalog.Row.TypedLayout {
