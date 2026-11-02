@@ -490,9 +490,9 @@ Sorted range cohorts in linked values continue from the last touched page;
 extent-backed values keep their indexed lookup path. Neither change introduces
 a primary or transport format version.
 
-Trusted gateways must also require `antfly_session_completion=10`. After joining
+Trusted gateways must also require `antfly_session_completion=11`. After joining
 execution and tearing down the session, the listener emits a private backend
-`y` frame containing a version 10 JSON completion witness. The witness carries
+`y` frame containing a version 11 JSON completion witness. The witness carries
 pending DDL receipts and transaction IDs, or explicitly marks unknown outcomes.
 Completion delivery has a separate five-second watchdog. EOF and transport
 deadlines never prove completion. Gateways persist pending witnesses and use
@@ -540,24 +540,24 @@ DDL, so dropping or replacing a SQL name cannot invalidate an issued receipt.
 Restore proofs survive deletion of the terminal job payload.
 
 Cloud records acknowledgement debt atomically with its fence CAS, then sends
-`X-Antfly-SQL-Settlement: ack-v10` using management authority. An acknowledgement
+`X-Antfly-SQL-Settlement: ack-v11` using management authority. An acknowledgement
 releases exactly one settled consumer and is idempotent. Native references have
 no TTL; Cloud's durable outbox retries after restarts or lost responses. An uncertain pin
 keeps its reference ID for reconciliation. Completion admission requires topology
-protocol 76 during rolling upgrades; reference mutations retain their protocol 69
+protocol 77 during rolling upgrades; reference mutations retain their protocol 69
 wire format.
 
 HTTP gateways may qualify an exact upstream connection with an authenticated,
 empty POST to `/db/v1/sql`, `X-Antfly-SQL-Probe: 10`, and an SQL fence header.
-The read-only probe returns 204, `X-Antfly-SQL-Capability: 10`, and an empty v10
+The read-only probe returns 204, `X-Antfly-SQL-Capability: 10`, and an empty v11
 completion witness. It never parses or executes a statement. Qualification is
 per connection, so an older pod in a rolling deployment cannot receive SQL
 based on another pod's capability advertisement.
 
-Cloud completion admission uses protocol v10 and requires durable session storage,
-durable IO, and fleet topology protocol 76. Distributed issuers also require owner
+Cloud completion admission uses protocol v11 and requires durable session storage,
+durable IO, and fleet topology protocol 77. Distributed issuers also require owner
 routing with native internal-service credentials. Missing prerequisites reject
-trusted completion admission before execution. Existing v3/v4/v5/v6/v7/v8/v9 receipts remain
+trusted completion admission before execution. Existing v3/v4/v5/v6/v7/v8/v9/v10 receipts remain
 readable for reconciliation during upgrades. Transaction consumer operations route
 to the durable owner, including after session-payload cleanup.
 
@@ -586,7 +586,7 @@ Sync and subsequent requests after an extended-protocol error.
 
 Forwarded session requests preserve their SQL fence header so the execution
 owner performs admission and emits its own prepared completion witness. New
-admission requires fleet protocol 76, including forwarding destinations; legacy
+admission requires fleet protocol 77, including forwarding destinations; legacy
 managed reference reconciliation retains its protocol 71 requirement.
 
 DDL consumers are prepared before CREATE, schema changes, FK publication,
@@ -618,15 +618,17 @@ execution and close forward once to the issuer with the original principal,
 execution limits and completion fence. Conflicting issuers are rejected before
 dispatch. Legacy random handles remain usable on their issuing node.
 
-Completion v10 requires submission-aware native metadata sources and fleet
-protocol 76. DDL preflight failures retire prepared consumers. Distributed
+Completion v11 requires submission-aware native metadata sources and fleet
+protocol 77. DDL preflight failures retire prepared consumers. Distributed
 metadata records submission when Raft assigns the command's accepted index;
 RPCs preserve definite non-admission separately from lost/uncertain replies.
 Middleware can publish an explicit no-execution witness before dispatch,
 including gzip body-capacity refusal, without guessing from HTTP status codes.
 
-Completion v10 / fleet protocol 76 preserves an earlier unknown transaction
+Completion v11 / fleet protocol 77 preserves an earlier unknown transaction
 when a later planning attempt is rejected. Only a fresh dispatch can prove
 non-admission from a domain rejection; recovery needs an authoritative terminal
 outcome. HTTP connection-resource operations attach their joined witness on
 capacity and local storage failures, while failed remote dispatch stays unknown.
+
+Completion v11 scopes shared-store producer state, capacity, retirement, and recovery by immutable issuing node identity. Shared stores require a nonzero routed node identity. Each issuer uses a dedicated durable-store facade; rebinding a live facade fails closed. Node-local stores retain their existing on-disk namespace.

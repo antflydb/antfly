@@ -342,7 +342,7 @@ pub const Session = struct {
                             const check_ready = self.source.vtable.completion_ready orelse return error.SqlWriteCapacityUnavailable;
                             if (!check_ready(self.source.context)) return error.SqlWriteCapacityUnavailable;
                             if (self.source.vtable.reserve_completion) |reserve| try reserve(self.source.context, &self.completion, 3);
-                            try self.parameterStatus("antfly_session_completion", "10");
+                            try self.parameterStatus("antfly_session_completion", "11");
                         }
                     }
                     try self.parameterStatus("server_version", "16.0-antfly");

@@ -60959,7 +60959,7 @@ test "SQL pgwire native transaction proofs route to the original node after payl
                     defer identity.deinit(self.owner.alloc);
                     authenticated = identity.is_internal_service;
                 }
-                if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-SQL-Settlement")) owner_mode = std.mem.eql(u8, header.value, "owner-v10");
+                if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-SQL-Settlement")) owner_mode = std.mem.eql(u8, header.value, "owner-v11");
             }
             try std.testing.expect(authenticated and owner_mode);
             if (self.reject) return .{ .status = 503, .body = try alloc.dupe(u8, "busy") };
@@ -61771,4 +61771,99 @@ test "SQL pgwire native replay routing rejection preserves an earlier unknown ex
         _ = try server.txn_sessions.cleanupExpired(a, std.math.maxInt(u64));
     }
     try std.testing.expectEqual(@as(u64, 1), try durable.registrationFloor());
+}
+
+test "SQL pgwire native shared store recovery isolates live issuer outboxes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/shared-issuers", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var storage = try docstore_mod.DocStore.open(a, path, .{});
+    defer storage.close();
+    var first_store = transactions_api.DurableSessionStore.init(a, &storage);
+    var second_store = transactions_api.DurableSessionStore.init(a, &storage);
+    const Fixture = struct {
+        fn node(ptr: *anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+        fn catalog(_: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            if (call != .sql_completion_ready) return error.TestUnexpectedResult;
+            return alloc.dupe(u8, "true");
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var first_id: u64 = 1;
+    var second_id: u64 = 2;
+    const first_cfg: ApiHttpServerConfig = .{ .session_store = &first_store, .session_store_scope = .cluster_shared, .session_router = .{ .ptr = &first_id, .vtable = &.{ .local_node_id = Fixture.node, .local_status = undefined, .node_base_uri = undefined } }, .session_executor = .{ .ptr = undefined, .vtable = &.{ .execute = Fixture.execute } }, .internal_service_secret = "shared-test", .internal_service_issuer = "test", .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } };
+    var second_cfg = first_cfg;
+    second_cfg.session_store = &second_store;
+    second_cfg.session_router.?.ptr = &second_id;
+    const source: StatusSource = .{ .ptr = undefined, .vtable = &.{ .status = undefined, .system_catalog = Fixture.catalog, .tracks_sql_submission = true } };
+    var first = ApiHttpServer.init(a, first_cfg, source, null, null);
+    defer first.deinit();
+    const completions = @import("sql_completion.zig");
+    try std.testing.expect(completions.capableJoined(&first, std.testing.io));
+    var completion: @import("../pgwire/completion.zig").Completion = .{};
+    defer completion.deinit(a);
+    try completions.reserveJoined(&first, &completion, 3, std.testing.io);
+    const session = try first.txn_sessions.begin(a, .{}, first_id);
+    var request = try transactions_api.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"n\":1}}}}}");
+    defer request.deinit(a);
+    var staged = (try first.txn_sessions.cloneCommitRequest(a, session.txn_id, &request)).?;
+    staged.deinit(a);
+    try completions.prepareTransaction(&first, a, &completion, session.txn_id);
+    _ = (try first.txn_sessions.markCommitExecutionStarted(a, session.txn_id)).?;
+    var reference: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&reference, completion.outcomes.items[0].reference_id.?);
+    var before = (try first_store.loadRegistration(a, reference)).?;
+    try std.testing.expect(before.value.prepared and before.value.execution_admitted and !before.value.joined);
+    before.deinit();
+    // A second API starts while the first API still owns this execution.
+    var second = ApiHttpServer.init(a, second_cfg, source, null, null);
+    defer second.deinit();
+    try std.testing.expect(completions.capableJoined(&second, std.testing.io));
+    // Shared storage cannot qualify with an anonymous issuer, even if all
+    // other durability and metadata capability checks would pass.
+    const saved_router = second.cfg.session_router;
+    second.cfg.session_router = null;
+    try std.testing.expect(!completions.capableJoined(&second, std.testing.io));
+    second.cfg.session_router = saved_router;
+    second_id = 0;
+    try std.testing.expect(!completions.capableJoined(&second, std.testing.io));
+    second_id = 2;
+    // Each issuer owns its sequence, admission window, and recovery boundary.
+    try second_store.reserveRegistrations(@import("completion_outbox.zig").max_window);
+    second_store.releaseRegistrations(@import("completion_outbox.zig").max_window);
+    const second_reference = try second_store.createRegistration(@splat(0x42), .{ .transaction_id = "second" });
+    try std.testing.expectEqual(@as(u64, 1), @import("completion_retirement.zig").sequence(second_reference));
+    try std.testing.expect(!std.mem.eql(u8, reference[0..8], second_reference[0..8]));
+    try std.testing.expectError(error.CompletionWrongOwner, second_store.bindRegistrationIssuer(first_id));
+    try completions.recoverUnpublished(&second, a, 32);
+    var surviving = (try first_store.loadRegistration(a, reference)).?;
+    surviving.deinit();
+    try std.testing.expectError(error.CompletionWrongOwner, second_store.loadRegistration(a, reference));
+    // Joining returns a durable pending reference while execution is unresolved.
+    completions.pinJoined(&first, a, &completion, std.testing.io);
+    try std.testing.expect(!completion.unknown and completion.outcomes.items.len == 1);
+    _ = (try first.txn_sessions.recordTerminalCommitWithRepair(a, session.txn_id, .committed, false, null, null)).?;
+    const receipt: @import("../pgwire/completion.zig").Receipt = .{ .outcomes = completion.outcomes.items };
+    try std.testing.expect(try completions.settled(&first, a, receipt, .{}));
+    try std.testing.expect(try completions.acknowledge(&first, a, receipt, .{}));
+    try std.testing.expectEqual(@as(u64, 1), try first_store.registrationFloor());
+    try std.testing.expectEqual(@as(u64, 0), try second_store.registrationFloor());
+    var other = (try second_store.loadRegistration(a, second_reference)).?;
+    other.deinit();
+    // A restarted facade resumes only its own persisted sequence and scan.
+    var restarted = transactions_api.DurableSessionStore.init(a, &storage);
+    try restarted.bindRegistrationIssuer(second_id);
+    const page = try restarted.registrationRecoveryPage(a, 0, 32);
+    defer a.free(page.references);
+    try std.testing.expectEqual(@as(usize, 1), page.references.len);
+    try std.testing.expectEqual(second_reference, page.references[0]);
+    const resumed = try restarted.createRegistration(@splat(0x43), .{ .transaction_id = "resumed" });
+    try std.testing.expectEqual(second_reference[0..8].*, resumed[0..8].*);
+    try std.testing.expectEqual(@as(u64, 2), @import("completion_retirement.zig").sequence(resumed));
 }

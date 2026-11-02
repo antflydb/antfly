@@ -1054,12 +1054,30 @@ pub const DurableSessionStore = struct {
     // but do not serialize read/modify/write snapshots, including proof retirement.
     mutation_mutex: std.atomic.Mutex = .unlocked,
     reserved_registrations: usize = 0,
+    registration_issuer: ?u64 = null,
+
     // Captured before this store allocates its first reference. Only earlier
     // references can belong to a dead process; never sweep a live collector.
     registration_recovery_before: ?u64 = null,
     registration_locks: [64]std.atomic.Mutex = @splat(.unlocked),
     fail_writes_for_test: bool = false,
     fail_lease_transition_after_session_write_for_test: bool = false,
+
+    // A facade owns one issuer for its entire lifetime. Sharing the physical
+    // transaction store is supported; rebinding a live facade is not.
+    pub fn bindRegistrationIssuer(self: *DurableSessionStore, issuer: u64) !void {
+        platform_sync.lockYielding(&self.mutation_mutex);
+        defer self.mutation_mutex.unlock();
+        if (self.registration_issuer) |bound| {
+            if (bound != issuer) return error.CompletionWrongOwner;
+        } else {
+            if (issuer != 0 and (self.registration_recovery_before != null or self.reserved_registrations != 0)) return error.CompletionWrongOwner;
+            self.registration_issuer = issuer;
+        }
+    }
+    fn registrationOutbox(self: *DurableSessionStore) @import("completion_outbox.zig").Namespace {
+        return .{ .issuer = self.registration_issuer orelse 0 };
+    }
 
     const Backend = union(enum) {
         docstore: *docstore_mod.DocStore,
@@ -1322,28 +1340,28 @@ pub const DurableSessionStore = struct {
     };
     fn registrationMutationTxn(self: *DurableSessionStore, txn: anytype, action: RegistrationMutation) ![16]u8 {
         if (self.registration_recovery_before == null)
-            self.registration_recovery_before = (try Outbox.producer(txn, self.alloc, @splat(0))).next;
+            self.registration_recovery_before = (try self.registrationOutbox().producer(txn, self.alloc, @splat(0))).next;
         switch (action) {
             .create => |value| {
                 if (value.reserved and self.reserved_registrations == 0) return error.SessionLimitExceeded;
                 const held = self.reserved_registrations - @as(usize, if (value.reserved) 1 else 0);
-                if (try Outbox.available(txn, self.alloc) <= held) return error.SessionLimitExceeded;
-                const floor = (try Outbox.producer(txn, self.alloc, value.seed)).retired_through;
-                const reference = try Outbox.create(txn, self.alloc, value.seed, value.outcome, value.prepared);
+                if (try self.registrationOutbox().available(txn, self.alloc) <= held) return error.SessionLimitExceeded;
+                const floor = (try self.registrationOutbox().producer(txn, self.alloc, value.seed)).retired_through;
+                const reference = try self.registrationOutbox().create(txn, self.alloc, value.seed, value.outcome, value.prepared);
                 if (value.local_transaction_id) |id| {
                     // Fold the local handoff into the intent allocation batch:
                     // no remote RPC or intermediate WAL commits are necessary.
                     _ = try self.completionReferenceTxn(txn, id, reference, false, floor, .prepare);
-                    try Outbox.put(txn, self.alloc, reference, .{ .outcome = value.outcome, .prepared = true, .execution_admitted = true, .phase = .registered });
+                    try self.registrationOutbox().put(txn, self.alloc, reference, .{ .outcome = value.outcome, .prepared = true, .execution_admitted = true, .phase = .registered });
                 }
                 return reference;
             },
-            .put => |value| try Outbox.put(txn, self.alloc, value.reference, value.record),
-            .remove => |reference| try Outbox.remove(txn, self.alloc, reference),
+            .put => |value| try self.registrationOutbox().put(txn, self.alloc, value.reference, value.record),
+            .remove => |reference| try self.registrationOutbox().remove(txn, self.alloc, reference),
             .retire_local => |value| {
-                const floor = (try Outbox.producer(txn, self.alloc, @splat(0))).retired_through;
+                const floor = (try self.registrationOutbox().producer(txn, self.alloc, @splat(0))).retired_through;
                 if (!try self.completionReferenceTxn(txn, value.transaction_id, value.reference, true, floor, .pin)) return error.CompletionUnavailable;
-                try Outbox.remove(txn, self.alloc, value.reference);
+                try self.registrationOutbox().remove(txn, self.alloc, value.reference);
             },
         }
         return @splat(0);
@@ -1378,12 +1396,12 @@ pub const DurableSessionStore = struct {
             .docstore => |store| blk: {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
-                break :blk try Outbox.available(&txn, self.alloc);
+                break :blk try self.registrationOutbox().available(&txn, self.alloc);
             },
             .runtime => |store| blk: {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                break :blk try Outbox.available(&txn, self.alloc);
+                break :blk try self.registrationOutbox().available(&txn, self.alloc);
             },
         };
         if (count > free or self.reserved_registrations > free - count) return error.SessionLimitExceeded;
@@ -1421,12 +1439,12 @@ pub const DurableSessionStore = struct {
             .docstore => |store| blk: {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
-                break :blk try Outbox.load(&txn, alloc, reference);
+                break :blk try self.registrationOutbox().load(&txn, alloc, reference);
             },
             .runtime => |store| blk: {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                break :blk try Outbox.load(&txn, alloc, reference);
+                break :blk try self.registrationOutbox().load(&txn, alloc, reference);
             },
         };
     }
@@ -1437,14 +1455,14 @@ pub const DurableSessionStore = struct {
             .docstore => |store| blk: {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
-                if (self.registration_recovery_before == null) self.registration_recovery_before = (try Outbox.producer(&txn, self.alloc, @splat(0))).next;
-                break :blk try Outbox.recoveryPage(&txn, alloc, self.registration_recovery_before.?, after, limit);
+                if (self.registration_recovery_before == null) self.registration_recovery_before = (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next;
+                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, self.registration_recovery_before.?, after, limit);
             },
             .runtime => |store| blk: {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                if (self.registration_recovery_before == null) self.registration_recovery_before = (try Outbox.producer(&txn, self.alloc, @splat(0))).next;
-                break :blk try Outbox.recoveryPage(&txn, alloc, self.registration_recovery_before.?, after, limit);
+                if (self.registration_recovery_before == null) self.registration_recovery_before = (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next;
+                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, self.registration_recovery_before.?, after, limit);
             },
         };
     }
@@ -1453,12 +1471,12 @@ pub const DurableSessionStore = struct {
             .docstore => |store| blk: {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
-                break :blk (try Outbox.producer(&txn, self.alloc, @splat(0))).retired_through;
+                break :blk (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).retired_through;
             },
             .runtime => |store| blk: {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                break :blk (try Outbox.producer(&txn, self.alloc, @splat(0))).retired_through;
+                break :blk (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).retired_through;
             },
         };
     }

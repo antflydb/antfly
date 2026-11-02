@@ -107,8 +107,9 @@ const std = @import("std");
 /// Version 74 retires unpublished completion subscriptions after issuer restart.
 /// Version 75 binds HTTP SQL handles to issuers and observes DDL submission.
 /// Version 76 requires attempt-aware commit proofs and joined connection refusals.
-pub const current_version: u16 = 76;
-pub const sql_completion_admission_version: u16 = 76;
+/// Version 77 isolates issuer outboxes in shared transaction stores.
+pub const current_version: u16 = 77;
+pub const sql_completion_admission_version: u16 = 77;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
 pub const job_state_version: u16 = 59;

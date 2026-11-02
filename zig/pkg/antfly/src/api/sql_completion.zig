@@ -6,6 +6,17 @@ const server_mod = @import("http_server.zig");
 const operation = @import("antfly_local_sources").api_operation;
 const refs = @import("../metadata/sql_completion_references.zig");
 const catalog = @import("antfly_local_sources").sql_catalog;
+fn registrationStore(server: *server_mod.ApiHttpServer) !*@import("transactions.zig").DurableSessionStore {
+    const store = server.txn_sessions.durable orelse return error.DurabilityUnavailable;
+    const issuer = if (server.txn_sessions.durable_scope == .cluster_shared) blk: {
+        const router = server.cfg.session_router orelse return error.CompletionOwnerUnavailable;
+        const node = router.localNodeId();
+        if (node == 0) return error.CompletionOwnerUnavailable;
+        break :blk node;
+    } else 0;
+    try store.bindRegistrationIssuer(issuer);
+    return store;
+}
 fn parseId(encoded: []const u8) ![16]u8 {
     var id: [16]u8 = undefined;
     if (encoded.len != 32) return error.InvalidArgument;
@@ -35,7 +46,7 @@ fn change(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, reference
 pub fn reserveJoined(server: *server_mod.ApiHttpServer, completion: *wire.Completion, desired: usize, network: std.Io) !void {
     if (completion.capacity.remaining >= desired) return;
     const io = server_mod.ApiHttpServer.configuredDurableIo(server.cfg) orelse return error.SqlWriteCapacityUnavailable;
-    const store = server.txn_sessions.durable orelse return error.SqlWriteCapacityUnavailable;
+    const store = try registrationStore(server);
     const Job = struct {
         store: *@import("transactions.zig").DurableSessionStore,
         count: usize,
@@ -64,7 +75,7 @@ pub fn reserveJoined(server: *server_mod.ApiHttpServer, completion: *wire.Comple
 // seal its plan. A failed/ambiguous preparation never admits the mutation.
 pub fn prepareTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8) !void {
     const encoded_id = std.fmt.bytesToHex(id, .lower);
-    const store = server.txn_sessions.durable orelse return error.DurabilityUnavailable;
+    const store = try registrationStore(server);
     for (completion.outcomes.items) |outcome| if (outcome.transaction_id) |old| {
         if (!std.mem.eql(u8, old, &encoded_id) or outcome.registration_node_id == null) continue;
         var record = (try store.loadRegistration(alloc, try parseId(outcome.reference_id.?))) orelse continue;
@@ -109,7 +120,7 @@ fn metadataTarget(input: operation.SQLCompletionOwner) refs.Owner {
     }, .publication_id = input.publication_id };
 }
 pub fn prepareMetadata(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, target: operation.SQLCompletionOwner) !void {
-    const store = server.txn_sessions.durable orelse return error.DurabilityUnavailable;
+    const store = try registrationStore(server);
     if (target.id == 0 or ((target.kind == .fk_initial or target.kind == .fk_generation) and target.publication_id == null)) return error.InvalidArgument;
     if (completion.join_begin) |begin| for (completion.outcomes.items[begin..]) |outcome| {
         const json = outcome.ddl_receipt_json orelse continue;
@@ -154,7 +165,7 @@ fn metadataPreparation(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
     try store.putRegistration(reference, .{ .outcome = .{ .ddl_receipt_json = json }, .prepared = true, .execution_admitted = true, .phase = .registered });
 }
 pub fn rejectMetadata(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, target: operation.SQLCompletionOwner) !void {
-    const store = server.txn_sessions.durable orelse return error.DurabilityUnavailable;
+    const store = try registrationStore(server);
     const begin = completion.join_begin orelse return;
     for (completion.outcomes.items[begin..]) |outcome| {
         const json = outcome.ddl_receipt_json orelse continue;
@@ -215,7 +226,7 @@ fn discardOutcome(completion: *wire.Completion, alloc: std.mem.Allocator, index:
     if (removed.ddl_receipt_json) |value| alloc.free(value);
 }
 fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion) !void {
-    const store = server.txn_sessions.durable orelse return error.DurabilityUnavailable;
+    const store = try registrationStore(server);
     var index = completion.join_begin orelse return;
     const local = if (server.cfg.session_router) |router| router.localNodeId() else 0;
     while (index < completion.outcomes.items.len) {
@@ -280,7 +291,7 @@ pub fn pinJoined(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, co
         done: std.Io.Event = .unset,
         fn run(job: *@This()) void {
             defer job.done.set(job.network);
-            const store = job.server.txn_sessions.durable orelse {
+            const store = registrationStore(job.server) catch {
                 job.completion.unknown = true;
                 return;
             };
@@ -344,7 +355,7 @@ fn pin(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, outcome: wir
     } else return error.InvalidArgument;
 }
 pub fn settled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, receipt: wire.Receipt, context: operation.RequestContext) !bool {
-    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return false;
+    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10 and receipt.version != 11) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return false;
     for (receipt.outcomes) |outcome| {
         try context.ensureActive();
         const reference = try parseId(outcome.reference_id orelse return false);
@@ -381,7 +392,7 @@ pub fn settled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, rece
     return true;
 }
 pub fn acknowledge(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, receipt: wire.Receipt, context: operation.RequestContext) !bool {
-    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return false;
+    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10 and receipt.version != 11) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return false;
     for (receipt.outcomes) |outcome| {
         try context.ensureActive();
         const reference = try parseId(outcome.reference_id orelse return false);
@@ -401,7 +412,7 @@ pub fn acknowledge(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
 }
 // A bounded probe can persist partial progress without discarding other owners.
 pub fn remaining(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, receipt: wire.Receipt, context: operation.RequestContext) !wire.Receipt {
-    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return .{ .unknown = true, .outcomes = try alloc.dupe(wire.Outcome, receipt.outcomes) };
+    if ((receipt.version != 3 and receipt.version != 4 and receipt.version != 5 and receipt.version != 6 and receipt.version != 7 and receipt.version != 8 and receipt.version != 9 and receipt.version != 10 and receipt.version != 11) or receipt.unknown or receipt.outcomes.len > wire.max_outcomes) return .{ .unknown = true, .outcomes = try alloc.dupe(wire.Outcome, receipt.outcomes) };
     var pending: std.ArrayList(wire.Outcome) = .empty;
     errdefer pending.deinit(alloc);
     for (receipt.outcomes, 0..) |outcome, index| {
@@ -424,7 +435,7 @@ fn consumerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, r
     const local = if (server.cfg.session_router) |router| router.localNodeId() else 0;
     const node = request.consumer_node_id orelse return error.InvalidArgument;
     if (node != local) return forwardOwner(server, alloc, request, node, forward);
-    const store = server.txn_sessions.durable orelse return error.DurabilityUnavailable;
+    const store = try registrationStore(server);
     const lock = store.lockRegistration(request.reference_id);
     defer lock.unlock();
     var record = (try store.loadRegistration(alloc, request.reference_id)) orelse return request.action == .acknowledge;
@@ -499,7 +510,7 @@ fn forwardOwner(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, req
     const auth = @import("internal_service_auth.zig");
     const token = try auth.tokenAlloc(alloc, .{ .secret = server.cfg.internal_service_secret orelse return error.CompletionOwnerUnavailable, .issuer = server.cfg.internal_service_issuer orelse return error.CompletionOwnerUnavailable }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
     defer alloc.free(token);
-    var response = try executor.execute(alloc, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = 1500, .headers = &.{ .{ .name = auth.header_name, .value = token }, .{ .name = "X-Antfly-SQL-Settlement", .value = "owner-v10" } } });
+    var response = try executor.execute(alloc, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = 1500, .headers = &.{ .{ .name = auth.header_name, .value = token }, .{ .name = "X-Antfly-SQL-Settlement", .value = "owner-v11" } } });
     defer response.deinit(alloc);
     if (response.status != 200) return error.CompletionOwnerUnavailable;
     var result = try std.json.parseFromSlice(struct { complete: bool }, alloc, response.body, .{});
@@ -538,7 +549,8 @@ pub fn ownerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
 // does not assert completion: missing consumer status remains unresolved, and
 // the transaction/job's own recovery and retention rules remain authoritative.
 pub fn recoverUnpublished(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, limit: usize) !void {
-    const store = server.txn_sessions.durable orelse return;
+    if (server.txn_sessions.durable == null) return;
+    const store = try registrationStore(server);
     const page = try store.registrationRecoveryPage(alloc, server.sql_completion_recovery_after, limit);
     defer alloc.free(page.references);
     const deadline = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
@@ -568,6 +580,7 @@ pub fn recoverUnpublished(server: *server_mod.ApiHttpServer, alloc: std.mem.Allo
 }
 pub fn capableJoined(server: *server_mod.ApiHttpServer, network: std.Io) bool {
     if (server.txn_sessions.durable == null or !server.source.vtable.tracks_sql_submission) return false;
+    _ = registrationStore(server) catch return false;
     // Registration outboxes belong to their issuing node even with shared
     // transaction storage; every distributed issuer needs authenticated routing.
     if (server.cfg.session_router) |router| {
