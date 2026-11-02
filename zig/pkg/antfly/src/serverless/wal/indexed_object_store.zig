@@ -22,6 +22,7 @@ const std = @import("std");
 const objectstore = @import("objectstore");
 const tree = @import("../graph_segment/page_tree.zig");
 const codec = @import("record_codec.zig");
+const payload_store = @import("payload.zig");
 const types = @import("types.zig");
 const WalStore = @import("store.zig").WalStore;
 const A = std.mem.Allocator;
@@ -34,6 +35,7 @@ pub const IndexedObjectStore = struct {
     bucket: []u8,
     prefix: []u8,
     max_attempts: usize = 8,
+    cancellation: ?objectstore.CancellationToken = null,
     /// Optional host admission ceiling. Existing receipts bypass this limit.
     max_new_lsn: ?u64 = null,
     /// Enable only after every WAL reader supports HEAD format 3.
@@ -106,6 +108,7 @@ pub const IndexedObjectStore = struct {
     pub const ReadParent = struct { latest_lsn: u64, write_epoch: u64, physical_first_lsn: u64, records: ?tree.Ref = null };
     pub const Head = struct {
         format: u32 = 2,
+        external_payloads: ?bool = null,
         packed_pages: ?bool = null,
         deferred_indexes: ?bool = null,
         deferred_tail: ?DeferredTail = null,
@@ -157,9 +160,9 @@ pub const IndexedObjectStore = struct {
     }
 
     fn commit(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8, operation_id: ?[]const u8, expected_latest: ?u64) !?u64 {
-        // Admission before any object write; records must fit an ordinary tree
-        // value. Large application blobs belong in immutable object storage.
-        if (payload.len > tree.max_record_bytes - 128) return error.WalRecordTooLarge;
+        // Bound opaque transaction admission before any object write. Large
+        // transactions use authenticated payload pages in this WAL epoch.
+        if (payload.len > payload_store.max_bytes) return error.WalRecordTooLarge;
         if (operation_id) |id| if (id.len == 0 or id.len > 4096) return error.InvalidWalOperationId;
         var ctx = try Context.init(self, namespace, null);
         defer ctx.deinit();
@@ -192,10 +195,7 @@ pub const IndexedObjectStore = struct {
             // Reserve maxInt for the exclusive upper bound and retained floor.
             if (self.max_new_lsn) |maximum| if (next > maximum) return error.PublicationLagExceeded;
             if (next == std.math.maxInt(u64)) return error.WalLsnExhausted;
-            const encoded = if (operation_id) |id|
-                try codec.encodeIdempotentRecordAlloc(self.alloc, next, timestamp, payload, id)
-            else
-                try codec.encodeRecordAlloc(self.alloc, next, timestamp, payload);
+            const encoded = try encodeStoredRecord(self.alloc, ctx.store(), next, timestamp, payload, operation_id);
             defer self.alloc.free(encoded);
             if (encoded.len + 8 > tree.max_record_bytes) return error.WalRecordTooLarge;
             var lsn_key: [8]u8 = undefined;
@@ -207,13 +207,14 @@ pub const IndexedObjectStore = struct {
                 receipt_change[0] = .{ .key = id, .value = &receipt };
                 break :blk &receipt_change;
             } else &.{};
-            switch (try self.tryDeferred(&ctx, current, &changes, operation_changes, next)) {
+            switch (if ((try codec.parseRecord(encoded, 0)).external_payload) @as(DeferredResult, .materialize) else try self.tryDeferred(&ctx, current, &changes, operation_changes, next)) {
                 .committed => return next,
                 .contended => continue,
                 .materialize => {},
             }
             var updated = try self.applyChanges(pages, current.value, &changes, operation_changes);
             updated.latest_lsn = next;
+            if ((try codec.parseRecord(encoded, 0)).external_payload) updated.external_payloads = true;
             updated.inline_tail = if (self.inline_tail_enabled) InlineTail.fromRecord(encoded) else null;
             try ctx.finishForest(&uploads, &updated);
             ctx.writeHead(updated, current.revision) catch |err| switch (err) {
@@ -223,6 +224,14 @@ pub const IndexedObjectStore = struct {
             return next;
         }
         return error.WalCommitContended;
+    }
+
+    fn encodeStoredRecord(a: A, pages: tree.Store, lsn: u64, timestamp: u64, payload: []const u8, operation_id: ?[]const u8) ![]u8 {
+        const overhead = 128 + if (operation_id) |id| id.len else @as(usize, 0);
+        if (payload.len <= tree.max_record_bytes -| overhead) return if (operation_id) |id| codec.encodeIdempotentRecordAlloc(a, lsn, timestamp, payload, id) else codec.encodeRecordAlloc(a, lsn, timestamp, payload);
+        const descriptor = try payload_store.store(a, pages, payload);
+        defer a.free(descriptor);
+        return codec.encodeExternalRecordAlloc(a, lsn, timestamp, descriptor, operation_id);
     }
 
     pub const BatchResult = types.BatchResult;
@@ -270,7 +279,7 @@ pub const IndexedObjectStore = struct {
             if (count > 1024) return error.InvalidWalBatch;
             var hash = Sha256.init(.{});
             for (group.payloads) |payload| {
-                if (payload.len > tree.max_record_bytes - 128) return error.WalRecordTooLarge;
+                if (payload.len > payload_store.max_bytes) return error.WalRecordTooLarge;
                 total = std.math.add(usize, total, payload.len + 32) catch return error.WalRecordTooLarge;
                 if (total > 8 * 1024 * 1024) return error.WalRecordTooLarge;
                 var len: [8]u8 = undefined;
@@ -305,6 +314,7 @@ pub const IndexedObjectStore = struct {
             var changes = std.ArrayList(tree.Mutation).empty;
             var operations = std.ArrayList(tree.Mutation).empty;
             var last = current.value.latest_lsn;
+            var external_payloads = false;
             for (groups, receipts, found, 0..) |group, *receipt, existing, index| {
                 var duplicate: ?usize = null;
                 for (groups[0..index], 0..) |prior, i| {
@@ -335,7 +345,9 @@ pub const IndexedObjectStore = struct {
                 for (group.payloads, 0..) |payload, i| {
                     const key = try scratch.create([8]u8);
                     std.mem.writeInt(u64, key, first + i, .big);
-                    try changes.append(scratch, .{ .key = key, .value = try codec.encodeRecordAlloc(scratch, first + i, group.timestamp, payload) });
+                    const encoded = try encodeStoredRecord(scratch, ctx.store(), first + i, group.timestamp, payload, null);
+                    external_payloads = external_payloads or (try codec.parseRecord(encoded, 0)).external_payload;
+                    try changes.append(scratch, .{ .key = key, .value = encoded });
                 }
                 std.mem.writeInt(u64, receipt[0..8], first, .little);
                 std.mem.writeInt(u64, receipt[8..16], last, .little);
@@ -343,13 +355,14 @@ pub const IndexedObjectStore = struct {
                 results[index] = .{ .start_lsn = first, .end_lsn = last };
             }
             if (changes.items.len == 0) return results;
-            switch (try self.tryDeferred(&ctx, current, changes.items, operations.items, last)) {
+            switch (if (external_payloads) @as(DeferredResult, .materialize) else try self.tryDeferred(&ctx, current, changes.items, operations.items, last)) {
                 .committed => return results,
                 .contended => continue,
                 .materialize => {},
             }
             var updated = try self.applyChanges(pages, current.value, changes.items, operations.items);
             updated.latest_lsn = last;
+            if (external_payloads) updated.external_payloads = true;
             updated.inline_tail = if (self.inline_tail_enabled) InlineTail.fromRecord(changes.items[changes.items.len - 1].value.?) else null;
             try ctx.finishForest(&uploads, &updated);
             ctx.writeHead(updated, current.revision) catch |err| switch (err) {
@@ -393,7 +406,8 @@ pub const IndexedObjectStore = struct {
         _ = self;
         return out;
     }
-    fn tryDeferred(self: *@This(), ctx: *Context, current: Snapshot, changes: []const tree.Mutation, operations: []const tree.Mutation, latest: u64) !enum { committed, contended, materialize } {
+    const DeferredResult = enum { committed, contended, materialize };
+    fn tryDeferred(self: *@This(), ctx: *Context, current: Snapshot, changes: []const tree.Mutation, operations: []const tree.Mutation, latest: u64) !DeferredResult {
         if (!self.deferred_indexes_enabled and current.value.deferred_indexes != true) return .materialize;
         const tail = current.value.deferred_tail orelse DeferredTail{};
         var updated = current.value;
@@ -403,6 +417,7 @@ pub const IndexedObjectStore = struct {
             for (changes) |change| {
                 const encoded = change.value orelse return error.InvalidWal;
                 const record = try codec.parseRecord(encoded, 0);
+                if (record.external_payload) return .materialize;
                 _ = try @import("../api/codec.zig").decodeMutationView(record.payload);
             }
             // Index activation starts at this accepting batch, including when
@@ -509,10 +524,10 @@ pub const IndexedObjectStore = struct {
             const record = try codec.parseRecord(encoded, 0);
             if (record.next_cursor != encoded.len) return error.InvalidWal;
             if (record.lsn < index.first_lsn) continue;
-            const mutation = try @import("../api/codec.zig").decodeMutationView(record.payload);
+            const mutation = try @import("../api/codec.zig").decodeMutationView(if (record.external_payload) try payload_store.load(a, pages, record.payload, payload_store.max_bytes) else record.payload);
             // Store small records in the authenticated index leaf. Large bodies
             // retain only their LSN and use the ordinary record tree on a hit.
-            const value = try a.alloc(u8, 8 + if (encoded.len <= 1536) encoded.len else @as(usize, 0));
+            const value = try a.alloc(u8, 8 + if (!record.external_payload and encoded.len <= 1536) encoded.len else @as(usize, 0));
             std.mem.writeInt(u64, value[0..8], record.lsn, .big);
             if (value.len > 8) @memcpy(value[8..], encoded);
             try documents.put(a, mutation.doc_id, value);
@@ -552,13 +567,15 @@ pub const IndexedObjectStore = struct {
             // Index cleanup shares the physical record checkpoint. Bound its
             // input bytes as well as record count so retries can make progress
             // with large accepted records under the existing host I/O budget.
-            if (bytes > 0 and bytes + entry.value.len > 2 * 1024 * 1024) {
+            const hydrated_bytes = if (record.external_payload) (try payload_store.reference(a, record.payload)).bytes else 0;
+            const work_bytes = entry.value.len + hydrated_bytes;
+            if (bytes > 0 and bytes + work_bytes > 2 * 1024 * 1024) {
                 end = record.lsn;
                 break;
             }
-            bytes += entry.value.len;
+            bytes += work_bytes;
             expected += 1;
-            const mutation = try @import("../api/codec.zig").decodeMutationView(record.payload);
+            const mutation = try @import("../api/codec.zig").decodeMutationView(if (record.external_payload) try payload_store.load(a, pages, record.payload, payload_store.max_bytes) else record.payload);
             try identities.put(a, try a.dupe(u8, mutation.doc_id), {});
         }
         if (expected != end) return error.InvalidWal;
@@ -592,12 +609,51 @@ pub const IndexedObjectStore = struct {
         defer ctx.deinit();
         var head = try ctx.readHead();
         defer head.deinit(self.alloc);
+        return describeHead(self.alloc, ctx.domain, head.value);
+    }
+    fn describeHead(a: A, domain: [32]u8, value: Head) !types.ReadSnapshot {
         var lineage: [40]u8 = undefined;
-        @memcpy(lineage[0..32], &ctx.domain);
-        std.mem.writeInt(u64, lineage[32..40], head.value.write_epoch, .big);
+        @memcpy(lineage[0..32], &domain);
+        std.mem.writeInt(u64, lineage[32..40], value.write_epoch, .big);
         var lineage_id: [32]u8 = undefined;
         Sha256.hash(&lineage, &lineage_id, .{});
-        return .{ .latest_lsn = head.value.latest_lsn, .first_lsn = head.value.first_lsn, .identity = try identity(self.alloc, ctx.domain, .{ .latest_lsn = head.value.latest_lsn, .write_epoch = head.value.write_epoch, .physical_first_lsn = head.value.physical_first_lsn, .records = head.value.records }), .lineage = lineage_id, .small_tail = head.value.inline_tail != null or head.value.deferred_tail != null, .parent_identity = if (head.value.read_parent) |value| try identity(self.alloc, ctx.domain, value) else null, .parent_lsn = if (head.value.read_parent) |value| value.latest_lsn else 0 };
+        return .{ .latest_lsn = value.latest_lsn, .first_lsn = value.first_lsn, .identity = try identity(a, domain, .{ .latest_lsn = value.latest_lsn, .write_epoch = value.write_epoch, .physical_first_lsn = value.physical_first_lsn, .records = value.records }), .lineage = lineage_id, .small_tail = value.inline_tail != null or value.deferred_tail != null, .parent_identity = if (value.read_parent) |parent_value| try identity(a, domain, parent_value) else null, .parent_lsn = if (value.read_parent) |parent_value| parent_value.latest_lsn else 0 };
+    }
+    /// Immutable serving metadata and an original local clock anchor. Callers
+    /// may retain owned decoded rows, but cannot renew these lazy references.
+    pub const CapturedHead = struct { head: Head, snapshot: types.ReadSnapshot, observed_ns: u64, scope: [32]u8 };
+    fn captureScope(self: *@This(), namespace: []const u8) ![32]u8 {
+        const bytes = try std.json.Stringify.valueAlloc(self.alloc, .{ self.bucket, self.prefix, namespace }, .{});
+        defer self.alloc.free(bytes);
+        var digest: [32]u8 = undefined;
+        Sha256.hash(bytes, &digest, .{});
+        return digest;
+    }
+    pub fn captureRead(self: *@This(), namespace: []const u8) !CapturedHead {
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        var head = try ctx.readHead();
+        defer head.deinit(self.alloc);
+        return .{ .head = head.value, .snapshot = try describeHead(self.alloc, ctx.domain, head.value), .observed_ns = ctx.opened_ns, .scope = try self.captureScope(namespace) };
+    }
+    /// Receipt lookup remains available after payload retention. It never
+    /// allocates an LSN or mutates HEAD merely to resolve a source retry.
+    pub fn findIdempotent(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8, operation_id: []const u8) !?u64 {
+        if (operation_id.len == 0 or operation_id.len > 4096) return error.InvalidWalOperationId;
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        var head = try ctx.readHead();
+        defer head.deinit(self.alloc);
+        const found = try self.lookupReceipts(self.alloc, ctx.store(), head.value, &.{operation_id});
+        defer self.alloc.free(found);
+        const value = found[0] orelse return null;
+        defer value.deinit(self.alloc);
+        var digest: [32]u8 = undefined;
+        Sha256.hash(payload, &digest, .{});
+        if (value.value.len != 48 or std.mem.readInt(u64, value.value[8..16], .little) != timestamp or !std.mem.eql(u8, value.value[16..48], &digest)) return error.WalIdempotencyConflict;
+        const lsn = std.mem.readInt(u64, value.value[0..8], .little);
+        if (lsn == 0 or lsn > head.value.latest_lsn) return error.InvalidWal;
+        return lsn;
     }
     pub fn readPointAlloc(self: *@This(), a: A, namespace: []const u8, id: []const u8, range: types.ReadRange) !types.PointRead {
         try range.check();
@@ -618,10 +674,12 @@ pub const IndexedObjectStore = struct {
                 const encoded = view.records[i];
                 const record = try codec.parseRecord(encoded, 0);
                 if (record.lsn < range.start_lsn) break;
+                // External bodies are never admitted to the deferred inline tail.
+                if (record.external_payload) return error.InvalidWal;
                 const mutation = @import("../api/codec.zig").decodeMutationView(record.payload) catch return .{};
                 if (!std.mem.eql(u8, id, mutation.doc_id)) continue;
                 if (encoded.len + @sizeOf(types.Record) > range.max_bytes) return error.WalReadBudgetExceeded;
-                const payload = try a.dupe(u8, record.payload);
+                const payload = if (record.external_payload) try payload_store.load(a, ctx.store(), record.payload, range.max_bytes -| (encoded.len + @sizeOf(types.Record))) else try a.dupe(u8, record.payload);
                 errdefer a.free(payload);
                 const operation_id = if (record.operation_id) |op| try a.dupe(u8, op) else null;
                 errdefer if (operation_id) |op| a.free(op);
@@ -652,10 +710,10 @@ pub const IndexedObjectStore = struct {
         if (encoded.len + @sizeOf(types.Record) > range.max_bytes) return error.WalReadBudgetExceeded;
         const record = try codec.parseRecord(encoded, 0);
         if (record.lsn != lsn or record.next_cursor != encoded.len) return error.InvalidWal;
-        const mutation = try @import("../api/codec.zig").decodeMutationView(record.payload);
-        if (!std.mem.eql(u8, id, mutation.doc_id)) return error.InvalidWal;
-        const payload = try a.dupe(u8, record.payload);
+        const payload = if (record.external_payload) try payload_store.load(a, ctx.store(), record.payload, range.max_bytes -| (encoded.len + @sizeOf(types.Record))) else try a.dupe(u8, record.payload);
         errdefer a.free(payload);
+        const mutation = try @import("../api/codec.zig").decodeMutationView(payload);
+        if (!std.mem.eql(u8, id, mutation.doc_id)) return error.InvalidWal;
         const operation_id = if (record.operation_id) |op| try a.dupe(u8, op) else null;
         errdefer if (operation_id) |op| a.free(op);
         try range.check();
@@ -671,11 +729,24 @@ pub const IndexedObjectStore = struct {
     }
 
     pub fn readRangeAlloc(self: *@This(), alloc: A, namespace: []const u8, range: types.ReadRange) ![]types.Record {
+        return self.readRangeAt(alloc, namespace, range, null);
+    }
+    pub fn readCapturedRangeAlloc(self: *@This(), alloc: A, namespace: []const u8, captured: CapturedHead, range: types.ReadRange) ![]types.Record {
+        return self.readRangeAt(alloc, namespace, range, captured);
+    }
+    fn readRangeAt(self: *@This(), alloc: A, namespace: []const u8, range: types.ReadRange, captured: ?CapturedHead) ![]types.Record {
         try range.check();
         if (range.start_lsn == 0 or range.end_lsn == std.math.maxInt(u64)) return error.InvalidWal;
         var ctx = try Context.init(self, namespace, range.cancellation);
         defer ctx.deinit();
-        var head = try ctx.readHead();
+        var head = if (captured) |cut| pinned: {
+            if (!std.mem.eql(u8, &cut.scope, &try self.captureScope(namespace))) return error.WalSnapshotScopeMismatch;
+            if (!std.mem.eql(u8, &cut.snapshot.identity, &(try describeHead(self.alloc, ctx.domain, cut.head)).identity)) return error.InvalidWal;
+            ctx.opened_ns = cut.observed_ns;
+            ctx.bounded_roots = cut.head.root_lifetime_ms != null;
+            try Context.check(&ctx);
+            break :pinned Snapshot{ .value = cut.head };
+        } else try ctx.readHead();
         defer head.deinit(self.alloc);
         if (range.start_lsn > range.end_lsn) return alloc.alloc(types.Record, 0);
         if (range.start_lsn < head.value.first_lsn) return error.WalSnapshotExpired;
@@ -687,7 +758,7 @@ pub const IndexedObjectStore = struct {
             const record = try codec.parseRecord(tail.bytes[0..tail.len], 0);
             const out = try alloc.alloc(types.Record, 1);
             errdefer alloc.free(out);
-            const payload = try alloc.dupe(u8, record.payload);
+            const payload = if (record.external_payload) try payload_store.load(alloc, ctx.store(), record.payload, range.max_bytes -| (@as(usize, tail.len) + @sizeOf(types.Record))) else try alloc.dupe(u8, record.payload);
             errdefer alloc.free(payload);
             const id = if (record.operation_id) |value| try alloc.dupe(u8, value) else null;
             errdefer if (id) |value| alloc.free(value);
@@ -719,8 +790,9 @@ pub const IndexedObjectStore = struct {
                 std.mem.readInt(u64, entry.key[0..8], .big) != expected) return error.InvalidWal;
             bytes = std.math.add(usize, bytes, entry.value.len + @sizeOf(types.Record)) catch return error.WalReadBudgetExceeded;
             if (bytes > range.max_bytes) return error.WalReadBudgetExceeded;
-            const payload = try alloc.dupe(u8, record.payload);
+            const payload = if (record.external_payload) try payload_store.load(alloc, ctx.store(), record.payload, range.max_bytes -| bytes) else try alloc.dupe(u8, record.payload);
             errdefer alloc.free(payload);
+            if (record.external_payload) bytes = std.math.add(usize, bytes, payload.len) catch return error.WalReadBudgetExceeded;
             const id = if (record.operation_id) |value| try alloc.dupe(u8, value) else null;
             errdefer if (id) |value| alloc.free(value);
             try out.append(alloc, .{ .lsn = record.lsn, .timestamp_ns = record.timestamp_ns, .payload = payload, .operation_id = id });
@@ -734,8 +806,9 @@ pub const IndexedObjectStore = struct {
                 if (record.lsn != expected) return error.InvalidWal;
                 bytes = std.math.add(usize, bytes, encoded.len + @sizeOf(types.Record)) catch return error.WalReadBudgetExceeded;
                 if (bytes > range.max_bytes) return error.WalReadBudgetExceeded;
-                const payload = try alloc.dupe(u8, record.payload);
+                const payload = if (record.external_payload) try payload_store.load(alloc, ctx.store(), record.payload, range.max_bytes -| bytes) else try alloc.dupe(u8, record.payload);
                 errdefer alloc.free(payload);
+                if (record.external_payload) bytes = std.math.add(usize, bytes, payload.len) catch return error.WalReadBudgetExceeded;
                 const id = if (record.operation_id) |value| try alloc.dupe(u8, value) else null;
                 errdefer if (id) |value| alloc.free(value);
                 try out.append(alloc, .{ .lsn = record.lsn, .timestamp_ns = record.timestamp_ns, .payload = payload, .operation_id = id });
@@ -974,7 +1047,7 @@ pub const IndexedObjectStore = struct {
             const root = try std.fmt.allocPrint(owner.alloc, "{s}/wal-v1/{s}", .{ owner.prefix, std.fmt.bytesToHex(digest, .lower) });
             var domain: [32]u8 = undefined;
             Sha256.hash(root, &domain, .{});
-            return .{ .owner = owner, .root = root, .domain = domain, .cancellation = cancellation, .opened_ns = owner.read_clock.read(), .bounded_roots = owner.managed_reads, .pack_enabled = owner.packed_pages_enabled };
+            return .{ .owner = owner, .root = root, .domain = domain, .cancellation = cancellation orelse owner.cancellation, .opened_ns = owner.read_clock.read(), .bounded_roots = owner.managed_reads, .pack_enabled = owner.packed_pages_enabled };
         }
         fn deinit(self: *@This()) void {
             if (self.packed_cache) |cache| cache.allocator.free(cache.bytes);
@@ -1022,8 +1095,8 @@ pub const IndexedObjectStore = struct {
             const parsed = try std.json.parseFromSlice(Head, a, result.body, .{});
             defer parsed.deinit();
             const head = parsed.value;
-            if ((head.packed_pages orelse false) != (head.format == 5) and head.format != 6) return error.InvalidWal;
-            if ((head.deferred_indexes == true) != (head.format == 6) or (head.deferred_tail != null and head.deferred_indexes != true)) return error.InvalidWal;
+            if ((head.packed_pages orelse false) != (head.format == 5) and head.format != 6 and head.format != 7) return error.InvalidWal;
+            if ((head.format != 7 and (head.deferred_indexes == true) != (head.format == 6)) or (head.deferred_tail != null and head.deferred_indexes != true)) return error.InvalidWal;
             if (head.deferred_tail) |*tail| try tail.validate(head.latest_lsn);
             const base_latest = head.latest_lsn - if (head.deferred_tail) |*tail| tail.count() else @as(usize, 0);
             self.pack_enabled = self.owner.packed_pages_enabled or (head.packed_pages orelse false);
@@ -1032,8 +1105,9 @@ pub const IndexedObjectStore = struct {
                 self.bounded_roots = true;
             } else if (self.owner.managed_reads) return error.WalReaderContractMissing;
             try check(self);
-            if ((head.format != 1 and head.format != 2 and head.format != 3 and head.format != 4 and head.format != 5 and head.format != 6) or head.write_epoch == 0 or head.physical_first_lsn == 0 or head.physical_first_lsn > head.first_lsn or head.physical_first_lsn > base_latest + 1 or head.first_lsn == 0 or head.latest_lsn == std.math.maxInt(u64) or
+            if ((head.format != 1 and head.format != 2 and head.format != 3 and head.format != 4 and head.format != 5 and head.format != 6 and head.format != 7) or head.write_epoch == 0 or head.physical_first_lsn == 0 or head.physical_first_lsn > head.first_lsn or head.physical_first_lsn > base_latest + 1 or head.first_lsn == 0 or head.latest_lsn == std.math.maxInt(u64) or
                 head.first_lsn > head.latest_lsn + 1 or (base_latest >= head.physical_first_lsn and head.records == null)) return error.InvalidWal;
+            if ((head.external_payloads == true) != (head.format == 7)) return error.InvalidWal;
             if (head.format < 4 and (head.document_index != null or head.read_parent != null or head.gc_documents != null)) return error.InvalidWal;
             if (head.format < 4 and (head.format == 3) != (head.inline_tail != null)) return error.InvalidWal;
             if (head.document_index) |index| {
@@ -1081,12 +1155,12 @@ pub const IndexedObjectStore = struct {
             var upgraded = head;
             upgraded.packed_pages = if (self.pack_enabled or (head.packed_pages orelse false)) true else null;
             if (upgraded.first_lsn > upgraded.latest_lsn) upgraded.inline_tail = null;
-            upgraded.format = if (upgraded.deferred_indexes == true) 6 else if (upgraded.packed_pages == true) 5 else if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else if (upgraded.inline_tail != null) 3 else 2;
+            upgraded.format = if (upgraded.external_payloads == true) 7 else if (upgraded.deferred_indexes == true) 6 else if (upgraded.packed_pages == true) 5 else if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else if (upgraded.inline_tail != null) 3 else 2;
             var bytes = try std.json.Stringify.valueAlloc(a, upgraded, .{ .emit_null_optional_fields = false });
             if (bytes.len > 4096 and upgraded.inline_tail != null) {
                 a.free(bytes);
                 upgraded.inline_tail = null;
-                upgraded.format = if (upgraded.deferred_indexes == true) 6 else if (upgraded.packed_pages == true) 5 else if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else 2;
+                upgraded.format = if (upgraded.external_payloads == true) 7 else if (upgraded.deferred_indexes == true) 6 else if (upgraded.packed_pages == true) 5 else if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else 2;
                 bytes = try std.json.Stringify.valueAlloc(a, upgraded, .{ .emit_null_optional_fields = false });
             }
             defer a.free(bytes);
@@ -2098,4 +2172,68 @@ test "serverless indexed WAL deferred projection validates before acceptance and
     defer types.freeRecords(a, background);
     try std.testing.expectEqualStrings("opaque", background[0].payload);
     try std.testing.expectEqualStrings(encoded, background[1].payload);
+}
+
+test "serverless indexed unified WAL large transactions retain receipts and immutable captured reads" {
+    const a = std.testing.allocator;
+    var fixture: ManagedReadFixture = undefined;
+    try fixture.init(a);
+    defer fixture.deinit();
+    fixture.wal.read_state_enabled = true;
+    const body = try a.alloc(u8, 2 * 1024 * 1024 + 127);
+    defer a.free(body);
+    for (body, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    try std.testing.expectEqual(@as(u64, 1), try fixture.wal.appendIdempotent("transactions", 0, body, "one"));
+    const captured = try fixture.wal.captureRead("transactions");
+    try std.testing.expectEqual(@as(u32, 7), captured.head.format);
+    _ = try fixture.wal.appendIdempotent("transactions", 0, "later", "two");
+    const range: types.ReadRange = .{ .start_lsn = 1, .end_lsn = 1, .max_bytes = body.len + 4096 };
+    try std.testing.expectError(error.WalReadBudgetExceeded, fixture.wal.readCapturedRangeAlloc(a, "transactions", captured, .{ .start_lsn = 1, .end_lsn = 1, .max_bytes = 1024 }));
+    try std.testing.expectError(error.WalSnapshotScopeMismatch, fixture.wal.readCapturedRangeAlloc(a, "another", captured, range));
+    _ = try fixture.wal.truncatePrefix("transactions", 3);
+    while (try fixture.wal.compactPrefixStep("transactions", 1)) {}
+    const rows = try fixture.wal.readCapturedRangeAlloc(a, "transactions", captured, range);
+    defer types.freeRecords(a, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualSlices(u8, body, rows[0].payload);
+    try std.testing.expectEqual(@as(?u64, 1), try fixture.wal.findIdempotent("transactions", 0, body, "one"));
+    try std.testing.expectError(error.WalIdempotencyConflict, fixture.wal.findIdempotent("transactions", 0, "different", "one"));
+    try std.testing.expectEqual(@as(u64, 1), try fixture.wal.appendIdempotent("transactions", 0, body, "one"));
+    fixture.now_ns += 31 * std.time.ns_per_s;
+    try std.testing.expectError(error.WalSnapshotExpired, fixture.wal.readCapturedRangeAlloc(a, "transactions", captured, range));
+}
+
+test "serverless indexed unified WAL bounds external point reads and compaction by hydrated bytes" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var wal = try IndexedObjectStore.init(a, client, "db", "point-external");
+    defer wal.deinit();
+    wal.document_index_enabled = true;
+    const body = try a.alloc(u8, 2 * 1024 * 1024 + 1);
+    defer a.free(body);
+    @memset(body, 'x');
+    const payload = try @import("../api/codec.zig").encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = "one", .body = body });
+    defer a.free(payload);
+    _ = try wal.appendIdempotent("docs", 0, payload, "first");
+    _ = try wal.appendIdempotent("docs", 0, payload, "second");
+    try std.testing.expectError(error.WalReadBudgetExceeded, wal.readPointAlloc(a, "docs", "one", .{ .start_lsn = 1, .end_lsn = 2, .max_bytes = 1024 }));
+    const point = try wal.readPointAlloc(a, "docs", "one", .{ .start_lsn = 1, .end_lsn = 2, .max_bytes = payload.len + 4096 });
+    defer a.free(point.record.?.payload);
+    defer a.free(point.record.?.operation_id.?);
+    try std.testing.expectEqualStrings(payload, point.record.?.payload);
+    try std.testing.expectEqual(@as(u64, 2), point.record.?.lsn);
+    _ = try wal.truncatePrefix("docs", 3);
+    try std.testing.expect(try wal.compactPrefixStep("docs", 256));
+    var ctx = try IndexedObjectStore.Context.init(&wal, "docs", null);
+    defer ctx.deinit();
+    var first = try ctx.readHead();
+    defer first.deinit(a);
+    // One oversized transaction may make progress, but its descriptor cannot
+    // make another oversized transaction look free in the same bounded step.
+    try std.testing.expectEqual(@as(u64, 2), first.value.physical_first_lsn);
+    try std.testing.expect(!try wal.compactPrefixStep("docs", 256));
+    try std.testing.expectEqual(@as(?u64, 1), try wal.findIdempotent("docs", 0, payload, "first"));
 }

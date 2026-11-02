@@ -137,3 +137,62 @@ is not migration. Keep compatible writers and collectors together during rollout
 R2 lacks atomic conditional DELETE in the host contract, so unsupported operations
 fail closed. S3 ETags and GCS generations remain typed. Provider transport correctness,
 managed-GC recovery and actual-provider performance require separate evidence.
+
+## Unified object WAL for lake and serverless ingestion
+
+Native writable lake tables and hosted serverless tables use the indexed object
+WAL engine in `serverless/wal/indexed_object_store.zig`. `lake_wal.zig` is a policy
+adapter: it validates source epoch/checkpoint progression, complete CDC batches,
+published coverage and pending-depth admission. It does not maintain another
+record chain, receipt directory or conditional tail pointer. A CDC batch remains
+one WAL transaction and one receipt/LSN. Raft and native LSM journals retain their
+separate replication and local-recovery responsibilities.
+
+Each table incarnation still has a scoped namespace and monotone LSN; sharing the
+engine does not introduce a global append lock. The WAL HEAD and Iceberg catalog
+HEAD remain separate authorities. Acknowledged acceptance precedes asynchronous
+publication, and replay plus catalog coverage bridge that boundary. Compaction
+must never infer publication from an uploaded file or a missing retained body.
+
+One conditional HEAD publishes the record and receipt roots. Exact replay is a
+read-only receipt lookup before current-schema and source-checkpoint validation;
+retaining or collecting payload bytes cannot release an operation identity for
+reuse. Conflicting payloads and stale conditional appends fail. After complete
+payload retention, the accepted high watermark still participates in admission;
+a catalog cut must cover that watermark before its checkpoint may replace the
+retained source body as admission evidence.
+
+Opaque transactions larger than an inline tree value use authenticated chunked
+payload pages in the same namespace and upload epoch. The committed record owns
+the root, byte count and digest. Readers bound the complete hydrated population,
+verify every chunk and digest, and never return a truncated successful prefix.
+HEAD format seven and the external-payload record flag fence incompatible readers.
+The native collector traverses these roots with the record/receipt roots, so
+uncommitted uploads remain collectible without a lake-specific blob collector.
+
+Accepted reads capture immutable roots, namespace/store scope and the original
+suspend-inclusive root-use clock. Lazy dereferences cannot extend that clock.
+Owned decoded overlays and retained cursor payloads may outlive it. Incremental
+replay requires a proven shared parent identity; a larger unproven jump rebuilds
+the bounded suffix. Equal LSNs alone do not prove ancestry.
+
+Logical retirement is limited by catalog coverage and every protected serving
+publication. Bounded shared compaction preserves receipt roots and watermarks.
+The shared collector owns durable mark/frontier/sweep progress and the epoch
+barrier. A bounded per-server registry carries only local owner/grace hints across
+request-scoped provider connections; it retains no client, credential or request
+cancellation pointer. Eviction/restart restarts the full local grace interval.
+Scheduled maintenance continues until physical collection completes.
+
+GCS control writes carry captured generations through native catalog, lease,
+enrichment and maintenance paths. Successful PUT responses retain their revision
+kind as well. Native ownership markers retain typed revisions for conditional
+vacuum. Mutable reads capture response revisions directly, avoiding compatibility
+ETag-to-generation metadata probes. S3/R2 continue using ETag revisions.
+
+Lake storage is unreleased. An unmarked nonempty legacy lake prefix fails closed;
+opening a reader does not initialize a format marker or hide that state. Existing
+development deployments must be quiesced, exported and rebuilt in a fresh table
+incarnation before switching. Preserve the original namespace/checkpoint backup
+until the new instance is qualified. This change does not automatically reset or
+migrate the HN deployment, and a disabled feature flag is not a format rollback.

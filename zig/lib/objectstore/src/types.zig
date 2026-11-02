@@ -109,6 +109,12 @@ pub const ObjectRevision = union(enum) {
     etag: []const u8,
     generation: []const u8,
 
+    pub fn token(self: ObjectRevision) []const u8 {
+        return switch (self) {
+            inline else => |bytes| bytes,
+        };
+    }
+
     pub fn clone(self: ObjectRevision, alloc: Allocator) !ObjectRevision {
         return switch (self) {
             .etag => |value| .{ .etag = try alloc.dupe(u8, value) },
@@ -287,6 +293,13 @@ pub const GetObjectRequest = struct { key: []const u8, options: GetOptions = .{}
 pub const PutResult = struct {
     etag: ?[]u8 = null,
     version_id: ?[]u8 = null,
+    revision_kind: enum { etag, generation } = .etag,
+    pub fn writeRevision(self: PutResult) ?ObjectRevision {
+        return switch (self.revision_kind) {
+            .etag => .{ .etag = self.etag orelse return null },
+            .generation => .{ .generation = self.version_id orelse return null },
+        };
+    }
 
     pub fn deinit(self: *PutResult, alloc: Allocator) void {
         if (self.etag) |value| alloc.free(value);

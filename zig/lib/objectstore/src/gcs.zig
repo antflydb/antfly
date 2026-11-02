@@ -1657,7 +1657,7 @@ fn objectListUrlAlloc(alloc: Allocator, cfg: JsonApiConfig, bucket: []const u8, 
 fn putResultFromMetadata(alloc: Allocator, metadata: types.ObjectMetadata) !types.PutResult {
     const etag = if (metadata.etag) |value| try alloc.dupe(u8, value) else null;
     errdefer if (etag) |value| alloc.free(value);
-    return .{ .etag = etag, .version_id = if (metadata.version_id) |value| try alloc.dupe(u8, value) else null };
+    return .{ .etag = etag, .revision_kind = .generation, .version_id = if (metadata.version_id) |value| try alloc.dupe(u8, value) else null };
 }
 fn parseVersionRetention(alloc: Allocator, body: []const u8, date: ?[]const u8, generation: []const u8, key: []const u8) !?types.VersionRetention {
     const time = @import("retention_time.zig");
@@ -2742,6 +2742,8 @@ test "gcs revision publication and deletion use one generation conditional reque
     var written = try client.compareAndPut("bucket", "HEAD", "next", revision, .{});
     defer written.deinit(a);
     try std.testing.expectEqualStrings("124", written.version_id.?);
+    try std.testing.expect(written.writeRevision().? == .generation);
+    try std.testing.expectEqualStrings("124", written.writeRevision().?.generation);
     try std.testing.expectEqual(@as(usize, 1), state.calls);
     try std.testing.expectError(error.PreconditionFailed, client.compareAndPut("bucket", "HEAD", "next", revision, .{}));
     try client.compareAndDelete("bucket", "HEAD", revision, .{});

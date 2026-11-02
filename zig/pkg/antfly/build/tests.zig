@@ -2919,6 +2919,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-cloudflare-host-test", "Run native Cloudflare host WAL, visibility and checkpoint contracts")
         .dependOn(&addFilteredTestRunArtifact(b, cloudflare_host_tests).step);
 
+    const object_wal_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/object_wal_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, object_wal_mod, true, true);
+    const object_wal_tests = b.addTest(.{
+        .root_module = object_wal_mod,
+        // Cache imports reach the archive engine too. Keep this owner focused
+        // on shared WAL storage, native admission and captured-cut contracts.
+        .filters = &.{ "serverless indexed", "serverless multiprovider", "external lake shared collector registry", "external lake bounded WAL cuts", "external lake segmented WAL", "external lake WAL collection", "external lake unified WAL" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-object-wal-test", "Run shared object WAL, lake adaptation and reclamation contracts")
+        .dependOn(&addFilteredTestRunArtifact(b, object_wal_tests).step);
+
     const serverless_default_filters = [_][]const u8{"serverless"};
     const serverless_tests = b.addTest(.{
         // macOS ReleaseFast measured 10.74 GB for this root. Reserve realistic

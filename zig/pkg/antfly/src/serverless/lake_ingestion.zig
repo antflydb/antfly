@@ -80,10 +80,6 @@ pub fn accept(a: A, binding: Binding, options: Options, context: Context, body: 
     var parsed = try std.json.parseFromSlice(Batch, a, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     const batch = parsed.value;
-    // Resolve current authority and validate full images before owning a batch.
-    var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
-    defer current.deinit(a);
-    try catalog.row_commit.validate(a, current.table.metadata_json, batch, context);
     const payload = try std.json.Stringify.valueAlloc(a, batch, .{});
     defer a.free(payload);
     var opened = try openQueue(a, binding, options);
@@ -94,11 +90,20 @@ pub fn accept(a: A, binding: Binding, options: Options, context: Context, body: 
     defer queue_arena.deinit();
     const scratch = queue_arena.allocator();
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
-    const last = try store.latest(scratch);
-    const latest = if (last) |record| record.lsn else 0;
     const identity = try std.json.Stringify.valueAlloc(scratch, .{ batch.source, batch.epoch, batch.batch_id }, .{});
     const operation_id = &catalog.types.digestHex(identity);
     if (try store.find(scratch, operation_id, payload)) |accepted| return accepted;
+    // Resolve an acknowledged retry before current-schema or checkpoint tests.
+    // Source evolution cannot turn a durable exact replay into a new append.
+    var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
+    defer current.deinit(a);
+    try catalog.row_commit.validate(a, current.table.metadata_json, batch, context);
+    const last = try store.latest(scratch);
+    const latest = if (last) |record| record.lsn else try store.watermark(scratch);
+    const covered = try coverage(a, current.table);
+    // Retirement may race the catalog read. A missing last body is usable only
+    // when this catalog cut proves the complete accepted high watermark.
+    if (last == null and latest != covered) return error.LakeCheckpointConflict;
     if (last) |record| {
         var previous = try std.json.parseFromSlice(Batch, a, record.payload, .{});
         defer previous.deinit();
@@ -118,7 +123,7 @@ pub fn accept(a: A, binding: Binding, options: Options, context: Context, body: 
         }
     }
     try context.ensureActive();
-    return store.append(scratch, operation_id, payload, latest, try coverage(a, current.table));
+    return store.append(scratch, operation_id, payload, latest, covered);
 }
 fn keyFieldsEqual(left: []const []const u8, right: []const []const u8) bool {
     if (left.len != right.len) return false;
@@ -179,7 +184,7 @@ pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
             defer active.deinit(client.allocator);
             const candidate = try std.json.parseFromSliceLeaky(Attempt, scratch, active.body, .{});
             if (std.mem.eql(u8, candidate.id, attempt.id) and std.mem.eql(u8, candidate.expected, attempt.expected) and std.mem.eql(u8, candidate.body, attempt.body)) {
-                try client.deleteObject(opened.bucket, intent_key, .{ .if_match_etag = active.metadata.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&context) });
+                try client.compareAndDelete(opened.bucket, intent_key, active.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&context) });
             }
             return true;
         },
@@ -409,4 +414,17 @@ test "external lake filesystem WAL retries a rejected intent after metadata pres
     const published = try managed.load(a);
     try std.testing.expectEqual(lsn, try coverage(a, published));
     try std.testing.expectEqual(catalog.types.Outcome.not_committed, try managed.resolve(a, attempt.id, &catalog.types.commitHash(commit)));
+    const shared: wal.Store = .{ .client = queue.client, .bucket = queue.bucket, .prefix = try prefix(a, queue.prefix, binding, options) };
+    const collected = try shared.prune(a, lsn, 256, false);
+    try std.testing.expect(collected.complete);
+    try std.testing.expect(try shared.latest(a) == null);
+    // The exact original request remains a receipt read after publication and
+    // complete body retirement, even though its initial checkpoint is stale.
+    try std.testing.expectEqual(lsn, try accept(a, binding, options, .{}, payload));
+    const invalid_reuse = "{\"batch_id\":\"first\",\"source\":\"test\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":\"invalid-long\"}}]}";
+    try std.testing.expectError(error.WalIdempotencyConflict, accept(a, binding, options, .{}, invalid_reuse));
+    const next = "{\"batch_id\":\"second\",\"source\":\"test\",\"epoch\":\"1\",\"expected_checkpoint\":\"1\",\"checkpoint\":\"2\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":2}}]}";
+    try std.testing.expectEqual(lsn + 1, try accept(a, binding, options, .{}, next));
+    try std.testing.expect(try drain(a, binding, options, .{}));
+    try std.testing.expect(!try drain(a, binding, options, .{}));
 }

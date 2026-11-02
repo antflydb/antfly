@@ -28,6 +28,7 @@ pub const ObjectStore = struct {
     gcs_client: ?*objectstore.Gcs.JsonApiClient = null,
     s3_client: ?*objectstore.S3.Client = null,
     owns_client: bool = true,
+    cancellation: ?objectstore.CancellationToken = null,
     indexed: ?*@import("indexed_object_store.zig").IndexedObjectStore = null,
     layout: std.atomic.Value(u8) = .init(0),
     bucket: []u8,
@@ -154,7 +155,7 @@ pub const ObjectStore = struct {
     fn readLayout(self: *ObjectStore) !?Layout {
         const key = try self.formatKey();
         defer self.alloc.free(key);
-        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 32 }) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 32, .cancellation = self.cancellation }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -187,7 +188,7 @@ pub const ObjectStore = struct {
             .indexed_relative => "antfly-wal:indexed:2",
             .managed_indexed_relative => "antfly-wal:indexed-managed:2",
         };
-        var published = self.client.compareAndPut(self.bucket, key, value, null, .{}) catch |err| {
+        var published = self.client.compareAndPut(self.bucket, key, value, null, .{ .cancellation = self.cancellation }) catch |err| {
             // The immutable selection may have committed before an ACK was
             // lost, or another compatible opener may have selected it first.
             if (try self.readLayout()) |selected| {
@@ -206,7 +207,7 @@ pub const ObjectStore = struct {
 
     /// Explicit format selection. Existing legacy WALs must be migrated into a
     /// new prefix; activation may never silently hide acknowledged records.
-    pub fn enableIndexed(self: *ObjectStore, options: struct { read_state: bool = false, document_index: bool = false, packed_pages: bool = false, deferred_indexes: bool = false, inline_tail: bool = true, managed_collection: bool = false }) !void {
+    pub fn enableIndexed(self: *ObjectStore, options: struct { read_state: bool = false, document_index: bool = false, packed_pages: bool = false, deferred_indexes: bool = false, inline_tail: bool = true, managed_collection: bool = false, initialize: bool = true }) !void {
         if (self.indexed != null) return error.WalAlreadyConfigured;
         const selected = try self.readLayout();
         if (selected == .legacy) return error.LegacyWalMigrationRequired;
@@ -231,13 +232,13 @@ pub const ObjectStore = struct {
             // prefix. Older unbounded readers may still hold historical roots.
             const pristine = wanted.managed() or wanted.relative();
             const migration_error = if (wanted.managed()) error.ManagedWalMigrationRequired else error.IndexedWalMigrationRequired;
-            if (pristine and try self.client.supportsObjectVersions(self.bucket, null)) {
-                var versions = try self.client.listObjectVersions(self.bucket, .{ .prefix = listing_prefix, .max_keys = 1 });
+            if (pristine and try self.client.supportsObjectVersions(self.bucket, self.cancellation)) {
+                var versions = try self.client.listObjectVersions(self.bucket, .{ .prefix = listing_prefix, .max_keys = 1, .cancellation = self.cancellation });
                 defer versions.deinit(self.alloc);
                 if (versions.entries.len != 0 or versions.is_truncated) return migration_error;
             }
             while (true) {
-                var page = try self.client.listObjects(self.bucket, .{ .prefix = listing_prefix, .continuation_token = cursor, .max_keys = 1000 });
+                var page = try self.client.listObjects(self.bucket, .{ .prefix = listing_prefix, .continuation_token = cursor, .max_keys = 1000, .cancellation = self.cancellation });
                 defer page.deinit(self.alloc);
                 for (page.entries) |item| {
                     if (std.mem.endsWith(u8, item.key, "/wal.log")) return error.LegacyWalMigrationRequired;
@@ -249,7 +250,7 @@ pub const ObjectStore = struct {
                 cursor = next;
             }
         }
-        try self.ensureLayout(wanted, true);
+        try self.ensureLayout(wanted, options.initialize);
         const indexed = try self.alloc.create(@import("indexed_object_store.zig").IndexedObjectStore);
         errdefer self.alloc.destroy(indexed);
         // Relative layout two reserves a nonempty physical prefix even when
@@ -268,6 +269,7 @@ pub const ObjectStore = struct {
         indexed.deferred_indexes_enabled = options.deferred_indexes;
         indexed.inline_tail_enabled = options.inline_tail;
         indexed.managed_reads = wanted.managed();
+        indexed.cancellation = self.cancellation;
         self.indexed = indexed;
     }
     pub fn deinit(self: *ObjectStore) void {

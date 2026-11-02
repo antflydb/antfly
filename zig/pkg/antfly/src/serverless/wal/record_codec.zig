@@ -35,7 +35,8 @@ pub fn encodeRecordAlloc(alloc: std.mem.Allocator, lsn: u64, timestamp_ns: u64, 
 }
 
 pub const idempotent_record_flag: u32 = @as(u32, 1) << 31;
-pub const idempotent_payload_max: usize = idempotent_record_flag - 1;
+pub const external_payload_flag: u32 = @as(u32, 1) << 30;
+pub const idempotent_payload_max: usize = external_payload_flag - 1;
 
 pub fn encodeIdempotentRecordAlloc(
     alloc: std.mem.Allocator,
@@ -63,6 +64,15 @@ pub fn encodeIdempotentRecordAlloc(
     return buf;
 }
 
+/// The descriptor is authenticated by the record tree. HEAD format seven fences
+/// readers which cannot hydrate these immutable, garbage-collected payload pages.
+pub fn encodeExternalRecordAlloc(a: std.mem.Allocator, lsn: u64, timestamp: u64, descriptor: []const u8, operation: ?[]const u8) ![]u8 {
+    const bytes = if (operation) |id| try encodeIdempotentRecordAlloc(a, lsn, timestamp, descriptor, id) else try encodeRecordAlloc(a, lsn, timestamp, descriptor);
+    const tag = std.mem.readInt(u32, bytes[16..20], .little);
+    std.mem.writeInt(u32, bytes[16..20], tag | external_payload_flag, .little);
+    return bytes;
+}
+
 pub fn encodeRecordsAlloc(alloc: std.mem.Allocator, records: []const wal_types.Record) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -83,6 +93,7 @@ pub const ParsedRecord = struct {
     payload: []const u8,
     operation_id: ?[]const u8,
     next_cursor: usize,
+    external_payload: bool = false,
 };
 
 pub fn parseRecord(raw: []const u8, start: usize) !ParsedRecord {
@@ -95,7 +106,7 @@ pub fn parseRecord(raw: []const u8, start: usize) !ParsedRecord {
     const length_tag = std.mem.readInt(u32, raw[cursor..][0..4], .little);
     cursor += 4;
     const idempotent = length_tag & idempotent_record_flag != 0;
-    const payload_len: usize = @intCast(length_tag & ~idempotent_record_flag);
+    const payload_len: usize = @intCast(length_tag & ~(idempotent_record_flag | external_payload_flag));
     var operation_id: ?[]const u8 = null;
     if (idempotent) {
         if (raw.len - cursor < 2) return error.InvalidWal;
@@ -114,6 +125,7 @@ pub fn parseRecord(raw: []const u8, start: usize) !ParsedRecord {
         .payload = payload,
         .operation_id = operation_id,
         .next_cursor = cursor,
+        .external_payload = length_tag & external_payload_flag != 0,
     };
 }
 

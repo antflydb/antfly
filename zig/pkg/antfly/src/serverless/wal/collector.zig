@@ -74,6 +74,7 @@ pub const Collector = struct {
     last_now_ns: u64 = 0,
     next_work_ns: u64 = 0,
     step_interval_ns: u64 = 250 * std.time.ns_per_ms,
+    inventory_limit: u32 = max_inventory,
     mutex: std.atomic.Mutex = .unlocked,
 
     /// Restart/takeover waits again. No cross-host timestamp authorizes delete.
@@ -123,6 +124,25 @@ pub const Collector = struct {
         }
     };
 
+    /// Process-local clock anchors cannot cross a restart. Durable job progress
+    /// lives in native metadata; this movable capsule preserves only an owner's
+    /// bounded hint between request-scoped provider connections.
+    pub const ResumeState = struct { owner: [16]u8, hint: Hint, root_len: usize, versions: ?bool, last_now_ns: u64 };
+    pub fn restoreState(self: *@This(), state: ResumeState) void {
+        self.owner = state.owner;
+        self.versions = state.versions;
+        self.last_now_ns = state.last_now_ns;
+        self.hints[0] = state.hint;
+        if (self.hints[0].state) |*value| value.root = self.hints[0].root[0..state.root_len];
+    }
+    pub fn suspendState(self: *@This(), namespace: []const u8) ResumeState {
+        var hint = self.hintFor(namespace).?.*;
+        const root_len = if (hint.state) |state| state.root.len else 0;
+        // No borrowed pointer survives the request-scoped collector. Restore
+        // binds the copied inline bytes only after they reach a stable owner.
+        if (hint.state) |*state| state.root = "";
+        return .{ .owner = self.owner, .hint = hint, .root_len = root_len, .versions = self.versions, .last_now_ns = self.last_now_ns };
+    }
     /// Keep the collector at a stable address after its first operation.
     pub fn init(a: A, wal: *Wal, io: std.Io) Collector {
         var owner: [16]u8 = undefined;
@@ -445,7 +465,9 @@ pub const Collector = struct {
                 var page = try self.collector.wal.traceCollectionPage(self.collector.alloc, self.namespace, self.active.id, self.active.roots.retired_before, ref, self.token);
                 defer page.deinit(self.collector.alloc);
                 var children = std.ArrayList(tree.Ref).empty;
-                for (page.entries) |entry| if (entry.child) |child| try children.append(self.arena, child.*);
+                for (page.entries) |entry| {
+                    if (entry.child) |child| try children.append(self.arena, child.*) else if (try @import("payload.zig").child(self.arena, entry.key, entry.value)) |child| try children.append(self.arena, child);
+                }
                 if (meta.child_offset > children.items.len) return error.InvalidCollectionState;
                 const end = @min(children.items.len, @as(usize, meta.child_offset) + child_chunk);
                 for (children.items[meta.child_offset..end]) |child| {
@@ -578,7 +600,7 @@ const Inventory = struct {
         try cursor.validate(versions, prefix);
         var result = Inventory{ .items = undefined, .more = false };
         if (versions) {
-            var page = try collector.client.listObjectVersions(collector.wal.bucket, .{ .prefix = prefix, .max_keys = max_inventory, .continuation_token = cursor.token, .key_marker = cursor.key, .version_id_marker = cursor.version, .cancellation = token });
+            var page = try collector.client.listObjectVersions(collector.wal.bucket, .{ .prefix = prefix, .max_keys = @min(max_inventory, @max(1, collector.inventory_limit)), .continuation_token = cursor.token, .key_marker = cursor.key, .version_id_marker = cursor.version, .cancellation = token });
             errdefer page.deinit(collector.alloc);
             if (page.entries.len > max_inventory) return error.InvalidCollectionListing;
             result.items = try collector.alloc.alloc(Item, page.entries.len);
@@ -587,7 +609,7 @@ const Inventory = struct {
             result.next = .{ .token = page.next_continuation_token, .key = page.next_key_marker, .version = page.next_version_id_marker };
             for (result.items, page.entries) |*item, entry| item.* = .{ .key = entry.key, .version = entry.version_id, .delete_marker = entry.is_delete_marker };
         } else {
-            var page = try collector.client.listObjects(collector.wal.bucket, .{ .prefix = prefix, .max_keys = max_inventory, .start_after = if (cursor.after.len != 0) cursor.after else null, .cancellation = token });
+            var page = try collector.client.listObjects(collector.wal.bucket, .{ .prefix = prefix, .max_keys = @min(max_inventory, @max(1, collector.inventory_limit)), .start_after = if (cursor.after.len != 0) cursor.after else null, .cancellation = token });
             errdefer page.deinit(collector.alloc);
             if (page.entries.len > max_inventory) return error.InvalidCollectionListing;
             result.items = try collector.alloc.alloc(Item, page.entries.len);
@@ -1325,4 +1347,51 @@ test "serverless multiprovider native collection preserves packed forest pages a
     defer @import("types.zig").freeRecords(std.testing.allocator, records);
     try std.testing.expectEqual(@as(usize, 64), records.len);
     for (records) |record| try std.testing.expectEqualSlices(u8, &body, record.payload);
+}
+
+test "serverless multiprovider unified WAL collector traces large payloads across request owners" {
+    const a = std.testing.allocator;
+    var memory = objects.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var wal = try Wal.init(a, client, "db", "large-gc");
+    defer wal.deinit();
+    wal.managed_reads = true;
+    var now: u64 = std.time.ns_per_s;
+    const Clock = struct {
+        fn read(raw: ?*const anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(raw.?))).*;
+        }
+    };
+    wal.read_clock = .{ .ptr = &now, .now_fn = Clock.read };
+    const body = try a.alloc(u8, 1024 * 1024 + 71);
+    defer a.free(body);
+    @memset(body, 'a');
+    _ = try wal.appendIdempotent("docs", 0, body, "retired");
+    @memset(body, 'b');
+    _ = try wal.appendIdempotent("docs", 0, body, "retained");
+    _ = try wal.truncatePrefix("docs", 2);
+    var state: ?Collector.ResumeState = null;
+    var finished = false;
+    var deleted: usize = 0;
+    for (0..5000) |_| {
+        var collector = Collector.init(a, &wal, std.testing.io);
+        if (state) |value| collector.restoreState(value);
+        const result = try collector.step("docs", null);
+        state = collector.suspendState("docs");
+        deleted += result.deleted_objects;
+        now += 250 * std.time.ns_per_ms;
+        if (result.phase == .waiting) now += Collector.grace_ns;
+        if (result.phase == .finished) {
+            finished = true;
+            break;
+        }
+    }
+    try std.testing.expect(finished and deleted > 0);
+    const rows = try wal.readRangeAlloc(a, "docs", .{ .start_lsn = 2, .end_lsn = 2, .max_bytes = body.len + 4096 });
+    defer @import("types.zig").freeRecords(a, rows);
+    try std.testing.expectEqualSlices(u8, body, rows[0].payload);
+    @memset(body, 'a');
+    try std.testing.expectEqual(@as(?u64, 1), try wal.findIdempotent("docs", 0, body, "retired"));
 }

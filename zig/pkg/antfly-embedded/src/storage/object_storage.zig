@@ -22,6 +22,7 @@ pub const transactional_store = objectstore.transactional_store;
 pub const immutable_log = objectstore.immutable_log;
 pub const ObjectStorage = objectstore.Client;
 pub const ObjectMetadata = objectstore.ObjectMetadata;
+pub const ObjectRevision = objectstore.ObjectRevision;
 pub const ObjectChecksum = objectstore.ObjectChecksum;
 pub const ObjectChecksumAlgorithm = objectstore.ObjectChecksumAlgorithm;
 pub const ObjectChecksumType = objectstore.ObjectChecksumType;
